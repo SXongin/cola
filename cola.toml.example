@@ -1,0 +1,16 @@
+# cola configuration
+# Copy to cola.toml and fill in your values.
+
+[opencode]
+url = "http://localhost:4096"
+# username and password are optional (for basic auth)
+# username = "opencode"
+# password = ""
+
+[feishu]
+app_id = "cli_xxxxxxxxxxxx"
+app_secret = "your-app-secret"
+
+[bridge]
+# Path to the session mapping file
+# session_file = "~/.cola/sessions.json"

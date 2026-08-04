@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+.env
+# Local config carries real app secrets — commit only cola.toml.example
+cola.toml
+# Test artifacts produced by the AI agent during live debugging
+SURVEY.md
