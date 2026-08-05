@@ -214,21 +214,6 @@ impl App {
             inflight.remove(&session_id);
         }
 
-        let after_seq = prompt_resp.as_ref().ok().and_then(|r| r.admitted_seq);
-        // NOTE: with the synchronous canonical API, the full response is
-        // already rendered from parts above, so no per-session SSE replay is
-        // needed. Keep the spawn only when after_seq is known (async path).
-        if let Some(seq) = after_seq {
-            let sse_client = self.opencode.clone();
-            let sid = session_id.clone();
-            let accs = Arc::clone(&self.accumulators);
-            let card_ids = Arc::clone(&self.card_message_ids);
-            let feishu_client = Arc::clone(&self.feishu);
-            tokio::spawn(async move {
-                if let Err(e) = listen_session_sse(&sse_client, &sid, Some(seq), &feishu_client, &accs, &card_ids).await { tracing::warn!("SSE session: {}", e); }
-            });
-        }
-
         // Permissions are handled by the independent poller spawned in App::run,
         // so a prompt blocked on a permission still gets its card shown.
         Ok(())
@@ -249,6 +234,14 @@ impl App {
         Ok(session.id)
     }
 
+    /// Handle a parsed SSE event. NOTE: the global `/api/event` stream only
+    /// delivers v2 durable events (message.updated, session.updated, ...) and
+    /// NOT the v1 `session.next.*` streaming events (they carry no location, so
+    /// the server filters them out), and permission events are typed-PubSub
+    /// only. As a result the `apply()` v1 path below is effectively inert today:
+    /// live rendering comes from `render_poll_loop` and the permission poller.
+    /// Kept because it is the tested streaming state machine, reusable if cola
+    /// ever moves to prompt_async + per-session SSE.
     pub async fn process_event(&self, event: opencode::client::OpenCodeEvent) {
         let session_id = match Self::extract_session_id(&event) { Some(id) => id, None => return };
         let is_tool_boundary = matches!(&event, opencode::client::OpenCodeEvent::ToolCalled { .. } | opencode::client::OpenCodeEvent::ToolSuccess { .. } | opencode::client::OpenCodeEvent::ToolFailed { .. } | opencode::client::OpenCodeEvent::ShellStarted { .. } | opencode::client::OpenCodeEvent::ShellEnded { .. } | opencode::client::OpenCodeEvent::StepEnded { .. });
@@ -261,15 +254,6 @@ impl App {
             else { acc.last_flush_at = Some(now); true }
         };
         if should_flush { self.flush_card(&session_id).await; }
-
-        if let opencode::client::OpenCodeEvent::PermissionAsked { data, .. } = &event {
-            if let Some(ref sid) = data.session_id {
-                if let Some(ref req_id) = data.id { let mut reqs = self.permission_requests.lock().await; reqs.insert(sid.clone(), req_id.clone()); }
-                let action = data.action.as_deref().unwrap_or("unknown");
-                let resources = data.resources.as_deref().map(|r| r.join(", ")).unwrap_or_default();
-                self.send_permission_card(sid, action, &resources).await;
-            }
-        }
     }
 
     async fn flush_card(&self, session_id: &str) {
@@ -321,24 +305,6 @@ impl App {
             _ => {}
         }
         result_card
-    }
-
-    async fn send_permission_card(&self, session_id: &str, action: &str, resources: &str) {
-        let reply_to = { let accs = self.accumulators.lock().await; accs.get(session_id).and_then(|a| a.reply_to_message_id.clone()) };
-        let Some(msg_id) = reply_to else { return };
-        let card = serde_json::json!({
-            "config": { "wide_screen_mode": true },
-            "header": { "title": { "tag": "plain_text", "content": "Permission Required" }, "template": "red" },
-            "elements": [
-                { "tag": "markdown", "content": format!("**{}**\n{}", action, resources) },
-                { "tag": "action", "actions": [
-                    { "tag": "button", "text": { "tag": "plain_text", "content": "Allow Once" }, "type": "primary", "value": { "action": "perm", "reply": "once", "session_id": session_id } },
-                    { "tag": "button", "text": { "tag": "plain_text", "content": "Allow Always" }, "type": "primary", "value": { "action": "perm", "reply": "always", "session_id": session_id } },
-                    { "tag": "button", "text": { "tag": "plain_text", "content": "Deny" }, "type": "danger", "value": { "action": "perm", "reply": "reject", "session_id": session_id } }
-                ]}
-            ]
-        });
-        let _ = self.feishu.reply_card(&msg_id, &card).await;
     }
 
     fn extract_session_id(event: &opencode::client::OpenCodeEvent) -> Option<String> {
@@ -559,61 +525,6 @@ async fn render_poll_loop(
     }
 }
 
-async fn listen_session_sse(
-    client: &opencode::Client, session_id: &str, after_seq: Option<i64>,
-    feishu: &Arc<feishu::Client>, accs_lock: &Arc<Mutex<HashMap<String, StreamAccumulator>>>,
-    card_ids_lock: &Arc<Mutex<HashMap<String, String>>>,
-) -> crate::error::Result<()> {
-    let mut url = client.url(&format!("/api/session/{}/event", session_id));
-    if let Some(seq) = after_seq { url.push_str(&format!("?after={}", seq)); }
-    let response = client.http.get(&url).send().await?.error_for_status()?;
-    tracing::info!("Session SSE connected: {}", session_id);
-    use futures_util::StreamExt;
-    let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(boundary) = buffer.find("\n\n") {
-            let block = buffer[..boundary].to_string();
-            buffer = buffer[boundary + 2..].to_string();
-            if block.trim().is_empty() { continue; }
-            let data: String = block.lines().filter(|l| l.starts_with("data:")).map(|l| l.strip_prefix("data:").unwrap().trim()).collect::<Vec<_>>().join("\n");
-            if data.is_empty() { continue; }
-            let event = match serde_json::from_str::<opencode::client::OpenCodeEvent>(&data) {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::warn!("Session SSE parse fail: {} raw={}", e, &data[..data.len().min(200)]);
-                    continue;
-                }
-            };
-            if let opencode::client::OpenCodeEvent::Unknown = &event {
-                tracing::debug!("Session SSE unknown: {}", &data[..data.len().min(120)]);
-                continue;
-            }
-            tracing::info!("Session SSE evt: {}", event_type_name(&event));
-            let is_tool_boundary = matches!(&event, opencode::client::OpenCodeEvent::ToolCalled { .. } | opencode::client::OpenCodeEvent::ToolSuccess { .. } | opencode::client::OpenCodeEvent::ToolFailed { .. } | opencode::client::OpenCodeEvent::StepEnded { .. });
-            let should_flush = {
-                let mut accs = accs_lock.lock().await;
-                let Some(acc) = accs.get_mut(session_id) else { continue; };
-                if !acc.apply(&event) { continue; }
-                let now = std::time::Instant::now();
-                if !is_tool_boundary && let Some(last) = acc.last_flush_at && now.duration_since(last) < std::time::Duration::from_millis(200) { false }
-                else { acc.last_flush_at = Some(now); true }
-            };
-            if should_flush {
-                let accs = accs_lock.lock().await;
-                let Some(acc) = accs.get(session_id) else { continue; };
-                let card = acc.build_card();
-                drop(accs);
-                let card_id = { let ids = card_ids_lock.lock().await; ids.get(session_id).cloned() };
-                if let Some(msg_id) = card_id && let Err(e) = feishu.update_message(&msg_id, &card).await { tracing::warn!("Card update: {}", e); }
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Independent permission poller: runs forever, surfaces pending permission
 /// requests as cards as soon as they appear. Started once at App startup so a
 /// prompt blocked on an unanswered permission still gets its card shown.
@@ -638,28 +549,8 @@ async fn permission_poll_loop(app: &Arc<App>) -> crate::error::Result<()> {
                             reqs.insert(sid.clone(), p.request_id.clone());
                         }
                         let body = describe_permission(p);
-                        // Result card shown after clicking a button (buttons carry these)
-                        let btn_value = |reply: &str, label: &str, color: &str| serde_json::json!({
-                            "action": "perm",
-                            "reply": reply,
-                            "session_id": &sid,
-                            "request_id": &p.request_id,
-                            "perm_label": label,
-                            "perm_color": color,
-                            "perm_body": &body,
-                        });
-                        let card = serde_json::json!({
-                            "config": { "wide_screen_mode": true },
-                            "header": { "title": { "tag": "plain_text", "content": "🔐 Permission Required" }, "template": "orange" },
-                            "elements": [
-                                { "tag": "markdown", "content": body },
-                                { "tag": "action", "actions": [
-                                    { "tag": "button", "text": { "tag": "plain_text", "content": "✅ Allow Once" }, "type": "primary", "value": btn_value("once", "✅ Allowed once", "green") },
-                                    { "tag": "button", "text": { "tag": "plain_text", "content": "🔁 Allow Always" }, "type": "default", "value": btn_value("always", "✅ Allowed always", "green") },
-                                    { "tag": "button", "text": { "tag": "plain_text", "content": "🚫 Deny" }, "type": "danger", "value": btn_value("reject", "🚫 Denied", "red") }
-                                ]}
-                            ]
-                        });
+                        let card =
+                            crate::feishu::card::build_permission_card(&sid, &p.request_id, &body);
                         // Reply to the message that triggered the prompt for this
                         // session; fall back to sending into the chat when the
                         // accumulator is gone (e.g. after a cola restart).
@@ -759,37 +650,6 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Short name of an OpenCode event for logging.
-fn event_type_name(e: &opencode::client::OpenCodeEvent) -> &'static str {
-    match e {
-        opencode::client::OpenCodeEvent::ServerConnected => "server.connected",
-        opencode::client::OpenCodeEvent::SessionPrompted { .. } => "prompted",
-        opencode::client::OpenCodeEvent::SessionPromptAdmitted { .. } => "prompt.admitted",
-        opencode::client::OpenCodeEvent::StepStarted { .. } => "step.started",
-        opencode::client::OpenCodeEvent::StepEnded { .. } => "step.ended",
-        opencode::client::OpenCodeEvent::StepFailed { .. } => "step.failed",
-        opencode::client::OpenCodeEvent::TextStarted { .. } => "text.started",
-        opencode::client::OpenCodeEvent::TextDelta { .. } => "text.delta",
-        opencode::client::OpenCodeEvent::TextEnded { .. } => "text.ended",
-        opencode::client::OpenCodeEvent::ReasoningStarted { .. } => "reasoning.started",
-        opencode::client::OpenCodeEvent::ReasoningDelta { .. } => "reasoning.delta",
-        opencode::client::OpenCodeEvent::ReasoningEnded { .. } => "reasoning.ended",
-        opencode::client::OpenCodeEvent::ToolCalled { .. } => "tool.called",
-        opencode::client::OpenCodeEvent::ToolSuccess { .. } => "tool.success",
-        opencode::client::OpenCodeEvent::ToolFailed { .. } => "tool.failed",
-        opencode::client::OpenCodeEvent::ToolProgress { .. } => "tool.progress",
-        opencode::client::OpenCodeEvent::ShellStarted { .. } => "shell.started",
-        opencode::client::OpenCodeEvent::ShellEnded { .. } => "shell.ended",
-        opencode::client::OpenCodeEvent::PermissionAsked { .. } => "permission.asked",
-        opencode::client::OpenCodeEvent::PermissionReplied { .. } => "permission.replied",
-        opencode::client::OpenCodeEvent::QuestionAsked { .. } => "question.asked",
-        opencode::client::OpenCodeEvent::QuestionReplied { .. } => "question.replied",
-        opencode::client::OpenCodeEvent::QuestionRejected { .. } => "question.rejected",
-        opencode::client::OpenCodeEvent::CompactionStarted { .. } => "compaction.started",
-        opencode::client::OpenCodeEvent::CompactionEnded { .. } => "compaction.ended",
-        opencode::client::OpenCodeEvent::Unknown => "unknown",
-    }
-}
-
 async fn sse_stream_loop(app: &Arc<App>) -> crate::error::Result<()> {
     loop {
         match sse_stream_once(app).await {
@@ -937,5 +797,43 @@ mod tests {
 
         // No change → nothing new.
         assert!(!render_new_turn_parts(&mut acc, &msgs("completed", "src\n"), epoch));
+    }
+
+    #[test]
+    fn empty_then_updated_part_renders_once_with_content() {
+        use crate::opencode::client::{MessageInfo, MessageTime, SessionMessage};
+
+        let epoch = 0;
+        let mut acc = StreamAccumulator::new("test");
+        acc.submit_epoch_ms = Some(epoch);
+
+        let msgs = |reasoning: &str, text: &str| vec![SessionMessage {
+            info: MessageInfo {
+                id: "a1".into(),
+                role: Some("assistant".into()),
+                parent_id: None,
+                time: Some(MessageTime { created: 100 }),
+            },
+            parts: serde_json::json!([
+                { "id": "prt_rsn", "type": "reasoning", "text": reasoning },
+                { "id": "prt_txt", "type": "text", "text": text },
+            ]),
+        }];
+
+        // Parts are written empty first, then updated with content. The empty
+        // version must NOT be rendered (it would freeze the placeholder).
+        assert!(!render_new_turn_parts(&mut acc, &msgs("", ""), epoch));
+        assert_eq!(acc.reasoning, "");
+        assert_eq!(acc.text, "");
+
+        // Once content lands (same part ids), render it once.
+        assert!(render_new_turn_parts(&mut acc, &msgs("Let me think", "Answer here"), epoch));
+        assert!(acc.reasoning.contains("Let me think"));
+        assert!(acc.text.contains("Answer here"));
+
+        // Re-fetching the same content must not duplicate.
+        assert!(!render_new_turn_parts(&mut acc, &msgs("Let me think", "Answer here"), epoch));
+        assert_eq!(acc.reasoning, "Let me think");
+        assert_eq!(acc.text, "Answer here");
     }
 }

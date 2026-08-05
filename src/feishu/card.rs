@@ -162,7 +162,7 @@ impl CardBuilder {
                 }
             }
             CardState::Done => {
-                if let Some(tool) = self.tools.iter().find(|t| t.status == "failed") {
+                if self.tools.iter().any(|t| t.status == "failed") {
                     (format!("❌ {} 失败", self.title), "red")
                 } else {
                     (format!("✅ {} 完成", self.title), "green")
@@ -185,6 +185,36 @@ fn collapsible_panel(title: &str, content: &str) -> serde_json::Value {
         },
         "elements": [
             { "tag": "markdown", "content": content }
+        ]
+    })
+}
+
+/// Build the interactive permission card. Buttons carry the request id, the
+/// session id and a description so the card callback (`action: "perm"`) can
+/// route the reply back to the right instance and render a result card.
+pub fn build_permission_card(session_id: &str, request_id: &str, body: &str) -> serde_json::Value {
+    let btn_value = |reply: &str, label: &str, color: &str| json!({
+        "action": "perm",
+        "reply": reply,
+        "session_id": session_id,
+        "request_id": request_id,
+        "perm_label": label,
+        "perm_color": color,
+        "perm_body": body,
+    });
+    json!({
+        "config": { "wide_screen_mode": true },
+        "header": {
+            "title": { "tag": "plain_text", "content": "🔐 Permission Required" },
+            "template": "orange"
+        },
+        "elements": [
+            { "tag": "markdown", "content": body },
+            { "tag": "action", "actions": [
+                { "tag": "button", "text": { "tag": "plain_text", "content": "✅ Allow Once" }, "type": "primary", "value": btn_value("once", "✅ Allowed once", "green") },
+                { "tag": "button", "text": { "tag": "plain_text", "content": "🔁 Allow Always" }, "type": "default", "value": btn_value("always", "✅ Allowed always", "green") },
+                { "tag": "button", "text": { "tag": "plain_text", "content": "🚫 Deny" }, "type": "danger", "value": btn_value("reject", "🚫 Denied", "red") }
+            ]}
         ]
     })
 }
@@ -274,5 +304,66 @@ mod tests {
         let card = CardBuilder::new("cola").with_state(CardState::Done).with_text("Done!").build();
         assert_eq!(card["header"]["template"].as_str().unwrap(), "green");
         assert!(card["header"]["title"]["content"].as_str().unwrap().contains("✅"));
+    }
+
+    #[test]
+    fn error_card_shows_red_header() {
+        let card = CardBuilder::new("cola")
+            .with_state(CardState::Error)
+            .with_text("**错误**: 503 request queue full")
+            .build();
+        assert_eq!(card["header"]["template"].as_str().unwrap(), "red");
+        assert!(card["header"]["title"]["content"].as_str().unwrap().contains("出错"));
+        assert!(card["body"]["elements"][0]["content"].as_str().unwrap().contains("503"));
+    }
+
+    #[test]
+    fn question_appears_before_content() {
+        let card = CardBuilder::new("cola")
+            .with_state(CardState::Done)
+            .with_question("看看目录里有什么")
+            .with_text("有 3 个文件。")
+            .build();
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert!(elements[0]["content"].as_str().unwrap().contains("看看目录里有什么"));
+        assert_eq!(elements[1]["tag"].as_str().unwrap(), "hr");
+    }
+
+    #[test]
+    fn failed_tool_marks_done_red() {
+        let tool = ToolPanel {
+            name: "bash".into(),
+            status: "failed".into(),
+            input: Some("cargo build".into()),
+            output: Some("error[E0308]".into()),
+        };
+        let card = CardBuilder::new("cola").with_state(CardState::Done).with_tool(tool).build();
+        assert_eq!(card["header"]["template"].as_str().unwrap(), "red");
+        assert!(card["header"]["title"]["content"].as_str().unwrap().contains("失败"));
+    }
+
+    #[test]
+    fn permission_card_carries_reply_payload() {
+        let card = build_permission_card("ses_abc", "per_123", "AI 想要执行 bash");
+        assert_eq!(card["header"]["title"]["content"].as_str().unwrap(), "🔐 Permission Required");
+        // Permission card is built v1-style: elements live at the top level.
+        let elements = card["elements"].as_array().unwrap();
+        // element 0 = description markdown, element 1 = action row
+        assert!(elements[0]["content"].as_str().unwrap().contains("AI 想要执行"));
+        let actions = elements[1]["actions"].as_array().unwrap();
+        assert_eq!(actions.len(), 3);
+        let values: Vec<_> = actions.iter().map(|a| &a["value"]).collect();
+        // Each button must carry the reply + request_id + session_id so the
+        // card callback can route the answer back.
+        let once = values.iter().find(|v| v["reply"] == "once").unwrap();
+        assert_eq!(once["request_id"], "per_123");
+        assert_eq!(once["session_id"], "ses_abc");
+        assert_eq!(once["perm_label"], "✅ Allowed once");
+        assert_eq!(once["perm_color"], "green");
+        assert!(once["perm_body"].as_str().unwrap().contains("bash"));
+        let reject = values.iter().find(|v| v["reply"] == "reject").unwrap();
+        assert_eq!(reject["perm_color"], "red");
+        let always = values.iter().find(|v| v["reply"] == "always").unwrap();
+        assert!(always["perm_label"].as_str().unwrap().contains("always"));
     }
 }

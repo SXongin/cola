@@ -58,13 +58,14 @@ fn find_opencode_server(preferred_port: Option<&str>) -> Option<(String, String)
             .to_string();
         servers.push((port, password));
     }
-    // Prefer the configured port so cola keeps its own dedicated server.
+    // Only match the configured port — cola runs its own dedicated server.
+    // Falling back to an arbitrary other OpenCode process would silently
+    // hijack another app's server (wrong data dir + password).
     if let Some(pref) = preferred_port {
-        if let Some(s) = servers.iter().find(|(p, _)| p == pref) {
-            return Some(s.clone());
-        }
+        servers.into_iter().find(|(p, _)| p == pref)
+    } else {
+        servers.into_iter().next()
     }
-    servers.into_iter().next()
 }
 
 /// Update the OpenCode config with the auto-detected port/password.
