@@ -113,13 +113,14 @@ async fn main() -> anyhow::Result<()> {    tracing_subscriber::registry()
         Err(e) => tracing::error!("Test message failed: {}", e),
     }
 
+    let opencode_client = opencode::Client::new(cfg.opencode.clone());
     let app = Arc::new(bridge::App::new(
         cfg.clone(),
-        opencode::Client::new(cfg.opencode.clone()),
-        feishu_client,
+        Arc::new(opencode_client.clone()),
+        Arc::new(feishu_client),
     )?);
 
-    app.run().await?;
+    app.run(&opencode_client).await?;
 
     Ok(())
 }

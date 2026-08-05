@@ -18,12 +18,16 @@ pub struct App {
     /// Session ids with a prompt currently in flight (serializes prompts per
     /// session so concurrent messages don't clobber each other's accumulators).
     pub inflight: Arc<Mutex<HashSet<String>>>,
-    pub opencode: opencode::Client,
-    pub feishu: Arc<feishu::Client>,
+    pub opencode: Arc<dyn opencode::Backend>,
+    pub feishu: Arc<dyn feishu::Platform>,
 }
 
 impl App {
-    pub fn new(cfg: Config, opencode: opencode::Client, feishu: feishu::Client) -> anyhow::Result<Self> {
+    pub fn new(
+        cfg: Config,
+        opencode: Arc<dyn opencode::Backend>,
+        feishu: Arc<dyn feishu::Platform>,
+    ) -> anyhow::Result<Self> {
         let session_store = SessionStore::new(cfg.bridge.session_file)?;
         Ok(Self {
             sessions: Arc::new(Mutex::new(session_store)),
@@ -33,16 +37,17 @@ impl App {
             seen_event_ids: Arc::new(Mutex::new(HashSet::new())),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             opencode,
-            feishu: Arc::new(feishu),
+            feishu,
         })
     }
 
-    pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
+    pub async fn run(self: Arc<Self>, sse_client: &opencode::Client) -> anyhow::Result<()> {
         let ws = Arc::clone(&self);
         let sse = Arc::clone(&self);
         let perm = Arc::clone(&self);
+        let sse_client = sse_client.clone();
         let ws_task = tokio::spawn(async move { if let Err(e) = feishu::ws::event_loop(&ws).await { tracing::error!("WS: {}", e); } });
-        let sse_task = tokio::spawn(async move { if let Err(e) = sse_stream_loop(&sse).await { tracing::error!("SSE: {}", e); } });
+        let sse_task = tokio::spawn(async move { if let Err(e) = sse_stream_loop(&sse_client, &sse).await { tracing::error!("SSE: {}", e); } });
         // Permissions are not delivered on the global SSE (typed PubSub only),
         // and a prompt can be blocked on an unanswered permission forever, so the
         // poller must run independently of any single prompt lifecycle.
@@ -650,9 +655,9 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Short name of an OpenCode event for logging.
-async fn sse_stream_loop(app: &Arc<App>) -> crate::error::Result<()> {
+async fn sse_stream_loop(client: &opencode::Client, app: &Arc<App>) -> crate::error::Result<()> {
     loop {
-        match sse_stream_once(app).await {
+        match sse_stream_once(client, app).await {
             Ok(()) => tracing::warn!("OpenCode SSE stream ended, reconnecting..."),
             Err(e) => tracing::warn!("OpenCode SSE error: {}, reconnecting...", e),
         }
@@ -660,8 +665,8 @@ async fn sse_stream_loop(app: &Arc<App>) -> crate::error::Result<()> {
     }
 }
 
-async fn sse_stream_once(app: &Arc<App>) -> crate::error::Result<()> {
-    let mut stream = opencode::sse::SseStream::connect(&app.opencode).await?;
+async fn sse_stream_once(client: &opencode::Client, app: &Arc<App>) -> crate::error::Result<()> {
+    let mut stream = opencode::sse::SseStream::connect(client).await?;
     tracing::info!("Connected to OpenCode SSE");
     while let Some(result) = stream.next_event().await {
         match result {
@@ -835,5 +840,270 @@ mod tests {
         assert!(!render_new_turn_parts(&mut acc, &msgs("Let me think", "Answer here"), epoch));
         assert_eq!(acc.reasoning, "Let me think");
         assert_eq!(acc.text, "Answer here");
+    }
+}
+
+// ===== Test double support (mock Backend + recording Platform) =====
+
+#[cfg(test)]
+mod test_support {
+    use super::*;
+
+    #[derive(Debug, Clone)]
+    pub enum PlatformCall {
+        ReplyCard { reply_to: String, card: serde_json::Value },
+        SendCard { receive_id: String, card: serde_json::Value },
+        UpdateMessage { message_id: String, card: serde_json::Value },
+        ReplyText { message_id: String, text: String },
+    }
+
+    /// Records every card cola would send, instead of posting to Feishu.
+    pub struct RecordingPlatform {
+        pub calls: Arc<tokio::sync::Mutex<Vec<PlatformCall>>>,
+    }
+
+    impl RecordingPlatform {
+        pub fn new() -> Self {
+            Self { calls: Arc::new(tokio::sync::Mutex::new(Vec::new())) }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl feishu::Platform for RecordingPlatform {
+        async fn get_ws_endpoint(&self) -> crate::error::Result<String> {
+            Ok("wss://example.test".into())
+        }
+
+        async fn reply_card(&self, reply_to: &str, card: &serde_json::Value) -> crate::error::Result<String> {
+            self.calls.lock().await.push(PlatformCall::ReplyCard { reply_to: reply_to.into(), card: card.clone() });
+            Ok("msg_reply".into())
+        }
+
+        async fn send_card(
+            &self,
+            _receive_id_type: &str,
+            receive_id: &str,
+            card: &serde_json::Value,
+        ) -> crate::error::Result<String> {
+            self.calls.lock().await.push(PlatformCall::SendCard { receive_id: receive_id.into(), card: card.clone() });
+            Ok("msg_sent".into())
+        }
+
+        async fn update_message(&self, message_id: &str, card: &serde_json::Value) -> crate::error::Result<()> {
+            self.calls.lock().await.push(PlatformCall::UpdateMessage { message_id: message_id.into(), card: card.clone() });
+            Ok(())
+        }
+
+        async fn reply_text(&self, message_id: &str, text: &str) -> crate::error::Result<String> {
+            self.calls.lock().await.push(PlatformCall::ReplyText { message_id: message_id.into(), text: text.into() });
+            Ok("msg_text".into())
+        }
+    }
+
+    /// Serves scripted parts/permissions instead of a live OpenCode server.
+    pub struct MockBackend {
+        pub parts: serde_json::Value,
+        pub permissions: Vec<opencode::client::PermissionRequest>,
+        /// When set, `prompt` fails with this message (simulates a provider 503).
+        pub prompt_error: Option<String>,
+    }
+
+    impl MockBackend {
+        pub fn new(parts: serde_json::Value) -> Self {
+            Self { parts, permissions: Vec::new(), prompt_error: None }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl opencode::Backend for MockBackend {
+        fn new_session_input(&self, directory: Option<&str>) -> opencode::client::CreateSessionInput {
+            opencode::client::CreateSessionInput {
+                id: None,
+                agent: None,
+                model: Some(opencode::client::ModelInfo { id: "m".into(), provider_id: "p".into(), variant: None }),
+                location: directory.map(|d| opencode::client::Location { directory: d.to_string() }),
+            }
+        }
+
+        async fn create_session(&self, _i: &opencode::client::CreateSessionInput) -> crate::error::Result<opencode::client::Session> {
+            Ok(opencode::client::Session { id: "ses_test".into(), project_id: None, agent: None, title: None, location: None, cost: None, time: None })
+        }
+
+        async fn prompt(&self, session_id: &str, _text: &str) -> crate::error::Result<opencode::client::PromptResponse> {
+            if let Some(err) = &self.prompt_error {
+                return Err(crate::error::BridgeError::OpenCode(err.clone()));
+            }
+            Ok(opencode::client::PromptResponse {
+                id: "msg_assist".into(),
+                session_id: Some(session_id.to_string()),
+                admitted_seq: None,
+                parent_id: Some("msg_user".into()),
+                error: None,
+                parts: self.parts.clone(),
+            })
+        }
+
+        async fn messages(&self, _session_id: &str) -> crate::error::Result<Vec<opencode::client::SessionMessage>> {
+            let now = chrono::Utc::now().timestamp_millis();
+            Ok(vec![opencode::client::SessionMessage {
+                info: opencode::client::MessageInfo {
+                    id: "msg_assist".into(),
+                    role: Some("assistant".into()),
+                    parent_id: Some("msg_user".into()),
+                    time: Some(opencode::client::MessageTime { created: now + 1000 }),
+                },
+                parts: self.parts.clone(),
+            }])
+        }
+
+        async fn list_permissions(&self, _d: Option<&str>) -> crate::error::Result<Vec<opencode::client::PermissionRequest>> {
+            Ok(self.permissions.clone())
+        }
+
+        async fn reply_permission(&self, _r: &str, _reply: &str, _d: Option<&str>) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        async fn interrupt(&self, _s: &str) -> crate::error::Result<()> { Ok(()) }
+        async fn compact(&self, _s: &str) -> crate::error::Result<()> { Ok(()) }
+        async fn switch_agent(&self, _s: &str, _a: &str) -> crate::error::Result<()> { Ok(()) }
+        async fn switch_model(&self, _s: &str, _m: &str) -> crate::error::Result<()> { Ok(()) }
+    }
+
+    pub fn test_config(session_file: &std::path::Path) -> crate::config::Config {
+        crate::config::Config {
+            opencode: crate::config::OpenCodeConfig {
+                url: "http://localhost:1".into(),
+                username: None,
+                password: None,
+                model: "test/model".into(),
+            },
+            feishu: crate::config::FeishuConfig { app_id: "app".into(), app_secret: "secret".into() },
+            bridge: crate::config::BridgeConfig { session_file: session_file.to_path_buf() },
+        }
+    }
+
+    /// The parts a real assistant turn produces: reasoning → tool → text.
+    pub fn realistic_parts() -> serde_json::Value {
+        serde_json::json!([
+            { "id": "prt_s1", "type": "step-start", "snapshot": "x" },
+            { "id": "prt_r1", "type": "reasoning", "text": "用户想让我分析目录。" },
+            { "id": "prt_t1", "type": "tool", "tool": "bash", "callID": "call_1",
+              "state": { "status": "completed", "input": { "command": "ls -la" }, "output": "src/\nCargo.toml\n" } },
+            { "id": "prt_f1", "type": "step-finish", "reason": "tool-calls" },
+            { "id": "prt_s2", "type": "step-start", "snapshot": "x" },
+            { "id": "prt_txt", "type": "text", "text": "当前目录有 src/ 和 Cargo.toml。" },
+            { "id": "prt_f2", "type": "step-finish", "reason": "stop" },
+        ])
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::test_support::*;
+    use super::*;
+
+    async fn build_app(cfg: crate::config::Config, backend: MockBackend) -> (Arc<App>, Arc<RecordingPlatform>) {
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
+        (app, platform)
+    }
+
+    #[tokio::test]
+    async fn handle_prompt_renders_reasoning_tools_and_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+        app.handle_message("msg_1".into(), "chat_1".into(), "chat_1".into(), "分析一下目录".into()).await;
+
+        let calls = platform.calls.lock().await.clone();
+        // First call must be the Loading reply card.
+        assert!(matches!(calls.first(), Some(PlatformCall::ReplyCard { .. })));
+        // At least one card update (flush) must follow.
+        let updates: Vec<_> = calls.iter().filter_map(|c| match c {
+            PlatformCall::UpdateMessage { card, .. } => Some(card.clone()),
+            _ => None,
+        }).collect();
+        assert!(!updates.is_empty(), "expected card updates, got: {:?}", calls);
+
+        let final_card = updates.last().unwrap().clone();
+        let text = final_card.to_string();
+        assert!(text.contains("✅"), "final header should be Done: {}", text);
+        assert!(text.contains("推理过程"), "reasoning panel missing: {}", text);
+        assert!(text.contains("bash"), "tool panel missing: {}", text);
+        assert!(text.contains("当前目录有 src/ 和 Cargo.toml。"), "text missing: {}", text);
+        assert!(text.contains("ls -la"), "tool input missing: {}", text);
+    }
+
+    #[tokio::test]
+    async fn prompt_error_renders_error_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.prompt_error = Some("Streaming response failed: [503] The request queue is full.".into());
+        let (app, platform) = build_app(cfg, backend).await;
+
+        app.handle_message("msg_1".into(), "chat_1".into(), "chat_1".into(), "hi".into()).await;
+
+        let calls = platform.calls.lock().await.clone();
+        let updates: Vec<_> = calls.iter().filter_map(|c| match c {
+            PlatformCall::UpdateMessage { card, .. } => Some(card.clone()),
+            _ => None,
+        }).collect();
+        assert!(!updates.is_empty(), "expected an error card update, got: {:?}", calls);
+        let card = updates.last().unwrap().to_string();
+        assert!(card.contains("❌"), "error card header missing: {}", card);
+        assert!(card.contains("503"), "error text missing: {}", card);
+    }
+
+    #[tokio::test]
+    async fn permission_poller_sends_card_and_card_action_replies() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.permissions = vec![opencode::client::PermissionRequest {
+            request_id: "per_1".into(),
+            session_id: Some("ses_test".into()),
+            permission: Some("bash".into()),
+            patterns: vec!["ls -la".into()],
+            metadata: None,
+            always: Vec::new(),
+        }];
+        let (app, platform) = build_app(cfg, backend).await;
+
+        // Seed a session + accumulator so the poller has a reply target.
+        app.handle_message("msg_1".into(), "chat_1".into(), "chat_1".into(), "hi".into()).await;
+
+        // Run the permission poller briefly.
+        tokio::spawn({
+            let app = app.clone();
+            async move {
+                let _ = permission_poll_loop(&app).await;
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+
+        let calls = platform.calls.lock().await.clone();
+        let perm_card = calls.iter().find_map(|c| match c {
+            PlatformCall::ReplyCard { card, .. } if card.to_string().contains("Permission Required") => Some(card.clone()),
+            _ => None,
+        });
+        let perm_card = perm_card.expect("permission card should have been sent");
+        assert!(perm_card.to_string().contains("ls -la"));
+
+        // Simulate the user clicking "Allow Once" and assert the reply routes.
+        let value = serde_json::json!({
+            "action": "perm",
+            "reply": "once",
+            "session_id": "ses_test",
+            "request_id": "per_1",
+            "perm_label": "✅ Allowed once",
+            "perm_color": "green",
+            "perm_body": "bash",
+        });
+        let result = app.handle_card_action(value).await;
+        assert!(result.is_some());
+        assert!(result.unwrap().to_string().contains("Allowed once"));
     }
 }

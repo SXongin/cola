@@ -731,7 +731,7 @@ pub struct PermissionListResponse {
     pub data: Vec<PermissionRequest>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PermissionRequest {
     #[serde(rename = "id")]
     pub request_id: String,
