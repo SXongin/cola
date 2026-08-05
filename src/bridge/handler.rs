@@ -1106,4 +1106,109 @@ mod integration_tests {
         assert!(result.is_some());
         assert!(result.unwrap().to_string().contains("Allowed once"));
     }
+
+    /// Live end-to-end wire check with a real Feishu bot.
+    ///
+    /// cola renders cards from a MOCK backend (deterministic, no real OpenCode
+    /// server), the real cola bot posts them into a test group, and a second
+    /// Feishu bot reads back what was actually delivered and asserts it matches
+    /// expectation. This verifies the wire format Feishu accepts, not just the
+    /// JSON cola builds in-process.
+    ///
+    /// Prerequisites (one-time, in the Feishu Open Platform):
+    ///   1. a second Feishu app with `im:message` read scope,
+    ///   2. a group containing both the cola bot and the test bot,
+    ///   3. set COLA_TEST_BOT_APP_ID / COLA_TEST_BOT_APP_SECRET /
+    ///      COLA_TEST_GROUP_CHAT_ID, then run:
+    ///      `cargo test --bin cola live_e2e_real_bot -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires a second Feishu bot + a test group; see test docs"]
+    async fn live_e2e_real_bot_renders_expected_cards() {
+        let test_app_id = std::env::var("COLA_TEST_BOT_APP_ID").unwrap_or_default();
+        let test_app_secret = std::env::var("COLA_TEST_BOT_APP_SECRET").unwrap_or_default();
+        let group_chat_id = std::env::var("COLA_TEST_GROUP_CHAT_ID").unwrap_or_default();
+        if test_app_id.is_empty() || test_app_secret.is_empty() || group_chat_id.is_empty() {
+            tracing::warn!("skipping live E2E: set COLA_TEST_BOT_APP_ID, COLA_TEST_BOT_APP_SECRET, COLA_TEST_GROUP_CHAT_ID");
+            return;
+        }
+
+        let mut cfg = crate::config::load("cola.toml").expect("load cola.toml");
+        let dir = tempfile::tempdir().unwrap();
+        cfg.bridge.session_file = dir.path().join("sessions.json");
+
+        // cola bot: the real Platform (posts real cards into the group).
+        let cola_platform = feishu::Client::new(cfg.feishu.clone());
+        // test bot: reads the group to verify what cola actually sent.
+        let test_bot = feishu::Client::new(crate::config::FeishuConfig {
+            app_id: test_app_id,
+            app_secret: test_app_secret,
+        });
+
+        // The test bot sends a real message so cola has a real reply target.
+        let prompt = "自动测试：请分析一下目录，然后汇报。";
+        let sent_msg_id = test_bot
+            .send_text("chat_id", &group_chat_id, prompt)
+            .await
+            .expect("send prompt to group");
+        let start = chrono::Utc::now().timestamp_millis();
+
+        let app = Arc::new(
+            App::new(
+                cfg.clone(),
+                Arc::new(MockBackend::new(realistic_parts())),
+                Arc::new(cola_platform),
+            )
+            .unwrap(),
+        );
+        app.handle_message(
+            sent_msg_id.clone(),
+            group_chat_id.clone(),
+            group_chat_id.clone(),
+            prompt.to_string(),
+        )
+        .await;
+
+        // Read back the group until the cola bot's final Done card appears.
+        let deadline = chrono::Utc::now() + chrono::Duration::seconds(30);
+        let mut final_text = String::new();
+        loop {
+            let msgs = test_bot
+                .list_messages("chat", &group_chat_id, start)
+                .await
+                .expect("list group messages");
+            for m in &msgs {
+                if m.msg_type == "interactive" {
+                    let content = m
+                        .body
+                        .as_ref()
+                        .and_then(|b| b.get("content"))
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("");
+                    if content.contains("✅") {
+                        final_text = content.to_string();
+                    }
+                }
+            }
+            if !final_text.is_empty() || chrono::Utc::now() > deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+        }
+
+        assert!(
+            final_text.contains("推理过程"),
+            "real card missing reasoning panel: {}",
+            final_text
+        );
+        assert!(
+            final_text.contains("bash"),
+            "real card missing tool panel: {}",
+            final_text
+        );
+        assert!(
+            final_text.contains("当前目录有 src/ 和 Cargo.toml。"),
+            "real card missing final text: {}",
+            final_text
+        );
+    }
 }

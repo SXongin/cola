@@ -275,6 +275,43 @@ impl Client {
             Ok(())
         }
     }
+
+    /// List messages in a chat (used by the live end-to-end harness: a second
+    /// Feishu bot reads what the cola bot actually sent).
+    #[allow(dead_code)]
+    pub async fn list_messages(
+        &self,
+        container_id_type: &str,
+        container_id: &str,
+        start_time: i64,
+    ) -> crate::error::Result<Vec<ChatMessage>> {
+        let token = self.get_access_token().await?;
+        let resp: MessagesResponse = self
+            .http
+            .get("https://open.feishu.cn/open-apis/im/v1/messages")
+            .query(&[
+                ("container_id_type", container_id_type),
+                ("container_id", container_id),
+                ("start_time", &start_time.to_string()),
+                ("sort_type", "ByCreateTimeAsc"),
+                ("page_size", "50"),
+            ])
+            .bearer_auth(&token)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        if resp.code != 0 {
+            Err(crate::error::BridgeError::Feishu(format!(
+                "list messages error {}: {}",
+                resp.code, resp.msg
+            )))
+        } else {
+            Ok(resp.data.items)
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -316,4 +353,46 @@ struct MessageResponse {
 #[derive(Debug, Deserialize)]
 struct MessageData {
     message_id: String,
+}
+
+/// A message returned by `list_messages` — used by the live E2E harness.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct ChatMessage {
+    #[serde(rename = "message_id")]
+    pub message_id: String,
+    #[serde(rename = "msg_type")]
+    pub msg_type: String,
+    #[serde(rename = "create_time")]
+    pub create_time: String,
+    #[serde(rename = "chat_id")]
+    pub chat_id: String,
+    #[serde(default)]
+    pub sender: Option<ChatMessageSender>,
+    #[serde(default)]
+    pub body: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct ChatMessageSender {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(rename = "sender_type", default)]
+    pub sender_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct MessagesResponse {
+    code: i32,
+    msg: String,
+    data: MessagesData,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct MessagesData {
+    #[serde(default)]
+    items: Vec<ChatMessage>,
 }
