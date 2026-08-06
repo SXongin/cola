@@ -4,3 +4,5 @@
 app_id = "cli_xxxxxxxxxxxx"
 app_secret = "your-test-bot-secret"
 group_chat_id = "oc_xxxxxxxxxxxxxxxxxxxxxxxx"
+# Directory the test session operates in (never the cola repo itself)
+work_dir = "/path/to/a/test/directory"

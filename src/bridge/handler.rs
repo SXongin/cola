@@ -1009,8 +1009,18 @@ mod integration_tests {
         (app, platform)
     }
 
+    /// Create a temp work dir, set it as the process cwd (sessions are created
+    /// in cwd, and tests must never operate in the cola repo) and return it.
+    /// The returned TempDir must stay alive for the test's duration.
+    fn test_work_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        dir
+    }
+
     #[tokio::test]
     async fn handle_prompt_renders_reasoning_tools_and_text() {
+        let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
         let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
@@ -1038,6 +1048,7 @@ mod integration_tests {
 
     #[tokio::test]
     async fn prompt_error_renders_error_card() {
+        let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
         let mut backend = MockBackend::new(realistic_parts());
@@ -1059,6 +1070,7 @@ mod integration_tests {
 
     #[tokio::test]
     async fn permission_poller_sends_card_and_card_action_replies() {
+        let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
         let mut backend = MockBackend::new(realistic_parts());
@@ -1135,6 +1147,8 @@ mod integration_tests {
             app_secret: String,
             #[serde(rename = "group_chat_id")]
             group_chat_id: String,
+            #[serde(rename = "work_dir", default)]
+            work_dir: Option<String>,
         }
 
         let test_cfg = std::fs::read_to_string("cola-test.toml")
@@ -1155,12 +1169,25 @@ mod integration_tests {
             .map(|c| c.group_chat_id.clone())
             .or_else(|| std::env::var("COLA_TEST_GROUP_CHAT_ID").ok())
             .unwrap_or_default();
+        let work_dir = test_cfg
+            .as_ref()
+            .and_then(|c| c.work_dir.clone())
+            .or_else(|| std::env::var("COLA_TEST_WORK_DIR").ok())
+            .unwrap_or_default();
         if test_app_id.is_empty() || test_app_secret.is_empty() || group_chat_id.is_empty() {
             tracing::warn!("skipping live E2E: configure cola-test.toml or set the COLA_TEST_BOT_* env vars");
             return;
         }
 
+        // Load the cola bot config from the repo BEFORE chdir'ing away from it.
         let mut cfg = crate::config::load("cola.toml").expect("load cola.toml");
+
+        if !work_dir.is_empty() {
+            // Never let the session operate in the cola repo itself.
+            std::env::set_current_dir(&work_dir).unwrap_or_else(|e| {
+                tracing::warn!("could not chdir to test work dir {}: {}", work_dir, e)
+            });
+        }
         let dir = tempfile::tempdir().unwrap();
         cfg.bridge.session_file = dir.path().join("sessions.json");
 
