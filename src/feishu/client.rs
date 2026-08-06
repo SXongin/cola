@@ -277,24 +277,22 @@ impl Client {
     }
 
     /// List messages in a chat (used by the live end-to-end harness: a second
-    /// Feishu bot reads what the cola bot actually sent).
+    /// Feishu bot reads what the cola bot actually sent). Queried without a
+    /// time window — Feishu's start_time/end_time filter returns empty for
+    /// recent messages on this API, so the harness filters client-side.
     #[allow(dead_code)]
     pub async fn list_messages(
         &self,
         container_id_type: &str,
         container_id: &str,
-        start_time: i64,
     ) -> crate::error::Result<Vec<ChatMessage>> {
         let token = self.get_access_token().await?;
-        let end_time = chrono::Utc::now().timestamp_millis();
         let resp = self
             .http
             .get("https://open.feishu.cn/open-apis/im/v1/messages")
             .query(&[
                 ("container_id_type", container_id_type),
                 ("container_id", container_id),
-                ("start_time", &start_time.to_string()),
-                ("end_time", &end_time.to_string()),
                 ("sort_type", "ByCreateTimeAsc"),
                 ("page_size", "50"),
             ])
