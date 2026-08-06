@@ -1,0 +1,6 @@
+# Live E2E test config template — copy to cola-test.toml and fill in.
+# cola-test.toml is gitignored because it holds a real app secret.
+
+app_id = "cli_xxxxxxxxxxxx"
+app_secret = "your-test-bot-secret"
+group_chat_id = "oc_xxxxxxxxxxxxxxxxxxxxxxxx"

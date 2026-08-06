@@ -286,22 +286,35 @@ impl Client {
         start_time: i64,
     ) -> crate::error::Result<Vec<ChatMessage>> {
         let token = self.get_access_token().await?;
-        let resp: MessagesResponse = self
+        let end_time = chrono::Utc::now().timestamp_millis();
+        let resp = self
             .http
             .get("https://open.feishu.cn/open-apis/im/v1/messages")
             .query(&[
                 ("container_id_type", container_id_type),
                 ("container_id", container_id),
                 ("start_time", &start_time.to_string()),
+                ("end_time", &end_time.to_string()),
                 ("sort_type", "ByCreateTimeAsc"),
                 ("page_size", "50"),
             ])
             .bearer_auth(&token)
             .send()
-            .await?
-            .error_for_status()?
-            .json()
             .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            eprintln!(
+                "list_messages failed: {} — body: {}",
+                status,
+                &text[..text.len().min(500)]
+            );
+            return Err(crate::error::BridgeError::Feishu(format!(
+                "list messages failed: {}",
+                status
+            )));
+        }
+        let resp: MessagesResponse = resp.json().await?;
 
         if resp.code != 0 {
             Err(crate::error::BridgeError::Feishu(format!(

@@ -1115,20 +1115,43 @@ mod integration_tests {
     /// expectation. This verifies the wire format Feishu accepts, not just the
     /// JSON cola builds in-process.
     ///
-    /// Prerequisites (one-time, in the Feishu Open Platform):
-    ///   1. a second Feishu app with `im:message` read scope,
-    ///   2. a group containing both the cola bot and the test bot,
-    ///   3. set COLA_TEST_BOT_APP_ID / COLA_TEST_BOT_APP_SECRET /
-    ///      COLA_TEST_GROUP_CHAT_ID, then run:
-    ///      `cargo test --bin cola live_e2e_real_bot -- --ignored`.
+    /// Credentials come from `cola-test.toml` (gitignored, see the .example
+    /// template) or the env vars COLA_TEST_BOT_APP_ID / COLA_TEST_BOT_APP_SECRET /
+    /// COLA_TEST_GROUP_CHAT_ID. Run:
+    ///   `cargo test --bin cola live_e2e_real_bot -- --ignored`
     #[tokio::test]
     #[ignore = "requires a second Feishu bot + a test group; see test docs"]
     async fn live_e2e_real_bot_renders_expected_cards() {
-        let test_app_id = std::env::var("COLA_TEST_BOT_APP_ID").unwrap_or_default();
-        let test_app_secret = std::env::var("COLA_TEST_BOT_APP_SECRET").unwrap_or_default();
-        let group_chat_id = std::env::var("COLA_TEST_GROUP_CHAT_ID").unwrap_or_default();
+        #[derive(serde::Deserialize)]
+        struct LiveTestCfg {
+            #[serde(rename = "app_id")]
+            app_id: String,
+            #[serde(rename = "app_secret")]
+            app_secret: String,
+            #[serde(rename = "group_chat_id")]
+            group_chat_id: String,
+        }
+
+        let test_cfg = std::fs::read_to_string("cola-test.toml")
+            .ok()
+            .and_then(|s| toml::from_str::<LiveTestCfg>(&s).ok());
+        let test_app_id = test_cfg
+            .as_ref()
+            .map(|c| c.app_id.clone())
+            .or_else(|| std::env::var("COLA_TEST_BOT_APP_ID").ok())
+            .unwrap_or_default();
+        let test_app_secret = test_cfg
+            .as_ref()
+            .map(|c| c.app_secret.clone())
+            .or_else(|| std::env::var("COLA_TEST_BOT_APP_SECRET").ok())
+            .unwrap_or_default();
+        let group_chat_id = test_cfg
+            .as_ref()
+            .map(|c| c.group_chat_id.clone())
+            .or_else(|| std::env::var("COLA_TEST_GROUP_CHAT_ID").ok())
+            .unwrap_or_default();
         if test_app_id.is_empty() || test_app_secret.is_empty() || group_chat_id.is_empty() {
-            tracing::warn!("skipping live E2E: set COLA_TEST_BOT_APP_ID, COLA_TEST_BOT_APP_SECRET, COLA_TEST_GROUP_CHAT_ID");
+            tracing::warn!("skipping live E2E: configure cola-test.toml or set the COLA_TEST_BOT_* env vars");
             return;
         }
 
