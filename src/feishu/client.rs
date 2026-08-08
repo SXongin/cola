@@ -293,7 +293,9 @@ impl Client {
             .query(&[
                 ("container_id_type", container_id_type),
                 ("container_id", container_id),
-                ("sort_type", "ByCreateTimeAsc"),
+                // Newest first, so recent cards (which the tests wait for) are
+                // on the first page even once the group passes 50 messages.
+                ("sort_type", "ByCreateTimeDesc"),
                 ("page_size", "50"),
             ])
             .bearer_auth(&token)

@@ -1463,12 +1463,16 @@ mod integration_tests {
     #[tokio::test]
     #[ignore = "requires a second Feishu bot + a test group; see live_e2e docs"]
     async fn live_e2e_question_card_is_delivered() {
+        // Unique per run so wait_for_card can't match a stale question card left
+        // in the group by a previous run.
+        let marker = format!("q-{}", uuid::Uuid::new_v4().to_string().get(..8).unwrap_or("x"));
+        let question_text = format!("你想继续吗？（{}）", marker);
         let mut backend = MockBackend::new(realistic_parts());
         backend.questions = vec![opencode::client::QuestionRequest {
             id: "que_live".into(),
             session_id: "ses_test".into(),
             questions: vec![opencode::client::QuestionInfo {
-                question: "你想继续吗？".into(),
+                question: question_text.clone(),
                 header: "下一步".into(),
                 options: vec![
                     opencode::client::QuestionOption { label: "继续".into(), description: String::new() },
@@ -1491,9 +1495,14 @@ mod integration_tests {
             }
         });
 
-        let content = harness.wait_for_card("❓ AI 想问你", 30).await;
+        let content = harness.wait_for_card(&marker, 30).await;
         assert!(
-            content.contains("你想继续吗"),
+            content.contains("❓ AI 想问你"),
+            "question card header missing: {}",
+            content
+        );
+        assert!(
+            content.contains(&question_text),
             "question card body missing: {}",
             content
         );
