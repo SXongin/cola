@@ -1339,21 +1339,71 @@ mod integration_tests {
         assert!(result.unwrap().to_string().contains("Allowed once"));
     }
 
-    /// Live end-to-end wire check with a real Feishu bot.
-    ///
-    /// cola renders cards from a MOCK backend (deterministic, no real OpenCode
-    /// server), the real cola bot posts them into a test group, and a second
-    /// Feishu bot reads back what was actually delivered and asserts it matches
-    /// expectation. This verifies the wire format Feishu accepts, not just the
-    /// JSON cola builds in-process.
-    ///
-    /// Credentials come from `cola-test.toml` (gitignored, see the .example
-    /// template) or the env vars COLA_TEST_BOT_APP_ID / COLA_TEST_BOT_APP_SECRET /
-    /// COLA_TEST_GROUP_CHAT_ID. Run:
-    ///   `cargo test --bin cola live_e2e_real_bot -- --ignored`
-    #[tokio::test]
-    #[ignore = "requires a second Feishu bot + a test group; see test docs"]
-    async fn live_e2e_real_bot_renders_expected_cards() {
+    /// A live E2E run: real cola bot (Platform) + a MOCK backend + the test bot
+    /// reading the group.
+    struct LiveHarness {
+        app: Arc<App>,
+        test_bot: feishu::Client,
+        group_chat_id: String,
+        _dir: tempfile::TempDir,
+    }
+
+    impl LiveHarness {
+        /// Post a message into the group via the test bot and have cola process
+        /// it; returns the sent message id (cola replies to it).
+        async fn send_and_process(&self, prompt: &str) -> String {
+            let sent_msg_id = self
+                .test_bot
+                .send_text("chat_id", &self.group_chat_id, prompt)
+                .await
+                .expect("send prompt to group");
+            self.app
+                .handle_message(
+                    sent_msg_id.clone(),
+                    self.group_chat_id.clone(),
+                    self.group_chat_id.clone(),
+                    prompt.to_string(),
+                )
+                .await;
+            sent_msg_id
+        }
+
+        /// Poll the group until an interactive card whose content contains
+        /// `needle` appears; returns the content or "" on timeout.
+        async fn wait_for_card(&self, needle: &str, timeout_secs: i64) -> String {
+            let deadline = chrono::Utc::now() + chrono::Duration::seconds(timeout_secs);
+            let mut found = String::new();
+            loop {
+                let msgs = self
+                    .test_bot
+                    .list_messages("chat", &self.group_chat_id)
+                    .await
+                    .expect("list group messages");
+                for m in &msgs {
+                    if m.msg_type == "interactive" {
+                        let content = m
+                            .body
+                            .as_ref()
+                            .and_then(|b| b.get("content"))
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("");
+                        if content.contains(needle) {
+                            found = content.to_string();
+                        }
+                    }
+                }
+                if !found.is_empty() || chrono::Utc::now() > deadline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+            }
+            found
+        }
+    }
+
+    /// Shared live E2E setup. Returns None when the test-bot credentials aren't
+    /// configured (the test then skips).
+    async fn live_setup(backend: MockBackend) -> Option<LiveHarness> {
         let _ = tracing_subscriber::fmt()
             .with_env_filter("cola=debug")
             .with_writer(std::io::stderr)
@@ -1396,14 +1446,12 @@ mod integration_tests {
             .unwrap_or_default();
         if test_app_id.is_empty() || test_app_secret.is_empty() || group_chat_id.is_empty() {
             tracing::warn!("skipping live E2E: configure cola-test.toml or set the COLA_TEST_BOT_* env vars");
-            return;
+            return None;
         }
 
         // Load the cola bot config from the repo BEFORE chdir'ing away from it.
         let mut cfg = crate::config::load("cola.toml").expect("load cola.toml");
-
         if !work_dir.is_empty() {
-            // Never let the session operate in the cola repo itself.
             std::env::set_current_dir(&work_dir).unwrap_or_else(|e| {
                 tracing::warn!("could not chdir to test work dir {}: {}", work_dir, e)
             });
@@ -1411,36 +1459,35 @@ mod integration_tests {
         let dir = tempfile::tempdir().unwrap();
         cfg.bridge.session_file = dir.path().join("sessions.json");
 
-        // cola bot: the real Platform (posts real cards into the group).
         let cola_platform = feishu::Client::new(cfg.feishu.clone());
-        // test bot: reads the group to verify what cola actually sent.
         let test_bot = feishu::Client::new(crate::config::FeishuConfig {
             app_id: test_app_id,
             app_secret: test_app_secret,
         });
+        let app = Arc::new(App::new(cfg, Arc::new(backend), Arc::new(cola_platform)).unwrap());
+        Some(LiveHarness { app, test_bot, group_chat_id, _dir: dir })
+    }
+
+    /// Live end-to-end wire check with a real Feishu bot.
+    ///
+    /// cola renders cards from a MOCK backend (deterministic, no real OpenCode
+    /// server), the real cola bot posts them into a test group, and a second
+    /// Feishu bot reads back what was actually delivered and asserts it matches
+    /// expectation. This verifies the wire format Feishu accepts, not just the
+    /// JSON cola builds in-process.
+    ///
+    /// Credentials come from `cola-test.toml` (gitignored, see the .example
+    /// template) or the env vars COLA_TEST_BOT_APP_ID / COLA_TEST_BOT_APP_SECRET /
+    /// COLA_TEST_GROUP_CHAT_ID. Run:
+    ///   `cargo test --bin cola live_e2e_real_bot -- --ignored`
+    #[tokio::test]
+    #[ignore = "requires a second Feishu bot + a test group; see test docs"]
+    async fn live_e2e_real_bot_renders_expected_cards() {
+        let Some(harness) = live_setup(MockBackend::new(realistic_parts())).await else { return };
 
         // The test bot sends a real message so cola has a real reply target.
         let prompt = "自动测试：请分析一下目录，然后汇报。";
-        let sent_msg_id = test_bot
-            .send_text("chat_id", &group_chat_id, prompt)
-            .await
-            .expect("send prompt to group");
-
-        let app = Arc::new(
-            App::new(
-                cfg.clone(),
-                Arc::new(MockBackend::new(realistic_parts())),
-                Arc::new(cola_platform),
-            )
-            .unwrap(),
-        );
-        app.handle_message(
-            sent_msg_id.clone(),
-            group_chat_id.clone(),
-            group_chat_id.clone(),
-            prompt.to_string(),
-        )
-        .await;
+        let sent_msg_id = harness.send_and_process(prompt).await;
 
         // Read back the group until the cola bot's final Done card appears.
         // Feishu's start_time/end_time window returns empty for recent messages
@@ -1449,31 +1496,7 @@ mod integration_tests {
         // client" placeholder), so this asserts real delivery + terminal header
         // state; the full reasoning/tool/text body is asserted in-process by
         // the RecordingPlatform tests.
-        let deadline = chrono::Utc::now() + chrono::Duration::seconds(30);
-        let mut final_text = String::new();
-        loop {
-            let msgs = test_bot
-                .list_messages("chat", &group_chat_id)
-                .await
-                .expect("list group messages");
-            for m in &msgs {
-                if m.msg_type == "interactive" {
-                    let content = m
-                        .body
-                        .as_ref()
-                        .and_then(|b| b.get("content"))
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("");
-                    if content.contains("✅") {
-                        final_text = content.to_string();
-                    }
-                }
-            }
-            if !final_text.is_empty() || chrono::Utc::now() > deadline {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
-        }
+        let final_text = harness.wait_for_card("✅", 30).await;
 
         assert!(
             final_text.contains("✅"),
@@ -1483,6 +1506,53 @@ mod integration_tests {
             final_text.contains("自动测试：请分析一下目录"),
             "card fallback title should carry the question, got: {}",
             final_text
+        );
+    }
+
+    /// Live E2E for the interactive `question` tool: the mock backend surfaces a
+    /// pending question request, the question poller turns it into a real card
+    /// the cola bot posts to the group, and the test bot reads it back.
+    #[tokio::test]
+    #[ignore = "requires a second Feishu bot + a test group; see live_e2e docs"]
+    async fn live_e2e_question_card_is_delivered() {
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.questions = vec![opencode::client::QuestionRequest {
+            id: "que_live".into(),
+            session_id: "ses_test".into(),
+            questions: vec![opencode::client::QuestionInfo {
+                question: "你想继续吗？".into(),
+                header: "下一步".into(),
+                options: vec![
+                    opencode::client::QuestionOption { label: "继续".into(), description: String::new() },
+                    opencode::client::QuestionOption { label: "停止".into(), description: String::new() },
+                ],
+                multiple: None,
+                custom: None,
+            }],
+        }];
+        let Some(harness) = live_setup(backend).await else { return };
+
+        // Give cola a session + reply target to work against.
+        harness.send_and_process("自动测试：请回答我的问题。").await;
+
+        // Run the question poller (it surfaces pending questions as cards).
+        tokio::spawn({
+            let app = harness.app.clone();
+            async move {
+                let _ = question_poll_loop(&app).await;
+            }
+        });
+
+        let content = harness.wait_for_card("❓ AI 想问你", 30).await;
+        assert!(
+            content.contains("你想继续吗"),
+            "question card body missing: {}",
+            content
+        );
+        assert!(
+            content.contains("继续"),
+            "question option button missing: {}",
+            content
         );
     }
 
