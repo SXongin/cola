@@ -127,7 +127,7 @@ impl App {
     }
 
     async fn handle_prompt(self: &Arc<Self>, thread_key: ThreadKey, text: String, message_id: &str) -> crate::error::Result<()> {
-        let session_id = self.get_or_create_session(&thread_key, &text).await?;
+        let mut session_id = self.get_or_create_session(&thread_key, &text).await?;
 
         // Serialize prompts per session: if one is already in flight, don't let
         // a second message overwrite its accumulator (the two would race on the
@@ -170,10 +170,56 @@ impl App {
             render_poll_loop(&render_app, render_sid, epoch_ms, render_done).await;
         });
 
-        let prompt_resp = self.opencode.prompt(&session_id, &text).await;
+        let mut prompt_resp = self.opencode.prompt(&session_id, &text).await;
 
-        done.store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = render_task.await;
+        // The mapped session may not exist on the current server — e.g. it was
+        // created in an old, now-abandoned store. Clear the mapping, create a
+        // fresh session and retry once.
+        if prompt_resp.as_ref().is_err_and(|e| e.is_session_not_found()) {
+            tracing::warn!("session {} not found on the server; recreating", session_id);
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = render_task.await;
+
+            {
+                let mut store = self.sessions.lock().await;
+                store.remove(&session_id);
+                store.persist()?;
+            }
+            let fresh_id = self.get_or_create_session(&thread_key, &text).await?;
+            // Re-key the card id + accumulator from the dead session to the new one.
+            {
+                let mut ids = self.card_message_ids.lock().await;
+                if let Some(cid) = ids.remove(&session_id) {
+                    ids.insert(fresh_id.clone(), cid);
+                }
+            }
+            {
+                let mut accs = self.accumulators.lock().await;
+                if let Some(acc) = accs.remove(&session_id) {
+                    accs.insert(fresh_id.clone(), acc);
+                }
+            }
+            {
+                let mut inflight = self.inflight.lock().await;
+                inflight.remove(&session_id);
+                inflight.insert(fresh_id.clone());
+            }
+            session_id = fresh_id;
+
+            let done2 = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let render_app2 = Arc::clone(self);
+            let render_sid2 = session_id.clone();
+            let render_done2 = std::sync::Arc::clone(&done2);
+            let render_task2 = tokio::spawn(async move {
+                render_poll_loop(&render_app2, render_sid2, epoch_ms, render_done2).await;
+            });
+            prompt_resp = self.opencode.prompt(&session_id, &text).await;
+            done2.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = render_task2.await;
+        } else {
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = render_task.await;
+        }
 
         let prompt_err = match &prompt_resp {
             Ok(r) => r.error.clone(),
@@ -906,11 +952,22 @@ mod test_support {
         pub permissions: Vec<opencode::client::PermissionRequest>,
         /// When set, `prompt` fails with this message (simulates a provider 503).
         pub prompt_error: Option<String>,
+        /// The session id `create_session` returns.
+        pub session_id: String,
+        /// When true, `prompt` 404s for any session id other than `session_id`
+        /// (simulates a stale mapping to a session that no longer exists).
+        pub stale_session_404: bool,
     }
 
     impl MockBackend {
         pub fn new(parts: serde_json::Value) -> Self {
-            Self { parts, permissions: Vec::new(), prompt_error: None }
+            Self {
+                parts,
+                permissions: Vec::new(),
+                prompt_error: None,
+                session_id: "ses_test".into(),
+                stale_session_404: false,
+            }
         }
     }
 
@@ -926,10 +983,13 @@ mod test_support {
         }
 
         async fn create_session(&self, _i: &opencode::client::CreateSessionInput) -> crate::error::Result<opencode::client::Session> {
-            Ok(opencode::client::Session { id: "ses_test".into(), project_id: None, agent: None, title: None, location: None, cost: None, time: None })
+            Ok(opencode::client::Session { id: self.session_id.clone(), project_id: None, agent: None, title: None, location: None, cost: None, time: None })
         }
 
         async fn prompt(&self, session_id: &str, _text: &str) -> crate::error::Result<opencode::client::PromptResponse> {
+            if self.stale_session_404 && session_id != self.session_id {
+                return Err(crate::error::BridgeError::SessionNotFound(session_id.to_string()));
+            }
             if let Some(err) = &self.prompt_error {
                 return Err(crate::error::BridgeError::OpenCode(err.clone()));
             }
@@ -1264,5 +1324,56 @@ mod integration_tests {
             "card fallback title should carry the question, got: {}",
             final_text
         );
+    }
+
+    #[tokio::test]
+    async fn stale_session_mapping_is_recreated_on_404() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_id = "ses_new".into();
+        backend.stale_session_404 = true;
+        let (app, platform) = build_app(cfg, backend).await;
+
+        // Seed a stale mapping: thread -> ses_old, which no longer exists on
+        // the (shared) server — e.g. left over from a previous store.
+        let thread = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: thread.clone(),
+                session_id: "ses_old".into(),
+                name: "old".into(),
+                directory: "/tmp".into(),
+                agent: None,
+            });
+            store.persist().unwrap();
+        }
+
+        app.handle_message("msg_1".into(), "chat_1".into(), "chat_1".into(), "hi".into()).await;
+
+        // The prompt on the stale session 404s; cola must recreate the session
+        // and retry, landing on a Done card instead of an error.
+        let calls = platform.calls.lock().await.clone();
+        let updates: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::UpdateMessage { card, .. } => Some(card.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(!updates.is_empty(), "expected a card update, got: {:?}", calls);
+        let card = updates.last().unwrap().to_string();
+        assert!(card.contains("✅"), "expected a Done card, got: {}", card);
+
+        // The store must now map the thread to the recreated session.
+        let sid = app
+            .sessions
+            .lock()
+            .await
+            .get_active(&thread)
+            .map(|e| e.session_id.clone());
+        assert_eq!(sid.as_deref(), Some("ses_new"));
     }
 }
