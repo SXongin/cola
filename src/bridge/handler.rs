@@ -180,12 +180,20 @@ impl App {
             done.store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = render_task.await;
 
-            {
+            // Remove the dead mapping and create a FRESH session on the current
+            // server — never fall through to another stale mapping for the
+            // thread. Reuse the dead session's directory so the user keeps
+            // working in the same project.
+            let old_dir = {
                 let mut store = self.sessions.lock().await;
-                store.remove(&session_id);
+                let dir = store.remove(&session_id).map(|e| e.directory);
                 store.persist()?;
-            }
-            let fresh_id = self.get_or_create_session(&thread_key, &text).await?;
+                dir
+            };
+            let directory = old_dir
+                .filter(|d| !d.is_empty())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().to_string_lossy().to_string());
+            let fresh_id = self.create_fresh_session(&thread_key, &text, directory).await?;
             // Re-key the card id + accumulator from the dead session to the new one.
             {
                 let mut ids = self.card_message_ids.lock().await;
@@ -277,8 +285,28 @@ impl App {
     async fn get_or_create_session(&self, thread_key: &ThreadKey, text: &str) -> crate::error::Result<String> {
         if let Some(id) = self.get_session_id(thread_key).await { return Ok(id); }
         let directory = std::env::current_dir().unwrap_or_default().to_string_lossy().to_string();
-        let session = self.opencode.create_session(&self.opencode.new_session_input(Some(&directory))).await?;
-        let entry = SessionEntry { thread_key: thread_key.clone(), session_id: session.id.clone(), name: text.chars().take(50).collect(), directory, agent: None };
+        self.create_fresh_session(thread_key, text, directory).await
+    }
+
+    /// Create a brand-new session on the current server and make it the active
+    /// one for the thread. Used when a mapped session no longer exists (404).
+    async fn create_fresh_session(
+        &self,
+        thread_key: &ThreadKey,
+        text: &str,
+        directory: String,
+    ) -> crate::error::Result<String> {
+        let session = self
+            .opencode
+            .create_session(&self.opencode.new_session_input(Some(&directory)))
+            .await?;
+        let entry = SessionEntry {
+            thread_key: thread_key.clone(),
+            session_id: session.id.clone(),
+            name: text.chars().take(50).collect(),
+            directory,
+            agent: None,
+        };
         let mut store = self.sessions.lock().await;
         store.set_active(entry);
         store.persist()?;
@@ -1336,16 +1364,24 @@ mod integration_tests {
         backend.stale_session_404 = true;
         let (app, platform) = build_app(cfg, backend).await;
 
-        // Seed a stale mapping: thread -> ses_old, which no longer exists on
-        // the (shared) server — e.g. left over from a previous store.
+        // Seed stale mappings: thread -> ses_old (active), then ses_old2. When
+        // ses_old 404s, cola must create a FRESH session, not fall through to
+        // the next stale mapping.
         let thread = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
         {
             let mut store = app.sessions.lock().await;
             store.set_active(crate::config::SessionEntry {
                 thread_key: thread.clone(),
+                session_id: "ses_old2".into(),
+                name: "old2".into(),
+                directory: "/tmp/old2".into(),
+                agent: None,
+            });
+            store.set_active(crate::config::SessionEntry {
+                thread_key: thread.clone(),
                 session_id: "ses_old".into(),
                 name: "old".into(),
-                directory: "/tmp".into(),
+                directory: "/tmp/old".into(),
                 agent: None,
             });
             store.persist().unwrap();
