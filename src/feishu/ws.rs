@@ -412,12 +412,12 @@ async fn handle_binary_frame(
                         && let Some(msg_data) = event_data.message
                     {
                         let text = parse_message_content(&msg_data);
-                        let root_id =
-                            msg_data.root_id.clone().unwrap_or_else(|| msg_data.message_id.clone());
+                        let thread_id = msg_data.thread_id.clone();
                         tracing::info!(
-                            "Message: chat={} root={} text={}",
+                            "Message: chat={} type={} thread={} text={}",
                             msg_data.chat_id,
-                            root_id,
+                            msg_data.chat_type,
+                            thread_id.as_deref().unwrap_or("-"),
                             &text.chars().take(50).collect::<String>()
                         );
                         // Handle the message on a separate task so the WS read loop
@@ -426,8 +426,14 @@ async fn handle_binary_frame(
                         // connection and Feishu eventually drops it (CLOSE-WAIT).
                         let app = app.clone();
                         tokio::spawn(async move {
-                            app.handle_message(msg_data.message_id, msg_data.chat_id, root_id, text)
-                                .await;
+                            app.handle_message(
+                                msg_data.message_id,
+                                msg_data.chat_id,
+                                msg_data.chat_type,
+                                thread_id,
+                                text,
+                            )
+                            .await;
                         });
                     }
                 }
@@ -481,6 +487,7 @@ mod tests {
             message_id: "msg_1".into(),
             root_id: None,
             parent_id: None,
+            thread_id: None,
             chat_id: "chat_1".into(),
             chat_type: "p2p".into(),
             message_type: "text".into(),
@@ -495,6 +502,7 @@ mod tests {
             message_id: "msg_2".into(),
             root_id: Some("root_1".into()),
             parent_id: None,
+            thread_id: None,
             chat_id: "chat_1".into(),
             chat_type: "group".into(),
             message_type: "image".into(),
@@ -595,8 +603,7 @@ mod tests {
         let msg = event_data.message.expect("message present");
 
         // This mirrors handle_binary_frame's routing decision.
-        let root_id = msg.root_id.clone().unwrap_or_else(|| msg.message_id.clone());
-        assert_eq!(root_id, "om_1");
+        assert_eq!(msg.thread_id, None);
         assert_eq!(parse_message_content(&msg), "hi");
 
         // And the dedup key used by the handler:

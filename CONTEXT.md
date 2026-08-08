@@ -21,8 +21,11 @@ A single conversation thread with an AI backend. In Feishu, one thread maps to o
 _Avoid_: Chat, conversation, room
 
 **Thread**:
-A Feishu message thread (root message + replies). The boundary that isolates one session from another.
-_Avoid_: Topic, channel
+A Feishu topic, identified by `thread_id` (`omt_...`; called "话题/topic" in the Feishu UI). A message is a topic message IFF it carries `thread_id`. The boundary that isolates one session from another (group or p2p).
+
+**Lobby**:
+A chat's top-level conversation: messages sent directly in a group (or p2p top-level), carrying no `thread_id`. One lobby session per chat.
+_Avoid_: Main channel, root session
 
 **Project**:
 A working directory on the filesystem where OpenCode operates. A property of a session, not of the bot. Switched via `/dir`.

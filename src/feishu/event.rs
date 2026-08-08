@@ -52,6 +52,8 @@ pub struct MessageData {
     pub message_id: String,
     pub root_id: Option<String>,
     pub parent_id: Option<String>,
+    /// The topic (`thread`) identifier, present iff this is a topic message.
+    pub thread_id: Option<String>,
     pub chat_id: String,
     pub chat_type: String,
     pub message_type: String,
@@ -151,6 +153,7 @@ mod tests {
                     "message_id": "om_reply_1",
                     "root_id": "om_root_1",
                     "parent_id": "om_reply_0",
+                    "thread_id": "omt_topic_1",
                     "create_time": "1609295409000",
                     "chat_id": "oc_group_1",
                     "chat_type": "group",
@@ -167,11 +170,38 @@ mod tests {
         assert_eq!(msg.chat_type, "group");
         assert_eq!(msg.root_id.as_deref(), Some("om_root_1"));
         assert_eq!(msg.parent_id.as_deref(), Some("om_reply_0"));
-        // Thread replies must be routed to the root message
+        assert_eq!(msg.thread_id.as_deref(), Some("omt_topic_1"));
+        // Topic identity is the thread_id, the authoritative topic identifier.
         assert_eq!(
-            msg.root_id.clone().unwrap_or_else(|| msg.message_id.clone()),
-            "om_root_1"
+            msg.thread_id.clone().unwrap_or_else(|| msg.message_id.clone()),
+            "omt_topic_1"
         );
+    }
+
+    #[test]
+    fn parses_p2p_topic_message_thread_id() {
+        // Findings #4: p2p chats CAN create topics; topic messages there carry
+        // thread_id/root_id too. cola must treat them the same as group topics.
+        let json = r#"{
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "message": {
+                    "message_id": "om_p2p_topic_reply",
+                    "root_id": "om_p2p_seed",
+                    "parent_id": "om_p2p_seed",
+                    "thread_id": "omt_p2p_topic_1",
+                    "chat_id": "oc_p2p_1",
+                    "chat_type": "p2p",
+                    "message_type": "text",
+                    "content": "{\"text\":\"hi\"}"
+                }
+            }
+        }"#;
+
+        let event: MessageReceiveEvent = serde_json::from_str(json).unwrap();
+        let msg = event.event.unwrap().message.unwrap();
+        assert_eq!(msg.thread_id.as_deref(), Some("omt_p2p_topic_1"));
+        assert_eq!(msg.root_id.as_deref(), Some("om_p2p_seed"));
     }
 
     #[test]
