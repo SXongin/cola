@@ -222,6 +222,75 @@ impl Client {
         Ok(resp.json().await?)
     }
 
+    /// List pending question requests for an instance (canonical: `GET /question`).
+    pub async fn list_questions(
+        &self,
+        directory: Option<&str>,
+    ) -> crate::error::Result<Vec<QuestionRequest>> {
+        let mut url = reqwest::Url::parse(&self.url("/question"))?;
+        if let Some(d) = directory {
+            url.query_pairs_mut().append_pair("directory", d);
+        }
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            eprintln!(
+                "list_questions failed: {} — body: {}",
+                status,
+                &text[..text.len().min(500)]
+            );
+            return Err(crate::error::BridgeError::OpenCode(format!(
+                "question list failed: {}",
+                status
+            )));
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Answer a question request (canonical: `POST /question/{id}/reply`).
+    pub async fn reply_question(
+        &self,
+        request_id: &str,
+        answers: &[Vec<String>],
+        directory: Option<&str>,
+    ) -> crate::error::Result<()> {
+        let body = serde_json::json!({ "answers": answers });
+        let mut url = reqwest::Url::parse(&self.url(&format!("/question/{}/reply", request_id)))?;
+        if let Some(d) = directory {
+            url.query_pairs_mut().append_pair("directory", d);
+        }
+        self.http
+            .post(url)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Reject a question request (canonical: `POST /question/{id}/reject`).
+    pub async fn reject_question(
+        &self,
+        request_id: &str,
+        directory: Option<&str>,
+    ) -> crate::error::Result<()> {
+        let mut url = reqwest::Url::parse(&self.url(&format!("/question/{}/reject", request_id)))?;
+        if let Some(d) = directory {
+            url.query_pairs_mut().append_pair("directory", d);
+        }
+        self.http
+            .post(url)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
     /// Interrupt an active session.
     pub async fn interrupt(&self, session_id: &str) -> crate::error::Result<()> {
         self.http
@@ -652,7 +721,7 @@ pub struct QuestionAskedData {
     pub tool: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct QuestionInfo {
     pub question: String,
     pub header: String,
@@ -661,7 +730,7 @@ pub struct QuestionInfo {
     pub custom: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct QuestionOption {
     pub label: String,
     pub description: String,
@@ -745,6 +814,16 @@ pub struct PermissionRequest {
     pub metadata: Option<serde_json::Value>,
     #[serde(default)]
     pub always: Vec<String>,
+}
+
+/// A pending question request (`GET /question`): the AI asks the user one or
+/// more questions and blocks until answered.
+#[derive(Debug, Clone, Deserialize)]
+pub struct QuestionRequest {
+    pub id: String,
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    pub questions: Vec<QuestionInfo>,
 }
 
 /// Parse "provider/model" (optionally "provider/model/variant") into ModelInfo.

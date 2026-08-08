@@ -219,6 +219,70 @@ pub fn build_permission_card(session_id: &str, request_id: &str, body: &str) -> 
     })
 }
 
+/// Build the interactive question card: one button per option (each carrying
+/// the request id, session id, question index and the chosen label) plus a
+/// reject button, so the card callback (`action: "question"`) can post the
+/// answer back to the session.
+pub fn build_question_card(
+    request_id: &str,
+    session_id: &str,
+    questions: &[crate::opencode::client::QuestionInfo],
+) -> serde_json::Value {
+    let mut markdown = String::new();
+    for (i, q) in questions.iter().enumerate() {
+        markdown.push_str(&format!("**{}. {}**\n", i + 1, q.question));
+        for opt in &q.options {
+            if opt.description.is_empty() {
+                markdown.push_str(&format!("- {}\n", opt.label));
+            } else {
+                markdown.push_str(&format!("- {} ({})\n", opt.label, opt.description));
+            }
+        }
+        markdown.push('\n');
+    }
+
+    let mut actions: Vec<serde_json::Value> = Vec::new();
+    for (qi, q) in questions.iter().enumerate() {
+        for opt in &q.options {
+            actions.push(json!({
+                "tag": "button",
+                "text": { "tag": "plain_text", "content": opt.label },
+                "type": "default",
+                "value": {
+                    "action": "question",
+                    "reply": "answer",
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "question_index": qi,
+                    "answer": opt.label,
+                },
+            }));
+        }
+    }
+    actions.push(json!({
+        "tag": "button",
+        "text": { "tag": "plain_text", "content": "🚫 无法回答" },
+        "type": "danger",
+        "value": {
+            "action": "question",
+            "reply": "reject",
+            "request_id": request_id,
+            "session_id": session_id,
+        },
+    }));
+
+    json!({
+        "config": { "wide_screen_mode": true },
+        "header": {
+            "title": { "tag": "plain_text", "content": "❓ AI 想问你" },
+            "template": "blue"
+        },
+        "elements": [
+            { "tag": "markdown", "content": markdown },
+            { "tag": "action", "actions": actions },
+        ]
+    })
+}
 fn truncate_md(text: &str, max_len: usize) -> String {
     if text.len() <= max_len {
         text.to_string()
@@ -340,6 +404,43 @@ mod tests {
         let card = CardBuilder::new("cola").with_state(CardState::Done).with_tool(tool).build();
         assert_eq!(card["header"]["template"].as_str().unwrap(), "red");
         assert!(card["header"]["title"]["content"].as_str().unwrap().contains("失败"));
+    }
+
+    #[test]
+    fn question_card_has_option_buttons_with_answer_payload() {
+        let questions = vec![
+            crate::opencode::client::QuestionInfo {
+                question: "选择要在哪个目录继续".into(),
+                header: "目录".into(),
+                options: vec![
+                    crate::opencode::client::QuestionOption { label: "/a".into(), description: "dir a".into() },
+                    crate::opencode::client::QuestionOption { label: "/b".into(), description: String::new() },
+                ],
+                multiple: None,
+                custom: None,
+            },
+        ];
+        let card = build_question_card("que_1", "ses_1", &questions);
+        let text = card.to_string();
+        assert!(text.contains("选择要在哪个目录继续"), "question text missing: {}", text);
+
+        let elements = card["elements"].as_array().unwrap();
+        let action = elements.iter().find(|e| e["tag"] == "action").unwrap();
+        let buttons = action["actions"].as_array().unwrap();
+        // one button per option + a reject button
+        assert_eq!(buttons.len(), 3);
+
+        let a_btn = buttons.iter().find(|b| b["text"]["content"] == "/a").unwrap();
+        let value = &a_btn["value"];
+        assert_eq!(value["action"], "question");
+        assert_eq!(value["reply"], "answer");
+        assert_eq!(value["request_id"], "que_1");
+        assert_eq!(value["session_id"], "ses_1");
+        assert_eq!(value["question_index"], 0);
+        assert_eq!(value["answer"], "/a");
+
+        let reject = buttons.iter().find(|b| b["value"]["reply"] == "reject").unwrap();
+        assert_eq!(reject["value"]["request_id"], "que_1");
     }
 
     #[test]

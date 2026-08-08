@@ -14,6 +14,9 @@ pub struct App {
     pub accumulators: Arc<Mutex<HashMap<String, StreamAccumulator>>>,
     pub card_message_ids: Arc<Mutex<HashMap<String, String>>>,
     pub permission_requests: Arc<Mutex<HashMap<String, String>>>,
+    /// request_id → pending question request (the AI asks the user; cola posts
+    /// the answer back from the question card).
+    pub question_requests: Arc<Mutex<HashMap<String, opencode::client::QuestionRequest>>>,
     pub seen_event_ids: Arc<Mutex<HashSet<String>>>,
     /// Session ids with a prompt currently in flight (serializes prompts per
     /// session so concurrent messages don't clobber each other's accumulators).
@@ -34,6 +37,7 @@ impl App {
             accumulators: Arc::new(Mutex::new(HashMap::new())),
             card_message_ids: Arc::new(Mutex::new(HashMap::new())),
             permission_requests: Arc::new(Mutex::new(HashMap::new())),
+            question_requests: Arc::new(Mutex::new(HashMap::new())),
             seen_event_ids: Arc::new(Mutex::new(HashSet::new())),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             opencode,
@@ -45,6 +49,7 @@ impl App {
         let ws = Arc::clone(&self);
         let sse = Arc::clone(&self);
         let perm = Arc::clone(&self);
+        let question = Arc::clone(&self);
         let sse_client = sse_client.clone();
         let ws_task = tokio::spawn(async move { if let Err(e) = feishu::ws::event_loop(&ws).await { tracing::error!("WS: {}", e); } });
         let sse_task = tokio::spawn(async move { if let Err(e) = sse_stream_loop(&sse_client, &sse).await { tracing::error!("SSE: {}", e); } });
@@ -52,7 +57,11 @@ impl App {
         // and a prompt can be blocked on an unanswered permission forever, so the
         // poller must run independently of any single prompt lifecycle.
         let perm_task = tokio::spawn(async move { if let Err(e) = permission_poll_loop(&perm).await { tracing::error!("Permission poller: {}", e); } });
-        tokio::try_join!(ws_task, sse_task, perm_task)?;
+        // Questions (the interactive `question` tool) work the same way: the AI
+        // blocks until answered, the event never reaches the global SSE, so poll
+        // and surface them as Feishu cards.
+        let question_task = tokio::spawn(async move { if let Err(e) = question_poll_loop(&question).await { tracing::error!("Question poller: {}", e); } });
+        tokio::try_join!(ws_task, sse_task, perm_task, question_task)?;
         Ok(())
     }
 
@@ -381,6 +390,57 @@ impl App {
                     }
                 }
             }
+            "question" => {
+                let reply = value.get("reply").and_then(|v| v.as_str()).unwrap_or("reject");
+                let request_id = value.get("request_id").and_then(|v| v.as_str());
+                if let Some(req_id) = request_id {
+                    let directory = {
+                        let store = self.sessions.lock().await;
+                        store.directory_for_session(&session_id)
+                    };
+                    match reply {
+                        "answer" => {
+                            let index = value.get("question_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                            let answer = value.get("answer").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            // Build answers in order: the chosen option for the
+                            // clicked question, empty for the rest.
+                            let count = {
+                                let reqs = self.question_requests.lock().await;
+                                reqs.get(req_id).map(|r| r.questions.len()).unwrap_or(index + 1)
+                            };
+                            let mut answers: Vec<Vec<String>> = Vec::new();
+                            for i in 0..count {
+                                answers.push(if i == index { vec![answer.clone()] } else { Vec::new() });
+                            }
+                            if let Err(e) = self.opencode.reply_question(req_id, &answers, directory.as_deref()).await {
+                                tracing::error!("question reply failed: {}", e);
+                            } else {
+                                tracing::info!("Question answered: {} session={} -> {:?}", req_id, session_id, answers);
+                                self.question_requests.lock().await.remove(req_id);
+                                result_card = Some(serde_json::json!({
+                                    "config": { "wide_screen_mode": true },
+                                    "header": { "title": { "tag": "plain_text", "content": format!("✅ 已回答：{}", answer) }, "template": "green" },
+                                    "elements": [ { "tag": "markdown", "content": format!("AI 的问题是：\n{}", answer) } ]
+                                }));
+                            }
+                        }
+                        "reject" => {
+                            if let Err(e) = self.opencode.reject_question(req_id, directory.as_deref()).await {
+                                tracing::error!("question reject failed: {}", e);
+                            } else {
+                                tracing::info!("Question rejected: {}", req_id);
+                                self.question_requests.lock().await.remove(req_id);
+                                result_card = Some(serde_json::json!({
+                                    "config": { "wide_screen_mode": true },
+                                    "header": { "title": { "tag": "plain_text", "content": "🚫 已拒绝回答" }, "template": "red" },
+                                    "elements": [ { "tag": "markdown", "content": "已拒绝回答 AI 的问题。" } ]
+                                }));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
             _ => {}
         }
         result_card
@@ -654,6 +714,52 @@ async fn permission_poll_loop(app: &Arc<App>) -> crate::error::Result<()> {
                     }
                 }
                 Err(e) => tracing::warn!("poll perm ({}): {}", dir, e),
+            }
+        }
+    }
+}
+
+/// Independent question poller: surfaces pending `question` tool requests as
+/// Feishu cards (the AI blocks until answered; the event never reaches the
+/// global SSE). Started once at App startup, like the permission poller.
+async fn question_poll_loop(app: &Arc<App>) -> crate::error::Result<()> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+        let directories = { app.sessions.lock().await.directories() };
+        for dir in &directories {
+            match app.opencode.list_questions(Some(dir)).await {
+                Ok(questions) => {
+                    for q in &questions {
+                        if seen.contains(&q.id) { continue; }
+                        seen.insert(q.id.clone());
+                        tracing::info!("Question ({}): {} — {} questions", dir, q.id, q.questions.len());
+                        {
+                            let mut reqs = app.question_requests.lock().await;
+                            reqs.insert(q.id.clone(), q.clone());
+                        }
+                        let card = crate::feishu::card::build_question_card(&q.id, &q.session_id, &q.questions);
+                        let reply_to = {
+                            let accs = app.accumulators.lock().await;
+                            accs.get(&q.session_id).and_then(|a| a.reply_to_message_id.clone())
+                        };
+                        let sent = if let Some(msg_id) = reply_to {
+                            app.feishu.reply_card(&msg_id, &card).await.is_ok()
+                        } else {
+                            let chat = { app.sessions.lock().await.chat_for_session(&q.session_id) };
+                            if let Some(chat_id) = chat {
+                                app.feishu.send_card("chat_id", &chat_id, &card).await.is_ok()
+                            } else {
+                                tracing::warn!("No reply target or chat for question on session {}", q.session_id);
+                                false
+                            }
+                        };
+                        if !sent {
+                            tracing::warn!("Question card send failed on session {}", q.session_id);
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("poll question ({}): {}", dir, e),
             }
         }
     }
@@ -978,6 +1084,10 @@ mod test_support {
     pub struct MockBackend {
         pub parts: serde_json::Value,
         pub permissions: Vec<opencode::client::PermissionRequest>,
+        /// Pending questions served by `list_questions`.
+        pub questions: Vec<opencode::client::QuestionRequest>,
+        /// Records `reply_question` calls: (request_id, answers).
+        pub reply_question_calls: Arc<tokio::sync::Mutex<Vec<(String, Vec<Vec<String>>)>>>,
         /// When set, `prompt` fails with this message (simulates a provider 503).
         pub prompt_error: Option<String>,
         /// The session id `create_session` returns.
@@ -992,6 +1102,8 @@ mod test_support {
             Self {
                 parts,
                 permissions: Vec::new(),
+                questions: Vec::new(),
+                reply_question_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 prompt_error: None,
                 session_id: "ses_test".into(),
                 stale_session_404: false,
@@ -1046,6 +1158,26 @@ mod test_support {
 
         async fn list_permissions(&self, _d: Option<&str>) -> crate::error::Result<Vec<opencode::client::PermissionRequest>> {
             Ok(self.permissions.clone())
+        }
+
+        async fn list_questions(&self, _d: Option<&str>) -> crate::error::Result<Vec<opencode::client::QuestionRequest>> {
+            Ok(self.questions.clone())
+        }
+
+        async fn reply_question(&self, request_id: &str, answers: &[Vec<String>], _d: Option<&str>) -> crate::error::Result<()> {
+            self.reply_question_calls
+                .lock()
+                .await
+                .push((request_id.to_string(), answers.to_vec()));
+            Ok(())
+        }
+
+        async fn reject_question(&self, request_id: &str, _d: Option<&str>) -> crate::error::Result<()> {
+            self.reply_question_calls
+                .lock()
+                .await
+                .push((request_id.to_string(), vec![vec!["__reject__".to_string()]]));
+            Ok(())
         }
 
         async fn reply_permission(&self, _r: &str, _reply: &str, _d: Option<&str>) -> crate::error::Result<()> {
@@ -1411,5 +1543,89 @@ mod integration_tests {
             .get_active(&thread)
             .map(|e| e.session_id.clone());
         assert_eq!(sid.as_deref(), Some("ses_new"));
+    }
+
+    #[tokio::test]
+    async fn question_card_action_posts_answer_back() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = Arc::new(MockBackend::new(realistic_parts()));
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
+
+        // The poll loop has surfaced a pending question request.
+        app.question_requests.lock().await.insert(
+            "que_1".into(),
+            opencode::client::QuestionRequest {
+                id: "que_1".into(),
+                session_id: "ses_1".into(),
+                questions: vec![opencode::client::QuestionInfo {
+                    question: "选择目录".into(),
+                    header: "目录".into(),
+                    options: vec![
+                        opencode::client::QuestionOption { label: "/a".into(), description: String::new() },
+                        opencode::client::QuestionOption { label: "/b".into(), description: String::new() },
+                    ],
+                    multiple: None,
+                    custom: None,
+                }],
+            },
+        );
+        // Seed the session → directory mapping so the reply routes correctly.
+        {
+            let thread = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: thread,
+                session_id: "ses_1".into(),
+                name: "x".into(),
+                directory: "/work".into(),
+                agent: None,
+            });
+        }
+
+        // User clicks the "/a" option button.
+        let value = serde_json::json!({
+            "action": "question",
+            "reply": "answer",
+            "request_id": "que_1",
+            "session_id": "ses_1",
+            "question_index": 0,
+            "answer": "/a",
+        });
+        let result = app.handle_card_action(value).await;
+        assert!(result.is_some());
+        assert!(result.unwrap().to_string().contains("已回答"));
+
+        let calls = backend.reply_question_calls.lock().await.clone();
+        assert_eq!(calls.len(), 1, "expected one reply_question call");
+        assert_eq!(calls[0].0, "que_1");
+        assert_eq!(calls[0].1, vec![vec!["/a".to_string()]]);
+    }
+
+    #[tokio::test]
+    async fn question_card_action_rejects() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = Arc::new(MockBackend::new(realistic_parts()));
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
+
+        let value = serde_json::json!({
+            "action": "question",
+            "reply": "reject",
+            "request_id": "que_1",
+            "session_id": "ses_1",
+        });
+        let result = app.handle_card_action(value).await;
+        assert!(result.is_some());
+        assert!(result.unwrap().to_string().contains("拒绝"));
+
+        let calls = backend.reply_question_calls.lock().await.clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "que_1");
+        assert!(calls[0].1[0][0].contains("reject"));
     }
 }
