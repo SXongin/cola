@@ -21,6 +21,8 @@ pub struct App {
     /// Session ids with a prompt currently in flight (serializes prompts per
     /// session so concurrent messages don't clobber each other's accumulators).
     pub inflight: Arc<Mutex<HashSet<String>>>,
+    /// Default directory for new sessions (from `[bridge] work_dir`).
+    pub work_dir: Option<String>,
     pub opencode: Arc<dyn opencode::Backend>,
     pub feishu: Arc<dyn feishu::Platform>,
 }
@@ -40,9 +42,25 @@ impl App {
             question_requests: Arc::new(Mutex::new(HashMap::new())),
             seen_event_ids: Arc::new(Mutex::new(HashSet::new())),
             inflight: Arc::new(Mutex::new(HashSet::new())),
+            work_dir: cfg.bridge.work_dir.clone().map(|p| p.to_string_lossy().to_string()),
             opencode,
             feishu,
         })
+    }
+
+    /// The directory a brand-new session starts in: `[bridge] work_dir` when
+    /// configured, else the process working directory. `/dir` still overrides
+    /// per session.
+    fn default_session_directory(&self) -> String {
+        self.work_dir
+            .clone()
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+            })
     }
 
     pub async fn run(self: Arc<Self>, sse_client: &opencode::Client) -> anyhow::Result<()> {
@@ -104,7 +122,7 @@ impl App {
             }
             Command::New(name) => {
                 let new_name = name.unwrap_or_else(|| format!("sess-{}", uuid::Uuid::new_v4()));
-                let directory = std::env::current_dir().unwrap_or_default().to_string_lossy().to_string();
+                let directory = self.default_session_directory();
                 let session = self.opencode.create_session(&self.opencode.new_session_input(Some(&directory))).await?;
                 let entry = SessionEntry { thread_key: thread_key.clone(), session_id: session.id.clone(), name: new_name.clone(), directory, agent: None };
                 let mut store = self.sessions.lock().await;
@@ -201,7 +219,7 @@ impl App {
             };
             let directory = old_dir
                 .filter(|d| !d.is_empty())
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().to_string_lossy().to_string());
+                .unwrap_or_else(|| self.default_session_directory());
             let fresh_id = self.create_fresh_session(&thread_key, &text, directory).await?;
             // Re-key the card id + accumulator from the dead session to the new one.
             {
@@ -293,7 +311,7 @@ impl App {
 
     async fn get_or_create_session(&self, thread_key: &ThreadKey, text: &str) -> crate::error::Result<String> {
         if let Some(id) = self.get_session_id(thread_key).await { return Ok(id); }
-        let directory = std::env::current_dir().unwrap_or_default().to_string_lossy().to_string();
+        let directory = self.default_session_directory();
         self.create_fresh_session(thread_key, text, directory).await
     }
 
@@ -1199,7 +1217,7 @@ mod test_support {
                 model: "test/model".into(),
             },
             feishu: crate::config::FeishuConfig { app_id: "app".into(), app_secret: "secret".into() },
-            bridge: crate::config::BridgeConfig { session_file: session_file.to_path_buf() },
+            bridge: crate::config::BridgeConfig { session_file: session_file.to_path_buf(), work_dir: None },
         }
     }
 
@@ -1450,12 +1468,11 @@ mod integration_tests {
             return None;
         }
 
-        // Load the cola bot config from the repo BEFORE chdir'ing away from it.
+        // Load the cola bot config from the repo; point new sessions at the
+        // configured work dir instead of chdir'ing the whole process.
         let mut cfg = crate::config::load("cola.toml").expect("load cola.toml");
         if !work_dir.is_empty() {
-            std::env::set_current_dir(&work_dir).unwrap_or_else(|e| {
-                tracing::warn!("could not chdir to test work dir {}: {}", work_dir, e)
-            });
+            cfg.bridge.work_dir = Some(work_dir.into());
         }
         let dir = tempfile::tempdir().unwrap();
         cfg.bridge.session_file = dir.path().join("sessions.json");
@@ -1497,8 +1514,9 @@ mod integration_tests {
         // the API only returns the v2 card's *fallback* (title + "upgrade your
         // client" placeholder), so this asserts real delivery + terminal header
         // state; the full reasoning/tool/text body is asserted in-process by
-        // the RecordingPlatform tests.
-        let final_text = harness.wait_for_card("✅", 30).await;
+        // the RecordingPlatform tests. The needle is this test's own prompt so
+        // it can't match a sibling live test sharing the group.
+        let final_text = harness.wait_for_card("自动测试：请分析一下目录", 30).await;
 
         assert!(
             final_text.contains("✅"),
@@ -1581,6 +1599,29 @@ mod integration_tests {
             "the chosen answer was not posted to the backend: {:?}",
             calls
         );
+    }
+
+    #[tokio::test]
+    async fn new_session_uses_configured_work_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(&dir.path().join("sessions.json"));
+        let work = dir.path().join("work");
+        cfg.bridge.work_dir = Some(work.clone());
+
+        // No chdir: the session directory must come from [bridge] work_dir, not
+        // the process cwd.
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        app.handle_message("msg_1".into(), "chat_1".into(), "chat_1".into(), "hi".into()).await;
+
+        let thread = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let entry = app
+            .sessions
+            .lock()
+            .await
+            .get_active(&thread)
+            .cloned()
+            .expect("a session should have been created");
+        assert_eq!(entry.directory, work.to_string_lossy().to_string());
     }
 
     #[tokio::test]

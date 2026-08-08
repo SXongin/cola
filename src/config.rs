@@ -39,6 +39,10 @@ pub struct FeishuConfig {
 pub struct BridgeConfig {
     #[serde(default = "default_session_file")]
     pub session_file: PathBuf,
+    /// Default directory for new sessions. When unset, falls back to the
+    /// process working directory. `/dir` overrides per session.
+    #[serde(default)]
+    pub work_dir: Option<PathBuf>,
 }
 
 fn default_session_file() -> PathBuf {

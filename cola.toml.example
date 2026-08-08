@@ -14,3 +14,6 @@ app_secret = "your-app-secret"
 [bridge]
 # Path to the session mapping file
 # session_file = "~/.cola/sessions.json"
+# Default directory for new sessions (instead of cola's working directory).
+# `/dir` still overrides per session. Leave unset to fall back to the cwd.
+# work_dir = "/path/to/a/project"
