@@ -1343,6 +1343,7 @@ mod integration_tests {
     /// reading the group.
     struct LiveHarness {
         app: Arc<App>,
+        backend: Arc<MockBackend>,
         test_bot: feishu::Client,
         group_chat_id: String,
         _dir: tempfile::TempDir,
@@ -1464,8 +1465,9 @@ mod integration_tests {
             app_id: test_app_id,
             app_secret: test_app_secret,
         });
-        let app = Arc::new(App::new(cfg, Arc::new(backend), Arc::new(cola_platform)).unwrap());
-        Some(LiveHarness { app, test_bot, group_chat_id, _dir: dir })
+        let backend = Arc::new(backend);
+        let app = Arc::new(App::new(cfg, backend.clone(), Arc::new(cola_platform)).unwrap());
+        Some(LiveHarness { app, backend, test_bot, group_chat_id, _dir: dir })
     }
 
     /// Live end-to-end wire check with a real Feishu bot.
@@ -1553,6 +1555,31 @@ mod integration_tests {
             content.contains("继续"),
             "question option button missing: {}",
             content
+        );
+
+        // Simulate the user clicking an option. Feishu's messages API strips
+        // button `value` payloads from the returned card, so the click is driven
+        // with the known payload (the payload shape is pinned in-process by the
+        // Seam C card test); the wire test above already confirmed the card was
+        // delivered with the question text and option labels.
+        let value = serde_json::json!({
+            "action": "question",
+            "reply": "answer",
+            "request_id": "que_live",
+            "session_id": "ses_test",
+            "question_index": 0,
+            "answer": "继续",
+        });
+        let result = harness.app.handle_card_action(value).await;
+        assert!(result.is_some(), "clicking an option should produce a result card");
+
+        let calls = harness.backend.reply_question_calls.lock().await.clone();
+        assert!(
+            calls.iter().any(|(req, answers)| {
+                req == "que_live" && answers == &vec![vec!["继续".to_string()]]
+            }),
+            "the chosen answer was not posted to the backend: {:?}",
+            calls
         );
     }
 
