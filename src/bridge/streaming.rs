@@ -1,6 +1,6 @@
 use crate::feishu::card::{CardBuilder, CardState, ToolPanel};
 use crate::opencode::client::OpenCodeEvent;
-use std::collections::HashMap;
+use indexmap::IndexMap;
 
 /// Accumulates streaming state for one session.
 #[derive(Default)]
@@ -8,7 +8,9 @@ pub struct StreamAccumulator {
     pub card_state: CardState,
     pub text: String,
     pub reasoning: String,
-    pub tools: HashMap<String, ToolPanel>,
+    /// Tool panels keyed by call ID, preserving the order they were called in —
+    /// the card renders them in execution order, not hash order.
+    pub tools: IndexMap<String, ToolPanel>,
     pub title: String,
     /// The user question this accumulator is answering (shown in card header).
     pub question: String,
@@ -437,6 +439,27 @@ mod tests {
 
         let card = acc.build_card();
         assert!(card.to_string().contains("write"));
+    }
+
+    #[test]
+    fn tools_render_in_call_order() {
+        let mut acc = StreamAccumulator::new("Test prompt");
+        acc.apply(&make_step_started("ses_1", "primary"));
+        acc.apply(&make_tool_called("ses_1", "call_1", "read"));
+        acc.apply(&make_tool_success("ses_1", "call_1"));
+        acc.apply(&make_tool_called("ses_1", "call_2", "bash"));
+        acc.apply(&make_tool_success("ses_1", "call_2"));
+        acc.apply(&make_tool_called("ses_1", "call_3", "question"));
+        acc.apply(&make_tool_success("ses_1", "call_3"));
+
+        // Tools must appear in the card in the order they were called, not in
+        // hash order.
+        let card = acc.build_card().to_string();
+        let read_pos = card.find("read").unwrap();
+        let bash_pos = card.find("bash").unwrap();
+        let question_pos = card.find("question").unwrap();
+        assert!(read_pos < bash_pos, "read should render before bash");
+        assert!(bash_pos < question_pos, "bash should render before question");
     }
 
     #[test]

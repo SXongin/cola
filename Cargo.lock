@@ -213,6 +213,7 @@ dependencies = [
  "clap",
  "dirs",
  "futures-util",
+ "indexmap",
  "reqwest",
  "serde",
  "serde_json",
