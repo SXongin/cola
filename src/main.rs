@@ -116,11 +116,11 @@ async fn main() -> anyhow::Result<()> {
     let opencode_client = opencode::Client::new(cfg.opencode.clone());
     let app = Arc::new(bridge::App::new(
         cfg.clone(),
-        Arc::new(opencode_client.clone()),
+        Arc::new(opencode_client),
         Arc::new(feishu_client),
     )?);
 
-    app.run(&opencode_client).await?;
+    app.run().await?;
 
     Ok(())
 }

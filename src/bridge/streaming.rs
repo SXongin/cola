@@ -17,7 +17,6 @@ pub struct StreamAccumulator {
     pub token_cost: Option<(i64, i64)>,
     pub error: Option<String>,
     pub reply_to_message_id: Option<String>,
-    pub last_flush_at: Option<std::time::Instant>,
     /// Part ids already rendered into this card — dedupes incremental polling.
     /// Reasoning/text parts are written empty first and updated with full text,
     /// so they are only tracked once they have content. Tool parts are tracked
@@ -38,7 +37,6 @@ impl StreamAccumulator {
             title: title.to_string(),
             question: String::new(),
             reply_to_message_id: None,
-            last_flush_at: None,
             rendered_parts: std::collections::HashSet::new(),
             rendered_tool_states: std::collections::HashMap::new(),
             submit_epoch_ms: None,
@@ -46,7 +44,14 @@ impl StreamAccumulator {
         }
     }
 
-    /// Apply a single event, returning true if the card should be flushed.
+    /// Apply a single v1 streaming event, returning true if the card should be
+    /// flushed.
+    ///
+    /// NOTE: the global `/event` stream only delivers v2 durable events, so this
+    /// v1 state machine is not wired to production (rendering goes through
+    /// `render_new_turn_parts`). Kept — and tested — as the canonical streaming
+    /// model, reusable if cola moves to prompt_async + per-session SSE.
+    #[allow(dead_code)]
     pub fn apply(&mut self, event: &OpenCodeEvent) -> bool {
         match event {
             OpenCodeEvent::StepStarted { data, .. } => {

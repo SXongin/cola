@@ -63,14 +63,11 @@ impl App {
             })
     }
 
-    pub async fn run(self: Arc<Self>, sse_client: &opencode::Client) -> anyhow::Result<()> {
+    pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         let ws = Arc::clone(&self);
-        let sse = Arc::clone(&self);
         let perm = Arc::clone(&self);
         let question = Arc::clone(&self);
-        let sse_client = sse_client.clone();
         let ws_task = tokio::spawn(async move { if let Err(e) = feishu::ws::event_loop(&ws).await { tracing::error!("WS: {}", e); } });
-        let sse_task = tokio::spawn(async move { if let Err(e) = sse_stream_loop(&sse_client, &sse).await { tracing::error!("SSE: {}", e); } });
         // Permissions are not delivered on the global SSE (typed PubSub only),
         // and a prompt can be blocked on an unanswered permission forever, so the
         // poller must run independently of any single prompt lifecycle.
@@ -79,7 +76,7 @@ impl App {
         // blocks until answered, the event never reaches the global SSE, so poll
         // and surface them as Feishu cards.
         let question_task = tokio::spawn(async move { if let Err(e) = question_poll_loop(&question).await { tracing::error!("Question poller: {}", e); } });
-        tokio::try_join!(ws_task, sse_task, perm_task, question_task)?;
+        tokio::try_join!(ws_task, perm_task, question_task)?;
         Ok(())
     }
 
@@ -340,28 +337,6 @@ impl App {
         Ok(session.id)
     }
 
-    /// Handle a parsed SSE event. NOTE: the global `/api/event` stream only
-    /// delivers v2 durable events (message.updated, session.updated, ...) and
-    /// NOT the v1 `session.next.*` streaming events (they carry no location, so
-    /// the server filters them out), and permission events are typed-PubSub
-    /// only. As a result the `apply()` v1 path below is effectively inert today:
-    /// live rendering comes from `render_poll_loop` and the permission poller.
-    /// Kept because it is the tested streaming state machine, reusable if cola
-    /// ever moves to prompt_async + per-session SSE.
-    pub async fn process_event(&self, event: opencode::client::OpenCodeEvent) {
-        let session_id = match Self::extract_session_id(&event) { Some(id) => id, None => return };
-        let is_tool_boundary = matches!(&event, opencode::client::OpenCodeEvent::ToolCalled { .. } | opencode::client::OpenCodeEvent::ToolSuccess { .. } | opencode::client::OpenCodeEvent::ToolFailed { .. } | opencode::client::OpenCodeEvent::ShellStarted { .. } | opencode::client::OpenCodeEvent::ShellEnded { .. } | opencode::client::OpenCodeEvent::StepEnded { .. });
-        let should_flush = {
-            let mut accs = self.accumulators.lock().await;
-            let Some(acc) = accs.get_mut(&session_id) else { return };
-            if !acc.apply(&event) { return; }
-            let now = std::time::Instant::now();
-            if !is_tool_boundary && let Some(last) = acc.last_flush_at && now.duration_since(last) < std::time::Duration::from_millis(200) { false }
-            else { acc.last_flush_at = Some(now); true }
-        };
-        if should_flush { self.flush_card(&session_id).await; }
-    }
-
     async fn flush_card(&self, session_id: &str) {
         let accs = self.accumulators.lock().await;
         let Some(acc) = accs.get(session_id) else { return };
@@ -463,32 +438,7 @@ impl App {
         }
         result_card
     }
-
-    fn extract_session_id(event: &opencode::client::OpenCodeEvent) -> Option<String> {
-        match event {
-            opencode::client::OpenCodeEvent::StepStarted { data, .. } => data.session_id.clone(),
-            opencode::client::OpenCodeEvent::StepEnded { data, .. } => data.session_id.clone(),
-            opencode::client::OpenCodeEvent::StepFailed { data, .. } => data.session_id.clone(),
-            opencode::client::OpenCodeEvent::TextStarted { data, .. } => data.session_id.clone(),
-            opencode::client::OpenCodeEvent::TextDelta { data, .. } => data.session_id.clone(),
-            opencode::client::OpenCodeEvent::TextEnded { data, .. } => data.session_id.clone(),
-            opencode::client::OpenCodeEvent::ReasoningStarted { data, .. } => data.session_id.clone(),
-            opencode::client::OpenCodeEvent::ReasoningDelta { data, .. } => data.session_id.clone(),
-            opencode::client::OpenCodeEvent::ReasoningEnded { data, .. } => data.session_id.clone(),
-            opencode::client::OpenCodeEvent::ToolCalled { data, .. } => data.session_id.clone(),
-            opencode::client::OpenCodeEvent::ToolSuccess { data, .. } => data.session_id.clone(),
-            opencode::client::OpenCodeEvent::ToolFailed { data, .. } => data.session_id.clone(),
-            opencode::client::OpenCodeEvent::ToolProgress { data, .. } => data.session_id.clone(),
-            opencode::client::OpenCodeEvent::ShellStarted { data, .. } => data.session_id.clone(),
-            opencode::client::OpenCodeEvent::ShellEnded { data, .. } => data.session_id.clone(),
-            opencode::client::OpenCodeEvent::PermissionAsked { data, .. } => data.session_id.clone(),
-            opencode::client::OpenCodeEvent::QuestionAsked { data, .. } => data.session_id.clone(),
-            _ => None,
-        }
-    }
-}
-
-// ===== Standalone functions =====
+}// ===== Standalone functions =====
 
 /// Render canonical message parts (from `POST /session/{id}/message` response)
 /// into the accumulator so the card shows the assistant's final result.
@@ -852,29 +802,6 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max { s.to_string() } else { format!("{}...", s.chars().take(max).collect::<String>()) }
 }
 
-/// Short name of an OpenCode event for logging.
-async fn sse_stream_loop(client: &opencode::Client, app: &Arc<App>) -> crate::error::Result<()> {
-    loop {
-        match sse_stream_once(client, app).await {
-            Ok(()) => tracing::warn!("OpenCode SSE stream ended, reconnecting..."),
-            Err(e) => tracing::warn!("OpenCode SSE error: {}, reconnecting...", e),
-        }
-        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-    }
-}
-
-async fn sse_stream_once(client: &opencode::Client, app: &Arc<App>) -> crate::error::Result<()> {
-    let mut stream = opencode::sse::SseStream::connect(client).await?;
-    tracing::info!("Connected to OpenCode SSE");
-    while let Some(result) = stream.next_event().await {
-        match result {
-            Ok(event) => app.process_event(event).await,
-            Err(e) => tracing::warn!("SSE: {}", e),
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1048,6 +975,7 @@ mod test_support {
     use super::*;
 
     #[derive(Debug, Clone)]
+    #[allow(dead_code)] // the recording adapter captures full call details for assertions
     pub enum PlatformCall {
         ReplyCard { reply_to: String, card: serde_json::Value },
         SendCard { receive_id: String, card: serde_json::Value },
@@ -1506,7 +1434,7 @@ mod integration_tests {
 
         // The test bot sends a real message so cola has a real reply target.
         let prompt = "自动测试：请分析一下目录，然后汇报。";
-        let sent_msg_id = harness.send_and_process(prompt).await;
+        let _sent_msg_id = harness.send_and_process(prompt).await;
 
         // Read back the group until the cola bot's final Done card appears.
         // Feishu's start_time/end_time window returns empty for recent messages
