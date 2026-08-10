@@ -214,6 +214,98 @@ fn build_response_frame(request: &ParsedFrame, result_card: Option<&serde_json::
     let data_b64 = base64::engine::general_purpose::STANDARD.encode(rsp_json.as_bytes());
     let payload = format!(r#"{{"code":200,"headers":null,"data":"{}"}}"#, data_b64);
 
+    Some(encode_response_frame(request, &payload))
+}
+
+/// Build the ack frame Feishu requires for EVERY ordinary event (message
+/// receive, bot added, ...). The Lark SDK sends this after handling each
+/// `MessageTypeEvent`; without it Feishu re-delivers the event forever and
+/// eventually stops pushing new ones. Same routing echo as the card response,
+/// but the payload data is null (no card to update).
+fn build_event_ack_frame(request: &ParsedFrame) -> Option<Vec<u8>> {
+    Some(encode_response_frame(
+        request,
+        r#"{"code":200,"headers":null,"data":null}"#,
+    ))
+}
+
+/// Answer a pbbp2 control "ping" frame with a "pong" so the server keeps the
+/// connection alive. Echoes routing fields; the headers type becomes "pong".
+fn build_pong_frame(request: &ParsedFrame) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+
+    // Field 1: seq_id (varint)
+    if request.seq_id != 0 {
+        encode_varint_field(&mut out, 1, request.seq_id);
+    }
+    // Field 2: log_id (varint)
+    if request.log_id != 0 {
+        encode_varint_field(&mut out, 2, request.log_id);
+    }
+    // Field 3: service (varint)
+    encode_varint_field(&mut out, 3, request.service as u64);
+    // Field 4: method (varint)
+    encode_varint_field(&mut out, 4, request.method as u64);
+
+    // Field 5: headers — reply type=pong, plus biz_rt
+    {
+        let mut hdr = Vec::new();
+        encode_string_field(&mut hdr, 1, "type");
+        encode_string_field(&mut hdr, 2, "pong");
+        encode_bytes_field(&mut out, 5, &hdr);
+    }
+    {
+        let mut hdr = Vec::new();
+        encode_string_field(&mut hdr, 1, "biz_rt");
+        encode_string_field(&mut hdr, 2, "1");
+        encode_bytes_field(&mut out, 5, &hdr);
+    }
+
+    // Field 6: payload_encoding
+    if let Some(pe) = &request.payload_encoding {
+        encode_string_field(&mut out, 6, pe);
+    }
+    // Field 7: payload_type
+    if let Some(pt) = &request.payload_type {
+        encode_string_field(&mut out, 7, pt);
+    }
+    // Field 8: payload (empty)
+    encode_bytes_field(&mut out, 8, b"");
+    // Field 9: log_id_new
+    if let Some(lin) = &request.log_id_new {
+        encode_string_field(&mut out, 9, lin);
+    }
+
+    Some(out)
+}
+
+/// Build a keepalive ping frame cola sends proactively (mirroring the Lark
+/// SDK's pingLoop) so an idle connection is detected as dead and reconnects.
+fn build_ping_frame() -> Vec<u8> {
+    let mut out = Vec::new();
+
+    // Field 3: service (varint) — 0 is fine for a control frame
+    encode_varint_field(&mut out, 3, 0);
+    // Field 4: method (varint) — FrameTypeControl
+    encode_varint_field(&mut out, 4, 0);
+
+    // Field 5: headers — type=ping
+    {
+        let mut hdr = Vec::new();
+        encode_string_field(&mut hdr, 1, "type");
+        encode_string_field(&mut hdr, 2, "ping");
+        encode_bytes_field(&mut out, 5, &hdr);
+    }
+
+    // Field 8: payload (empty)
+    encode_bytes_field(&mut out, 8, b"");
+
+    out
+}
+
+/// Shared frame writer: echoes the request's routing fields and headers and
+/// places `payload` in field 8.
+fn encode_response_frame(request: &ParsedFrame, payload: &str) -> Vec<u8> {
     let mut out = Vec::new();
 
     // Field 1: seq_id (varint)
@@ -259,7 +351,7 @@ fn build_response_frame(request: &ParsedFrame, result_card: Option<&serde_json::
         encode_string_field(&mut out, 9, lin);
     }
 
-    Some(out)
+    out
 }
 
 fn encode_varint_field(out: &mut Vec<u8>, field: u32, value: u64) {
@@ -317,30 +409,84 @@ async fn handle_connection(
     mut ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     app: &Arc<App>,
 ) -> crate::error::Result<()> {
-    while let Some(msg) = ws.next().await {
-        match msg {
-            Ok(tokio_tungstenite::tungstenite::Message::Binary(data)) => {
-                handle_binary_frame(&data, &mut ws, app).await?;
-            }
-            Ok(tokio_tungstenite::tungstenite::Message::Ping(data)) => {
-                ws.send(tokio_tungstenite::tungstenite::Message::Pong(data))
+    // Proactive keepalive: send a control ping periodically (mirrors the Lark
+    // SDK's pingLoop). Combined with the read timeout below, an idle or half-
+    // dead connection is detected and torn down so event_loop reconnects.
+    const PING_INTERVAL: Duration = Duration::from_secs(60);
+    const READ_TIMEOUT: Duration = Duration::from_secs(180);
+
+    let mut ping_ticker = tokio::time::interval(PING_INTERVAL);
+    // First tick fires immediately; skip it so we don't ping before the read loop starts.
+    ping_ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = ping_ticker.tick() => {
+                if let Err(e) = ws
+                    .send(tokio_tungstenite::tungstenite::Message::Binary(build_ping_frame().into()))
                     .await
-                    .map_err(|e| crate::error::BridgeError::Feishu(format!("Pong failed: {}", e)))?;
+                {
+                    tracing::warn!("WS keepalive ping failed: {}", e);
+                    return Err(crate::error::BridgeError::Feishu(format!(
+                        "WS keepalive ping failed: {}", e
+                    )));
+                }
             }
-            Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
-                tracing::info!("WebSocket closed by server");
-                return Ok(());
+            msg = tokio::time::timeout(READ_TIMEOUT, ws.next()) => {
+                match msg {
+                    Err(_) => {
+                        // No frame at all for READ_TIMEOUT — the connection is
+                        // half-dead (TCP still ESTAB but server silent). Tear it
+                        // down so event_loop reconnects; otherwise cola wedges
+                        // forever and stops receiving new messages.
+                        tracing::warn!("WS read timeout after {}s, reconnecting", READ_TIMEOUT.as_secs());
+                        return Err(crate::error::BridgeError::Feishu(
+                            format!("WS read timeout after {}s", READ_TIMEOUT.as_secs()),
+                        ));
+                    }
+                    Ok(None) => {
+                        tracing::info!("WebSocket closed by server");
+                        return Ok(());
+                    }
+                    Ok(Some(msg)) => match msg {
+                        Ok(tokio_tungstenite::tungstenite::Message::Binary(data)) => {
+                            handle_binary_frame(&data, &mut ws, app).await?;
+                        }
+                        Ok(tokio_tungstenite::tungstenite::Message::Ping(data)) => {
+                            ws.send(tokio_tungstenite::tungstenite::Message::Pong(data))
+                                .await
+                                .map_err(|e| crate::error::BridgeError::Feishu(format!("Pong failed: {}", e)))?;
+                        }
+                        Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
+                            tracing::info!("WebSocket closed by server");
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            return Err(crate::error::BridgeError::Feishu(format!(
+                                "WebSocket error: {}",
+                                e
+                            )));
+                        }
+                        _ => {}
+                    },
+                }
             }
-            Err(e) => {
-                return Err(crate::error::BridgeError::Feishu(format!(
-                    "WebSocket error: {}",
-                    e
-                )));
-            }
-            _ => {}
         }
     }
-    Ok(())
+}
+
+/// Ack an ordinary WS event frame (message receive, bot added, ...). Feishu's
+/// long-connection protocol is at-least-once: an unacked event is re-delivered
+/// forever, and a client that never acks is eventually treated as dead. Same
+/// routing echo as the card response, but the payload data is null.
+async fn send_event_ack(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>, frame: &ParsedFrame) {
+    if let Some(ack_bytes) = build_event_ack_frame(frame)
+        && let Err(e) = ws
+            .send(tokio_tungstenite::tungstenite::Message::Binary(ack_bytes.into()))
+            .await
+    {
+        tracing::warn!("WS event ack send failed: {}", e);
+    }
 }
 
 async fn handle_binary_frame(
@@ -356,29 +502,50 @@ async fn handle_binary_frame(
         }
     };
 
-    let msg_type = frame
-        .headers
-        .get("type")
-        .map(|s| s.as_str())
-        .unwrap_or("unknown");
+    let msg_type = frame.headers.get("type").map(|s| s.as_str()).unwrap_or("unknown");
 
     match msg_type {
         "ping" => {
             tracing::debug!("WS ping (heartbeat)");
+            // Answer the server's keepalive ping so it doesn't consider the
+            // connection dead. The Lark SDK sends a pong for every ping.
+            if let Some(pong_bytes) = build_pong_frame(&frame) {
+                if let Err(e) = ws
+                    .send(tokio_tungstenite::tungstenite::Message::Binary(pong_bytes.into()))
+                    .await
+                {
+                    tracing::warn!("WS pong send failed: {}", e);
+                }
+            }
         }
         "event" => {
             let payload = &frame.payload;
             let payload_str = String::from_utf8_lossy(payload);
-            tracing::info!("WS event payload: {}", &payload_str.chars().take(300).collect::<String>());
+            tracing::info!(
+                "WS event payload: {}",
+                &payload_str.chars().take(300).collect::<String>()
+            );
 
             let event_type = serde_json::from_slice::<serde_json::Value>(&payload)
                 .ok()
-                .and_then(|v| v.get("header")?.get("event_type")?.as_str().map(|s| s.to_string()))
+                .and_then(|v| {
+                    v.get("header")?
+                        .get("event_type")?
+                        .as_str()
+                        .map(|s| s.to_string())
+                })
                 .unwrap_or_default();
 
             tracing::info!("WS event: type={}", event_type);
 
             if event_type == "im.message.receive_v1" {
+                // Ack EVERY event first. Feishu's long-connection protocol is
+                // at-least-once: an unacked event is re-delivered (and re-delivered),
+                // and a client that never acks is eventually treated as dead and
+                // stops receiving new events entirely. Without this the bot appears
+                // unresponsive to all new messages.
+                send_event_ack(ws, &frame).await;
+
                 // Dedup by event_id from JSON payload (stable across retries)
                 let event_id = serde_json::from_slice::<serde_json::Value>(&payload)
                     .ok()
@@ -438,23 +605,36 @@ async fn handle_binary_frame(
                     }
                 }
             } else if event_type == "card.action.trigger" {
-                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&payload) {
-                    // card.action.trigger has event.action.value.not event.value
-                    if let Some(action) = value.get("event").and_then(|e| e.get("action"))
-                        && let Some(action_value) = action.get("value")
+                // card.action.trigger has event.action.value (not event.value).
+                let action_value = serde_json::from_slice::<serde_json::Value>(&payload)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("event")
+                            .and_then(|e| e.get("action"))
+                            .and_then(|a| a.get("value"))
+                            .cloned()
+                    });
+                // Ack ALWAYS — even an unparseable card action must be acked,
+                // otherwise Feishu re-delivers it forever (pitfall 8).
+                let result_card = match action_value {
+                    Some(value) => app.handle_card_action(value).await,
+                    None => None,
+                };
+                let resp = build_response_frame(&frame, result_card.as_ref());
+                if let Some(resp_bytes) = resp {
+                    if let Err(e) = ws
+                        .send(tokio_tungstenite::tungstenite::Message::Binary(resp_bytes.into()))
+                        .await
                     {
-                        let result_card = app.handle_card_action(action_value.clone()).await;
-                        // Send ack response back over WS to suppress "callback offline" error
-                        let resp = build_response_frame(&frame, result_card.as_ref());
-                        if let Some(resp_bytes) = resp {
-                            if let Err(e) = ws.send(tokio_tungstenite::tungstenite::Message::Binary(resp_bytes.into())).await {
-                                tracing::warn!("WS response send failed: {}", e);
-                            } else {
-                                tracing::info!("Sent card action ack");
-                            }
-                        }
+                        tracing::warn!("WS response send failed: {}", e);
+                    } else {
+                        tracing::info!("Sent card action ack");
                     }
                 }
+            } else {
+                // Any other event type (bot added, message recalled, ...) still
+                // needs an ack, otherwise Feishu re-delivers it forever.
+                send_event_ack(ws, &frame).await;
             }
         }
         "card" => {
@@ -648,5 +828,71 @@ mod tests {
         assert!(v["data"].as_str().map(|s| !s.is_empty()).unwrap_or(false));
         // headers echoed back (plus biz_rt)
         assert!(parsed.headers.len() >= 2);
+    }
+
+    /// Every WS event (message receive, bot added, ...) must be acked with a
+    /// code-200 frame, exactly like the Lark SDK does for each event. Feishu
+    /// re-delivers events it never sees an ack for, then stops pushing.
+    #[test]
+    fn event_ack_frame_has_code_200_and_null_data() {
+        let mut bytes = Vec::new();
+        encode_varint_field(&mut bytes, 1, 7);
+        encode_varint_field(&mut bytes, 2, 3);
+        encode_varint_field(&mut bytes, 3, 12);
+        encode_varint_field(&mut bytes, 4, 1);
+        let mut hdr = Vec::new();
+        encode_string_field(&mut hdr, 1, "type");
+        encode_string_field(&mut hdr, 2, "event");
+        encode_bytes_field(&mut bytes, 5, &hdr);
+        encode_bytes_field(
+            &mut bytes,
+            8,
+            br#"{"header":{"event_type":"im.message.receive_v1"}}"#,
+        );
+
+        let request = parse_frame(&bytes).unwrap();
+        let ack = build_event_ack_frame(&request).expect("ack builds");
+
+        let parsed = parse_frame(&ack).expect("ack parses");
+        assert_eq!(parsed.seq_id, 7);
+        assert_eq!(parsed.service, 12);
+        // payload must be {"code":200,"headers":null,"data":null}
+        let payload_str = String::from_utf8_lossy(&parsed.payload);
+        let v: serde_json::Value = serde_json::from_str(&payload_str).unwrap();
+        assert_eq!(v["code"], 200);
+        assert_eq!(v["data"], serde_json::Value::Null);
+    }
+
+    /// A pbbp2 control "ping" frame from Feishu must be answered with a
+    /// "pong" frame echoing the request's routing fields; ignoring it lets
+    /// the server consider the connection dead.
+    #[test]
+    fn ping_frame_produces_pong_frame() {
+        let mut bytes = Vec::new();
+        encode_varint_field(&mut bytes, 1, 11);
+        encode_varint_field(&mut bytes, 3, 12);
+        encode_varint_field(&mut bytes, 4, 0);
+        let mut hdr = Vec::new();
+        encode_string_field(&mut hdr, 1, "type");
+        encode_string_field(&mut hdr, 2, "ping");
+        encode_bytes_field(&mut bytes, 5, &hdr);
+
+        let request = parse_frame(&bytes).unwrap();
+        let pong = build_pong_frame(&request).expect("pong builds");
+
+        let parsed = parse_frame(&pong).expect("pong parses");
+        assert_eq!(parsed.seq_id, 11);
+        assert_eq!(parsed.service, 12);
+        assert_eq!(parsed.headers.get("type").map(|s| s.as_str()), Some("pong"));
+    }
+
+    /// The keepalive ping cola sends itself (like the SDK's pingLoop) must be
+    /// a control frame carrying headers type=ping.
+    #[test]
+    fn ping_frame_built_for_keepalive() {
+        let ping = build_ping_frame();
+        let parsed = parse_frame(&ping).expect("ping parses");
+        assert_eq!(parsed.method, 0); // FrameTypeControl
+        assert_eq!(parsed.headers.get("type").map(|s| s.as_str()), Some("ping"));
     }
 }
