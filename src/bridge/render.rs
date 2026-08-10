@@ -170,8 +170,15 @@ pub(crate) async fn flush_card(app: &Arc<App>, session_id: &str) {
     let Some(acc) = accs.get(session_id) else { return };
     let card = acc.build_card();
     drop(accs);
-    let card_id = { let ids = app.card_message_ids.lock().await; ids.get(session_id).cloned() };
-    if let Some(msg_id) = card_id && let Err(e) = app.feishu.update_message(&msg_id, &card).await { tracing::warn!("Card update failed: {}", e); }
+    let card_id = {
+        let ids = app.card_message_ids.lock().await;
+        ids.get(session_id).cloned()
+    };
+    if let Some(msg_id) = card_id
+        && let Err(e) = app.feishu.update_message(&msg_id, &card).await
+    {
+        tracing::warn!("Card update failed: {}", e);
+    }
 }
 
 /// Incremental renderer: while the synchronous prompt is in flight, poll the
@@ -198,13 +205,25 @@ pub(crate) async fn render_poll_loop(
         };
         let (changed, parts_rendered, text_len, reasoning_len) = {
             let mut accs = app.accumulators.lock().await;
-            let Some(acc) = accs.get_mut(&session_id) else { continue; };
+            let Some(acc) = accs.get_mut(&session_id) else {
+                continue;
+            };
             let before = acc.rendered_parts.len();
             let changed = render_new_turn_parts(acc, &msgs, epoch_ms);
-            (changed, acc.rendered_parts.len() - before, acc.text.len(), acc.reasoning.len())
+            (
+                changed,
+                acc.rendered_parts.len() - before,
+                acc.text.len(),
+                acc.reasoning.len(),
+            )
         };
         if changed {
-            tracing::info!("render poll: {} new parts, text={} reasoning={}", parts_rendered, text_len, reasoning_len);
+            tracing::info!(
+                "render poll: {} new parts, text={} reasoning={}",
+                parts_rendered,
+                text_len,
+                reasoning_len
+            );
             flush_card(app, &session_id).await;
         }
     }
@@ -241,7 +260,12 @@ mod tests {
         let tool = &acc.tools["call_1"];
         assert_eq!(tool.name, "bash");
         assert_eq!(tool.status, "completed");
-        assert!(tool.output.as_deref().unwrap().contains("/root/workspace/dev/cola"));
+        assert!(
+            tool.output
+                .as_deref()
+                .unwrap()
+                .contains("/root/workspace/dev/cola")
+        );
         assert!(tool.input.as_deref().unwrap().contains("pwd"));
 
         let card = acc.build_card().to_string();
@@ -272,17 +296,32 @@ mod tests {
         let msgs = vec![
             // Old turn assistant message (before epoch) — skipped.
             SessionMessage {
-                info: MessageInfo { id: "old".into(), role: Some("assistant".into()), parent_id: None, time: Some(MessageTime { created: 100 }) },
+                info: MessageInfo {
+                    id: "old".into(),
+                    role: Some("assistant".into()),
+                    parent_id: None,
+                    time: Some(MessageTime { created: 100 }),
+                },
                 parts: serde_json::json!([{ "id": "prt_old", "type": "reasoning", "text": "old reasoning" }]),
             },
             // User message — skipped (not assistant).
             SessionMessage {
-                info: MessageInfo { id: "user".into(), role: Some("user".into()), parent_id: None, time: Some(MessageTime { created: 2000 }) },
+                info: MessageInfo {
+                    id: "user".into(),
+                    role: Some("user".into()),
+                    parent_id: None,
+                    time: Some(MessageTime { created: 2000 }),
+                },
                 parts: serde_json::json!([{ "id": "prt_user", "type": "text", "text": "question" }]),
             },
             // Current turn assistant message.
             SessionMessage {
-                info: MessageInfo { id: "a1".into(), role: Some("assistant".into()), parent_id: None, time: Some(MessageTime { created: 3000 }) },
+                info: MessageInfo {
+                    id: "a1".into(),
+                    role: Some("assistant".into()),
+                    parent_id: None,
+                    time: Some(MessageTime { created: 3000 }),
+                },
                 parts: serde_json::json!([
                     { "id": "prt_rsn", "type": "reasoning", "text": "Let me think" },
                     { "id": "prt_tool", "type": "tool", "tool": "bash", "callID": "call_1", "state": { "status": "completed", "input": { "command": "ls" }, "output": "src" } },
@@ -355,18 +394,20 @@ mod tests {
         let mut acc = StreamAccumulator::new("test");
         acc.submit_epoch_ms = Some(epoch);
 
-        let msgs = |reasoning: &str, text: &str| vec![SessionMessage {
-            info: MessageInfo {
-                id: "a1".into(),
-                role: Some("assistant".into()),
-                parent_id: None,
-                time: Some(MessageTime { created: 100 }),
-            },
-            parts: serde_json::json!([
-                { "id": "prt_rsn", "type": "reasoning", "text": reasoning },
-                { "id": "prt_txt", "type": "text", "text": text },
-            ]),
-        }];
+        let msgs = |reasoning: &str, text: &str| {
+            vec![SessionMessage {
+                info: MessageInfo {
+                    id: "a1".into(),
+                    role: Some("assistant".into()),
+                    parent_id: None,
+                    time: Some(MessageTime { created: 100 }),
+                },
+                parts: serde_json::json!([
+                    { "id": "prt_rsn", "type": "reasoning", "text": reasoning },
+                    { "id": "prt_txt", "type": "text", "text": text },
+                ]),
+            }]
+        };
 
         // Parts are written empty first, then updated with content. The empty
         // version must NOT be rendered (it would freeze the placeholder).
@@ -375,13 +416,59 @@ mod tests {
         assert_eq!(acc.text, "");
 
         // Once content lands (same part ids), render it once.
-        assert!(render_new_turn_parts(&mut acc, &msgs("Let me think", "Answer here"), epoch));
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &msgs("Let me think", "Answer here"),
+            epoch
+        ));
         assert!(acc.reasoning.contains("Let me think"));
         assert!(acc.text.contains("Answer here"));
 
         // Re-fetching the same content must not duplicate.
-        assert!(!render_new_turn_parts(&mut acc, &msgs("Let me think", "Answer here"), epoch));
+        assert!(!render_new_turn_parts(
+            &mut acc,
+            &msgs("Let me think", "Answer here"),
+            epoch
+        ));
         assert_eq!(acc.reasoning, "Let me think");
         assert_eq!(acc.text, "Answer here");
+    }
+
+    /// Regression: real OpenCode part payloads carry NO `id` field (the DB id
+    /// is not serialised into the part JSON). Dedup must fall back to content,
+    /// otherwise the poll loop + final render append the same text twice
+    /// (observed: card text 81 → 162 chars).
+    #[test]
+    fn text_without_id_is_not_rendered_twice() {
+        use crate::opencode::client::{MessageInfo, MessageTime, SessionMessage};
+
+        let epoch = 0;
+        let mut acc = StreamAccumulator::new("test");
+        acc.submit_epoch_ms = Some(epoch);
+
+        // Realistic: no "id" on the text part.
+        let msgs = || {
+            vec![SessionMessage {
+                info: MessageInfo {
+                    id: "a1".into(),
+                    role: Some("assistant".into()),
+                    parent_id: None,
+                    time: Some(MessageTime { created: 100 }),
+                },
+                parts: serde_json::json!([
+                    { "type": "text", "text": "你好！很高兴认识你。" },
+                    { "type": "reasoning", "text": "thinking" },
+                ]),
+            }]
+        };
+
+        // Poll loop renders the parts.
+        assert!(render_new_turn_parts(&mut acc, &msgs(), epoch));
+        assert_eq!(acc.text, "你好！很高兴认识你。");
+
+        // Final render re-fetches the same messages — must NOT append again.
+        assert!(!render_new_turn_parts(&mut acc, &msgs(), epoch));
+        assert_eq!(acc.text, "你好！很高兴认识你。");
+        assert_eq!(acc.reasoning, "thinking");
     }
 }

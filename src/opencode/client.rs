@@ -43,7 +43,9 @@ impl Client {
             id: None,
             agent: None,
             model: self.model.clone(),
-            location: directory.map(|d| Location { directory: d.to_string() }),
+            location: directory.map(|d| Location {
+                directory: d.to_string(),
+            }),
         }
     }
 
@@ -135,12 +137,20 @@ impl Client {
                 admitted_seq: None,
                 parent_id,
                 error,
-                parts: parsed.get("parts").cloned().unwrap_or(serde_json::Value::Array(vec![])),
+                parts: parsed
+                    .get("parts")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Array(vec![])),
             });
         }
 
         // Fallback: older servers expose `/api/session/{id}/prompt` with `prompt` payload.
-        tracing::warn!("canonical /session/{}/message failed ({}), falling back to /api/session/{}/prompt", session_id, resp.status(), session_id);
+        tracing::warn!(
+            "canonical /session/{}/message failed ({}), falling back to /api/session/{}/prompt",
+            session_id,
+            resp.status(),
+            session_id
+        );
         let body = serde_json::json!({
             "prompt": {
                 "text": text,
@@ -179,12 +189,7 @@ impl Client {
         if let Some(d) = directory {
             url.query_pairs_mut().append_pair("directory", d);
         }
-        self.http
-            .post(url)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?;
+        self.http.post(url).json(&body).send().await?.error_for_status()?;
         Ok(())
     }
 
@@ -192,21 +197,27 @@ impl Client {
     /// `directory` selects the instance; without it only the server cwd's
     /// instance is checked, so permissions for sessions in other directories
     /// would be missed.
-    pub async fn list_permissions(&self, directory: Option<&str>) -> crate::error::Result<Vec<PermissionRequest>> {
+    pub async fn list_permissions(
+        &self,
+        directory: Option<&str>,
+    ) -> crate::error::Result<Vec<PermissionRequest>> {
         let mut url = reqwest::Url::parse(&self.url("/permission"))?;
         if let Some(d) = directory {
             url.query_pairs_mut().append_pair("directory", d);
         }
-        let resp = self
-            .http
-            .get(url)
-            .send()
-            .await?;
+        let resp = self.http.get(url).send().await?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            tracing::warn!("GET /permission failed: {} — body: {}", status, &text[..text.len().min(500)]);
-            return Err(crate::error::BridgeError::OpenCode(format!("permission list failed: {}", status)));
+            tracing::warn!(
+                "GET /permission failed: {} — body: {}",
+                status,
+                &text[..text.len().min(500)]
+            );
+            return Err(crate::error::BridgeError::OpenCode(format!(
+                "permission list failed: {}",
+                status
+            )));
         }
         Ok(resp.json().await?)
     }
@@ -231,11 +242,7 @@ impl Client {
         if let Some(d) = directory {
             url.query_pairs_mut().append_pair("directory", d);
         }
-        let resp = self
-            .http
-            .get(url)
-            .send()
-            .await?;
+        let resp = self.http.get(url).send().await?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
@@ -264,12 +271,7 @@ impl Client {
         if let Some(d) = directory {
             url.query_pairs_mut().append_pair("directory", d);
         }
-        self.http
-            .post(url)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?;
+        self.http.post(url).json(&body).send().await?.error_for_status()?;
         Ok(())
     }
 
@@ -283,11 +285,7 @@ impl Client {
         if let Some(d) = directory {
             url.query_pairs_mut().append_pair("directory", d);
         }
-        self.http
-            .post(url)
-            .send()
-            .await?
-            .error_for_status()?;
+        self.http.post(url).send().await?.error_for_status()?;
         Ok(())
     }
 

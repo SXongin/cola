@@ -27,9 +27,7 @@ async fn resolve_opencode_server(cfg: &mut config::OpenCodeConfig) -> anyhow::Re
     let preferred_port = cfg.url.rsplit(':').next().and_then(|s| s.parse().ok());
     let candidates = bridge::discovery::scan_processes();
 
-    if let Some(server) =
-        bridge::discovery::select_server(&candidates, preferred_port).cloned()
-    {
+    if let Some(server) = bridge::discovery::select_server(&candidates, preferred_port).cloned() {
         cfg.url = format!("http://localhost:{}", server.port);
         cfg.password = Some(server.password);
         tracing::info!("Attached to OpenCode server at {}", cfg.url);
@@ -45,10 +43,7 @@ async fn resolve_opencode_server(cfg: &mut config::OpenCodeConfig) -> anyhow::Re
         }
         p
     };
-    let password = cfg
-        .password
-        .clone()
-        .unwrap_or_else(|| "cola-secret".to_string());
+    let password = cfg.password.clone().unwrap_or_else(|| "cola-secret".to_string());
     tracing::info!("No shared OpenCode server found; starting one on port {}", port);
     spawn_self_server(port, &password)?;
     wait_for_port(port).await?;
@@ -108,7 +103,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Test: send a message to verify the Feishu REST API works
     let user_open_id = "ou_5f48e110fbdcda4a3f1500e74055e42e";
-    match feishu_client.send_text("open_id", user_open_id, "cola online ✓").await {
+    match feishu_client
+        .send_text("open_id", user_open_id, "cola online ✓")
+        .await
+    {
         Ok(msg_id) => tracing::info!("Test message sent: {}", msg_id),
         Err(e) => tracing::error!("Test message failed: {}", e),
     }

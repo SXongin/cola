@@ -11,10 +11,10 @@ pub enum CardState {
     Error,
 }
 
-    /// Builds Feishu interactive card JSON (v2 schema with collapsible panels).
-    /// The Feishu API stores a generic fallback copy; clients that support v2
-    /// render the real card with foldable panels.
-    pub struct CardBuilder {
+/// Builds Feishu interactive card JSON (v2 schema with collapsible panels).
+/// The Feishu API stores a generic fallback copy; clients that support v2
+/// render the real card with foldable panels.
+pub struct CardBuilder {
     title: String,
     state: CardState,
     text: String,
@@ -193,15 +193,17 @@ fn collapsible_panel(title: &str, content: &str) -> serde_json::Value {
 /// session id and a description so the card callback (`action: "perm"`) can
 /// route the reply back to the right instance and render a result card.
 pub fn build_permission_card(session_id: &str, request_id: &str, body: &str) -> serde_json::Value {
-    let btn_value = |reply: &str, label: &str, color: &str| json!({
-        "action": "perm",
-        "reply": reply,
-        "session_id": session_id,
-        "request_id": request_id,
-        "perm_label": label,
-        "perm_color": color,
-        "perm_body": body,
-    });
+    let btn_value = |reply: &str, label: &str, color: &str| {
+        json!({
+            "action": "perm",
+            "reply": reply,
+            "session_id": session_id,
+            "request_id": request_id,
+            "perm_label": label,
+            "perm_color": color,
+            "perm_body": body,
+        })
+    };
     json!({
         "config": { "wide_screen_mode": true },
         "header": {
@@ -324,7 +326,10 @@ mod tests {
             .with_text("pub fn main() {")
             .build();
         let elements = card["body"]["elements"].as_array().unwrap();
-        assert_eq!(elements.last().unwrap()["content"].as_str().unwrap(), "pub fn main() {");
+        assert_eq!(
+            elements.last().unwrap()["content"].as_str().unwrap(),
+            "pub fn main() {"
+        );
     }
 
     #[test]
@@ -342,7 +347,12 @@ mod tests {
         let elements = card["body"]["elements"].as_array().unwrap();
         let panel = &elements[0];
         assert_eq!(panel["tag"].as_str().unwrap(), "collapsible_panel");
-        assert!(panel["header"]["title"]["content"].as_str().unwrap().contains("✅ read"));
+        assert!(
+            panel["header"]["title"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("✅ read")
+        );
         assert!(panel.to_string().contains("fn main() {}"));
     }
 
@@ -365,9 +375,17 @@ mod tests {
 
     #[test]
     fn done_card_green() {
-        let card = CardBuilder::new("cola").with_state(CardState::Done).with_text("Done!").build();
+        let card = CardBuilder::new("cola")
+            .with_state(CardState::Done)
+            .with_text("Done!")
+            .build();
         assert_eq!(card["header"]["template"].as_str().unwrap(), "green");
-        assert!(card["header"]["title"]["content"].as_str().unwrap().contains("✅"));
+        assert!(
+            card["header"]["title"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("✅")
+        );
     }
 
     #[test]
@@ -377,8 +395,18 @@ mod tests {
             .with_text("**错误**: 503 request queue full")
             .build();
         assert_eq!(card["header"]["template"].as_str().unwrap(), "red");
-        assert!(card["header"]["title"]["content"].as_str().unwrap().contains("出错"));
-        assert!(card["body"]["elements"][0]["content"].as_str().unwrap().contains("503"));
+        assert!(
+            card["header"]["title"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("出错")
+        );
+        assert!(
+            card["body"]["elements"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("503")
+        );
     }
 
     #[test]
@@ -389,7 +417,12 @@ mod tests {
             .with_text("有 3 个文件。")
             .build();
         let elements = card["body"]["elements"].as_array().unwrap();
-        assert!(elements[0]["content"].as_str().unwrap().contains("看看目录里有什么"));
+        assert!(
+            elements[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("看看目录里有什么")
+        );
         assert_eq!(elements[1]["tag"].as_str().unwrap(), "hr");
     }
 
@@ -401,28 +434,44 @@ mod tests {
             input: Some("cargo build".into()),
             output: Some("error[E0308]".into()),
         };
-        let card = CardBuilder::new("cola").with_state(CardState::Done).with_tool(tool).build();
+        let card = CardBuilder::new("cola")
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
         assert_eq!(card["header"]["template"].as_str().unwrap(), "red");
-        assert!(card["header"]["title"]["content"].as_str().unwrap().contains("失败"));
+        assert!(
+            card["header"]["title"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("失败")
+        );
     }
 
     #[test]
     fn question_card_has_option_buttons_with_answer_payload() {
-        let questions = vec![
-            crate::opencode::client::QuestionInfo {
-                question: "选择要在哪个目录继续".into(),
-                header: "目录".into(),
-                options: vec![
-                    crate::opencode::client::QuestionOption { label: "/a".into(), description: "dir a".into() },
-                    crate::opencode::client::QuestionOption { label: "/b".into(), description: String::new() },
-                ],
-                multiple: None,
-                custom: None,
-            },
-        ];
+        let questions = vec![crate::opencode::client::QuestionInfo {
+            question: "选择要在哪个目录继续".into(),
+            header: "目录".into(),
+            options: vec![
+                crate::opencode::client::QuestionOption {
+                    label: "/a".into(),
+                    description: "dir a".into(),
+                },
+                crate::opencode::client::QuestionOption {
+                    label: "/b".into(),
+                    description: String::new(),
+                },
+            ],
+            multiple: None,
+            custom: None,
+        }];
         let card = build_question_card("que_1", "ses_1", &questions);
         let text = card.to_string();
-        assert!(text.contains("选择要在哪个目录继续"), "question text missing: {}", text);
+        assert!(
+            text.contains("选择要在哪个目录继续"),
+            "question text missing: {}",
+            text
+        );
 
         let elements = card["elements"].as_array().unwrap();
         let action = elements.iter().find(|e| e["tag"] == "action").unwrap();
@@ -446,7 +495,10 @@ mod tests {
     #[test]
     fn permission_card_carries_reply_payload() {
         let card = build_permission_card("ses_abc", "per_123", "AI 想要执行 bash");
-        assert_eq!(card["header"]["title"]["content"].as_str().unwrap(), "🔐 Permission Required");
+        assert_eq!(
+            card["header"]["title"]["content"].as_str().unwrap(),
+            "🔐 Permission Required"
+        );
         // Permission card is built v1-style: elements live at the top level.
         let elements = card["elements"].as_array().unwrap();
         // element 0 = description markdown, element 1 = action row

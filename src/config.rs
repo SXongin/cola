@@ -155,13 +155,22 @@ mod tests {
 
     #[test]
     fn classify_topic_messages_in_group_and_p2p() {
-        assert_eq!(ConversationKind::classify("group", Some("omt_t_1")), ConversationKind::Topic);
-        assert_eq!(ConversationKind::classify("p2p", Some("omt_t_1")), ConversationKind::Topic);
+        assert_eq!(
+            ConversationKind::classify("group", Some("omt_t_1")),
+            ConversationKind::Topic
+        );
+        assert_eq!(
+            ConversationKind::classify("p2p", Some("omt_t_1")),
+            ConversationKind::Topic
+        );
     }
 
     #[test]
     fn classify_group_root_is_lobby_p2p_top_is_conversation() {
-        assert_eq!(ConversationKind::classify("group", None), ConversationKind::GroupLobby);
+        assert_eq!(
+            ConversationKind::classify("group", None),
+            ConversationKind::GroupLobby
+        );
         assert_eq!(ConversationKind::classify("p2p", None), ConversationKind::P2p);
     }
 

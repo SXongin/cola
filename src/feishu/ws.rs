@@ -141,8 +141,7 @@ fn parse_frame(data: &[u8]) -> Option<ParsedFrame> {
                 if pos + len as usize > data.len() {
                     return None;
                 }
-                frame.log_id_new =
-                    Some(String::from_utf8_lossy(&data[pos..pos + len as usize]).to_string());
+                frame.log_id_new = Some(String::from_utf8_lossy(&data[pos..pos + len as usize]).to_string());
                 pos += len as usize;
             }
             // Skip other fields
@@ -812,7 +811,11 @@ mod tests {
 
         encode_string_field(&mut bytes, 6, "json"); // payload_encoding
         encode_string_field(&mut bytes, 7, "event"); // payload_type
-        encode_bytes_field(&mut bytes, 8, br#"{"header":{"event_type":"im.message.receive_v1"}}"#);
+        encode_bytes_field(
+            &mut bytes,
+            8,
+            br#"{"header":{"event_type":"im.message.receive_v1"}}"#,
+        );
         encode_string_field(&mut bytes, 9, "log-new-1"); // log_id_new
 
         let frame = parse_frame(&bytes).expect("frame parses");
@@ -843,14 +846,23 @@ mod tests {
         encode_string_field(&mut hdr, 1, "type");
         encode_string_field(&mut hdr, 2, "event");
         encode_bytes_field(&mut bytes, 5, &hdr);
-        encode_bytes_field(&mut bytes, 8, br#"{"header":{"event_type":"im.message.receive_v1"}}"#);
+        encode_bytes_field(
+            &mut bytes,
+            8,
+            br#"{"header":{"event_type":"im.message.receive_v1"}}"#,
+        );
 
         let frame = parse_frame(&bytes).unwrap();
         assert_eq!(frame.headers.get("type").map(|s| s.as_str()), Some("event"));
 
         let event_type = serde_json::from_slice::<serde_json::Value>(&frame.payload)
             .ok()
-            .and_then(|v| v.get("header")?.get("event_type")?.as_str().map(|s| s.to_string()))
+            .and_then(|v| {
+                v.get("header")?
+                    .get("event_type")?
+                    .as_str()
+                    .map(|s| s.to_string())
+            })
             .unwrap_or_default();
         assert_eq!(event_type, "im.message.receive_v1");
     }
@@ -890,10 +902,7 @@ mod tests {
         assert_eq!(parse_message_content(&msg), "hi");
 
         // And the dedup key used by the handler:
-        let event_id = event
-            .header
-            .as_ref()
-            .and_then(|h| h.event_id.clone());
+        let event_id = event.header.as_ref().and_then(|h| h.event_id.clone());
         assert_eq!(event_id.as_deref(), Some("e1"));
     }
 

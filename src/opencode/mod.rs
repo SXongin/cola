@@ -2,8 +2,7 @@ pub mod client;
 pub mod types;
 
 pub use client::{
-    Client, CreateSessionInput, PermissionRequest, PromptResponse, QuestionRequest, Session,
-    SessionMessage,
+    Client, CreateSessionInput, PermissionRequest, PromptResponse, QuestionRequest, Session, SessionMessage,
 };
 
 use crate::error::Result;
@@ -21,17 +20,9 @@ pub trait Backend: Send + Sync {
 
     async fn prompt(&self, session_id: &str, text: &str) -> Result<PromptResponse>;
 
-    async fn reply_permission(
-        &self,
-        request_id: &str,
-        reply: &str,
-        directory: Option<&str>,
-    ) -> Result<()>;
+    async fn reply_permission(&self, request_id: &str, reply: &str, directory: Option<&str>) -> Result<()>;
 
-    async fn list_permissions(
-        &self,
-        directory: Option<&str>,
-    ) -> Result<Vec<PermissionRequest>>;
+    async fn list_permissions(&self, directory: Option<&str>) -> Result<Vec<PermissionRequest>>;
 
     async fn list_questions(&self, directory: Option<&str>) -> Result<Vec<QuestionRequest>>;
 
@@ -69,19 +60,11 @@ impl Backend for Client {
         Client::prompt(self, session_id, text).await
     }
 
-    async fn reply_permission(
-        &self,
-        request_id: &str,
-        reply: &str,
-        directory: Option<&str>,
-    ) -> Result<()> {
+    async fn reply_permission(&self, request_id: &str, reply: &str, directory: Option<&str>) -> Result<()> {
         Client::reply_permission(self, request_id, reply, directory).await
     }
 
-    async fn list_permissions(
-        &self,
-        directory: Option<&str>,
-    ) -> Result<Vec<PermissionRequest>> {
+    async fn list_permissions(&self, directory: Option<&str>) -> Result<Vec<PermissionRequest>> {
         Client::list_permissions(self, directory).await
     }
 

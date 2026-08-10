@@ -22,7 +22,9 @@ pub struct ServerCandidate {
 pub fn scan_processes() -> Vec<ServerCandidate> {
     let default_data_home = dirs::data_dir().map(|p| p.to_string_lossy().to_string());
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else { return out };
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return out;
+    };
     for entry in entries.flatten() {
         let pid = entry.file_name().to_string_lossy().to_string();
         if !pid.chars().all(|c| c.is_ascii_digit()) {
@@ -33,10 +35,7 @@ pub fn scan_processes() -> Vec<ServerCandidate> {
             Err(_) => continue,
         };
         let args: Vec<&str> = cmdline.split('\0').collect();
-        let is_server = args
-            .first()
-            .map(|a| a.contains("opencode"))
-            .unwrap_or(false)
+        let is_server = args.first().map(|a| a.contains("opencode")).unwrap_or(false)
             && args.iter().skip(1).any(|a| *a == "serve");
         if !is_server {
             continue;
@@ -67,7 +66,11 @@ pub fn scan_processes() -> Vec<ServerCandidate> {
             None => true,
             Some(home) => Some(home) == default_data_home,
         };
-        out.push(ServerCandidate { port, password, uses_default_store });
+        out.push(ServerCandidate {
+            port,
+            password,
+            uses_default_store,
+        });
     }
     out
 }
@@ -82,10 +85,7 @@ pub fn select_server(
     candidates: &[ServerCandidate],
     preferred_port: Option<u16>,
 ) -> Option<&ServerCandidate> {
-    let eligible: Vec<&ServerCandidate> = candidates
-        .iter()
-        .filter(|c| c.uses_default_store)
-        .collect();
+    let eligible: Vec<&ServerCandidate> = candidates.iter().filter(|c| c.uses_default_store).collect();
     preferred_port
         .and_then(|p| eligible.iter().find(|c| c.port == p).copied())
         .or_else(|| eligible.first().copied())
@@ -126,7 +126,11 @@ mod tests {
     use super::*;
 
     fn cand(port: u16, password: &str, uses_default_store: bool) -> ServerCandidate {
-        ServerCandidate { port, password: password.into(), uses_default_store }
+        ServerCandidate {
+            port,
+            password: password.into(),
+            uses_default_store,
+        }
     }
 
     #[test]
@@ -166,7 +170,10 @@ mod tests {
             cmd.args,
             vec!["serve", "--port", "4096", "--hostname", "127.0.0.1"]
         );
-        assert!(cmd.env.contains(&("OPENCODE_SERVER_PASSWORD".into(), "secret".into())));
+        assert!(
+            cmd.env
+                .contains(&("OPENCODE_SERVER_PASSWORD".into(), "secret".into()))
+        );
         // The server MUST land on the default store so sessions are shared with
         // OpenChamber / the CLI: strip any inherited XDG_DATA_HOME rather than
         // pinning a private one.

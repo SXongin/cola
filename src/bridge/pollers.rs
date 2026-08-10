@@ -18,16 +18,22 @@ pub(crate) async fn permission_poll_loop(app: &Arc<App>) -> crate::error::Result
                 Ok(perms) => {
                     for p in &perms {
                         let sid = p.session_id.clone().unwrap_or_default();
-                        if seen.contains(&p.request_id) { continue; }
+                        if seen.contains(&p.request_id) {
+                            continue;
+                        }
                         seen.insert(p.request_id.clone());
-                        tracing::info!("Permission ({}): {} {:?}", dir, p.permission.as_deref().unwrap_or("?"), p.patterns);
+                        tracing::info!(
+                            "Permission ({}): {} {:?}",
+                            dir,
+                            p.permission.as_deref().unwrap_or("?"),
+                            p.patterns
+                        );
                         {
                             let mut reqs = app.permission_requests.lock().await;
                             reqs.insert(sid.clone(), p.request_id.clone());
                         }
                         let body = describe_permission(p);
-                        let card =
-                            crate::feishu::card::build_permission_card(&sid, &p.request_id, &body);
+                        let card = crate::feishu::card::build_permission_card(&sid, &p.request_id, &body);
                         // Reply to the message that triggered the prompt for this
                         // session; fall back to sending into the chat when the
                         // accumulator is gone (e.g. after a cola restart).
@@ -69,17 +75,21 @@ pub(crate) async fn question_poll_loop(app: &Arc<App>) -> crate::error::Result<(
             match app.opencode.list_questions(Some(dir)).await {
                 Ok(questions) => {
                     for q in &questions {
-                        if seen.contains(&q.id) { continue; }
+                        if seen.contains(&q.id) {
+                            continue;
+                        }
                         seen.insert(q.id.clone());
                         tracing::info!("Question ({}): {} — {} questions", dir, q.id, q.questions.len());
                         {
                             let mut reqs = app.question_requests.lock().await;
                             reqs.insert(q.id.clone(), q.clone());
                         }
-                        let card = crate::feishu::card::build_question_card(&q.id, &q.session_id, &q.questions);
+                        let card =
+                            crate::feishu::card::build_question_card(&q.id, &q.session_id, &q.questions);
                         let reply_to = {
                             let accs = app.accumulators.lock().await;
-                            accs.get(&q.session_id).and_then(|a| a.reply_to_message_id.clone())
+                            accs.get(&q.session_id)
+                                .and_then(|a| a.reply_to_message_id.clone())
                         };
                         let sent = if let Some(msg_id) = reply_to {
                             app.feishu.reply_card(&msg_id, &card).await.is_ok()
@@ -88,7 +98,10 @@ pub(crate) async fn question_poll_loop(app: &Arc<App>) -> crate::error::Result<(
                             if let Some(chat_id) = chat {
                                 app.feishu.send_card("chat_id", &chat_id, &card).await.is_ok()
                             } else {
-                                tracing::warn!("No reply target or chat for question on session {}", q.session_id);
+                                tracing::warn!(
+                                    "No reply target or chat for question on session {}",
+                                    q.session_id
+                                );
                                 false
                             }
                         };
@@ -118,12 +131,20 @@ fn describe_permission(p: &crate::opencode::client::PermissionRequest) -> String
     // Metadata often carries richer context (e.g. bash command, tool input)
     if let Some(meta) = &p.metadata {
         let mut shown = 0;
-        for (key, label) in [("command", "命令"), ("cwd", "目录"), ("description", "说明"), ("input", "输入"), ("path", "路径")] {
+        for (key, label) in [
+            ("command", "命令"),
+            ("cwd", "目录"),
+            ("description", "说明"),
+            ("input", "输入"),
+            ("path", "路径"),
+        ] {
             if let Some(v) = meta.get(key) {
                 let val = v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string());
                 s.push_str(&format!("**{}**: `{}`\n", label, truncate(&val, 200)));
                 shown += 1;
-                if shown >= 3 { break; }
+                if shown >= 3 {
+                    break;
+                }
             }
         }
         if shown == 0 {
@@ -169,5 +190,9 @@ fn describe_action(action: &str) -> (&'static str, &'static str) {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max { s.to_string() } else { format!("{}...", s.chars().take(max).collect::<String>()) }
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", s.chars().take(max).collect::<String>())
+    }
 }
