@@ -58,6 +58,24 @@ pub struct MessageData {
     pub chat_type: String,
     pub message_type: String,
     pub content: String,
+    /// Users/bots mentioned in the message, with their display names.
+    #[serde(default)]
+    pub mentions: Vec<Mention>,
+}
+
+/// A `@mention` inside a message. The raw text carries a placeholder like
+/// `@_user_1` (`key`); `id.open_id` is the mentioned party and `name` their
+/// display name. The bot itself appears here when someone @'s it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Mention {
+    pub key: Option<String>,
+    pub id: Option<MentionId>,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MentionId {
+    pub open_id: Option<String>,
 }
 
 /// Parsed message content — varies by message_type.
@@ -111,7 +129,10 @@ mod tests {
 
         let header = event.header.expect("header present");
         assert_eq!(header.event_type.as_deref(), Some("im.message.receive_v1"));
-        assert_eq!(header.event_id.as_deref(), Some("5e220b3b2e0f4e6ab8c5f0d7f2a6b123"));
+        assert_eq!(
+            header.event_id.as_deref(),
+            Some("5e220b3b2e0f4e6ab8c5f0d7f2a6b123")
+        );
         assert_eq!(header.create_time.as_deref(), Some("1609295409000"));
         assert_eq!(header.app_id.as_deref(), Some("cli_test"));
         assert_eq!(event.schema.as_deref(), Some("2.0"));
@@ -202,6 +223,57 @@ mod tests {
         let msg = event.event.unwrap().message.unwrap();
         assert_eq!(msg.thread_id.as_deref(), Some("omt_p2p_topic_1"));
         assert_eq!(msg.root_id.as_deref(), Some("om_p2p_seed"));
+    }
+
+    #[test]
+    fn parses_mentions_with_names() {
+        let json = r#"{
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "message": {
+                    "message_id": "om_m",
+                    "chat_id": "oc_g1",
+                    "chat_type": "group",
+                    "message_type": "text",
+                    "content": "{\"text\":\"@_user_1 你好 @_user_2 请 review\"}",
+                    "mentions": [
+                        { "key": "@_user_1", "id": { "open_id": "ou_bot_1" }, "name": "cola", "tenant_key": "t" },
+                        { "key": "@_user_2", "id": { "open_id": "ou_li" }, "name": "李明", "tenant_key": "t" }
+                    ]
+                }
+            }
+        }"#;
+
+        let event: MessageReceiveEvent = serde_json::from_str(json).unwrap();
+        let msg = event.event.unwrap().message.unwrap();
+        assert_eq!(msg.mentions.len(), 2);
+        assert_eq!(msg.mentions[0].key.as_deref(), Some("@_user_1"));
+        assert_eq!(
+            msg.mentions[0].id.as_ref().and_then(|i| i.open_id.as_deref()),
+            Some("ou_bot_1")
+        );
+        assert_eq!(msg.mentions[0].name.as_deref(), Some("cola"));
+        assert_eq!(msg.mentions[1].name.as_deref(), Some("李明"));
+    }
+
+    #[test]
+    fn missing_mentions_defaults_to_empty() {
+        let json = r#"{
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "message": {
+                    "message_id": "om_m",
+                    "chat_id": "oc_p1",
+                    "chat_type": "p2p",
+                    "message_type": "text",
+                    "content": "{\"text\":\"hi\"}"
+                }
+            }
+        }"#;
+
+        let event: MessageReceiveEvent = serde_json::from_str(json).unwrap();
+        let msg = event.event.unwrap().message.unwrap();
+        assert!(msg.mentions.is_empty());
     }
 
     #[test]

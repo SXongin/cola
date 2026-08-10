@@ -18,16 +18,14 @@ pub trait Platform: Send + Sync {
 
     async fn reply_card(&self, reply_to: &str, card: &Value) -> Result<String>;
 
-    async fn send_card(
-        &self,
-        receive_id_type: &str,
-        receive_id: &str,
-        card: &Value,
-    ) -> Result<String>;
+    async fn send_card(&self, receive_id_type: &str, receive_id: &str, card: &Value) -> Result<String>;
 
     async fn update_message(&self, message_id: &str, card: &Value) -> Result<()>;
 
     async fn reply_text(&self, message_id: &str, text: &str) -> Result<String>;
+
+    /// The bot's own open_id, used to recognise @mentions of cola itself.
+    async fn bot_open_id(&self) -> Result<String>;
 }
 
 #[async_trait]
@@ -40,12 +38,7 @@ impl Platform for Client {
         Client::reply_card(self, reply_to, card).await
     }
 
-    async fn send_card(
-        &self,
-        receive_id_type: &str,
-        receive_id: &str,
-        card: &Value,
-    ) -> Result<String> {
+    async fn send_card(&self, receive_id_type: &str, receive_id: &str, card: &Value) -> Result<String> {
         Client::send_card(self, receive_id_type, receive_id, card).await
     }
 
@@ -55,5 +48,9 @@ impl Platform for Client {
 
     async fn reply_text(&self, message_id: &str, text: &str) -> Result<String> {
         Client::reply_text(self, message_id, text).await
+    }
+
+    async fn bot_open_id(&self) -> Result<String> {
+        Client::bot_open_id(self).await
     }
 }

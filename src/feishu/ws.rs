@@ -578,7 +578,20 @@ async fn handle_binary_frame(
                     if let Some(event_data) = event.event
                         && let Some(msg_data) = event_data.message
                     {
-                        let text = parse_message_content(&msg_data);
+                        let mut text = parse_message_content(&msg_data);
+                        // Replace @mention placeholders (`@_user_N`) with real
+                        // names so the AI sees who was referenced; the bot's own
+                        // mention is dropped. Feishu otherwise leaks opaque
+                        // `@_user_1` tokens into the prompt.
+                        if !msg_data.mentions.is_empty() {
+                            let bot_id = app.bot_open_id.lock().await.clone().unwrap_or_default();
+                            if let Some(eid) = event.header.as_ref().and_then(|h| h.event_id.clone())
+                                && is_mentioned(&msg_data.mentions, &bot_id)
+                            {
+                                tracing::info!("event {} mentions bot", eid);
+                            }
+                            text = strip_mentions(&text, &msg_data.mentions, &bot_id);
+                        }
                         let thread_id = msg_data.thread_id.clone();
                         tracing::info!(
                             "Message: chat={} type={} thread={} text={}",
@@ -657,6 +670,40 @@ fn parse_message_content(msg: &MessageData) -> String {
     msg.content.clone()
 }
 
+/// True when any mention targets the bot itself (`bot_open_id`). Used to know
+/// whether a group message addressed cola directly.
+fn is_mentioned(mentions: &[crate::feishu::event::Mention], bot_open_id: &str) -> bool {
+    mentions
+        .iter()
+        .any(|m| m.id.as_ref().and_then(|i| i.open_id.as_deref()) == Some(bot_open_id))
+}
+
+/// Replace @mention placeholders (`@_user_1`) in text with readable names:
+/// the bot's own mention is dropped, other mentions become `@名字`, so the
+/// AI sees who was referenced instead of opaque `@_user_N` tokens.
+fn strip_mentions(text: &str, mentions: &[crate::feishu::event::Mention], bot_open_id: &str) -> String {
+    if mentions.is_empty() {
+        return text.to_string();
+    }
+    let mut out = text.to_string();
+    for m in mentions {
+        let Some(key) = m.key.as_deref() else { continue };
+        if !out.contains(key) {
+            continue;
+        }
+        let is_bot = m.id.as_ref().and_then(|i| i.open_id.as_deref()) == Some(bot_open_id);
+        let replacement = if is_bot {
+            ""
+        } else if let Some(name) = m.name.as_deref() {
+            &format!("@{name}")
+        } else {
+            ""
+        };
+        out = out.replace(key, replacement);
+    }
+    out.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -672,6 +719,7 @@ mod tests {
             chat_type: "p2p".into(),
             message_type: "text".into(),
             content: r#"{"text": "hello world"}"#.into(),
+            mentions: vec![],
         };
         assert_eq!(parse_message_content(&msg), "hello world");
     }
@@ -687,8 +735,63 @@ mod tests {
             chat_type: "group".into(),
             message_type: "image".into(),
             content: r#"{"image_key": "abc123"}"#.into(),
+            mentions: vec![],
         };
         assert_eq!(parse_message_content(&msg), r#"{"image_key": "abc123"}"#);
+    }
+
+    fn mention(key: &str, open_id: &str, name: &str) -> crate::feishu::event::Mention {
+        crate::feishu::event::Mention {
+            key: Some(key.into()),
+            id: Some(crate::feishu::event::MentionId {
+                open_id: Some(open_id.into()),
+            }),
+            name: Some(name.into()),
+        }
+    }
+
+    #[test]
+    fn strip_mentions_drops_bot_and_names_others() {
+        let text = "@_user_1 你好 @_user_2 请 review";
+        let mentions = vec![
+            mention("@_user_1", "ou_bot", "cola"),
+            mention("@_user_2", "ou_li", "李明"),
+        ];
+        assert_eq!(strip_mentions(text, &mentions, "ou_bot"), "你好 @李明 请 review");
+    }
+
+    #[test]
+    fn strip_mentions_handles_no_mentions() {
+        assert_eq!(strip_mentions("hello", &[], "ou_bot"), "hello");
+    }
+
+    #[test]
+    fn strip_mentions_handles_bot_only_message() {
+        let text = "@_user_1 你能做什么？";
+        let mentions = vec![mention("@_user_1", "ou_bot", "cola")];
+        assert_eq!(strip_mentions(text, &mentions, "ou_bot"), "你能做什么？");
+    }
+
+    #[test]
+    fn strip_mentions_handles_mention_without_name() {
+        let text = "hi @_user_2";
+        let mentions = vec![crate::feishu::event::Mention {
+            key: Some("@_user_2".into()),
+            id: None,
+            name: None,
+        }];
+        assert_eq!(strip_mentions(text, &mentions, "ou_bot"), "hi");
+    }
+
+    #[test]
+    fn is_mentioned_detects_bot() {
+        let mentions = vec![
+            mention("@_user_1", "ou_bot", "cola"),
+            mention("@_user_2", "ou_li", "李明"),
+        ];
+        assert!(is_mentioned(&mentions, "ou_bot"));
+        assert!(!is_mentioned(&mentions, "ou_other"));
+        assert!(!is_mentioned(&[], "ou_bot"));
     }
 
     /// Build a WS frame the same way the encode helpers write it, then confirm

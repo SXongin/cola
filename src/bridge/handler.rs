@@ -35,6 +35,8 @@ pub struct App {
     pub inflight: Arc<Mutex<HashSet<String>>>,
     /// Default directory for new sessions (from `[bridge] work_dir`).
     pub work_dir: Option<String>,
+    /// cola's own Feishu open_id, used to recognise @mentions of the bot.
+    pub bot_open_id: Arc<Mutex<Option<String>>>,
     pub opencode: Arc<dyn opencode::Backend>,
     pub feishu: Arc<dyn feishu::Platform>,
 }
@@ -54,7 +56,12 @@ impl App {
             question_requests: Arc::new(Mutex::new(HashMap::new())),
             seen_event_ids: Arc::new(Mutex::new(HashSet::new())),
             inflight: Arc::new(Mutex::new(HashSet::new())),
-            work_dir: cfg.bridge.work_dir.clone().map(|p| p.to_string_lossy().to_string()),
+            work_dir: cfg
+                .bridge
+                .work_dir
+                .clone()
+                .map(|p| p.to_string_lossy().to_string()),
+            bot_open_id: Arc::new(Mutex::new(None)),
             opencode,
             feishu,
         })
@@ -76,93 +83,206 @@ impl App {
     }
 
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
+        // Discover cola's own open_id so @mentions of the bot can be recognised
+        // and stripped from prompt text (Feishu delivers them as `@_user_N`).
+        match self.feishu.bot_open_id().await {
+            Ok(id) => {
+                tracing::info!("bot open_id: {}", id);
+                *self.bot_open_id.lock().await = Some(id);
+            }
+            Err(e) => tracing::warn!("failed to fetch bot open_id, mention handling disabled: {}", e),
+        }
+
         let ws = Arc::clone(&self);
         let perm = Arc::clone(&self);
         let question = Arc::clone(&self);
-        let ws_task = tokio::spawn(async move { if let Err(e) = feishu::ws::event_loop(&ws).await { tracing::error!("WS: {}", e); } });
+        let ws_task = tokio::spawn(async move {
+            if let Err(e) = feishu::ws::event_loop(&ws).await {
+                tracing::error!("WS: {}", e);
+            }
+        });
         // Permissions are not delivered on the global SSE (typed PubSub only),
         // and a prompt can be blocked on an unanswered permission forever, so the
         // poller must run independently of any single prompt lifecycle.
-        let perm_task = tokio::spawn(async move { if let Err(e) = permission_poll_loop(&perm).await { tracing::error!("Permission poller: {}", e); } });
+        let perm_task = tokio::spawn(async move {
+            if let Err(e) = permission_poll_loop(&perm).await {
+                tracing::error!("Permission poller: {}", e);
+            }
+        });
         // Questions (the interactive `question` tool) work the same way: the AI
         // blocks until answered, the event never reaches the global SSE, so poll
         // and surface them as Feishu cards.
-        let question_task = tokio::spawn(async move { if let Err(e) = question_poll_loop(&question).await { tracing::error!("Question poller: {}", e); } });
+        let question_task = tokio::spawn(async move {
+            if let Err(e) = question_poll_loop(&question).await {
+                tracing::error!("Question poller: {}", e);
+            }
+        });
         tokio::try_join!(ws_task, perm_task, question_task)?;
         Ok(())
     }
 
-    pub async fn handle_message(self: &Arc<Self>, message_id: String, chat_id: String, chat_type: String, thread_id: Option<String>, text: String) {
+    pub async fn handle_message(
+        self: &Arc<Self>,
+        message_id: String,
+        chat_id: String,
+        chat_type: String,
+        thread_id: Option<String>,
+        text: String,
+    ) {
         let kind = ConversationKind::classify(&chat_type, thread_id.as_deref());
         let thread_key = kind.thread_key(&chat_id, thread_id.as_deref());
         if let Some(cmd) = command::parse_command(&text) {
-            if let Err(e) = self.handle_command(cmd, thread_key, &message_id, kind).await { tracing::error!("Cmd: {}", e); }
+            if let Err(e) = self.handle_command(cmd, thread_key, &message_id, kind).await {
+                tracing::error!("Cmd: {}", e);
+            }
             return;
         }
-        if let Err(e) = self.handle_prompt(thread_key, text, &message_id, kind).await { tracing::error!("Prompt: {}", e); }
+        if let Err(e) = self.handle_prompt(thread_key, text, &message_id, kind).await {
+            tracing::error!("Prompt: {}", e);
+        }
     }
 
-    async fn handle_command(self: &Arc<Self>, cmd: Command, thread_key: ThreadKey, message_id: &str, kind: ConversationKind) -> crate::error::Result<()> {
+    async fn handle_command(
+        self: &Arc<Self>,
+        cmd: Command,
+        thread_key: ThreadKey,
+        message_id: &str,
+        kind: ConversationKind,
+    ) -> crate::error::Result<()> {
         match cmd {
             Command::Dir(path) => {
-                let session = self.opencode.create_session(&self.opencode.new_session_input(Some(&path))).await?;
-                let entry = SessionEntry { thread_key: thread_key.clone(), session_id: session.id.clone(), name: path.clone(), directory: path.clone(), agent: None };
+                let session = self
+                    .opencode
+                    .create_session(&self.opencode.new_session_input(Some(&path)))
+                    .await?;
+                let entry = SessionEntry {
+                    thread_key: thread_key.clone(),
+                    session_id: session.id.clone(),
+                    name: path.clone(),
+                    directory: path.clone(),
+                    agent: None,
+                };
                 let mut store = self.sessions.lock().await;
                 store.set_active(entry);
                 store.persist()?;
-                self.feishu.reply_text(message_id, &format!("Session moved to {}", path)).await?;
+                self.feishu
+                    .reply_text(message_id, &format!("Session moved to {}", path))
+                    .await?;
             }
             Command::Switch(name) => {
                 let mut store = self.sessions.lock().await;
-                if store.switch(&thread_key, &name).is_some() { self.feishu.reply_text(message_id, &format!("Switched to \"{}\".", name)).await?; }
-                else { self.feishu.reply_text(message_id, &format!("No session matching \"{}\".", name)).await?; }
+                if store.switch(&thread_key, &name).is_some() {
+                    self.feishu
+                        .reply_text(message_id, &format!("Switched to \"{}\".", name))
+                        .await?;
+                } else {
+                    self.feishu
+                        .reply_text(message_id, &format!("No session matching \"{}\".", name))
+                        .await?;
+                }
             }
             Command::List => {
                 let store = self.sessions.lock().await;
                 let entries = store.list_thread(&thread_key);
-                if entries.is_empty() { self.feishu.reply_text(message_id, "No sessions.").await?; return Ok(()); }
+                if entries.is_empty() {
+                    self.feishu.reply_text(message_id, "No sessions.").await?;
+                    return Ok(());
+                }
                 let active_id = store.get_active(&thread_key).map(|e| &e.session_id);
                 let mut list = String::from("**Sessions:**\n");
                 for e in &entries {
-                    let mark = if active_id.map_or(false, |id| id == &e.session_id) { " (active)" } else { "" };
-                    list.push_str(&format!("- {} [{}]{mark}\n  dir: {}\n", e.name, &e.session_id[..e.session_id.len().min(12)], e.directory));
+                    let mark = if active_id.map_or(false, |id| id == &e.session_id) {
+                        " (active)"
+                    } else {
+                        ""
+                    };
+                    list.push_str(&format!(
+                        "- {} [{}]{mark}\n  dir: {}\n",
+                        e.name,
+                        &e.session_id[..e.session_id.len().min(12)],
+                        e.directory
+                    ));
                 }
                 self.feishu.reply_text(message_id, &list).await?;
             }
             Command::New(name) => {
                 let new_name = name.unwrap_or_else(|| format!("sess-{}", uuid::Uuid::new_v4()));
                 let directory = self.default_session_directory();
-                let session = self.opencode.create_session(&self.opencode.new_session_input(Some(&directory))).await?;
-                let entry = SessionEntry { thread_key: thread_key.clone(), session_id: session.id.clone(), name: new_name.clone(), directory, agent: None };
+                let session = self
+                    .opencode
+                    .create_session(&self.opencode.new_session_input(Some(&directory)))
+                    .await?;
+                let entry = SessionEntry {
+                    thread_key: thread_key.clone(),
+                    session_id: session.id.clone(),
+                    name: new_name.clone(),
+                    directory,
+                    agent: None,
+                };
                 let mut store = self.sessions.lock().await;
                 store.set_active(entry);
                 store.persist()?;
-                self.feishu.reply_text(message_id, &format!("Created \"{}\".", new_name)).await?;
+                self.feishu
+                    .reply_text(message_id, &format!("Created \"{}\".", new_name))
+                    .await?;
             }
             Command::Name(name) => {
                 let mut store = self.sessions.lock().await;
-                if let Some(entry) = store.get_active(&thread_key) { let mut e = entry.clone(); e.name = name.clone(); store.set_active(e); store.persist()?; }
-                self.feishu.reply_text(message_id, &format!("Renamed to \"{}\".", name)).await?;
+                if let Some(entry) = store.get_active(&thread_key) {
+                    let mut e = entry.clone();
+                    e.name = name.clone();
+                    store.set_active(e);
+                    store.persist()?;
+                }
+                self.feishu
+                    .reply_text(message_id, &format!("Renamed to \"{}\".", name))
+                    .await?;
             }
             Command::Stop => {
-                if let Some(id) = self.get_session_id(&thread_key).await { self.opencode.interrupt(&id).await?; self.feishu.reply_text(message_id, "Interrupted.").await?; }
+                if let Some(id) = self.get_session_id(&thread_key).await {
+                    self.opencode.interrupt(&id).await?;
+                    self.feishu.reply_text(message_id, "Interrupted.").await?;
+                }
             }
             Command::Compact => {
-                if let Some(id) = self.get_session_id(&thread_key).await { self.opencode.compact(&id).await?; self.feishu.reply_text(message_id, "Compacting...").await?; }
+                if let Some(id) = self.get_session_id(&thread_key).await {
+                    self.opencode.compact(&id).await?;
+                    self.feishu.reply_text(message_id, "Compacting...").await?;
+                }
             }
             Command::Agent(name) => {
-                if let Some(id) = self.get_session_id(&thread_key).await { self.opencode.switch_agent(&id, &name).await?; self.feishu.reply_text(message_id, &format!("Agent: {}", name)).await?; }
+                if let Some(id) = self.get_session_id(&thread_key).await {
+                    self.opencode.switch_agent(&id, &name).await?;
+                    self.feishu
+                        .reply_text(message_id, &format!("Agent: {}", name))
+                        .await?;
+                }
             }
             Command::Model(name) => {
-                if let Some(id) = self.get_session_id(&thread_key).await { self.opencode.switch_model(&id, &name).await?; self.feishu.reply_text(message_id, &format!("Model: {}", name)).await?; }
+                if let Some(id) = self.get_session_id(&thread_key).await {
+                    self.opencode.switch_model(&id, &name).await?;
+                    self.feishu
+                        .reply_text(message_id, &format!("Model: {}", name))
+                        .await?;
+                }
             }
-            Command::Help => { self.feishu.reply_text(message_id, &command::help_text()).await?; }
-            Command::Forward(text) => { self.handle_prompt(thread_key, text, message_id, kind).await?; }
+            Command::Help => {
+                self.feishu.reply_text(message_id, &command::help_text()).await?;
+            }
+            Command::Forward(text) => {
+                self.handle_prompt(thread_key, text, message_id, kind).await?;
+            }
         }
         Ok(())
     }
 
-    async fn handle_prompt(self: &Arc<Self>, thread_key: ThreadKey, text: String, message_id: &str, kind: ConversationKind) -> crate::error::Result<()> {
+    async fn handle_prompt(
+        self: &Arc<Self>,
+        thread_key: ThreadKey,
+        text: String,
+        message_id: &str,
+        kind: ConversationKind,
+    ) -> crate::error::Result<()> {
         let (mut session_id, created) = self.get_or_create_session(&thread_key, &text).await?;
 
         // First message on a group's top level created a lobby session: reply
@@ -178,13 +298,18 @@ impl App {
             let mut inflight = self.inflight.lock().await;
             if inflight.contains(&session_id) {
                 drop(inflight);
-                let _ = self.feishu.reply_text(message_id, "⏳ 上一条消息还在处理中，请稍等它完成后重发。").await;
+                let _ = self
+                    .feishu
+                    .reply_text(message_id, "⏳ 上一条消息还在处理中，请稍等它完成后重发。")
+                    .await;
                 return Ok(());
             }
             inflight.insert(session_id.clone());
         }
 
-        let loading = crate::feishu::card::CardBuilder::new(&text.chars().take(50).collect::<String>()).with_state(crate::feishu::card::CardState::Loading).build();
+        let loading = crate::feishu::card::CardBuilder::new(&text.chars().take(50).collect::<String>())
+            .with_state(crate::feishu::card::CardState::Loading)
+            .build();
         let card_msg_id = self.feishu.reply_card(message_id, &loading).await?;
         {
             let mut ids = self.card_message_ids.lock().await;
@@ -321,11 +446,21 @@ impl App {
     }
 
     async fn get_session_id(&self, thread_key: &ThreadKey) -> Option<String> {
-        self.sessions.lock().await.get_active(thread_key).map(|e| e.session_id.clone())
+        self.sessions
+            .lock()
+            .await
+            .get_active(thread_key)
+            .map(|e| e.session_id.clone())
     }
 
-    async fn get_or_create_session(&self, thread_key: &ThreadKey, text: &str) -> crate::error::Result<(String, bool)> {
-        if let Some(id) = self.get_session_id(thread_key).await { return Ok((id, false)); }
+    async fn get_or_create_session(
+        &self,
+        thread_key: &ThreadKey,
+        text: &str,
+    ) -> crate::error::Result<(String, bool)> {
+        if let Some(id) = self.get_session_id(thread_key).await {
+            return Ok((id, false));
+        }
         let directory = self.default_session_directory();
         let id = self.create_fresh_session(thread_key, text, directory).await?;
         Ok((id, true))
@@ -363,7 +498,10 @@ impl App {
         let session_id = value.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
         // Carried from the permission card for the result display
         let perm_label = value.get("perm_label").and_then(|v| v.as_str()).unwrap_or("");
-        let perm_color = value.get("perm_color").and_then(|v| v.as_str()).unwrap_or("green");
+        let perm_color = value
+            .get("perm_color")
+            .and_then(|v| v.as_str())
+            .unwrap_or("green");
         let perm_body = value.get("perm_body").and_then(|v| v.as_str()).unwrap_or("");
 
         let mut result_card = None;
@@ -377,7 +515,11 @@ impl App {
                         let store = self.sessions.lock().await;
                         store.directory_for_session(&session_id)
                     };
-                    if let Err(e) = self.opencode.reply_permission(req_id, reply, directory.as_deref()).await {
+                    if let Err(e) = self
+                        .opencode
+                        .reply_permission(req_id, reply, directory.as_deref())
+                        .await
+                    {
                         tracing::error!("perm reply failed: {}", e);
                     } else {
                         tracing::info!("Permission reply sent: {} session={}", reply, session_id);
@@ -403,8 +545,13 @@ impl App {
                     };
                     match reply {
                         "answer" => {
-                            let index = value.get("question_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                            let answer = value.get("answer").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let index =
+                                value.get("question_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                            let answer = value
+                                .get("answer")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
                             // Build answers in order: the chosen option for the
                             // clicked question, empty for the rest.
                             let count = {
@@ -413,12 +560,25 @@ impl App {
                             };
                             let mut answers: Vec<Vec<String>> = Vec::new();
                             for i in 0..count {
-                                answers.push(if i == index { vec![answer.clone()] } else { Vec::new() });
+                                answers.push(if i == index {
+                                    vec![answer.clone()]
+                                } else {
+                                    Vec::new()
+                                });
                             }
-                            if let Err(e) = self.opencode.reply_question(req_id, &answers, directory.as_deref()).await {
+                            if let Err(e) = self
+                                .opencode
+                                .reply_question(req_id, &answers, directory.as_deref())
+                                .await
+                            {
                                 tracing::error!("question reply failed: {}", e);
                             } else {
-                                tracing::info!("Question answered: {} session={} -> {:?}", req_id, session_id, answers);
+                                tracing::info!(
+                                    "Question answered: {} session={} -> {:?}",
+                                    req_id,
+                                    session_id,
+                                    answers
+                                );
                                 self.question_requests.lock().await.remove(req_id);
                                 result_card = Some(serde_json::json!({
                                     "config": { "wide_screen_mode": true },
@@ -428,7 +588,8 @@ impl App {
                             }
                         }
                         "reject" => {
-                            if let Err(e) = self.opencode.reject_question(req_id, directory.as_deref()).await {
+                            if let Err(e) = self.opencode.reject_question(req_id, directory.as_deref()).await
+                            {
                                 tracing::error!("question reject failed: {}", e);
                             } else {
                                 tracing::info!("Question rejected: {}", req_id);
@@ -459,10 +620,22 @@ mod test_support {
     #[derive(Debug, Clone)]
     #[allow(dead_code)] // the recording adapter captures full call details for assertions
     pub enum PlatformCall {
-        ReplyCard { reply_to: String, card: serde_json::Value },
-        SendCard { receive_id: String, card: serde_json::Value },
-        UpdateMessage { message_id: String, card: serde_json::Value },
-        ReplyText { message_id: String, text: String },
+        ReplyCard {
+            reply_to: String,
+            card: serde_json::Value,
+        },
+        SendCard {
+            receive_id: String,
+            card: serde_json::Value,
+        },
+        UpdateMessage {
+            message_id: String,
+            card: serde_json::Value,
+        },
+        ReplyText {
+            message_id: String,
+            text: String,
+        },
     }
 
     /// Records every card cola would send, instead of posting to Feishu.
@@ -472,7 +645,9 @@ mod test_support {
 
     impl RecordingPlatform {
         pub fn new() -> Self {
-            Self { calls: Arc::new(tokio::sync::Mutex::new(Vec::new())) }
+            Self {
+                calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            }
         }
     }
 
@@ -483,7 +658,10 @@ mod test_support {
         }
 
         async fn reply_card(&self, reply_to: &str, card: &serde_json::Value) -> crate::error::Result<String> {
-            self.calls.lock().await.push(PlatformCall::ReplyCard { reply_to: reply_to.into(), card: card.clone() });
+            self.calls.lock().await.push(PlatformCall::ReplyCard {
+                reply_to: reply_to.into(),
+                card: card.clone(),
+            });
             Ok("msg_reply".into())
         }
 
@@ -493,18 +671,35 @@ mod test_support {
             receive_id: &str,
             card: &serde_json::Value,
         ) -> crate::error::Result<String> {
-            self.calls.lock().await.push(PlatformCall::SendCard { receive_id: receive_id.into(), card: card.clone() });
+            self.calls.lock().await.push(PlatformCall::SendCard {
+                receive_id: receive_id.into(),
+                card: card.clone(),
+            });
             Ok("msg_sent".into())
         }
 
-        async fn update_message(&self, message_id: &str, card: &serde_json::Value) -> crate::error::Result<()> {
-            self.calls.lock().await.push(PlatformCall::UpdateMessage { message_id: message_id.into(), card: card.clone() });
+        async fn update_message(
+            &self,
+            message_id: &str,
+            card: &serde_json::Value,
+        ) -> crate::error::Result<()> {
+            self.calls.lock().await.push(PlatformCall::UpdateMessage {
+                message_id: message_id.into(),
+                card: card.clone(),
+            });
             Ok(())
         }
 
         async fn reply_text(&self, message_id: &str, text: &str) -> crate::error::Result<String> {
-            self.calls.lock().await.push(PlatformCall::ReplyText { message_id: message_id.into(), text: text.into() });
+            self.calls.lock().await.push(PlatformCall::ReplyText {
+                message_id: message_id.into(),
+                text: text.into(),
+            });
             Ok("msg_text".into())
+        }
+
+        async fn bot_open_id(&self) -> crate::error::Result<String> {
+            Ok("ou_test_bot".into())
         }
     }
 
@@ -545,16 +740,37 @@ mod test_support {
             opencode::client::CreateSessionInput {
                 id: None,
                 agent: None,
-                model: Some(opencode::client::ModelInfo { id: "m".into(), provider_id: "p".into(), variant: None }),
-                location: directory.map(|d| opencode::client::Location { directory: d.to_string() }),
+                model: Some(opencode::client::ModelInfo {
+                    id: "m".into(),
+                    provider_id: "p".into(),
+                    variant: None,
+                }),
+                location: directory.map(|d| opencode::client::Location {
+                    directory: d.to_string(),
+                }),
             }
         }
 
-        async fn create_session(&self, _i: &opencode::client::CreateSessionInput) -> crate::error::Result<opencode::client::Session> {
-            Ok(opencode::client::Session { id: self.session_id.clone(), project_id: None, agent: None, title: None, location: None, cost: None, time: None })
+        async fn create_session(
+            &self,
+            _i: &opencode::client::CreateSessionInput,
+        ) -> crate::error::Result<opencode::client::Session> {
+            Ok(opencode::client::Session {
+                id: self.session_id.clone(),
+                project_id: None,
+                agent: None,
+                title: None,
+                location: None,
+                cost: None,
+                time: None,
+            })
         }
 
-        async fn prompt(&self, session_id: &str, _text: &str) -> crate::error::Result<opencode::client::PromptResponse> {
+        async fn prompt(
+            &self,
+            session_id: &str,
+            _text: &str,
+        ) -> crate::error::Result<opencode::client::PromptResponse> {
             if self.stale_session_404 && session_id != self.session_id {
                 return Err(crate::error::BridgeError::SessionNotFound(session_id.to_string()));
             }
@@ -571,7 +787,10 @@ mod test_support {
             })
         }
 
-        async fn messages(&self, _session_id: &str) -> crate::error::Result<Vec<opencode::client::SessionMessage>> {
+        async fn messages(
+            &self,
+            _session_id: &str,
+        ) -> crate::error::Result<Vec<opencode::client::SessionMessage>> {
             let now = chrono::Utc::now().timestamp_millis();
             Ok(vec![opencode::client::SessionMessage {
                 info: opencode::client::MessageInfo {
@@ -584,15 +803,26 @@ mod test_support {
             }])
         }
 
-        async fn list_permissions(&self, _d: Option<&str>) -> crate::error::Result<Vec<opencode::client::PermissionRequest>> {
+        async fn list_permissions(
+            &self,
+            _d: Option<&str>,
+        ) -> crate::error::Result<Vec<opencode::client::PermissionRequest>> {
             Ok(self.permissions.clone())
         }
 
-        async fn list_questions(&self, _d: Option<&str>) -> crate::error::Result<Vec<opencode::client::QuestionRequest>> {
+        async fn list_questions(
+            &self,
+            _d: Option<&str>,
+        ) -> crate::error::Result<Vec<opencode::client::QuestionRequest>> {
             Ok(self.questions.clone())
         }
 
-        async fn reply_question(&self, request_id: &str, answers: &[Vec<String>], _d: Option<&str>) -> crate::error::Result<()> {
+        async fn reply_question(
+            &self,
+            request_id: &str,
+            answers: &[Vec<String>],
+            _d: Option<&str>,
+        ) -> crate::error::Result<()> {
             self.reply_question_calls
                 .lock()
                 .await
@@ -608,14 +838,27 @@ mod test_support {
             Ok(())
         }
 
-        async fn reply_permission(&self, _r: &str, _reply: &str, _d: Option<&str>) -> crate::error::Result<()> {
+        async fn reply_permission(
+            &self,
+            _r: &str,
+            _reply: &str,
+            _d: Option<&str>,
+        ) -> crate::error::Result<()> {
             Ok(())
         }
 
-        async fn interrupt(&self, _s: &str) -> crate::error::Result<()> { Ok(()) }
-        async fn compact(&self, _s: &str) -> crate::error::Result<()> { Ok(()) }
-        async fn switch_agent(&self, _s: &str, _a: &str) -> crate::error::Result<()> { Ok(()) }
-        async fn switch_model(&self, _s: &str, _m: &str) -> crate::error::Result<()> { Ok(()) }
+        async fn interrupt(&self, _s: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn compact(&self, _s: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn switch_agent(&self, _s: &str, _a: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn switch_model(&self, _s: &str, _m: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
     }
 
     pub fn test_config(session_file: &std::path::Path) -> crate::config::Config {
@@ -626,8 +869,14 @@ mod test_support {
                 password: None,
                 model: "test/model".into(),
             },
-            feishu: crate::config::FeishuConfig { app_id: "app".into(), app_secret: "secret".into() },
-            bridge: crate::config::BridgeConfig { session_file: session_file.to_path_buf(), work_dir: None },
+            feishu: crate::config::FeishuConfig {
+                app_id: "app".into(),
+                app_secret: "secret".into(),
+            },
+            bridge: crate::config::BridgeConfig {
+                session_file: session_file.to_path_buf(),
+                work_dir: None,
+            },
         }
     }
 
@@ -651,7 +900,10 @@ mod integration_tests {
     use super::test_support::*;
     use super::*;
 
-    async fn build_app(cfg: crate::config::Config, backend: MockBackend) -> (Arc<App>, Arc<RecordingPlatform>) {
+    async fn build_app(
+        cfg: crate::config::Config,
+        backend: MockBackend,
+    ) -> (Arc<App>, Arc<RecordingPlatform>) {
         let platform = Arc::new(RecordingPlatform::new());
         let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
         (app, platform)
@@ -673,16 +925,26 @@ mod integration_tests {
         let cfg = test_config(&dir.path().join("sessions.json"));
         let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
-        app.handle_message("msg_1".into(), "chat_1".into(), "p2p".into(), None, "分析一下目录".into()).await;
+        app.handle_message(
+            "msg_1".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "分析一下目录".into(),
+        )
+        .await;
 
         let calls = platform.calls.lock().await.clone();
         // First call must be the Loading reply card.
         assert!(matches!(calls.first(), Some(PlatformCall::ReplyCard { .. })));
         // At least one card update (flush) must follow.
-        let updates: Vec<_> = calls.iter().filter_map(|c| match c {
-            PlatformCall::UpdateMessage { card, .. } => Some(card.clone()),
-            _ => None,
-        }).collect();
+        let updates: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::UpdateMessage { card, .. } => Some(card.clone()),
+                _ => None,
+            })
+            .collect();
         assert!(!updates.is_empty(), "expected card updates, got: {:?}", calls);
 
         let final_card = updates.last().unwrap().clone();
@@ -690,7 +952,11 @@ mod integration_tests {
         assert!(text.contains("✅"), "final header should be Done: {}", text);
         assert!(text.contains("推理过程"), "reasoning panel missing: {}", text);
         assert!(text.contains("bash"), "tool panel missing: {}", text);
-        assert!(text.contains("当前目录有 src/ 和 Cargo.toml。"), "text missing: {}", text);
+        assert!(
+            text.contains("当前目录有 src/ 和 Cargo.toml。"),
+            "text missing: {}",
+            text
+        );
         assert!(text.contains("ls -la"), "tool input missing: {}", text);
     }
 
@@ -703,14 +969,22 @@ mod integration_tests {
         backend.prompt_error = Some("Streaming response failed: [503] The request queue is full.".into());
         let (app, platform) = build_app(cfg, backend).await;
 
-        app.handle_message("msg_1".into(), "chat_1".into(), "p2p".into(), None, "hi".into()).await;
+        app.handle_message("msg_1".into(), "chat_1".into(), "p2p".into(), None, "hi".into())
+            .await;
 
         let calls = platform.calls.lock().await.clone();
-        let updates: Vec<_> = calls.iter().filter_map(|c| match c {
-            PlatformCall::UpdateMessage { card, .. } => Some(card.clone()),
-            _ => None,
-        }).collect();
-        assert!(!updates.is_empty(), "expected an error card update, got: {:?}", calls);
+        let updates: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::UpdateMessage { card, .. } => Some(card.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !updates.is_empty(),
+            "expected an error card update, got: {:?}",
+            calls
+        );
         let card = updates.last().unwrap().to_string();
         assert!(card.contains("❌"), "error card header missing: {}", card);
         assert!(card.contains("503"), "error text missing: {}", card);
@@ -733,7 +1007,8 @@ mod integration_tests {
         let (app, platform) = build_app(cfg, backend).await;
 
         // Seed a session + accumulator so the poller has a reply target.
-        app.handle_message("msg_1".into(), "chat_1".into(), "p2p".into(), None, "hi".into()).await;
+        app.handle_message("msg_1".into(), "chat_1".into(), "p2p".into(), None, "hi".into())
+            .await;
 
         // Run the permission poller briefly.
         tokio::spawn({
@@ -746,7 +1021,9 @@ mod integration_tests {
 
         let calls = platform.calls.lock().await.clone();
         let perm_card = calls.iter().find_map(|c| match c {
-            PlatformCall::ReplyCard { card, .. } if card.to_string().contains("Permission Required") => Some(card.clone()),
+            PlatformCall::ReplyCard { card, .. } if card.to_string().contains("Permission Required") => {
+                Some(card.clone())
+            }
             _ => None,
         });
         let perm_card = perm_card.expect("permission card should have been sent");
@@ -895,7 +1172,13 @@ mod integration_tests {
         });
         let backend = Arc::new(backend);
         let app = Arc::new(App::new(cfg, backend.clone(), Arc::new(cola_platform)).unwrap());
-        Some(LiveHarness { app, backend, test_bot, group_chat_id, _dir: dir })
+        Some(LiveHarness {
+            app,
+            backend,
+            test_bot,
+            group_chat_id,
+            _dir: dir,
+        })
     }
 
     /// Live end-to-end wire check with a real Feishu bot.
@@ -913,7 +1196,9 @@ mod integration_tests {
     #[tokio::test]
     #[ignore = "requires a second Feishu bot + a test group; see test docs"]
     async fn live_e2e_real_bot_renders_expected_cards() {
-        let Some(harness) = live_setup(MockBackend::new(realistic_parts())).await else { return };
+        let Some(harness) = live_setup(MockBackend::new(realistic_parts())).await else {
+            return;
+        };
 
         // The test bot sends a real message so cola has a real reply target.
         let prompt = "自动测试：请分析一下目录，然后汇报。";
@@ -958,14 +1243,22 @@ mod integration_tests {
                 question: question_text.clone(),
                 header: "下一步".into(),
                 options: vec![
-                    opencode::client::QuestionOption { label: "继续".into(), description: String::new() },
-                    opencode::client::QuestionOption { label: "停止".into(), description: String::new() },
+                    opencode::client::QuestionOption {
+                        label: "继续".into(),
+                        description: String::new(),
+                    },
+                    opencode::client::QuestionOption {
+                        label: "停止".into(),
+                        description: String::new(),
+                    },
                 ],
                 multiple: None,
                 custom: None,
             }],
         }];
-        let Some(harness) = live_setup(backend).await else { return };
+        let Some(harness) = live_setup(backend).await else {
+            return;
+        };
 
         // Give cola a session + reply target to work against.
         harness.send_and_process("自动测试：请回答我的问题。").await;
@@ -1009,13 +1302,16 @@ mod integration_tests {
             "answer": "继续",
         });
         let result = harness.app.handle_card_action(value).await;
-        assert!(result.is_some(), "clicking an option should produce a result card");
+        assert!(
+            result.is_some(),
+            "clicking an option should produce a result card"
+        );
 
         let calls = harness.backend.reply_question_calls.lock().await.clone();
         assert!(
-            calls.iter().any(|(req, answers)| {
-                req == "que_live" && answers == &vec![vec!["继续".to_string()]]
-            }),
+            calls
+                .iter()
+                .any(|(req, answers)| { req == "que_live" && answers == &vec![vec!["继续".to_string()]] }),
             "the chosen answer was not posted to the backend: {:?}",
             calls
         );
@@ -1031,7 +1327,8 @@ mod integration_tests {
         // No chdir: the session directory must come from [bridge] work_dir, not
         // the process cwd.
         let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-        app.handle_message("msg_1".into(), "chat_1".into(), "p2p".into(), None, "hi".into()).await;
+        app.handle_message("msg_1".into(), "chat_1".into(), "p2p".into(), None, "hi".into())
+            .await;
 
         let thread = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
         let entry = app
@@ -1052,14 +1349,24 @@ mod integration_tests {
         let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
         // A top-level group message (no thread_id) is the group "lobby".
-        app.handle_message("msg_1".into(), "oc_group_1".into(), "group".into(), None, "hi".into()).await;
+        app.handle_message(
+            "msg_1".into(),
+            "oc_group_1".into(),
+            "group".into(),
+            None,
+            "hi".into(),
+        )
+        .await;
 
         // Guidance text is replied once.
         let calls = platform.calls.lock().await.clone();
-        let guidance: Vec<_> = calls.iter().filter_map(|c| match c {
-            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
-            _ => None,
-        }).collect();
+        let guidance: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
         assert!(
             guidance.iter().any(|t| t.contains("已创建群会话")),
             "expected lobby guidance, got: {:?}",
@@ -1068,7 +1375,13 @@ mod integration_tests {
 
         // Session lives under the lobby key (chat_id == thread_id).
         let lobby_key = crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into());
-        let entry = app.sessions.lock().await.get_active(&lobby_key).cloned().expect("lobby session created");
+        let entry = app
+            .sessions
+            .lock()
+            .await
+            .get_active(&lobby_key)
+            .cloned()
+            .expect("lobby session created");
         assert_eq!(entry.session_id, "ses_test");
     }
 
@@ -1079,15 +1392,37 @@ mod integration_tests {
         let cfg = test_config(&dir.path().join("sessions.json"));
         let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
-        app.handle_message("msg_1".into(), "oc_group_1".into(), "group".into(), None, "hi".into()).await;
-        app.handle_message("msg_2".into(), "oc_group_1".into(), "group".into(), None, "again".into()).await;
+        app.handle_message(
+            "msg_1".into(),
+            "oc_group_1".into(),
+            "group".into(),
+            None,
+            "hi".into(),
+        )
+        .await;
+        app.handle_message(
+            "msg_2".into(),
+            "oc_group_1".into(),
+            "group".into(),
+            None,
+            "again".into(),
+        )
+        .await;
 
         let calls = platform.calls.lock().await.clone();
-        let guidance: Vec<_> = calls.iter().filter_map(|c| match c {
-            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
-            _ => None,
-        }).collect();
-        assert_eq!(guidance.len(), 1, "guidance must be one-time, got: {:?}", guidance);
+        let guidance: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            guidance.len(),
+            1,
+            "guidance must be one-time, got: {:?}",
+            guidance
+        );
     }
 
     #[tokio::test]
@@ -1097,14 +1432,22 @@ mod integration_tests {
         let cfg = test_config(&dir.path().join("sessions.json"));
         let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
-        app.handle_message("msg_1".into(), "oc_p2p_1".into(), "p2p".into(), None, "hi".into()).await;
+        app.handle_message("msg_1".into(), "oc_p2p_1".into(), "p2p".into(), None, "hi".into())
+            .await;
 
         let calls = platform.calls.lock().await.clone();
-        let guidance: Vec<_> = calls.iter().filter_map(|c| match c {
-            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
-            _ => None,
-        }).collect();
-        assert!(guidance.is_empty(), "p2p must not show lobby guidance, got: {:?}", guidance);
+        let guidance: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            guidance.is_empty(),
+            "p2p must not show lobby guidance, got: {:?}",
+            guidance
+        );
     }
 
     #[tokio::test]
@@ -1136,12 +1479,38 @@ mod integration_tests {
 
         // Lobby message routes to the lobby session; topic message routes to
         // the topic session — never creating or switching across.
-        app.handle_message("msg_1".into(), "oc_group_1".into(), "group".into(), None, "hi".into()).await;
-        app.handle_message("msg_2".into(), "oc_group_1".into(), "group".into(), Some("omt_topic_1".into()), "refactor".into()).await;
+        app.handle_message(
+            "msg_1".into(),
+            "oc_group_1".into(),
+            "group".into(),
+            None,
+            "hi".into(),
+        )
+        .await;
+        app.handle_message(
+            "msg_2".into(),
+            "oc_group_1".into(),
+            "group".into(),
+            Some("omt_topic_1".into()),
+            "refactor".into(),
+        )
+        .await;
 
         let store = app.sessions.lock().await;
-        let lobby = store.get_active(&crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into())).cloned().unwrap();
-        let topic = store.get_active(&crate::config::ThreadKey::new("oc_group_1".into(), "omt_topic_1".into())).cloned().unwrap();
+        let lobby = store
+            .get_active(&crate::config::ThreadKey::new(
+                "oc_group_1".into(),
+                "oc_group_1".into(),
+            ))
+            .cloned()
+            .unwrap();
+        let topic = store
+            .get_active(&crate::config::ThreadKey::new(
+                "oc_group_1".into(),
+                "omt_topic_1".into(),
+            ))
+            .cloned()
+            .unwrap();
         assert_eq!(lobby.session_id, "ses_lobby");
         assert_eq!(topic.session_id, "ses_topic");
         assert_ne!(lobby.thread_key, topic.thread_key);
@@ -1149,11 +1518,18 @@ mod integration_tests {
 
         // No guidance: the lobby session already existed.
         let calls = platform.calls.lock().await.clone();
-        let guidance: Vec<_> = calls.iter().filter_map(|c| match c {
-            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
-            _ => None,
-        }).collect();
-        assert!(guidance.is_empty(), "no guidance when lobby exists, got: {:?}", guidance);
+        let guidance: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            guidance.is_empty(),
+            "no guidance when lobby exists, got: {:?}",
+            guidance
+        );
     }
 
     #[tokio::test]
@@ -1183,12 +1559,32 @@ mod integration_tests {
             store.persist().unwrap();
         }
 
-        app.handle_message("msg_1".into(), "oc_p2p_1".into(), "p2p".into(), None, "hi".into()).await;
-        app.handle_message("msg_2".into(), "oc_p2p_1".into(), "p2p".into(), Some("omt_p2p_1".into()), "topic hi".into()).await;
+        app.handle_message("msg_1".into(), "oc_p2p_1".into(), "p2p".into(), None, "hi".into())
+            .await;
+        app.handle_message(
+            "msg_2".into(),
+            "oc_p2p_1".into(),
+            "p2p".into(),
+            Some("omt_p2p_1".into()),
+            "topic hi".into(),
+        )
+        .await;
 
         let store = app.sessions.lock().await;
-        let top = store.get_active(&crate::config::ThreadKey::new("oc_p2p_1".into(), "oc_p2p_1".into())).cloned().unwrap();
-        let topic = store.get_active(&crate::config::ThreadKey::new("oc_p2p_1".into(), "omt_p2p_1".into())).cloned().unwrap();
+        let top = store
+            .get_active(&crate::config::ThreadKey::new(
+                "oc_p2p_1".into(),
+                "oc_p2p_1".into(),
+            ))
+            .cloned()
+            .unwrap();
+        let topic = store
+            .get_active(&crate::config::ThreadKey::new(
+                "oc_p2p_1".into(),
+                "omt_p2p_1".into(),
+            ))
+            .cloned()
+            .unwrap();
         assert_eq!(top.session_id, "ses_top");
         assert_eq!(topic.session_id, "ses_p2p_topic");
         assert_ne!(top.thread_key, topic.thread_key);
@@ -1227,7 +1623,8 @@ mod integration_tests {
             store.persist().unwrap();
         }
 
-        app.handle_message("msg_1".into(), "chat_1".into(), "p2p".into(), None, "hi".into()).await;
+        app.handle_message("msg_1".into(), "chat_1".into(), "p2p".into(), None, "hi".into())
+            .await;
 
         // The prompt on the stale session 404s; cola must recreate the session
         // and retry, landing on a Done card instead of an error.
@@ -1272,8 +1669,14 @@ mod integration_tests {
                     question: "选择目录".into(),
                     header: "目录".into(),
                     options: vec![
-                        opencode::client::QuestionOption { label: "/a".into(), description: String::new() },
-                        opencode::client::QuestionOption { label: "/b".into(), description: String::new() },
+                        opencode::client::QuestionOption {
+                            label: "/a".into(),
+                            description: String::new(),
+                        },
+                        opencode::client::QuestionOption {
+                            label: "/b".into(),
+                            description: String::new(),
+                        },
                     ],
                     multiple: None,
                     custom: None,

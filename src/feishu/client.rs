@@ -120,7 +120,11 @@ impl Client {
 
         let status = resp.status();
         let text = resp.text().await?;
-        tracing::debug!("WS endpoint response: {} body={}", status, &text[..text.len().min(500)]);
+        tracing::debug!(
+            "WS endpoint response: {} body={}",
+            status,
+            &text[..text.len().min(500)]
+        );
 
         let resp_data: WsEndpointResponse = serde_json::from_str(&text).map_err(|e| {
             crate::error::BridgeError::Feishu(format!("parse ws endpoint: {e} — body: {text}"))
@@ -136,8 +140,49 @@ impl Client {
         }
     }
 
+    /// The bot's own open_id, used to recognise @mentions of cola itself.
+    /// Fetches it from the bot info API on each call; the caller caches the
+    /// result on `App.bot_open_id` at startup.
+    pub async fn bot_open_id(&self) -> crate::error::Result<String> {
+        let token = self.get_access_token().await?;
+        let resp = self
+            .http
+            .get("https://open.feishu.cn/open-apis/bot/v3/info")
+            .bearer_auth(&token)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let text = resp.text().await?;
+        tracing::debug!(
+            "bot info response: {} body={}",
+            status,
+            &text[..text.len().min(500)]
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| crate::error::BridgeError::Feishu(format!("parse bot info: {e} — body: {text}")))?;
+        let code = parsed["code"].as_i64().unwrap_or(-1);
+        if code != 0 {
+            return Err(crate::error::BridgeError::Feishu(format!(
+                "bot info error {code} — body: {text}"
+            )));
+        }
+        parsed["bot"]["open_id"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                crate::error::BridgeError::Feishu(format!("bot info missing bot.open_id — body: {text}"))
+            })
+    }
+
     /// Send a text message to a user (by open_id) or chat.
-    pub async fn send_text(&self, receive_id_type: &str, receive_id: &str, text: &str) -> crate::error::Result<String> {
+    pub async fn send_text(
+        &self,
+        receive_id_type: &str,
+        receive_id: &str,
+        text: &str,
+    ) -> crate::error::Result<String> {
         let token = self.get_access_token().await?;
         let body = serde_json::json!({
             "receive_id": receive_id,
