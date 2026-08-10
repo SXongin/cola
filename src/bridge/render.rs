@@ -95,26 +95,30 @@ pub(crate) fn render_new_turn_parts(
         }
         let Some(parts) = m.parts.as_array() else { continue };
         for part in parts {
-            let ptype = part.get("type").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+            let ptype = part
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string();
             // Reasoning/text parts are written with empty text first, then
             // updated with the full content. Only render once they have content,
             // otherwise we'd freeze the placeholder version.
             if ptype == "reasoning" || ptype == "text" {
-                let has_text = part
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .map(|s| !s.is_empty())
-                    .unwrap_or(false);
-                if !has_text {
+                let Some(t) = part.get("text").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if t.is_empty() {
                     continue;
                 }
-                let part_id = part.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
-                if let Some(id) = &part_id {
-                    if acc.rendered_parts.contains(id) {
-                        continue;
-                    }
-                    acc.rendered_parts.insert(id.clone());
+                // OpenCode part payloads carry NO `id` (the DB column id is not
+                // serialised), so dedupe on content: the same part re-fetched
+                // (poll + final render) must not append twice. This is what
+                // previously doubled the card text (81 → 162 chars).
+                let dedup_key = format!("{}:{}", ptype, t);
+                if acc.rendered_parts.contains(&dedup_key) {
+                    continue;
                 }
+                acc.rendered_parts.insert(dedup_key);
                 render_part(acc, part);
                 rendered_any = true;
                 continue;
@@ -305,32 +309,42 @@ mod tests {
         let mut acc = StreamAccumulator::new("test");
         acc.submit_epoch_ms = Some(epoch);
 
-        let msgs = |status: &str, output: &str| vec![SessionMessage {
-            info: MessageInfo {
-                id: "a1".into(),
-                role: Some("assistant".into()),
-                parent_id: None,
-                time: Some(MessageTime { created: 100 }),
-            },
-            parts: serde_json::json!([{
-                "id": "prt_tool",
-                "type": "tool",
-                "tool": "bash",
-                "callID": "call_1",
-                "state": { "status": status, "input": { "command": "ls" }, "output": output },
-            }]),
-        }];
+        let msgs = |status: &str, output: &str| {
+            vec![SessionMessage {
+                info: MessageInfo {
+                    id: "a1".into(),
+                    role: Some("assistant".into()),
+                    parent_id: None,
+                    time: Some(MessageTime { created: 100 }),
+                },
+                parts: serde_json::json!([{
+                    "id": "prt_tool",
+                    "type": "tool",
+                    "tool": "bash",
+                    "callID": "call_1",
+                    "state": { "status": status, "input": { "command": "ls" }, "output": output },
+                }]),
+            }]
+        };
 
         // First render: tool running.
         assert!(render_new_turn_parts(&mut acc, &msgs("running", ""), epoch));
         assert_eq!(acc.tools["call_1"].status, "running");
 
         // Same part id, updated to completed — must re-render (upsert).
-        assert!(render_new_turn_parts(&mut acc, &msgs("completed", "src\n"), epoch));
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &msgs("completed", "src\n"),
+            epoch
+        ));
         assert_eq!(acc.tools["call_1"].status, "completed");
 
         // No change → nothing new.
-        assert!(!render_new_turn_parts(&mut acc, &msgs("completed", "src\n"), epoch));
+        assert!(!render_new_turn_parts(
+            &mut acc,
+            &msgs("completed", "src\n"),
+            epoch
+        ));
     }
 
     #[test]
