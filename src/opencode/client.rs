@@ -175,6 +175,22 @@ impl Client {
         Ok(body.data)
     }
 
+    /// Fetch a session's info (canonical: `GET /session/{id}`), used to resolve
+    /// a sub-task (child) session's parent chain so permission cards for subtask
+    /// sessions can be routed to the chat the parent is mapped to.
+    pub async fn session_info(
+        &self,
+        session_id: &str,
+        directory: Option<&str>,
+    ) -> crate::error::Result<SessionInfo> {
+        let mut url = reqwest::Url::parse(&self.url(&format!("/session/{}", session_id)))?;
+        if let Some(d) = directory {
+            url.query_pairs_mut().append_pair("directory", d);
+        }
+        let resp = self.http.get(url).send().await?.error_for_status()?;
+        Ok(resp.json().await?)
+    }
+
     /// Reply to a permission request (canonical: `POST /permission/{id}/reply`).
     /// `directory` routes the request to the instance that owns the permission —
     /// without it the server checks the cwd instance and returns 404/400.
@@ -353,6 +369,15 @@ pub struct Session {
     pub location: Option<serde_json::Value>,
     pub cost: Option<f64>,
     pub time: Option<SessionTime>,
+}
+
+/// Minimal `Session.Info` (canonical `GET /session/{id}`) — enough to resolve
+/// a sub-task session's parent.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionInfo {
+    pub id: String,
+    #[serde(rename = "parentID")]
+    pub parent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

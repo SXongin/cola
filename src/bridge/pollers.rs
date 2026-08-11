@@ -2,6 +2,45 @@ use std::sync::Arc;
 
 use crate::bridge::handler::App;
 
+/// Where to deliver a permission/question card.
+enum CardTarget {
+    /// Reply to a specific message (an in-flight prompt's streaming card).
+    ReplyTo(String),
+    /// Send into a chat.
+    Chat(String),
+}
+
+/// Resolve where a card for `session_id` should be delivered.
+///
+/// Sessions cola created map to a Feishu chat directly. Sub-task sessions
+/// (created by the `task` tool) are NOT in cola's SessionStore, so when the
+/// direct lookup fails we walk up the parent chain (via `session_info`) until
+/// a session cola knows is found. The directory is passed through so the
+/// parent session is looked up in the same server instance.
+async fn resolve_card_target(app: &Arc<App>, session_id: &str, directory: &str) -> Option<CardTarget> {
+    let mut current = session_id.to_string();
+    for _ in 0..8 {
+        // In-flight prompt for this session → reply to its streaming card.
+        let reply_to = {
+            let accs = app.accumulators.lock().await;
+            accs.get(&current).and_then(|a| a.reply_to_message_id.clone())
+        };
+        if let Some(msg_id) = reply_to {
+            return Some(CardTarget::ReplyTo(msg_id));
+        }
+        // Session mapped to a chat → send into the chat.
+        let chat = { app.sessions.lock().await.chat_for_session(&current) };
+        if let Some(chat_id) = chat {
+            return Some(CardTarget::Chat(chat_id));
+        }
+        // Unknown session → walk up to its parent (sub-task child sessions).
+        let info = app.opencode.session_info(&current, Some(directory)).await.ok()?;
+        let parent = info.parent_id.filter(|p| p != &current)?;
+        current = parent;
+    }
+    None
+}
+
 /// Independent permission poller: runs forever, surfaces pending permission
 /// requests as cards as soon as they appear. Started once at App startup so a
 /// prompt blocked on an unanswered permission still gets its card shown.
@@ -28,26 +67,21 @@ pub(crate) async fn permission_poll_loop(app: &Arc<App>) -> crate::error::Result
                             p.permission.as_deref().unwrap_or("?"),
                             p.patterns
                         );
-                        {
-                            let mut reqs = app.permission_requests.lock().await;
-                            reqs.insert(sid.clone(), p.request_id.clone());
-                        }
                         let body = describe_permission(p);
-                        let card = crate::feishu::card::build_permission_card(&sid, &p.request_id, &body);
+                        let card =
+                            crate::feishu::card::build_permission_card(&sid, &p.request_id, &body, dir);
                         // Reply to the message that triggered the prompt for this
                         // session; fall back to sending into the chat when the
-                        // accumulator is gone (e.g. after a cola restart).
-                        let reply_to = {
-                            let accs = app.accumulators.lock().await;
-                            accs.get(&sid).and_then(|a| a.reply_to_message_id.clone())
-                        };
-                        let sent = if let Some(msg_id) = reply_to {
-                            app.feishu.reply_card(&msg_id, &card).await.is_ok()
-                        } else {
-                            let chat = { app.sessions.lock().await.chat_for_session(&sid) };
-                            if let Some(chat_id) = chat {
+                        // accumulator is gone (e.g. after a cola restart). Sub-task
+                        // sessions resolve up the parent chain.
+                        let sent = match resolve_card_target(app, &sid, dir).await {
+                            Some(CardTarget::ReplyTo(msg_id)) => {
+                                app.feishu.reply_card(&msg_id, &card).await.is_ok()
+                            }
+                            Some(CardTarget::Chat(chat_id)) => {
                                 app.feishu.send_card("chat_id", &chat_id, &card).await.is_ok()
-                            } else {
+                            }
+                            None => {
                                 tracing::warn!("No reply target or chat for permission on session {}", sid);
                                 false
                             }
@@ -85,19 +119,15 @@ pub(crate) async fn question_poll_loop(app: &Arc<App>) -> crate::error::Result<(
                             reqs.insert(q.id.clone(), q.clone());
                         }
                         let card =
-                            crate::feishu::card::build_question_card(&q.id, &q.session_id, &q.questions);
-                        let reply_to = {
-                            let accs = app.accumulators.lock().await;
-                            accs.get(&q.session_id)
-                                .and_then(|a| a.reply_to_message_id.clone())
-                        };
-                        let sent = if let Some(msg_id) = reply_to {
-                            app.feishu.reply_card(&msg_id, &card).await.is_ok()
-                        } else {
-                            let chat = { app.sessions.lock().await.chat_for_session(&q.session_id) };
-                            if let Some(chat_id) = chat {
+                            crate::feishu::card::build_question_card(&q.id, &q.session_id, &q.questions, dir);
+                        let sent = match resolve_card_target(app, &q.session_id, dir).await {
+                            Some(CardTarget::ReplyTo(msg_id)) => {
+                                app.feishu.reply_card(&msg_id, &card).await.is_ok()
+                            }
+                            Some(CardTarget::Chat(chat_id)) => {
                                 app.feishu.send_card("chat_id", &chat_id, &card).await.is_ok()
-                            } else {
+                            }
+                            None => {
                                 tracing::warn!(
                                     "No reply target or chat for question on session {}",
                                     q.session_id

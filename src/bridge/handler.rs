@@ -25,7 +25,6 @@ pub struct App {
     pub sessions: Arc<Mutex<SessionStore>>,
     pub accumulators: Arc<Mutex<HashMap<String, StreamAccumulator>>>,
     pub card_message_ids: Arc<Mutex<HashMap<String, String>>>,
-    pub permission_requests: Arc<Mutex<HashMap<String, String>>>,
     /// request_id → pending question request (the AI asks the user; cola posts
     /// the answer back from the question card).
     pub question_requests: Arc<Mutex<HashMap<String, opencode::client::QuestionRequest>>>,
@@ -52,7 +51,6 @@ impl App {
             sessions: Arc::new(Mutex::new(session_store)),
             accumulators: Arc::new(Mutex::new(HashMap::new())),
             card_message_ids: Arc::new(Mutex::new(HashMap::new())),
-            permission_requests: Arc::new(Mutex::new(HashMap::new())),
             question_requests: Arc::new(Mutex::new(HashMap::new())),
             seen_event_ids: Arc::new(Mutex::new(HashSet::new())),
             inflight: Arc::new(Mutex::new(HashSet::new())),
@@ -496,6 +494,17 @@ impl App {
     pub async fn handle_card_action(&self, value: serde_json::Value) -> Option<serde_json::Value> {
         let action = value.get("action").and_then(|v| v.as_str()).unwrap_or("");
         let session_id = value.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+        // The card carries the owning directory (needed for subtask sessions
+        // that aren't in the SessionStore); fall back to the SessionStore map.
+        let directory = value
+            .get("directory")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let directory = match directory {
+            Some(d) => Some(d),
+            None => self.sessions.lock().await.directory_for_session(session_id),
+        };
+        let directory = directory.as_deref();
         // Carried from the permission card for the result display
         let perm_label = value.get("perm_label").and_then(|v| v.as_str()).unwrap_or("");
         let perm_color = value
@@ -511,15 +520,7 @@ impl App {
                 let request_id = value.get("request_id").and_then(|v| v.as_str());
                 if let Some(req_id) = request_id {
                     // Route the reply to the instance owning the session.
-                    let directory = {
-                        let store = self.sessions.lock().await;
-                        store.directory_for_session(&session_id)
-                    };
-                    if let Err(e) = self
-                        .opencode
-                        .reply_permission(req_id, reply, directory.as_deref())
-                        .await
-                    {
+                    if let Err(e) = self.opencode.reply_permission(req_id, reply, directory).await {
                         tracing::error!("perm reply failed: {}", e);
                     } else {
                         tracing::info!("Permission reply sent: {} session={}", reply, session_id);
@@ -539,10 +540,6 @@ impl App {
                 let reply = value.get("reply").and_then(|v| v.as_str()).unwrap_or("reject");
                 let request_id = value.get("request_id").and_then(|v| v.as_str());
                 if let Some(req_id) = request_id {
-                    let directory = {
-                        let store = self.sessions.lock().await;
-                        store.directory_for_session(&session_id)
-                    };
                     match reply {
                         "answer" => {
                             let index =
@@ -566,11 +563,7 @@ impl App {
                                     Vec::new()
                                 });
                             }
-                            if let Err(e) = self
-                                .opencode
-                                .reply_question(req_id, &answers, directory.as_deref())
-                                .await
-                            {
+                            if let Err(e) = self.opencode.reply_question(req_id, &answers, directory).await {
                                 tracing::error!("question reply failed: {}", e);
                             } else {
                                 tracing::info!(
@@ -588,8 +581,7 @@ impl App {
                             }
                         }
                         "reject" => {
-                            if let Err(e) = self.opencode.reject_question(req_id, directory.as_deref()).await
-                            {
+                            if let Err(e) = self.opencode.reject_question(req_id, directory).await {
                                 tracing::error!("question reject failed: {}", e);
                             } else {
                                 tracing::info!("Question rejected: {}", req_id);
@@ -718,6 +710,9 @@ mod test_support {
         /// When true, `prompt` 404s for any session id other than `session_id`
         /// (simulates a stale mapping to a session that no longer exists).
         pub stale_session_404: bool,
+        /// child session_id → parent session_id, served by `session_info`
+        /// (simulates sub-task sessions created by the `task` tool).
+        pub session_parents: std::collections::HashMap<String, String>,
     }
 
     impl MockBackend {
@@ -730,6 +725,7 @@ mod test_support {
                 prompt_error: None,
                 session_id: "ses_test".into(),
                 stale_session_404: false,
+                session_parents: std::collections::HashMap::new(),
             }
         }
     }
@@ -845,6 +841,17 @@ mod test_support {
             _d: Option<&str>,
         ) -> crate::error::Result<()> {
             Ok(())
+        }
+
+        async fn session_info(
+            &self,
+            session_id: &str,
+            _d: Option<&str>,
+        ) -> crate::error::Result<opencode::client::SessionInfo> {
+            Ok(opencode::client::SessionInfo {
+                id: session_id.to_string(),
+                parent_id: self.session_parents.get(session_id).cloned(),
+            })
         }
 
         async fn interrupt(&self, _s: &str) -> crate::error::Result<()> {
@@ -1042,6 +1049,72 @@ mod integration_tests {
         let result = app.handle_card_action(value).await;
         assert!(result.is_some());
         assert!(result.unwrap().to_string().contains("Allowed once"));
+    }
+
+    #[tokio::test]
+    async fn subtask_permission_routes_to_mapped_parent_and_reply_carries_directory() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        // A sub-task session cola never created; its permission must be routed
+        // up to the parent session's chat.
+        let child = "ses_child_task";
+        backend
+            .session_parents
+            .insert(child.into(), backend.session_id.clone());
+        backend.permissions = vec![opencode::client::PermissionRequest {
+            request_id: "per_child".into(),
+            session_id: Some(child.into()),
+            permission: Some("bash".into()),
+            patterns: vec!["git status".into()],
+            metadata: None,
+            always: Vec::new(),
+        }];
+        let (app, platform) = build_app(cfg, backend).await;
+
+        // Seed the parent session so it maps child → parent → chat.
+        app.handle_message("msg_1".into(), "chat_1".into(), "p2p".into(), None, "hi".into())
+            .await;
+
+        tokio::spawn({
+            let app = app.clone();
+            async move {
+                let _ = permission_poll_loop(&app).await;
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+
+        // The permission card for the child session must reach the parent's chat
+        // (no "No reply target" warning, no SendCard-only: a ReplyCard suffices).
+        let calls = platform.calls.lock().await.clone();
+        let perm_card = calls.iter().find_map(|c| match c {
+            PlatformCall::ReplyCard { card, .. } if card.to_string().contains("git status") => {
+                Some(card.clone())
+            }
+            _ => None,
+        });
+        let perm_card = perm_card.expect("subtask permission card should be sent to the parent");
+        let value = perm_card["elements"][1]["actions"][0]["value"].clone();
+        assert_eq!(value["session_id"], child);
+        // The card must carry the owning directory so the reply routes to the
+        // right instance even though the child session isn't in the store.
+        assert!(
+            value["directory"]
+                .as_str()
+                .map(|d| !d.is_empty())
+                .unwrap_or(false),
+            "permission card must carry a directory, got: {}",
+            value
+        );
+
+        // Clicking Allow routes the reply with that directory.
+        let mut value = value;
+        value["reply"] = serde_json::json!("once");
+        value["perm_label"] = serde_json::json!("✅ Allowed once");
+        value["perm_color"] = serde_json::json!("green");
+        let result = app.handle_card_action(value).await;
+        assert!(result.is_some(), "reply should succeed for subtask session");
     }
 
     /// A live E2E run: real cola bot (Platform) + a MOCK backend + the test bot

@@ -11,6 +11,16 @@ pub enum CardState {
     Error,
 }
 
+/// Feishu rejects JSON 2.0 cards with more than 200 total components/elements
+/// (ErrCode 11310 "element exceeds the limit"). A single collapsible panel
+/// counts as multiple components (panel + header title + icon + nested
+/// markdown), so cap the number of tool panels rendered in one card.
+const MAX_TOOL_PANELS: usize = 10;
+/// The visible result text element; bound it so a very long reply never pushes
+/// the card over Feishu's total card size / element limits. Reasoning, tool
+/// input/output and the question are already truncated per-element.
+const MAX_TEXT_CHARS: usize = 3000;
+
 /// Builds Feishu interactive card JSON (v2 schema with collapsible panels).
 /// The Feishu API stores a generic fallback copy; clients that support v2
 /// render the real card with foldable panels.
@@ -107,8 +117,12 @@ impl CardBuilder {
             elements.push(collapsible_panel("💭 推理过程", &truncate_md(r, 800)));
         }
 
-        // Tools — one folded panel each, header shows icon + name
-        for tool in &self.tools {
+        // Tools — one folded panel each, header shows icon + name. Cap the
+        // count: each panel expands to several JSON components and Feishu
+        // rejects cards over 200 components (11310). Once the cap is reached,
+        // note the hidden ones instead of rendering every panel.
+        let shown_tools = self.tools.iter().take(MAX_TOOL_PANELS);
+        for tool in shown_tools {
             let mut content = String::new();
             if let Some(ref i) = tool.input {
                 content.push_str(&format!("**Input**\n{}\n", truncate_md(i, 400)));
@@ -124,10 +138,23 @@ impl CardBuilder {
                 &content,
             ));
         }
+        if self.tools.len() > MAX_TOOL_PANELS {
+            elements.push(json!({
+                "tag": "markdown",
+                "content": format!("… 还有 {} 个工具未显示", self.tools.len() - MAX_TOOL_PANELS)
+            }));
+        }
 
-        // Result text — always visible
+        // Result text — always visible, truncated to keep the card within
+        // Feishu's size limits (over-limit cards are rejected: ErrCode 11310).
         if !self.text.is_empty() {
-            elements.push(json!({ "tag": "markdown", "content": self.text }));
+            let content = if self.text.chars().count() <= MAX_TEXT_CHARS {
+                self.text.clone()
+            } else {
+                let head: String = self.text.chars().take(MAX_TEXT_CHARS).collect();
+                format!("{}\n\n…（内容过长，已截断，完整内容请查看 OpenChamber）", head)
+            };
+            elements.push(json!({ "tag": "markdown", "content": content }));
         } else if self.state == CardState::Streaming || self.state == CardState::Loading {
             elements.push(json!({ "tag": "markdown", "content": "⏳ ..." }));
         }
@@ -190,15 +217,22 @@ fn collapsible_panel(title: &str, content: &str) -> serde_json::Value {
 }
 
 /// Build the interactive permission card. Buttons carry the request id, the
-/// session id and a description so the card callback (`action: "perm"`) can
-/// route the reply back to the right instance and render a result card.
-pub fn build_permission_card(session_id: &str, request_id: &str, body: &str) -> serde_json::Value {
+/// session id, the owning directory and a description so the card callback
+/// (`action: "perm"`) can route the reply back to the right instance and
+/// render a result card.
+pub fn build_permission_card(
+    session_id: &str,
+    request_id: &str,
+    body: &str,
+    directory: &str,
+) -> serde_json::Value {
     let btn_value = |reply: &str, label: &str, color: &str| {
         json!({
             "action": "perm",
             "reply": reply,
             "session_id": session_id,
             "request_id": request_id,
+            "directory": directory,
             "perm_label": label,
             "perm_color": color,
             "perm_body": body,
@@ -229,6 +263,7 @@ pub fn build_question_card(
     request_id: &str,
     session_id: &str,
     questions: &[crate::opencode::client::QuestionInfo],
+    directory: &str,
 ) -> serde_json::Value {
     let mut markdown = String::new();
     for (i, q) in questions.iter().enumerate() {
@@ -255,6 +290,7 @@ pub fn build_question_card(
                     "reply": "answer",
                     "request_id": request_id,
                     "session_id": session_id,
+                    "directory": directory,
                     "question_index": qi,
                     "answer": opt.label,
                 },
@@ -270,6 +306,7 @@ pub fn build_question_card(
             "reply": "reject",
             "request_id": request_id,
             "session_id": session_id,
+            "directory": directory,
         },
     }));
 
@@ -465,7 +502,7 @@ mod tests {
             multiple: None,
             custom: None,
         }];
-        let card = build_question_card("que_1", "ses_1", &questions);
+        let card = build_question_card("que_1", "ses_1", &questions, "/tmp/proj/lib");
         let text = card.to_string();
         assert!(
             text.contains("选择要在哪个目录继续"),
@@ -493,8 +530,67 @@ mod tests {
     }
 
     #[test]
+    fn tool_panels_capped_at_limit() {
+        // Feishu rejects JSON 2.0 cards over 200 components (11310). Each tool
+        // panel = panel + nested markdown (+ header), so cap the count.
+        let mut builder = CardBuilder::new("cola").with_state(CardState::Done);
+        for i in 0..25 {
+            builder = builder.with_tool(ToolPanel {
+                name: format!("tool {}", i),
+                status: "completed".into(),
+                input: Some("in".into()),
+                output: Some("out".into()),
+            });
+        }
+        let card = builder.build();
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let panels = elements
+            .iter()
+            .filter(|e| e["tag"].as_str() == Some("collapsible_panel"))
+            .count();
+        assert_eq!(panels, MAX_TOOL_PANELS, "tool panels must be capped");
+        // A note tells the user some tools are hidden.
+        assert!(
+            elements
+                .iter()
+                .any(|e| e.to_string().contains("还有 15 个工具未显示")),
+            "hidden-tools note missing: {}",
+            card.to_string()
+        );
+    }
+
+    #[test]
+    fn long_text_is_truncated() {
+        let long = "x".repeat(MAX_TEXT_CHARS + 100);
+        let card = CardBuilder::new("cola")
+            .with_state(CardState::Done)
+            .with_text(&long)
+            .build();
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let text_el = elements.iter().find(|e| e["tag"] == "markdown").unwrap();
+        let content = text_el["content"].as_str().unwrap();
+        assert!(
+            content.chars().count() <= MAX_TEXT_CHARS + 40,
+            "text not truncated enough: {} chars",
+            content.chars().count()
+        );
+        assert!(content.contains("已截断"));
+    }
+
+    #[test]
+    fn short_text_is_not_truncated() {
+        let card = CardBuilder::new("cola")
+            .with_state(CardState::Done)
+            .with_text("short reply")
+            .build();
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let text_el = elements.iter().find(|e| e["tag"] == "markdown").unwrap();
+        assert_eq!(text_el["content"].as_str().unwrap(), "short reply");
+    }
+
+    #[test]
     fn permission_card_carries_reply_payload() {
-        let card = build_permission_card("ses_abc", "per_123", "AI 想要执行 bash");
+        let card = build_permission_card("ses_abc", "per_123", "AI 想要执行 bash", "/tmp/proj/lib");
         assert_eq!(
             card["header"]["title"]["content"].as_str().unwrap(),
             "🔐 Permission Required"

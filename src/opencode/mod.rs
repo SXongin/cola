@@ -2,7 +2,8 @@ pub mod client;
 pub mod types;
 
 pub use client::{
-    Client, CreateSessionInput, PermissionRequest, PromptResponse, QuestionRequest, Session, SessionMessage,
+    Client, CreateSessionInput, PermissionRequest, PromptResponse, QuestionRequest, Session, SessionInfo,
+    SessionMessage,
 };
 
 use crate::error::Result;
@@ -36,6 +37,9 @@ pub trait Backend: Send + Sync {
     async fn reject_question(&self, request_id: &str, directory: Option<&str>) -> Result<()>;
 
     async fn messages(&self, session_id: &str) -> Result<Vec<SessionMessage>>;
+
+    /// Fetch a session's info (exposes the parent chain for sub-task sessions).
+    async fn session_info(&self, session_id: &str, directory: Option<&str>) -> Result<SessionInfo>;
 
     async fn interrupt(&self, session_id: &str) -> Result<()>;
 
@@ -87,6 +91,10 @@ impl Backend for Client {
 
     async fn messages(&self, session_id: &str) -> Result<Vec<SessionMessage>> {
         Client::messages(self, session_id).await
+    }
+
+    async fn session_info(&self, session_id: &str, directory: Option<&str>) -> Result<SessionInfo> {
+        Client::session_info(self, session_id, directory).await
     }
 
     async fn interrupt(&self, session_id: &str) -> Result<()> {
