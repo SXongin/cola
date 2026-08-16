@@ -289,37 +289,6 @@ impl Client {
         }
     }
 
-    /// Reply with a plain `text` message (far larger length limit than a card).
-    /// Used to deliver the full answer of a long turn that only fits in the
-    /// card as a preview.
-    pub async fn reply_plain_text(&self, message_id: &str, text: &str) -> crate::error::Result<String> {
-        let token = self.get_access_token().await?;
-        let body = serde_json::json!({
-            "msg_type": "text",
-            "content": serde_json::json!({ "text": text }).to_string()
-        });
-        let resp: MessageResponse = self
-            .http
-            .post(format!(
-                "https://open.feishu.cn/open-apis/im/v1/messages/{}/reply",
-                message_id
-            ))
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
-        if resp.code != 0 {
-            Err(crate::error::BridgeError::Feishu(format!(
-                "plain text reply error {}: {}",
-                resp.code, resp.msg
-            )))
-        } else {
-            Ok(resp.data.message_id)
-        }
-    }
-
     /// Reply to a message with a completion notice: a short text message. When
     /// the requester's display name is known, @-mention them so the group gets
     /// a real notification; otherwise a plain reply still notifies the author.

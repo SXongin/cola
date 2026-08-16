@@ -788,25 +788,6 @@ impl App {
             map.insert(session_id.clone(), baseline);
         }
 
-        // Long answers: the streaming card only previews the text; deliver the
-        // full answer as a separate plain-text message so it is never truncated
-        // by the card's size limits.
-        {
-            let accs = self.accumulators.lock().await;
-            if let Some(acc) = accs.get(&session_id)
-                && acc.card_state == crate::feishu::card::CardState::Done
-                && acc.text.chars().count() > crate::feishu::card::STATUS_PREVIEW_CHARS
-                && let Some(reply_to) = &acc.reply_to_message_id
-            {
-                let full = acc.text.clone();
-                let reply_to = reply_to.clone();
-                drop(accs);
-                if let Err(e) = self.feishu.reply_plain_text(&reply_to, &full).await {
-                    tracing::warn!("full answer reply: {}", e);
-                }
-            }
-        }
-
         // Group completion notice: the streaming card is patched in place, which
         // pushes no new notification — so reply to the requester's message so
         // Feishu notifies them. p2p chats don't need it (the reply lands in the
@@ -1424,10 +1405,6 @@ mod test_support {
             message_id: String,
             text: String,
         },
-        ReplyPlainText {
-            message_id: String,
-            text: String,
-        },
         CompletionNotice {
             reply_to: String,
             open_id: String,
@@ -1497,14 +1474,6 @@ mod test_support {
                 text: text.into(),
             });
             Ok("msg_text".into())
-        }
-
-        async fn reply_plain_text(&self, message_id: &str, text: &str) -> crate::error::Result<String> {
-            self.calls.lock().await.push(PlatformCall::ReplyPlainText {
-                message_id: message_id.into(),
-                text: text.into(),
-            });
-            Ok("msg_plain".into())
         }
 
         async fn reply_completion_notice(
@@ -1790,10 +1759,10 @@ mod test_support {
         ])
     }
 
-    /// A prompt whose answer is far longer than the card preview limit, so the
-    /// full text must be delivered as a separate plain-text message.
+    /// A prompt whose answer is far longer than one card's text budget, so it
+    /// must flow across continuation cards (no plain-text fallback anymore).
     pub fn long_answer_parts() -> serde_json::Value {
-        // 1200 × 6 chars = 7200 chars, above STATUS_PREVIEW_CHARS (6000).
+        // 1200 × 6 chars = 7200 chars, above MAX_CARD_TEXT_CHARS (6000).
         let long_text = "很长的回答。".repeat(1200);
         serde_json::json!([
             { "id": "prt_s1", "type": "step-start", "snapshot": "x" },
@@ -2180,7 +2149,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn long_answer_sends_full_text_as_separate_message() {
+    async fn long_answer_splits_across_cards_no_plain_text() {
         let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
@@ -2197,30 +2166,37 @@ mod integration_tests {
         .await;
 
         let calls = platform.calls.lock().await.clone();
-        // The streaming card only previews the long text…
-        let last_update = calls
+        // Every message cola sent must be a CARD (ReplyCard / UpdateMessage) —
+        // no separate plain-text message for long answers.
+        assert!(
+            calls.iter().all(|c| {
+                matches!(
+                    c,
+                    PlatformCall::ReplyCard { .. } | PlatformCall::UpdateMessage { .. }
+                )
+            }),
+            "long answer must stay on cards, got: {:?}",
+            calls
+        );
+        // The FULL text must be present across the cards (not truncated).
+        let all_cards: String = calls
             .iter()
             .filter_map(|c| match c {
-                PlatformCall::UpdateMessage { card, .. } => Some(card),
+                PlatformCall::ReplyCard { card, .. } => Some(card.to_string()),
+                PlatformCall::UpdateMessage { card, .. } => Some(card.to_string()),
                 _ => None,
             })
-            .next_back()
-            .unwrap();
-        let update = last_update.to_string();
+            .collect();
         assert!(
-            update.contains("内容较长"),
-            "card should preview, not carry all: {}",
-            update
+            all_cards.contains("很长的回答。"),
+            "full answer must appear on a card: {}",
+            all_cards
         );
-        // …and the FULL text arrives as a separate plain-text message.
-        let full = calls
-            .iter()
-            .find_map(|c| match c {
-                PlatformCall::ReplyPlainText { text, .. } => Some(text.clone()),
-                _ => None,
-            })
-            .expect("full answer must be sent as plain text");
-        assert_eq!(full, "很长的回答。".repeat(1200));
+        let expected = "很长的回答。".repeat(1200);
+        assert!(
+            all_cards.chars().filter(|c| *c != '"').count() >= expected.chars().count(),
+            "all text must be delivered (preview-only would lose the tail)"
+        );
     }
 
     #[tokio::test]
@@ -2242,10 +2218,11 @@ mod integration_tests {
 
         let calls = platform.calls.lock().await.clone();
         assert!(
-            !calls
-                .iter()
-                .any(|c| matches!(c, PlatformCall::ReplyPlainText { .. })),
-            "short answer must not spawn a separate message: {:?}",
+            calls.iter().all(|c| matches!(
+                c,
+                PlatformCall::ReplyCard { .. } | PlatformCall::UpdateMessage { .. }
+            )),
+            "answer must stay on cards: {:?}",
             calls
         );
     }

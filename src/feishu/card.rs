@@ -20,10 +20,11 @@ pub enum CardState {
 /// markdown), so cap the number of tool panels rendered in one card.
 /// A question with more options than this collapses them into a folding/// `overflow` group instead of a tall stack of buttons.
 const MAX_VISIBLE_OPTIONS: usize = 3;
-/// A card shows this much text before the rest goes to a separate plain-text
-/// message. Kept generous so realistic answers fit on the card itself; the
-/// full-text message is the safety net for genuinely long replies.
-pub const STATUS_PREVIEW_CHARS: usize = 6000;
+/// How much text ONE card carries before it is finalized and the rest continues
+/// on the next card. Kept below Feishu's card limits so a card full of text
+/// never overflows; long answers flow across continuation cards instead of a
+/// separate plain-text message.
+pub const MAX_CARD_TEXT_CHARS: usize = 6000;
 /// Estimated component ceiling for a card body. Feishu rejects cards over ~200
 /// components (ErrCode 11310); when a streaming card would cross this it is
 /// finalized with a "to be continued" marker and a fresh continuation card is
@@ -33,10 +34,10 @@ pub const MAX_CARD_COMPONENTS: usize = 150;
 /// not just the element count — roughly 150KB). A streaming card also splits
 /// when the estimate crosses this.
 pub const MAX_CARD_JSON_CHARS: usize = 100_000;
-/// The visible result text element; bound it so a very long reply never pushes
-/// the card over Feishu's total card size / element limits. Reasoning, tool
-/// input/output and the question are already truncated per-element.
-const MAX_TEXT_CHARS: usize = 3000;
+/// A single text element; bound it so a very long reply never pushes the card
+/// over Feishu's total card size / element limits. Reasoning, tool input/output
+/// and the question are already truncated per-element.
+pub const MAX_TEXT_CHARS: usize = 3000;
 
 /// Builds Feishu interactive card JSON (v2 schema with collapsible panels).
 /// Body elements are appended in the order the builder methods are called, so
@@ -262,14 +263,15 @@ impl CardBuilder {
         if text.is_empty() {
             return self;
         }
-        // Truncate per element to stay within Feishu's card size limits.
-        let content = if text.chars().count() <= MAX_TEXT_CHARS {
-            text.to_string()
-        } else {
-            let head: String = text.chars().take(MAX_TEXT_CHARS).collect();
-            format!("{}\n\n…（内容过长，已截断，可回复「继续」或分段提问）", head)
-        };
-        self.body.push(json!({ "tag": "markdown", "content": content }));
+        // Long text is split across multiple elements (each within the
+        // per-element limit) so nothing is truncated; the card splitter bounds
+        // how much text one card carries.
+        let mut rest = text;
+        while !rest.is_empty() {
+            let take: String = rest.chars().take(MAX_TEXT_CHARS).collect();
+            self.body.push(json!({ "tag": "markdown", "content": take }));
+            rest = &rest[take.len()..];
+        }
         self
     }
 
@@ -1019,21 +1021,32 @@ mod tests {
     }
 
     #[test]
-    fn long_text_is_truncated() {
-        let long = "x".repeat(MAX_TEXT_CHARS + 100);
+    fn long_text_splits_across_multiple_elements() {
+        let long = "x".repeat(MAX_TEXT_CHARS * 2 + 100);
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_text(&long)
             .build();
         let elements = card["body"]["elements"].as_array().unwrap();
-        let text_el = elements.iter().find(|e| e["tag"] == "markdown").unwrap();
-        let content = text_el["content"].as_str().unwrap();
+        let text_els: Vec<_> = elements.iter().filter(|e| e["tag"] == "markdown").collect();
         assert!(
-            content.chars().count() <= MAX_TEXT_CHARS + 40,
-            "text not truncated enough: {} chars",
-            content.chars().count()
+            text_els.len() >= 3,
+            "long text must split into multiple elements, got {}: {}",
+            text_els.len(),
+            card
         );
-        assert!(content.contains("已截断"));
+        // No element exceeds the per-element cap, and NOTHING is truncated —
+        // the full text is preserved across the elements.
+        for el in &text_els {
+            let content = el["content"].as_str().unwrap();
+            assert!(
+                content.chars().count() <= MAX_TEXT_CHARS,
+                "element over cap: {} chars",
+                content.chars().count()
+            );
+        }
+        let joined: String = text_els.iter().map(|e| e["content"].as_str().unwrap()).collect();
+        assert_eq!(joined, long, "all text must be preserved, none truncated");
     }
 
     #[test]

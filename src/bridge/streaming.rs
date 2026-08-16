@@ -114,11 +114,30 @@ impl StreamAccumulator {
 
     /// Append a text chunk, keeping it in the chronological timeline (merging
     /// consecutive text chunks so the card doesn't produce one element each).
+    /// Text is chunked so no single timeline item exceeds `MAX_CARD_TEXT_CHARS`
+    /// — the card splitter can then break a long answer across cards at item
+    /// boundaries instead of truncating it.
     pub fn push_text(&mut self, chunk: &str) {
         self.text.push_str(chunk);
-        match self.timeline.last_mut() {
-            Some(TimelineItem::Text(last)) => last.push_str(chunk),
-            _ => self.timeline.push(TimelineItem::Text(chunk.to_string())),
+        let max = crate::feishu::card::MAX_CARD_TEXT_CHARS;
+        let mut remaining = chunk;
+        while !remaining.is_empty() {
+            let space = match self.timeline.last_mut() {
+                Some(TimelineItem::Text(last)) => max.saturating_sub(last.chars().count()),
+                _ => 0,
+            };
+            if space == 0 {
+                let take: String = remaining.chars().take(max).collect();
+                self.timeline.push(TimelineItem::Text(take.clone()));
+                remaining = &remaining[take.len()..];
+                continue;
+            }
+            let take: String = remaining.chars().take(space).collect();
+            match self.timeline.last_mut() {
+                Some(TimelineItem::Text(last)) => last.push_str(&take),
+                _ => self.timeline.push(TimelineItem::Text(take.clone())),
+            }
+            remaining = &remaining[take.len()..];
         }
     }
 
@@ -302,15 +321,17 @@ impl StreamAccumulator {
     }
 
     /// First timeline index whose items would push the estimated component
-    /// count over `MAX_CARD_COMPONENTS`, or the estimated JSON size over
-    /// `MAX_CARD_JSON_CHARS` (Feishu caps total card size too, not just the
+    /// count over `MAX_CARD_COMPONENTS`, the estimated JSON size over
+    /// `MAX_CARD_JSON_CHARS`, or the accumulated text over
+    /// `MAX_CARD_TEXT_CHARS` (Feishu caps total card size too, not just the
     /// element count). Returns `timeline.len()` when everything fits.
     fn estimate_split_index(&self, start: usize) -> usize {
         let mut comps = 0usize;
         let mut size = 0usize;
+        let mut card_text = 0usize;
         for (i, item) in self.timeline.iter().enumerate().skip(start) {
-            let (c, s) = match item {
-                TimelineItem::Reasoning(r) => (4, 200 + r.chars().count().min(800)),
+            let (c, s, t) = match item {
+                TimelineItem::Reasoning(r) => (4, 200 + r.chars().count().min(800), 0),
                 TimelineItem::Tool(call_id) => {
                     let panel_size = self.tools.get(call_id).map(|p| {
                         let input = p
@@ -325,14 +346,25 @@ impl StreamAccumulator {
                             .unwrap_or(0);
                         200 + input + output
                     });
-                    (4, panel_size.unwrap_or(200))
+                    (4, panel_size.unwrap_or(200), 0)
                 }
-                TimelineItem::Text(t) => (1, t.chars().count()),
+                // Text is chunked to ≤ MAX_CARD_TEXT_CHARS per item, so a
+                // single item never exceeds the per-card budget; the budget
+                // accumulates across items and splits at the boundary. The
+                // component estimate mirrors `with_text`, which splits each
+                // element at MAX_TEXT_CHARS.
+                TimelineItem::Text(t) => {
+                    let chars = t.chars().count();
+                    let elements = chars.div_ceil(crate::feishu::card::MAX_TEXT_CHARS);
+                    (elements, chars, chars)
+                }
             };
             comps += c;
             size += s;
+            card_text += t;
             if comps > crate::feishu::card::MAX_CARD_COMPONENTS
                 || size > crate::feishu::card::MAX_CARD_JSON_CHARS
+                || card_text > crate::feishu::card::MAX_CARD_TEXT_CHARS
             {
                 return i;
             }
@@ -359,11 +391,10 @@ impl StreamAccumulator {
         builder = builder.with_subtitle(&self.title);
 
         // Render reasoning, text and tool panels in CHRONOLOGICAL order
-        // (interleaved), like OpenChamber shows them — text capped to a preview
-        // budget; the full text goes as a separate plain-text message after
-        // completion.
-        let preview = crate::feishu::card::STATUS_PREVIEW_CHARS;
-        let budget = preview;
+        // (interleaved), like OpenChamber shows them. Text is chunked at push
+        // time and bounded per card by `estimate_split_index`, so everything in
+        // [start..end) renders in full — no preview truncation, no separate
+        // plain-text message.
         let mut pending = String::new();
         let mut saw_content = false;
         for item in self.timeline.iter().take(end).skip(start) {
@@ -377,14 +408,8 @@ impl StreamAccumulator {
                     saw_content = true;
                 }
                 TimelineItem::Text(t) => {
-                    if budget > 0 {
-                        let take: String = t
-                            .chars()
-                            .take(budget.saturating_sub(pending.chars().count()))
-                            .collect();
-                        pending.push_str(&take);
-                        saw_content = true;
-                    }
+                    pending.push_str(t);
+                    saw_content = true;
                 }
                 TimelineItem::Tool(call_id) => {
                     if !pending.is_empty() {
@@ -399,11 +424,6 @@ impl StreamAccumulator {
         }
         if !pending.is_empty() {
             builder = builder.with_text(&pending);
-        }
-        // Tell the user the full answer is coming as a separate message when the
-        // card preview had to be cut.
-        if self.text.chars().count() > preview {
-            builder = builder.with_text("…（内容较长，完整内容见下一条消息）");
         }
 
         if include_tail {
@@ -487,6 +507,7 @@ impl StreamAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feishu::card::MAX_CARD_TEXT_CHARS;
     use crate::opencode::client::{
         ErrorMessage, OpenCodeEvent, ReasoningEndedData, ReasoningStartedData, StepEndedData, StepFailedData,
         StepStartedData, TextDeltaData, TextEndedData, TokenCount, ToolCalledData, ToolFailedData,
@@ -910,6 +931,79 @@ mod tests {
             rest.to_string().contains("最后的结论。"),
             "conclusion must appear on a continuation"
         );
+    }
+
+    /// A long answer flows across continuation cards instead of being truncated
+    /// to a preview (there is no plain-text fallback anymore). Text is chunked
+    /// at push time so the split lands between chunks, and every chunk renders.
+    #[test]
+    fn long_text_splits_across_continuation_cards() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Done;
+        let long = "很长的回答。".repeat(2000); // 12_000 chars > one card budget
+        acc.push_text(&long);
+
+        // First card: text-budget split marks it "to be continued".
+        let (card, full) = acc.build_card_with_split();
+        assert!(full, "long text must split past one card's budget");
+        assert!(
+            card.to_string().contains("部分完成，继续中"),
+            "split card must show the partial header: {}",
+            card
+        );
+        assert!(acc.render_from > 0, "render_from must advance");
+
+        // The continuation carries the tail; between them all text is present.
+        let (rest, full2) = acc.build_card_with_split();
+        assert!(!full2, "tail should fit: {:?}", rest);
+        let card_text = card.to_string();
+        let rest_text = rest.to_string();
+        let joined_len =
+            card_text.chars().filter(|c| *c != '"').count() + rest_text.chars().filter(|c| *c != '"').count();
+        assert!(
+            joined_len >= long.chars().count(),
+            "all text must survive the split (card={} rest={} long={})",
+            card_text.len(),
+            rest_text.len(),
+            long.chars().count()
+        );
+        assert!(
+            rest_text.contains("很长的回答。"),
+            "tail text must appear on the continuation: {}",
+            rest_text
+        );
+    }
+
+    /// `push_text` chunks one large blob into bounded timeline items so a single
+    /// item never exceeds the per-card text budget.
+    #[test]
+    fn push_text_chunks_long_blobs() {
+        let mut acc = StreamAccumulator::new("test");
+        let long = "字".repeat(MAX_CARD_TEXT_CHARS * 2 + 100);
+        acc.push_text(&long);
+
+        let text_items: Vec<&String> = acc
+            .timeline
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::Text(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text_items.len() >= 3,
+            "a long blob must be split into multiple text items, got {}",
+            text_items.len()
+        );
+        for t in &text_items {
+            assert!(
+                t.chars().count() <= MAX_CARD_TEXT_CHARS,
+                "text item over the per-card budget: {} chars",
+                t.chars().count()
+            );
+        }
+        let joined: String = text_items.iter().map(|t| t.as_str()).collect();
+        assert_eq!(joined, long, "all text must be preserved across chunks");
     }
 
     /// Text and tool calls must render interleaved (chronological), not all

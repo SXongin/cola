@@ -24,10 +24,6 @@ pub trait Platform: Send + Sync {
 
     async fn reply_text(&self, message_id: &str, text: &str) -> Result<String>;
 
-    /// Reply with a raw plain-text message (`msg_type: text`), which has a far
-    /// larger length limit than a card. Used for the full answer of long turns.
-    async fn reply_plain_text(&self, message_id: &str, text: &str) -> Result<String>;
-
     /// Reply to a message with a completion notice. When `name` is known the
     /// requester is @-mentioned (`<at user_id="...">name</at>`); otherwise a
     /// plain reply — Feishu still notifies the message's author either way.
@@ -66,10 +62,6 @@ impl Platform for Client {
 
     async fn reply_text(&self, message_id: &str, text: &str) -> Result<String> {
         Client::reply_text(self, message_id, text).await
-    }
-
-    async fn reply_plain_text(&self, message_id: &str, text: &str) -> Result<String> {
-        Client::reply_plain_text(self, message_id, text).await
     }
 
     async fn reply_completion_notice(
