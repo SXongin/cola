@@ -7,3 +7,5 @@ cola.toml
 cola-test.toml
 # Test artifacts produced by the AI agent during live debugging
 SURVEY.md
+# Live run logs (contain transient command echoes)
+test.log
