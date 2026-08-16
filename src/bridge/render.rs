@@ -82,10 +82,7 @@ fn render_part(acc: &mut StreamAccumulator, part: &serde_json::Value) {
                 .and_then(|s| s.get("status"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("completed");
-            let input = part
-                .get("state")
-                .and_then(|s| s.get("input"))
-                .map(|v| serde_json::to_string(v).unwrap_or_default());
+            let input = part.get("state").and_then(|s| s.get("input")).cloned();
             // OpenCode stores tool output as `state.content` (array of
             // {type:"text",text}) plus an optional `result`, and failures put
             // the reason in `state.error.message`. There is NO `state.output`
@@ -375,7 +372,13 @@ mod tests {
                 .unwrap()
                 .contains("/root/workspace/dev/cola")
         );
-        assert!(tool.input.as_deref().unwrap().contains("pwd"));
+        assert!(
+            tool.input
+                .as_ref()
+                .map(|i| i.to_string())
+                .unwrap_or_default()
+                .contains("pwd")
+        );
 
         let card = acc.build_card().to_string();
         assert!(card.contains("推理过程"));

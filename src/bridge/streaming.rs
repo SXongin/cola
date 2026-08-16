@@ -216,10 +216,7 @@ impl StreamAccumulator {
                     let panel = ToolPanel {
                         name: data.tool.as_deref().unwrap_or("unknown").to_string(),
                         status: "running".to_string(),
-                        input: data
-                            .input
-                            .as_ref()
-                            .map(|i| serde_json::to_string_pretty(i).unwrap_or_default()),
+                        input: data.input.clone(),
                         output: None,
                     };
                     self.push_tool(call_id, panel);
@@ -318,8 +315,8 @@ impl StreamAccumulator {
                     let panel_size = self.tools.get(call_id).map(|p| {
                         let input = p
                             .input
-                            .as_deref()
-                            .map(|x| x.chars().count().min(400))
+                            .as_ref()
+                            .map(|x| x.to_string().chars().count().min(400))
                             .unwrap_or(0);
                         let output = p
                             .output
@@ -770,7 +767,7 @@ mod tests {
             ToolPanel {
                 name: "bash".into(),
                 status: "completed".into(),
-                input: Some("ls".into()),
+                input: Some(serde_json::json!("ls")),
                 output: Some("src".into()),
             },
         );
@@ -859,7 +856,7 @@ mod tests {
             ToolPanel {
                 name: "bash".into(),
                 status: "completed".into(),
-                input: Some("ls".into()),
+                input: Some(serde_json::json!("ls")),
                 output: Some("src".into()),
             },
         );
@@ -927,7 +924,7 @@ mod tests {
             ToolPanel {
                 name: "bash".into(),
                 status: "completed".into(),
-                input: Some("ls".into()),
+                input: Some(serde_json::json!("ls")),
                 output: Some("src".into()),
             },
         );
@@ -937,7 +934,7 @@ mod tests {
             ToolPanel {
                 name: "read".into(),
                 status: "completed".into(),
-                input: Some("cola.toml".into()),
+                input: Some(serde_json::json!("cola.toml")),
                 output: Some("[bridge]".into()),
             },
         );
@@ -989,7 +986,7 @@ mod tests {
             ToolPanel {
                 name: "bash".into(),
                 status: "running".into(),
-                input: Some("ls".into()),
+                input: Some(serde_json::json!("ls")),
                 output: None,
             },
         );
@@ -998,7 +995,7 @@ mod tests {
             ToolPanel {
                 name: "bash".into(),
                 status: "completed".into(),
-                input: Some("ls".into()),
+                input: Some(serde_json::json!("ls")),
                 output: Some("src".into()),
             },
         );

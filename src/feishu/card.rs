@@ -67,7 +67,10 @@ pub struct CardActionButton {
 pub struct ToolPanel {
     pub name: String,
     pub status: String,
-    pub input: Option<String>,
+    /// The raw structured tool input (what OpenCode recorded for the call), kept
+    /// as JSON so the panel can render it human-friendly per tool type instead
+    /// of dumping a raw JSON blob.
+    pub input: Option<serde_json::Value>,
     pub output: Option<String>,
 }
 
@@ -86,8 +89,11 @@ impl ToolPanel {
 /// One tool panel as a folded collapsible element.
 fn tool_panel_element(tool: &ToolPanel) -> serde_json::Value {
     let mut content = String::new();
-    if let Some(ref i) = tool.input {
-        content.push_str(&format!("**Input**\n{}\n", truncate_md(i, 400)));
+    if let Some(i) = &tool.input {
+        let formatted = format_tool_input(&tool.name, i);
+        if !formatted.is_empty() {
+            content.push_str(&format!("**Input**\n{}\n", truncate_md(&formatted, 400)));
+        }
     }
     if let Some(ref o) = tool.output {
         content.push_str(&format!("**Output**\n{}", truncate_md(o, 800)));
@@ -96,6 +102,126 @@ fn tool_panel_element(tool: &ToolPanel) -> serde_json::Value {
         content = "_(no details)_".to_string();
     }
     collapsible_panel(&format!("{} {}", tool.status_icon(), tool.name), &content)
+}
+
+/// Render a tool's input JSON as human-readable markdown, keyed on the tool
+/// name. Recognized tools get tailored one-liners (bash → the command, read →
+/// the file path, edit → file + a change summary); anything else falls back to
+/// a generic key-value list.
+fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
+    // Non-object inputs (a bare path string, a number) just display as-is.
+    let obj = match input.as_object() {
+        Some(o) => o,
+        None => return input.as_str().map(|s| s.to_string()).unwrap_or_default(),
+    };
+    let get = |k: &str| obj.get(k).and_then(|v| v.as_str());
+    match name {
+        "bash" | "shell" => {
+            let mut s = String::new();
+            if let Some(cmd) = get("command") {
+                s.push_str(&format!("`{}`", cmd));
+            }
+            if let Some(dir) = get("workdir") {
+                s.push_str(&format!("\n📁 `{}`", dir));
+            }
+            if let Some(d) = get("description") {
+                s.push_str(&format!("\n📝 {}", d));
+            }
+            if s.is_empty() { input.to_string() } else { s }
+        }
+        "edit" => {
+            let file = get("filePath").unwrap_or("?");
+            let old = get("oldString").unwrap_or("");
+            let new = get("newString").unwrap_or("");
+            let mut s = format!("📄 `{}`", file);
+            if !old.is_empty() {
+                s.push_str(&format!("\n- {}", first_chunk(old, 120)));
+            }
+            if !new.is_empty() {
+                s.push_str(&format!("\n+ {}", first_chunk(new, 120)));
+            }
+            s
+        }
+        "read" | "write" | "glob" | "grep" => {
+            let mut parts = Vec::new();
+            for k in ["filePath", "path", "pattern"] {
+                if let Some(v) = get(k) {
+                    parts.push(format!("`{}`", v));
+                }
+            }
+            if let Some(v) = get("pattern") {
+                if parts.is_empty() {
+                    parts.push(format!("`{}`", v));
+                } else {
+                    parts.push(format!("匹配 `{}`", v));
+                }
+            }
+            if let Some(v) = get("include") {
+                parts.push(format!("include `{}`", v));
+            }
+            let mut s = match name {
+                "read" => "📖",
+                "write" => "✏️",
+                "glob" | "grep" => "🔍",
+                _ => "🔧",
+            }
+            .to_string();
+            s.push(' ');
+            s.push_str(&parts.join(" · "));
+            if let Some(offset) = obj.get("offset").and_then(|v| v.as_i64()) {
+                s.push_str(&format!("\n从第 {} 行起", offset));
+            }
+            if let Some(limit) = obj.get("limit").and_then(|v| v.as_i64()) {
+                s.push_str(&format!("\n最多 {} 行", limit));
+            }
+            if s.len() <= 1 { input.to_string() } else { s }
+        }
+        "webfetch" => {
+            if let Some(url) = get("url") {
+                format!("🌐 `{}`", url)
+            } else {
+                input.to_string()
+            }
+        }
+        "task" => {
+            let desc = get("description").unwrap_or("子任务");
+            let sub = get("subagent_type")
+                .map(|s| format!("\n🤖 `{}`", s))
+                .unwrap_or_default();
+            format!("🔀 {}{}", desc, sub)
+        }
+        _ => {
+            // Generic: one `- key: value` line per scalar field.
+            let mut lines = Vec::new();
+            for (k, v) in obj {
+                let val = match v {
+                    serde_json::Value::String(s) => s.to_string(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::Bool(b) => b.to_string(),
+                    other => other.to_string(),
+                };
+                lines.push(format!("- {}: {}", k, first_chunk(&val, 160)));
+            }
+            if lines.is_empty() {
+                input.to_string()
+            } else {
+                lines.join("\n")
+            }
+        }
+    }
+}
+
+/// The first line of `s`, clipped to `max_chars` (with a "…" marker). Used to
+/// summarize multi-line tool inputs (edit diffs, task prompts) instead of
+/// flooding the card.
+fn first_chunk(s: &str, max_chars: usize) -> String {
+    let first = s.lines().next().unwrap_or("");
+    let clipped: String = first.chars().take(max_chars).collect();
+    if clipped.chars().count() < first.chars().count() {
+        format!("{}…", clipped)
+    } else {
+        clipped
+    }
 }
 
 impl CardBuilder {
@@ -613,7 +739,7 @@ mod tests {
         let tool = ToolPanel {
             name: "read".into(),
             status: "completed".into(),
-            input: Some("src/main.rs".into()),
+            input: Some(json!("src/main.rs")),
             output: Some("fn main() {}".into()),
         };
         let card = CardBuilder::new()
@@ -637,7 +763,7 @@ mod tests {
         let tool = ToolPanel {
             name: "bash".into(),
             status: "running".into(),
-            input: Some("cargo test".into()),
+            input: Some(json!({"command": "cargo test"})),
             output: None,
         };
         let card = CardBuilder::new()
@@ -724,7 +850,7 @@ mod tests {
         let tool = ToolPanel {
             name: "bash".into(),
             status: "failed".into(),
-            input: Some("cargo build".into()),
+            input: Some(json!({"command": "cargo build"})),
             output: Some("error[E0308]".into()),
         };
         let card = CardBuilder::new()
@@ -875,7 +1001,7 @@ mod tests {
             builder = builder.with_tool(ToolPanel {
                 name: format!("tool {}", i),
                 status: "completed".into(),
-                input: Some("in".into()),
+                input: Some(json!("in")),
                 output: Some("out".into()),
             });
         }
@@ -949,5 +1075,108 @@ mod tests {
         assert_eq!(reject["perm_color"], "red");
         let always = values.iter().find(|v| v["reply"] == "always").unwrap();
         assert!(always["perm_label"].as_str().unwrap().contains("always"));
+    }
+
+    #[test]
+    fn tool_input_bash_shows_command_and_workdir() {
+        let tool = ToolPanel {
+            name: "bash".into(),
+            status: "completed".into(),
+            input: Some(json!({"command": "cargo test --all", "workdir": "/proj"})),
+            output: None,
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        let text = card.to_string();
+        assert!(text.contains("cargo test --all"), "command missing: {}", text);
+        assert!(text.contains("/proj"), "workdir missing: {}", text);
+        assert!(!text.contains("workdir"), "raw key leaked: {}", text);
+        assert!(!text.contains("command"), "raw key leaked: {}", text);
+    }
+
+    #[test]
+    fn tool_input_edit_shows_file_and_diff() {
+        let tool = ToolPanel {
+            name: "edit".into(),
+            status: "completed".into(),
+            input: Some(json!({
+                "filePath": "src/main.rs",
+                "oldString": "let a = 1;",
+                "newString": "let a = 2;"
+            })),
+            output: None,
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        let text = card.to_string();
+        assert!(text.contains("src/main.rs"), "file missing: {}", text);
+        assert!(text.contains("- let a = 1;"), "old line missing: {}", text);
+        assert!(text.contains("+ let a = 2;"), "new line missing: {}", text);
+        assert!(!text.contains("filePath"), "raw key leaked: {}", text);
+    }
+
+    #[test]
+    fn tool_input_read_shows_path_and_limits() {
+        let tool = ToolPanel {
+            name: "read".into(),
+            status: "completed".into(),
+            input: Some(json!({"filePath": "src/foo.rs", "limit": 80})),
+            output: None,
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        let text = card.to_string();
+        assert!(text.contains("src/foo.rs"), "path missing: {}", text);
+        assert!(text.contains("最多 80 行"), "limit missing: {}", text);
+        assert!(!text.contains("filePath"), "raw key leaked: {}", text);
+    }
+
+    #[test]
+    fn tool_input_string_shows_as_is() {
+        // A bare string input (non-object) renders directly.
+        let tool = ToolPanel {
+            name: "read".into(),
+            status: "completed".into(),
+            input: Some(json!("src/main.rs")),
+            output: None,
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        assert!(card.to_string().contains("src/main.rs"));
+    }
+
+    #[test]
+    fn tool_input_unknown_falls_back_to_key_value() {
+        let tool = ToolPanel {
+            name: "custom_tool".into(),
+            status: "completed".into(),
+            input: Some(json!({"a": "b", "c": 3})),
+            output: None,
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        let text = card.to_string();
+        assert!(text.contains("- a: b"), "kv line missing: {}", text);
+        assert!(text.contains("- c: 3"), "kv line missing: {}", text);
+    }
+
+    #[test]
+    fn tool_input_first_chunk_clips_long_values() {
+        assert_eq!(first_chunk("short", 100), "short");
+        assert_eq!(first_chunk("x", 1), "x");
+        let long = "a".repeat(50);
+        assert_eq!(first_chunk(&long, 10), format!("{}…", "a".repeat(10)));
+        // Only the first line of multi-line input is shown.
+        assert_eq!(first_chunk("first line\nsecond line", 100), "first line");
     }
 }
