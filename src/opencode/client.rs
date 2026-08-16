@@ -275,6 +275,42 @@ impl Client {
         Ok(resp.json().await?)
     }
 
+    /// The model's context-window size (tokens), from `GET /provider`. Best
+    /// effort: any failure returns Ok(None) so the footer just omits the ratio.
+    pub async fn model_context_window(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> crate::error::Result<Option<i64>> {
+        let resp = self.http.get(self.url("/provider")).send().await?;
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+        let text = resp.text().await?;
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return Ok(None);
+        };
+        let all = v.get("all").and_then(|a| a.as_array());
+        let Some(all) = all else { return Ok(None) };
+        for prov in all {
+            if prov.get("id").and_then(|i| i.as_str()) != Some(provider) {
+                continue;
+            }
+            let Some(models) = prov.get("models").and_then(|m| m.as_object()) else {
+                continue;
+            };
+            if let Some(m) = models.get(model)
+                && let Some(ctx) = m
+                    .get("limit")
+                    .and_then(|l| l.get("context"))
+                    .and_then(|c| c.as_i64())
+            {
+                return Ok(Some(ctx));
+            }
+        }
+        Ok(None)
+    }
+
     /// Answer a question request (canonical: `POST /question/{id}/reply`).
     pub async fn reply_question(
         &self,
@@ -307,8 +343,10 @@ impl Client {
 
     /// Interrupt an active session.
     pub async fn interrupt(&self, session_id: &str) -> crate::error::Result<()> {
+        // Canonical path has NO `/api` prefix (see AGENTS.md pitfall #1); the
+        // old `/api/session/{id}/interrupt` 404'd so `/stop` silently failed.
         self.http
-            .post(self.url(&format!("/api/session/{}/interrupt", session_id)))
+            .post(self.url(&format!("/session/{}/abort", session_id)))
             .send()
             .await?
             .error_for_status()?;
@@ -378,6 +416,9 @@ pub struct SessionInfo {
     pub id: String,
     #[serde(rename = "parentID")]
     pub parent_id: Option<String>,
+    /// The server-managed session title (what OpenChamber shows).
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -451,6 +492,44 @@ pub struct MessageInfo {
     pub parent_id: Option<String>,
     #[serde(default)]
     pub time: Option<MessageTime>,
+    #[serde(rename = "modelID", default)]
+    pub model_id: Option<String>,
+    #[serde(rename = "providerID", default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub tokens: Option<MessageTokens>,
+}
+
+/// Token usage carried on an assistant message's `info.tokens`.
+#[derive(Debug, Default, Deserialize)]
+pub struct MessageTokens {
+    #[serde(default)]
+    pub input: i64,
+    #[serde(default)]
+    pub output: i64,
+    #[serde(default)]
+    pub total: i64,
+    #[serde(default)]
+    pub cache: Option<MessageTokenCache>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct MessageTokenCache {
+    #[serde(default)]
+    pub read: i64,
+    #[serde(default)]
+    pub write: i64,
+}
+
+impl MessageTokens {
+    /// The context the model actually consumed: `total` when the server reports
+    /// it, else the cached prefix + the fresh input. (`input` alone is only the
+    /// per-message delta — mostly cache reads — so it understates context a lot.)
+    pub fn context_used(&self) -> i64 {
+        let cache_read = self.cache.as_ref().map(|c| c.read).unwrap_or(0);
+        let fallback = self.input + cache_read;
+        if self.total > 0 { self.total } else { fallback }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -867,6 +946,26 @@ fn parse_model(spec: &str) -> Option<ModelInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_used_prefers_total_over_input_delta() {
+        // Real shape: `input` is only the per-message delta; the cached prefix
+        // is the bulk of the context. Using `input` alone understates usage.
+        let tokens: MessageTokens = serde_json::from_str(
+            r#"{"total":612920,"input":263,"output":308,"reasoning":253,
+                "cache":{"write":0,"read":612096}}"#,
+        )
+        .unwrap();
+        assert_eq!(tokens.context_used(), 612920);
+
+        // No `total` (older server): input + cache.read.
+        let tokens: MessageTokens = serde_json::from_str(r#"{"input":263,"cache":{"read":612096}}"#).unwrap();
+        assert_eq!(tokens.context_used(), 612359);
+
+        // Degenerate: neither present.
+        let tokens: MessageTokens = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(tokens.context_used(), 0);
+    }
 
     #[test]
     fn parse_server_connected() {

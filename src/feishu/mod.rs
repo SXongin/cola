@@ -24,6 +24,24 @@ pub trait Platform: Send + Sync {
 
     async fn reply_text(&self, message_id: &str, text: &str) -> Result<String>;
 
+    /// Reply with a raw plain-text message (`msg_type: text`), which has a far
+    /// larger length limit than a card. Used for the full answer of long turns.
+    async fn reply_plain_text(&self, message_id: &str, text: &str) -> Result<String>;
+
+    /// Reply to a message with a completion notice. When `name` is known the
+    /// requester is @-mentioned (`<at user_id="...">name</at>`); otherwise a
+    /// plain reply — Feishu still notifies the message's author either way.
+    async fn reply_completion_notice(
+        &self,
+        message_id: &str,
+        open_id: &str,
+        name: Option<&str>,
+        text: &str,
+    ) -> Result<String>;
+
+    /// The display name of a user (contact API), best-effort `Ok(None)` on failure.
+    async fn user_name(&self, open_id: &str) -> Result<Option<String>>;
+
     /// The bot's own open_id, used to recognise @mentions of cola itself.
     async fn bot_open_id(&self) -> Result<String>;
 }
@@ -48,6 +66,24 @@ impl Platform for Client {
 
     async fn reply_text(&self, message_id: &str, text: &str) -> Result<String> {
         Client::reply_text(self, message_id, text).await
+    }
+
+    async fn reply_plain_text(&self, message_id: &str, text: &str) -> Result<String> {
+        Client::reply_plain_text(self, message_id, text).await
+    }
+
+    async fn reply_completion_notice(
+        &self,
+        message_id: &str,
+        open_id: &str,
+        name: Option<&str>,
+        text: &str,
+    ) -> Result<String> {
+        Client::reply_completion_notice(self, message_id, open_id, name, text).await
+    }
+
+    async fn user_name(&self, open_id: &str) -> Result<Option<String>> {
+        Client::user_name(self, open_id).await
     }
 
     async fn bot_open_id(&self) -> Result<String> {

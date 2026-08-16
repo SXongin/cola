@@ -176,7 +176,9 @@ impl Client {
             })
     }
 
-    /// Send a text message to a user (by open_id) or chat.
+    /// Send a text message to a user (by open_id) or chat. Only the live e2e
+    /// harness uses this.
+    #[cfg(test)]
     pub async fn send_text(
         &self,
         receive_id_type: &str,
@@ -285,6 +287,116 @@ impl Client {
         } else {
             Ok(resp.data.message_id)
         }
+    }
+
+    /// Reply with a plain `text` message (far larger length limit than a card).
+    /// Used to deliver the full answer of a long turn that only fits in the
+    /// card as a preview.
+    pub async fn reply_plain_text(&self, message_id: &str, text: &str) -> crate::error::Result<String> {
+        let token = self.get_access_token().await?;
+        let body = serde_json::json!({
+            "msg_type": "text",
+            "content": serde_json::json!({ "text": text }).to_string()
+        });
+        let resp: MessageResponse = self
+            .http
+            .post(format!(
+                "https://open.feishu.cn/open-apis/im/v1/messages/{}/reply",
+                message_id
+            ))
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if resp.code != 0 {
+            Err(crate::error::BridgeError::Feishu(format!(
+                "plain text reply error {}: {}",
+                resp.code, resp.msg
+            )))
+        } else {
+            Ok(resp.data.message_id)
+        }
+    }
+
+    /// Reply to a message with a completion notice: a short text message. When
+    /// the requester's display name is known, @-mention them so the group gets
+    /// a real notification; otherwise a plain reply still notifies the author.
+    pub async fn reply_completion_notice(
+        &self,
+        message_id: &str,
+        open_id: &str,
+        name: Option<&str>,
+        text: &str,
+    ) -> crate::error::Result<String> {
+        let token = self.get_access_token().await?;
+        let mut content = String::new();
+        if let Some(name) = name {
+            let escaped = name.replace('<', "&lt;").replace('>', "&gt;");
+            content.push_str(&format!("<at user_id=\"{}\">{}</at> ", open_id, escaped));
+        }
+        content.push_str(text);
+        let body = serde_json::json!({
+            "msg_type": "text",
+            "content": serde_json::json!({"text": content}).to_string()
+        });
+
+        let resp: MessageResponse = self
+            .http
+            .post(format!(
+                "https://open.feishu.cn/open-apis/im/v1/messages/{}/reply",
+                message_id
+            ))
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        if resp.code != 0 {
+            Err(crate::error::BridgeError::Feishu(format!(
+                "reply completion notice error {}: {}",
+                resp.code, resp.msg
+            )))
+        } else {
+            Ok(resp.data.message_id)
+        }
+    }
+
+    /// The display name of a Feishu user (`contact:user.base:readonly`).
+    /// Returns `Ok(None)` on any failure (missing permission, deleted user) so
+    /// callers fall back to a plain reply instead of erroring.
+    ///
+    /// Response shape: `GET /contact/v3/users/{open_id}` → `data.user.name`
+    /// (NOT `data.name` — reading the wrong path silently returned None).
+    pub async fn user_name(&self, open_id: &str) -> crate::error::Result<Option<String>> {
+        let token = self.get_access_token().await?;
+        let url = format!(
+            "https://open.feishu.cn/open-apis/contact/v3/users/{}?user_id_type=open_id",
+            open_id
+        );
+        let resp = self.http.get(url).bearer_auth(&token).send().await?;
+        let text = resp.text().await?;
+        let v: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| crate::error::BridgeError::Feishu(format!("parse user info: {e} — body: {text}")))?;
+        let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            tracing::debug!(
+                "user_name lookup failed ({code}): {}",
+                &text[..text.len().min(200)]
+            );
+            return Ok(None);
+        }
+        let name = v["data"]["user"]["name"].as_str().map(|s| s.to_string());
+        if name.is_none() {
+            tracing::debug!(
+                "user_name lookup returned no name: {}",
+                &text[..text.len().min(300)]
+            );
+        }
+        Ok(name)
     }
 
     /// Update (patch) an existing message card.

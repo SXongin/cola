@@ -101,16 +101,6 @@ async fn main() -> anyhow::Result<()> {
 
     let feishu_client = feishu::Client::new(cfg.feishu.clone());
 
-    // Test: send a message to verify the Feishu REST API works
-    let user_open_id = "ou_5f48e110fbdcda4a3f1500e74055e42e";
-    match feishu_client
-        .send_text("open_id", user_open_id, "cola online ✓")
-        .await
-    {
-        Ok(msg_id) => tracing::info!("Test message sent: {}", msg_id),
-        Err(e) => tracing::error!("Test message failed: {}", e),
-    }
-
     let opencode_client = opencode::Client::new(cfg.opencode.clone());
     let app = Arc::new(bridge::App::new(
         cfg.clone(),

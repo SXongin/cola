@@ -199,13 +199,23 @@ fn parse_header(data: &[u8]) -> Option<(String, String)> {
 /// frame's fields (seq_id, log_id, service, method, headers, payload_*)
 /// and sets the payload to the ack JSON, matching the Lark SDK's Response
 /// format: {"code":200,"headers":null,"data":"<base64>"}.
-fn build_response_frame(request: &ParsedFrame, result_card: Option<&serde_json::Value>) -> Option<Vec<u8>> {
+fn build_response_frame(
+    request: &ParsedFrame,
+    result: Option<&crate::bridge::handler::CardActionResult>,
+) -> Option<Vec<u8>> {
     use base64::Engine;
 
-    // CardActionTriggerResponse: optionally update the card with the result.
-    // Format: {"card":{"type":"raw","data":{card json}}}
-    let rsp_json = if let Some(card) = result_card {
-        serde_json::json!({"card": {"type": "raw", "data": card}}).to_string()
+    // CardActionTriggerResponse: optionally show a Toast and/or update the card
+    // with the result. Format: {"toast":{...},"card":{"type":"raw","data":{card json}}}
+    let rsp_json = if let Some(result) = result {
+        let mut obj = serde_json::json!({});
+        if let Some(toast) = &result.toast {
+            obj["toast"] = serde_json::json!({ "type": "success", "content": toast });
+        }
+        if let Some(card) = &result.card {
+            obj["card"] = serde_json::json!({ "type": "raw", "data": card });
+        }
+        obj.to_string()
     } else {
         "{}".to_string()
     };
@@ -488,6 +498,61 @@ async fn send_event_ack(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>, fra
     }
 }
 
+/// Extract the `event.action.value` from a `card.action.trigger` payload, and
+/// normalize the two non-button component shapes into the standard value cola's
+/// handler expects:
+/// - folding button groups / dropdowns deliver the chosen option as a string
+///   (`action.option`, encoded "qi|label" by the card) → decoded into
+///   `question_index` + `answer`;
+/// - form containers deliver their inputs as `action.form_value` → the first
+///   non-empty input value becomes `answer` (the typed custom answer).
+fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Value> {
+    let v = serde_json::from_slice::<serde_json::Value>(payload).ok()?;
+    let a = v.get("event")?.get("action")?;
+    let mut val = match a.get("value").cloned() {
+        Some(value) => value,
+        None => {
+            // Form submit callbacks don't always deliver the button `value`; the
+            // routing payload is encoded in the button `name`
+            // ("submit|<req>|<ses>|<qi>|<dir>") — rebuild the value from it.
+            let name = a.get("name").and_then(|n| n.as_str())?;
+            let parts: Vec<&str> = name.split('|').collect();
+            if parts.len() != 5 || parts[0] != "submit" {
+                return None;
+            }
+            serde_json::json!({
+                "action": "question",
+                "reply": "answer",
+                "request_id": parts[1],
+                "session_id": parts[2],
+                "question_index": parts[3].parse::<u64>().ok()?,
+                "directory": parts[4],
+            })
+        }
+    };
+    if let Some(opt) = a.get("option").and_then(|o| o.as_str()) {
+        // "qi|label" from an overflow/select option.
+        if let Some((qi, label)) = opt.split_once('|') {
+            if let Ok(qi_num) = qi.parse::<u64>() {
+                val["question_index"] = serde_json::Value::from(qi_num);
+            }
+            val["answer"] = serde_json::Value::String(label.to_string());
+        }
+    }
+    if let Some(fv) = a.get("form_value").and_then(|f| f.as_object()) {
+        // Typed custom answer: first non-empty input value.
+        for (_, v) in fv {
+            if let Some(s) = v.as_str()
+                && !s.is_empty()
+            {
+                val["answer"] = serde_json::Value::String(s.to_string());
+                break;
+            }
+        }
+    }
+    Some(val)
+}
+
 async fn handle_binary_frame(
     data: &[u8],
     ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
@@ -592,6 +657,13 @@ async fn handle_binary_frame(
                             text = strip_mentions(&text, &msg_data.mentions, &bot_id);
                         }
                         let thread_id = msg_data.thread_id.clone();
+                        // Who sent the message: needed for the group completion
+                        // notice (reply/@ the requester when a group turn ends).
+                        let sender_open_id = event_data
+                            .sender
+                            .as_ref()
+                            .and_then(|s| s.sender_id.as_ref())
+                            .and_then(|i| i.open_id.clone());
                         tracing::info!(
                             "Message: chat={} type={} thread={} text={}",
                             msg_data.chat_id,
@@ -611,28 +683,25 @@ async fn handle_binary_frame(
                                 msg_data.chat_type,
                                 thread_id,
                                 text,
+                                sender_open_id,
                             )
                             .await;
                         });
                     }
                 }
             } else if event_type == "card.action.trigger" {
-                // card.action.trigger has event.action.value (not event.value).
-                let action_value = serde_json::from_slice::<serde_json::Value>(&payload)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("event")
-                            .and_then(|e| e.get("action"))
-                            .and_then(|a| a.get("value"))
-                            .cloned()
-                    });
                 // Ack ALWAYS — even an unparseable card action must be acked,
                 // otherwise Feishu re-delivers it forever (pitfall 8).
-                let result_card = match action_value {
+                let action_value = extract_card_action_value(payload);
+                tracing::debug!(
+                    "card action value: {:?}",
+                    action_value.as_ref().map(|v| v.to_string())
+                );
+                let result = match action_value {
                     Some(value) => app.handle_card_action(value).await,
                     None => None,
                 };
-                let resp = build_response_frame(&frame, result_card.as_ref());
+                let resp = build_response_frame(&frame, result.as_ref());
                 if let Some(resp_bytes) = resp {
                     if let Err(e) = ws
                         .send(tokio_tungstenite::tungstenite::Message::Binary(resp_bytes.into()))
@@ -666,7 +735,55 @@ fn parse_message_content(msg: &MessageData) -> String {
     {
         return content["text"].as_str().unwrap_or("").to_string();
     }
+    // Non-text messages can still be cards with user text inside (the client
+    // sometimes wraps input in a card: {"title":"","content":[[{"tag":"text",
+    // "text":"..."}]]}). Without extracting it, the raw JSON leaks into the
+    // prompt and shows up verbatim on the OpenChamber side.
+    if let Some(text) = extract_card_text(&msg.content) {
+        return text;
+    }
     msg.content.clone()
+}
+
+/// Extract the user-visible text from a card/interactive message JSON. The
+/// client's card payload carries the SAME text in both `content` and `content_v2`
+/// — walk only one of them (v2 is canonical), otherwise the text is collected
+/// twice and the prompt gets a duplicated message. Returns None when there is
+/// no readable text (e.g. an image message), so the caller falls back to raw.
+fn extract_card_text(content: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(content).ok()?;
+    let source = if v.get("content_v2").is_some() {
+        v.get("content_v2")
+    } else {
+        v.get("content")
+    }?;
+    let mut out = String::new();
+    collect_text_fields(source, &mut out);
+    let text = out.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+fn collect_text_fields(v: &serde_json::Value, out: &mut String) {
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::String(s)) = map.get("text") {
+                out.push_str(s);
+            }
+            for val in map.values() {
+                collect_text_fields(val, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for val in arr {
+                collect_text_fields(val, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// True when any mention targets the bot itself (`bot_open_id`). Used to know
@@ -701,6 +818,17 @@ fn strip_mentions(text: &str, mentions: &[crate::feishu::event::Mention], bot_op
         out = out.replace(key, replacement);
     }
     out.trim().to_string()
+}
+
+/// Remove Feishu @mention placeholder tokens (`@_user_N`) from arbitrary text,
+/// regardless of any mentions mapping. Used to clean stale session names that
+/// were persisted before mention stripping existed (they would otherwise leak
+/// `@_user_1` into the card header and `/list`).
+pub fn strip_mention_tokens(text: &str) -> String {
+    text.split_whitespace()
+        .filter(|w| !w.starts_with("@_user_"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -739,6 +867,33 @@ mod tests {
         assert_eq!(parse_message_content(&msg), r#"{"image_key": "abc123"}"#);
     }
 
+    /// Feishu sometimes delivers the user's input as a CARD (msg_type
+    /// "interactive"/"post") whose content is the message JSON. The visible
+    /// text must be extracted — from `content_v2`/`content` only ONCE — not
+    /// forwarded as raw JSON (or duplicated) to the AI.
+    #[test]
+    fn parse_card_message_extracts_user_text() {
+        let msg = MessageData {
+            message_id: "msg_3".into(),
+            root_id: None,
+            parent_id: None,
+            thread_id: None,
+            chat_id: "chat_1".into(),
+            chat_type: "p2p".into(),
+            message_type: "interactive".into(),
+            // `content` and `content_v2` carry the same text.
+            content: r#"{"title":"","content":[[{"tag":"text","text":"你说的AI回复镜像是什么意思？"}]],"content_v2":[[{"tag":"text","text":"你说的AI回复镜像是什么意思？"}]]}"#.into(),
+            mentions: vec![],
+        };
+        let text = parse_message_content(&msg);
+        assert_eq!(
+            text, "你说的AI回复镜像是什么意思？",
+            "text must be extracted once: {}",
+            text
+        );
+        assert!(!text.contains("content"), "raw JSON must not leak: {}", text);
+    }
+
     fn mention(key: &str, open_id: &str, name: &str) -> crate::feishu::event::Mention {
         crate::feishu::event::Mention {
             key: Some(key.into()),
@@ -757,6 +912,15 @@ mod tests {
             mention("@_user_2", "ou_li", "李明"),
         ];
         assert_eq!(strip_mentions(text, &mentions, "ou_bot"), "你好 @李明 请 review");
+    }
+
+    #[test]
+    fn strip_mention_tokens_cleans_stale_session_names() {
+        // Stale names persisted before mention stripping existed.
+        assert_eq!(strip_mention_tokens("@_user_1 你好"), "你好");
+        assert_eq!(strip_mention_tokens("@_user_1 你能做什么？"), "你能做什么？");
+        assert_eq!(strip_mention_tokens("frontend-refactor"), "frontend-refactor");
+        assert_eq!(strip_mention_tokens(""), "");
     }
 
     #[test]
@@ -942,6 +1106,54 @@ mod tests {
         assert!(parsed.headers.len() >= 2);
     }
 
+    /// A card callback ack carries an optional Toast (instant client feedback)
+    /// plus the JSON 2.0 result card that replaces the interactive buttons.
+    #[test]
+    fn card_response_includes_toast_and_2_0_card() {
+        use base64::Engine;
+
+        let mut bytes = Vec::new();
+        encode_varint_field(&mut bytes, 1, 1);
+        encode_varint_field(&mut bytes, 3, 12);
+        encode_varint_field(&mut bytes, 4, 2);
+        let mut hdr = Vec::new();
+        encode_string_field(&mut hdr, 1, "type");
+        encode_string_field(&mut hdr, 2, "card");
+        encode_bytes_field(&mut bytes, 5, &hdr);
+        encode_bytes_field(&mut bytes, 8, b"{}");
+
+        let request = parse_frame(&bytes).unwrap();
+        let result = crate::bridge::handler::CardActionResult {
+            card: Some(serde_json::json!({
+                "schema": "2.0",
+                "header": { "title": { "tag": "plain_text", "content": "✅ Allowed once" }, "template": "green" },
+                "body": { "elements": [] }
+            })),
+            toast: Some("已允许本次执行".to_string()),
+        };
+        let resp = build_response_frame(&request, Some(&result)).expect("response builds");
+
+        let parsed = parse_frame(&resp).expect("response parses");
+        let payload_str = String::from_utf8_lossy(&parsed.payload);
+        let v: serde_json::Value = serde_json::from_str(&payload_str).unwrap();
+        let data_b64 = v["data"].as_str().unwrap();
+        let decoded = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(data_b64)
+                .unwrap(),
+        )
+        .unwrap();
+        let inner: serde_json::Value = serde_json::from_str(&decoded).unwrap();
+        assert_eq!(inner["toast"]["type"], "success");
+        assert_eq!(inner["toast"]["content"], "已允许本次执行");
+        assert_eq!(inner["card"]["type"], "raw");
+        assert_eq!(inner["card"]["data"]["schema"], "2.0");
+        assert_eq!(
+            inner["card"]["data"]["header"]["title"]["content"],
+            "✅ Allowed once"
+        );
+    }
+
     /// Every WS event (message receive, bot added, ...) must be acked with a
     /// code-200 frame, exactly like the Lark SDK does for each event. Feishu
     /// re-delivers events it never sees an ack for, then stops pushing.
@@ -1006,5 +1218,108 @@ mod tests {
         let parsed = parse_frame(&ping).expect("ping parses");
         assert_eq!(parsed.method, 0); // FrameTypeControl
         assert_eq!(parsed.headers.get("type").map(|s| s.as_str()), Some("ping"));
+    }
+
+    /// A folding button group (overflow) click delivers `action.option` as the
+    /// encoded "qi|label" string; it must decode back into the standard answer.
+    #[test]
+    fn overflow_option_decodes_into_question_answer() {
+        let payload = br#"{
+            "schema": "2.0",
+            "event": {
+                "action": {
+                    "tag": "overflow",
+                    "value": {
+                        "action": "question",
+                        "reply": "answer",
+                        "request_id": "que_1",
+                        "session_id": "ses_1"
+                    },
+                    "option": "2|/a2"
+                }
+            }
+        }"#;
+        let value = extract_card_action_value(payload).expect("value extracted");
+        assert_eq!(value["question_index"], 2);
+        assert_eq!(value["answer"], "/a2");
+        assert_eq!(value["request_id"], "que_1");
+    }
+
+    /// A form-submitted custom answer arrives as `action.form_value`; the typed
+    /// text must become `answer` on the button's routing payload.
+    #[test]
+    fn form_custom_answer_becomes_answer() {
+        let payload = r#"{
+            "schema": "2.0",
+            "event": {
+                "action": {
+                    "tag": "button",
+                    "name": "submit_0",
+                    "value": {
+                        "action": "question",
+                        "reply": "answer",
+                        "request_id": "que_1",
+                        "session_id": "ses_1",
+                        "question_index": 0
+                    },
+                    "form_value": {
+                        "custom_0": "自己写的答案"
+                    }
+                }
+            }
+        }"#;
+        let value = extract_card_action_value(payload.as_bytes()).expect("value extracted");
+        assert_eq!(value["answer"], "自己写的答案");
+        assert_eq!(value["question_index"], 0);
+        assert_eq!(value["request_id"], "que_1");
+    }
+
+    /// Form submit callbacks may omit `action.value` entirely — the routing
+    /// payload is then rebuilt from the button `name`.
+    #[test]
+    fn form_submit_without_value_rebuilds_routing_from_name() {
+        let payload = r#"{
+            "schema": "2.0",
+            "event": {
+                "action": {
+                    "tag": "button",
+                    "name": "submit|que_1|ses_1|0|/tmp/proj",
+                    "form_value": {
+                        "custom_0": "自定义答案"
+                    }
+                }
+            }
+        }"#;
+        let value = extract_card_action_value(payload.as_bytes()).expect("value extracted");
+        assert_eq!(value["answer"], "自定义答案");
+        assert_eq!(value["question_index"], 0);
+        assert_eq!(value["request_id"], "que_1");
+        assert_eq!(value["session_id"], "ses_1");
+        assert_eq!(value["directory"], "/tmp/proj");
+        assert_eq!(value["reply"], "answer");
+    }
+
+    /// A plain button click keeps its value untouched (no option/form_value).
+    #[test]
+    fn plain_button_value_unchanged() {
+        let payload = br#"{
+            "schema": "2.0",
+            "event": {
+                "action": {
+                    "tag": "button",
+                    "value": {
+                        "action": "question",
+                        "reply": "answer",
+                        "request_id": "que_1",
+                        "session_id": "ses_1",
+                        "question_index": 1,
+                        "answer": "/b"
+                    }
+                }
+            }
+        }"#;
+        let value = extract_card_action_value(payload).expect("value extracted");
+        assert_eq!(value["answer"], "/b");
+        assert_eq!(value["question_index"], 1);
     }
 }

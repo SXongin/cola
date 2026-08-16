@@ -35,7 +35,7 @@ pub struct FeishuConfig {
     pub app_secret: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BridgeConfig {
     #[serde(default = "default_session_file")]
     pub session_file: PathBuf,
@@ -43,6 +43,25 @@ pub struct BridgeConfig {
     /// process working directory. `/dir` overrides per session.
     #[serde(default)]
     pub work_dir: Option<PathBuf>,
+    /// In group chats, reply to the requester's message with a short
+    /// completion notice (the streaming card is patched in place and so does
+    /// not push a new notification). p2p chats don't need it.
+    #[serde(default = "default_group_completion_notice")]
+    pub group_completion_notice: bool,
+}
+
+impl Default for BridgeConfig {
+    fn default() -> Self {
+        Self {
+            session_file: default_session_file(),
+            work_dir: None,
+            group_completion_notice: default_group_completion_notice(),
+        }
+    }
+}
+
+fn default_group_completion_notice() -> bool {
+    true
 }
 
 fn default_session_file() -> PathBuf {
@@ -130,6 +149,10 @@ pub struct SessionEntry {
     pub directory: String,
     #[serde(default)]
     pub agent: Option<String>,
+    /// When true, pending permission requests for this session are answered
+    /// automatically (`/autoaccept`) instead of showing a Feishu card.
+    #[serde(default)]
+    pub auto_accept: bool,
 }
 
 #[cfg(test)]

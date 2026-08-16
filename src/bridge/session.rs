@@ -56,6 +56,12 @@ impl SessionStore {
             .map(|e| e.thread_key.clone())
     }
 
+    /// Find the entry for a session ID (regardless of thread). Used to check
+    /// per-session flags like `auto_accept` from the permission poller.
+    pub fn entry_for_session(&self, session_id: &str) -> Option<&SessionEntry> {
+        self.entries.iter().find(|e| e.session_id == session_id)
+    }
+
     /// Directory for a session ID (used to route permission requests to the
     /// correct server instance).
     pub fn directory_for_session(&self, session_id: &str) -> Option<String> {
@@ -91,6 +97,11 @@ impl SessionStore {
         self.entries.iter().filter(|e| &e.thread_key == key).collect()
     }
 
+    /// All known sessions (used by the external-message poller).
+    pub fn all_entries(&self) -> Vec<&SessionEntry> {
+        self.entries.iter().collect()
+    }
+
     /// Switch active session by name (partial match).
     pub fn switch(&mut self, key: &ThreadKey, name: &str) -> Option<&SessionEntry> {
         let pos = self
@@ -121,6 +132,7 @@ mod tests {
             name: name.into(),
             directory: dir.into(),
             agent: None,
+            auto_accept: false,
         }
     }
 

@@ -38,6 +38,11 @@ pub trait Backend: Send + Sync {
 
     async fn messages(&self, session_id: &str) -> Result<Vec<SessionMessage>>;
 
+    /// The model's context-window size (tokens), from `GET /provider`. Used to
+    /// compute the context-usage ratio for the card footer. Best-effort: None
+    /// when the provider/model can't be resolved.
+    async fn model_context_window(&self, provider: &str, model: &str) -> Result<Option<i64>>;
+
     /// Fetch a session's info (exposes the parent chain for sub-task sessions).
     async fn session_info(&self, session_id: &str, directory: Option<&str>) -> Result<SessionInfo>;
 
@@ -91,6 +96,10 @@ impl Backend for Client {
 
     async fn messages(&self, session_id: &str) -> Result<Vec<SessionMessage>> {
         Client::messages(self, session_id).await
+    }
+
+    async fn model_context_window(&self, provider: &str, model: &str) -> Result<Option<i64>> {
+        Client::model_context_window(self, provider, model).await
     }
 
     async fn session_info(&self, session_id: &str, directory: Option<&str>) -> Result<SessionInfo> {

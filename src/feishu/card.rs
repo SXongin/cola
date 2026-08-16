@@ -7,6 +7,9 @@ pub enum CardState {
     Loading,
     Reasoning,
     Streaming,
+    /// A card that was finalized mid-turn because the content filled the card;
+    /// the rest continues in the next card. Shown as "部分完成，继续中".
+    Continued,
     Done,
     Error,
 }
@@ -15,23 +18,49 @@ pub enum CardState {
 /// (ErrCode 11310 "element exceeds the limit"). A single collapsible panel
 /// counts as multiple components (panel + header title + icon + nested
 /// markdown), so cap the number of tool panels rendered in one card.
-const MAX_TOOL_PANELS: usize = 10;
+/// A question with more options than this collapses them into a folding/// `overflow` group instead of a tall stack of buttons.
+const MAX_VISIBLE_OPTIONS: usize = 3;
+/// A card shows this much text before the rest goes to a separate plain-text
+/// message. Kept generous so realistic answers fit on the card itself; the
+/// full-text message is the safety net for genuinely long replies.
+pub const STATUS_PREVIEW_CHARS: usize = 6000;
+/// Estimated component ceiling for a card body. Feishu rejects cards over ~200
+/// components (ErrCode 11310); when a streaming card would cross this it is
+/// finalized with a "to be continued" marker and a fresh continuation card is
+/// sent instead.
+pub const MAX_CARD_COMPONENTS: usize = 150;
+/// Estimated JSON size ceiling for a card body (Feishu caps total card size,
+/// not just the element count — roughly 150KB). A streaming card also splits
+/// when the estimate crosses this.
+pub const MAX_CARD_JSON_CHARS: usize = 100_000;
 /// The visible result text element; bound it so a very long reply never pushes
 /// the card over Feishu's total card size / element limits. Reasoning, tool
 /// input/output and the question are already truncated per-element.
 const MAX_TEXT_CHARS: usize = 3000;
 
 /// Builds Feishu interactive card JSON (v2 schema with collapsible panels).
-/// The Feishu API stores a generic fallback copy; clients that support v2
-/// render the real card with foldable panels.
+/// Body elements are appended in the order the builder methods are called, so
+/// text and tool panels can be interleaved chronologically.
 pub struct CardBuilder {
-    title: String,
     state: CardState,
-    text: String,
-    reasoning: Option<String>,
+    /// Tool panels in call order (also drives the header's running-tool hint).
     tools: Vec<ToolPanel>,
+    /// Body elements, in call order.
+    body: Vec<serde_json::Value>,
     footer: Option<String>,
-    question: Option<String>,
+    subtitle: Option<String>,
+    /// JSON 2.0 buttons shown only on the Error card (e.g. a retry action).
+    error_buttons: Vec<CardActionButton>,
+}
+
+/// A JSON 2.0 button (tag: `button`, sits directly in `body.elements`).
+#[derive(Debug, Clone)]
+pub struct CardActionButton {
+    pub text: String,
+    /// `primary` | `default` | `danger`.
+    pub kind: &'static str,
+    /// Callback payload delivered to cola on click.
+    pub value: serde_json::Value,
 }
 
 #[derive(Debug, Clone)]
@@ -47,27 +76,54 @@ impl ToolPanel {
         match self.status.as_str() {
             "running" | "pending" => "⏳",
             "completed" => "✅",
-            "failed" => "❌",
+            // OpenCode marks failed tools as status "error" (not "failed").
+            "failed" | "error" => "❌",
             _ => "🔧",
         }
     }
 }
 
+/// One tool panel as a folded collapsible element.
+fn tool_panel_element(tool: &ToolPanel) -> serde_json::Value {
+    let mut content = String::new();
+    if let Some(ref i) = tool.input {
+        content.push_str(&format!("**Input**\n{}\n", truncate_md(i, 400)));
+    }
+    if let Some(ref o) = tool.output {
+        content.push_str(&format!("**Output**\n{}", truncate_md(o, 800)));
+    }
+    if content.is_empty() {
+        content = "_(no details)_".to_string();
+    }
+    collapsible_panel(&format!("{} {}", tool.status_icon(), tool.name), &content)
+}
+
 impl CardBuilder {
-    pub fn new(title: &str) -> Self {
+    pub fn new() -> Self {
         Self {
-            title: title.to_string(),
             state: CardState::Loading,
-            text: String::new(),
-            reasoning: None,
             tools: Vec::new(),
+            body: Vec::new(),
             footer: None,
-            question: None,
+            subtitle: None,
+            error_buttons: Vec::new(),
         }
     }
 
-    pub fn with_question(mut self, question: &str) -> Self {
-        self.question = Some(question.to_string());
+    /// The session/thread name, shown as the card's subtitle so the header can
+    /// stay focused on state. The card is a reply to the user's message, so the
+    /// question itself is already visible in the reply context — no need to echo
+    /// it again. Empty subtitles are omitted.
+    pub fn with_subtitle(mut self, subtitle: &str) -> Self {
+        if !subtitle.is_empty() {
+            self.subtitle = Some(subtitle.to_string());
+        }
+        self
+    }
+
+    /// Buttons shown on the Error card (rendered only in that state).
+    pub fn with_error_buttons(mut self, buttons: Vec<CardActionButton>) -> Self {
+        self.error_buttons = buttons;
         self
     }
 
@@ -77,17 +133,34 @@ impl CardBuilder {
     }
 
     pub fn with_text(mut self, text: &str) -> Self {
-        self.text = text.to_string();
+        if text.is_empty() {
+            return self;
+        }
+        // Truncate per element to stay within Feishu's card size limits.
+        let content = if text.chars().count() <= MAX_TEXT_CHARS {
+            text.to_string()
+        } else {
+            let head: String = text.chars().take(MAX_TEXT_CHARS).collect();
+            format!("{}\n\n…（内容过长，已截断，可回复「继续」或分段提问）", head)
+        };
+        self.body.push(json!({ "tag": "markdown", "content": content }));
         self
     }
 
     pub fn with_reasoning(mut self, reasoning: &str) -> Self {
-        self.reasoning = Some(reasoning.to_string());
+        if !reasoning.is_empty() {
+            self.body
+                .push(collapsible_panel("💭 推理过程", &truncate_md(reasoning, 800)));
+        }
         self
     }
 
     pub fn with_tool(mut self, tool: ToolPanel) -> Self {
+        let panel = tool.clone();
         self.tools.push(tool);
+        // All tools are shown; the streaming card splits into continuation
+        // cards when the component estimate exceeds the Feishu limit.
+        self.body.push(tool_panel_element(&panel));
         self
     }
 
@@ -96,106 +169,82 @@ impl CardBuilder {
         self
     }
 
+    /// Push an already-built body element (used for inline permission/question
+    /// sections on the streaming card).
+    pub fn with_element(mut self, element: serde_json::Value) -> Self {
+        self.body.push(element);
+        self
+    }
+
     /// Build the Feishu card JSON payload (v2 schema).
     pub fn build(&self) -> serde_json::Value {
-        let mut elements: Vec<serde_json::Value> = Vec::new();
-
-        // Question being answered — visible so the user knows which prompt
-        // this reply corresponds to (queued prompts answer in order)
-        if let Some(ref q) = self.question {
-            elements.push(json!({
-                "tag": "markdown",
-                "content": format!("**问**: {}", truncate_md(q, 200))
-            }));
-            elements.push(json!({"tag": "hr"}));
-        }
-
-        // Reasoning — folded collapsible panel
-        if let Some(ref r) = self.reasoning
-            && !r.is_empty()
-        {
-            elements.push(collapsible_panel("💭 推理过程", &truncate_md(r, 800)));
-        }
-
-        // Tools — one folded panel each, header shows icon + name. Cap the
-        // count: each panel expands to several JSON components and Feishu
-        // rejects cards over 200 components (11310). Once the cap is reached,
-        // note the hidden ones instead of rendering every panel.
-        let shown_tools = self.tools.iter().take(MAX_TOOL_PANELS);
-        for tool in shown_tools {
-            let mut content = String::new();
-            if let Some(ref i) = tool.input {
-                content.push_str(&format!("**Input**\n{}\n", truncate_md(i, 400)));
-            }
-            if let Some(ref o) = tool.output {
-                content.push_str(&format!("**Output**\n{}", truncate_md(o, 800)));
-            }
-            if content.is_empty() {
-                content = "_(no details)_".to_string();
-            }
-            elements.push(collapsible_panel(
-                &format!("{} {}", tool.status_icon(), tool.name),
-                &content,
-            ));
-        }
-        if self.tools.len() > MAX_TOOL_PANELS {
-            elements.push(json!({
-                "tag": "markdown",
-                "content": format!("… 还有 {} 个工具未显示", self.tools.len() - MAX_TOOL_PANELS)
-            }));
-        }
-
-        // Result text — always visible, truncated to keep the card within
-        // Feishu's size limits (over-limit cards are rejected: ErrCode 11310).
-        if !self.text.is_empty() {
-            let content = if self.text.chars().count() <= MAX_TEXT_CHARS {
-                self.text.clone()
-            } else {
-                let head: String = self.text.chars().take(MAX_TEXT_CHARS).collect();
-                format!("{}\n\n…（内容过长，已截断，完整内容请查看 OpenChamber）", head)
-            };
-            elements.push(json!({ "tag": "markdown", "content": content }));
-        } else if self.state == CardState::Streaming || self.state == CardState::Loading {
-            elements.push(json!({ "tag": "markdown", "content": "⏳ ..." }));
-        }
+        let mut elements = self.body.clone();
 
         if let Some(ref footer) = self.footer {
             elements.push(json!({"tag": "hr"}));
             elements.push(json!({ "tag": "markdown", "content": footer }));
         }
 
+        // Error card actions: a retry button so the user can re-submit without
+        // retyping. Only rendered in the Error state.
+        if self.state == CardState::Error {
+            for btn in &self.error_buttons {
+                elements.push(json!({
+                    "tag": "button",
+                    "text": { "tag": "plain_text", "content": btn.text },
+                    "type": btn.kind,
+                    "value": btn.value,
+                }));
+            }
+        }
+
         let (header_title, template) = self.header_info();
+        let mut header = serde_json::json!({
+            "title": { "tag": "plain_text", "content": header_title },
+            "template": template
+        });
+        if let Some(ref subtitle) = self.subtitle {
+            header["subtitle"] = serde_json::json!({
+                "tag": "plain_text",
+                "content": subtitle
+            });
+        }
         json!({
             "schema": "2.0",
             "config": { "wide_screen_mode": true },
-            "header": {
-                "title": { "tag": "plain_text", "content": header_title },
-                "template": template
-            },
+            "header": header,
             "body": { "elements": elements }
         })
     }
 
-    /// Dynamic header: title + color template based on state.
+    /// Dynamic header: the card is a reply, so the header shows only the state
+    /// (the question already sits in the reply context above). The session name
+    /// goes in the subtitle.
     fn header_info(&self) -> (String, &'static str) {
         match self.state {
-            CardState::Loading => (format!("⏳ {} 思考中...", self.title), "blue"),
-            CardState::Reasoning => (format!("💭 {} 推理中...", self.title), "blue"),
+            CardState::Loading => ("⏳ 思考中...".to_string(), "blue"),
+            CardState::Reasoning => ("💭 推理中...".to_string(), "blue"),
             CardState::Streaming => {
                 if let Some(tool) = self.tools.iter().find(|t| t.status == "running") {
                     (format!("🔧 {} {}", tool.status_icon(), tool.name), "orange")
                 } else {
-                    (format!("✍️ {} 回复中...", self.title), "blue")
+                    ("✍️ 回复中...".to_string(), "blue")
                 }
             }
+            // A split card is finalized; its content continues in the next card.
+            CardState::Continued => ("⏳ 部分完成，继续中…".to_string(), "blue"),
             CardState::Done => {
-                if self.tools.iter().any(|t| t.status == "failed") {
-                    (format!("❌ {} 失败", self.title), "red")
+                if self
+                    .tools
+                    .iter()
+                    .any(|t| t.status == "failed" || t.status == "error")
+                {
+                    ("❌ 失败".to_string(), "red")
                 } else {
-                    (format!("✅ {} 完成", self.title), "green")
+                    ("✅ 完成".to_string(), "green")
                 }
             }
-            CardState::Error => (format!("❌ {} 出错", self.title), "red"),
+            CardState::Error => ("❌ 出错".to_string(), "red"),
         }
     }
 }
@@ -216,16 +265,15 @@ fn collapsible_panel(title: &str, content: &str) -> serde_json::Value {
     })
 }
 
-/// Build the interactive permission card. Buttons carry the request id, the
-/// session id, the owning directory and a description so the card callback
-/// (`action: "perm"`) can route the reply back to the right instance and
-/// render a result card.
-pub fn build_permission_card(
+/// The three permission buttons (Allow Once / Allow Always / Deny), as body
+/// elements. Shared by the standalone permission card and the inline section on
+/// the streaming card.
+pub fn permission_buttons(
     session_id: &str,
     request_id: &str,
     body: &str,
     directory: &str,
-) -> serde_json::Value {
+) -> Vec<serde_json::Value> {
     let btn_value = |reply: &str, label: &str, color: &str| {
         json!({
             "action": "perm",
@@ -238,36 +286,127 @@ pub fn build_permission_card(
             "perm_body": body,
         })
     };
+    vec![
+        json!({ "tag": "button", "text": { "tag": "plain_text", "content": "✅ Allow Once" }, "type": "primary", "value": btn_value("once", "✅ Allowed once", "green") }),
+        json!({ "tag": "button", "text": { "tag": "plain_text", "content": "🔁 Allow Always" }, "type": "default", "value": btn_value("always", "✅ Allowed always", "green") }),
+        json!({ "tag": "button", "text": { "tag": "plain_text", "content": "🚫 Deny" }, "type": "danger", "value": btn_value("reject", "🚫 Denied", "red") }),
+    ]
+}
+
+/// Build the interactive permission card (JSON 2.0). Buttons sit directly in
+/// `body.elements` — the v1 `action` container is gone in schema 2.0. Each
+/// button carries the request id, session id, owning directory and a
+/// description so the card callback (`action: "perm"`) can route the reply
+/// back to the right instance and render a result card.
+pub fn build_permission_card(
+    session_id: &str,
+    request_id: &str,
+    body: &str,
+    directory: &str,
+) -> serde_json::Value {
+    let mut elements = vec![json!({ "tag": "markdown", "content": body })];
+    elements.extend(permission_buttons(session_id, request_id, body, directory));
     json!({
+        "schema": "2.0",
         "config": { "wide_screen_mode": true },
         "header": {
             "title": { "tag": "plain_text", "content": "🔐 Permission Required" },
             "template": "orange"
         },
-        "elements": [
-            { "tag": "markdown", "content": body },
-            { "tag": "action", "actions": [
-                { "tag": "button", "text": { "tag": "plain_text", "content": "✅ Allow Once" }, "type": "primary", "value": btn_value("once", "✅ Allowed once", "green") },
-                { "tag": "button", "text": { "tag": "plain_text", "content": "🔁 Allow Always" }, "type": "default", "value": btn_value("always", "✅ Allowed always", "green") },
-                { "tag": "button", "text": { "tag": "plain_text", "content": "🚫 Deny" }, "type": "danger", "value": btn_value("reject", "🚫 Denied", "red") }
-            ]}
-        ]
+        "body": { "elements": elements }
     })
 }
 
-/// Build the interactive question card: one button per option (each carrying
-/// the request id, session id, question index and the chosen label) plus a
-/// reject button, so the card callback (`action: "question"`) can post the
-/// answer back to the session.
-pub fn build_question_card(
+/// A display label for a session name: strips raw Feishu mention tokens
+/// (`@_user_N`) and drops the meaningless `/new`-generated `sess-<uuid>` default
+/// (the caller then shows the session ID instead). Used for card subtitles and
+/// notification cards.
+pub fn clean_session_label(name: &str) -> String {
+    let cleaned = crate::feishu::ws::strip_mention_tokens(name);
+    if cleaned.starts_with("sess-") && cleaned.len() == 41 {
+        String::new()
+    } else {
+        cleaned
+    }
+}
+
+/// A notification card telling the Feishu side that OpenChamber (or another
+/// client on the same store) has posted a new user message to a session.
+/// Kept deliberately small and link-free — cola doesn't couple to OpenChamber.
+pub fn build_external_message_card(session_name: &str, preview: &str) -> serde_json::Value {
+    let session_name = clean_session_label(session_name);
+    let mut content = String::new();
+    if !session_name.is_empty() {
+        content.push_str(&format!("**{}**\n", session_name));
+    }
+    content.push_str(preview);
+    json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true },
+        "header": {
+            "title": { "tag": "plain_text", "content": "💬 有新消息" },
+            "template": "blue"
+        },
+        "body": { "elements": [ { "tag": "markdown", "content": content } ] }
+    })
+}
+
+/// Replacement for a permission/question card whose request was already resolved
+/// by another client (e.g. OpenChamber) — so the Feishu card never stays dead.
+/// `detail` is the original request text, so the user can see WHAT was handled.
+pub fn build_resolved_elsewhere_card(kind: &str, detail: &str) -> serde_json::Value {
+    let mut body = format!("该{}请求已在其他端处理，无需操作。", kind);
+    if !detail.is_empty() {
+        body.push_str(&format!("\n\n{}", detail));
+    }
+    json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true },
+        "header": {
+            "title": { "tag": "plain_text", "content": "✅ 已处理" },
+            "template": "green"
+        },
+        "body": { "elements": [ { "tag": "markdown", "content": body } ] }
+    })
+}
+
+/// A one-line-per-question summary of a `question` request, for the stale card.
+pub fn question_summary(questions: &[crate::opencode::client::QuestionInfo]) -> String {
+    let mut s = String::new();
+    for (i, q) in questions.iter().enumerate() {
+        s.push_str(&format!("{}. {}\n", i + 1, q.question));
+    }
+    s
+}
+
+/// Build the interactive question card (JSON 2.0). Options render as buttons
+/// when few, or collapse into a folding `overflow` group when many; a question
+/// that allows a custom answer (`custom`, default true) gets an input box in a
+/// form container. Already-answered questions (`answered[i] == Some(labels)`)
+/// render as a static "已选" line instead of buttons, so answering one question
+/// never silently submits the others. A submit button appears when some (but
+/// not all) questions are answered; a reject button sits at the bottom. The
+/// card callback (`action: "question"`) posts the answer back to the session.
+/// The body elements of a question prompt: a markdown summary (with ✅ on
+/// answered questions), option buttons (or a folding `overflow` when many),
+/// a custom-answer input form, an optional "submit/skip" button, and a reject
+/// button. Shared by the standalone question card and the inline section on the
+/// streaming card.
+pub fn question_elements(
     request_id: &str,
     session_id: &str,
     questions: &[crate::opencode::client::QuestionInfo],
     directory: &str,
-) -> serde_json::Value {
+    answered: &[Option<Vec<String>>],
+) -> Vec<serde_json::Value> {
+    let is_answered = |qi: usize| -> bool { answered.get(qi).and_then(|a| a.as_ref()).is_some() };
     let mut markdown = String::new();
     for (i, q) in questions.iter().enumerate() {
-        markdown.push_str(&format!("**{}. {}**\n", i + 1, q.question));
+        if is_answered(i) {
+            markdown.push_str(&format!("✅ **{}. {}**\n", i + 1, q.question));
+        } else {
+            markdown.push_str(&format!("**{}. {}**\n", i + 1, q.question));
+        }
         for opt in &q.options {
             if opt.description.is_empty() {
                 markdown.push_str(&format!("- {}\n", opt.label));
@@ -275,29 +414,118 @@ pub fn build_question_card(
                 markdown.push_str(&format!("- {} ({})\n", opt.label, opt.description));
             }
         }
+        if let Some(Some(labels)) = answered.get(i) {
+            markdown.push_str(&format!("  👉 已选：{}\n", labels.join("、")));
+        }
         markdown.push('\n');
     }
 
-    let mut actions: Vec<serde_json::Value> = Vec::new();
+    // Overflow (folding button group) delivers the chosen option as a STRING
+    // (`action.option`), so each option's value encodes the question index and
+    // the answer ("qi|label") and ws.rs decodes it back into the standard
+    // answer shape.
+    let mut elements: Vec<serde_json::Value> = vec![json!({ "tag": "markdown", "content": markdown })];
     for (qi, q) in questions.iter().enumerate() {
-        for opt in &q.options {
-            actions.push(json!({
-                "tag": "button",
-                "text": { "tag": "plain_text", "content": opt.label },
-                "type": "default",
+        if is_answered(qi) {
+            continue;
+        }
+        if q.options.len() > MAX_VISIBLE_OPTIONS {
+            let options: Vec<serde_json::Value> = q
+                .options
+                .iter()
+                .map(|opt| {
+                    json!({
+                        "text": { "tag": "plain_text", "content": opt.label },
+                        "value": format!("{}|{}", qi, opt.label),
+                    })
+                })
+                .collect();
+            elements.push(json!({
+                "tag": "overflow",
+                "width": "fill",
+                "options": options,
                 "value": {
                     "action": "question",
                     "reply": "answer",
                     "request_id": request_id,
                     "session_id": session_id,
                     "directory": directory,
-                    "question_index": qi,
-                    "answer": opt.label,
                 },
+            }));
+        } else {
+            for opt in &q.options {
+                elements.push(json!({
+                    "tag": "button",
+                    "text": { "tag": "plain_text", "content": opt.label },
+                    "type": "default",
+                    "value": {
+                        "action": "question",
+                        "reply": "answer",
+                        "request_id": request_id,
+                        "session_id": session_id,
+                        "directory": directory,
+                        "question_index": qi,
+                        "answer": opt.label,
+                    },
+                }));
+            }
+        }
+
+        // Free-text answer (OpenCode questions allow custom by default). The
+        // typed text arrives in `action.form_value`; ws.rs injects it into the
+        // button's `answer` field so the handler stays unchanged.
+        if q.custom.unwrap_or(true) {
+            let input_name = format!("custom_{}", qi);
+            elements.push(json!({
+                "tag": "form",
+                "name": format!("form_{}", qi),
+                "elements": [
+                    {
+                        "tag": "input",
+                        "name": input_name,
+                        "placeholder": { "tag": "plain_text", "content": "✍️ 输入自定义答案" },
+                        "max_length": 500,
+                        "width": "fill",
+                    },
+                    {
+                        "tag": "button",
+                        "text": { "tag": "plain_text", "content": "✍️ 自定义" },
+                        "type": "default",
+                        "form_action_type": "submit",
+                        // Form submit callbacks don't always carry the button
+                        // `value`, so the routing payload is ALSO encoded in the
+                        // `name` ("submit|req|ses|qi|dir") — ws.rs rebuilds the
+                        // value from it when `action.value` is absent.
+                        "name": format!("submit|{}|{}|{}|{}", request_id, session_id, qi, directory),
+                        "value": {
+                            "action": "question",
+                            "reply": "answer",
+                            "request_id": request_id,
+                            "session_id": session_id,
+                            "directory": directory,
+                            "question_index": qi,
+                        },
+                    },
+                ],
             }));
         }
     }
-    actions.push(json!({
+    let answered_count = answered.iter().filter(|a| a.is_some()).count();
+    if answered_count > 0 && answered_count < questions.len() {
+        elements.push(json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": "✅ 提交（跳过剩余）" },
+            "type": "primary",
+            "value": {
+                "action": "question",
+                "reply": "submit",
+                "request_id": request_id,
+                "session_id": session_id,
+                "directory": directory,
+            },
+        }));
+    }
+    elements.push(json!({
         "tag": "button",
         "text": { "tag": "plain_text", "content": "🚫 无法回答" },
         "type": "danger",
@@ -310,16 +538,27 @@ pub fn build_question_card(
         },
     }));
 
+    elements
+}
+
+/// Build the interactive question card (JSON 2.0): a header plus the question
+/// body elements from `question_elements`.
+pub fn build_question_card(
+    request_id: &str,
+    session_id: &str,
+    questions: &[crate::opencode::client::QuestionInfo],
+    directory: &str,
+    answered: &[Option<Vec<String>>],
+) -> serde_json::Value {
+    let elements = question_elements(request_id, session_id, questions, directory, answered);
     json!({
+        "schema": "2.0",
         "config": { "wide_screen_mode": true },
         "header": {
             "title": { "tag": "plain_text", "content": "❓ AI 想问你" },
             "template": "blue"
         },
-        "elements": [
-            { "tag": "markdown", "content": markdown },
-            { "tag": "action", "actions": actions },
-        ]
+        "body": { "elements": elements }
     })
 }
 fn truncate_md(text: &str, max_len: usize) -> String {
@@ -336,7 +575,7 @@ mod tests {
 
     #[test]
     fn loading_card_header() {
-        let card = CardBuilder::new("cola").with_state(CardState::Loading).build();
+        let card = CardBuilder::new().with_state(CardState::Loading).build();
         let header = &card["header"]["title"]["content"];
         assert!(header.as_str().unwrap().contains("思考中"));
         assert_eq!(card["schema"].as_str().unwrap(), "2.0");
@@ -344,7 +583,7 @@ mod tests {
 
     #[test]
     fn reasoning_is_collapsible_panel() {
-        let card = CardBuilder::new("cola")
+        let card = CardBuilder::new()
             .with_state(CardState::Reasoning)
             .with_reasoning("Let me analyze this code...")
             .build();
@@ -358,7 +597,7 @@ mod tests {
 
     #[test]
     fn streaming_card_shows_text() {
-        let card = CardBuilder::new("cola")
+        let card = CardBuilder::new()
             .with_state(CardState::Streaming)
             .with_text("pub fn main() {")
             .build();
@@ -377,7 +616,7 @@ mod tests {
             input: Some("src/main.rs".into()),
             output: Some("fn main() {}".into()),
         };
-        let card = CardBuilder::new("cola")
+        let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
             .build();
@@ -401,7 +640,7 @@ mod tests {
             input: Some("cargo test".into()),
             output: None,
         };
-        let card = CardBuilder::new("cola")
+        let card = CardBuilder::new()
             .with_state(CardState::Streaming)
             .with_tool(tool)
             .build();
@@ -412,7 +651,7 @@ mod tests {
 
     #[test]
     fn done_card_green() {
-        let card = CardBuilder::new("cola")
+        let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_text("Done!")
             .build();
@@ -427,7 +666,7 @@ mod tests {
 
     #[test]
     fn error_card_shows_red_header() {
-        let card = CardBuilder::new("cola")
+        let card = CardBuilder::new()
             .with_state(CardState::Error)
             .with_text("**错误**: 503 request queue full")
             .build();
@@ -447,20 +686,37 @@ mod tests {
     }
 
     #[test]
-    fn question_appears_before_content() {
-        let card = CardBuilder::new("cola")
+    fn clean_session_label_handles_uuid_and_mentions() {
+        // `/new`-generated `sess-<uuid>` names are meaningless → empty label, so
+        // the caller shows the session ID instead (never "新会话").
+        assert_eq!(
+            clean_session_label("sess-7a025fa5-74a1-44e0-b5c5-80b9a21f71bc"),
+            ""
+        );
+        assert_eq!(clean_session_label("@_user_1 你好"), "你好");
+        assert_eq!(clean_session_label("frontend-refactor"), "frontend-refactor");
+        // A notification card shows the cleaned label, not the raw name.
+        let card = build_external_message_card("sess-7a025fa5-74a1-44e0-b5c5-80b9a21f71bc", "hi");
+        let text = card.to_string();
+        assert!(!text.contains("sess-"), "raw sess-uuid must not leak: {}", text);
+    }
+
+    #[test]
+    fn subtitle_shows_session_name_in_header() {
+        let card = CardBuilder::new()
             .with_state(CardState::Done)
-            .with_question("看看目录里有什么")
+            .with_subtitle("proj-lib")
             .with_text("有 3 个文件。")
             .build();
-        let elements = card["body"]["elements"].as_array().unwrap();
-        assert!(
-            elements[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("看看目录里有什么")
+        assert_eq!(
+            card["header"]["subtitle"]["content"].as_str().unwrap(),
+            "proj-lib"
         );
-        assert_eq!(elements[1]["tag"].as_str().unwrap(), "hr");
+        // The header itself is state-only — the question is not echoed.
+        assert_eq!(card["header"]["title"]["content"].as_str().unwrap(), "✅ 完成");
+        // No "问:" body element (the reply context already shows the question).
+        let text = card.to_string();
+        assert!(!text.contains("**问**"), "question echoed: {}", text);
     }
 
     #[test]
@@ -471,7 +727,7 @@ mod tests {
             input: Some("cargo build".into()),
             output: Some("error[E0308]".into()),
         };
-        let card = CardBuilder::new("cola")
+        let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
             .build();
@@ -502,7 +758,7 @@ mod tests {
             multiple: None,
             custom: None,
         }];
-        let card = build_question_card("que_1", "ses_1", &questions, "/tmp/proj/lib");
+        let card = build_question_card("que_1", "ses_1", &questions, "/tmp/proj/lib", &[None]);
         let text = card.to_string();
         assert!(
             text.contains("选择要在哪个目录继续"),
@@ -510,9 +766,10 @@ mod tests {
             text
         );
 
-        let elements = card["elements"].as_array().unwrap();
-        let action = elements.iter().find(|e| e["tag"] == "action").unwrap();
-        let buttons = action["actions"].as_array().unwrap();
+        // JSON 2.0: buttons live directly in body.elements (no v1 action row).
+        assert_eq!(card["schema"].as_str().unwrap(), "2.0");
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let buttons: Vec<_> = elements.iter().filter(|e| e["tag"] == "button").collect();
         // one button per option + a reject button
         assert_eq!(buttons.len(), 3);
 
@@ -530,10 +787,90 @@ mod tests {
     }
 
     #[test]
-    fn tool_panels_capped_at_limit() {
-        // Feishu rejects JSON 2.0 cards over 200 components (11310). Each tool
-        // panel = panel + nested markdown (+ header), so cap the count.
-        let mut builder = CardBuilder::new("cola").with_state(CardState::Done);
+    fn question_card_many_options_collapse_into_overflow() {
+        let mut options = Vec::new();
+        for i in 0..5 {
+            options.push(crate::opencode::client::QuestionOption {
+                label: format!("/a{}", i),
+                description: String::new(),
+            });
+        }
+        let questions = vec![crate::opencode::client::QuestionInfo {
+            question: "选一个目录".into(),
+            header: "目录".into(),
+            options,
+            multiple: None,
+            custom: None,
+        }];
+        let card = build_question_card("que_1", "ses_1", &questions, "/tmp/proj/lib", &[None]);
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let overflow = elements
+            .iter()
+            .find(|e| e["tag"] == "overflow")
+            .expect("many options collapse into an overflow");
+        let options = overflow["options"].as_array().unwrap();
+        assert_eq!(options.len(), 5);
+        // Each option encodes "qi|label"; ws.rs decodes it back to an answer.
+        assert_eq!(options[0]["value"].as_str().unwrap(), "0|/a0");
+        assert_eq!(options[4]["value"].as_str().unwrap(), "0|/a4");
+        // The overflow carries the routing payload for the reply.
+        assert_eq!(overflow["value"]["request_id"], "que_1");
+        assert_eq!(overflow["value"]["reply"], "answer");
+        // No raw option buttons for the collapsed question.
+        let buttons: Vec<_> = elements.iter().filter(|e| e["tag"] == "button").collect();
+        assert_eq!(buttons.len(), 1, "only the reject button remains");
+        assert_eq!(buttons[0]["value"]["reply"], "reject");
+    }
+
+    #[test]
+    fn question_card_custom_answer_form_added_when_custom_allowed() {
+        let questions = vec![crate::opencode::client::QuestionInfo {
+            question: "q".into(),
+            header: "h".into(),
+            options: vec![crate::opencode::client::QuestionOption {
+                label: "/a".into(),
+                description: String::new(),
+            }],
+            multiple: None,
+            custom: None, // default: custom answers allowed
+        }];
+        let card = build_question_card("que_1", "ses_1", &questions, "/tmp/proj/lib", &[None]);
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let form = elements
+            .iter()
+            .find(|e| e["tag"] == "form")
+            .expect("custom-allowed question gets an input form");
+        assert_eq!(form["name"], "form_0");
+        assert!(form.to_string().contains("input"), "form needs an input");
+        assert!(form.to_string().contains("form_action_type"));
+    }
+
+    #[test]
+    fn question_card_custom_disabled_has_no_input_form() {
+        let questions = vec![crate::opencode::client::QuestionInfo {
+            question: "q".into(),
+            header: "h".into(),
+            options: vec![crate::opencode::client::QuestionOption {
+                label: "/a".into(),
+                description: String::new(),
+            }],
+            multiple: None,
+            custom: Some(false),
+        }];
+        let card = build_question_card("que_1", "ses_1", &questions, "/tmp/proj/lib", &[None]);
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert!(
+            elements.iter().all(|e| e["tag"] != "form"),
+            "custom-disabled question must not get an input form: {}",
+            card
+        );
+    }
+
+    #[test]
+    fn tool_panels_are_all_rendered() {
+        // All tool panels are shown; the streaming card splits into
+        // continuation cards when the component estimate crosses the limit.
+        let mut builder = CardBuilder::new().with_state(CardState::Done);
         for i in 0..25 {
             builder = builder.with_tool(ToolPanel {
                 name: format!("tool {}", i),
@@ -548,21 +885,17 @@ mod tests {
             .iter()
             .filter(|e| e["tag"].as_str() == Some("collapsible_panel"))
             .count();
-        assert_eq!(panels, MAX_TOOL_PANELS, "tool panels must be capped");
-        // A note tells the user some tools are hidden.
+        assert_eq!(panels, 25, "every tool panel must be rendered");
         assert!(
-            elements
-                .iter()
-                .any(|e| e.to_string().contains("还有 15 个工具未显示")),
-            "hidden-tools note missing: {}",
-            card.to_string()
+            !elements.iter().any(|e| e.to_string().contains("工具未显示")),
+            "no hidden-tools note should appear"
         );
     }
 
     #[test]
     fn long_text_is_truncated() {
         let long = "x".repeat(MAX_TEXT_CHARS + 100);
-        let card = CardBuilder::new("cola")
+        let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_text(&long)
             .build();
@@ -579,7 +912,7 @@ mod tests {
 
     #[test]
     fn short_text_is_not_truncated() {
-        let card = CardBuilder::new("cola")
+        let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_text("short reply")
             .build();
@@ -595,13 +928,15 @@ mod tests {
             card["header"]["title"]["content"].as_str().unwrap(),
             "🔐 Permission Required"
         );
-        // Permission card is built v1-style: elements live at the top level.
-        let elements = card["elements"].as_array().unwrap();
-        // element 0 = description markdown, element 1 = action row
+        // JSON 2.0: body.elements hold the markdown + buttons directly (no v1
+        // action row).
+        assert_eq!(card["schema"].as_str().unwrap(), "2.0");
+        let elements = card["body"]["elements"].as_array().unwrap();
+        // element 0 = description markdown, rest = buttons
         assert!(elements[0]["content"].as_str().unwrap().contains("AI 想要执行"));
-        let actions = elements[1]["actions"].as_array().unwrap();
-        assert_eq!(actions.len(), 3);
-        let values: Vec<_> = actions.iter().map(|a| &a["value"]).collect();
+        let buttons: Vec<_> = elements.iter().filter(|e| e["tag"] == "button").collect();
+        assert_eq!(buttons.len(), 3);
+        let values: Vec<_> = buttons.iter().map(|a| &a["value"]).collect();
         // Each button must carry the reply + request_id + session_id so the
         // card callback can route the answer back.
         let once = values.iter().find(|v| v["reply"] == "once").unwrap();

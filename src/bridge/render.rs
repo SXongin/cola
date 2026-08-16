@@ -3,19 +3,70 @@ use std::sync::Arc;
 use crate::bridge::handler::App;
 use crate::bridge::streaming::StreamAccumulator;
 
+/// Extract the user-visible output of a tool part. Tries the historical
+/// `state.output` / `state.metadata.output`, then the current schema:
+/// `state.content[*].text` joined, `state.result` (string), and for an "error"
+/// status the `state.error.message`.
+fn extract_tool_output(part: &serde_json::Value, status: &str) -> Option<String> {
+    if let Some(o) = part
+        .get("state")
+        .and_then(|s| s.get("output"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+    {
+        return Some(o);
+    }
+    let state = part.get("state")?;
+    let mut out = String::new();
+    if let Some(arr) = state.get("content").and_then(|c| c.as_array()) {
+        for item in arr {
+            if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
+                out.push_str(t);
+            }
+        }
+    }
+    if let Some(r) = state.get("result").and_then(|v| v.as_str()) {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(r);
+    }
+    if status == "error"
+        && let Some(e) = state
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|v| v.as_str())
+    {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("❌ {}", e));
+    }
+    if out.is_empty() {
+        // Historical fallback: `state.metadata.output`.
+        state
+            .get("metadata")
+            .and_then(|m| m.get("output"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    } else {
+        Some(out)
+    }
+}
+
 /// Render canonical message parts (from `POST /session/{id}/message` response)
 /// into the accumulator so the card shows the assistant's final result.
 fn render_part(acc: &mut StreamAccumulator, part: &serde_json::Value) {
     match part.get("type").and_then(|t| t.as_str()) {
         Some("text") => {
             if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                acc.text.push_str(t);
+                acc.push_text(t);
             }
             acc.card_state = crate::feishu::card::CardState::Streaming;
         }
         Some("reasoning") => {
             if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                acc.reasoning.push_str(t);
+                acc.push_reasoning(t);
             }
             acc.card_state = crate::feishu::card::CardState::Reasoning;
         }
@@ -35,20 +86,13 @@ fn render_part(acc: &mut StreamAccumulator, part: &serde_json::Value) {
                 .get("state")
                 .and_then(|s| s.get("input"))
                 .map(|v| serde_json::to_string(v).unwrap_or_default());
-            let output = part
-                .get("state")
-                .and_then(|s| s.get("output"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .or_else(|| {
-                    part.get("state")
-                        .and_then(|s| s.get("metadata"))
-                        .and_then(|m| m.get("output"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                });
-            acc.tools.insert(
-                call_id,
+            // OpenCode stores tool output as `state.content` (array of
+            // {type:"text",text}) plus an optional `result`, and failures put
+            // the reason in `state.error.message`. There is NO `state.output`
+            // field on tool parts — reading it silently lost every result.
+            let output = extract_tool_output(part, status);
+            acc.push_tool(
+                &call_id,
                 crate::feishu::card::ToolPanel {
                     name: name.to_string(),
                     status: status.to_string(),
@@ -67,11 +111,80 @@ fn render_part(acc: &mut StreamAccumulator, part: &serde_json::Value) {
     }
 }
 
-pub(crate) fn render_parts(acc: &mut StreamAccumulator, parts: &serde_json::Value) {
-    let Some(arr) = parts.as_array() else { return };
+/// Render a batch of parts into the accumulator, skipping anything already
+/// rendered (same dedup as the poll loop). Returns true if anything new was
+/// rendered. Used as the final fallback when the incremental poll missed parts.
+pub(crate) fn render_parts(acc: &mut StreamAccumulator, parts: &serde_json::Value) -> bool {
+    let Some(arr) = parts.as_array() else { return false };
+    let mut rendered_any = false;
     for part in arr {
-        render_part(acc, part);
+        if render_part_once(acc, part) {
+            rendered_any = true;
+        }
     }
+    rendered_any
+}
+
+/// Render a single part into the accumulator, applying the same dedup rules as
+/// the poll loop: reasoning/text are tracked by `{type}:{content}` (OpenCode
+/// part payloads carry NO `id`), tool parts by a state signature so they can
+/// re-render on running → completed, everything else by part `id`. Returns true
+/// if the part was rendered (not skipped as duplicate/empty).
+fn render_part_once(acc: &mut StreamAccumulator, part: &serde_json::Value) -> bool {
+    let ptype = part
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?")
+        .to_string();
+    // Reasoning/text parts are written with empty text first, then updated with
+    // the full content. Only render once they have content, otherwise we'd
+    // freeze the placeholder version.
+    if ptype == "reasoning" || ptype == "text" {
+        let Some(t) = part.get("text").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        if t.is_empty() {
+            return false;
+        }
+        let dedup_key = format!("{}:{}", ptype, t);
+        if acc.rendered_parts.contains(&dedup_key) {
+            return false;
+        }
+        acc.rendered_parts.insert(dedup_key);
+        render_part(acc, part);
+        return true;
+    }
+    // Tool parts get updated in place (running → completed); re-render whenever
+    // the state signature changes so panels don't stay stuck on "running".
+    if ptype == "tool" {
+        let call_id = part.get("callID").and_then(|v| v.as_str()).unwrap_or_default();
+        let status = part
+            .pointer("/state/status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let output_len = part
+            .pointer("/state/output")
+            .and_then(|v| v.as_str())
+            .map(|s| s.len())
+            .unwrap_or(0);
+        let sig = format!("{}|{}", status, output_len);
+        if acc.rendered_tool_states.get(call_id) == Some(&sig) {
+            return false;
+        }
+        acc.rendered_tool_states.insert(call_id.to_string(), sig);
+        render_part(acc, part);
+        return true;
+    }
+    // Everything else (step-start/step-finish/patch): render once.
+    let part_id = part.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+    if let Some(id) = &part_id {
+        if acc.rendered_parts.contains(id) {
+            return false;
+        }
+        acc.rendered_parts.insert(id.clone());
+    }
+    render_part(acc, part);
+    true
 }
 
 /// Render the parts of this turn's assistant messages that haven't been
@@ -93,71 +206,21 @@ pub(crate) fn render_new_turn_parts(
         if !is_assistant || !in_turn {
             continue;
         }
+        // Capture the answering model + token usage for the card footer.
+        if let Some(model_id) = &m.info.model_id {
+            acc.model_id = Some(model_id.clone());
+        }
+        if let Some(provider_id) = &m.info.provider_id {
+            acc.provider_id = Some(provider_id.clone());
+        }
+        if let Some(tokens) = &m.info.tokens {
+            acc.context_tokens = tokens.context_used();
+        }
         let Some(parts) = m.parts.as_array() else { continue };
         for part in parts {
-            let ptype = part
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?")
-                .to_string();
-            // Reasoning/text parts are written with empty text first, then
-            // updated with the full content. Only render once they have content,
-            // otherwise we'd freeze the placeholder version.
-            if ptype == "reasoning" || ptype == "text" {
-                let Some(t) = part.get("text").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                if t.is_empty() {
-                    continue;
-                }
-                // OpenCode part payloads carry NO `id` (the DB column id is not
-                // serialised), so dedupe on content: the same part re-fetched
-                // (poll + final render) must not append twice. This is what
-                // previously doubled the card text (81 → 162 chars).
-                let dedup_key = format!("{}:{}", ptype, t);
-                if acc.rendered_parts.contains(&dedup_key) {
-                    continue;
-                }
-                acc.rendered_parts.insert(dedup_key);
-                render_part(acc, part);
+            if render_part_once(acc, part) {
                 rendered_any = true;
-                continue;
             }
-            // Tool parts get updated in place (running → completed); re-render
-            // whenever the state signature changes so panels don't stay stuck
-            // on "running".
-            if ptype == "tool" {
-                let call_id = part.get("callID").and_then(|v| v.as_str()).unwrap_or_default();
-                let status = part
-                    .pointer("/state/status")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let output_len = part
-                    .pointer("/state/output")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.len())
-                    .unwrap_or(0);
-                let sig = format!("{}|{}", status, output_len);
-                if let Some(prev) = acc.rendered_tool_states.get(call_id) {
-                    if prev == &sig {
-                        continue;
-                    }
-                }
-                acc.rendered_tool_states.insert(call_id.to_string(), sig);
-                render_part(acc, part);
-                rendered_any = true;
-                continue;
-            }
-            // Everything else (step-start/step-finish/patch): render once.
-            let part_id = part.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
-            if let Some(id) = &part_id {
-                if acc.rendered_parts.contains(id) {
-                    continue;
-                }
-                acc.rendered_parts.insert(id.clone());
-            }
-            render_part(acc, part);
-            rendered_any = true;
         }
     }
     rendered_any
@@ -165,19 +228,65 @@ pub(crate) fn render_new_turn_parts(
 
 /// Push the accumulator's current card to Feishu as an update of the loading
 /// card, so the user sees reasoning/tool/text appear incrementally.
+/// Upper bound on continuation cards sent for one flush (each is a new message).
+const MAX_CARD_CHAIN: usize = 8;
+
 pub(crate) async fn flush_card(app: &Arc<App>, session_id: &str) {
-    let accs = app.accumulators.lock().await;
-    let Some(acc) = accs.get(session_id) else { return };
-    let card = acc.build_card();
-    drop(accs);
-    let card_id = {
-        let ids = app.card_message_ids.lock().await;
-        ids.get(session_id).cloned()
-    };
-    if let Some(msg_id) = card_id
-        && let Err(e) = app.feishu.update_message(&msg_id, &card).await
-    {
-        tracing::warn!("Card update failed: {}", e);
+    for _ in 0..MAX_CARD_CHAIN {
+        let (card, full) = {
+            let mut accs = app.accumulators.lock().await;
+            match accs.get_mut(session_id) {
+                Some(acc) => acc.build_card_with_split(),
+                None => return,
+            }
+        };
+        let card_id = {
+            let ids = app.card_message_ids.lock().await;
+            ids.get(session_id).cloned()
+        };
+        let Some(card_id) = card_id else { return };
+        if !full {
+            if let Err(e) = app.feishu.update_message(&card_id, &card).await {
+                tracing::warn!("Card update failed: {}", e);
+            }
+            return;
+        }
+
+        // The card hit the component limit: finalize it with a "to be
+        // continued" marker, then send a FRESH continuation card that takes over
+        // subsequent updates. `build_card_with_split` already advanced
+        // `render_from` past the split point, so the continuation holds only the
+        // remaining content — nothing is lost.
+        if let Err(e) = app.feishu.update_message(&card_id, &card).await {
+            tracing::warn!("Card split update failed: {}", e);
+        }
+        let reply_to = {
+            let accs = app.accumulators.lock().await;
+            accs.get(session_id).and_then(|a| a.reply_to_message_id.clone())
+        };
+        let Some(reply_to) = reply_to else { return };
+        let (cont_card, cont_full) = {
+            let mut accs = app.accumulators.lock().await;
+            accs.get_mut(session_id)
+                .map(|acc| acc.build_card_with_split())
+                .unwrap_or((serde_json::json!({}), false))
+        };
+        match app.feishu.reply_card(&reply_to, &cont_card).await {
+            Ok(new_id) => {
+                app.card_message_ids
+                    .lock()
+                    .await
+                    .insert(session_id.to_string(), new_id);
+                if !cont_full {
+                    return;
+                }
+                // The continuation is itself over the limit → loop and split again.
+            }
+            Err(e) => {
+                tracing::warn!("Card continuation send failed: {}", e);
+                return;
+            }
+        }
     }
 }
 
@@ -301,6 +410,9 @@ mod tests {
                     role: Some("assistant".into()),
                     parent_id: None,
                     time: Some(MessageTime { created: 100 }),
+                    model_id: None,
+                    provider_id: None,
+                    tokens: None,
                 },
                 parts: serde_json::json!([{ "id": "prt_old", "type": "reasoning", "text": "old reasoning" }]),
             },
@@ -311,6 +423,9 @@ mod tests {
                     role: Some("user".into()),
                     parent_id: None,
                     time: Some(MessageTime { created: 2000 }),
+                    model_id: None,
+                    provider_id: None,
+                    tokens: None,
                 },
                 parts: serde_json::json!([{ "id": "prt_user", "type": "text", "text": "question" }]),
             },
@@ -321,6 +436,9 @@ mod tests {
                     role: Some("assistant".into()),
                     parent_id: None,
                     time: Some(MessageTime { created: 3000 }),
+                    model_id: None,
+                    provider_id: None,
+                    tokens: None,
                 },
                 parts: serde_json::json!([
                     { "id": "prt_rsn", "type": "reasoning", "text": "Let me think" },
@@ -355,6 +473,9 @@ mod tests {
                     role: Some("assistant".into()),
                     parent_id: None,
                     time: Some(MessageTime { created: 100 }),
+                    model_id: None,
+                    provider_id: None,
+                    tokens: None,
                 },
                 parts: serde_json::json!([{
                     "id": "prt_tool",
@@ -401,6 +522,9 @@ mod tests {
                     role: Some("assistant".into()),
                     parent_id: None,
                     time: Some(MessageTime { created: 100 }),
+                    model_id: None,
+                    provider_id: None,
+                    tokens: None,
                 },
                 parts: serde_json::json!([
                     { "id": "prt_rsn", "type": "reasoning", "text": reasoning },
@@ -454,6 +578,9 @@ mod tests {
                     role: Some("assistant".into()),
                     parent_id: None,
                     time: Some(MessageTime { created: 100 }),
+                    model_id: None,
+                    provider_id: None,
+                    tokens: None,
                 },
                 parts: serde_json::json!([
                     { "type": "text", "text": "你好！很高兴认识你。" },
@@ -470,5 +597,102 @@ mod tests {
         assert!(!render_new_turn_parts(&mut acc, &msgs(), epoch));
         assert_eq!(acc.text, "你好！很高兴认识你。");
         assert_eq!(acc.reasoning, "thinking");
+    }
+
+    /// Real OpenCode failed-tool parts use `state.status: "error"` with the
+    /// reason in `state.error.message` and NO `state.output` field — the panel
+    /// must show the error and mark the card failed, not stay stuck "running".
+    #[test]
+    fn failed_tool_error_part_renders_output_and_error_state() {
+        use crate::opencode::client::{MessageInfo, MessageTime, SessionMessage};
+
+        let epoch = 0;
+        let mut acc = StreamAccumulator::new("test");
+        acc.submit_epoch_ms = Some(epoch);
+
+        let msgs = vec![SessionMessage {
+            info: MessageInfo {
+                id: "a1".into(),
+                role: Some("assistant".into()),
+                parent_id: None,
+                time: Some(MessageTime { created: 100 }),
+                model_id: None,
+                provider_id: None,
+                tokens: None,
+            },
+            parts: serde_json::json!([
+                { "type": "tool", "tool": "edit", "callID": "call_edit",
+                  "state": {
+                    "status": "error",
+                    "input": { "filePath": "src/main.rs", "oldString": "a", "newString": "b" },
+                    "content": [ { "type": "text", "text": "something went wrong" } ],
+                    "error": { "type": "unknown", "message": "no such file" },
+                    "result": null
+                  } }
+            ]),
+        }];
+
+        assert!(render_new_turn_parts(&mut acc, &msgs, epoch));
+        let tool = acc.tools.get("call_edit").expect("tool rendered");
+        assert_eq!(tool.status, "error");
+        let out = tool.output.clone().unwrap_or_default();
+        assert!(
+            out.contains("no such file"),
+            "error message must be shown: {}",
+            out
+        );
+
+        // The Done card header must flag the failure, not "✅ 完成".
+        acc.card_state = crate::feishu::card::CardState::Done;
+        let card = acc.build_card();
+        let header = card["header"]["title"]["content"].as_str().unwrap();
+        assert!(header.contains("失败"), "failed tool → red header: {}", header);
+    }
+    /// Regression: the final reconcile falls back to `render_parts(resp.parts)`
+    /// when the incremental poll already rendered everything (`render_new_turn_parts`
+    /// returns false). `render_parts` used to append unconditionally, doubling the
+    /// card text on long turns (the poll renders the answer while the card is still
+    /// "streaming", then the final card repeats it).
+    #[test]
+    fn render_parts_fallback_does_not_double_already_rendered_text() {
+        use crate::opencode::client::{MessageInfo, MessageTime, SessionMessage};
+
+        let epoch = 0;
+        let mut acc = StreamAccumulator::new("test");
+        acc.submit_epoch_ms = Some(epoch);
+
+        let msgs = vec![SessionMessage {
+            info: MessageInfo {
+                id: "a1".into(),
+                role: Some("assistant".into()),
+                parent_id: None,
+                time: Some(MessageTime { created: 100 }),
+                model_id: None,
+                provider_id: None,
+                tokens: None,
+            },
+            parts: serde_json::json!([
+                { "type": "reasoning", "text": "Let me check" },
+                { "type": "text", "text": "The answer." },
+                { "type": "tool", "tool": "bash", "callID": "call_1",
+                  "state": { "status": "completed", "input": { "command": "ls" }, "output": "src" } },
+            ]),
+        }];
+
+        // Long turn: the poll loop already rendered the parts.
+        assert!(render_new_turn_parts(&mut acc, &msgs, epoch));
+
+        // Final reconcile: nothing new from messages → falls back to the
+        // response parts (identical content). Must NOT append again.
+        let resp_parts = serde_json::json!([
+            { "type": "reasoning", "text": "Let me check" },
+            { "type": "text", "text": "The answer." },
+            { "type": "tool", "tool": "bash", "callID": "call_1",
+              "state": { "status": "completed", "input": { "command": "ls" }, "output": "src" } },
+        ]);
+        assert!(!render_parts(&mut acc, &resp_parts));
+        assert_eq!(acc.text, "The answer.");
+        assert_eq!(acc.reasoning, "Let me check");
+        assert_eq!(acc.tools["call_1"].output.as_deref(), Some("src"));
     }
 }
