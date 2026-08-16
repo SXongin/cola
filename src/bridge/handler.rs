@@ -366,16 +366,38 @@ impl App {
                     .await?;
             }
             Command::AutoAccept(on) => {
-                let mut store = self.sessions.lock().await;
-                if let Some(entry) = store.get_active(&thread_key) {
-                    let mut e = entry.clone();
-                    e.auto_accept = on;
-                    store.set_active(e);
-                    store.persist()?;
+                // The flag gates future permissions; turning it on should ALSO
+                // clear requests that are already pending but were seen before
+                // (the poller's `seen` set skips them, so they'd otherwise hang
+                // as cards forever).
+                let mut approved = 0usize;
+                if let Some((sid, dir)) = {
+                    let store = self.sessions.lock().await;
+                    store
+                        .get_active(&thread_key)
+                        .map(|e| (e.session_id.clone(), e.directory.clone()))
+                } {
+                    {
+                        let mut store = self.sessions.lock().await;
+                        if let Some(entry) = store.get_active(&thread_key) {
+                            let mut e = entry.clone();
+                            e.auto_accept = on;
+                            store.set_active(e);
+                            store.persist()?;
+                        }
+                    }
+                    if on {
+                        approved = self.approve_pending_for_session(&sid, &dir).await;
+                    }
                 }
                 let state = if on { "开" } else { "关" };
+                let extra = if on && approved > 0 {
+                    format!("（已自动批准 {} 条待处理请求）", approved)
+                } else {
+                    String::new()
+                };
                 self.feishu
-                    .reply_text(message_id, &format!("🔁 已将会话自动审批{state}。"))
+                    .reply_text(message_id, &format!("🔁 已将会话自动审批{state}。{}", extra))
                     .await?;
             }
             Command::Stop => {
@@ -841,6 +863,64 @@ impl App {
             .await
             .get_active(thread_key)
             .map(|e| e.session_id.clone())
+    }
+
+    /// After `/autoaccept on`: answer every permission request that is ALREADY
+    /// pending for `session_id` (or one of its sub-task child sessions) with
+    /// "once". The permission poller's `seen` set skips requests it has already
+    /// surfaced, so enabling autoaccept would otherwise leave old cards hanging
+    /// forever. Returns how many requests were approved.
+    async fn approve_pending_for_session(&self, session_id: &str, directory: &str) -> usize {
+        let Ok(perms) = self.opencode.list_permissions(Some(directory)).await else {
+            return 0;
+        };
+        let mut approved = 0usize;
+        for p in &perms {
+            // Match the session itself or a sub-task child (its parent chain).
+            let Some(sid) = p.session_id.clone() else { continue };
+            if sid != session_id && !self.session_descends_from(&sid, session_id, directory).await {
+                continue;
+            }
+            match self
+                .opencode
+                .reply_permission(&p.request_id, "once", Some(directory))
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        "Auto-accepted pending permission {} on session {} ({})",
+                        p.request_id,
+                        sid,
+                        p.permission.as_deref().unwrap_or("?")
+                    );
+                    approved += 1;
+                }
+                Err(e) => tracing::warn!("auto-accept pending {} on session {}: {}", p.request_id, sid, e),
+            }
+        }
+        approved
+    }
+
+    /// Whether `candidate` is `root` or a sub-task child reachable by walking
+    /// up its parent chain (sub-task child sessions carry their own sessionID).
+    async fn session_descends_from(&self, candidate: &str, root: &str, directory: &str) -> bool {
+        if candidate == root {
+            return true;
+        }
+        let mut current = candidate.to_string();
+        for _ in 0..8 {
+            let Ok(info) = self.opencode.session_info(&current, Some(directory)).await else {
+                return false;
+            };
+            let Some(parent) = info.parent_id.filter(|p| p != &current) else {
+                return false;
+            };
+            if parent == root {
+                return true;
+            }
+            current = parent;
+        }
+        false
     }
 
     async fn get_or_create_session(
@@ -2332,6 +2412,119 @@ mod integration_tests {
             }),
             "no permission card should be sent for an auto-accept session: {:?}",
             sent
+        );
+    }
+
+    /// `/autoaccept on` must also approve requests that were ALREADY pending
+    /// (seen before the flag existed), not just future ones. Otherwise the
+    /// poller's `seen` set leaves old permission cards hanging forever.
+    #[tokio::test]
+    async fn autoaccept_on_approves_already_pending_permission() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut mock = MockBackend::new(realistic_parts());
+        mock.permissions = vec![opencode::client::PermissionRequest {
+            request_id: "per_pending".into(),
+            session_id: Some("ses_test".into()),
+            permission: Some("bash".into()),
+            patterns: vec!["ls -la".into()],
+            metadata: None,
+            always: Vec::new(),
+        }];
+        let perm_calls = mock.reply_permission_calls.clone();
+        let (app, _platform) = build_app(cfg, mock).await;
+
+        // Session already mapped but autoaccept OFF — the permission would have
+        // been surfaced as a card before the user enabled it.
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+                session_id: "ses_test".into(),
+                name: "aa".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                auto_accept: false,
+            });
+            store.persist().unwrap();
+        }
+
+        // Now the user turns autoaccept on via the command.
+        app.handle_command(
+            Command::AutoAccept(true),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_cmd",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        // The already-pending request was approved with "once" immediately.
+        let calls = perm_calls.lock().await.clone();
+        assert_eq!(
+            calls,
+            vec![("per_pending".to_string(), "once".to_string())],
+            "turning autoaccept on should approve already-pending requests"
+        );
+        // The flag is persisted for future requests.
+        let entry = {
+            let store = app.sessions.lock().await;
+            store
+                .get_active(&crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()))
+                .cloned()
+        };
+        assert!(entry.unwrap().auto_accept, "autoaccept flag should persist");
+    }
+
+    /// Sub-task child sessions carry their own sessionID; `/autoaccept on` on
+    /// the parent must reach through the parent chain and approve their
+    /// pending permissions too.
+    #[tokio::test]
+    async fn autoaccept_on_approves_child_session_permission() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut mock = MockBackend::new(realistic_parts());
+        mock.permissions = vec![opencode::client::PermissionRequest {
+            request_id: "per_child".into(),
+            session_id: Some("ses_child".into()),
+            permission: Some("bash".into()),
+            patterns: vec!["rm -rf x".into()],
+            metadata: None,
+            always: Vec::new(),
+        }];
+        mock.session_parents.insert("ses_child".into(), "ses_test".into());
+        let perm_calls = mock.reply_permission_calls.clone();
+        let (app, _platform) = build_app(cfg, mock).await;
+
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+                session_id: "ses_test".into(),
+                name: "aa".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                auto_accept: false,
+            });
+            store.persist().unwrap();
+        }
+
+        app.handle_command(
+            Command::AutoAccept(true),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_cmd",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let calls = perm_calls.lock().await.clone();
+        assert_eq!(
+            calls,
+            vec![("per_child".to_string(), "once".to_string())],
+            "child-session permission should be approved via the parent chain"
         );
     }
 
