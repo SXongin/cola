@@ -97,12 +97,57 @@ fn tool_panel_element(tool: &ToolPanel) -> serde_json::Value {
         }
     }
     if let Some(ref o) = tool.output {
-        content.push_str(&format!("**Output**\n{}", truncate_md(o, 800)));
+        content.push_str(&format!(
+            "**Output**\n{}",
+            truncate_md(&format_tool_output(&tool.name, o), 800)
+        ));
     }
     if content.is_empty() {
         content = "_(no details)_".to_string();
     }
     collapsible_panel(&format!("{} {}", tool.status_icon(), tool.name), &content)
+}
+
+/// Render a tool's raw output string human-friendly. OpenCode's `read` tool
+/// wraps its output in XML tags (`<path>…</path>`, `<type>…</type>`,
+/// `<content>…</content>`); strip them so the card shows just the file path and
+/// the numbered lines instead of raw markup. Other tools pass through unchanged.
+fn format_tool_output(name: &str, output: &str) -> String {
+    if name != "read" || !output.contains("<path>") {
+        return output.to_string();
+    }
+    let mut path = String::new();
+    let mut body = String::new();
+    for line in output.lines() {
+        let l = line.trim_end();
+        if l.starts_with("<path>") && l.ends_with("</path>") {
+            path = l
+                .trim_start_matches("<path>")
+                .trim_end_matches("</path>")
+                .to_string();
+        } else if l.trim() == "<content>"
+            || l.trim() == "</content>"
+            || l.trim() == "<type>file</type>"
+            || l.trim() == "<type>directory</type>"
+        {
+            // Skip the wrapper tags.
+        } else if !body.is_empty() || !line.is_empty() {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(line);
+        }
+    }
+    let mut out = String::new();
+    if !path.is_empty() {
+        out.push_str(&format!("📄 `{}`\n", path));
+    }
+    out.push_str(&body);
+    if out.trim().is_empty() {
+        output.to_string()
+    } else {
+        out
+    }
 }
 
 /// Render a tool's input JSON as human-readable markdown, keyed on the tool
@@ -1018,6 +1063,74 @@ mod tests {
             !elements.iter().any(|e| e.to_string().contains("工具未显示")),
             "no hidden-tools note should appear"
         );
+    }
+
+    #[test]
+    fn read_tool_output_strips_xml_wrapper() {
+        let raw = "\
+<path>/root/workspace/dev/cola/src/main.rs</path>
+<type>file</type>
+<content>
+1: fn main() {
+2:     println!(\"hi\");
+3: }
+</content>";
+        let out = format_tool_output("read", raw);
+        assert!(!out.contains("<path>"), "path tag must be stripped: {}", out);
+        assert!(
+            !out.contains("<content>"),
+            "content tag must be stripped: {}",
+            out
+        );
+        assert!(
+            !out.contains("</content>"),
+            "closing tag must be stripped: {}",
+            out
+        );
+        assert!(!out.contains("<type>"), "type tag must be stripped: {}", out);
+        assert!(
+            out.contains("/root/workspace/dev/cola/src/main.rs"),
+            "path must still be shown: {}",
+            out
+        );
+        assert!(
+            out.contains("fn main() {"),
+            "the actual code must be kept: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn non_read_tool_output_passes_through() {
+        let raw = "some\nplain output";
+        assert_eq!(format_tool_output("bash", raw), raw);
+        // Even a read-named tool without the wrapper is left alone.
+        assert_eq!(format_tool_output("read", "no wrapper here"), "no wrapper here");
+    }
+
+    #[test]
+    fn read_tool_output_renders_in_panel() {
+        let raw = "\
+<path>/x/y.rs</path>
+<type>file</type>
+<content>
+1: use std::fs;
+</content>";
+        let tool = ToolPanel {
+            name: "read".into(),
+            status: "completed".into(),
+            input: Some(json!({"filePath": "/x/y.rs"})),
+            output: Some(raw.into()),
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        let text = card.to_string();
+        assert!(!text.contains("<path>"), "wrapper leaks into card: {}", text);
+        assert!(!text.contains("<content>"), "wrapper leaks into card: {}", text);
+        assert!(text.contains("/x/y.rs"), "path shown: {}", text);
+        assert!(text.contains("use std::fs"), "code shown: {}", text);
     }
 
     #[test]
