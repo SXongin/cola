@@ -1536,6 +1536,8 @@ mod test_support {
         pub fail_prompt_count: Arc<std::sync::atomic::AtomicUsize>,
         /// Records every `prompt` call's text (asserts retry re-submits).
         pub prompt_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
+        /// Records every `prompt_async` call's text (asserts supplement path).
+        pub prompt_async_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
         /// The session id `create_session` returns.
         pub session_id: String,
         /// When true, `prompt` 404s for any session id other than `session_id`
@@ -1559,6 +1561,7 @@ mod test_support {
                 prompt_error: None,
                 fail_prompt_count: std::sync::atomic::AtomicUsize::new(0).into(),
                 prompt_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                prompt_async_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 session_id: "ses_test".into(),
                 stale_session_404: false,
                 session_parents: std::collections::HashMap::new(),
@@ -1625,6 +1628,11 @@ mod test_support {
                 error: None,
                 parts: self.parts.clone(),
             })
+        }
+
+        async fn prompt_async(&self, session_id: &str, text: &str) -> crate::error::Result<()> {
+            self.prompt_async_calls.lock().await.push(format!("{}:{}", session_id, text));
+            Ok(())
         }
 
         async fn messages(

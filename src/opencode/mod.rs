@@ -21,6 +21,11 @@ pub trait Backend: Send + Sync {
 
     async fn prompt(&self, session_id: &str, text: &str) -> Result<PromptResponse>;
 
+    /// Fire-and-forget prompt (OpenCode `prompt_async`): message persisted and
+    /// a run forked, returns immediately. Used by the supplement path so a
+    /// message sent mid-turn doesn't block.
+    async fn prompt_async(&self, session_id: &str, text: &str) -> Result<()>;
+
     async fn reply_permission(&self, request_id: &str, reply: &str, directory: Option<&str>) -> Result<()>;
 
     async fn list_permissions(&self, directory: Option<&str>) -> Result<Vec<PermissionRequest>>;
@@ -67,6 +72,10 @@ impl Backend for Client {
 
     async fn prompt(&self, session_id: &str, text: &str) -> Result<PromptResponse> {
         Client::prompt(self, session_id, text).await
+    }
+
+    async fn prompt_async(&self, session_id: &str, text: &str) -> Result<()> {
+        Client::prompt_async(self, session_id, text).await
     }
 
     async fn reply_permission(&self, request_id: &str, reply: &str, directory: Option<&str>) -> Result<()> {

@@ -175,6 +175,41 @@ impl Client {
         Ok(body.data)
     }
 
+    /// Fire-and-forget prompt: `POST /session/{id}/prompt_async`. OpenCode
+    /// immediately persists the user message (`createUserMessage`) and forks a
+    /// run (`Effect.forkIn`), returning 204 — the caller doesn't block until the
+    /// turn finishes. Used by the supplement path: while a turn is in flight we
+    /// send the new message here so it lands in the DB and the running loop
+    /// picks it up at the next tool boundary (merged into the current turn),
+    /// without a second synchronous prompt blocking the WS read loop.
+    pub async fn prompt_async(&self, session_id: &str, text: &str) -> crate::error::Result<()> {
+        let mut body = serde_json::json!({
+            "parts": [{"type": "text", "text": text}],
+        });
+        if let Some(model) = &self.model {
+            body["model"] = serde_json::json!({
+                "providerID": model.provider_id,
+                "modelID": model.id,
+            });
+        }
+        let resp = self
+            .http
+            .post(self.url(&format!("/session/{}/prompt_async", session_id)))
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(crate::error::BridgeError::OpenCode(format!(
+                "prompt_async {}: {} {}",
+                session_id,
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            )));
+        }
+        tracing::info!("prompt_async sent to session {}", session_id);
+        Ok(())
+    }
+
     /// Fetch a session's info (canonical: `GET /session/{id}`), used to resolve
     /// a sub-task (child) session's parent chain so permission cards for subtask
     /// sessions can be routed to the chat the parent is mapped to.
