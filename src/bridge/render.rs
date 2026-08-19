@@ -6,7 +6,8 @@ use crate::bridge::streaming::StreamAccumulator;
 /// Extract the user-visible output of a tool part. Tries the historical
 /// `state.output` / `state.metadata.output`, then the current schema:
 /// `state.content[*].text` joined, `state.result` (string), and for an "error"
-/// status the `state.error.message`.
+/// status the `state.error` — which may be a string (`"Could not find ..."`) or
+/// an object (`{"message": "..."}`).
 fn extract_tool_output(part: &serde_json::Value, status: &str) -> Option<String> {
     if let Some(o) = part
         .get("state")
@@ -32,10 +33,13 @@ fn extract_tool_output(part: &serde_json::Value, status: &str) -> Option<String>
         out.push_str(r);
     }
     if status == "error"
-        && let Some(e) = state
-            .get("error")
-            .and_then(|e| e.get("message"))
-            .and_then(|v| v.as_str())
+        && let Some(e) = state.get("error").and_then(|e| match e {
+            // Object form: `{"message": "..."}`.
+            serde_json::Value::Object(m) => m.get("message").and_then(|v| v.as_str()),
+            // Plain string form: `"Could not find oldString..."`.
+            serde_json::Value::String(s) => Some(s.as_str()),
+            _ => None,
+        })
     {
         if !out.is_empty() {
             out.push('\n');
@@ -650,6 +654,49 @@ mod tests {
         let card = acc.build_card();
         let header = card["header"]["title"]["content"].as_str().unwrap();
         assert!(header.contains("失败"), "failed tool → red header: {}", header);
+    }
+
+    /// Some tools (e.g. `edit` with a stale `oldString`) put the reason in a
+    /// PLAIN STRING (`state.error: "Could not find oldString..."`), not an
+    /// object — it must still show up on the panel, not vanish.
+    #[test]
+    fn failed_tool_string_error_renders_on_panel() {
+        use crate::opencode::client::{MessageInfo, MessageTime, SessionMessage};
+
+        let epoch = 0;
+        let mut acc = StreamAccumulator::new("test");
+        acc.submit_epoch_ms = Some(epoch);
+
+        let msgs = vec![SessionMessage {
+            info: MessageInfo {
+                id: "a1".into(),
+                role: Some("assistant".into()),
+                parent_id: None,
+                time: Some(MessageTime { created: 100 }),
+                model_id: None,
+                provider_id: None,
+                tokens: None,
+            },
+            parts: serde_json::json!([
+                { "type": "tool", "tool": "edit", "callID": "call_edit",
+                  "state": {
+                    "status": "error",
+                    "input": { "filePath": "src/main.rs", "oldString": "a", "newString": "b" },
+                    "error": "Could not find oldString in the file. It must match exactly."
+                  } }
+            ]),
+        }];
+
+        assert!(render_new_turn_parts(&mut acc, &msgs, epoch));
+        let tool = acc.tools.get("call_edit").expect("tool rendered");
+        assert_eq!(tool.status, "error");
+        let out = tool.output.clone().unwrap_or_default();
+        assert!(
+            out.contains("Could not find oldString"),
+            "string error message must be shown: {:?}",
+            out
+        );
+        assert!(!out.is_empty(), "output must not be empty for a string error");
     }
     /// Regression: the final reconcile falls back to `render_parts(resp.parts)`
     /// when the incremental poll already rendered everything (`render_new_turn_parts`
