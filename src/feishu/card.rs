@@ -407,15 +407,11 @@ impl CardBuilder {
             // A split card is finalized; its content continues in the next card.
             CardState::Continued => ("⏳ 部分完成，继续中…".to_string(), "blue"),
             CardState::Done => {
-                if self
-                    .tools
-                    .iter()
-                    .any(|t| t.status == "failed" || t.status == "error")
-                {
-                    ("❌ 失败".to_string(), "red")
-                } else {
-                    ("✅ 完成".to_string(), "green")
-                }
+                // The turn itself finished. Individual tool failures are shown
+                // on their own panels (❌ + reason); they don't make the whole
+                // turn a failure — the model routinely retries or works around
+                // a failed tool call and still completes the task.
+                ("✅ 完成".to_string(), "green")
             }
             CardState::Error => ("❌ 出错".to_string(), "red"),
         }
@@ -893,23 +889,26 @@ mod tests {
     }
 
     #[test]
-    fn failed_tool_marks_done_red() {
+    fn failed_tool_does_not_fail_whole_card() {
+        // A failed tool call is a normal part of an agent run — the model
+        // retries or works around it. The card stays "✅ 完成"; the failure is
+        // shown only on the tool's own panel (❌ + reason).
         let tool = ToolPanel {
-            name: "bash".into(),
-            status: "failed".into(),
-            input: Some(json!({"command": "cargo build"})),
-            output: Some("error[E0308]".into()),
+            name: "edit".into(),
+            status: "error".into(),
+            input: Some(json!({"filePath": "src/main.rs"})),
+            output: Some("❌ Could not find oldString...".into()),
         };
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
             .build();
-        assert_eq!(card["header"]["template"].as_str().unwrap(), "red");
+        assert_eq!(card["header"]["template"].as_str().unwrap(), "green");
         assert!(
             card["header"]["title"]["content"]
                 .as_str()
                 .unwrap()
-                .contains("失败")
+                .contains("完成")
         );
     }
 

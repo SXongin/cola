@@ -81,6 +81,58 @@ async fn wait_for_port(port: u16) -> anyhow::Result<()> {
     anyhow::bail!("OpenCode server did not start on port {}", port)
 }
 
+/// Path of the singleton lock file — created atomically at startup so a second
+/// cola process refuses to start and stays out of the Feishu WS + permission
+/// flow (two instances double-answer permission cards and double-send events).
+fn lock_file_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".cola")
+        .join("cola.lock")
+}
+
+/// Hold the singleton lock for the lifetime of the process. Fails fast if
+/// another cola is already running (its PID is in the lock file). The lock file
+/// is cleaned up on drop.
+struct SingletonLock(std::path::PathBuf);
+
+impl SingletonLock {
+    fn acquire() -> anyhow::Result<Self> {
+        let path = lock_file_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                writeln!(file, "{}", std::process::id())?;
+                tracing::info!("Acquired singleton lock at {}", path.display());
+                Ok(SingletonLock(path))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let owner = std::fs::read_to_string(&path).unwrap_or_default();
+                anyhow::bail!(
+                    "Another cola instance is already running (lock {} owned by PID {}). \
+                     Refusing to start a duplicate that would double-handle Feishu events.",
+                    path.display(),
+                    owner.trim()
+                )
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+impl Drop for SingletonLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
@@ -90,6 +142,10 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let mut cfg = config::load(&cli.config)?;
+
+    // Grab the singleton lock BEFORE touching the network or the store — a
+    // duplicate cola must die before it can double-connect to the Feishu WS.
+    let _lock = SingletonLock::acquire()?;
 
     resolve_opencode_server(&mut cfg.opencode).await?;
 

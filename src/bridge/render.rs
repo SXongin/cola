@@ -649,11 +649,16 @@ mod tests {
             out
         );
 
-        // The Done card header must flag the failure, not "✅ 完成".
+        // The Done card header stays green — the failure is on the tool's own
+        // panel, not the whole turn.
         acc.card_state = crate::feishu::card::CardState::Done;
         let card = acc.build_card();
         let header = card["header"]["title"]["content"].as_str().unwrap();
-        assert!(header.contains("失败"), "failed tool → red header: {}", header);
+        assert!(
+            header.contains("完成"),
+            "failed tool alone must not fail the card: {}",
+            header
+        );
     }
 
     /// Some tools (e.g. `edit` with a stale `oldString`) put the reason in a
