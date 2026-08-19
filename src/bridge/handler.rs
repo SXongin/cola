@@ -510,6 +510,46 @@ impl App {
         }
 
         let subtitle = self.session_subtitle(&thread_key, &text).await;
+
+        // Supplement path: if this session already has a turn in flight, don't
+        // start a competing run_prompt (it would overwrite the running turn's
+        // accumulator and race on the same card). Instead send the message
+        // fire-and-forget via prompt_async — OpenCode persists it and the
+        // running loop picks it up at the next tool boundary, merging it into
+        // the current turn (original message preserved; model sees full
+        // history). This is what lets the user append context mid-turn without
+        // /stop and without interrupting a tool call.
+        {
+            let busy = self.inflight.lock().await.contains(&session_id);
+            if busy {
+                match self.opencode.prompt_async(&session_id, &text).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            "supplement: session {} in-flight, message queued to merge into current turn",
+                            session_id
+                        );
+                        if kind == ConversationKind::P2p || kind == ConversationKind::Topic {
+                            let _ = self
+                                .feishu
+                                .reply_text(
+                                    message_id,
+                                    "📨 已收到补充，将并入当前处理。若当前轮已结束，会作为下一条消息继续。",
+                                )
+                                .await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("supplement: prompt_async failed: {}", e);
+                        let _ = self
+                            .feishu
+                            .reply_text(message_id, "⚠️ 补充消息发送失败，请稍后重试。")
+                            .await;
+                    }
+                }
+                return Ok(());
+            }
+        }
+
         self.run_prompt(PromptContext {
             session_id,
             thread_key,
@@ -1631,7 +1671,10 @@ mod test_support {
         }
 
         async fn prompt_async(&self, session_id: &str, text: &str) -> crate::error::Result<()> {
-            self.prompt_async_calls.lock().await.push(format!("{}:{}", session_id, text));
+            self.prompt_async_calls
+                .lock()
+                .await
+                .push(format!("{}:{}", session_id, text));
             Ok(())
         }
 
@@ -3703,5 +3746,62 @@ mod integration_tests {
                 .pending_questions
                 .is_empty()
         );
+    }
+
+    /// When a turn is already in flight, a new message must NOT start a
+    /// competing run_prompt (which would overwrite the running accumulator and
+    /// race on the same card). It goes through the supplement path: the message
+    /// is sent fire-and-forget via prompt_async (OpenCode merges it into the
+    /// current turn) and the user gets a notice — no Loading card, no second
+    /// accumulator.
+    #[tokio::test]
+    async fn message_during_inflight_goes_to_supplement_path() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        let sup_calls = backend.prompt_async_calls.clone();
+        let (app, platform) = build_app(cfg, backend).await;
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+                session_id: "ses_test".into(),
+                name: "aa".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                auto_accept: false,
+            });
+            store.persist().unwrap();
+        }
+        app.inflight.lock().await.insert("ses_test".to_string());
+
+        app.handle_message(
+            "msg_sup".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "补充一下，改用方案 B".into(),
+            None,
+        )
+        .await;
+
+        // prompt_async was called with the supplement text.
+        let calls = sup_calls.lock().await.clone();
+        assert!(
+            calls.iter().any(|c| c.contains("补充一下，改用方案 B")),
+            "supplement text must be sent via prompt_async: {:?}",
+            calls
+        );
+
+        // NO Loading card / run_prompt was started for the supplement message.
+        let sent = platform.calls.lock().await.clone();
+        assert!(
+            sent.iter().all(|c| matches!(c, PlatformCall::ReplyText { .. })),
+            "supplement must only reply text, not start a card: {:?}",
+            sent
+        );
+        // The in-flight marker is preserved (still running).
+        assert!(app.inflight.lock().await.contains("ses_test"));
     }
 }
