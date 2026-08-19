@@ -19,8 +19,9 @@ pub enum Command {
     Agent(String),
     /// Switch model in the current session
     Model(String),
-    /// Toggle auto-accept of permission requests for the current session.
-    AutoAccept(bool),
+    /// Auto-accept of permission requests for the current session. `None` just
+    /// reports the current state; `Some(true/false)` switches it.
+    AutoAccept(Option<bool>),
     /// Restart cola itself, preserving startup args and the log redirect.
     Restart,
     /// Show available commands, or help for one command (`/help <cmd>`).
@@ -68,15 +69,15 @@ pub fn parse_command(text: &str) -> Option<Command> {
             Some(p) => Some(Command::Model(p.to_string())),
             None => Some(Command::Help(Some("model".into()))),
         },
-        // `/autoaccept` toggles; `/autoaccept on|off` sets explicitly.
+        // `/autoaccept` reports the current state; `/autoaccept on|off` switches.
         "/autoaccept" => match arg {
-            Some("on") | Some("true") | Some("1") => Some(Command::AutoAccept(true)),
-            Some("off") | Some("false") | Some("0") => Some(Command::AutoAccept(false)),
+            Some("on") | Some("true") | Some("1") => Some(Command::AutoAccept(Some(true))),
+            Some("off") | Some("false") | Some("0") => Some(Command::AutoAccept(Some(false))),
             Some(other) => match other.parse::<bool>() {
-                Ok(b) => Some(Command::AutoAccept(b)),
-                Err(_) => None,
+                Ok(b) => Some(Command::AutoAccept(Some(b))),
+                Err(_) => Some(Command::Help(Some("autoaccept".into()))),
             },
-            None => Some(Command::AutoAccept(true)),
+            None => Some(Command::AutoAccept(None)),
         },
         "/restart" => Some(Command::Restart),
         "/help" => Some(Command::Help(arg.map(|s| s.to_lowercase()))),
@@ -98,7 +99,7 @@ pub fn help_text() -> String {
 `/compact` · Compact context
 `/agent <name>` · Switch agent
 `/model <p/m>` · Switch model
-`/autoaccept [on|off]` · Auto-allow permissions for this session
+`/autoaccept` · Show auto-approve status; `/autoaccept on|off` switches
 `/restart` · Restart cola (keeps startup args + log redirect)
 `/help <command>` · Show help for one command (e.g. `/help model`)
     "
@@ -132,7 +133,7 @@ pub fn command_help(name: &str) -> Option<String> {
             "/model <provider/model>\nSwitch the model for the current session.\nExample: `/model opencode-go/deepseek-v4-flash`"
         }
         "autoaccept" => {
-            "/autoaccept [on|off]\nToggle auto-allowing permission requests for this session (no permission cards).\nDefault (no arg): on. Example: `/autoaccept on`"
+            "/autoaccept [on|off]\nShow or switch auto-allowing permission requests for this session (no permission cards).\nNo arg: show current state. `/autoaccept on` / `/autoaccept off` switch it.\nExample: `/autoaccept`"
         }
         "restart" => {
             "/restart\nRestart cola itself, keeping startup args and the log redirect. cola announces in this chat when it's back."

@@ -365,11 +365,25 @@ impl App {
                     .reply_text(message_id, &format!("Renamed to \"{}\".", name))
                     .await?;
             }
-            Command::AutoAccept(on) => {
-                // The flag gates future permissions; turning it on should ALSO
-                // clear requests that are already pending but were seen before
-                // (the poller's `seen` set skips them, so they'd otherwise hang
-                // as cards forever).
+            Command::AutoAccept(switch) => {
+                // With no argument (`None`) this just reports the current state;
+                // `Some(on)` switches the flag AND clears requests that are
+                // already pending but were seen before (the poller's `seen` set
+                // skips them, so they'd otherwise hang as cards forever).
+                let current = {
+                    let store = self.sessions.lock().await;
+                    store.get_active(&thread_key).map(|e| e.auto_accept)
+                };
+                let on = match switch {
+                    Some(on) => on,
+                    None => {
+                        let state = if current.unwrap_or(false) { "开" } else { "关" };
+                        self.feishu
+                            .reply_text(message_id, &format!("🔁 当前会话自动审批：{}。", state))
+                            .await?;
+                        return Ok(());
+                    }
+                };
                 let mut approved = 0usize;
                 if let Some((sid, dir)) = {
                     let store = self.sessions.lock().await;
@@ -2429,7 +2443,7 @@ mod integration_tests {
 
         // Now the user turns autoaccept on via the command.
         app.handle_command(
-            Command::AutoAccept(true),
+            Command::AutoAccept(Some(true)),
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             "msg_cmd",
             crate::config::ConversationKind::P2p,
@@ -2489,7 +2503,7 @@ mod integration_tests {
         }
 
         app.handle_command(
-            Command::AutoAccept(true),
+            Command::AutoAccept(Some(true)),
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             "msg_cmd",
             crate::config::ConversationKind::P2p,
