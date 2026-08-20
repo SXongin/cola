@@ -41,6 +41,34 @@ async fn resolve_card_target(app: &Arc<App>, session_id: &str, directory: &str) 
     None
 }
 
+/// Whether a permission request for `session_id` should be auto-accepted.
+///
+/// Mirrors the `/autoaccept` flag, resolved like `resolve_card_target` does for
+/// card delivery: a sub-task child session is NOT in cola's SessionStore, so a
+/// direct lookup misses it and it would surface a card even though its parent
+/// session has autoaccept on. Walking the parent chain makes the child inherit
+/// the parent's flag, consistent with `App::approve_pending_for_session`.
+async fn should_auto_accept(app: &Arc<App>, session_id: &str, directory: &str) -> bool {
+    let mut current = session_id.to_string();
+    for _ in 0..8 {
+        {
+            let sessions = app.sessions.lock().await;
+            if let Some(e) = sessions.entry_for_session(&current) {
+                return e.auto_accept;
+            }
+        }
+        // Unknown session → walk up to its parent (sub-task child sessions).
+        let Ok(info) = app.opencode.session_info(&current, Some(directory)).await else {
+            return false;
+        };
+        let Some(parent) = info.parent_id.filter(|p| p != &current) else {
+            return false;
+        };
+        current = parent;
+    }
+    false
+}
+
 /// Independent permission poller: runs forever, surfaces pending permission
 /// requests as cards as soon as they appear. Started once at App startup so a
 /// prompt blocked on an unanswered permission still gets its card shown.
@@ -71,13 +99,9 @@ pub(crate) async fn permission_poll_loop(app: &Arc<App>) -> crate::error::Result
                         );
                         // `/autoaccept` sessions: answer the request automatically
                         // instead of showing a card (mirrors OpenChamber's toggle).
-                        let auto = app
-                            .sessions
-                            .lock()
-                            .await
-                            .entry_for_session(&sid)
-                            .map(|e| e.auto_accept)
-                            .unwrap_or(false);
+                        // Resolves sub-task child sessions up their parent chain so
+                        // they inherit the parent's flag (like approve_pending).
+                        let auto = should_auto_accept(app, &sid, dir).await;
                         if auto {
                             match app
                                 .opencode
