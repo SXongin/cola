@@ -37,7 +37,23 @@ pub const MAX_CARD_JSON_CHARS: usize = 100_000;
 /// A single text element; bound it so a very long reply never pushes the card
 /// over Feishu's total card size / element limits. Reasoning, tool input/output
 /// and the question are already truncated per-element.
-pub const MAX_TEXT_CHARS: usize = 3000;
+pub const MAX_ELEMENT_TEXT_CHARS: usize = 3000;
+
+/// Split `text` into chunks of at most `max` chars (character-aware), keeping
+/// the full content. Used to bound single card elements and timeline items.
+pub(crate) fn chunk_text(text: &str, max: usize) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let take: String = rest.chars().take(max).collect();
+        chunks.push(take.clone());
+        rest = &rest[take.len()..];
+    }
+    chunks
+}
 
 /// Builds Feishu interactive card JSON (v2 schema with collapsible panels).
 /// Body elements are appended in the order the builder methods are called, so
@@ -190,16 +206,22 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
         }
         "read" | "write" | "glob" | "grep" => {
             let mut parts = Vec::new();
-            for k in ["filePath", "path", "pattern"] {
-                if let Some(v) = get(k) {
-                    parts.push(format!("`{}`", v));
-                }
-            }
-            if let Some(v) = get("pattern") {
-                if parts.is_empty() {
-                    parts.push(format!("`{}`", v));
-                } else {
+            // `pattern` is the search key for glob/grep — show it as "匹配",
+            // not twice. File paths render as plain paths.
+            if name == "grep" || name == "glob" {
+                if let Some(v) = get("pattern") {
                     parts.push(format!("匹配 `{}`", v));
+                }
+                for k in ["filePath", "path"] {
+                    if let Some(v) = get(k) {
+                        parts.push(format!("`{}`", v));
+                    }
+                }
+            } else {
+                for k in ["filePath", "path"] {
+                    if let Some(v) = get(k) {
+                        parts.push(format!("`{}`", v));
+                    }
                 }
             }
             if let Some(v) = get("include") {
@@ -305,17 +327,11 @@ impl CardBuilder {
     }
 
     pub fn with_text(mut self, text: &str) -> Self {
-        if text.is_empty() {
-            return self;
-        }
         // Long text is split across multiple elements (each within the
         // per-element limit) so nothing is truncated; the card splitter bounds
         // how much text one card carries.
-        let mut rest = text;
-        while !rest.is_empty() {
-            let take: String = rest.chars().take(MAX_TEXT_CHARS).collect();
-            self.body.push(json!({ "tag": "markdown", "content": take }));
-            rest = &rest[take.len()..];
+        for chunk in chunk_text(text, MAX_ELEMENT_TEXT_CHARS) {
+            self.body.push(json!({ "tag": "markdown", "content": chunk }));
         }
         self
     }
@@ -1134,7 +1150,7 @@ mod tests {
 
     #[test]
     fn long_text_splits_across_multiple_elements() {
-        let long = "x".repeat(MAX_TEXT_CHARS * 2 + 100);
+        let long = "x".repeat(MAX_ELEMENT_TEXT_CHARS * 2 + 100);
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_text(&long)
@@ -1152,7 +1168,7 @@ mod tests {
         for el in &text_els {
             let content = el["content"].as_str().unwrap();
             assert!(
-                content.chars().count() <= MAX_TEXT_CHARS,
+                content.chars().count() <= MAX_ELEMENT_TEXT_CHARS,
                 "element over cap: {} chars",
                 content.chars().count()
             );
@@ -1260,6 +1276,54 @@ mod tests {
         assert!(text.contains("src/foo.rs"), "path missing: {}", text);
         assert!(text.contains("最多 80 行"), "limit missing: {}", text);
         assert!(!text.contains("filePath"), "raw key leaked: {}", text);
+    }
+
+    #[test]
+    fn tool_input_grep_shows_pattern_once() {
+        // Regression: the pattern was rendered twice (as a bare path AND as
+        // "匹配 …") for grep/glob inputs.
+        let tool = ToolPanel {
+            name: "grep".into(),
+            status: "completed".into(),
+            input: Some(json!({"pattern": "fn main", "path": "src/main.rs", "include": "*.rs"})),
+            output: None,
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        let text = card.to_string();
+        assert!(
+            text.matches("fn main").count() == 1,
+            "pattern must appear exactly once: {}",
+            text
+        );
+        assert!(
+            text.contains("匹配 `fn main`"),
+            "pattern should be shown as 匹配: {}",
+            text
+        );
+        assert!(text.contains("src/main.rs"), "path missing: {}", text);
+    }
+
+    #[test]
+    fn tool_input_glob_shows_pattern_once() {
+        let tool = ToolPanel {
+            name: "glob".into(),
+            status: "completed".into(),
+            input: Some(json!({"pattern": "**/*.ts"})),
+            output: None,
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        let text = card.to_string();
+        assert!(
+            text.matches("**/*.ts").count() == 1,
+            "glob pattern must appear once: {}",
+            text
+        );
     }
 
     #[test]

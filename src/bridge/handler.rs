@@ -365,54 +365,56 @@ impl App {
                     .reply_text(message_id, &format!("Renamed to \"{}\".", name))
                     .await?;
             }
-            Command::AutoAccept(switch) => {
-                // With no argument (`None`) this just reports the current state;
-                // `Some(on)` switches the flag AND clears requests that are
-                // already pending but were seen before (the poller's `seen` set
-                // skips them, so they'd otherwise hang as cards forever).
-                let current = {
+            Command::AutoAccept(action) => {
+                // `Status` reports the current state; `Set(on)` switches the flag
+                // AND clears requests that are already pending but were seen
+                // before (the poller's `seen` set skips them, so they'd
+                // otherwise hang as cards forever).
+                let entry = {
                     let store = self.sessions.lock().await;
-                    store.get_active(&thread_key).map(|e| e.auto_accept)
+                    store.get_active(&thread_key).cloned()
                 };
-                let on = match switch {
-                    Some(on) => on,
-                    None => {
-                        let state = if current.unwrap_or(false) { "开" } else { "关" };
+                match action {
+                    crate::bridge::command::AutoAcceptAction::Status => {
+                        let state = if entry.as_ref().map(|e| e.auto_accept).unwrap_or(false) {
+                            "开"
+                        } else {
+                            "关"
+                        };
                         self.feishu
                             .reply_text(message_id, &format!("🔁 当前会话自动审批：{}。", state))
                             .await?;
                         return Ok(());
                     }
-                };
-                let mut approved = 0usize;
-                if let Some((sid, dir)) = {
-                    let store = self.sessions.lock().await;
-                    store
-                        .get_active(&thread_key)
-                        .map(|e| (e.session_id.clone(), e.directory.clone()))
-                } {
-                    {
-                        let mut store = self.sessions.lock().await;
-                        if let Some(entry) = store.get_active(&thread_key) {
-                            let mut e = entry.clone();
+                    crate::bridge::command::AutoAcceptAction::Set(on) => {
+                        let approved = if on {
+                            if let Some(e) = &entry {
+                                self.approve_pending_for_session(&e.session_id, &e.directory)
+                                    .await
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        };
+                        if let Some(e) = entry {
+                            let mut store = self.sessions.lock().await;
+                            let mut e = e.clone();
                             e.auto_accept = on;
                             store.set_active(e);
                             store.persist()?;
                         }
-                    }
-                    if on {
-                        approved = self.approve_pending_for_session(&sid, &dir).await;
+                        let state = if on { "开" } else { "关" };
+                        let extra = if on && approved > 0 {
+                            format!("（已自动批准 {} 条待处理请求）", approved)
+                        } else {
+                            String::new()
+                        };
+                        self.feishu
+                            .reply_text(message_id, &format!("🔁 已将会话自动审批{state}。{}", extra))
+                            .await?;
                     }
                 }
-                let state = if on { "开" } else { "关" };
-                let extra = if on && approved > 0 {
-                    format!("（已自动批准 {} 条待处理请求）", approved)
-                } else {
-                    String::new()
-                };
-                self.feishu
-                    .reply_text(message_id, &format!("🔁 已将会话自动审批{state}。{}", extra))
-                    .await?;
             }
             Command::Stop => {
                 if let Some(id) = self.get_session_id(&thread_key).await {
@@ -2494,7 +2496,7 @@ mod integration_tests {
 
         // Now the user turns autoaccept on via the command.
         app.handle_command(
-            Command::AutoAccept(Some(true)),
+            Command::AutoAccept(crate::bridge::command::AutoAcceptAction::Set(true)),
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             "msg_cmd",
             crate::config::ConversationKind::P2p,
@@ -2554,7 +2556,7 @@ mod integration_tests {
         }
 
         app.handle_command(
-            Command::AutoAccept(Some(true)),
+            Command::AutoAccept(crate::bridge::command::AutoAcceptAction::Set(true)),
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             "msg_cmd",
             crate::config::ConversationKind::P2p,

@@ -352,10 +352,10 @@ impl StreamAccumulator {
                 // single item never exceeds the per-card budget; the budget
                 // accumulates across items and splits at the boundary. The
                 // component estimate mirrors `with_text`, which splits each
-                // element at MAX_TEXT_CHARS.
+                // element at MAX_ELEMENT_TEXT_CHARS.
                 TimelineItem::Text(t) => {
                     let chars = t.chars().count();
-                    let elements = chars.div_ceil(crate::feishu::card::MAX_TEXT_CHARS);
+                    let elements = chars.div_ceil(crate::feishu::card::MAX_ELEMENT_TEXT_CHARS);
                     (elements, chars, chars)
                 }
             };

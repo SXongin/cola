@@ -19,15 +19,23 @@ pub enum Command {
     Agent(String),
     /// Switch model in the current session
     Model(String),
-    /// Auto-accept of permission requests for the current session. `None` just
-    /// reports the current state; `Some(true/false)` switches it.
-    AutoAccept(Option<bool>),
+    /// Auto-accept of permission requests for the current session.
+    AutoAccept(AutoAcceptAction),
     /// Restart cola itself, preserving startup args and the log redirect.
     Restart,
     /// Show available commands, or help for one command (`/help <cmd>`).
     Help(Option<String>),
     /// Forward unrecognized slash command to OpenCode as prompt text
     Forward(String),
+}
+
+/// What `/autoaccept` should do: report the current state, or switch it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoAcceptAction {
+    /// No argument — just report whether autoaccept is currently on.
+    Status,
+    /// `on` / `off` — switch the flag.
+    Set(bool),
 }
 
 /// Parse a slash command from message text. Returns `None` if the message
@@ -71,13 +79,15 @@ pub fn parse_command(text: &str) -> Option<Command> {
         },
         // `/autoaccept` reports the current state; `/autoaccept on|off` switches.
         "/autoaccept" => match arg {
-            Some("on") | Some("true") | Some("1") => Some(Command::AutoAccept(Some(true))),
-            Some("off") | Some("false") | Some("0") => Some(Command::AutoAccept(Some(false))),
+            Some("on") | Some("true") | Some("1") => Some(Command::AutoAccept(AutoAcceptAction::Set(true))),
+            Some("off") | Some("false") | Some("0") => {
+                Some(Command::AutoAccept(AutoAcceptAction::Set(false)))
+            }
             Some(other) => match other.parse::<bool>() {
-                Ok(b) => Some(Command::AutoAccept(Some(b))),
+                Ok(b) => Some(Command::AutoAccept(AutoAcceptAction::Set(b))),
                 Err(_) => Some(Command::Help(Some("autoaccept".into()))),
             },
-            None => Some(Command::AutoAccept(None)),
+            None => Some(Command::AutoAccept(AutoAcceptAction::Status)),
         },
         "/restart" => Some(Command::Restart),
         "/help" => Some(Command::Help(arg.map(|s| s.to_lowercase()))),

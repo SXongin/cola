@@ -96,11 +96,36 @@ fn lock_file_path() -> std::path::PathBuf {
 /// is cleaned up on drop.
 struct SingletonLock(std::path::PathBuf);
 
+/// Whether a PID refers to a live process. On Linux this checks `/proc/{pid}`;
+/// elsewhere it conservatively assumes the PID is alive so a lock is never
+/// stolen from a real process (a stale lock on a non-Linux host is a manual
+/// delete, same as before).
+fn pid_alive(pid: i32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::path::Path::new(&format!("/proc/{}", pid)).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 impl SingletonLock {
     fn acquire() -> anyhow::Result<Self> {
         let path = lock_file_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+        }
+        // A lock file whose PID is no longer alive is a stale leftover from a
+        // crashed/killed process — reclaim it instead of failing forever.
+        if let Ok(owner) = std::fs::read_to_string(&path)
+            && let Ok(pid) = owner.trim().parse::<i32>()
+            && !pid_alive(pid)
+        {
+            tracing::warn!("Removing stale singleton lock (owner PID {} is not alive)", pid);
+            let _ = std::fs::remove_file(&path);
         }
         match std::fs::OpenOptions::new()
             .write(true)
