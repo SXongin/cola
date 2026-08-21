@@ -1,11 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::ops::Deref;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
-use crate::bridge::command::{self, Command};
-use crate::bridge::pollers::{external_message_poll_loop, permission_poll_loop, question_poll_loop};
+use crate::bridge::command;
+use crate::bridge::core::SharedCore;
 use crate::bridge::render::{flush_card, render_new_turn_parts, render_parts, render_poll_loop};
-use crate::bridge::session::SessionStore;
 use crate::bridge::streaming::StreamAccumulator;
 use crate::config::{Config, ConversationKind, SessionEntry, ThreadKey};
 use crate::feishu;
@@ -24,40 +22,6 @@ const GROUP_LOBBY_GUIDANCE: &str = "\
 /// Re-exec cola itself with the ORIGINAL startup args, inheriting stdio so a
 /// shell log redirect (`cola ... > test.log 2>&1`) carries into the new process.
 /// The current process then calls `std::process::exit(0)` right after.
-fn restart_process() -> std::io::Result<()> {
-    use std::process::{Command, Stdio};
-    let mut exe = std::env::current_exe()?;
-    // If the binary was replaced by a rebuild while we're running,
-    // `/proc/self/exe` resolves to "<path> (deleted)" — spawning that fails with
-    // ENOENT. Strip the suffix: the NEW binary lives at that path, which is
-    // exactly what a restart wants.
-    if let Some(s) = exe.to_str()
-        && let Some(clean) = s.strip_suffix(" (deleted)")
-    {
-        exe = std::path::PathBuf::from(clean);
-    }
-    // `Command::new` resolves bare names via PATH; always use an absolute path.
-    if !exe.is_absolute() {
-        exe = std::env::current_dir()?.join(exe);
-    }
-    // argv[0] is the exe path; pass the rest through unchanged.
-    Command::new(&exe)
-        .args(std::env::args().skip(1))
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()?;
-    Ok(())
-}
-
-/// The file the restart flow uses to tell the new process which chat to
-/// announce the restart in.
-fn restart_notify_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".cola")
-        .join("restart-notify.json")
-}
 
 /// Everything `run_prompt` needs for one turn. Built by `handle_prompt` for a
 /// fresh message and by the error-card "retry" action (which reuses the
@@ -73,51 +37,61 @@ struct PromptContext {
     is_group: bool,
 }
 
+/// The bridge coordinator. Owns the state shared by every flow ([`SharedCore`])
+/// plus the per-flow modules that hold their own private state. `Deref`s to the
+/// shared core so flows and callers can reach `app.sessions`, `app.opencode`,
+/// etc. without threading a separate handle.
 pub struct App {
-    pub sessions: Arc<Mutex<SessionStore>>,
-    pub accumulators: Arc<Mutex<HashMap<String, StreamAccumulator>>>,
-    pub card_message_ids: Arc<Mutex<HashMap<String, String>>>,
-    /// request_id → pending question request (the AI asks the user; cola posts
-    /// the answer back from the question card).
-    pub question_requests: Arc<Mutex<HashMap<String, opencode::client::QuestionRequest>>>,
-    /// request_id → answers recorded so far (None = not answered yet). A request
-    /// is only submitted once EVERY question has an answer (or the user clicks
-    /// "submit/skip"), because `reply_question` expects answers for all of them.
-    pub question_partial: Arc<Mutex<QuestionPartial>>,
-    /// session_id → created time of the last user message cola knows about.
-    /// The external-message poller notifies Feishu when a NEWER user message
-    /// appears (someone posted from OpenChamber or another shared-store client).
-    pub last_user_msg_epoch: Arc<Mutex<HashMap<String, i64>>>,
-    /// request_id → (card message_id, description) of the permission card cola
-    /// sent. Used to mark a card stale — WITH the original request text — when
-    /// the request is resolved by ANOTHER client.
-    pub sent_permission_cards: Arc<Mutex<HashMap<String, (String, String)>>>,
-    /// request_id → (card message_id, description) of the question card cola
-    /// sent (same use).
-    pub sent_question_cards: Arc<Mutex<HashMap<String, (String, String)>>>,
-    pub seen_event_ids: Arc<Mutex<HashSet<String>>>,
-    /// request ids already answered on the permission/question cards. Guards
-    /// against double-click races (two card callbacks before the result card
-    /// replaces the buttons): a second click on the same request is ignored
-    /// server-side instead of re-replying.
-    pub answered_requests: Arc<Mutex<HashSet<String>>>,
-    /// Session ids with a prompt currently in flight (serializes prompts per
-    /// session so concurrent messages don't clobber each other's accumulators).
-    pub inflight: Arc<Mutex<HashSet<String>>>,
-    /// Default directory for new sessions (from `[bridge] work_dir`).
-    pub work_dir: Option<String>,
-    /// Whether to send the group completion notice (from `[bridge] group_completion_notice`).
-    pub group_completion_notice: bool,
-    /// cola's own Feishu open_id, used to recognise @mentions of the bot.
-    pub bot_open_id: Arc<Mutex<Option<String>>>,
-    pub opencode: Arc<dyn opencode::Backend>,
-    pub feishu: Arc<dyn feishu::Platform>,
+    core: Arc<SharedCore>,
+    /// Weak self-reference, set once inside `run` (which holds the Arc). Lets
+    /// the `EventSink` trait impl (which only has `&self`) recover a
+    /// `&Arc<App>` to hand to the inherent methods. `Weak` so it never keeps
+    /// the app alive — no reference cycle. `std::sync::Mutex` because it is
+    /// locked without awaiting.
+    self_weak: std::sync::Mutex<Option<std::sync::Weak<App>>>,
+    /// Permission flow: owns `sent_permission_cards`, polls pending requests,
+    /// and handles the "perm" card action.
+    pub permission: super::permission::PermissionFlow,
+    /// Question flow: owns `question_requests` / `question_partial` /
+    /// `sent_question_cards`, polls pending questions, and handles the
+    /// "question" card action (answer / submit / reject).
+    pub question: super::question::QuestionFlow,
+    /// External-message flow: owns `last_user_msg_epoch`, notifies Feishu when
+    /// another shared-store client posts while cola is idle.
+    pub external: super::external::ExternalFlow,
 }
 
-/// Partial answers recorded for a pending question request: `answers[i]` is
-/// `None` until the user answers question `i`. A request is only submitted once
-/// every slot is filled (or the user clicks "submit/skip").
-type QuestionPartial = HashMap<String, Vec<Option<Vec<String>>>>;
+impl Deref for App {
+    type Target = SharedCore;
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::bridge::EventSink for App {
+    async fn handle_message(
+        &self,
+        message_id: String,
+        chat_id: String,
+        chat_type: String,
+        thread_id: Option<String>,
+        text: String,
+        requester_open_id: Option<String>,
+    ) {
+        if let Some(app) = self.self_arc() {
+            app.handle_message(message_id, chat_id, chat_type, thread_id, text, requester_open_id)
+                .await;
+        }
+    }
+
+    async fn handle_card_action(&self, value: serde_json::Value) -> Option<CardActionResult> {
+        match self.self_arc() {
+            Some(app) => app.handle_card_action(value).await,
+            None => None,
+        }
+    }
+}
 
 /// What a card click produces: an optional replacement card (JSON 2.0, so it
 /// stays update-compatible with the 2.0 interactive cards, see Feishu err
@@ -135,49 +109,28 @@ impl App {
         opencode: Arc<dyn opencode::Backend>,
         feishu: Arc<dyn feishu::Platform>,
     ) -> anyhow::Result<Self> {
-        let session_store = SessionStore::new(cfg.bridge.session_file)?;
+        let core = Arc::new(SharedCore::new(&cfg, opencode, feishu)?);
         Ok(Self {
-            sessions: Arc::new(Mutex::new(session_store)),
-            accumulators: Arc::new(Mutex::new(HashMap::new())),
-            card_message_ids: Arc::new(Mutex::new(HashMap::new())),
-            question_requests: Arc::new(Mutex::new(HashMap::new())),
-            question_partial: Arc::new(Mutex::new(HashMap::new())),
-            last_user_msg_epoch: Arc::new(Mutex::new(HashMap::new())),
-            sent_permission_cards: Arc::new(Mutex::new(HashMap::new())),
-            sent_question_cards: Arc::new(Mutex::new(HashMap::new())),
-            seen_event_ids: Arc::new(Mutex::new(HashSet::new())),
-            answered_requests: Arc::new(Mutex::new(HashSet::new())),
-            inflight: Arc::new(Mutex::new(HashSet::new())),
-            work_dir: cfg
-                .bridge
-                .work_dir
-                .clone()
-                .map(|p| p.to_string_lossy().to_string()),
-            group_completion_notice: cfg.bridge.group_completion_notice,
-            bot_open_id: Arc::new(Mutex::new(None)),
-            opencode,
-            feishu,
+            self_weak: std::sync::Mutex::new(None),
+            permission: super::permission::PermissionFlow::new(),
+            question: super::question::QuestionFlow::new(),
+            external: super::external::ExternalFlow::new(),
+            core,
         })
     }
 
-    /// The directory a brand-new session starts in: `[bridge] work_dir` when
-    /// configured, else the process working directory. `/dir` still overrides
-    /// per session.
-    fn default_session_directory(&self) -> String {
-        self.work_dir
-            .clone()
-            .filter(|d| !d.is_empty())
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string()
-            })
+    /// Recover an `Arc<Self>` from the weak self-reference set by `run`. Used
+    /// by the `EventSink` trait impl to hand a `&Arc<App>` to the inherent
+    /// methods. None before `run` sets it (and after it returns).
+    fn self_arc(&self) -> Option<Arc<Self>> {
+        self.self_weak.lock().unwrap().as_ref().and_then(|w| w.upgrade())
     }
 
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
+        // Let the EventSink trait impl recover a &Arc<App> from &self.
+        *self.self_weak.lock().unwrap() = Some(Arc::downgrade(&self));
         // After a `/restart`, announce it in the chat that requested it.
-        let notify_path = restart_notify_path();
+        let notify_path = command::restart_notify_path();
         if let Ok(raw) = std::fs::read_to_string(&notify_path)
             && let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
             && let Some(chat_id) = v.get("chat_id").and_then(|c| c.as_str())
@@ -197,19 +150,17 @@ impl App {
 
         // Discover cola's own open_id so @mentions of the bot can be recognised
         // and stripped from prompt text (Feishu delivers them as `@_user_N`).
-        match self.feishu.bot_open_id().await {
-            Ok(id) => {
-                tracing::info!("bot open_id: {}", id);
-                *self.bot_open_id.lock().await = Some(id);
-            }
-            Err(e) => tracing::warn!("failed to fetch bot open_id, mention handling disabled: {}", e),
-        }
+        // Owned by the ws module now (see `feishu::ws`).
 
         let ws = Arc::clone(&self);
+        let ws_feishu = Arc::clone(&self.feishu);
+        let ws_state = Arc::new(feishu::ws::WsState::new());
         let perm = Arc::clone(&self);
         let question = Arc::clone(&self);
+        let external = Arc::clone(&self);
         let ws_task = tokio::spawn(async move {
-            if let Err(e) = feishu::ws::event_loop(&ws).await {
+            let sink: Arc<dyn crate::bridge::EventSink> = ws;
+            if let Err(e) = feishu::ws::event_loop(&sink, &ws_feishu, &ws_state).await {
                 tracing::error!("WS: {}", e);
             }
         });
@@ -217,7 +168,7 @@ impl App {
         // and a prompt can be blocked on an unanswered permission forever, so the
         // poller must run independently of any single prompt lifecycle.
         let perm_task = tokio::spawn(async move {
-            if let Err(e) = permission_poll_loop(&perm).await {
+            if let Err(e) = perm.permission.poll_loop(&perm).await {
                 tracing::error!("Permission poller: {}", e);
             }
         });
@@ -225,15 +176,14 @@ impl App {
         // blocks until answered, the event never reaches the global SSE, so poll
         // and surface them as Feishu cards.
         let question_task = tokio::spawn(async move {
-            if let Err(e) = question_poll_loop(&question).await {
+            if let Err(e) = question.question.poll_loop(&question).await {
                 tracing::error!("Question poller: {}", e);
             }
         });
         // Notify Feishu when someone posts a message from another shared-store
         // client (e.g. OpenChamber) while cola is idle on that session.
-        let external = Arc::clone(&self);
         let external_task = tokio::spawn(async move {
-            if let Err(e) = external_message_poll_loop(&external).await {
+            if let Err(e) = external.external.poll_loop(&external).await {
                 tracing::error!("External message poller: {}", e);
             }
         });
@@ -267,220 +217,7 @@ impl App {
         }
     }
 
-    async fn handle_command(
-        self: &Arc<Self>,
-        cmd: Command,
-        thread_key: ThreadKey,
-        message_id: &str,
-        kind: ConversationKind,
-    ) -> crate::error::Result<()> {
-        match cmd {
-            Command::Dir(path) => {
-                let session = self
-                    .opencode
-                    .create_session(&self.opencode.new_session_input(Some(&path)))
-                    .await?;
-                let entry = SessionEntry {
-                    thread_key: thread_key.clone(),
-                    session_id: session.id.clone(),
-                    name: path.clone(),
-                    directory: path.clone(),
-                    agent: None,
-                    auto_accept: false,
-                };
-                let mut store = self.sessions.lock().await;
-                store.set_active(entry);
-                store.persist()?;
-                self.feishu
-                    .reply_text(message_id, &format!("Session moved to {}", path))
-                    .await?;
-            }
-            Command::Switch(name) => {
-                let mut store = self.sessions.lock().await;
-                if store.switch(&thread_key, &name).is_some() {
-                    self.feishu
-                        .reply_text(message_id, &format!("Switched to \"{}\".", name))
-                        .await?;
-                } else {
-                    self.feishu
-                        .reply_text(message_id, &format!("No session matching \"{}\".", name))
-                        .await?;
-                }
-            }
-            Command::List => {
-                let store = self.sessions.lock().await;
-                let entries = store.list_thread(&thread_key);
-                if entries.is_empty() {
-                    self.feishu.reply_text(message_id, "No sessions.").await?;
-                    return Ok(());
-                }
-                let active_id = store.get_active(&thread_key).map(|e| &e.session_id);
-                let mut list = String::from("**Sessions:**\n");
-                for e in &entries {
-                    let mark = if active_id.map_or(false, |id| id == &e.session_id) {
-                        " (active)"
-                    } else {
-                        ""
-                    };
-                    list.push_str(&format!(
-                        "- {} [{}]{mark}\n  dir: {}\n",
-                        crate::feishu::ws::strip_mention_tokens(&e.name),
-                        &e.session_id[..e.session_id.len().min(12)],
-                        e.directory
-                    ));
-                }
-                self.feishu.reply_text(message_id, &list).await?;
-            }
-            Command::New(name) => {
-                let new_name = name.unwrap_or_else(|| format!("sess-{}", uuid::Uuid::new_v4()));
-                let directory = self.default_session_directory();
-                let session = self
-                    .opencode
-                    .create_session(&self.opencode.new_session_input(Some(&directory)))
-                    .await?;
-                let entry = SessionEntry {
-                    thread_key: thread_key.clone(),
-                    session_id: session.id.clone(),
-                    name: new_name.clone(),
-                    directory,
-                    agent: None,
-                    auto_accept: false,
-                };
-                let mut store = self.sessions.lock().await;
-                store.set_active(entry);
-                store.persist()?;
-                self.feishu
-                    .reply_text(message_id, &format!("Created \"{}\".", new_name))
-                    .await?;
-            }
-            Command::Name(name) => {
-                let mut store = self.sessions.lock().await;
-                if let Some(entry) = store.get_active(&thread_key) {
-                    let mut e = entry.clone();
-                    e.name = name.clone();
-                    store.set_active(e);
-                    store.persist()?;
-                }
-                self.feishu
-                    .reply_text(message_id, &format!("Renamed to \"{}\".", name))
-                    .await?;
-            }
-            Command::AutoAccept(action) => {
-                // `Status` reports the current state; `Set(on)` switches the flag
-                // AND clears requests that are already pending but were seen
-                // before (the poller's `seen` set skips them, so they'd
-                // otherwise hang as cards forever).
-                let entry = {
-                    let store = self.sessions.lock().await;
-                    store.get_active(&thread_key).cloned()
-                };
-                match action {
-                    crate::bridge::command::AutoAcceptAction::Status => {
-                        let state = if entry.as_ref().map(|e| e.auto_accept).unwrap_or(false) {
-                            "开"
-                        } else {
-                            "关"
-                        };
-                        self.feishu
-                            .reply_text(message_id, &format!("🔁 当前会话自动审批：{}。", state))
-                            .await?;
-                        return Ok(());
-                    }
-                    crate::bridge::command::AutoAcceptAction::Set(on) => {
-                        let approved = if on {
-                            if let Some(e) = &entry {
-                                self.approve_pending_for_session(&e.session_id, &e.directory)
-                                    .await
-                            } else {
-                                0
-                            }
-                        } else {
-                            0
-                        };
-                        if let Some(e) = entry {
-                            let mut store = self.sessions.lock().await;
-                            let mut e = e.clone();
-                            e.auto_accept = on;
-                            store.set_active(e);
-                            store.persist()?;
-                        }
-                        let state = if on { "开" } else { "关" };
-                        let extra = if on && approved > 0 {
-                            format!("（已自动批准 {} 条待处理请求）", approved)
-                        } else {
-                            String::new()
-                        };
-                        self.feishu
-                            .reply_text(message_id, &format!("🔁 已将会话自动审批{state}。{}", extra))
-                            .await?;
-                    }
-                }
-            }
-            Command::Stop => {
-                if let Some(id) = self.get_session_id(&thread_key).await {
-                    self.opencode.interrupt(&id).await?;
-                    self.feishu.reply_text(message_id, "Interrupted.").await?;
-                }
-            }
-            Command::Compact => {
-                if let Some(id) = self.get_session_id(&thread_key).await {
-                    self.opencode.compact(&id).await?;
-                    self.feishu.reply_text(message_id, "Compacting...").await?;
-                }
-            }
-            Command::Agent(name) => {
-                if let Some(id) = self.get_session_id(&thread_key).await {
-                    self.opencode.switch_agent(&id, &name).await?;
-                    self.feishu
-                        .reply_text(message_id, &format!("Agent: {}", name))
-                        .await?;
-                }
-            }
-            Command::Model(name) => {
-                if let Some(id) = self.get_session_id(&thread_key).await {
-                    self.opencode.switch_model(&id, &name).await?;
-                    self.feishu
-                        .reply_text(message_id, &format!("Model: {}", name))
-                        .await?;
-                }
-            }
-            Command::Help(target) => {
-                let text = match target {
-                    Some(name) => match command::command_help(&name) {
-                        Some(h) => h,
-                        None => format!("未知命令 `{}`。\n\n{}", name, command::help_text()),
-                    },
-                    None => command::help_text(),
-                };
-                self.feishu.reply_text(message_id, &text).await?;
-            }
-            Command::Restart => {
-                // Reply BEFORE exiting, then re-exec ourselves with the SAME
-                // startup args and inherited stdio (so the log redirect to
-                // test.log keeps working in the new process).
-                self.feishu.reply_text(message_id, "♻️ 正在重启，稍候…").await?;
-                // Remember which chat to announce the restart in.
-                let notify = serde_json::json!({ "chat_id": thread_key.chat_id });
-                let _ = std::fs::write(restart_notify_path(), notify.to_string());
-                match restart_process() {
-                    Ok(()) => std::process::exit(0),
-                    Err(e) => {
-                        tracing::error!("restart spawn failed: {}", e);
-                        self.feishu
-                            .reply_text(message_id, &format!("重启失败：{}", e))
-                            .await?;
-                    }
-                }
-            }
-            Command::Forward(text) => {
-                self.handle_prompt(thread_key, text, message_id, kind, None, false)
-                    .await?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn handle_prompt(
+    pub(crate) async fn handle_prompt(
         self: &Arc<Self>,
         thread_key: ThreadKey,
         text: String,
@@ -601,6 +338,49 @@ impl App {
         } else {
             format!("{} · {}", name, id_tail)
         }
+    }
+
+    /// Refresh the streaming card's subtitle from the server's live session
+    /// title, returning true if it changed (and the card was re-flushed).
+    ///
+    /// OpenCode/OpenChamber automatically summarize and rename a session after a
+    /// turn; cola's card subtitle is only captured when the prompt starts, so it
+    /// would otherwise stay on the "new session" default title until restart.
+    /// Called periodically from the render poll loop, so the title follows the
+    /// server within a poll interval.
+    pub(crate) async fn refresh_session_title(self: &Arc<Self>, session_id: &str) -> bool {
+        // Only meaningful while a turn is actively streaming on a live card.
+        let acc_present = self.accumulators.lock().await.contains_key(session_id);
+        if !acc_present {
+            return false;
+        }
+        let thread_key = self.sessions.lock().await.thread_for_session(session_id);
+        let Some(thread_key) = thread_key else {
+            return false;
+        };
+        // The subtitle is formatted with the session id-tail; recompute it now
+        // and keep whatever the server currently reports.
+        let fresh = self.session_subtitle(&thread_key, "").await;
+        if fresh.is_empty() {
+            return false;
+        }
+        let mut accs = self.accumulators.lock().await;
+        let Some(acc) = accs.get_mut(session_id) else {
+            return false;
+        };
+        if acc.title == fresh {
+            return false;
+        }
+        tracing::info!(
+            "session {} title updated: {:?} -> {:?}",
+            session_id,
+            acc.title,
+            fresh
+        );
+        acc.title = fresh;
+        drop(accs);
+        crate::bridge::render::flush_card(self, session_id).await;
+        true
     }
 
     /// Run one prompt end-to-end: show a Loading card (either a fresh reply or a
@@ -829,7 +609,7 @@ impl App {
         // itself created (or the submit epoch). Anything newer than this later
         // is from another shared-store client (e.g. OpenChamber).
         {
-            let mut map = self.last_user_msg_epoch.lock().await;
+            let mut map = self.external.last_user_msg_epoch.lock().await;
             let baseline = final_msgs
                 .as_ref()
                 .map(|msgs| {
@@ -894,7 +674,7 @@ impl App {
         Ok(())
     }
 
-    async fn get_session_id(&self, thread_key: &ThreadKey) -> Option<String> {
+    pub(crate) async fn get_session_id(&self, thread_key: &ThreadKey) -> Option<String> {
         self.sessions
             .lock()
             .await
@@ -907,7 +687,7 @@ impl App {
     /// "once". The permission poller's `seen` set skips requests it has already
     /// surfaced, so enabling autoaccept would otherwise leave old cards hanging
     /// forever. Returns how many requests were approved.
-    async fn approve_pending_for_session(&self, session_id: &str, directory: &str) -> usize {
+    pub(crate) async fn approve_pending_for_session(&self, session_id: &str, directory: &str) -> usize {
         let Ok(perms) = self.opencode.list_permissions(Some(directory)).await else {
             return 0;
         };
@@ -1007,432 +787,96 @@ impl App {
     /// Handle a card action (permission Allow/Deny, question answer/reject,
     /// error-card retry). Returns the updated card showing the decision, so the
     /// caller can send it back in the ack, plus an optional Toast for instant
-    /// client feedback.
+    /// client feedback. Dispatches to the flow that owns the action tag.
     pub async fn handle_card_action(self: &Arc<Self>, value: serde_json::Value) -> Option<CardActionResult> {
         let action = value.get("action").and_then(|v| v.as_str()).unwrap_or("");
-        let session_id = value.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
-        // The card carries the owning directory (needed for subtask sessions
-        // that aren't in the SessionStore); fall back to the SessionStore map.
-        let directory = value
-            .get("directory")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let directory = match directory {
-            Some(d) => Some(d),
-            None => self.sessions.lock().await.directory_for_session(session_id),
-        };
-        let directory = directory.as_deref();
-        // Carried from the permission card for the result display
-        let perm_label = value.get("perm_label").and_then(|v| v.as_str()).unwrap_or("");
-        let perm_color = value
-            .get("perm_color")
-            .and_then(|v| v.as_str())
-            .unwrap_or("green");
-        let perm_body = value.get("perm_body").and_then(|v| v.as_str()).unwrap_or("");
-
-        // Result cards must stay JSON 2.0: a 2.0 card cannot be "updated" back
-        // to a 1.0 card in the callback response (Feishu err 200830).
-        let result_card = |title: &str, template: &str, body: &str| CardActionResult {
-            card: Some(serde_json::json!({
-                "schema": "2.0",
-                "config": { "wide_screen_mode": true },
-                "header": { "title": { "tag": "plain_text", "content": title }, "template": template },
-                "body": { "elements": [ { "tag": "markdown", "content": body } ] }
-            })),
-            toast: None,
-        };
-
-        let mut result = None;
         match action {
-            "perm" => {
-                let reply = value.get("reply").and_then(|v| v.as_str()).unwrap_or("reject");
-                let request_id = value.get("request_id").and_then(|v| v.as_str());
-                if let Some(req_id) = request_id {
-                    // Inline interaction: the session has a live streaming card,
-                    // so the result is NOT returned as a replacement card — the
-                    // streaming card re-renders itself on the next poll.
-                    let inline = self.accumulators.lock().await.contains_key(session_id);
-                    // Double-click guard: once answered, a second click on the
-                    // same request only re-serves the result.
-                    let answered = {
-                        let mut seen = self.answered_requests.lock().await;
-                        if seen.contains(req_id) {
-                            true
-                        } else {
-                            seen.insert(req_id.to_string());
-                            false
-                        }
-                    };
-                    if !answered {
-                        // Route the reply to the instance owning the session.
-                        if let Err(e) = self.opencode.reply_permission(req_id, reply, directory).await {
-                            // The request is probably already resolved by another
-                            // client (e.g. OpenChamber) — show feedback instead of
-                            // leaving the user with a dead card and no response.
-                            tracing::error!("perm reply failed: {}", e);
-                            let mut r = result_card("⚠️ 处理失败", "red", "该权限请求可能已在其他端处理。");
-                            if inline {
-                                r.card = None;
-                            }
-                            r.toast = Some("可能已在其他端处理".to_string());
-                            result = Some(r);
-                            return result;
-                        }
-                        tracing::info!("Permission reply sent: {} session={}", reply, session_id);
-                        self.sent_permission_cards.lock().await.remove(req_id);
-                        if inline && let Some(acc) = self.accumulators.lock().await.get_mut(session_id) {
-                            acc.pending_permissions.retain(|p| p.request_id != req_id);
-                        }
-                    }
-                    // Result card: shows the decision, no buttons.
-                    let label = if !perm_label.is_empty() { perm_label } else { reply };
-                    let toast = match reply {
-                        "once" => "已允许本次执行".to_string(),
-                        "always" => "已允许，后续将自动放行".to_string(),
-                        _ => "已拒绝".to_string(),
-                    };
-                    let body = if perm_body.is_empty() {
-                        format!("Permission: {}", reply)
-                    } else {
-                        perm_body.to_string()
-                    };
-                    let mut r = result_card(label, perm_color, &body);
-                    if inline {
-                        r.card = None;
-                    }
-                    r.toast = Some(toast);
-                    result = Some(r);
-                }
-            }
-            "question" => {
-                let reply = value.get("reply").and_then(|v| v.as_str()).unwrap_or("reject");
-                let request_id = value.get("request_id").and_then(|v| v.as_str());
-                if let Some(req_id) = request_id {
-                    // Inline interaction: the session has a live streaming card —
-                    // answered inline there, so no replacement card is returned.
-                    let inline = self.accumulators.lock().await.contains_key(session_id);
-                    match reply {
-                        "answer" => {
-                            let index =
-                                value.get("question_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                            let answer = value
-                                .get("answer")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            if answer.is_empty() {
-                                return None;
-                            }
-                            // A request is submitted ONLY when every question has
-                            // an answer (`reply_question` expects all of them).
-                            let already = self.answered_requests.lock().await.contains(req_id);
-                            if already {
-                                // finalized before (double-click): replay the result.
-                                let mut r = result_card(
-                                    &format!("✅ 已回答：{}", answer),
-                                    "green",
-                                    &format!("AI 的问题是：\n{}", answer),
-                                );
-                                if inline {
-                                    r.card = None;
-                                }
-                                result = Some(r);
-                            } else {
-                                let n = {
-                                    let reqs = self.question_requests.lock().await;
-                                    reqs.get(req_id).map(|r| r.questions.len())
-                                };
-                                let Some(n) = n else {
-                                    return None; // stale card for an already-submitted request
-                                };
-                                // Record this question's answer.
-                                let (answered_count, slot) = {
-                                    let mut partial = self.question_partial.lock().await;
-                                    let slot =
-                                        partial.entry(req_id.to_string()).or_insert_with(|| vec![None; n]);
-                                    if index < n {
-                                        slot[index] = Some(vec![answer.clone()]);
-                                    }
-                                    let count = slot.iter().filter(|a| a.is_some()).count();
-                                    (count, slot.clone())
-                                };
-                                // Keep the inline card's partial answers in sync.
-                                if inline
-                                    && let Some(pq) = self
-                                        .accumulators
-                                        .lock()
-                                        .await
-                                        .get_mut(session_id)
-                                        .and_then(|acc| {
-                                            acc.pending_questions
-                                                .iter_mut()
-                                                .find(|pq| pq.request_id == req_id)
-                                        })
-                                {
-                                    pq.answers = slot.clone();
-                                }
-                                if answered_count == n {
-                                    // All questions answered → submit the whole request.
-                                    self.answered_requests.lock().await.insert(req_id.to_string());
-                                    let answers: Vec<Vec<String>> = self
-                                        .question_partial
-                                        .lock()
-                                        .await
-                                        .remove(req_id)
-                                        .unwrap_or_default()
-                                        .into_iter()
-                                        .map(|a| a.unwrap_or_default())
-                                        .collect();
-                                    if let Err(e) =
-                                        self.opencode.reply_question(req_id, &answers, directory).await
-                                    {
-                                        tracing::error!("question reply failed: {}", e);
-                                        let mut r =
-                                            result_card("⚠️ 处理失败", "red", "该问题可能已在其他端回答。");
-                                        if inline {
-                                            r.card = None;
-                                        }
-                                        r.toast = Some("可能已在其他端回答".to_string());
-                                        result = Some(r);
-                                        return result;
-                                    }
-                                    tracing::info!(
-                                        "Question answered: {} session={} -> {:?}",
-                                        req_id,
-                                        session_id,
-                                        answers
-                                    );
-                                    self.question_requests.lock().await.remove(req_id);
-                                    self.sent_question_cards.lock().await.remove(req_id);
-                                    if inline
-                                        && let Some(acc) = self.accumulators.lock().await.get_mut(session_id)
-                                    {
-                                        acc.pending_questions.retain(|pq| pq.request_id != req_id);
-                                    }
-                                    let mut r = result_card(
-                                        &format!("✅ 已回答：{}", answer),
-                                        "green",
-                                        &format!("AI 的问题是：\n{}", answer),
-                                    );
-                                    if inline {
-                                        r.card = None;
-                                    }
-                                    r.toast = Some("已回答".to_string());
-                                    result = Some(r);
-                                } else if inline {
-                                    // Inline: the streaming card re-renders with the
-                                    // updated partial answers — toast only.
-                                    let mut r = CardActionResult {
-                                        card: None,
-                                        toast: None,
-                                    };
-                                    r.toast = Some(format!("已记录答案，还有 {} 题未答", n - answered_count));
-                                    result = Some(r);
-                                } else {
-                                    // Still questions left: return an updated card that
-                                    // shows the answered ones as done and the rest open.
-                                    let remaining = n - answered_count;
-                                    let req = {
-                                        let reqs = self.question_requests.lock().await;
-                                        reqs.get(req_id).cloned()
-                                    };
-                                    let req = req?;
-                                    let partial = self
-                                        .question_partial
-                                        .lock()
-                                        .await
-                                        .get(req_id)
-                                        .cloned()
-                                        .unwrap_or_else(|| vec![None; n]);
-                                    let card = crate::feishu::card::build_question_card(
-                                        req_id,
-                                        &req.session_id,
-                                        &req.questions,
-                                        directory.unwrap_or(""),
-                                        &partial,
-                                    );
-                                    let mut r = CardActionResult {
-                                        card: Some(card),
-                                        toast: None,
-                                    };
-                                    r.toast = Some(format!("已记录答案，还有 {} 题未答", remaining));
-                                    result = Some(r);
-                                }
-                            }
-                        }
-                        "submit" => {
-                            // Finalize with whatever was answered (empty for the rest).
-                            let already = self.answered_requests.lock().await.contains(req_id);
-                            if already {
-                                let mut r = result_card("✅ 已回答", "green", "已提交 AI 的问题答案。");
-                                if inline {
-                                    r.card = None;
-                                }
-                                result = Some(r);
-                            } else {
-                                self.answered_requests.lock().await.insert(req_id.to_string());
-                                let answers: Vec<Vec<String>> = self
-                                    .question_partial
-                                    .lock()
-                                    .await
-                                    .remove(req_id)
-                                    .unwrap_or_default()
-                                    .into_iter()
-                                    .map(|a| a.unwrap_or_default())
-                                    .collect();
-                                if let Err(e) =
-                                    self.opencode.reply_question(req_id, &answers, directory).await
-                                {
-                                    tracing::error!("question reply failed: {}", e);
-                                    let mut r =
-                                        result_card("⚠️ 处理失败", "red", "该问题可能已在其他端回答。");
-                                    if inline {
-                                        r.card = None;
-                                    }
-                                    r.toast = Some("可能已在其他端回答".to_string());
-                                    result = Some(r);
-                                    return result;
-                                }
-                                tracing::info!(
-                                    "Question submitted: {} session={} -> {:?}",
-                                    req_id,
-                                    session_id,
-                                    answers
-                                );
-                                self.question_requests.lock().await.remove(req_id);
-                                if inline
-                                    && let Some(acc) = self.accumulators.lock().await.get_mut(session_id)
-                                {
-                                    acc.pending_questions.retain(|pq| pq.request_id != req_id);
-                                }
-                                let labels: Vec<&str> =
-                                    answers.iter().flatten().map(|s| s.as_str()).collect();
-                                let summary = if labels.is_empty() {
-                                    "已提交".to_string()
-                                } else {
-                                    labels.join("、")
-                                };
-                                let mut r = result_card(
-                                    &format!("✅ 已回答：{}", summary),
-                                    "green",
-                                    &format!("AI 的问题是：\n{}", summary),
-                                );
-                                if inline {
-                                    r.card = None;
-                                }
-                                r.toast = Some("已提交".to_string());
-                                result = Some(r);
-                            }
-                        }
-                        "reject" => {
-                            let already = self.answered_requests.lock().await.contains(req_id);
-                            if already {
-                                let mut r = result_card("🚫 已拒绝回答", "red", "已拒绝回答 AI 的问题。");
-                                if inline {
-                                    r.card = None;
-                                }
-                                result = Some(r);
-                            } else {
-                                self.answered_requests.lock().await.insert(req_id.to_string());
-                                if let Err(e) = self.opencode.reject_question(req_id, directory).await {
-                                    tracing::error!("question reject failed: {}", e);
-                                    let mut r =
-                                        result_card("⚠️ 处理失败", "red", "该问题可能已在其他端回答。");
-                                    if inline {
-                                        r.card = None;
-                                    }
-                                    r.toast = Some("可能已在其他端回答".to_string());
-                                    result = Some(r);
-                                    return result;
-                                }
-                                tracing::info!("Question rejected: {}", req_id);
-                                self.question_requests.lock().await.remove(req_id);
-                                self.question_partial.lock().await.remove(req_id);
-                                self.sent_question_cards.lock().await.remove(req_id);
-                                if inline
-                                    && let Some(acc) = self.accumulators.lock().await.get_mut(session_id)
-                                {
-                                    acc.pending_questions.retain(|pq| pq.request_id != req_id);
-                                }
-                                let mut r = result_card("🚫 已拒绝回答", "red", "已拒绝回答 AI 的问题。");
-                                if inline {
-                                    r.card = None;
-                                }
-                                r.toast = Some("已拒绝回答".to_string());
-                                result = Some(r);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            "retry" => {
-                // Re-submit the failed prompt on the SAME card. The card callback
-                // must ack within 3s, so spawn the prompt pipeline and return a
-                // "retrying" card immediately; run_prompt then resets the card to
-                // Loading and streams the new attempt into it.
-                let sid = value
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
-                if !sid.is_empty() {
-                    let inflight = { self.inflight.lock().await.contains(&sid) };
-                    let ctx = {
-                        let accs = self.accumulators.lock().await;
-                        accs.get(&sid).map(|a| {
-                            (
-                                a.prompt.clone().unwrap_or_default(),
-                                a.reply_to_message_id.clone().unwrap_or_default(),
-                                a.title.clone(),
-                                a.requester_open_id.clone(),
-                                a.is_group,
-                            )
-                        })
-                    };
-                    let card_id = self.card_message_ids.lock().await.get(&sid).cloned();
-                    let thread_key = self.sessions.lock().await.thread_for_session(&sid);
-                    if !inflight
-                        && let Some((text, reply_to, subtitle, requester, is_group)) = ctx
-                        && !text.is_empty()
-                        && let Some(card_id) = card_id
-                        && let Some(thread_key) = thread_key
-                    {
-                        let app = Arc::clone(self);
-                        tokio::spawn(async move {
-                            if let Err(e) = app
-                                .run_prompt(PromptContext {
-                                    session_id: sid.to_string(),
-                                    thread_key,
-                                    text,
-                                    message_id: reply_to,
-                                    subtitle,
-                                    existing_card_id: Some(card_id),
-                                    requester_open_id: requester,
-                                    is_group,
-                                })
-                                .await
-                            {
-                                tracing::error!("retry prompt: {}", e);
-                            }
-                        });
-                        let mut r = result_card("⏳ 正在重试...", "blue", "已重新提交原始问题。");
-                        r.toast = Some("正在重试...".to_string());
-                        result = Some(r);
-                    } else {
-                        // Nothing to retry (no stored prompt / card, or a prompt is
-                        // already in flight): keep the card as it is.
-                        tracing::warn!(
-                            "retry: no retryable context for session {} (inflight={})",
-                            sid,
-                            inflight
-                        );
-                    }
-                }
-            }
-            _ => {}
+            "perm" => self.permission.handle_card_action(self, &value).await,
+            "question" => self.question.handle_card_action(self, &value).await,
+            "retry" => self.handle_retry_action(&value).await,
+            _ => None,
         }
-        result
+    }
+
+    /// Re-submit a failed prompt on the SAME card (error-card "retry" button).
+    /// The card callback must ack within 3s, so spawn the prompt pipeline and
+    /// return a "retrying" card immediately; run_prompt then resets the card to
+    /// Loading and streams the new attempt into it.
+    async fn handle_retry_action(self: &Arc<Self>, value: &serde_json::Value) -> Option<CardActionResult> {
+        let sid = value
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if sid.is_empty() {
+            return None;
+        }
+        let inflight = { self.inflight.lock().await.contains(&sid) };
+        let ctx = {
+            let accs = self.accumulators.lock().await;
+            accs.get(&sid).map(|a| {
+                (
+                    a.prompt.clone().unwrap_or_default(),
+                    a.reply_to_message_id.clone().unwrap_or_default(),
+                    a.title.clone(),
+                    a.requester_open_id.clone(),
+                    a.is_group,
+                )
+            })
+        };
+        let card_id = self.card_message_ids.lock().await.get(&sid).cloned();
+        let thread_key = self.sessions.lock().await.thread_for_session(&sid);
+        if !inflight
+            && let Some((text, reply_to, subtitle, requester, is_group)) = ctx
+            && !text.is_empty()
+            && let Some(card_id) = card_id
+            && let Some(thread_key) = thread_key
+        {
+            let app = Arc::clone(self);
+            tokio::spawn(async move {
+                if let Err(e) = app
+                    .run_prompt(PromptContext {
+                        session_id: sid.to_string(),
+                        thread_key,
+                        text,
+                        message_id: reply_to,
+                        subtitle,
+                        existing_card_id: Some(card_id),
+                        requester_open_id: requester,
+                        is_group,
+                    })
+                    .await
+                {
+                    tracing::error!("retry prompt: {}", e);
+                }
+            });
+            let mut r = retry_result_card();
+            r.toast = Some("正在重试...".to_string());
+            Some(r)
+        } else {
+            // Nothing to retry (no stored prompt / card, or a prompt is already
+            // in flight): keep the card as it is.
+            tracing::warn!(
+                "retry: no retryable context for session {} (inflight={})",
+                sid,
+                inflight
+            );
+            None
+        }
+    }
+}
+
+/// A JSON 2.0 "retrying" card returned by the error-card retry action. Must
+/// stay JSON 2.0 (see Feishu err 200830). The streaming card re-renders itself.
+fn retry_result_card() -> CardActionResult {
+    CardActionResult {
+        card: Some(serde_json::json!({
+            "schema": "2.0",
+            "config": { "wide_screen_mode": true },
+            "header": { "title": { "tag": "plain_text", "content": "⏳ 正在重试..." }, "template": "blue" },
+            "body": { "elements": [ { "tag": "markdown", "content": "已重新提交原始问题。" } ] }
+        })),
+        toast: None,
     }
 }
 
@@ -1843,6 +1287,7 @@ mod test_support {
 mod integration_tests {
     use super::test_support::*;
     use super::*;
+    use crate::bridge::command::Command;
 
     async fn build_app(
         cfg: crate::config::Config,
@@ -2215,6 +1660,68 @@ mod integration_tests {
         );
     }
 
+    /// The card subtitle follows the server's live session title during a turn:
+    /// OpenCode auto-renames a session after streaming, and `refresh_session_title`
+    /// (called from the render poll loop) must update the card instead of leaving
+    /// it on the "new session" default until restart.
+    #[tokio::test]
+    async fn refresh_session_title_updates_live_card_on_server_rename() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut mock = MockBackend::new(realistic_parts());
+        // The server already has a final auto-generated title.
+        mock.session_titles
+            .insert("ses_test".into(), "修复登录鉴权问题".into());
+        let backend = Arc::new(mock);
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: key.clone(),
+                session_id: "ses_test".into(),
+                name: "sess-7a025fa5-74a1-44e0-b5c5-80b9a21f71bc".into(),
+                directory: "/tmp/x".into(),
+                agent: None,
+                auto_accept: false,
+            });
+        }
+
+        // Simulate an in-flight turn whose card was captured with the OLD
+        // default subtitle before the server auto-titled the session.
+        let mut acc = crate::bridge::streaming::StreamAccumulator::new("test");
+        acc.reply_to_message_id = Some("msg_1".into());
+        acc.session_id = Some("ses_test".into());
+        {
+            let mut accs = app.accumulators.lock().await;
+            accs.insert("ses_test".into(), acc);
+        }
+
+        // The server's live title differs → refresh must update the card subtitle.
+        let refreshed = app.refresh_session_title("ses_test").await;
+        assert!(refreshed, "a server rename must refresh the card title");
+        let title = app
+            .accumulators
+            .lock()
+            .await
+            .get("ses_test")
+            .unwrap()
+            .title
+            .clone();
+        assert_eq!(title, "修复登录鉴权问题 · test");
+        // A second refresh with no further change must be a no-op (no churn).
+        assert!(
+            !app.refresh_session_title("ses_test").await,
+            "no change when the title already matches"
+        );
+        // No accumulator (a finished turn) → refresh is a no-op.
+        app.accumulators.lock().await.remove("ses_test");
+        assert!(!app.refresh_session_title("ses_test").await);
+    }
+
     #[tokio::test]
     async fn long_answer_splits_across_cards_no_plain_text() {
         let _wd = test_work_dir();
@@ -2325,7 +1832,7 @@ mod integration_tests {
         tokio::spawn({
             let app = app.clone();
             async move {
-                let _ = permission_poll_loop(&app).await;
+                let _ = app.permission.poll_loop(&app).await;
             }
         });
         tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
@@ -2433,7 +1940,7 @@ mod integration_tests {
         tokio::spawn({
             let app = app.clone();
             async move {
-                let _ = permission_poll_loop(&app).await;
+                let _ = app.permission.poll_loop(&app).await;
             }
         });
         tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
@@ -2579,7 +2086,8 @@ mod integration_tests {
         let cfg = test_config(&dir.path().join("sessions.json"));
         // No pending permissions on the server — the card cola sent is stale.
         let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-        app.sent_permission_cards
+        app.permission
+            .sent_permission_cards
             .lock()
             .await
             .insert("per_stale".into(), ("om_sent_card".into(), "bash ls -la".into()));
@@ -2587,7 +2095,7 @@ mod integration_tests {
         tokio::spawn({
             let app = app.clone();
             async move {
-                let _ = permission_poll_loop(&app).await;
+                let _ = app.permission.poll_loop(&app).await;
             }
         });
         tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
@@ -2636,7 +2144,8 @@ mod integration_tests {
         }
         // Baseline: a minute ago, so the fresh user message is "new".
         let baseline = chrono::Utc::now().timestamp_millis() - 60_000;
-        app.last_user_msg_epoch
+        app.external
+            .last_user_msg_epoch
             .lock()
             .await
             .insert("ses_ext".into(), baseline);
@@ -2644,7 +2153,7 @@ mod integration_tests {
         tokio::spawn({
             let app = app.clone();
             async move {
-                let _ = external_message_poll_loop(&app).await;
+                let _ = app.external.poll_loop(&app).await;
             }
         });
         tokio::time::sleep(std::time::Duration::from_millis(8500)).await;
@@ -2684,7 +2193,8 @@ mod integration_tests {
             metadata: None,
             always: Vec::new(),
         }];
-        let (app, platform) = build_app(cfg, backend).await;
+        let parent_id = backend.session_id.clone();
+        let (app, _platform) = build_app(cfg, backend).await;
 
         // Seed the parent session so it maps child → parent → chat.
         app.handle_message(
@@ -2700,32 +2210,53 @@ mod integration_tests {
         tokio::spawn({
             let app = app.clone();
             async move {
-                let _ = permission_poll_loop(&app).await;
+                let _ = app.permission.poll_loop(&app).await;
             }
         });
         tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
 
-        // The permission card for the child session must reach the parent's chat
-        // (no "No reply target" warning, no SendCard-only: a ReplyCard suffices).
-        let calls = platform.calls.lock().await.clone();
-        let perm_card = calls.iter().find_map(|c| match c {
-            PlatformCall::ReplyCard { card, .. } if card.to_string().contains("git status") => {
-                Some(card.clone())
-            }
-            _ => None,
-        });
-        let perm_card = perm_card.expect("subtask permission card should be sent to the parent");
-        // JSON 2.0: buttons sit directly in body.elements; grab the first one.
-        let first_button = perm_card["body"]["elements"]
+        // The parent session has a live streaming card, so the child's
+        // permission is INLINED on it (one-card-per-turn), not sent as a
+        // separate card — the child itself has no accumulator, so it must be
+        // hosted on the parent's card found by walking the parent chain.
+        let perm_inline = app
+            .accumulators
+            .lock()
+            .await
+            .get(&parent_id)
+            .expect("parent accumulator exists")
+            .pending_permissions
+            .clone();
+        assert_eq!(
+            perm_inline.len(),
+            1,
+            "subtask permission should be inlined on the parent card"
+        );
+        assert_eq!(perm_inline[0].request_id, "per_child");
+        assert_eq!(perm_inline[0].session_id, child);
+
+        // The streaming card renders the inline section with the child's buttons.
+        let card = app
+            .accumulators
+            .lock()
+            .await
+            .get(&parent_id)
+            .unwrap()
+            .build_card();
+        let card_text = card.to_string();
+        assert!(card_text.contains("权限请求"), "inline section missing");
+        assert!(card_text.contains("git status"), "permission body missing");
+        // The button carries the CHILD session id (the request's owner) plus the
+        // owning directory so the reply routes to the right instance even though
+        // the child session isn't in the store.
+        let first_button = card["body"]["elements"]
             .as_array()
             .unwrap()
             .iter()
             .find(|e| e["tag"] == "button")
-            .expect("permission card has buttons");
+            .expect("permission buttons present");
         let value = first_button["value"].clone();
         assert_eq!(value["session_id"], child);
-        // The card must carry the owning directory so the reply routes to the
-        // right instance even though the child session isn't in the store.
         assert!(
             value["directory"]
                 .as_str()
@@ -2735,13 +2266,107 @@ mod integration_tests {
             value
         );
 
-        // Clicking Allow routes the reply with that directory.
+        // Clicking Allow routes the reply with that directory and drops the
+        // inline section (no replacement card — the streaming card re-renders).
         let mut value = value;
         value["reply"] = serde_json::json!("once");
         value["perm_label"] = serde_json::json!("✅ Allowed once");
         value["perm_color"] = serde_json::json!("green");
         let result = app.handle_card_action(value).await;
         assert!(result.is_some(), "reply should succeed for subtask session");
+        assert!(
+            result.unwrap().card.is_none(),
+            "inline answer must not replace the streaming card"
+        );
+        assert!(
+            app.accumulators
+                .lock()
+                .await
+                .get(&parent_id)
+                .unwrap()
+                .pending_permissions
+                .is_empty(),
+            "inline permission section should be removed after answering"
+        );
+    }
+
+    /// Without a live streaming card (e.g. the parent turn finished or cola
+    /// restarted), a sub-task child's permission falls back to a separate card
+    /// sent into the parent's chat — still routed up the parent chain, never
+    /// dropped.
+    #[tokio::test]
+    async fn subtask_permission_without_streaming_card_sends_card_to_parent_chat() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        let child = "ses_child_task";
+        backend
+            .session_parents
+            .insert(child.into(), backend.session_id.clone());
+        backend.permissions = vec![opencode::client::PermissionRequest {
+            request_id: "per_child".into(),
+            session_id: Some(child.into()),
+            permission: Some("bash".into()),
+            patterns: vec!["git status".into()],
+            metadata: None,
+            always: Vec::new(),
+        }];
+        let (app, platform) = build_app(cfg, backend).await;
+
+        // Map the parent session to a chat WITHOUT an active accumulator (no
+        // handle_message call — the turn is finished).
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+                session_id: "ses_test".into(),
+                name: "parent".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                auto_accept: false,
+            });
+            store.persist().unwrap();
+        }
+
+        tokio::spawn({
+            let app = app.clone();
+            async move {
+                let _ = app.permission.poll_loop(&app).await;
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+
+        // No inline host: the permission becomes a separate card delivered into
+        // the parent's chat (the child has no card of its own to host it).
+        let calls = platform.calls.lock().await.clone();
+        let perm_card = calls.iter().find_map(|c| match c {
+            PlatformCall::SendCard { receive_id, card }
+                if receive_id == "chat_1" && card.to_string().contains("git status") =>
+            {
+                Some(card.clone())
+            }
+            _ => None,
+        });
+        let perm_card =
+            perm_card.expect("subtask permission should fall back to a separate card in the parent chat");
+        // The card still carries the child's session id + owning directory.
+        let first_button = perm_card["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["tag"] == "button")
+            .expect("permission card has buttons");
+        let value = first_button["value"].clone();
+        assert_eq!(value["session_id"], child);
+        assert!(
+            value["directory"]
+                .as_str()
+                .map(|d| !d.is_empty())
+                .unwrap_or(false),
+            "separate card must carry a directory, got: {}",
+            value
+        );
     }
 
     /// A live E2E run: real cola bot (Platform) + a MOCK backend + the test bot
@@ -2968,7 +2593,7 @@ mod integration_tests {
         tokio::spawn({
             let app = harness.app.clone();
             async move {
-                let _ = question_poll_loop(&app).await;
+                let _ = app.question.poll_loop(&app).await;
             }
         });
 
@@ -3401,7 +3026,7 @@ mod integration_tests {
         let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
 
         // The poll loop has surfaced a pending question request.
-        app.question_requests.lock().await.insert(
+        app.question.question_requests.lock().await.insert(
             "que_1".into(),
             opencode::client::QuestionRequest {
                 id: "que_1".into(),
@@ -3508,7 +3133,7 @@ mod integration_tests {
         let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
 
         // A pending single-question request (the same one the card was built for).
-        app.question_requests.lock().await.insert(
+        app.question.question_requests.lock().await.insert(
             "que_1".into(),
             opencode::client::QuestionRequest {
                 id: "que_1".into(),
@@ -3579,7 +3204,7 @@ mod integration_tests {
                 },
             ]
         };
-        app.question_requests.lock().await.insert(
+        app.question.question_requests.lock().await.insert(
             "que_2".into(),
             opencode::client::QuestionRequest {
                 id: "que_2".into(),
@@ -3683,7 +3308,7 @@ mod integration_tests {
         tokio::spawn({
             let app = app.clone();
             async move {
-                let _ = question_poll_loop(&app).await;
+                let _ = app.question.poll_loop(&app).await;
             }
         });
         tokio::time::sleep(std::time::Duration::from_millis(3500)).await;

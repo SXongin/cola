@@ -1,13 +1,60 @@
-use crate::bridge::handler::App;
+use crate::bridge::EventSink;
+use crate::feishu::Platform;
 use crate::feishu::event::{MessageData, MessageReceiveEvent};
 use futures_util::{SinkExt, StreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 const MAX_RECONNECT_DELAY_SECS: u64 = 30;
+
+/// State the ws platform owns, folded out of the bridge core: event-id dedupe
+/// (Feishu re-delivers at-least-once) and cola's own open_id (needed to strip
+/// the bot's own @mention from prompt text).
+pub struct WsState {
+    seen_event_ids: Mutex<HashSet<String>>,
+    bot_open_id: Mutex<Option<String>>,
+}
+
+impl WsState {
+    pub fn new() -> Self {
+        Self {
+            seen_event_ids: Mutex::new(HashSet::new()),
+            bot_open_id: Mutex::new(None),
+        }
+    }
+
+    /// cola's own Feishu open_id, fetched lazily once so @mentions of the bot
+    /// can be recognised. `Ok(None)` means mention handling is disabled.
+    async fn bot_open_id(&self, feishu: &Arc<dyn Platform>) -> Option<String> {
+        {
+            let cached = self.bot_open_id.lock().await;
+            if cached.is_some() {
+                return cached.clone();
+            }
+        }
+        match feishu.bot_open_id().await {
+            Ok(id) => {
+                tracing::info!("bot open_id: {}", id);
+                *self.bot_open_id.lock().await = Some(id.clone());
+                Some(id)
+            }
+            Err(e) => {
+                tracing::warn!("failed to fetch bot open_id, mention handling disabled: {}", e);
+                None
+            }
+        }
+    }
+}
+
+impl Default for WsState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // --- Minimal protobuf varint parser for Feishu's pbbp2 frame ---
 
@@ -390,10 +437,14 @@ fn encode_varint(out: &mut Vec<u8>, mut value: u64) {
 
 // --- WebSocket event loop ---
 
-pub async fn event_loop(app: &Arc<App>) -> crate::error::Result<()> {
+pub async fn event_loop(
+    sink: &Arc<dyn EventSink>,
+    feishu: &Arc<dyn Platform>,
+    state: &Arc<WsState>,
+) -> crate::error::Result<()> {
     let mut attempt = 0;
     loop {
-        match connect_and_listen(app).await {
+        match connect_and_listen(sink, feishu, state).await {
             Ok(()) => tracing::info!("WebSocket closed cleanly, reconnecting..."),
             Err(e) => tracing::warn!("WebSocket error: {}, reconnecting...", e),
         }
@@ -404,19 +455,25 @@ pub async fn event_loop(app: &Arc<App>) -> crate::error::Result<()> {
     }
 }
 
-async fn connect_and_listen(app: &Arc<App>) -> crate::error::Result<()> {
-    let ws_url = app.feishu.get_ws_endpoint().await?;
+async fn connect_and_listen(
+    sink: &Arc<dyn EventSink>,
+    feishu: &Arc<dyn Platform>,
+    state: &Arc<WsState>,
+) -> crate::error::Result<()> {
+    let ws_url = feishu.get_ws_endpoint().await?;
     tracing::info!("WS endpoint resolved");
     let (ws_stream, _) = connect_async(&ws_url)
         .await
         .map_err(|e| crate::error::BridgeError::Feishu(format!("WS connect failed: {}", e)))?;
     tracing::info!("Connected to Feishu WebSocket");
-    handle_connection(ws_stream, app).await
+    handle_connection(ws_stream, sink, feishu, state).await
 }
 
 async fn handle_connection(
     mut ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
-    app: &Arc<App>,
+    sink: &Arc<dyn EventSink>,
+    feishu: &Arc<dyn Platform>,
+    state: &Arc<WsState>,
 ) -> crate::error::Result<()> {
     // Proactive keepalive: send a control ping periodically (mirrors the Lark
     // SDK's pingLoop). Combined with the read timeout below, an idle or half-
@@ -459,7 +516,7 @@ async fn handle_connection(
                     }
                     Ok(Some(msg)) => match msg {
                         Ok(tokio_tungstenite::tungstenite::Message::Binary(data)) => {
-                            handle_binary_frame(&data, &mut ws, app).await?;
+                            handle_binary_frame(&data, &mut ws, sink, feishu, state).await?;
                         }
                         Ok(tokio_tungstenite::tungstenite::Message::Ping(data)) => {
                             ws.send(tokio_tungstenite::tungstenite::Message::Pong(data))
@@ -556,7 +613,9 @@ fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Value> {
 async fn handle_binary_frame(
     data: &[u8],
     ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
-    app: &Arc<App>,
+    sink: &Arc<dyn EventSink>,
+    feishu: &Arc<dyn Platform>,
+    state: &Arc<WsState>,
 ) -> crate::error::Result<()> {
     let frame = match parse_frame(data) {
         Some(v) => v,
@@ -616,7 +675,7 @@ async fn handle_binary_frame(
                     .and_then(|v| v.get("header")?.get("event_id")?.as_str().map(|s| s.to_string()));
 
                 if let Some(ref eid) = event_id {
-                    let mut seen = app.seen_event_ids.lock().await;
+                    let mut seen = state.seen_event_ids.lock().await;
                     if seen.contains(eid) {
                         tracing::info!("Deduped event_id={}", &eid[..eid.len().min(30)]);
                         return Ok(());
@@ -648,7 +707,7 @@ async fn handle_binary_frame(
                         // mention is dropped. Feishu otherwise leaks opaque
                         // `@_user_1` tokens into the prompt.
                         if !msg_data.mentions.is_empty() {
-                            let bot_id = app.bot_open_id.lock().await.clone().unwrap_or_default();
+                            let bot_id = state.bot_open_id(feishu).await.unwrap_or_default();
                             if let Some(eid) = event.header.as_ref().and_then(|h| h.event_id.clone())
                                 && is_mentioned(&msg_data.mentions, &bot_id)
                             {
@@ -675,9 +734,9 @@ async fn handle_binary_frame(
                         // keeps reading (heartbeats, new messages, card actions) while
                         // a prompt is in flight. Blocking here wedges the entire
                         // connection and Feishu eventually drops it (CLOSE-WAIT).
-                        let app = app.clone();
+                        let sink = sink.clone();
                         tokio::spawn(async move {
-                            app.handle_message(
+                            sink.handle_message(
                                 msg_data.message_id,
                                 msg_data.chat_id,
                                 msg_data.chat_type,
@@ -698,7 +757,7 @@ async fn handle_binary_frame(
                     action_value.as_ref().map(|v| v.to_string())
                 );
                 let result = match action_value {
-                    Some(value) => app.handle_card_action(value).await,
+                    Some(value) => sink.handle_card_action(value).await,
                     None => None,
                 };
                 let resp = build_response_frame(&frame, result.as_ref());

@@ -291,3 +291,264 @@ mod tests {
         assert_eq!(parse_command("/List"), Some(Command::List));
     }
 }
+
+// ===== Command execution (the Command flow) =====
+// Moved out of handler.rs so the bridge coordinator stays thin; these methods
+// run the parsed slash commands against the shared core.
+
+use crate::bridge::handler::App;
+use crate::config::{ConversationKind, SessionEntry, ThreadKey};
+use std::sync::Arc;
+
+/// Re-exec cola itself with the ORIGINAL startup args, inheriting stdio so a
+/// shell log redirect (`cola ... > test.log 2>&1`) carries into the new process.
+/// The current process then calls `std::process::exit(0)` right after.
+fn restart_process() -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    let mut exe = std::env::current_exe()?;
+    // If the binary was replaced by a rebuild while we're running,
+    // `/proc/self/exe` resolves to "<path> (deleted)" — spawning that fails with
+    // ENOENT. Strip the suffix: the NEW binary lives at that path, which is
+    // exactly what a restart wants.
+    if let Some(s) = exe.to_str()
+        && let Some(clean) = s.strip_suffix(" (deleted)")
+    {
+        exe = std::path::PathBuf::from(clean);
+    }
+    // `Command::new` resolves bare names via PATH; always use an absolute path.
+    if !exe.is_absolute() {
+        exe = std::env::current_dir()?.join(exe);
+    }
+    // argv[0] is the exe path; pass the rest through unchanged.
+    Command::new(&exe)
+        .args(std::env::args().skip(1))
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    Ok(())
+}
+
+/// The file the restart flow uses to tell the new process which chat to
+/// announce the restart in.
+pub(crate) fn restart_notify_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".cola")
+        .join("restart-notify.json")
+}
+
+impl App {
+    pub(crate) async fn handle_command(
+        self: &Arc<Self>,
+        cmd: Command,
+        thread_key: ThreadKey,
+        message_id: &str,
+        kind: ConversationKind,
+    ) -> crate::error::Result<()> {
+        match cmd {
+            Command::Dir(path) => {
+                let session = self
+                    .opencode
+                    .create_session(&self.opencode.new_session_input(Some(&path)))
+                    .await?;
+                let entry = SessionEntry {
+                    thread_key: thread_key.clone(),
+                    session_id: session.id.clone(),
+                    name: path.clone(),
+                    directory: path.clone(),
+                    agent: None,
+                    auto_accept: false,
+                };
+                let mut store = self.sessions.lock().await;
+                store.set_active(entry);
+                store.persist()?;
+                self.feishu
+                    .reply_text(message_id, &format!("Session moved to {}", path))
+                    .await?;
+            }
+            Command::Switch(name) => {
+                let mut store = self.sessions.lock().await;
+                if store.switch(&thread_key, &name).is_some() {
+                    self.feishu
+                        .reply_text(message_id, &format!("Switched to \"{}\"", name))
+                        .await?;
+                } else {
+                    self.feishu
+                        .reply_text(message_id, &format!("No session matching \"{}\"", name))
+                        .await?;
+                }
+            }
+            Command::List => {
+                let store = self.sessions.lock().await;
+                let entries = store.list_thread(&thread_key);
+                if entries.is_empty() {
+                    self.feishu.reply_text(message_id, "No sessions.").await?;
+                    return Ok(());
+                }
+                let active_id = store.get_active(&thread_key).map(|e| &e.session_id);
+                let mut list = String::from("**Sessions:**\n");
+                for e in &entries {
+                    let mark = if active_id.map_or(false, |id| id == &e.session_id) {
+                        " (active)"
+                    } else {
+                        ""
+                    };
+                    list.push_str(&format!(
+                        "- {} [{}]{mark}\n  dir: {}\n",
+                        crate::feishu::ws::strip_mention_tokens(&e.name),
+                        &e.session_id[..e.session_id.len().min(12)],
+                        e.directory
+                    ));
+                }
+                self.feishu.reply_text(message_id, &list).await?;
+            }
+            Command::New(name) => {
+                let new_name = name.unwrap_or_else(|| format!("sess-{}", uuid::Uuid::new_v4()));
+                let directory = self.default_session_directory();
+                let session = self
+                    .opencode
+                    .create_session(&self.opencode.new_session_input(Some(&directory)))
+                    .await?;
+                let entry = SessionEntry {
+                    thread_key: thread_key.clone(),
+                    session_id: session.id.clone(),
+                    name: new_name.clone(),
+                    directory,
+                    agent: None,
+                    auto_accept: false,
+                };
+                let mut store = self.sessions.lock().await;
+                store.set_active(entry);
+                store.persist()?;
+                self.feishu
+                    .reply_text(message_id, &format!("Created \"{}\".", new_name))
+                    .await?;
+            }
+            Command::Name(name) => {
+                let mut store = self.sessions.lock().await;
+                if let Some(entry) = store.get_active(&thread_key) {
+                    let mut e = entry.clone();
+                    e.name = name.clone();
+                    store.set_active(e);
+                    store.persist()?;
+                }
+                self.feishu
+                    .reply_text(message_id, &format!("Renamed to \"{}\".", name))
+                    .await?;
+            }
+            Command::AutoAccept(action) => {
+                // `Status` reports the current state; `Set(on)` switches the flag
+                // AND clears requests that are already pending but were seen
+                // before (the poller's `seen` set skips them, so they'd
+                // otherwise hang as cards forever).
+                let entry = {
+                    let store = self.sessions.lock().await;
+                    store.get_active(&thread_key).cloned()
+                };
+                match action {
+                    crate::bridge::command::AutoAcceptAction::Status => {
+                        let state = if entry.as_ref().map(|e| e.auto_accept).unwrap_or(false) {
+                            "开"
+                        } else {
+                            "关"
+                        };
+                        self.feishu
+                            .reply_text(message_id, &format!("🔁 当前会话自动审批：{}。", state))
+                            .await?;
+                        return Ok(());
+                    }
+                    crate::bridge::command::AutoAcceptAction::Set(on) => {
+                        let approved = if on {
+                            if let Some(e) = &entry {
+                                self.approve_pending_for_session(&e.session_id, &e.directory)
+                                    .await
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        };
+                        if let Some(e) = entry {
+                            let mut store = self.sessions.lock().await;
+                            let mut e = e.clone();
+                            e.auto_accept = on;
+                            store.set_active(e);
+                            store.persist()?;
+                        }
+                        let state = if on { "开" } else { "关" };
+                        let extra = if on && approved > 0 {
+                            format!("（已自动批准 {} 条待处理请求）", approved)
+                        } else {
+                            String::new()
+                        };
+                        self.feishu
+                            .reply_text(message_id, &format!("🔁 已将会话自动审批{state}。{}", extra))
+                            .await?;
+                    }
+                }
+            }
+            Command::Stop => {
+                if let Some(id) = self.get_session_id(&thread_key).await {
+                    self.opencode.interrupt(&id).await?;
+                    self.feishu.reply_text(message_id, "Interrupted.").await?;
+                }
+            }
+            Command::Compact => {
+                if let Some(id) = self.get_session_id(&thread_key).await {
+                    self.opencode.compact(&id).await?;
+                    self.feishu.reply_text(message_id, "Compacting...").await?;
+                }
+            }
+            Command::Agent(name) => {
+                if let Some(id) = self.get_session_id(&thread_key).await {
+                    self.opencode.switch_agent(&id, &name).await?;
+                    self.feishu
+                        .reply_text(message_id, &format!("Agent: {}", name))
+                        .await?;
+                }
+            }
+            Command::Model(name) => {
+                if let Some(id) = self.get_session_id(&thread_key).await {
+                    self.opencode.switch_model(&id, &name).await?;
+                    self.feishu
+                        .reply_text(message_id, &format!("Model: {}", name))
+                        .await?;
+                }
+            }
+            Command::Help(target) => {
+                let text = match target {
+                    Some(name) => match command_help(&name) {
+                        Some(h) => h,
+                        None => format!("未知命令 `{}`。\n\n{}", name, help_text()),
+                    },
+                    None => help_text(),
+                };
+                self.feishu.reply_text(message_id, &text).await?;
+            }
+            Command::Restart => {
+                // Reply BEFORE exiting, then re-exec ourselves with the SAME
+                // startup args and inherited stdio (so the log redirect to
+                // test.log keeps working in the new process).
+                self.feishu.reply_text(message_id, "♻️ 正在重启，稍候…").await?;
+                // Remember which chat to announce the restart in.
+                let notify = serde_json::json!({ "chat_id": thread_key.chat_id });
+                let _ = std::fs::write(restart_notify_path(), notify.to_string());
+                match restart_process() {
+                    Ok(()) => std::process::exit(0),
+                    Err(e) => {
+                        tracing::error!("restart spawn failed: {}", e);
+                        self.feishu
+                            .reply_text(message_id, &format!("重启失败：{}", e))
+                            .await?;
+                    }
+                }
+            }
+            Command::Forward(text) => {
+                self.handle_prompt(thread_key, text, message_id, kind, None, false)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+}
