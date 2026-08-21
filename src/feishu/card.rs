@@ -38,6 +38,10 @@ pub const MAX_CARD_JSON_CHARS: usize = 100_000;
 /// over Feishu's total card size / element limits. Reasoning, tool input/output
 /// and the question are already truncated per-element.
 pub const MAX_ELEMENT_TEXT_CHARS: usize = 3000;
+/// Cap for a tool's OUTPUT shown inside its collapsible panel. Higher than the
+/// old 800: code-wrapped output renders without line wrapping, so a file or
+/// command output can be meaningfully long.
+pub const TOOL_OUTPUT_MAX_CHARS: usize = 3000;
 
 /// Split `text` into chunks of at most `max` chars (character-aware), keeping
 /// the full content. Used to bound single card elements and timeline items.
@@ -113,10 +117,20 @@ fn tool_panel_element(tool: &ToolPanel) -> serde_json::Value {
         }
     }
     if let Some(ref o) = tool.output {
-        content.push_str(&format!(
-            "**Output**\n{}",
-            truncate_md(&format_tool_output(&tool.name, o), 800)
-        ));
+        let (header, lang, body) = format_tool_output(&tool.name, o);
+        content.push_str("**Output**\n");
+        if let Some(h) = &header {
+            content.push_str(&format!("{}\n", h));
+        }
+        let body = truncate_md(&body, TOOL_OUTPUT_MAX_CHARS);
+        // File content (read) and anything with long lines render as a fenced
+        // code block: Feishu markdown wraps plain text but not code blocks, so
+        // long file/command output stays on one visual line instead of folding.
+        if tool.name == "read" || needs_code_block(&body) {
+            content.push_str(&fenced_code(&body, lang));
+        } else {
+            content.push_str(&body);
+        }
     }
     if content.is_empty() {
         content = "_(no details)_".to_string();
@@ -128,9 +142,12 @@ fn tool_panel_element(tool: &ToolPanel) -> serde_json::Value {
 /// wraps its output in XML tags (`<path>…</path>`, `<type>…</type>`,
 /// `<content>…</content>`); strip them so the card shows just the file path and
 /// the numbered lines instead of raw markup. Other tools pass through unchanged.
-fn format_tool_output(name: &str, output: &str) -> String {
+///
+/// Returns `(header, language hint, body)`: the header (the file-path line) is
+/// markdown; the body is shown as a code block so long lines don't wrap.
+fn format_tool_output(name: &str, output: &str) -> (Option<String>, Option<&'static str>, String) {
     if name != "read" || !output.contains("<path>") {
-        return output.to_string();
+        return (None, None, output.to_string());
     }
     let mut path = String::new();
     let mut body = String::new();
@@ -154,16 +171,71 @@ fn format_tool_output(name: &str, output: &str) -> String {
             body.push_str(line);
         }
     }
-    let mut out = String::new();
-    if !path.is_empty() {
-        out.push_str(&format!("📄 `{}`\n", path));
+    if body.trim().is_empty() {
+        // Nothing usable parsed — show the raw output so info isn't lost.
+        return (None, None, output.to_string());
     }
-    out.push_str(&body);
-    if out.trim().is_empty() {
-        output.to_string()
-    } else {
-        out
-    }
+    (Some(format!("📄 `{}`", path)), code_lang_for_path(&path), body)
+}
+
+/// A language hint for a file path's extension, used as the fenced-code-block
+/// language on a `read` panel. Unknown/extension-less paths get `text`.
+fn code_lang_for_path(path: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(path).extension()?.to_str()?;
+    Some(match ext {
+        "rs" => "rust",
+        "py" => "python",
+        "js" | "mjs" | "cjs" => "javascript",
+        "ts" | "tsx" => "typescript",
+        "jsx" => "jsx",
+        "go" => "go",
+        "c" | "h" => "c",
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" => "cpp",
+        "java" => "java",
+        "rb" => "ruby",
+        "php" => "php",
+        "sh" | "bash" | "zsh" => "bash",
+        "ps1" => "powershell",
+        "md" | "markdown" => "markdown",
+        "json" => "json",
+        "yaml" | "yml" => "yaml",
+        "toml" => "toml",
+        "xml" | "svg" => "xml",
+        "html" | "htm" => "html",
+        "css" | "scss" | "less" => "css",
+        "sql" => "sql",
+        "txt" | "log" => "text",
+        _ => "text",
+    })
+}
+
+/// Whether `text` contains a line long enough that Feishu's markdown would wrap
+/// it — the case where a fenced code block (which does NOT wrap) is the fix.
+fn needs_code_block(text: &str) -> bool {
+    text.lines().any(|l| l.chars().count() > 100)
+}
+
+/// Wrap `text` in a fenced code block so long lines render without wrapping.
+/// The fence is sized longer than any backtick run in the content, so an
+/// embedded ``` can't break out of the block.
+fn fenced_code(text: &str, lang: Option<&str>) -> String {
+    let max_run = text
+        .chars()
+        .fold((0usize, 0usize), |(best, run), c| {
+            if c == '`' {
+                let run = run + 1;
+                (best.max(run), run)
+            } else {
+                (best, 0)
+            }
+        })
+        .0;
+    let fence = "`".repeat((max_run + 1).max(3));
+    let head = match lang {
+        Some(l) if !l.is_empty() => format!("{fence}{l}"),
+        _ => fence.clone(),
+    };
+    format!("{head}\n{text}\n{fence}")
 }
 
 /// Render a tool's input JSON as human-readable markdown, keyed on the tool
@@ -415,7 +487,10 @@ impl CardBuilder {
             CardState::Reasoning => ("💭 推理中...".to_string(), "blue"),
             CardState::Streaming => {
                 if let Some(tool) = self.tools.iter().find(|t| t.status == "running") {
-                    (format!("🔧 {} {}", tool.status_icon(), tool.name), "orange")
+                    // One icon only: `status_icon` already marks running/pending
+                    // with ⏳, so an extra hardcoded 🔧 would show TWO icons
+                    // (e.g. "🔧 ⏳ bench") on long-running tools.
+                    (format!("{} {}", tool.status_icon(), tool.name), "orange")
                 } else {
                     ("✍️ 回复中...".to_string(), "blue")
                 }
@@ -831,6 +906,13 @@ mod tests {
             .build();
         let header = card["header"]["title"]["content"].as_str().unwrap();
         assert!(header.contains("bash"));
+        // The running tool's header must show exactly ONE icon (the status icon
+        // ⏳), not a duplicated "🔧 ⏳" pair.
+        assert_eq!(
+            header, "⏳ bash",
+            "running-tool header must be a single icon: {}",
+            header
+        );
         assert_eq!(card["header"]["template"].as_str().unwrap(), "orange");
     }
 
@@ -1090,37 +1172,44 @@ mod tests {
 2:     println!(\"hi\");
 3: }
 </content>";
-        let out = format_tool_output("read", raw);
-        assert!(!out.contains("<path>"), "path tag must be stripped: {}", out);
+        let (header, lang, body) = format_tool_output("read", raw);
+        assert_eq!(lang, Some("rust"), "language hint from .rs: {:?}", lang);
+        let header = header.unwrap_or_default();
         assert!(
-            !out.contains("<content>"),
+            !header.contains("<path>"),
+            "path tag must be stripped: {}",
+            header
+        );
+        assert!(
+            !body.contains("<content>"),
             "content tag must be stripped: {}",
-            out
+            body
         );
         assert!(
-            !out.contains("</content>"),
+            !body.contains("</content>"),
             "closing tag must be stripped: {}",
-            out
+            body
         );
-        assert!(!out.contains("<type>"), "type tag must be stripped: {}", out);
+        assert!(!body.contains("<type>"), "type tag must be stripped: {}", body);
         assert!(
-            out.contains("/root/workspace/dev/cola/src/main.rs"),
+            header.contains("/root/workspace/dev/cola/src/main.rs"),
             "path must still be shown: {}",
-            out
+            header
         );
         assert!(
-            out.contains("fn main() {"),
+            body.contains("fn main() {"),
             "the actual code must be kept: {}",
-            out
+            body
         );
     }
 
     #[test]
     fn non_read_tool_output_passes_through() {
         let raw = "some\nplain output";
-        assert_eq!(format_tool_output("bash", raw), raw);
+        assert_eq!(format_tool_output("bash", raw).2, raw);
+        assert_eq!(format_tool_output("bash", raw).0, None);
         // Even a read-named tool without the wrapper is left alone.
-        assert_eq!(format_tool_output("read", "no wrapper here"), "no wrapper here");
+        assert_eq!(format_tool_output("read", "no wrapper here").2, "no wrapper here");
     }
 
     #[test]
@@ -1146,6 +1235,75 @@ mod tests {
         assert!(!text.contains("<content>"), "wrapper leaks into card: {}", text);
         assert!(text.contains("/x/y.rs"), "path shown: {}", text);
         assert!(text.contains("use std::fs"), "code shown: {}", text);
+        // File content renders as a fenced code block (no line wrapping).
+        assert!(text.contains("```rust"), "rust fenced code block: {}", text);
+        assert!(text.contains("```"), "closing fence: {}", text);
+    }
+
+    #[test]
+    fn tool_output_long_lines_wrapped_in_code_block() {
+        // A non-read tool with a line long enough to wrap must become a code
+        // block so Feishu doesn't fold it.
+        let long = format!("cargo run {}", "a".repeat(140));
+        let tool = ToolPanel {
+            name: "bash".into(),
+            status: "completed".into(),
+            input: None,
+            output: Some(long.clone()),
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        // The markdown content (JSON-decoded) must fence the long line.
+        let md = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .expect("panel markdown content");
+        assert!(
+            md.contains(&format!("```\n{long}\n```")),
+            "long line must be fenced: {}",
+            md
+        );
+    }
+
+    #[test]
+    fn tool_output_short_plain_lines_not_fenced() {
+        // Short, well-formed plain output stays plain text (no fences).
+        let tool = ToolPanel {
+            name: "bash".into(),
+            status: "completed".into(),
+            input: None,
+            output: Some("all tests passed".into()),
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        let text = card.to_string();
+        assert!(!text.contains("```"), "short output must not be fenced: {}", text);
+    }
+
+    #[test]
+    fn fenced_code_sizes_fence_beyond_inner_backticks() {
+        let body = "line with `tick` and\n```\ninner fence\n```\nend";
+        let out = fenced_code(body, None);
+        // The inner run is 3 backticks, so the outer fence must be longer.
+        assert!(
+            out.starts_with("````\n"),
+            "outer fence must exceed inner run: {}",
+            out
+        );
+        assert!(out.ends_with("\n````"), "closing fence too short: {}", out);
+        assert!(out.contains(body), "content must be preserved");
+    }
+
+    #[test]
+    fn code_lang_for_path_maps_common_extensions() {
+        assert_eq!(code_lang_for_path("src/main.rs"), Some("rust"));
+        assert_eq!(code_lang_for_path("x.py"), Some("python"));
+        assert_eq!(code_lang_for_path("f.sh"), Some("bash"));
+        assert_eq!(code_lang_for_path("noext"), None);
+        assert_eq!(code_lang_for_path("f.unknownext"), Some("text"));
     }
 
     #[test]

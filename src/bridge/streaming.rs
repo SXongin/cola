@@ -342,7 +342,7 @@ impl StreamAccumulator {
                         let output = p
                             .output
                             .as_deref()
-                            .map(|x| x.chars().count().min(800))
+                            .map(|x| x.chars().count().min(crate::feishu::card::TOOL_OUTPUT_MAX_CHARS))
                             .unwrap_or(0);
                         200 + input + output
                     });
