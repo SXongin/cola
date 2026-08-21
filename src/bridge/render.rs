@@ -313,6 +313,9 @@ pub(crate) async fn render_poll_loop(
                 continue;
             }
         };
+        // OpenCode auto-renames sessions after a turn; follow the server's live
+        // title so the card subtitle doesn't stay on the "new session" default.
+        app.refresh_session_title(&session_id).await;
         let (changed, parts_rendered, text_len, reasoning_len) = {
             let mut accs = app.accumulators.lock().await;
             let Some(acc) = accs.get_mut(&session_id) else {
