@@ -100,10 +100,29 @@ struct SingletonLock(std::path::PathBuf);
 /// elsewhere it conservatively assumes the PID is alive so a lock is never
 /// stolen from a real process (a stale lock on a non-Linux host is a manual
 /// delete, same as before).
+///
+/// A zombie ('Z') is treated as DEAD: it can no longer handle a permission or
+/// post an event, so a lock owned by one is stale and reclaimable. This is what
+/// lets a `/restart` child start while the old process lingers as a zombie
+/// until its parent (the interactive shell) reaps it — without this, the child
+/// sees the old PID in /proc, refuses to start ("Another cola instance"), and
+/// exits, leaving nothing running.
 fn pid_alive(pid: i32) -> bool {
     #[cfg(target_os = "linux")]
     {
-        std::path::Path::new(&format!("/proc/{}", pid)).exists()
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        // /proc/<pid>/stat is "pid (comm) state ppid ..." — the comm may itself
+        // contain ')', so take the part after the LAST ')' and read its first
+        // char (field 3 = state). Unknown/unparseable is treated as alive (the
+        // conservative direction: never steal a lock we can't verify is dead).
+        !matches!(
+            stat.rsplit(')')
+                .next()
+                .and_then(|s| s.trim_start().chars().next()),
+            Some('Z')
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -119,11 +138,10 @@ impl SingletonLock {
             std::fs::create_dir_all(parent)?;
         }
         // A lock file whose PID is no longer alive is a stale leftover from a
-        // crashed/killed process — reclaim it instead of failing forever.
-        if let Ok(owner) = std::fs::read_to_string(&path)
-            && let Ok(pid) = owner.trim().parse::<i32>()
-            && !pid_alive(pid)
-        {
+        // crashed/killed process — reclaim it instead of failing forever. A
+        // zombie counts as dead (see `pid_alive`), which is also what lets a
+        // `/restart` child start while the old process lingers as a zombie.
+        if let Some(pid) = stale_lock_owner(&path) {
             tracing::warn!("Removing stale singleton lock (owner PID {} is not alive)", pid);
             let _ = std::fs::remove_file(&path);
         }
@@ -150,6 +168,15 @@ impl SingletonLock {
             Err(e) => Err(e.into()),
         }
     }
+}
+
+/// Whether the PID recorded in a lock file is stale (dead or a zombie) and the
+/// lock can be reclaimed. `None` means "not reclaimable" — either the file
+/// can't be read, the PID can't be parsed, or the owner is genuinely alive.
+fn stale_lock_owner(path: &std::path::Path) -> Option<i32> {
+    let owner = std::fs::read_to_string(path).ok()?;
+    let pid = owner.trim().parse::<i32>().ok()?;
+    if pid_alive(pid) { None } else { Some(pid) }
 }
 
 impl Drop for SingletonLock {
@@ -192,4 +219,81 @@ async fn main() -> anyhow::Result<()> {
     app.run().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pid_alive_sees_own_process_as_alive() {
+        assert!(pid_alive(std::process::id() as i32));
+    }
+
+    #[test]
+    fn pid_alive_missing_pid_is_dead() {
+        // PID 1 is the init process and is always alive on Linux.
+        assert!(pid_alive(1));
+        // A far-out PID is almost certainly nonexistent.
+        assert!(!pid_alive(i32::MAX - 1));
+    }
+
+    /// The core restart bug: a zombie process's /proc entry persists until its
+    /// parent reaps it, so the old `pid_alive` (mere /proc existence) treated a
+    /// zombie as alive. A `/restart` child therefore refused to start while the
+    /// old cola lingered as a zombie, and the new process never came up.
+    #[test]
+    fn pid_alive_treats_zombie_as_dead() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn zombie child");
+        let pid = child.id() as i32;
+        // Let the child exit; we must NOT wait() yet, so it stays a zombie.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("zombie stat readable");
+        let state = stat
+            .rsplit(')')
+            .next()
+            .and_then(|s| s.trim_start().chars().next());
+        assert_eq!(state, Some('Z'), "child should be a zombie: {stat}");
+        assert!(!pid_alive(pid), "a zombie must not be considered alive");
+        let _ = child.wait(); // reap
+    }
+
+    #[test]
+    fn singleton_lock_reclaimed_from_zombie_owner() {
+        let home = tempfile::tempdir().unwrap();
+        let lock = home.path().join("cola.lock");
+
+        // Simulate the old cola: it acquires the lock and exits, leaving its
+        // PID in the file as a zombie.
+        let mut owner = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("echo $$ > '{}'; exit 0", lock.display()))
+            .spawn()
+            .expect("spawn lock owner");
+        let owner_pid = owner.id() as i32;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!pid_alive(owner_pid), "owner should be a zombie");
+
+        // A new cola can now reclaim the lock instead of refusing to start:
+        // the stale-owner check must see the zombie as dead.
+        assert_eq!(
+            stale_lock_owner(&lock),
+            Some(owner_pid),
+            "a lock owned by a zombie must be stale/reclaimable"
+        );
+        let _ = owner.wait(); // reap the zombie
+    }
+
+    #[test]
+    fn singleton_lock_with_live_owner_is_not_stale() {
+        let home = tempfile::tempdir().unwrap();
+        let lock = home.path().join("cola.lock");
+        std::fs::write(&lock, std::process::id().to_string()).unwrap();
+        // Our own process is alive — the lock must NOT be reclaimable.
+        assert_eq!(stale_lock_owner(&lock), None);
+    }
 }
