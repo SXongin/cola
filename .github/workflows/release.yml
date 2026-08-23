@@ -13,13 +13,26 @@ permissions:
 jobs:
   release:
     name: Build and publish
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - name: Build release binary
-        run: cargo build --release --locked
       - name: Validate semver tag
         run: |
           set -euo pipefail
@@ -27,17 +40,49 @@ jobs:
             echo "Tag '$GITHUB_REF_NAME' is not a valid semver version" >&2
             exit 1
           fi
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package
+        shell: bash
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME}"
           mkdir -p dist
-          tar -C target/release -czf "dist/cola-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" cola
-          sha256sum "dist/cola-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" > "dist/SHA256SUMS"
+          if [ "${{ matrix.archive }}" = "tar" ]; then
+            tar -C "target/${{ matrix.target }}/release" -czf "dist/cola-${VERSION}-${{ matrix.target }}.tar.gz" cola
+          else
+            cp "target/${{ matrix.target }}/release/cola.exe" "dist/cola-${VERSION}-${{ matrix.target }}.exe"
+            zip -j "dist/cola-${VERSION}-${{ matrix.target }}.zip" "dist/cola-${VERSION}-${{ matrix.target }}.exe"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cola-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.tar.gz *.zip > SHA256SUMS
+          cat SHA256SUMS
       - name: Release
         uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           files: |
             dist/*.tar.gz
+            dist/*.zip
             dist/SHA256SUMS
