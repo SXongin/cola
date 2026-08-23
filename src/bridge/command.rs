@@ -23,6 +23,9 @@ pub enum Command {
     AutoAccept(AutoAcceptAction),
     /// Restart cola itself, preserving startup args and the log redirect.
     Restart,
+    /// Restart the OpenCode server — but only when cola started it. A server
+    /// another tool launched is never touched.
+    RestartOpenCode,
     /// Show available commands, or help for one command (`/help <cmd>`).
     Help(Option<String>),
     /// Forward unrecognized slash command to OpenCode as prompt text
@@ -90,6 +93,7 @@ pub fn parse_command(text: &str) -> Option<Command> {
             None => Some(Command::AutoAccept(AutoAcceptAction::Status)),
         },
         "/restart" => Some(Command::Restart),
+        "/restart-opencode" => Some(Command::RestartOpenCode),
         "/help" => Some(Command::Help(arg.map(|s| s.to_lowercase()))),
         // `/init`, `/review`, or any unknown /command — forward to OpenCode
         _ => Some(Command::Forward(trimmed.to_string())),
@@ -111,6 +115,7 @@ pub fn help_text() -> String {
 `/model <p/m>` · Switch model
 `/autoaccept` · Show auto-approve status; `/autoaccept on|off` switches
 `/restart` · Restart cola (keeps startup args + log redirect)
+`/restart-opencode` · Restart the OpenCode server (only when cola started it)
 `/help <command>` · Show help for one command (e.g. `/help model`)
     "
     .to_string()
@@ -147,6 +152,9 @@ pub fn command_help(name: &str) -> Option<String> {
         }
         "restart" => {
             "/restart\nRestart cola itself, keeping startup args and the log redirect. cola announces in this chat when it's back."
+        }
+        "restart-opencode" => {
+            "/restart-opencode\nRestart the OpenCode server. cola only restarts a server IT started; a server launched by another tool is left alone and needs a manual restart."
         }
         "help" => {
             "/help [command]\nList all commands, or show detailed help for one.\nExample: `/help model`"
@@ -540,6 +548,38 @@ impl App {
                         tracing::error!("restart spawn failed: {}", e);
                         self.feishu
                             .reply_text(message_id, &format!("重启失败：{}", e))
+                            .await?;
+                    }
+                }
+            }
+            Command::RestartOpenCode => {
+                // Restart the OpenCode server, but ONLY when cola started it.
+                // A server launched by another tool is never touched: cola has
+                // no record of its configuration, and killing it could take
+                // down another application's runtime.
+                match crate::bridge::discovery::restart_self_spawned_server().await {
+                    Ok(crate::bridge::discovery::RestartOutcome::Restarted) => {
+                        self.feishu
+                            .reply_text(message_id, "♻️ 已重启 OpenCode 服务器。")
+                            .await?;
+                    }
+                    Ok(crate::bridge::discovery::RestartOutcome::NotOwned) => {
+                        self.feishu
+                            .reply_text(
+                                message_id,
+                                "这个 OpenCode 服务器不是 cola 启动的，需要你手动重启它。",
+                            )
+                            .await?;
+                    }
+                    Ok(crate::bridge::discovery::RestartOutcome::NoServer) => {
+                        self.feishu
+                            .reply_text(message_id, "当前没有正在运行的 OpenCode 服务器。")
+                            .await?;
+                    }
+                    Err(e) => {
+                        tracing::error!("restart opencode failed: {}", e);
+                        self.feishu
+                            .reply_text(message_id, &format!("重启 OpenCode 失败：{}", e))
                             .await?;
                     }
                 }

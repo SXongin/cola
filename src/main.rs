@@ -54,31 +54,13 @@ async fn resolve_opencode_server(cfg: &mut config::OpenCodeConfig) -> anyhow::Re
 
 /// Spawn cola's own `opencode serve` (default store, so sessions stay shared).
 fn spawn_self_server(port: u16, password: &str) -> anyhow::Result<()> {
-    let cmd = bridge::discovery::self_start_command(port, password);
-    let mut child = std::process::Command::new("opencode");
-    child.args(&cmd.args).envs(cmd.env.iter().cloned());
-    for key in &cmd.remove_env {
-        child.env_remove(key);
-    }
-    // If the launching environment doesn't pin OpenCode config, disable the
-    // interactive question tool: cola answers questions via Feishu cards, so a
-    // blocked question must never hang a session.
-    if std::env::var_os("OPENCODE_CONFIG_CONTENT").is_none() {
-        child.env("OPENCODE_CONFIG_CONTENT", r#"{"tools":{"question":false}}"#);
-    }
-    child.spawn()?;
+    bridge::discovery::spawn_self_server(port, password)?;
     Ok(())
 }
 
 /// Wait until the self-started server accepts connections.
 async fn wait_for_port(port: u16) -> anyhow::Result<()> {
-    for _ in 0..100 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-            return Ok(());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-    anyhow::bail!("OpenCode server did not start on port {}", port)
+    bridge::discovery::wait_for_port(port).await
 }
 
 /// Path of the singleton lock file — created atomically at startup so a second
