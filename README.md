@@ -68,7 +68,22 @@ In Feishu: `/dir <path>`, `/switch <name>`, `/list`, `/new [name]`, `/name <name
 ## Development
 
 ```bash
+cargo fmt --all -- --check   # formatting
+cargo clippy --workspace --all-targets -- -D warnings   # lints
 cargo test    # 185 unit/integration tests
+cargo build --release
 ```
 
 Read `AGENTS.md` before touching the OpenCode server API, Feishu card/WS integration, or the bridge protocol — the known pitfalls there are hard-won. Reference source trees live under `/root/workspace/dev/` (opencode, cc-connect, openchamber).
+
+## CI & releases
+
+GitHub Actions runs the four gates above on every push to `main` and every pull request (`.github/workflows/ci.yml`). Linux is the supported platform — runtime discovery reads `/proc`, so the test suite only passes there.
+
+Tagging a version publishes a release with the compiled binary:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` builds the release binary, packages it as `cola-<version>-x86_64-unknown-linux-gnu.tar.gz` plus a `SHA256SUMS` file, and attaches both to a GitHub release with auto-generated notes.
