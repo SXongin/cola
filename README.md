@@ -80,10 +80,10 @@ Read `AGENTS.md` before touching the OpenCode server API, Feishu card/WS integra
 
 GitHub Actions runs the four gates above on every push to `main` and every pull request (`.github/workflows/ci.yml`). Linux is the supported platform — runtime discovery reads `/proc`, so the test suite only passes there.
 
-Tagging a version publishes a release with the compiled binary:
+Tagging a version publishes a release with the compiled binary. Tags follow strict semver without a `v` prefix:
 
 ```bash
-git tag v0.1.0 && git push origin v0.1.0
+git tag 1.2.3 && git push origin 1.2.3
 ```
 
 `.github/workflows/release.yml` builds the release binary, packages it as `cola-<version>-x86_64-unknown-linux-gnu.tar.gz` plus a `SHA256SUMS` file, and attaches both to a GitHub release with auto-generated notes.

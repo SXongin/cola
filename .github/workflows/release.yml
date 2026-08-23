@@ -2,7 +2,10 @@ name: Release
 
 on:
   push:
-    tags: ['v*']
+    # Strict semver without the v prefix: 1.2.3, 1.2.3-alpha.1, 1.2.3+build.5.
+    # The trailing * keeps the trigger broad; an exact semver check runs as a
+    # job step so malformed tags (e.g. 1.2.3.4) fail loudly.
+    tags: ['[0-9]+.[0-9]+.[0-9]+*']
 
 permissions:
   contents: write
@@ -17,10 +20,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
         run: cargo build --release --locked
+      - name: Validate semver tag
+        run: |
+          set -euo pipefail
+          if ! grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$' <<< "$GITHUB_REF_NAME"; then
+            echo "Tag '$GITHUB_REF_NAME' is not a valid semver version" >&2
+            exit 1
+          fi
       - name: Package
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${GITHUB_REF_NAME}"
           mkdir -p dist
           tar -C target/release -czf "dist/cola-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" cola
           sha256sum "dist/cola-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" > "dist/SHA256SUMS"
