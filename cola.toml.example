@@ -1,19 +1,33 @@
 # cola configuration
-# Copy to cola.toml and fill in your values.
+# Copy to cola.toml and fill in your values. cola.toml is gitignored because
+# it holds your real Feishu app secret.
 
 [opencode]
+# The OpenCode server cola talks to. cola discovers a running server on the
+# default store and rewrites this URL automatically (see README); this value is
+# the fallback / preferred port when none is running (cola starts its own).
 url = "http://localhost:4096"
 # username and password are optional (for basic auth)
 # username = "opencode"
 # password = ""
+# Model cola's own sessions use by default. It must exist on the server cola
+# attaches to (usually `opencode/...`, matching the shared server's providers).
+model = "opencode-go/deepseek-v4-flash"
 
 [feishu]
+# Your Feishu custom app's credentials. Create one at
+# https://open.feishu.cn/app, enable the "im:message" / "im:message:send_as_bot"
+# scopes, and grant the bot the needed permissions.
 app_id = "cli_xxxxxxxxxxxx"
 app_secret = "your-app-secret"
 
 [bridge]
-# Path to the session mapping file
+# Path to the session mapping file (chat thread <-> OpenCode session).
 # session_file = "~/.cola/sessions.json"
 # Default directory for new sessions (instead of cola's working directory).
 # `/dir` still overrides per session. Leave unset to fall back to the cwd.
 # work_dir = "/path/to/a/project"
+# In group chats, reply to the requester's message with a short completion
+# notice (the streaming card is patched in place, so it does not push a new
+# notification). Set false to disable.
+# group_completion_notice = true
