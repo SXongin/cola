@@ -5,6 +5,7 @@ mod feishu;
 mod opencode;
 
 use clap::Parser;
+use std::io::IsTerminal;
 use std::sync::Arc;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -19,6 +20,12 @@ struct Cli {
     /// won't wipe history since the file is appended, not overwritten.
     #[arg(short, long)]
     log_file: Option<std::path::PathBuf>,
+
+    /// Take over the singleton lock by terminating any running cola instance,
+    /// instead of refusing to start. Set automatically when cola restarts
+    /// itself via `/restart`.
+    #[arg(long)]
+    replace: bool,
 }
 
 /// Resolve which OpenCode server cola talks to, mutating the config.
@@ -84,6 +91,26 @@ fn lock_file_path() -> std::path::PathBuf {
 /// is cleaned up on drop.
 struct SingletonLock(std::path::PathBuf);
 
+/// Outcome of trying to take the singleton lock.
+enum AcquireOutcome {
+    /// This process now holds the lock.
+    Acquired(SingletonLock),
+    /// A live cola instance holds the lock (owner PID reported).
+    HeldByInstance { pid: i32 },
+}
+
+/// Whether a PID refers to a live process whose command line names cola.
+/// Guards the takeover path: never kill a PID that reuse has handed to an
+/// unrelated program (the lock file may carry a stale PID).
+fn is_cola_process(pid: i32) -> bool {
+    let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let cmdline = String::from_utf8_lossy(&cmdline);
+    let args: Vec<&str> = cmdline.split('\0').collect();
+    args.first().map(|a| a.contains("cola")).unwrap_or(false)
+}
+
 /// Whether a PID refers to a live process. On Linux this checks `/proc/{pid}`;
 /// elsewhere it conservatively assumes the PID is alive so a lock is never
 /// stolen from a real process (a stale lock on a non-Linux host is a manual
@@ -120,42 +147,105 @@ fn pid_alive(pid: i32) -> bool {
 }
 
 impl SingletonLock {
-    fn acquire() -> anyhow::Result<Self> {
-        let path = lock_file_path();
+    fn acquire() -> anyhow::Result<AcquireOutcome> {
+        Self::acquire_at(lock_file_path())
+    }
+
+    /// Try to take the singleton lock at `path`. A lock file whose PID is no
+    /// longer a live cola is a stale leftover from a crashed/killed process and
+    /// is reclaimed instead of failing forever. A zombie counts as dead (see
+    /// `pid_alive`), which is also what lets a `/restart` child start while the
+    /// old process lingers as a zombie. A LIVE owner is reported so the caller
+    /// can decide whether to replace it.
+    fn acquire_at(path: std::path::PathBuf) -> anyhow::Result<AcquireOutcome> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // A lock file whose PID is no longer alive is a stale leftover from a
-        // crashed/killed process — reclaim it instead of failing forever. A
-        // zombie counts as dead (see `pid_alive`), which is also what lets a
-        // `/restart` child start while the old process lingers as a zombie.
-        if let Some(pid) = stale_lock_owner(&path) {
-            tracing::warn!("Removing stale singleton lock (owner PID {} is not alive)", pid);
-            let _ = std::fs::remove_file(&path);
-        }
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                use std::io::Write;
-                writeln!(file, "{}", std::process::id())?;
-                tracing::info!("Acquired singleton lock at {}", path.display());
-                Ok(SingletonLock(path))
+        loop {
+            if let Some(pid) = stale_lock_owner(&path) {
+                tracing::warn!("Removing stale singleton lock (owner PID {} is not alive)", pid);
+                let _ = std::fs::remove_file(&path);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let owner = std::fs::read_to_string(&path).unwrap_or_default();
-                anyhow::bail!(
-                    "Another cola instance is already running (lock {} owned by PID {}). \
-                     Refusing to start a duplicate that would double-handle Feishu events.",
-                    path.display(),
-                    owner.trim()
-                )
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    writeln!(file, "{}", std::process::id())?;
+                    tracing::info!("Acquired singleton lock at {}", path.display());
+                    return Ok(AcquireOutcome::Acquired(SingletonLock(path)));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let owner = std::fs::read_to_string(&path).unwrap_or_default();
+                    match owner.trim().parse::<i32>() {
+                        // A live owner is a genuine conflict.
+                        Ok(pid) if pid_alive(pid) => {
+                            return Ok(AcquireOutcome::HeldByInstance { pid });
+                        }
+                        // Owner died between the stale check and the open; loop
+                        // to reclaim it and retry.
+                        _ => {}
+                    }
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => Err(e.into()),
         }
     }
+}
+
+/// Terminate the running cola instance (SIGTERM, escalating to SIGKILL) and
+/// wait for it to die. Only ever kills a PID verified to be a cola process —
+/// a stale lock file may hold a PID that reuse has handed to an unrelated
+/// program, which must never be killed.
+fn replace_instance(pid: i32) -> anyhow::Result<()> {
+    if !is_cola_process(pid) {
+        anyhow::bail!(
+            "lock owner PID {} is not a cola process; refusing to kill it \
+             (stale PID reused by another program?)",
+            pid
+        );
+    }
+    let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
+    for _ in 0..50 {
+        if !pid_alive(pid) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    tracing::warn!("PID {} did not exit on SIGTERM; sending SIGKILL", pid);
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status();
+    for _ in 0..50 {
+        if !pid_alive(pid) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    anyhow::bail!("old cola instance PID {} did not exit after SIGKILL", pid)
+}
+
+/// Ask the user (on a terminal) whether to replace the running instance.
+/// Returns whether they agreed. Non-interactive startup never prompts: it uses
+/// `--replace` or fails fast.
+fn confirm_replace(pid: i32) -> anyhow::Result<bool> {
+    use std::io::Write;
+    print!(
+        "⚠️ 另一个 cola 实例（PID {}）正在运行。是否替换它并接管？[y/N] ",
+        pid
+    );
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(parse_confirm(&line))
+}
+
+/// Whether a user-typed answer to a `[y/N]` prompt means yes. Accepts y/yes,
+/// case-insensitively; anything else (including empty/Enter) is no.
+fn parse_confirm(line: &str) -> bool {
+    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
 /// Whether the PID recorded in a lock file is stale (dead or a zombie) and the
@@ -176,6 +266,7 @@ impl Drop for SingletonLock {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
     // Append (never truncate) to the log file when given, so a restart keeps
     // history instead of wiping it like a shell `>` redirect does. Logs also
     // keep going to stdout.
@@ -194,8 +285,33 @@ async fn main() -> anyhow::Result<()> {
     let mut cfg = config::load(&cli.config)?;
 
     // Grab the singleton lock BEFORE touching the network or the store — a
-    // duplicate cola must die before it can double-connect to the Feishu WS.
-    let _lock = SingletonLock::acquire()?;
+    // duplicate cola must die before it can double-connect to the Feishu WS. A
+    // live owner is either taken over (via `--replace`, or interactively after
+    // a y/N prompt) or refused with a clear message. `/restart` re-execs with
+    // `--replace`, so the restarted process always holds replacement rights.
+    let _lock = match SingletonLock::acquire()? {
+        AcquireOutcome::Acquired(lock) => lock,
+        AcquireOutcome::HeldByInstance { pid } => {
+            let replace = cli.replace || (std::io::stdin().is_terminal() && confirm_replace(pid)?);
+            if !replace {
+                anyhow::bail!(
+                    "另一个 cola 实例（PID {}）正在运行，拒绝启动重复实例（会双处理飞书事件）。\n\
+                     要接管，请用 `cola --replace` 启动，或在飞书里给旧实例发 /restart。",
+                    pid
+                );
+            }
+            tracing::warn!("replacing running cola instance (PID {})", pid);
+            replace_instance(pid)?;
+            // The old owner is dead; re-acquire (it may linger as a zombie,
+            // which `acquire_at` treats as stale and reclaims).
+            match SingletonLock::acquire()? {
+                AcquireOutcome::Acquired(lock) => lock,
+                AcquireOutcome::HeldByInstance { pid } => {
+                    anyhow::bail!("另一个 cola 实例（PID {}）在替换后仍占用锁，放弃启动", pid)
+                }
+            }
+        }
+    };
 
     resolve_opencode_server(&mut cfg.opencode).await?;
 
@@ -293,5 +409,84 @@ mod tests {
         std::fs::write(&lock, std::process::id().to_string()).unwrap();
         // Our own process is alive — the lock must NOT be reclaimable.
         assert_eq!(stale_lock_owner(&lock), None);
+    }
+
+    #[test]
+    fn acquire_at_acquires_fresh_lock() {
+        let home = tempfile::tempdir().unwrap();
+        let lock = home.path().join("cola.lock");
+        match SingletonLock::acquire_at(lock.clone()).unwrap() {
+            AcquireOutcome::Acquired(_held) => {
+                // Lock file now carries our PID. `_held` keeps the lock alive so
+                // its Drop doesn't remove the file before we read it.
+                let owner = std::fs::read_to_string(&lock).unwrap();
+                assert_eq!(owner.trim(), std::process::id().to_string());
+            }
+            AcquireOutcome::HeldByInstance { .. } => panic!("fresh lock must be acquired"),
+        }
+    }
+
+    #[test]
+    fn acquire_at_reports_live_owner() {
+        let home = tempfile::tempdir().unwrap();
+        let lock = home.path().join("cola.lock");
+        // Lock owned by OUR live PID (this test process).
+        std::fs::write(&lock, std::process::id().to_string()).unwrap();
+        match SingletonLock::acquire_at(lock).unwrap() {
+            AcquireOutcome::Acquired(_) => panic!("live owner must not be reclaimable"),
+            AcquireOutcome::HeldByInstance { pid } => {
+                assert_eq!(pid, std::process::id() as i32);
+            }
+        }
+    }
+
+    #[test]
+    fn acquire_at_reclaims_stale_lock_and_acquires() {
+        let home = tempfile::tempdir().unwrap();
+        let lock = home.path().join("cola.lock");
+        // A dead owner (PID far out of range) is stale and gets reclaimed.
+        std::fs::write(&lock, i32::MAX.to_string()).unwrap();
+        match SingletonLock::acquire_at(lock).unwrap() {
+            AcquireOutcome::Acquired(_) => {}
+            AcquireOutcome::HeldByInstance { .. } => panic!("stale lock must be reclaimed"),
+        }
+    }
+
+    #[test]
+    fn replace_instance_refuses_non_cola_process() {
+        // A live `sh` is NOT a cola process — replacing it must refuse (never
+        // kill an unrelated program that reused a stale lock PID).
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 0.5")
+            .spawn()
+            .expect("spawn sh");
+        let pid = child.id() as i32;
+        assert!(!is_cola_process(pid), "sh must not be considered a cola process");
+        assert!(
+            replace_instance(pid).is_err(),
+            "must refuse to kill a non-cola PID"
+        );
+        assert!(pid_alive(pid), "the non-cola process must be left alive");
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn is_cola_process_matches_own_binary() {
+        // The test binary is named after the crate, so its own cmdline names
+        // cola — the guard must recognise it (the takeover path depends on it).
+        assert!(is_cola_process(std::process::id() as i32));
+        assert!(!is_cola_process(i32::MAX - 1));
+    }
+
+    #[test]
+    fn parse_confirm_accepts_only_explicit_yes() {
+        assert!(parse_confirm("y"));
+        assert!(parse_confirm("Y"));
+        assert!(parse_confirm("yes"));
+        assert!(!parse_confirm(""));
+        assert!(!parse_confirm("n"));
+        assert!(!parse_confirm("N"));
+        assert!(!parse_confirm("maybe"));
     }
 }

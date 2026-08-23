@@ -151,7 +151,7 @@ pub fn command_help(name: &str) -> Option<String> {
             "/autoaccept [on|off]\nShow or switch auto-allowing permission requests for this session (no permission cards).\nNo arg: show current state. `/autoaccept on` / `/autoaccept off` switch it.\nExample: `/autoaccept`"
         }
         "restart" => {
-            "/restart\nRestart cola itself, keeping startup args and the log redirect. cola announces in this chat when it's back."
+            "/restart\nRestart cola itself, keeping startup args and the log redirect. The new process takes over the singleton lock (passes --replace). cola announces in this chat when it's back."
         }
         "restart-opencode" => {
             "/restart-opencode\nRestart the OpenCode server. cola only restarts a server IT started; a server launched by another tool is left alone and needs a manual restart."
@@ -310,7 +310,10 @@ use std::sync::Arc;
 
 /// Re-exec cola itself with the ORIGINAL startup args, inheriting stdio so a
 /// shell log redirect (`cola ... > test.log 2>&1`) carries into the new process.
-/// The current process then calls `std::process::exit(0)` right after.
+/// `--replace` is appended so the new process can take over the singleton lock
+/// even while the old process lingers (briefly alive, then a zombie until the
+/// launching shell reaps it). The current process then calls
+/// `std::process::exit(0)` right after.
 fn restart_process() -> std::io::Result<()> {
     use std::process::{Command, Stdio};
     let mut exe = std::env::current_exe()?;
@@ -327,9 +330,14 @@ fn restart_process() -> std::io::Result<()> {
     if !exe.is_absolute() {
         exe = std::env::current_dir()?.join(exe);
     }
-    // argv[0] is the exe path; pass the rest through unchanged.
+    // argv[0] is the exe path; pass the rest through unchanged, plus `--replace`
+    // so the restarted cola is allowed to take the singleton lock from us.
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.iter().any(|a| a == "--replace") {
+        args.push("--replace".to_string());
+    }
     Command::new(&exe)
-        .args(std::env::args().skip(1))
+        .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
