@@ -108,51 +108,47 @@ enum AcquireOutcome {
     HeldByInstance { pid: i32 },
 }
 
-/// Whether a PID refers to a live process whose command line names cola.
+/// Whether a PID refers to a live process whose executable is named cola.
 /// Guards the takeover path: never kill a PID that reuse has handed to an
-/// unrelated program (the lock file may carry a stale PID).
+/// unrelated program (the lock file may carry a stale PID). Uses the
+/// executable name first (registered by the OS, not spoofable via argv), with
+/// the command-line argv as a fallback.
 fn is_cola_process(pid: i32) -> bool {
-    let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid as u32)]),
+        false,
+        sysinfo::ProcessRefreshKind::nothing()
+            .with_exe(sysinfo::UpdateKind::Always)
+            .with_cmd(sysinfo::UpdateKind::Always),
+    );
+    let Some(proc_) = system.process(sysinfo::Pid::from_u32(pid as u32)) else {
         return false;
     };
-    let cmdline = String::from_utf8_lossy(&cmdline);
-    let args: Vec<&str> = cmdline.split('\0').collect();
-    args.first().map(|a| a.contains("cola")).unwrap_or(false)
+    if let Some(exe) = proc_.exe()
+        && exe.to_string_lossy().contains("cola")
+    {
+        return true;
+    }
+    proc_
+        .cmd()
+        .first()
+        .map(|a| a.to_string_lossy().contains("cola"))
+        .unwrap_or(false)
 }
 
-/// Whether a PID refers to a live process. On Linux this checks `/proc/{pid}`;
-/// elsewhere it conservatively assumes the PID is alive so a lock is never
-/// stolen from a real process (a stale lock on a non-Linux host is a manual
-/// delete, same as before).
+/// Whether a PID refers to a live process. A zombie ('Z') is treated as DEAD:
+/// it can no longer handle a permission or post an event, so a lock owned by
+/// one is stale and reclaimable. This is what lets a `/restart` child start
+/// while the old process lingers as a zombie until its parent (the interactive
+/// shell) reaps it — without this, the child sees the old PID, refuses to start
+/// ("Another cola instance"), and exits, leaving nothing running.
 ///
-/// A zombie ('Z') is treated as DEAD: it can no longer handle a permission or
-/// post an event, so a lock owned by one is stale and reclaimable. This is what
-/// lets a `/restart` child start while the old process lingers as a zombie
-/// until its parent (the interactive shell) reaps it — without this, the child
-/// sees the old PID in /proc, refuses to start ("Another cola instance"), and
-/// exits, leaving nothing running.
+/// Cross-platform via sysinfo: a missing process is dead; an existing process
+/// whose zombie state cannot be determined is treated as alive (conservative —
+/// never steal a lock we can't verify is dead).
 fn pid_alive(pid: i32) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            return false;
-        };
-        // /proc/<pid>/stat is "pid (comm) state ppid ..." — the comm may itself
-        // contain ')', so take the part after the LAST ')' and read its first
-        // char (field 3 = state). Unknown/unparseable is treated as alive (the
-        // conservative direction: never steal a lock we can't verify is dead).
-        !matches!(
-            stat.rsplit(')')
-                .next()
-                .and_then(|s| s.trim_start().chars().next()),
-            Some('Z')
-        )
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        true
-    }
+    bridge::discovery::process_alive(pid)
 }
 
 impl SingletonLock {
@@ -204,10 +200,10 @@ impl SingletonLock {
     }
 }
 
-/// Terminate the running cola instance (SIGTERM, escalating to SIGKILL) and
-/// wait for it to die. Only ever kills a PID verified to be a cola process —
-/// a stale lock file may hold a PID that reuse has handed to an unrelated
-/// program, which must never be killed.
+/// Terminate the running cola instance (SIGTERM, escalating to SIGKILL on unix;
+/// `taskkill /F` on Windows) and wait for it to die. Only ever kills a PID
+/// verified to be a cola process — a stale lock file may hold a PID that reuse
+/// has handed to an unrelated program, which must never be killed.
 fn replace_instance(pid: i32) -> anyhow::Result<()> {
     if !is_cola_process(pid) {
         anyhow::bail!(
@@ -216,7 +212,7 @@ fn replace_instance(pid: i32) -> anyhow::Result<()> {
             pid
         );
     }
-    let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
+    bridge::discovery::terminate_process(pid)?;
     for _ in 0..50 {
         if !pid_alive(pid) {
             return Ok(());
@@ -224,9 +220,7 @@ fn replace_instance(pid: i32) -> anyhow::Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     tracing::warn!("PID {} did not exit on SIGTERM; sending SIGKILL", pid);
-    let _ = std::process::Command::new("kill")
-        .args(["-9", &pid.to_string()])
-        .status();
+    bridge::discovery::force_kill(pid)?;
     for _ in 0..50 {
         if !pid_alive(pid) {
             return Ok(());
@@ -376,7 +370,9 @@ mod tests {
     /// parent reaps it, so the old `pid_alive` (mere /proc existence) treated a
     /// zombie as alive. A `/restart` child therefore refused to start while the
     /// old cola lingered as a zombie, and the new process never came up.
+    /// Linux-only: relies on `/proc` and POSIX zombie semantics.
     #[test]
+    #[cfg(target_os = "linux")]
     fn pid_alive_treats_zombie_as_dead() {
         let mut child = std::process::Command::new("sh")
             .arg("-c")
@@ -397,6 +393,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn singleton_lock_reclaimed_from_zombie_owner() {
         let home = tempfile::tempdir().unwrap();
         let lock = home.path().join("cola.lock");
@@ -473,6 +470,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn replace_instance_refuses_non_cola_process() {
         // A live `sh` is NOT a cola process — replacing it must refuse (never
         // kill an unrelated program that reused a stale lock PID).

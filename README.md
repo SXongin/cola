@@ -70,7 +70,7 @@ In Feishu: `/dir <path>`, `/switch <name>`, `/list`, `/new [name]`, `/name <name
 ```bash
 cargo fmt --all -- --check   # formatting
 cargo clippy --workspace --all-targets -- -D warnings   # lints
-cargo test    # 185 unit/integration tests
+cargo test    # 188 unit/integration tests
 cargo build --release
 ```
 
@@ -78,9 +78,9 @@ Read `AGENTS.md` before touching the OpenCode server API, Feishu card/WS integra
 
 ## CI & releases
 
-GitHub Actions runs the four gates above on every push to `main` and every pull request (`.github/workflows/ci.yml`). Linux is the supported platform — runtime discovery reads `/proc`, so the test suite only passes there.
+GitHub Actions runs the four gates above on every push to `main` and every pull request (`.github/workflows/ci.yml`). clippy, test and build run on all three platforms (Linux/macOS/Windows); runtime discovery and the singleton lock are cross-platform via `sysinfo` (no `/proc` dependency). See `docs/adr/0005-cross-platform-process-discovery.md` for the design.
 
-Tagging a version publishes a release with the compiled binary. Tags follow strict semver without a `v` prefix:
+Tagging a version publishes a release with the compiled binary for all three platforms. Tags follow strict semver without a `v` prefix:
 
 ```bash
 git tag 1.2.3 && git push origin 1.2.3

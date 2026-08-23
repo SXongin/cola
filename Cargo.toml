@@ -29,6 +29,7 @@ uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 async-trait = "0.1"
 indexmap = "2"
+sysinfo = "0.39"
 
 [dev-dependencies]
 tempfile = "3"

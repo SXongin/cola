@@ -7,75 +7,103 @@
 //! running on the default store (whoever started it — OpenChamber, a manual
 //! `opencode serve`, another tool) and only starts its own when none exists.
 
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
 /// An `opencode serve` process discovered on the machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerCandidate {
     pub pid: i32,
     pub port: u16,
     pub password: String,
-    /// Whether the server reads the default store (`XDG_DATA_HOME` unset or
-    /// equal to the default `~/.local/share/opencode`).
+    /// Whether the server reads the default store (the directory OpenCode
+    /// itself resolves as its default data home — `$XDG_DATA_HOME` if set,
+    /// else `~/.local/share` — on every platform).
     pub uses_default_store: bool,
 }
 
-/// Scan `/proc` for running `opencode serve` processes. Thin I/O — the
-/// interesting decisions live in [`select_server`].
+/// The data directory OpenCode resolves as its default on every platform.
+///
+/// OpenCode uses the `xdg-basedir` package, which computes `$XDG_DATA_HOME` if
+/// set and `~/.local/share` otherwise — on Linux, macOS AND Windows (macOS and
+/// Windows do NOT get platform-conventional paths; a known opencode issue,
+/// #8235, that was auto-closed unfixed). cola must mirror this exactly, so
+/// `dirs::data_dir()` — which returns `~/Library/Application Support` on macOS
+/// — is deliberately NOT used here.
+fn default_data_home() -> std::path::PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".local")
+                .join("share")
+        })
+}
+
+/// Scan for running `opencode serve` processes. Thin I/O — the interesting
+/// decisions live in [`select_server`].
+///
+/// Uses sysinfo so discovery works on every platform (there is no `/proc` on
+/// macOS/Windows). cmdline and environ are refreshed on every call (`Always`)
+/// so a restarted server's new port/password is picked up.
 pub fn scan_processes() -> Vec<ServerCandidate> {
-    let default_data_home = dirs::data_dir().map(|p| p.to_string_lossy().to_string());
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let pid = entry.file_name().to_string_lossy().to_string();
-        if !pid.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        let pid_num: i32 = pid.parse().ok().unwrap_or(0);
-        let cmdline = match std::fs::read(format!("/proc/{pid}/cmdline")) {
-            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
-            Err(_) => continue,
-        };
-        let args: Vec<&str> = cmdline.split('\0').collect();
-        let is_server = args.first().map(|a| a.contains("opencode")).unwrap_or(false)
-            && args.iter().skip(1).any(|a| *a == "serve");
-        if !is_server {
-            continue;
-        }
-        let mut port = None;
-        let mut idx = 0;
-        while idx < args.len() {
-            if args[idx] == "--port" && idx + 1 < args.len() {
-                port = args[idx + 1].parse().ok();
+    let default_store = default_data_home().to_string_lossy().into_owned();
+    let mut system = System::new();
+    let refresh = ProcessRefreshKind::nothing()
+        .with_cmd(UpdateKind::Always)
+        .with_environ(UpdateKind::Always);
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
+
+    system
+        .processes()
+        .values()
+        .filter_map(|proc_| {
+            let args: Vec<String> = proc_
+                .cmd()
+                .iter()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect();
+            let is_server = args.first().map(|a| a.contains("opencode")).unwrap_or(false)
+                && args.iter().skip(1).any(|a| a == "serve");
+            if !is_server {
+                return None;
             }
-            idx += 1;
-        }
-        let Some(port) = port else { continue };
-        let env = match std::fs::read(format!("/proc/{pid}/environ")) {
-            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
-            Err(_) => continue,
-        };
-        let password = env
-            .split('\0')
-            .find_map(|kv| kv.strip_prefix("OPENCODE_SERVER_PASSWORD="))
-            .unwrap_or("")
-            .to_string();
-        let xdg = env
-            .split('\0')
-            .find_map(|kv| kv.strip_prefix("XDG_DATA_HOME="))
-            .map(|s| s.to_string());
-        let uses_default_store = match xdg {
-            None => true,
-            Some(home) => Some(home) == default_data_home,
-        };
-        out.push(ServerCandidate {
-            pid: pid_num,
-            port,
-            password,
-            uses_default_store,
-        });
-    }
-    out
+            let port = args
+                .iter()
+                .position(|a| a == "--port")
+                .and_then(|idx| args.get(idx + 1))
+                .and_then(|p| p.parse().ok())?;
+            let env: Vec<String> = proc_
+                .environ()
+                .iter()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect();
+            let password = env
+                .iter()
+                .find_map(|kv| kv.strip_prefix("OPENCODE_SERVER_PASSWORD="))
+                .unwrap_or("")
+                .to_string();
+            let xdg = env
+                .iter()
+                .find_map(|kv| kv.strip_prefix("XDG_DATA_HOME="))
+                .map(|s| s.to_string());
+            // A server reads the default store when the directory it uses
+            // equals the default data home. Unset XDG_DATA_HOME means OpenCode
+            // used `~/.local/share`; reading another process's env is
+            // best-effort (macOS/Windows limit it to same-user processes), so
+            // an unreadable env degrades to "assume default store".
+            let uses_default_store = match xdg {
+                None => true,
+                Some(home) => home == default_store,
+            };
+            Some(ServerCandidate {
+                pid: proc_.pid().as_u32() as i32,
+                port,
+                password,
+                uses_default_store,
+            })
+        })
+        .collect()
 }
 
 /// Pick the server cola should attach to.
@@ -189,15 +217,83 @@ fn is_self_spawned_record(path: &std::path::Path, pid: i32) -> bool {
 
 /// Whether a pid is a live `opencode serve` process (not a dead/zombie pid that
 /// the OS recycled, and not some other program that happened to reuse the pid).
-/// Reads `/proc/<pid>/cmdline` and checks the `serve` subcommand.
+/// Reads the process cmdline via sysinfo and checks the `serve` subcommand.
 fn is_live_opencode_serve(pid: i32) -> bool {
-    let cmdline = match std::fs::read(format!("/proc/{pid}/cmdline")) {
-        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
-        Err(_) => return false,
-    };
-    let args: Vec<&str> = cmdline.split('\0').collect();
-    args.first().map(|a| a.contains("opencode")).unwrap_or(false)
-        && args.iter().skip(1).any(|a| *a == "serve")
+    process_cmd(pid)
+        .map(|args| {
+            args.first().map(|a| a.contains("opencode")).unwrap_or(false)
+                && args.iter().skip(1).any(|a| a == "serve")
+        })
+        .unwrap_or(false)
+}
+
+/// The command-line args of a process, from sysinfo (None if not visible).
+pub fn process_cmd(pid: i32) -> Option<Vec<String>> {
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[Pid::from_u32(pid as u32)]),
+        false,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
+    system
+        .process(Pid::from_u32(pid as u32))
+        .map(|p| p.cmd().iter().map(|s| s.to_string_lossy().into_owned()).collect())
+}
+
+/// Whether a PID refers to a live process (not a zombie, not missing).
+///
+/// Conservative on platforms where sysinfo cannot determine zombie state: a
+/// process that exists but whose status is unknown is treated as alive, so a
+/// lock is never stolen from a process that might still be running.
+pub fn process_alive(pid: i32) -> bool {
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid as u32)]), false);
+    match system.process(Pid::from_u32(pid as u32)) {
+        Some(p) => p.status() != sysinfo::ProcessStatus::Zombie,
+        None => false,
+    }
+}
+
+/// Terminate a process. On unix this sends SIGTERM (graceful: the process's
+/// Drop handlers run, releasing the singleton lock and the Feishu WS); the
+/// caller should poll [`process_alive`] and escalate to SIGKILL via
+/// [`force_kill`]. On Windows there is no POSIX signal and the graceful
+/// `taskkill /PID` first stage is a no-op for a windowless CLI, so we go
+/// straight to `taskkill /F`.
+pub fn terminate_process(pid: i32) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            anyhow::bail!("taskkill /F failed for pid {}", pid)
+        }
+    }
+}
+
+/// Force-kill a process (SIGKILL on unix). No-op on Windows, where
+/// [`terminate_process`] already force-terminated.
+pub fn force_kill(pid: i32) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        Ok(())
+    }
 }
 
 /// Spawn an `opencode serve` on the default store (same semantics as main's
@@ -261,17 +357,18 @@ pub async fn restart_self_spawned_server() -> anyhow::Result<RestartOutcome> {
     // Kill our own server, wait for the port to release, re-raise it on the same
     // port/password, and wait until it accepts connections again.
     let _ = clear_self_spawned();
-    match std::process::Command::new("kill")
-        .arg(server.pid.to_string())
-        .status()
-    {
-        Ok(_) => tracing::info!("restarting self-spawned opencode (pid {})", server.pid),
-        Err(e) => {
-            tracing::warn!("kill self-spawned opencode {} failed: {}", server.pid, e);
-            return Err(e.into());
-        }
+    if let Err(e) = terminate_process(server.pid) {
+        tracing::warn!("terminate self-spawned opencode {} failed: {}", server.pid, e);
+        return Err(e);
     }
-    // Give the port time to free up.
+    tracing::info!("restarting self-spawned opencode (pid {})", server.pid);
+    // Give the process time to die and the port to free up.
+    for _ in 0..50 {
+        if !process_alive(server.pid) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     for _ in 0..25 {
         if tokio::net::TcpStream::connect(("127.0.0.1", server.port))
             .await
@@ -396,5 +493,41 @@ mod tests {
         // the unit-level claim: the record alone is insufficient. The liveness
         // gate is exercised by live_opencode_serve_requires_real_serve_process.
         assert!(!is_live_opencode_serve(999_999_999));
+    }
+
+    #[test]
+    fn process_alive_detects_own_process() {
+        // This test process is alive on every platform.
+        assert!(process_alive(std::process::id() as i32));
+        // A far-out pid is dead everywhere.
+        assert!(!process_alive(i32::MAX - 1));
+    }
+
+    #[test]
+    fn process_cmd_reads_own_command_line() {
+        // The test binary's own cmdline is readable on every platform; it names
+        // the crate (cola) so the args are non-empty.
+        let cmd = process_cmd(std::process::id() as i32).expect("own cmd readable");
+        assert!(!cmd.is_empty());
+        // A non-existent pid yields no cmdline.
+        assert!(process_cmd(999_999_999).is_none());
+    }
+
+    #[test]
+    fn default_data_home_prefers_xdg_when_set() {
+        let saved = std::env::var_os("XDG_DATA_HOME");
+        // `XDG_DATA_HOME` unset → `$HOME/.local/share`.
+        let home = dirs::home_dir().unwrap();
+        let expected = home.join(".local").join("share");
+        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        assert_eq!(default_data_home(), expected);
+        // Explicitly set → used verbatim (mirrors opencode's xdg-basedir).
+        unsafe { std::env::set_var("XDG_DATA_HOME", "/custom/data/home") };
+        assert_eq!(default_data_home(), std::path::PathBuf::from("/custom/data/home"));
+        // Restore so parallel tests aren't affected.
+        match saved {
+            Some(v) => unsafe { std::env::set_var("XDG_DATA_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_DATA_HOME") },
+        }
     }
 }
