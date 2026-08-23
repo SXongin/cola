@@ -15,9 +15,10 @@ struct Cli {
     #[arg(short, long, default_value = "cola.toml")]
     config: String,
 
-    /// Also append logs to this file (never truncates). Without it logs go to
-    /// stdout only. Handy under systemd or when stdout is redirected — restart
-    /// won't wipe history since the file is appended, not overwritten.
+    /// Log file to append to (default ~/.cola/cola.log, never truncates).
+    /// Logs always go to the file; when stdout is a terminal they mirror there
+    /// too. Restart won't wipe history since the file is appended, not
+    /// overwritten.
     #[arg(short, long)]
     log_file: Option<std::path::PathBuf>,
 
@@ -26,6 +27,14 @@ struct Cli {
     /// itself via `/restart`.
     #[arg(long)]
     replace: bool,
+}
+
+/// The default append log file, used when `--log-file` is not given.
+fn default_log_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".cola")
+        .join("cola.log")
 }
 
 /// Resolve which OpenCode server cola talks to, mutating the config.
@@ -267,20 +276,31 @@ impl Drop for SingletonLock {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Append (never truncate) to the log file when given, so a restart keeps
-    // history instead of wiping it like a shell `>` redirect does. Logs also
-    // keep going to stdout.
-    let make_writer: tracing_subscriber::fmt::writer::BoxMakeWriter = match &cli.log_file {
-        Some(path) => {
-            let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-            tracing_subscriber::fmt::writer::BoxMakeWriter::new(file)
-        }
-        None => tracing_subscriber::fmt::writer::BoxMakeWriter::new(|| std::io::stdout()),
-    };
+    // Logs always append to a file (default ~/.cola/cola.log; --log-file
+    // overrides) so a restart keeps history instead of wiping it like a shell
+    // `>` redirect does. The file is ANSI-free. When stdout is a real terminal
+    // it mirrors the logs too (with ANSI); a redirected stdout gets no cola
+    // logs, so the redirect target stays clean and the file is authoritative.
+    let log_path = cli.log_file.clone().unwrap_or_else(default_log_path);
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(file)
+        .with_ansi(false);
+    let stdout_layer = std::io::stdout()
+        .is_terminal()
+        .then(|| tracing_subscriber::fmt::layer().with_ansi(true));
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "cola=info".into()))
-        .with(tracing_subscriber::fmt::layer().with_writer(make_writer))
+        .with(file_layer)
+        .with(stdout_layer)
         .init();
+    tracing::info!("logging to {}", log_path.display());
 
     let mut cfg = config::load(&cli.config)?;
 
