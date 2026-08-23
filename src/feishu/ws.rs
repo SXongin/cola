@@ -411,7 +411,7 @@ fn encode_response_frame(request: &ParsedFrame, payload: &str) -> Vec<u8> {
 }
 
 fn encode_varint_field(out: &mut Vec<u8>, field: u32, value: u64) {
-    let tag = (field << 3) | 0; // wire type 0 = varint
+    let tag = field << 3; // wire type 0 = varint
     encode_varint(out, tag as u64);
     encode_varint(out, value);
 }
@@ -632,13 +632,12 @@ async fn handle_binary_frame(
             tracing::debug!("WS ping (heartbeat)");
             // Answer the server's keepalive ping so it doesn't consider the
             // connection dead. The Lark SDK sends a pong for every ping.
-            if let Some(pong_bytes) = build_pong_frame(&frame) {
-                if let Err(e) = ws
+            if let Some(pong_bytes) = build_pong_frame(&frame)
+                && let Err(e) = ws
                     .send(tokio_tungstenite::tungstenite::Message::Binary(pong_bytes.into()))
                     .await
-                {
-                    tracing::warn!("WS pong send failed: {}", e);
-                }
+            {
+                tracing::warn!("WS pong send failed: {}", e);
             }
         }
         "event" => {
@@ -649,7 +648,7 @@ async fn handle_binary_frame(
                 &payload_str.chars().take(300).collect::<String>()
             );
 
-            let event_type = serde_json::from_slice::<serde_json::Value>(&payload)
+            let event_type = serde_json::from_slice::<serde_json::Value>(payload)
                 .ok()
                 .and_then(|v| {
                     v.get("header")?
@@ -670,7 +669,7 @@ async fn handle_binary_frame(
                 send_event_ack(ws, &frame).await;
 
                 // Dedup by event_id from JSON payload (stable across retries)
-                let event_id = serde_json::from_slice::<serde_json::Value>(&payload)
+                let event_id = serde_json::from_slice::<serde_json::Value>(payload)
                     .ok()
                     .and_then(|v| v.get("header")?.get("event_id")?.as_str().map(|s| s.to_string()));
 
@@ -685,7 +684,7 @@ async fn handle_binary_frame(
 
                 // Filter: skip events older than 5 minutes (Feishu replays old unacked events)
                 let now_ms = chrono::Utc::now().timestamp_millis();
-                let event_age = serde_json::from_slice::<serde_json::Value>(&payload)
+                let event_age = serde_json::from_slice::<serde_json::Value>(payload)
                     .ok()
                     .and_then(|v| v.get("header")?.get("create_time")?.as_str()?.parse::<i64>().ok())
                     .map(|ct| now_ms - ct);
@@ -697,56 +696,55 @@ async fn handle_binary_frame(
                     return Ok(());
                 }
 
-                if let Ok(event) = serde_json::from_slice::<MessageReceiveEvent>(&payload) {
-                    if let Some(event_data) = event.event
-                        && let Some(msg_data) = event_data.message
-                    {
-                        let mut text = parse_message_content(&msg_data);
-                        // Replace @mention placeholders (`@_user_N`) with real
-                        // names so the AI sees who was referenced; the bot's own
-                        // mention is dropped. Feishu otherwise leaks opaque
-                        // `@_user_1` tokens into the prompt.
-                        if !msg_data.mentions.is_empty() {
-                            let bot_id = state.bot_open_id(feishu).await.unwrap_or_default();
-                            if let Some(eid) = event.header.as_ref().and_then(|h| h.event_id.clone())
-                                && is_mentioned(&msg_data.mentions, &bot_id)
-                            {
-                                tracing::info!("event {} mentions bot", eid);
-                            }
-                            text = strip_mentions(&text, &msg_data.mentions, &bot_id);
+                if let Ok(event) = serde_json::from_slice::<MessageReceiveEvent>(payload)
+                    && let Some(event_data) = event.event
+                    && let Some(msg_data) = event_data.message
+                {
+                    let mut text = parse_message_content(&msg_data);
+                    // Replace @mention placeholders (`@_user_N`) with real
+                    // names so the AI sees who was referenced; the bot's own
+                    // mention is dropped. Feishu otherwise leaks opaque
+                    // `@_user_1` tokens into the prompt.
+                    if !msg_data.mentions.is_empty() {
+                        let bot_id = state.bot_open_id(feishu).await.unwrap_or_default();
+                        if let Some(eid) = event.header.as_ref().and_then(|h| h.event_id.clone())
+                            && is_mentioned(&msg_data.mentions, &bot_id)
+                        {
+                            tracing::info!("event {} mentions bot", eid);
                         }
-                        let thread_id = msg_data.thread_id.clone();
-                        // Who sent the message: needed for the group completion
-                        // notice (reply/@ the requester when a group turn ends).
-                        let sender_open_id = event_data
-                            .sender
-                            .as_ref()
-                            .and_then(|s| s.sender_id.as_ref())
-                            .and_then(|i| i.open_id.clone());
-                        tracing::info!(
-                            "Message: chat={} type={} thread={} text={}",
+                        text = strip_mentions(&text, &msg_data.mentions, &bot_id);
+                    }
+                    let thread_id = msg_data.thread_id.clone();
+                    // Who sent the message: needed for the group completion
+                    // notice (reply/@ the requester when a group turn ends).
+                    let sender_open_id = event_data
+                        .sender
+                        .as_ref()
+                        .and_then(|s| s.sender_id.as_ref())
+                        .and_then(|i| i.open_id.clone());
+                    tracing::info!(
+                        "Message: chat={} type={} thread={} text={}",
+                        msg_data.chat_id,
+                        msg_data.chat_type,
+                        thread_id.as_deref().unwrap_or("-"),
+                        &text.chars().take(50).collect::<String>()
+                    );
+                    // Handle the message on a separate task so the WS read loop
+                    // keeps reading (heartbeats, new messages, card actions) while
+                    // a prompt is in flight. Blocking here wedges the entire
+                    // connection and Feishu eventually drops it (CLOSE-WAIT).
+                    let sink = sink.clone();
+                    tokio::spawn(async move {
+                        sink.handle_message(
+                            msg_data.message_id,
                             msg_data.chat_id,
                             msg_data.chat_type,
-                            thread_id.as_deref().unwrap_or("-"),
-                            &text.chars().take(50).collect::<String>()
-                        );
-                        // Handle the message on a separate task so the WS read loop
-                        // keeps reading (heartbeats, new messages, card actions) while
-                        // a prompt is in flight. Blocking here wedges the entire
-                        // connection and Feishu eventually drops it (CLOSE-WAIT).
-                        let sink = sink.clone();
-                        tokio::spawn(async move {
-                            sink.handle_message(
-                                msg_data.message_id,
-                                msg_data.chat_id,
-                                msg_data.chat_type,
-                                thread_id,
-                                text,
-                                sender_open_id,
-                            )
-                            .await;
-                        });
-                    }
+                            thread_id,
+                            text,
+                            sender_open_id,
+                        )
+                        .await;
+                    });
                 }
             } else if event_type == "card.action.trigger" {
                 // Ack ALWAYS — even an unparseable card action must be acked,

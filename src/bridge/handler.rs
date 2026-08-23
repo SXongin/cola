@@ -19,9 +19,9 @@ const GROUP_LOBBY_GUIDANCE: &str = "\
 - `/dir <路径>` 切换项目目录
 - `/help` 查看全部命令";
 
-/// Re-exec cola itself with the ORIGINAL startup args, inheriting stdio so a
-/// shell log redirect (`cola ... > test.log 2>&1`) carries into the new process.
-/// The current process then calls `std::process::exit(0)` right after.
+// Re-exec cola itself with the ORIGINAL startup args, inheriting stdio so a
+// shell log redirect (`cola ... > test.log 2>&1`) carries into the new process.
+// The current process then calls `std::process::exit(0)` right after.
 
 /// Everything `run_prompt` needs for one turn. Built by `handle_prompt` for a
 /// fresh message and by the error-card "retry" action (which reuses the
@@ -881,6 +881,9 @@ impl App {
 mod test_support {
     use super::*;
 
+    /// A recorded `reply_question` call: (request_id, answers).
+    type QuestionReplyRecord = (String, Vec<Vec<String>>);
+
     #[derive(Debug, Clone)]
     #[allow(dead_code)] // the recording adapter captures full call details for assertions
     pub enum PlatformCall {
@@ -1010,7 +1013,7 @@ mod test_support {
         /// Pending questions served by `list_questions`.
         pub questions: Vec<opencode::client::QuestionRequest>,
         /// Records `reply_question` calls: (request_id, answers).
-        pub reply_question_calls: Arc<tokio::sync::Mutex<Vec<(String, Vec<Vec<String>>)>>>,
+        pub reply_question_calls: Arc<tokio::sync::Mutex<Vec<QuestionReplyRecord>>>,
         /// When set, `prompt` fails with this message (simulates a provider 503).
         pub prompt_error: Option<String>,
         /// Number of initial `prompt` calls to fail (for testing retry-after-error).

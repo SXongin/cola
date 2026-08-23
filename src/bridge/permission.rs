@@ -192,9 +192,7 @@ impl PermissionFlow {
 
         let reply = value.get("reply").and_then(|v| v.as_str()).unwrap_or("reject");
         let request_id = value.get("request_id").and_then(|v| v.as_str());
-        let Some(req_id) = request_id else {
-            return None;
-        };
+        let req_id = request_id?;
         // Inline interaction: the session (or its sub-task parent chain) has a
         // live streaming card, so the result is NOT returned as a replacement
         // card — the streaming card re-renders itself on the next poll.

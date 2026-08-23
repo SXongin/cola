@@ -1,11 +1,11 @@
-/// Discovery of the OpenCode server cola should attach to, and the command to
-/// start its own when none is running.
-///
-/// The invariant is the STORE: sessions are shared only when every client
-/// (cola, OpenChamber, the CLI) reads the same data directory
-/// (`~/.local/share/opencode`). cola therefore attaches to any OpenCode server
-/// running on the default store (whoever started it — OpenChamber, a manual
-/// `opencode serve`, another tool) and only starts its own when none exists.
+//! Discovery of the OpenCode server cola should attach to, and the command to
+//! start its own when none is running.
+//!
+//! The invariant is the STORE: sessions are shared only when every client
+//! (cola, OpenChamber, the CLI) reads the same data directory
+//! (`~/.local/share/opencode`). cola therefore attaches to any OpenCode server
+//! running on the default store (whoever started it — OpenChamber, a manual
+//! `opencode serve`, another tool) and only starts its own when none exists.
 
 /// An `opencode serve` process discovered on the machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,7 +252,7 @@ pub enum RestartOutcome {
 /// to reply that the server needs a manual restart.
 pub async fn restart_self_spawned_server() -> anyhow::Result<RestartOutcome> {
     let candidates = scan_processes();
-    let Some(server) = select_server(&candidates, None).map(|c| c.clone()) else {
+    let Some(server) = select_server(&candidates, None).cloned() else {
         return Ok(RestartOutcome::NoServer);
     };
     if !is_self_spawned(server.pid) {

@@ -851,7 +851,7 @@ mod tests {
         assert!(header.as_str().unwrap().contains("推理中"));
         let elements = card["body"]["elements"].as_array().unwrap();
         assert_eq!(elements[0]["tag"].as_str().unwrap(), "collapsible_panel");
-        assert_eq!(elements[0]["expanded"].as_bool().unwrap(), false);
+        assert!(!elements[0]["expanded"].as_bool().unwrap());
         assert!(elements[0].to_string().contains("analyze"));
     }
 

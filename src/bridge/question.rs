@@ -158,9 +158,7 @@ impl QuestionFlow {
 
         let reply = value.get("reply").and_then(|v| v.as_str()).unwrap_or("reject");
         let request_id = value.get("request_id").and_then(|v| v.as_str());
-        let Some(req_id) = request_id else {
-            return None;
-        };
+        let req_id = request_id?;
         // Inline interaction: the session (or its sub-task parent chain) has a
         // live streaming card — answered inline there, so no replacement card is
         // returned.
@@ -272,7 +270,7 @@ impl QuestionFlow {
                         r.card = None;
                     }
                     r.toast = Some("已回答".to_string());
-                    return Some(r);
+                    Some(r)
                 } else if inline {
                     // Inline: the streaming card re-renders with the updated
                     // partial answers — toast only.
@@ -281,7 +279,7 @@ impl QuestionFlow {
                         toast: None,
                     };
                     r.toast = Some(format!("已记录答案，还有 {} 题未答", n - answered_count));
-                    return Some(r);
+                    Some(r)
                 } else {
                     // Still questions left: return an updated card that shows the
                     // answered ones as done and the rest open.
@@ -310,7 +308,7 @@ impl QuestionFlow {
                         toast: None,
                     };
                     r.toast = Some(format!("已记录答案，还有 {} 题未答", remaining));
-                    return Some(r);
+                    Some(r)
                 }
             }
             "submit" => {

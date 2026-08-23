@@ -164,142 +164,6 @@ pub fn command_help(name: &str) -> Option<String> {
     Some(text.to_string())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn plain_text_is_not_command() {
-        assert_eq!(parse_command("hello world"), None);
-        assert_eq!(parse_command("fix the bug"), None);
-    }
-
-    #[test]
-    fn parse_dir_with_path() {
-        let cmd = parse_command("/dir /home/user/project");
-        assert_eq!(cmd, Some(Command::Dir("/home/user/project".into())));
-    }
-
-    #[test]
-    fn parse_dir_missing_arg_shows_dir_help() {
-        assert_eq!(parse_command("/dir"), Some(Command::Help(Some("dir".into()))));
-        assert_eq!(parse_command("/name"), Some(Command::Help(Some("name".into()))));
-        assert_eq!(parse_command("/model"), Some(Command::Help(Some("model".into()))));
-        assert_eq!(parse_command("/agent"), Some(Command::Help(Some("agent".into()))));
-        assert_eq!(
-            parse_command("/switch"),
-            Some(Command::Help(Some("switch".into())))
-        );
-    }
-
-    #[test]
-    fn parse_switch() {
-        assert_eq!(
-            parse_command("/switch backend"),
-            Some(Command::Switch("backend".into()))
-        );
-    }
-
-    #[test]
-    fn parse_list() {
-        assert_eq!(parse_command("/list"), Some(Command::List));
-        assert_eq!(parse_command(" /list "), Some(Command::List));
-    }
-
-    #[test]
-    fn parse_restart() {
-        assert_eq!(parse_command("/restart"), Some(Command::Restart));
-        assert_eq!(parse_command("/restart now"), Some(Command::Restart));
-    }
-
-    #[test]
-    fn parse_new_with_name() {
-        assert_eq!(
-            parse_command("/new my-session"),
-            Some(Command::New(Some("my-session".into())))
-        );
-    }
-
-    #[test]
-    fn parse_new_without_name() {
-        assert_eq!(parse_command("/new"), Some(Command::New(None)));
-    }
-
-    #[test]
-    fn parse_name() {
-        assert_eq!(
-            parse_command("/name frontend-refactor"),
-            Some(Command::Name("frontend-refactor".into()))
-        );
-    }
-
-    #[test]
-    fn parse_stop() {
-        assert_eq!(parse_command("/stop"), Some(Command::Stop));
-    }
-
-    #[test]
-    fn parse_compact() {
-        assert_eq!(parse_command("/compact"), Some(Command::Compact));
-    }
-
-    #[test]
-    fn parse_agent() {
-        assert_eq!(
-            parse_command("/agent primary"),
-            Some(Command::Agent("primary".into()))
-        );
-    }
-
-    #[test]
-    fn parse_model() {
-        assert_eq!(
-            parse_command("/model anthropic/claude-sonnet-4-5"),
-            Some(Command::Model("anthropic/claude-sonnet-4-5".into()))
-        );
-    }
-
-    #[test]
-    fn parse_help() {
-        assert_eq!(parse_command("/help"), Some(Command::Help(None)));
-        assert_eq!(
-            parse_command("/help model"),
-            Some(Command::Help(Some("model".into())))
-        );
-        assert_eq!(
-            parse_command("/help Model"),
-            Some(Command::Help(Some("model".into())))
-        );
-    }
-
-    #[test]
-    fn command_help_known_and_unknown() {
-        assert!(command_help("model").unwrap().contains("/model"));
-        assert!(command_help("dir").unwrap().contains("NEW session"));
-        assert_eq!(command_help("nonexistent"), None);
-    }
-
-    #[test]
-    fn unknown_command_forwarded() {
-        let cmd = parse_command("/init");
-        assert_eq!(cmd, Some(Command::Forward("/init".into())));
-
-        let cmd2 = parse_command("/some-unknown-command arg1");
-        assert_eq!(cmd2, Some(Command::Forward("/some-unknown-command arg1".into())));
-    }
-
-    #[test]
-    fn trailing_spaces_ignored() {
-        assert_eq!(parse_command("  /list  "), Some(Command::List));
-    }
-
-    #[test]
-    fn case_insensitive_command() {
-        assert_eq!(parse_command("/STOP"), Some(Command::Stop));
-        assert_eq!(parse_command("/List"), Some(Command::List));
-    }
-}
-
 // ===== Command execution (the Command flow) =====
 // Moved out of handler.rs so the bridge coordinator stays thin; these methods
 // run the parsed slash commands against the shared core.
@@ -405,7 +269,7 @@ impl App {
                 let active_id = store.get_active(&thread_key).map(|e| &e.session_id);
                 let mut list = String::from("**Sessions:**\n");
                 for e in &entries {
-                    let mark = if active_id.map_or(false, |id| id == &e.session_id) {
+                    let mark = if active_id == Some(&e.session_id) {
                         " (active)"
                     } else {
                         ""
@@ -598,5 +462,141 @@ impl App {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_text_is_not_command() {
+        assert_eq!(parse_command("hello world"), None);
+        assert_eq!(parse_command("fix the bug"), None);
+    }
+
+    #[test]
+    fn parse_dir_with_path() {
+        let cmd = parse_command("/dir /home/user/project");
+        assert_eq!(cmd, Some(Command::Dir("/home/user/project".into())));
+    }
+
+    #[test]
+    fn parse_dir_missing_arg_shows_dir_help() {
+        assert_eq!(parse_command("/dir"), Some(Command::Help(Some("dir".into()))));
+        assert_eq!(parse_command("/name"), Some(Command::Help(Some("name".into()))));
+        assert_eq!(parse_command("/model"), Some(Command::Help(Some("model".into()))));
+        assert_eq!(parse_command("/agent"), Some(Command::Help(Some("agent".into()))));
+        assert_eq!(
+            parse_command("/switch"),
+            Some(Command::Help(Some("switch".into())))
+        );
+    }
+
+    #[test]
+    fn parse_switch() {
+        assert_eq!(
+            parse_command("/switch backend"),
+            Some(Command::Switch("backend".into()))
+        );
+    }
+
+    #[test]
+    fn parse_list() {
+        assert_eq!(parse_command("/list"), Some(Command::List));
+        assert_eq!(parse_command(" /list "), Some(Command::List));
+    }
+
+    #[test]
+    fn parse_restart() {
+        assert_eq!(parse_command("/restart"), Some(Command::Restart));
+        assert_eq!(parse_command("/restart now"), Some(Command::Restart));
+    }
+
+    #[test]
+    fn parse_new_with_name() {
+        assert_eq!(
+            parse_command("/new my-session"),
+            Some(Command::New(Some("my-session".into())))
+        );
+    }
+
+    #[test]
+    fn parse_new_without_name() {
+        assert_eq!(parse_command("/new"), Some(Command::New(None)));
+    }
+
+    #[test]
+    fn parse_name() {
+        assert_eq!(
+            parse_command("/name frontend-refactor"),
+            Some(Command::Name("frontend-refactor".into()))
+        );
+    }
+
+    #[test]
+    fn parse_stop() {
+        assert_eq!(parse_command("/stop"), Some(Command::Stop));
+    }
+
+    #[test]
+    fn parse_compact() {
+        assert_eq!(parse_command("/compact"), Some(Command::Compact));
+    }
+
+    #[test]
+    fn parse_agent() {
+        assert_eq!(
+            parse_command("/agent primary"),
+            Some(Command::Agent("primary".into()))
+        );
+    }
+
+    #[test]
+    fn parse_model() {
+        assert_eq!(
+            parse_command("/model anthropic/claude-sonnet-4-5"),
+            Some(Command::Model("anthropic/claude-sonnet-4-5".into()))
+        );
+    }
+
+    #[test]
+    fn parse_help() {
+        assert_eq!(parse_command("/help"), Some(Command::Help(None)));
+        assert_eq!(
+            parse_command("/help model"),
+            Some(Command::Help(Some("model".into())))
+        );
+        assert_eq!(
+            parse_command("/help Model"),
+            Some(Command::Help(Some("model".into())))
+        );
+    }
+
+    #[test]
+    fn command_help_known_and_unknown() {
+        assert!(command_help("model").unwrap().contains("/model"));
+        assert!(command_help("dir").unwrap().contains("NEW session"));
+        assert_eq!(command_help("nonexistent"), None);
+    }
+
+    #[test]
+    fn unknown_command_forwarded() {
+        let cmd = parse_command("/init");
+        assert_eq!(cmd, Some(Command::Forward("/init".into())));
+
+        let cmd2 = parse_command("/some-unknown-command arg1");
+        assert_eq!(cmd2, Some(Command::Forward("/some-unknown-command arg1".into())));
+    }
+
+    #[test]
+    fn trailing_spaces_ignored() {
+        assert_eq!(parse_command("  /list  "), Some(Command::List));
+    }
+
+    #[test]
+    fn case_insensitive_command() {
+        assert_eq!(parse_command("/STOP"), Some(Command::Stop));
+        assert_eq!(parse_command("/List"), Some(Command::List));
     }
 }
