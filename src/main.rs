@@ -360,10 +360,17 @@ mod tests {
 
     #[test]
     fn pid_alive_missing_pid_is_dead() {
-        // PID 1 is the init process and is always alive on Linux.
-        assert!(pid_alive(1));
-        // A far-out PID is almost certainly nonexistent.
+        // A far-out PID is almost certainly nonexistent on every platform.
         assert!(!pid_alive(i32::MAX - 1));
+    }
+
+    // PID 1 is the init process, always alive — but only assert this where
+    // sysinfo reliably enumerates it (Windows exposes System Idle as PID 0/1
+    // with restricted visibility, so the invariant doesn't hold there).
+    #[test]
+    #[cfg(unix)]
+    fn pid_alive_sees_init_process_as_alive() {
+        assert!(pid_alive(1));
     }
 
     /// The core restart bug: a zombie process's /proc entry persists until its
