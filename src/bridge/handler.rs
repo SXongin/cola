@@ -46,9 +46,9 @@ pub struct App {
     /// Weak self-reference, set once inside `run` (which holds the Arc). Lets
     /// the `EventSink` trait impl (which only has `&self`) recover a
     /// `&Arc<App>` to hand to the inherent methods. `Weak` so it never keeps
-    /// the app alive — no reference cycle. `std::sync::Mutex` because it is
-    /// locked without awaiting.
-    self_weak: std::sync::Mutex<Option<std::sync::Weak<App>>>,
+    /// the app alive — no reference cycle; `OnceLock` because it is written
+    /// exactly once, before any event can arrive.
+    self_weak: std::sync::OnceLock<std::sync::Weak<App>>,
     /// Permission flow: owns `sent_permission_cards`, polls pending requests,
     /// and handles the "perm" card action.
     pub permission: super::permission::PermissionFlow,
@@ -111,7 +111,7 @@ impl App {
     ) -> anyhow::Result<Self> {
         let core = Arc::new(SharedCore::new(&cfg, opencode, feishu)?);
         Ok(Self {
-            self_weak: std::sync::Mutex::new(None),
+            self_weak: std::sync::OnceLock::new(),
             permission: super::permission::PermissionFlow::new(),
             question: super::question::QuestionFlow::new(),
             external: super::external::ExternalFlow::new(),
@@ -123,12 +123,12 @@ impl App {
     /// by the `EventSink` trait impl to hand a `&Arc<App>` to the inherent
     /// methods. None before `run` sets it (and after it returns).
     fn self_arc(&self) -> Option<Arc<Self>> {
-        self.self_weak.lock().unwrap().as_ref().and_then(|w| w.upgrade())
+        self.self_weak.get().and_then(|w| w.upgrade())
     }
 
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         // Let the EventSink trait impl recover a &Arc<App> from &self.
-        *self.self_weak.lock().unwrap() = Some(Arc::downgrade(&self));
+        let _ = self.self_weak.set(Arc::downgrade(&self));
         // After a `/restart`, announce it in the chat that requested it.
         let notify_path = command::restart_notify_path();
         if let Ok(raw) = std::fs::read_to_string(&notify_path)
@@ -850,7 +850,7 @@ impl App {
                     tracing::error!("retry prompt: {}", e);
                 }
             });
-            let mut r = retry_result_card();
+            let mut r = crate::bridge::pollers::result_card("⏳ 正在重试...", "blue", "已重新提交原始问题。");
             r.toast = Some("正在重试...".to_string());
             Some(r)
         } else {
@@ -863,20 +863,6 @@ impl App {
             );
             None
         }
-    }
-}
-
-/// A JSON 2.0 "retrying" card returned by the error-card retry action. Must
-/// stay JSON 2.0 (see Feishu err 200830). The streaming card re-renders itself.
-fn retry_result_card() -> CardActionResult {
-    CardActionResult {
-        card: Some(serde_json::json!({
-            "schema": "2.0",
-            "config": { "wide_screen_mode": true },
-            "header": { "title": { "tag": "plain_text", "content": "⏳ 正在重试..." }, "template": "blue" },
-            "body": { "elements": [ { "tag": "markdown", "content": "已重新提交原始问题。" } ] }
-        })),
-        toast: None,
     }
 }
 

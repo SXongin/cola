@@ -3,7 +3,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::bridge::handler::{App, CardActionResult};
-use crate::bridge::pollers::{CardTarget, inline_host_session, resolve_card_target};
+use crate::bridge::pollers::{
+    CardTarget, inline_host_session, mark_stale_cards, resolve_card_target, result_card,
+};
 
 /// Partial answers recorded for a pending question request: `answers[i]` is
 /// `None` until the user answers question `i`. A request is only submitted once
@@ -414,48 +416,6 @@ impl QuestionFlow {
             }
             _ => None,
         }
-    }
-}
-
-/// Mark question cards as "already handled" when the underlying request
-/// disappeared without cola answering it (another client resolved it).
-async fn mark_stale_cards(
-    app: &Arc<App>,
-    pending: &std::collections::HashSet<String>,
-    sent: &Arc<Mutex<HashMap<String, (String, String)>>>,
-    kind: &str,
-) {
-    let stale: Vec<(String, String, String)> = {
-        let sent_map = sent.lock().await.clone();
-        let answered = app.answered_requests.lock().await;
-        sent_map
-            .into_iter()
-            .filter(|(rid, _)| !pending.contains(rid) && !answered.contains(rid))
-            .map(|(rid, (mid, desc))| (rid, mid, desc))
-            .collect()
-    };
-    for (rid, mid, desc) in stale {
-        sent.lock().await.remove(&rid);
-        let card = crate::feishu::card::build_resolved_elsewhere_card(kind, &desc);
-        if let Err(e) = app.feishu.update_message(&mid, &card).await {
-            tracing::warn!("mark stale {} card {}: {}", kind, rid, e);
-        } else {
-            tracing::info!("Marked stale {} card {} as handled", kind, rid);
-        }
-    }
-}
-
-/// A JSON 2.0 result card for a card-action response (must stay 2.0 to remain
-/// update-compatible with the 2.0 interactive cards — Feishu err 200830).
-fn result_card(title: &str, template: &str, body: &str) -> CardActionResult {
-    CardActionResult {
-        card: Some(serde_json::json!({
-            "schema": "2.0",
-            "config": { "wide_screen_mode": true },
-            "header": { "title": { "tag": "plain_text", "content": title }, "template": template },
-            "body": { "elements": [ { "tag": "markdown", "content": body } ] }
-        })),
-        toast: None,
     }
 }
 
