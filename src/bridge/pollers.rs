@@ -4,6 +4,38 @@ use tokio::sync::Mutex;
 
 use crate::bridge::handler::{App, CardActionResult};
 
+/// How often the server-reconnect loop rescans `/proc` for a changed server.
+const RECONNECT_POLL_INTERVAL_SECS: u64 = 5;
+
+/// Independent poller: detects when the OpenCode server cola is attached to has
+/// been restarted/replaced (another tool like OpenChamber manages it, so its
+/// pid, port and password can change under us), and re-points the client at the
+/// new server.
+///
+/// Without this, cola keeps hammering the dead port and every request 502s —
+/// messages arrive on the WS but prompts/permissions never work again until a
+/// manual cola restart. Started once at App startup.
+pub(crate) async fn reconnect_poll_loop(app: &Arc<App>) -> crate::error::Result<()> {
+    let mut current = app.opencode.base_url();
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(RECONNECT_POLL_INTERVAL_SECS)).await;
+        let candidates = crate::bridge::discovery::scan_processes();
+        let Some(server) = crate::bridge::discovery::select_server(&candidates, None) else {
+            continue;
+        };
+        let url = format!("http://localhost:{}", server.port);
+        if url == current {
+            continue;
+        }
+        tracing::warn!("OpenCode server changed ({} -> {}); reconnecting", current, url);
+        if let Err(e) = app.opencode.reconnect(&url, &server.password).await {
+            tracing::warn!("reconnect to {} failed: {}", url, e);
+            continue; // keep the old endpoint; retry next tick
+        }
+        current = url;
+    }
+}
+
 /// Where to deliver a permission/question card.
 pub enum CardTarget {
     /// Reply to a specific message (an in-flight prompt's streaming card).

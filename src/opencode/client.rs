@@ -3,37 +3,97 @@
 use crate::config::OpenCodeConfig;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Lightweight HTTP client for the OpenCode Server REST API.
-#[derive(Clone)]
+///
+/// The server cola talks to can be restarted/replaced at runtime (another tool
+/// like OpenChamber manages it), which may change its port and password. So the
+/// endpoint — base URL + auth — is held in a `RwLock` and can be swapped via
+/// [`Client::reconnect`] without dropping the shared `Arc<dyn Backend>`.
 pub struct Client {
-    pub http: reqwest::Client,
-    pub base_url: String,
+    http: Arc<std::sync::RwLock<HttpHandle>>,
+    /// The username used for Basic auth (reused on reconnect).
+    username: Option<String>,
     /// Default model for new sessions, e.g. "opencode/deepseek-v4-flash-free"
     pub model: Option<ModelInfo>,
 }
 
+/// The live HTTP handle: the reqwest client (with its baked-in auth headers)
+/// and the base URL. Replaced wholesale on reconnect.
+struct HttpHandle {
+    client: reqwest::Client,
+    base_url: String,
+}
+
+/// Build a reqwest client with the standard JSON content-type and optional
+/// Basic auth (OpenCode server password). Reused on reconnect so a changed
+/// password produces a fresh client.
+fn build_http_client(username: &Option<String>, password: &Option<String>) -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::CONTENT_TYPE, "application/json".parse().unwrap());
+
+    let mut builder = reqwest::Client::builder().default_headers(headers);
+
+    if let (Some(user), Some(pass)) = (username, password) {
+        let auth = format!("{}:{}", user, pass);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(auth);
+        let auth_value = reqwest::header::HeaderValue::from_str(&format!("Basic {}", encoded)).unwrap();
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        default_headers.insert(reqwest::header::AUTHORIZATION, auth_value);
+        builder = builder.default_headers(default_headers);
+    }
+
+    builder.build().expect("failed to build reqwest client")
+}
+
+impl Clone for Client {
+    fn clone(&self) -> Self {
+        Self {
+            http: Arc::clone(&self.http),
+            username: self.username.clone(),
+            model: self.model.clone(),
+        }
+    }
+}
+
 impl Client {
     pub fn new(cfg: OpenCodeConfig) -> Self {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(reqwest::header::CONTENT_TYPE, "application/json".parse().unwrap());
-
-        let mut builder = reqwest::Client::builder().default_headers(headers);
-
-        if let (Some(user), Some(pass)) = (&cfg.username, &cfg.password) {
-            let auth = format!("{}:{}", user, pass);
-            let encoded = base64::engine::general_purpose::STANDARD.encode(auth);
-            let auth_value = reqwest::header::HeaderValue::from_str(&format!("Basic {}", encoded)).unwrap();
-            let mut default_headers = reqwest::header::HeaderMap::new();
-            default_headers.insert(reqwest::header::AUTHORIZATION, auth_value);
-            builder = builder.default_headers(default_headers);
-        }
-
         Self {
-            http: builder.build().expect("failed to build reqwest client"),
-            base_url: cfg.url.trim_end_matches('/').to_string(),
+            http: Arc::new(std::sync::RwLock::new(HttpHandle {
+                client: build_http_client(&cfg.username, &cfg.password),
+                base_url: cfg.url.trim_end_matches('/').to_string(),
+            })),
+            username: cfg.username.clone(),
             model: parse_model(&cfg.model),
         }
+    }
+
+    /// Point this client at a different server (port/password changed because
+    /// the old one was restarted/replaced). Rare; only called by the reconnect
+    /// loop when discovery finds the attached server is gone.
+    pub async fn reconnect(&self, url: &str, password: &str) {
+        let handle = HttpHandle {
+            client: build_http_client(&self.username, &Some(password.to_string())),
+            base_url: url.trim_end_matches('/').to_string(),
+        };
+        let mut w = self.http.write().unwrap();
+        *w = handle;
+        drop(w);
+        tracing::info!("reconnected opencode client to {}", url);
+    }
+
+    /// The current base URL.
+    pub fn base_url(&self) -> String {
+        self.http.read().unwrap().base_url.clone()
+    }
+
+    pub fn url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url(), path)
+    }
+
+    fn http(&self) -> reqwest::Client {
+        self.http.read().unwrap().client.clone()
     }
 
     /// Create the session input for a new session, applying the configured
@@ -49,14 +109,10 @@ impl Client {
         }
     }
 
-    pub fn url(&self, path: &str) -> String {
-        format!("{}{}", self.base_url, path)
-    }
-
     /// List all sessions.
     pub async fn list_sessions(&self) -> crate::error::Result<SessionsListOutput> {
         let resp = self
-            .http
+            .http()
             .get(self.url("/api/session"))
             .send()
             .await?
@@ -67,7 +123,7 @@ impl Client {
     /// Create a new session with an optional directory and agent.
     pub async fn create_session(&self, input: &CreateSessionInput) -> crate::error::Result<Session> {
         let resp = self
-            .http
+            .http()
             .post(self.url("/api/session"))
             .json(input)
             .send()
@@ -91,7 +147,7 @@ impl Client {
             });
         }
         let resp = self
-            .http
+            .http()
             .post(self.url(&format!("/session/{}/message", session_id)))
             .json(&body)
             .send()
@@ -144,6 +200,15 @@ impl Client {
             });
         }
 
+        // Canonical 404: the session doesn't exist on this server (e.g. it was
+        // created before a server restart/replacement, or another client removed
+        // it). Report SessionNotFound so the bridge recreates the session —
+        // falling back to the legacy path here would surface a confusing 502 and
+        // the recreate never fires (see AGENTS.md pitfall #1).
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(crate::error::BridgeError::SessionNotFound(session_id.to_string()));
+        }
+
         // Fallback: older servers expose `/api/session/{id}/prompt` with `prompt` payload.
         tracing::warn!(
             "canonical /session/{}/message failed ({}), falling back to /api/session/{}/prompt",
@@ -158,7 +223,7 @@ impl Client {
             "delivery": "steer",
         });
         let resp = self
-            .http
+            .http()
             .post(self.url(&format!("/api/session/{}/prompt", session_id)))
             .json(&body)
             .send()
@@ -193,7 +258,7 @@ impl Client {
             });
         }
         let resp = self
-            .http
+            .http()
             .post(self.url(&format!("/session/{}/prompt_async", session_id)))
             .json(&body)
             .send()
@@ -222,7 +287,7 @@ impl Client {
         if let Some(d) = directory {
             url.query_pairs_mut().append_pair("directory", d);
         }
-        let resp = self.http.get(url).send().await?.error_for_status()?;
+        let resp = self.http().get(url).send().await?.error_for_status()?;
         Ok(resp.json().await?)
     }
 
@@ -240,7 +305,12 @@ impl Client {
         if let Some(d) = directory {
             url.query_pairs_mut().append_pair("directory", d);
         }
-        self.http.post(url).json(&body).send().await?.error_for_status()?;
+        self.http()
+            .post(url)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 
@@ -256,7 +326,7 @@ impl Client {
         if let Some(d) = directory {
             url.query_pairs_mut().append_pair("directory", d);
         }
-        let resp = self.http.get(url).send().await?;
+        let resp = self.http().get(url).send().await?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
@@ -276,7 +346,7 @@ impl Client {
     /// Fetch all messages (with parts) for a session (canonical: `GET /session/{id}/message`).
     pub async fn messages(&self, session_id: &str) -> crate::error::Result<Vec<SessionMessage>> {
         let resp = self
-            .http
+            .http()
             .get(self.url(&format!("/session/{}/message", session_id)))
             .send()
             .await?
@@ -293,7 +363,7 @@ impl Client {
         if let Some(d) = directory {
             url.query_pairs_mut().append_pair("directory", d);
         }
-        let resp = self.http.get(url).send().await?;
+        let resp = self.http().get(url).send().await?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
@@ -317,7 +387,7 @@ impl Client {
         provider: &str,
         model: &str,
     ) -> crate::error::Result<Option<i64>> {
-        let resp = self.http.get(self.url("/provider")).send().await?;
+        let resp = self.http().get(self.url("/provider")).send().await?;
         if !resp.status().is_success() {
             return Ok(None);
         }
@@ -358,7 +428,12 @@ impl Client {
         if let Some(d) = directory {
             url.query_pairs_mut().append_pair("directory", d);
         }
-        self.http.post(url).json(&body).send().await?.error_for_status()?;
+        self.http()
+            .post(url)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 
@@ -372,7 +447,7 @@ impl Client {
         if let Some(d) = directory {
             url.query_pairs_mut().append_pair("directory", d);
         }
-        self.http.post(url).send().await?.error_for_status()?;
+        self.http().post(url).send().await?.error_for_status()?;
         Ok(())
     }
 
@@ -380,7 +455,7 @@ impl Client {
     pub async fn interrupt(&self, session_id: &str) -> crate::error::Result<()> {
         // Canonical path has NO `/api` prefix (see AGENTS.md pitfall #1); the
         // old `/api/session/{id}/interrupt` 404'd so `/stop` silently failed.
-        self.http
+        self.http()
             .post(self.url(&format!("/session/{}/abort", session_id)))
             .send()
             .await?
@@ -390,7 +465,7 @@ impl Client {
 
     /// Compact a session's context.
     pub async fn compact(&self, session_id: &str) -> crate::error::Result<()> {
-        self.http
+        self.http()
             .post(self.url(&format!("/api/session/{}/compact", session_id)))
             .send()
             .await?
@@ -401,7 +476,7 @@ impl Client {
     /// Switch the agent for a session.
     pub async fn switch_agent(&self, session_id: &str, agent: &str) -> crate::error::Result<()> {
         let body = serde_json::json!({ "agent": agent });
-        self.http
+        self.http()
             .post(self.url(&format!("/api/session/{}/agent", session_id)))
             .json(&body)
             .send()
@@ -413,7 +488,7 @@ impl Client {
     /// Switch the model for a session.
     pub async fn switch_model(&self, session_id: &str, model: &str) -> crate::error::Result<()> {
         let body = serde_json::json!({ "model": model });
-        self.http
+        self.http()
             .post(self.url(&format!("/api/session/{}/model", session_id)))
             .json(&body)
             .send()

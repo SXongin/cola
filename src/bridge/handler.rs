@@ -158,6 +158,7 @@ impl App {
         let perm = Arc::clone(&self);
         let question = Arc::clone(&self);
         let external = Arc::clone(&self);
+        let reconnect = Arc::clone(&self);
         let ws_task = tokio::spawn(async move {
             let sink: Arc<dyn crate::bridge::EventSink> = ws;
             if let Err(e) = feishu::ws::event_loop(&sink, &ws_feishu, &ws_state).await {
@@ -187,7 +188,15 @@ impl App {
                 tracing::error!("External message poller: {}", e);
             }
         });
-        tokio::try_join!(ws_task, perm_task, question_task, external_task)?;
+        // The OpenCode server cola attaches to is managed by another tool that
+        // can restart it (new pid/port/password). Re-detect a changed server so
+        // cola reconnects instead of 502ing against the dead port forever.
+        let reconnect_task = tokio::spawn(async move {
+            if let Err(e) = crate::bridge::pollers::reconnect_poll_loop(&reconnect).await {
+                tracing::error!("Reconnect poller: {}", e);
+            }
+        });
+        tokio::try_join!(ws_task, perm_task, question_task, external_task, reconnect_task)?;
         Ok(())
     }
 
@@ -1219,6 +1228,12 @@ mod test_support {
         }
         async fn switch_model(&self, _s: &str, _m: &str) -> crate::error::Result<()> {
             Ok(())
+        }
+        async fn reconnect(&self, _url: &str, _password: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn base_url(&self) -> String {
+            "http://mock".into()
         }
     }
 

@@ -58,6 +58,15 @@ pub trait Backend: Send + Sync {
     async fn switch_agent(&self, session_id: &str, agent: &str) -> Result<()>;
 
     async fn switch_model(&self, session_id: &str, model: &str) -> Result<()>;
+
+    /// Re-point the backend at a different OpenCode server (port/password
+    /// changed because the server was restarted/replaced at runtime). No-op for
+    /// mocks.
+    async fn reconnect(&self, url: &str, password: &str) -> Result<()>;
+
+    /// The base URL this backend currently targets (used by the reconnect loop
+    /// to detect a changed server).
+    fn base_url(&self) -> String;
 }
 
 #[async_trait]
@@ -129,5 +138,14 @@ impl Backend for Client {
 
     async fn switch_model(&self, session_id: &str, model: &str) -> Result<()> {
         Client::switch_model(self, session_id, model).await
+    }
+
+    async fn reconnect(&self, url: &str, password: &str) -> Result<()> {
+        Client::reconnect(self, url, password).await;
+        Ok(())
+    }
+
+    fn base_url(&self) -> String {
+        Client::base_url(self)
     }
 }

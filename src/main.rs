@@ -13,6 +13,12 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 struct Cli {
     #[arg(short, long, default_value = "cola.toml")]
     config: String,
+
+    /// Also append logs to this file (never truncates). Without it logs go to
+    /// stdout only. Handy under systemd or when stdout is redirected — restart
+    /// won't wipe history since the file is appended, not overwritten.
+    #[arg(short, long)]
+    log_file: Option<std::path::PathBuf>,
 }
 
 /// Resolve which OpenCode server cola talks to, mutating the config.
@@ -169,12 +175,22 @@ impl Drop for SingletonLock {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    // Append (never truncate) to the log file when given, so a restart keeps
+    // history instead of wiping it like a shell `>` redirect does. Logs also
+    // keep going to stdout.
+    let make_writer: tracing_subscriber::fmt::writer::BoxMakeWriter = match &cli.log_file {
+        Some(path) => {
+            let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+            tracing_subscriber::fmt::writer::BoxMakeWriter::new(file)
+        }
+        None => tracing_subscriber::fmt::writer::BoxMakeWriter::new(|| std::io::stdout()),
+    };
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "cola=info".into()))
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_writer(make_writer))
         .init();
 
-    let cli = Cli::parse();
     let mut cfg = config::load(&cli.config)?;
 
     // Grab the singleton lock BEFORE touching the network or the store — a
