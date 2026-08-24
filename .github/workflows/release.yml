@@ -33,28 +33,38 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - name: Validate semver tag
-        shell: bash
+      - name: Validate semver tag (bash)
+        if: runner.os != 'Windows'
         run: |
           set -euo pipefail
           if ! grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$' <<< "$GITHUB_REF_NAME"; then
             echo "Tag '$GITHUB_REF_NAME' is not a valid semver version" >&2
             exit 1
           fi
+      - name: Validate semver tag (pwsh)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_NAME -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$') {
+            Write-Error "Tag '$env:GITHUB_REF_NAME' is not a valid semver version"
+            exit 1
+          }
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
-      - name: Package
+      - name: Package (tar)
+        if: matrix.archive == 'tar'
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME}"
           mkdir -p dist
-          if [ "${{ matrix.archive }}" = "tar" ]; then
-            tar -C "target/${{ matrix.target }}/release" -czf "dist/cola-${VERSION}-${{ matrix.target }}.tar.gz" cola
-          else
-            cp "target/${{ matrix.target }}/release/cola.exe" "dist/cola-${VERSION}-${{ matrix.target }}.exe"
-            zip -j "dist/cola-${VERSION}-${{ matrix.target }}.zip" "dist/cola-${VERSION}-${{ matrix.target }}.exe"
-          fi
+          tar -C "target/${{ matrix.target }}/release" -czf "dist/cola-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" cola
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/cola.exe" "dist/cola-${env:GITHUB_REF_NAME}-${{ matrix.target }}.exe"
+          Compress-Archive -Path "dist/cola-${env:GITHUB_REF_NAME}-${{ matrix.target }}.exe" -DestinationPath "dist/cola-${env:GITHUB_REF_NAME}-${{ matrix.target }}.zip" -Force
       - uses: actions/upload-artifact@v4
         with:
           name: cola-${{ matrix.target }}
