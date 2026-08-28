@@ -12,8 +12,8 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 #[derive(Parser)]
 #[command(name = "cola", about = "Bridge bot connecting OpenCode to Feishu")]
 struct Cli {
-    #[arg(short, long, default_value = "cola.toml")]
-    config: String,
+    #[arg(short, long)]
+    config: Option<String>,
 
     /// Log file to append to (default ~/.cola/cola.log, never truncates).
     /// Logs always go to the file; when stdout is a terminal they mirror there
@@ -35,6 +35,32 @@ fn default_log_path() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join(".cola")
         .join("cola.log")
+}
+
+/// Resolve the config file, walking the fallback chain and giving a first-use
+/// hint when none is found.
+///
+/// `--config` is used verbatim; otherwise `./cola.toml` then `~/.cola/cola.toml`
+/// are tried. If nothing exists, prints a first-run guide (Feishu credentials
+/// are mandatory, so silently running on defaults is pointless) and exits
+/// non-zero.
+fn resolve_config_or_exit(explicit: &Option<String>) -> std::path::PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    match config::resolve_config_path(explicit.as_deref(), &cwd, &home) {
+        Some(path) => path,
+        None => {
+            let home_cfg = home.join(".cola").join("cola.toml");
+            eprintln!(
+                "首次使用 cola：未找到配置文件（已依次查找 `./cola.toml`、`{}`）。\n\
+                 请从仓库中的 `cola.toml.example` 复制并填写飞书 app_id / app_secret：\n\
+                 \x20 cp cola.toml.example cola.toml   # 然后编辑 cola.toml\n\
+                 \x20 mkdir -p ~/.cola && cp cola.toml.example ~/.cola/cola.toml   # 或放到统一状态目录",
+                home_cfg.display()
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Resolve which OpenCode server cola talks to, mutating the config.
@@ -296,7 +322,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
     tracing::info!("logging to {}", log_path.display());
 
-    let mut cfg = config::load(&cli.config)?;
+    let config_path = resolve_config_or_exit(&cli.config);
+
+    let mut cfg = config::load(&config_path)?;
 
     // Grab the singleton lock BEFORE touching the network or the store — a
     // duplicate cola must die before it can double-connect to the Feishu WS. A

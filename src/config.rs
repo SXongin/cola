@@ -1,9 +1,35 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-pub fn load(path: &str) -> anyhow::Result<Config> {
+pub fn load(path: &Path) -> anyhow::Result<Config> {
     let content = std::fs::read_to_string(path)?;
     Ok(toml::from_str(&content)?)
+}
+
+/// Resolve the config file path using the fallback lookup.
+///
+/// Order (first existing wins):
+/// 1. `explicit` — the user's `--config` flag, used verbatim (missing explicit
+///    file is a hard error, never silently ignored).
+/// 2. `./cola.toml` in the current directory.
+/// 3. `~/.cola/cola.toml` — the same cross-platform dir as logs, session
+///    mapping, lock and pid files, so launcher shortcuts without a notion of
+///    "current directory" still find it.
+///
+/// Returns `None` when no fallback file exists.
+pub fn resolve_config_path(explicit: Option<&str>, cwd: &Path, home: &Path) -> Option<PathBuf> {
+    if let Some(path) = explicit {
+        return Some(PathBuf::from(path));
+    }
+    let cwd_config = cwd.join("cola.toml");
+    if cwd_config.exists() {
+        return Some(cwd_config);
+    }
+    let home_config = home.join(".cola").join("cola.toml");
+    if home_config.exists() {
+        return Some(home_config);
+    }
+    None
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +179,13 @@ pub struct SessionEntry {
     /// automatically (`/autoaccept`) instead of showing a Feishu card.
     #[serde(default)]
     pub auto_accept: bool,
+    /// For topic-backed sessions: the `message_id` of a message INSIDE the
+    /// topic (recorded when the topic was created via `/topic`). Permission /
+    /// question / external cards that must be *sent* (no in-flight card to
+    /// reply to) reply to this anchor, which keeps them inside the topic — the
+    /// create API rejects `receive_id_type=thread_id`.
+    #[serde(default)]
+    pub topic_anchor: Option<String>,
 }
 
 #[cfg(test)]
@@ -214,5 +247,44 @@ mod tests {
         // Old sessions.json entries used `root_id`; the serde alias keeps them loadable.
         let key: ThreadKey = serde_json::from_str(r#"{"chat_id":"oc_1","root_id":"omt_old"}"#).unwrap();
         assert_eq!(key.thread_id, "omt_old");
+    }
+
+    #[test]
+    fn resolve_config_explicit_wins_even_if_missing() {
+        // An explicit --config is used verbatim; existence is not checked here
+        // (a missing explicit file is a hard error upstream, never a fallback).
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("cola.toml"), "").unwrap();
+        let p = resolve_config_path(Some("/custom/cola.toml"), cwd.path(), home.path());
+        assert_eq!(p.unwrap(), PathBuf::from("/custom/cola.toml"));
+    }
+
+    #[test]
+    fn resolve_config_prefers_cwd_over_home() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("cola.toml"), "").unwrap();
+        std::fs::create_dir_all(home.path().join(".cola")).unwrap();
+        std::fs::write(home.path().join(".cola/cola.toml"), "").unwrap();
+        let p = resolve_config_path(None, cwd.path(), home.path());
+        assert_eq!(p.unwrap(), cwd.path().join("cola.toml"));
+    }
+
+    #[test]
+    fn resolve_config_falls_back_to_home_when_cwd_missing() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".cola")).unwrap();
+        std::fs::write(home.path().join(".cola/cola.toml"), "").unwrap();
+        let p = resolve_config_path(None, cwd.path(), home.path());
+        assert_eq!(p.unwrap(), home.path().join(".cola/cola.toml"));
+    }
+
+    #[test]
+    fn resolve_config_none_when_nothing_exists() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_config_path(None, cwd.path(), home.path()), None);
     }
 }

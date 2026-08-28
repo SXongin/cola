@@ -71,15 +71,6 @@ impl SessionStore {
             .map(|e| e.directory.clone())
     }
 
-    /// Chat (thread) a session belongs to — fallback target for permission
-    /// cards when no per-message reply target is known (e.g. after a restart).
-    pub fn chat_for_session(&self, session_id: &str) -> Option<String> {
-        self.entries
-            .iter()
-            .find(|e| e.session_id == session_id)
-            .map(|e| e.thread_key.chat_id.clone())
-    }
-
     /// Unique session directories, used by the permission poller to check every
     /// instance the bot has created sessions in.
     pub fn directories(&self) -> Vec<String> {
@@ -133,6 +124,7 @@ mod tests {
             directory: dir.into(),
             agent: None,
             auto_accept: false,
+            topic_anchor: None,
         }
     }
 

@@ -786,6 +786,7 @@ impl App {
             directory,
             agent: None,
             auto_accept: false,
+            topic_anchor: None,
         };
         let mut store = self.sessions.lock().await;
         store.set_active(entry);
@@ -903,6 +904,11 @@ mod test_support {
             message_id: String,
             text: String,
         },
+        ReplyInThread {
+            message_id: String,
+            text: String,
+            thread_id: Option<String>,
+        },
         CompletionNotice {
             reply_to: String,
             open_id: String,
@@ -974,6 +980,20 @@ mod test_support {
             Ok("msg_text".into())
         }
 
+        async fn reply_in_thread(
+            &self,
+            message_id: &str,
+            text: &str,
+        ) -> crate::error::Result<(String, Option<String>)> {
+            self.calls.lock().await.push(PlatformCall::ReplyInThread {
+                message_id: message_id.into(),
+                text: text.into(),
+                thread_id: Some("omt_created_topic".into()),
+            });
+            // The mock's created topic-reply message id becomes the anchor.
+            Ok(("msg_topic_reply".into(), Some("omt_created_topic".into())))
+        }
+
         async fn reply_completion_notice(
             &self,
             message_id: &str,
@@ -996,6 +1016,24 @@ mod test_support {
 
         async fn bot_open_id(&self) -> crate::error::Result<String> {
             Ok("ou_test_bot".into())
+        }
+
+        async fn list_messages(
+            &self,
+            _container_id_type: &str,
+            _container_id: &str,
+        ) -> crate::error::Result<Vec<crate::feishu::client::ChatMessage>> {
+            Ok(vec![crate::feishu::client::ChatMessage {
+                message_id: "msg_in_topic_anchor".into(),
+                msg_type: "interactive".into(),
+                create_time: "0".into(),
+                chat_id: "chat_1".into(),
+                sender: Some(crate::feishu::client::ChatMessageSender {
+                    id: Some("cli_bot".into()),
+                    sender_type: Some("app".into()),
+                }),
+                body: None,
+            }])
         }
     }
 
@@ -1612,6 +1650,7 @@ mod integration_tests {
                 directory: "/tmp/x".into(),
                 agent: None,
                 auto_accept: false,
+                topic_anchor: None,
             });
         }
 
@@ -1629,6 +1668,7 @@ mod integration_tests {
                 directory: "/tmp/y".into(),
                 agent: None,
                 auto_accept: false,
+                topic_anchor: None,
             });
         }
         assert_eq!(app.session_subtitle(&key, "另一个问题").await, "00ea4e7");
@@ -1656,6 +1696,7 @@ mod integration_tests {
                 directory: "/tmp/x".into(),
                 agent: None,
                 auto_accept: false,
+                topic_anchor: None,
             });
         }
         assert_eq!(
@@ -1691,6 +1732,7 @@ mod integration_tests {
                 directory: "/tmp/x".into(),
                 agent: None,
                 auto_accept: false,
+                topic_anchor: None,
             });
         }
 
@@ -1937,6 +1979,7 @@ mod integration_tests {
                 directory: "/tmp/aa".into(),
                 agent: None,
                 auto_accept: true,
+                topic_anchor: None,
             });
             store.persist().unwrap();
         }
@@ -2001,6 +2044,7 @@ mod integration_tests {
                 directory: "/tmp/aa".into(),
                 agent: None,
                 auto_accept: false,
+                topic_anchor: None,
             });
             store.persist().unwrap();
         }
@@ -2062,6 +2106,7 @@ mod integration_tests {
                 directory: "/tmp/aa".into(),
                 agent: None,
                 auto_accept: false,
+                topic_anchor: None,
             });
             store.persist().unwrap();
         }
@@ -2143,6 +2188,7 @@ mod integration_tests {
                 directory: "/tmp/ext".into(),
                 agent: None,
                 auto_accept: false,
+                topic_anchor: None,
             });
             store.persist().unwrap();
         }
@@ -2174,6 +2220,67 @@ mod integration_tests {
             notify.to_string().contains("OpenChamber 里发的消息"),
             "notification should preview the message: {}",
             notify
+        );
+    }
+
+    /// External messages to a TOPIC-backed session are notified by replying to
+    /// a message INSIDE the topic, not sent to the chat top level. Covers the
+    /// no-persisted-anchor case (session created before `/topic` stored the
+    /// anchor): `resolve_topic_anchor` queries the thread for the newest bot
+    /// message and replies to it.
+    #[tokio::test]
+    async fn external_message_to_topic_session_notifies_into_thread() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut mock = MockBackend::new(realistic_parts());
+        mock.external_user_message = Some("话题里的外部消息".to_string());
+        let (app, platform) = build_app(cfg, mock).await;
+
+        // A TOPIC-backed session (thread_id != chat_id) with NO persisted
+        // anchor (like the old /topic sessions) — the anchor must be resolved
+        // by querying the thread.
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_topic_ext".into()),
+                session_id: "ses_ext".into(),
+                name: "话题会话".into(),
+                directory: "/tmp/ext".into(),
+                agent: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+            store.persist().unwrap();
+        }
+        let baseline = chrono::Utc::now().timestamp_millis() - 60_000;
+        app.external
+            .last_user_msg_epoch
+            .lock()
+            .await
+            .insert("ses_ext".into(), baseline);
+
+        tokio::spawn({
+            let app = app.clone();
+            async move {
+                let _ = app.external.poll_loop(&app).await;
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(8500)).await;
+
+        let calls = platform.calls.lock().await.clone();
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                PlatformCall::ReplyCard { reply_to, card } if reply_to == "msg_in_topic_anchor" && card.to_string().contains("有新消息")
+            )),
+            "topic external notification should reply into the topic (resolved anchor): {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, PlatformCall::SendCard { receive_id, .. } if receive_id == "chat_1")),
+            "topic external notification must NOT go to chat top level: {calls:?}"
         );
     }
 
@@ -2329,6 +2436,7 @@ mod integration_tests {
                 directory: "/tmp/aa".into(),
                 agent: None,
                 auto_accept: false,
+                topic_anchor: None,
             });
             store.persist().unwrap();
         }
@@ -2370,6 +2478,74 @@ mod integration_tests {
                 .unwrap_or(false),
             "separate card must carry a directory, got: {}",
             value
+        );
+    }
+
+    /// A topic-backed session with no streaming card falls back to a separate
+    /// permission card. The card replies to the session's topic anchor (a
+    /// message inside the topic), which keeps it inside the topic — the create
+    /// API rejects `thread_id` as a receive target, so replying to the anchor is
+    /// the reliable way to reach the topic.
+    #[tokio::test]
+    async fn separate_permission_card_sent_into_topic_for_topic_session() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.permissions = vec![opencode::client::PermissionRequest {
+            request_id: "per_topic".into(),
+            session_id: Some("ses_topic".into()),
+            permission: Some("bash".into()),
+            patterns: vec!["cargo build".into()],
+            metadata: None,
+            always: Vec::new(),
+        }];
+        let (app, platform) = build_app(cfg, backend).await;
+
+        // Map the session to a TOPIC (thread_id != chat_id) with an anchor
+        // message inside the topic, no accumulator.
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_topic_1".into()),
+                session_id: "ses_topic".into(),
+                name: "topic-session".into(),
+                directory: "/tmp/topic".into(),
+                agent: None,
+                auto_accept: false,
+                topic_anchor: Some("msg_in_topic_anchor".into()),
+            });
+            store.persist().unwrap();
+        }
+
+        tokio::spawn({
+            let app = app.clone();
+            async move {
+                let _ = app.permission.poll_loop(&app).await;
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+
+        // The separate card must be reply'd to the topic anchor (not sent to
+        // the chat top level).
+        let calls = platform.calls.lock().await.clone();
+        let perm_card = calls.iter().find_map(|c| match c {
+            PlatformCall::ReplyCard { reply_to, card }
+                if reply_to == "msg_in_topic_anchor" && card.to_string().contains("cargo build") =>
+            {
+                Some(card.clone())
+            }
+            _ => None,
+        });
+        assert!(
+            perm_card.is_some(),
+            "topic permission card should reply to the topic anchor, got: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, PlatformCall::SendCard { receive_id, .. } if receive_id == "chat_1")),
+            "permission card must NOT go to the chat top level: {calls:?}"
         );
     }
 
@@ -2488,7 +2664,7 @@ mod integration_tests {
 
         // Load the cola bot config from the repo; point new sessions at the
         // configured work dir instead of chdir'ing the whole process.
-        let mut cfg = crate::config::load("cola.toml").expect("load cola.toml");
+        let mut cfg = crate::config::load(std::path::Path::new("cola.toml")).expect("load cola.toml");
         if !work_dir.is_empty() {
             cfg.bridge.work_dir = Some(work_dir.into());
         }
@@ -2678,6 +2854,145 @@ mod integration_tests {
         assert_eq!(entry.directory, work.to_string_lossy().to_string());
     }
 
+    /// `/topic <dir>` creates a real Feishu topic (via reply_in_thread) backed
+    /// by a new session rooted at <dir>, maps the returned thread_id to that
+    /// session, and leaves the lobby conversation untouched.
+    #[tokio::test]
+    async fn topic_command_creates_topic_mapped_to_new_session() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_id = "ses_topic".into();
+        let (app, platform) = build_app(cfg, backend).await;
+
+        app.handle_command(
+            Command::Topic {
+                directory: "/root/proj/lib".into(),
+                name: Some("api-refactor".into()),
+            },
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_topic",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        // The topic is created via reply_in_thread on the command message.
+        let calls = platform.calls.lock().await.clone();
+        assert!(
+            calls.iter().any(
+                |c| matches!(c, PlatformCall::ReplyInThread { message_id, .. } if message_id == "msg_topic")
+            ),
+            "expected a reply_in_thread on the command message, got {calls:?}"
+        );
+
+        // The created topic's thread_id is mapped to the new session.
+        let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
+        let entry = app
+            .sessions
+            .lock()
+            .await
+            .get_active(&topic_key)
+            .cloned()
+            .expect("topic thread_id should map to the new session");
+        assert_eq!(entry.session_id, "ses_topic");
+        assert_eq!(entry.directory, "/root/proj/lib");
+        assert_eq!(entry.name, "api-refactor");
+        // The topic anchor is the confirmation message INSIDE the topic; future
+        // sent cards reply to it so they stay in the topic.
+        assert_eq!(entry.topic_anchor.as_deref(), Some("msg_topic_reply"));
+
+        // The lobby conversation still maps to nothing new (no session was
+        // created for the lobby itself).
+        let lobby_key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        assert!(app.sessions.lock().await.get_active(&lobby_key).is_none());
+    }
+
+    /// A message sent INSIDE the created topic routes to the topic's session,
+    /// not to a fresh lobby session.
+    #[tokio::test]
+    async fn topic_command_created_topic_routes_messages_to_its_session() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_id = "ses_topic".into();
+        let prompt_calls = backend.prompt_calls.clone();
+        let (app, _platform) = build_app(cfg, backend).await;
+
+        // Create the topic first.
+        app.handle_command(
+            Command::Topic {
+                directory: "/root/proj/lib".into(),
+                name: None,
+            },
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_topic",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        // Now a message arrives inside that topic (thread_id = the mapped one).
+        app.handle_message(
+            "msg_in_topic".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            Some("omt_created_topic".into()),
+            "帮我看看这个目录".into(),
+            None,
+        )
+        .await;
+
+        // It must reuse the topic session (ses_topic), not create a new one.
+        let calls = prompt_calls.lock().await.clone();
+        assert_eq!(calls, vec!["帮我看看这个目录".to_string()]);
+        let store = app.sessions.lock().await;
+        let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
+        assert_eq!(
+            store.get_active(&topic_key).map(|e| e.session_id.as_str()),
+            Some("ses_topic")
+        );
+        // The lobby got NO session of its own.
+        let lobby_key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        assert!(store.get_active(&lobby_key).is_none());
+    }
+
+    /// `/topic` invoked from inside a topic is rejected with a note rather than
+    /// nesting another topic.
+    #[tokio::test]
+    async fn topic_command_rejected_inside_existing_topic() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+        app.handle_command(
+            Command::Topic {
+                directory: "/root/proj/lib".into(),
+                name: None,
+            },
+            crate::config::ThreadKey::new("chat_1".into(), "omt_existing".into()),
+            "msg_topic",
+            crate::config::ConversationKind::Topic,
+        )
+        .await
+        .unwrap();
+
+        // No session created, no topic created — just a plain text note.
+        let calls = platform.calls.lock().await.clone();
+        assert!(
+            calls
+                .iter()
+                .all(|c| !matches!(c, PlatformCall::ReplyInThread { .. })),
+            "must not create a topic from inside a topic: {calls:?}"
+        );
+        assert!(calls.iter().any(|c| matches!(c, PlatformCall::ReplyText { .. })));
+        let store = app.sessions.lock().await;
+        assert!(store.all_entries().is_empty());
+    }
+
     #[tokio::test]
     async fn group_root_message_creates_lobby_session_and_shows_guidance() {
         let _wd = test_work_dir();
@@ -2814,6 +3129,7 @@ mod integration_tests {
                 directory: "/tmp/lobby".into(),
                 agent: None,
                 auto_accept: false,
+                topic_anchor: None,
             });
             store.set_active(crate::config::SessionEntry {
                 thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "omt_topic_1".into()),
@@ -2822,6 +3138,7 @@ mod integration_tests {
                 directory: "/tmp/topic".into(),
                 agent: None,
                 auto_accept: false,
+                topic_anchor: None,
             });
             store.persist().unwrap();
         }
@@ -2900,6 +3217,7 @@ mod integration_tests {
                 directory: "/tmp/top".into(),
                 agent: None,
                 auto_accept: false,
+                topic_anchor: None,
             });
             store.set_active(crate::config::SessionEntry {
                 thread_key: crate::config::ThreadKey::new("oc_p2p_1".into(), "omt_p2p_1".into()),
@@ -2908,6 +3226,7 @@ mod integration_tests {
                 directory: "/tmp/ptopic".into(),
                 agent: None,
                 auto_accept: false,
+                topic_anchor: None,
             });
             store.persist().unwrap();
         }
@@ -2974,6 +3293,7 @@ mod integration_tests {
                 directory: "/tmp/old2".into(),
                 agent: None,
                 auto_accept: false,
+                topic_anchor: None,
             });
             store.set_active(crate::config::SessionEntry {
                 thread_key: thread.clone(),
@@ -2982,6 +3302,7 @@ mod integration_tests {
                 directory: "/tmp/old".into(),
                 agent: None,
                 auto_accept: false,
+                topic_anchor: None,
             });
             store.persist().unwrap();
         }
@@ -3064,6 +3385,7 @@ mod integration_tests {
                 directory: "/work".into(),
                 agent: None,
                 auto_accept: false,
+                topic_anchor: None,
             });
         }
 
@@ -3402,6 +3724,7 @@ mod integration_tests {
                 directory: "/tmp/aa".into(),
                 agent: None,
                 auto_accept: false,
+                topic_anchor: None,
             });
             store.persist().unwrap();
         }

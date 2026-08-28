@@ -25,15 +25,15 @@ impl ExternalFlow {
     pub(crate) async fn poll_loop(&self, app: &Arc<App>) -> crate::error::Result<()> {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(8)).await;
-            let sessions: Vec<(String, String, String)> = app
+            let sessions: Vec<(String, crate::config::ThreadKey, String)> = app
                 .sessions
                 .lock()
                 .await
                 .all_entries()
                 .into_iter()
-                .map(|e| (e.session_id.clone(), e.thread_key.chat_id.clone(), e.name.clone()))
+                .map(|e| (e.session_id.clone(), e.thread_key.clone(), e.name.clone()))
                 .collect();
-            for (sid, chat_id, name) in sessions {
+            for (sid, thread_key, name) in sessions {
                 // While cola is answering this session, any new message is cola's own.
                 if app.inflight.lock().await.contains(&sid) {
                     continue;
@@ -61,7 +61,18 @@ impl ExternalFlow {
                         drop(map);
                         tracing::info!("External message on session {}: {}", sid, preview);
                         let card = crate::feishu::card::build_external_message_card(&name, &preview);
-                        if let Err(e) = app.feishu.send_card("chat_id", &chat_id, &card).await {
+                        // A topic session must be reached by replying to a
+                        // message INSIDE the topic (the create API rejects
+                        // `receive_id_type=thread_id`). Resolve an in-topic
+                        // anchor — the persisted `/topic` confirmation card, or
+                        // the newest bot message in the thread. Non-topic
+                        // sessions fall back to the chat top level.
+                        let anchor = crate::bridge::pollers::resolve_topic_anchor(app, &thread_key).await;
+                        let sent = match anchor {
+                            Some(anchor) => app.feishu.reply_card(&anchor, &card).await,
+                            None => app.feishu.send_card("chat_id", &thread_key.chat_id, &card).await,
+                        };
+                        if let Err(e) = sent {
                             tracing::warn!("external message notify: {}", e);
                         }
                     }

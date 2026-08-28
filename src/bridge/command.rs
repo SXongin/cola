@@ -9,6 +9,8 @@ pub enum Command {
     List,
     /// Create a fresh session, optionally named
     New(Option<String>),
+    /// Create a real Feishu topic backed by a fresh session rooted at `directory`.
+    Topic { directory: String, name: Option<String> },
     /// Rename the current session
     Name(String),
     /// Interrupt the current session execution
@@ -66,6 +68,23 @@ pub fn parse_command(text: &str) -> Option<Command> {
         },
         "/list" => Some(Command::List),
         "/new" => Some(Command::New(arg.map(|s| s.to_string()))),
+        "/topic" => match arg {
+            Some(a) => {
+                // `/topic <dir>` or `/topic <dir> <name>`
+                let mut it = a.splitn(2, ' ');
+                let dir = it.next().unwrap_or("").trim();
+                let name = it.next().map(|s| s.trim()).filter(|s| !s.is_empty());
+                if dir.is_empty() {
+                    Some(Command::Help(Some("topic".into())))
+                } else {
+                    Some(Command::Topic {
+                        directory: dir.to_string(),
+                        name: name.map(|s| s.to_string()),
+                    })
+                }
+            }
+            None => Some(Command::Help(Some("topic".into()))),
+        },
         "/name" => match arg {
             Some(p) => Some(Command::Name(p.to_string())),
             None => Some(Command::Help(Some("name".into()))),
@@ -108,6 +127,7 @@ pub fn help_text() -> String {
 `/switch <name>` · Switch to named session
 `/list` · List sessions in this thread
 `/new [name]` · Create a new session
+`/topic <dir> [name]` · Create a new Feishu topic + session in <dir>
 `/name <name>` · Rename current session
 `/stop` · Interrupt execution
 `/compact` · Compact context
@@ -135,6 +155,9 @@ pub fn command_help(name: &str) -> Option<String> {
         }
         "new" => {
             "/new [name]\nCreate a fresh session, optionally named. Without a name a generated one is used.\nExample: `/new api-refactor`"
+        }
+        "topic" => {
+            "/topic <dir> [name]\nCreate a real Feishu topic backed by a new session rooted at <dir>. The topic is UI-separated from the current conversation, so you can switch between topics in the Feishu client. Reply inside the created topic to talk to that session.\nExample: `/topic /root/proj/lib api-refactor`"
         }
         "name" => "/name <name>\nRename the current session.\nExample: `/name frontend`",
         "stop" => {
@@ -239,6 +262,7 @@ impl App {
                     directory: path.clone(),
                     agent: None,
                     auto_accept: false,
+                    topic_anchor: None,
                 };
                 let mut store = self.sessions.lock().await;
                 store.set_active(entry);
@@ -297,6 +321,7 @@ impl App {
                     directory,
                     agent: None,
                     auto_accept: false,
+                    topic_anchor: None,
                 };
                 let mut store = self.sessions.lock().await;
                 store.set_active(entry);
@@ -304,6 +329,79 @@ impl App {
                 self.feishu
                     .reply_text(message_id, &format!("Created \"{}\".", new_name))
                     .await?;
+            }
+            Command::Topic { directory, name } => {
+                // Opening a topic from inside another topic would nest
+                // confusingly; only create topics from a non-topic message.
+                if kind == ConversationKind::Topic {
+                    self.feishu
+                        .reply_text(
+                            message_id,
+                            "⚠️ /topic 只能从会话顶层使用，不能在话题里再开话题。请在主会话里发 /topic <目录>。",
+                        )
+                        .await?;
+                    return Ok(());
+                }
+                let session = self
+                    .opencode
+                    .create_session(&self.opencode.new_session_input(Some(&directory)))
+                    .await?;
+                let display_name = name.unwrap_or_else(|| {
+                    directory
+                        .trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(&directory)
+                        .to_string()
+                });
+                // Create a real topic anchored on the user's command message.
+                // `anchor` is the created reply's own message_id — a message
+                // INSIDE the topic, so permission/question/external cards that
+                // must be sent (no streaming card) can reply to it and stay in
+                // the topic (the create API rejects `thread_id` as a target).
+                let (anchor, thread_id) = self
+                    .feishu
+                    .reply_in_thread(
+                        message_id,
+                        &format!(
+                            "📌 已创建会话 `{}`（目录 `{}`）。\n请在本话题内回复，即可和这个会话对话。",
+                            display_name, directory
+                        ),
+                    )
+                    .await?;
+                let Some(thread_id) = thread_id else {
+                    tracing::warn!(
+                        "topic: no thread_id returned for /topic in chat {}; not mapping session",
+                        thread_key.chat_id
+                    );
+                    self.feishu
+                        .reply_text(
+                            message_id,
+                            "⚠️ 当前会话不支持创建话题（未返回 thread_id）。请改用 `/dir <目录>` 或在飞书里手动创建话题。",
+                        )
+                        .await?;
+                    return Ok(());
+                };
+                let topic_key = crate::config::ThreadKey::new(thread_key.chat_id.clone(), thread_id.clone());
+                let entry = crate::config::SessionEntry {
+                    thread_key: topic_key,
+                    session_id: session.id.clone(),
+                    name: display_name,
+                    directory,
+                    agent: None,
+                    auto_accept: false,
+                    topic_anchor: Some(anchor),
+                };
+                let mut store = self.sessions.lock().await;
+                store.set_active(entry);
+                store.persist()?;
+                tracing::info!(
+                    "topic: created topic {} for session {} in chat {}",
+                    thread_id,
+                    session.id,
+                    thread_key.chat_id
+                );
             }
             Command::Name(name) => {
                 let mut store = self.sessions.lock().await;
@@ -524,6 +622,37 @@ mod tests {
     #[test]
     fn parse_new_without_name() {
         assert_eq!(parse_command("/new"), Some(Command::New(None)));
+    }
+
+    #[test]
+    fn parse_topic_with_dir_and_name() {
+        assert_eq!(
+            parse_command("/topic /root/proj/lib api-refactor"),
+            Some(Command::Topic {
+                directory: "/root/proj/lib".into(),
+                name: Some("api-refactor".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_topic_with_dir_only() {
+        assert_eq!(
+            parse_command("/topic /root/proj/lib"),
+            Some(Command::Topic {
+                directory: "/root/proj/lib".into(),
+                name: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_topic_missing_arg_shows_help() {
+        assert_eq!(parse_command("/topic"), Some(Command::Help(Some("topic".into()))));
+        assert_eq!(
+            parse_command("/topic "),
+            Some(Command::Help(Some("topic".into())))
+        );
     }
 
     #[test]

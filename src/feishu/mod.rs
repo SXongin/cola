@@ -24,6 +24,12 @@ pub trait Platform: Send + Sync {
 
     async fn reply_text(&self, message_id: &str, text: &str) -> Result<String>;
 
+    /// Reply to a message in thread form (`reply_in_thread: true`), creating a
+    /// topic. Returns the created reply's `message_id` (an anchor inside the
+    /// topic) and the topic's `thread_id` (or `None` if the chat does not
+    /// support topic replies).
+    async fn reply_in_thread(&self, message_id: &str, text: &str) -> Result<(String, Option<String>)>;
+
     /// Reply to a message with a completion notice. When `name` is known the
     /// requester is @-mentioned (`<at user_id="...">name</at>`); otherwise a
     /// plain reply — Feishu still notifies the message's author either way.
@@ -40,6 +46,15 @@ pub trait Platform: Send + Sync {
 
     /// The bot's own open_id, used to recognise @mentions of cola itself.
     async fn bot_open_id(&self) -> Result<String>;
+
+    /// List messages in a container (chat or topic). `container_id_type` is
+    /// `"chat"` or `"thread"`; used to find a message INSIDE a topic to reply
+    /// into it (the create API cannot target a `thread_id`).
+    async fn list_messages(
+        &self,
+        container_id_type: &str,
+        container_id: &str,
+    ) -> Result<Vec<client::ChatMessage>>;
 }
 
 #[async_trait]
@@ -64,6 +79,10 @@ impl Platform for Client {
         Client::reply_text(self, message_id, text).await
     }
 
+    async fn reply_in_thread(&self, message_id: &str, text: &str) -> Result<(String, Option<String>)> {
+        Client::reply_in_thread(self, message_id, text).await
+    }
+
     async fn reply_completion_notice(
         &self,
         message_id: &str,
@@ -80,5 +99,13 @@ impl Platform for Client {
 
     async fn bot_open_id(&self) -> Result<String> {
         Client::bot_open_id(self).await
+    }
+
+    async fn list_messages(
+        &self,
+        container_id_type: &str,
+        container_id: &str,
+    ) -> Result<Vec<client::ChatMessage>> {
+        Client::list_messages(self, container_id_type, container_id).await
     }
 }

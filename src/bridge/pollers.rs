@@ -38,10 +38,53 @@ pub(crate) async fn reconnect_poll_loop(app: &Arc<App>) -> crate::error::Result<
 
 /// Where to deliver a permission/question card.
 pub enum CardTarget {
-    /// Reply to a specific message (an in-flight prompt's streaming card).
+    /// Reply to a specific message (an in-flight prompt's streaming card, or a
+    /// topic's anchor message).
     ReplyTo(String),
-    /// Send into a chat.
+    /// Send into a chat (fallback when no replyable message is known).
     Chat(String),
+}
+
+/// Resolve a `message_id` that lives INSIDE the given topic, so a card can
+/// reply to it and land inside the topic.
+///
+/// Order:
+/// 1. The session's persisted `topic_anchor` (the `/topic` confirmation card).
+/// 2. The newest bot message in the thread (`list_messages` with
+///    `container_id_type=thread`) — covers topic sessions created before the
+///    anchor field existed, or whose anchor card was deleted.
+///
+/// Returns `None` when the session has no anchor and the thread query fails or
+/// returns nothing usable.
+pub(crate) async fn resolve_topic_anchor(
+    app: &Arc<App>,
+    thread_key: &crate::config::ThreadKey,
+) -> Option<String> {
+    if thread_key.thread_id == thread_key.chat_id {
+        return None; // not a topic
+    }
+    // 1. Persisted anchor.
+    let anchor = {
+        let store = app.sessions.lock().await;
+        store.get_active(thread_key).and_then(|e| e.topic_anchor.clone())
+    };
+    if let Some(a) = anchor {
+        return Some(a);
+    }
+    // 2. Newest bot message inside the thread.
+    let msgs = app
+        .feishu
+        .list_messages("thread", &thread_key.thread_id)
+        .await
+        .ok()?;
+    msgs.iter()
+        .find(|m| {
+            m.sender
+                .as_ref()
+                .map(|s| s.sender_type.as_deref() == Some("app"))
+                .unwrap_or(false)
+        })
+        .map(|m| m.message_id.clone())
 }
 
 /// Resolve where a card for `session_id` should be delivered.
@@ -66,10 +109,27 @@ pub(crate) async fn resolve_card_target(
         if let Some(msg_id) = reply_to {
             return Some(CardTarget::ReplyTo(msg_id));
         }
-        // Session mapped to a chat → send into the chat.
-        let chat = { app.sessions.lock().await.chat_for_session(&current) };
-        if let Some(chat_id) = chat {
-            return Some(CardTarget::Chat(chat_id));
+        // Session mapped to a chat. A topic-backed session must be reached by
+        // replying to a message INSIDE the topic (the create API rejects
+        // `receive_id_type=thread_id`). Resolve an in-topic anchor — the
+        // persisted `/topic` confirmation card, or the newest bot message in
+        // the thread (covers sessions created before the anchor existed).
+        // Non-topic sessions, or topic sessions with no reachable anchor, fall
+        // back to sending into the chat top level.
+        let entry = {
+            let store = app.sessions.lock().await;
+            store.entry_for_session(&current).cloned()
+        };
+        if let Some(entry) = entry {
+            let anchor = if entry.thread_key.thread_id != entry.thread_key.chat_id {
+                resolve_topic_anchor(app, &entry.thread_key).await
+            } else {
+                None
+            };
+            if let Some(anchor) = anchor {
+                return Some(CardTarget::ReplyTo(anchor));
+            }
+            return Some(CardTarget::Chat(entry.thread_key.chat_id));
         }
         // Unknown session → walk up to its parent (sub-task child sessions).
         let info = app.opencode.session_info(&current, Some(directory)).await.ok()?;

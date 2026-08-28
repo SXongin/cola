@@ -289,6 +289,56 @@ impl Client {
         }
     }
 
+    /// Reply to a message **in thread form** (`reply_in_thread: true`), which
+    /// creates a topic around the seed message. Returns `(message_id,
+    /// thread_id)`: the id of the created reply (which lives INSIDE the topic,
+    /// usable as an anchor to reply into it later) and the new topic's
+    /// `thread_id`. Used by `/topic` to open a real, UI-separated conversation.
+    ///
+    /// `thread_id` is `None` when the response carries no topic (the chat does
+    /// not support topic replies) — the caller must not persist a broken
+    /// mapping in that case.
+    pub async fn reply_in_thread(
+        &self,
+        message_id: &str,
+        text: &str,
+    ) -> crate::error::Result<(String, Option<String>)> {
+        let token = self.get_access_token().await?;
+        let body = serde_json::json!({
+            "msg_type": "interactive",
+            "reply_in_thread": true,
+            "content": serde_json::json!({
+                "config": { "wide_screen_mode": true },
+                "elements": [{
+                    "tag": "markdown",
+                    "content": text
+                }]
+            }).to_string()
+        });
+
+        let resp: MessageResponse = self
+            .http
+            .post(format!(
+                "https://open.feishu.cn/open-apis/im/v1/messages/{}/reply",
+                message_id
+            ))
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        if resp.code != 0 {
+            Err(crate::error::BridgeError::Feishu(format!(
+                "reply in thread error {}: {}",
+                resp.code, resp.msg
+            )))
+        } else {
+            Ok((resp.data.message_id, resp.data.thread_id))
+        }
+    }
+
     /// Reply to a message with a completion notice: a short text message. When
     /// the requester's display name is known, @-mention them so the group gets
     /// a real notification; otherwise a plain reply still notifies the author.
@@ -492,6 +542,10 @@ struct MessageResponse {
 #[derive(Debug, Deserialize)]
 struct MessageData {
     message_id: String,
+    /// Present on replies sent in thread form (`reply_in_thread: true`): the
+    /// id of the topic created around the seed message.
+    #[serde(default)]
+    thread_id: Option<String>,
 }
 
 /// A message returned by `list_messages` — used by the live E2E harness.
