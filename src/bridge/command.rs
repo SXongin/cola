@@ -211,7 +211,9 @@ pub fn command_help(name: &str) -> Option<String> {
         "topic" => {
             "/topic <dir> [name]\nCreate a real Feishu topic backed by a new session rooted at <dir>. The topic is UI-separated from the current conversation, so you can switch between topics in the Feishu client. Reply inside the created topic to talk to that session.\nExample: `/topic /root/proj/lib api-refactor`"
         }
-        "name" => "/name <name>\nRename the current session server-side (visible to every client sharing the store).\nExample: `/name frontend`",
+        "name" => {
+            "/name <name>\nRename the current session server-side (visible to every client sharing the store).\nExample: `/name frontend`"
+        }
         "stop" => {
             "/stop\nInterrupt the current execution (aborts the running prompt, e.g. a stuck question or tool)."
         }
@@ -347,7 +349,8 @@ impl App {
                     .await?;
             }
             Command::Switch(keyword) => {
-                self.handle_switch(&thread_key, &keyword, message_id, kind).await?;
+                self.handle_switch(&thread_key, &keyword, message_id, kind)
+                    .await?;
             }
             Command::List { keyword, all } => {
                 self.handle_list(&thread_key, keyword.as_deref(), all, message_id)
@@ -392,9 +395,7 @@ impl App {
                 store.persist()?;
                 self.invalidate_session_list_cache().await;
                 if removed.is_empty() {
-                    self.feishu
-                        .reply_text(message_id, "当前没有映射的会话。")
-                        .await?;
+                    self.feishu.reply_text(message_id, "当前没有映射的会话。").await?;
                 } else {
                     self.feishu
                         .reply_text(
@@ -820,7 +821,9 @@ impl App {
             .filter(|s| s.id.to_lowercase().starts_with(&lower))
             .collect();
         if prefix.len() == 1 {
-            return self.adopt_session(thread_key, prefix[0], message_id, kind, force).await;
+            return self
+                .adopt_session(thread_key, prefix[0], message_id, kind, force)
+                .await;
         }
         if prefix.len() > 1 {
             let list = candidates_list("ID 前缀匹配到多个，请用完整 ID：", &prefix);
@@ -833,7 +836,9 @@ impl App {
             .filter(|s| s.title.to_lowercase().contains(&lower))
             .collect();
         if titles.len() == 1 {
-            return self.adopt_session(thread_key, titles[0], message_id, kind, force).await;
+            return self
+                .adopt_session(thread_key, titles[0], message_id, kind, force)
+                .await;
         }
         if titles.len() > 1 {
             let list = candidates_list("标题匹配到多个，请用完整 ID：", &titles);
@@ -964,11 +969,7 @@ impl App {
 
 /// The last 7 characters of a session id (display suffix).
 fn id_tail(id: &str) -> String {
-    id.strip_prefix("ses_")
-        .unwrap_or(id)
-        .chars()
-        .take(7)
-        .collect()
+    id.strip_prefix("ses_").unwrap_or(id).chars().take(7).collect()
 }
 
 /// Case-insensitive keyword match on a session's title, directory or id
@@ -1053,8 +1054,20 @@ mod tests {
 
     #[test]
     fn parse_list() {
-        assert_eq!(parse_command("/list"), Some(Command::List { keyword: None, all: false }));
-        assert_eq!(parse_command(" /list "), Some(Command::List { keyword: None, all: false }));
+        assert_eq!(
+            parse_command("/list"),
+            Some(Command::List {
+                keyword: None,
+                all: false
+            })
+        );
+        assert_eq!(
+            parse_command(" /list "),
+            Some(Command::List {
+                keyword: None,
+                all: false
+            })
+        );
     }
 
     #[test]
@@ -1068,7 +1081,10 @@ mod tests {
         );
         assert_eq!(
             parse_command("/list --all"),
-            Some(Command::List { keyword: None, all: true })
+            Some(Command::List {
+                keyword: None,
+                all: true
+            })
         );
         assert_eq!(
             parse_command("/list cola --all"),
@@ -1090,17 +1106,29 @@ mod tests {
     fn parse_attach() {
         assert_eq!(
             parse_command("/attach ses_abc123"),
-            Some(Command::Attach { query: "ses_abc123".into(), force: false })
+            Some(Command::Attach {
+                query: "ses_abc123".into(),
+                force: false
+            })
         );
         assert_eq!(
             parse_command("/attach ses_abc123 --force"),
-            Some(Command::Attach { query: "ses_abc123".into(), force: true })
+            Some(Command::Attach {
+                query: "ses_abc123".into(),
+                force: true
+            })
         );
         assert_eq!(
             parse_command("/attach some title"),
-            Some(Command::Attach { query: "some title".into(), force: false })
+            Some(Command::Attach {
+                query: "some title".into(),
+                force: false
+            })
         );
-        assert_eq!(parse_command("/attach"), Some(Command::Help(Some("attach".into()))));
+        assert_eq!(
+            parse_command("/attach"),
+            Some(Command::Help(Some("attach".into())))
+        );
     }
 
     #[test]
@@ -1223,12 +1251,24 @@ mod tests {
 
     #[test]
     fn trailing_spaces_ignored() {
-        assert_eq!(parse_command("  /list  "), Some(Command::List { keyword: None, all: false }));
+        assert_eq!(
+            parse_command("  /list  "),
+            Some(Command::List {
+                keyword: None,
+                all: false
+            })
+        );
     }
 
     #[test]
     fn case_insensitive_command() {
         assert_eq!(parse_command("/STOP"), Some(Command::Stop));
-        assert_eq!(parse_command("/List"), Some(Command::List { keyword: None, all: false }));
+        assert_eq!(
+            parse_command("/List"),
+            Some(Command::List {
+                keyword: None,
+                all: false
+            })
+        );
     }
 }

@@ -127,11 +127,7 @@ impl Client {
     /// Rename a session server-side (canonical: `PATCH /session/{id}` with
     /// `{"title": ...}`). The change is visible to every client sharing the
     /// store (OpenChamber, CLI).
-    pub async fn update_session_title(
-        &self,
-        session_id: &str,
-        title: &str,
-    ) -> crate::error::Result<()> {
+    pub async fn update_session_title(&self, session_id: &str, title: &str) -> crate::error::Result<()> {
         let body = serde_json::json!({ "title": title });
         self.http()
             .patch(self.url(&format!("/session/{}", session_id)))

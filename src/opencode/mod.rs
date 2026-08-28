@@ -2,8 +2,8 @@ pub mod client;
 pub mod types;
 
 pub use client::{
-    Client, CreateSessionInput, PermissionRequest, PromptResponse, QuestionRequest, Session,
-    SessionInfo, SessionListInfo, SessionMessage,
+    Client, CreateSessionInput, PermissionRequest, PromptResponse, QuestionRequest, Session, SessionInfo,
+    SessionListInfo, SessionMessage,
 };
 
 use crate::error::Result;

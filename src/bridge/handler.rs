@@ -1150,9 +1150,7 @@ mod test_support {
             })
         }
 
-        async fn list_sessions(
-            &self,
-        ) -> crate::error::Result<Vec<opencode::client::SessionListInfo>> {
+        async fn list_sessions(&self) -> crate::error::Result<Vec<opencode::client::SessionListInfo>> {
             self.list_sessions_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(self.session_list.clone())
@@ -1714,7 +1712,10 @@ mod integration_tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
         let mock = MockBackend::new(realistic_parts());
-        mock.session_titles.lock().unwrap().insert("ses_00ea4e77cffez1fo4wrNuJyHF0".into(), "New session - 2026-08-28".into());
+        mock.session_titles.lock().unwrap().insert(
+            "ses_00ea4e77cffez1fo4wrNuJyHF0".into(),
+            "New session - 2026-08-28".into(),
+        );
         let (app, _) = build_app(cfg, mock).await;
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
 
@@ -1740,7 +1741,10 @@ mod integration_tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
         let mock = MockBackend::new(realistic_parts());
-        mock.session_titles.lock().unwrap().insert("ses_test".into(), "OpenChamber 显示的标题".into());
+        mock.session_titles
+            .lock()
+            .unwrap()
+            .insert("ses_test".into(), "OpenChamber 显示的标题".into());
         let (app, _) = build_app(cfg, mock).await;
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
 
@@ -1772,7 +1776,10 @@ mod integration_tests {
         let cfg = test_config(&dir.path().join("sessions.json"));
         let mock = MockBackend::new(realistic_parts());
         // The server already has a final auto-generated title.
-        mock.session_titles.lock().unwrap().insert("ses_test".into(), "修复登录鉴权问题".into());
+        mock.session_titles
+            .lock()
+            .unwrap()
+            .insert("ses_test".into(), "修复登录鉴权问题".into());
         let backend = Arc::new(mock);
         let platform = Arc::new(RecordingPlatform::new());
         let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -3852,7 +3859,10 @@ mod integration_tests {
         }
 
         app.handle_command(
-            Command::List { keyword: None, all: false },
+            Command::List {
+                keyword: None,
+                all: false,
+            },
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             "msg_list",
             crate::config::ConversationKind::P2p,
@@ -3896,7 +3906,10 @@ mod integration_tests {
 
         // Keyword filters by title.
         app.handle_command(
-            Command::List { keyword: Some("登录".into()), all: false },
+            Command::List {
+                keyword: Some("登录".into()),
+                all: false,
+            },
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             "msg_list",
             crate::config::ConversationKind::P2p,
@@ -3918,7 +3931,10 @@ mod integration_tests {
         // Without --all the child is hidden even though it is newest.
         platform.calls.lock().await.clear();
         app.handle_command(
-            Command::List { keyword: None, all: false },
+            Command::List {
+                keyword: None,
+                all: false,
+            },
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             "msg_list2",
             crate::config::ConversationKind::P2p,
@@ -3939,7 +3955,10 @@ mod integration_tests {
         // --all reveals the child.
         platform.calls.lock().await.clear();
         app.handle_command(
-            Command::List { keyword: None, all: true },
+            Command::List {
+                keyword: None,
+                all: true,
+            },
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             "msg_list3",
             crate::config::ConversationKind::P2p,
@@ -3984,7 +4003,10 @@ mod integration_tests {
 
         // Two /list in a row → one server fetch.
         app.handle_command(
-            Command::List { keyword: None, all: false },
+            Command::List {
+                keyword: None,
+                all: false,
+            },
             key.clone(),
             "m1",
             crate::config::ConversationKind::P2p,
@@ -3992,7 +4014,10 @@ mod integration_tests {
         .await
         .unwrap();
         app.handle_command(
-            Command::List { keyword: None, all: false },
+            Command::List {
+                keyword: None,
+                all: false,
+            },
             key.clone(),
             "m2",
             crate::config::ConversationKind::P2p,
@@ -4011,7 +4036,10 @@ mod integration_tests {
         .await
         .unwrap();
         app.handle_command(
-            Command::List { keyword: None, all: false },
+            Command::List {
+                keyword: None,
+                all: false,
+            },
             key,
             "m4",
             crate::config::ConversationKind::P2p,
@@ -4036,7 +4064,10 @@ mod integration_tests {
         let (app, _platform) = build_app(cfg, backend).await;
 
         app.handle_command(
-            Command::Attach { query: "ses_foreign123abc".into(), force: false },
+            Command::Attach {
+                query: "ses_foreign123abc".into(),
+                force: false,
+            },
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             "msg_attach",
             crate::config::ConversationKind::P2p,
@@ -4064,17 +4095,16 @@ mod integration_tests {
             100,
         )];
         let mut platform = RecordingPlatform::new();
-        platform.chat_names.insert("oc_group_other".into(), "隔壁群".into());
+        platform
+            .chat_names
+            .insert("oc_group_other".into(), "隔壁群".into());
         let platform = Arc::new(platform);
         let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
         // Another thread already owns the session.
         {
             let mut store = app.sessions.lock().await;
             store.set_active(crate::config::SessionEntry {
-                thread_key: crate::config::ThreadKey::new(
-                    "oc_group_other".into(),
-                    "oc_group_other".into(),
-                ),
+                thread_key: crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into()),
                 session_id: "ses_foreign123abc".into(),
                 directory: "/work/foreign".into(),
                 agent: None,
@@ -4084,7 +4114,10 @@ mod integration_tests {
         }
 
         app.handle_command(
-            Command::Attach { query: "ses_foreign123abc".into(), force: false },
+            Command::Attach {
+                query: "ses_foreign123abc".into(),
+                force: false,
+            },
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             "msg_attach",
             crate::config::ConversationKind::P2p,
@@ -4124,10 +4157,7 @@ mod integration_tests {
         {
             let mut store = app.sessions.lock().await;
             store.set_active(crate::config::SessionEntry {
-                thread_key: crate::config::ThreadKey::new(
-                    "oc_group_other".into(),
-                    "oc_group_other".into(),
-                ),
+                thread_key: crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into()),
                 session_id: "ses_foreign123abc".into(),
                 directory: "/work/foreign".into(),
                 agent: None,
@@ -4137,7 +4167,10 @@ mod integration_tests {
         }
 
         app.handle_command(
-            Command::Attach { query: "ses_foreign123abc".into(), force: true },
+            Command::Attach {
+                query: "ses_foreign123abc".into(),
+                force: true,
+            },
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             "msg_attach",
             crate::config::ConversationKind::P2p,
@@ -4192,12 +4225,7 @@ mod integration_tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
         let mut backend = MockBackend::new(realistic_parts());
-        backend.session_list = vec![list_session(
-            "ses_alpha01",
-            "唯一外部标题",
-            "/work/ext",
-            100,
-        )];
+        backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
         let (app, _platform) = build_app(cfg, backend).await;
 
         app.handle_command(
@@ -4340,12 +4368,7 @@ mod integration_tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
         let mut backend = MockBackend::new(realistic_parts());
-        backend.session_list = vec![list_session(
-            "ses_foreign123abc",
-            "外部会话",
-            "/work/ext",
-            100,
-        )];
+        backend.session_list = vec![list_session("ses_foreign123abc", "外部会话", "/work/ext", 100)];
         let (app, platform) = build_app(cfg, backend).await;
         // The topic already owns a session.
         {
@@ -4362,16 +4385,27 @@ mod integration_tests {
         let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into());
 
         for cmd in [
-            Command::List { keyword: None, all: false },
+            Command::List {
+                keyword: None,
+                all: false,
+            },
             Command::Switch("外部".into()),
-            Command::Attach { query: "ses_foreign123abc".into(), force: false },
+            Command::Attach {
+                query: "ses_foreign123abc".into(),
+                force: false,
+            },
             Command::New(None),
             Command::Dir("/work/x".into()),
         ] {
             platform.calls.lock().await.clear();
-            app.handle_command(cmd.clone(), topic_key.clone(), "msg_topic", crate::config::ConversationKind::Topic)
-                .await
-                .unwrap();
+            app.handle_command(
+                cmd.clone(),
+                topic_key.clone(),
+                "msg_topic",
+                crate::config::ConversationKind::Topic,
+            )
+            .await
+            .unwrap();
             let calls = platform.calls.lock().await.clone();
             let text = calls
                 .iter()
@@ -4388,7 +4422,12 @@ mod integration_tests {
         }
         // The topic's session mapping is untouched.
         assert_eq!(
-            app.sessions.lock().await.get_active(&topic_key).unwrap().session_id,
+            app.sessions
+                .lock()
+                .await
+                .get_active(&topic_key)
+                .unwrap()
+                .session_id,
             "ses_topic_owned"
         );
     }
@@ -4399,17 +4438,15 @@ mod integration_tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
         let mut backend = MockBackend::new(realistic_parts());
-        backend.session_list = vec![list_session(
-            "ses_foreign123abc",
-            "外部会话",
-            "/work/ext",
-            100,
-        )];
+        backend.session_list = vec![list_session("ses_foreign123abc", "外部会话", "/work/ext", 100)];
         let (app, _platform) = build_app(cfg, backend).await;
         let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_fresh".into());
 
         app.handle_command(
-            Command::Attach { query: "ses_foreign123abc".into(), force: false },
+            Command::Attach {
+                query: "ses_foreign123abc".into(),
+                force: false,
+            },
             topic_key.clone(),
             "msg_topic_cmd",
             crate::config::ConversationKind::Topic,
