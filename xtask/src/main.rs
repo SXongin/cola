@@ -12,8 +12,9 @@ fn main() {
         "test" => run("test"),
         "clippy" => run_clippy(),
         "fmt" => run_fmt(),
+        "audit" => run_audit(),
         other => {
-            eprintln!("Unknown task: {other}. Available: check, test, clippy, fmt");
+            eprintln!("Unknown task: {other}. Available: check, test, clippy, fmt, audit");
             exit(1);
         }
     }
@@ -53,6 +54,14 @@ fn run_fmt() {
         .status()
         .unwrap();
     if !status.success() {
+        exit(status.code().unwrap_or(1));
+    }
+}
+
+fn run_audit() {
+    let status = Command::new("cargo").args(["deny", "check"]).status().unwrap();
+    if !status.success() {
+        eprintln!("Dependency audit failed. Install cargo-deny: cargo install cargo-deny");
         exit(status.code().unwrap_or(1));
     }
 }

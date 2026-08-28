@@ -1,0 +1,27 @@
+# Local git hooks, managed by lefthook (https://lefthook.dev).
+# After cloning, run: lefthook install
+#
+# Pre-commit mirrors CI (fmt + clippy) but only fires when staged files touch
+# Rust, so docs/.scratch-only commits stay fast. commit-msg enforces
+# Conventional Commits. pre-push runs a dependency audit.
+# See AGENTS.md for details.
+
+pre-commit:
+  parallel: true
+  commands:
+    fmt:
+      glob: "*.rs"
+      run: cargo fmt --all -- --check
+    clippy:
+      glob: "*.rs"
+      run: cargo clippy --workspace --all-targets -- -D warnings
+
+commit-msg:
+  commands:
+    conventional-commits:
+      run: scripts/check-commit-msg.sh {1}
+
+pre-push:
+  commands:
+    audit:
+      run: cargo xtask audit

@@ -1,0 +1,32 @@
+# Dependency audit configuration for `cargo deny check` / `cargo xtask audit`.
+# Runs automatically in lefthook's pre-push hook; run manually with `cargo xtask audit`.
+
+[advisories]
+# RustSec advisory database. `cargo deny` downloads and caches it on first run.
+db-path = "~/.cargo/advisory-db"
+yanked = "warn"
+# Error only if an unmaintained crate is a direct dependency.
+unmaintained = "workspace"
+
+[bans]
+multiple-versions = "warn"
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+  "MPL-2.0",
+  "BSL-1.0",
+]
+
+[licenses.private]
+ignore = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
