@@ -1085,6 +1085,20 @@ mod test_support {
         /// When set, `messages` returns this as a fresh user message (simulates
         /// a message posted from OpenChamber).
         pub external_user_message: Option<String>,
+        /// When set, `messages` returns this as the assistant reply to the
+        /// external user message (simulates OpenCode answering it), replacing the
+        /// default assistant turn. Returned only once `external_reply_ready`
+        /// flips, so tests can script the reply arriving on a LATER poll.
+        pub external_reply_parts: Option<serde_json::Value>,
+        /// Gates whether the `external_reply_parts` assistant turn is returned.
+        /// The test holds a clone of this `Arc` and flips it after the
+        /// notification card is sent, to simulate the model answering later.
+        pub external_reply_ready: Arc<std::sync::atomic::AtomicBool>,
+        /// Created time of the external user message, captured on first read so
+        /// it stays stable across polls (the poller's baseline logic must not
+        /// see the same message as "new" every call). A test may bump it via
+        /// the `Arc` handle to simulate a SECOND external message arriving.
+        pub external_user_created: Arc<std::sync::Mutex<Option<i64>>>,
         /// Records every `reply_permission` call: (request_id, reply).
         pub reply_permission_calls: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
         /// session_id → server title (simulates OpenChamber's session title).
@@ -1134,6 +1148,9 @@ mod test_support {
                 parts,
                 permissions: Vec::new(),
                 external_user_message: None,
+                external_reply_parts: None,
+                external_reply_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                external_user_created: Arc::new(std::sync::Mutex::new(None)),
                 reply_permission_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 session_titles: std::sync::Mutex::new(std::collections::HashMap::new()),
                 questions: Vec::new(),
@@ -1270,20 +1287,50 @@ mod test_support {
         ) -> crate::error::Result<Vec<opencode::client::SessionMessage>> {
             let now = chrono::Utc::now().timestamp_millis();
             // When set, simulate a user message posted by ANOTHER client (e.g.
-            // OpenChamber), for the external-message poller tests.
+            // OpenChamber), for the external-message poller tests. If an AI
+            // reply is also set (and `external_reply_ready` has flipped), return
+            // it as the assistant turn — simulates OpenCode answering the
+            // shared-store message.
             if let Some(text) = &self.external_user_message {
-                return Ok(vec![opencode::client::SessionMessage {
+                // Stable created time: captured once, so the same message is not
+                // seen as "new" on every poll.
+                let created = {
+                    let mut slot = self.external_user_created.lock().unwrap();
+                    *slot.get_or_insert_with(|| chrono::Utc::now().timestamp_millis())
+                };
+                let mut msgs = vec![opencode::client::SessionMessage {
                     info: opencode::client::MessageInfo {
                         id: "msg_ext_user".into(),
                         role: Some("user".into()),
                         parent_id: None,
-                        time: Some(opencode::client::MessageTime { created: now }),
+                        time: Some(opencode::client::MessageTime { created }),
                         model_id: None,
                         provider_id: None,
                         tokens: None,
                     },
                     parts: serde_json::json!([{ "type": "text", "text": text }]),
-                }]);
+                }];
+                if self
+                    .external_reply_ready
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    && let Some(parts) = &self.external_reply_parts
+                {
+                    msgs.push(opencode::client::SessionMessage {
+                        info: opencode::client::MessageInfo {
+                            id: "msg_ext_assist".into(),
+                            role: Some("assistant".into()),
+                            parent_id: Some("msg_ext_user".into()),
+                            time: Some(opencode::client::MessageTime {
+                                created: created + 1000,
+                            }),
+                            model_id: None,
+                            provider_id: None,
+                            tokens: None,
+                        },
+                        parts: parts.clone(),
+                    });
+                }
+                return Ok(msgs);
             }
             Ok(vec![opencode::client::SessionMessage {
                 info: opencode::client::MessageInfo {
@@ -2399,6 +2446,194 @@ mod integration_tests {
                 .iter()
                 .any(|c| matches!(c, PlatformCall::SendCard { receive_id, .. } if receive_id == "chat_1")),
             "topic external notification must NOT go to chat top level: {calls:?}"
+        );
+    }
+
+    /// The model's reply to an external (OpenChamber-posted) message must render
+    /// INTO the notification card — update in place, so the Feishu side sees the
+    /// answer without a second card. The reply is scripted to arrive on a LATER
+    /// poll: the renderer must idle (no card update) while the reply is absent,
+    /// then stream reasoning/tools/text in and finalize Done when the turn
+    /// completes.
+    #[tokio::test]
+    async fn external_message_reply_renders_into_notification_card() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut mock = MockBackend::new(realistic_parts());
+        mock.external_user_message = Some("OpenChamber 里发的消息".to_string());
+        // OpenCode's reply to that message: reasoning → tool → text → stop.
+        mock.external_reply_parts = Some(serde_json::json!([
+            { "type": "step-start", "snapshot": "x" },
+            { "type": "reasoning", "text": "我来看看目录。" },
+            { "type": "tool", "tool": "bash", "callID": "call_1",
+              "state": { "status": "completed", "input": { "command": "ls" }, "output": "src" } },
+            { "type": "text", "text": "目录里有 src。" },
+            { "type": "step-finish", "reason": "stop" },
+        ]));
+        let reply_ready = mock.external_reply_ready.clone();
+        let (app, platform) = build_app(cfg, mock).await;
+
+        // A known session whose chat the notification goes to.
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
+                session_id: "ses_ext".into(),
+                directory: "/tmp/ext".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+            store.persist().unwrap();
+        }
+        let baseline = chrono::Utc::now().timestamp_millis() - 60_000;
+        app.external
+            .last_user_msg_epoch
+            .lock()
+            .await
+            .insert("ses_ext".into(), baseline);
+
+        tokio::spawn({
+            let app = app.clone();
+            async move {
+                let _ = app.external.poll_loop(&app).await;
+            }
+        });
+        // First poll tick (8s) sends the notification and arms the renderer;
+        // a few render-loop ticks then run while the reply is still absent.
+        tokio::time::sleep(std::time::Duration::from_millis(10500)).await;
+
+        // The renderer must NOT have touched the card yet — the reply hasn't
+        // arrived, so the notification card stays as sent.
+        let calls_before = platform.calls.lock().await.clone();
+        assert!(
+            calls_before
+                .iter()
+                .all(|c| !matches!(c, PlatformCall::UpdateMessage { .. })),
+            "no card update while the reply is absent: {calls_before:?}"
+        );
+        assert!(
+            calls_before.iter().any(
+                |c| matches!(c, PlatformCall::SendCard { receive_id, .. } if receive_id == "oc_group_1")
+            ),
+            "notification card should be sent: {calls_before:?}"
+        );
+
+        // Now the model replies; the renderer picks it up on the next poll.
+        reply_ready.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
+        let calls = platform.calls.lock().await.clone();
+        let sent_card = calls.iter().find_map(|c| match c {
+            PlatformCall::SendCard { receive_id, card } if receive_id == "oc_group_1" => Some(card.clone()),
+            _ => None,
+        });
+        let sent_card = sent_card.expect("notification card should be sent");
+        // The reply rendered IN PLACE on the SAME card (msg_sent): it shows the
+        // external user's message and the AI's reasoning/tool/text, finalized Done.
+        let final_card = calls.iter().find_map(|c| match c {
+            PlatformCall::UpdateMessage { message_id, card } if message_id == "msg_sent" => {
+                Some(card.clone())
+            }
+            _ => None,
+        });
+        let final_card = final_card.expect("the notification card must be updated in place");
+        let text = final_card.to_string();
+        assert!(text.contains("✅"), "reply card should be Done: {}", text);
+        assert!(
+            text.contains("OpenChamber 里发的消息"),
+            "the external user message must stay visible: {}",
+            text
+        );
+        assert!(text.contains("我来看看目录"), "reasoning missing: {}", text);
+        assert!(text.contains("bash"), "tool panel missing: {}", text);
+        assert!(text.contains("目录里有 src。"), "reply text missing: {}", text);
+
+        // No SECOND card was sent — the reply lives entirely on the notification.
+        let second_cards = calls
+            .iter()
+            .filter(|c| matches!(c, PlatformCall::ReplyCard { .. } | PlatformCall::SendCard { .. }))
+            .count();
+        assert_eq!(
+            second_cards, 1,
+            "only the notification card should be sent, got: {calls:?}"
+        );
+        // Sanity: the notification card was NOT replaced by a different one.
+        assert!(sent_card.to_string().contains("有新消息"));
+    }
+
+    /// The renderer guard: arming a renderer for the SAME external message must
+    /// be a no-op (no clobbering of the armed card), while a NEWER message must
+    /// replace the armed renderer so the old one exits on the next poll.
+    #[tokio::test]
+    async fn external_reply_render_guard_replaces_only_newer_messages() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut mock = MockBackend::new(realistic_parts());
+        // No reply parts: the armed loops just idle/exit; we assert state only.
+        mock.external_user_message = Some("外部消息".to_string());
+        let (app, _platform) = build_app(cfg, mock).await;
+
+        // Arm once for the first external message.
+        app.external
+            .start_reply_render(&app, "ses_ext", 1000, "n1", "第一条")
+            .await;
+        {
+            let accs = app.accumulators.lock().await;
+            let acc = accs.get("ses_ext").expect("renderer accumulator");
+            assert_eq!(acc.submit_epoch_ms, Some(1000));
+            assert_eq!(acc.reply_to_message_id.as_deref(), Some("n1"));
+        }
+        assert_eq!(
+            app.card_message_ids
+                .lock()
+                .await
+                .get("ses_ext")
+                .map(String::as_str),
+            Some("n1")
+        );
+
+        // Re-arming for the SAME message (e.g. a duplicate poll) is a no-op:
+        // the armed card id and epoch must not be clobbered.
+        app.external
+            .start_reply_render(&app, "ses_ext", 1000, "n1b", "第一条")
+            .await;
+        {
+            let accs = app.accumulators.lock().await;
+            let acc = accs.get("ses_ext").expect("renderer accumulator");
+            assert_eq!(acc.submit_epoch_ms, Some(1000));
+            assert_eq!(acc.reply_to_message_id.as_deref(), Some("n1"));
+        }
+        assert_eq!(
+            app.card_message_ids
+                .lock()
+                .await
+                .get("ses_ext")
+                .map(String::as_str),
+            Some("n1")
+        );
+
+        // A NEWER external message replaces the armed renderer (its card id and
+        // epoch move to the new notification).
+        app.external
+            .start_reply_render(&app, "ses_ext", 2000, "n2", "第二条")
+            .await;
+        {
+            let accs = app.accumulators.lock().await;
+            let acc = accs.get("ses_ext").expect("renderer accumulator");
+            assert_eq!(acc.submit_epoch_ms, Some(2000));
+            assert_eq!(acc.reply_to_message_id.as_deref(), Some("n2"));
+        }
+        assert_eq!(
+            app.card_message_ids
+                .lock()
+                .await
+                .get("ses_ext")
+                .map(String::as_str),
+            Some("n2")
         );
     }
 

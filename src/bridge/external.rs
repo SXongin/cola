@@ -3,6 +3,17 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::bridge::handler::App;
+use crate::bridge::render::{flush_card, render_and_flush};
+use crate::bridge::streaming::StreamAccumulator;
+
+/// How often the external-message poller checks for new shared-store messages.
+const POLL_INTERVAL_SECS: u64 = 8;
+/// Poll cadence for the external-reply renderer (matches `render_poll_loop`).
+const RENDER_POLL_MS: u64 = 1500;
+/// How long the external-reply renderer waits for a reply before giving up. A
+/// message posted in OpenChamber may never actually be sent, so the loop idles
+/// and times out; the card then simply stays the "有新消息" notification.
+const RENDER_TIMEOUT_SECS: u64 = 600;
 
 /// The external-message flow: watches for user messages that were NOT sent by
 /// cola (someone posted from OpenChamber or another client on the shared store)
@@ -24,7 +35,7 @@ impl ExternalFlow {
     /// the Feishu side. Started once at App startup.
     pub(crate) async fn poll_loop(&self, app: &Arc<App>) -> crate::error::Result<()> {
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(8)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(POLL_INTERVAL_SECS)).await;
             let sessions: Vec<(String, crate::config::ThreadKey)> = app
                 .sessions
                 .lock()
@@ -81,8 +92,15 @@ impl ExternalFlow {
                             Some(anchor) => app.feishu.reply_card(&anchor, &card).await,
                             None => app.feishu.send_card("chat_id", &thread_key.chat_id, &card).await,
                         };
-                        if let Err(e) = sent {
-                            tracing::warn!("external message notify: {}", e);
+                        match sent {
+                            Ok(card_id) => {
+                                // Now render the model's reply INTO that card, so
+                                // the Feishu side sees the answer, not just the
+                                // notification.
+                                self.start_reply_render(app, &sid, latest, &card_id, &preview)
+                                    .await;
+                            }
+                            Err(e) => tracing::warn!("external message notify: {}", e),
                         }
                     }
                     _ => {}
@@ -90,6 +108,202 @@ impl ExternalFlow {
             }
         }
     }
+
+    /// Arm an incremental renderer that streams the model's reply to the
+    /// external message INTO the notification card (update in place — no
+    /// second card). The loop exits when the turn finishes, cola's own prompt
+    /// (or a newer external message) replaces the accumulator, a newer user
+    /// message starts a new turn, or a hard timeout elapses.
+    pub(crate) async fn start_reply_render(
+        &self,
+        app: &Arc<App>,
+        session_id: &str,
+        epoch_ms: i64,
+        card_id: &str,
+        preview: &str,
+    ) {
+        // Guard: a renderer for THIS message is already armed (the accumulator
+        // still carries its epoch). cola's own prompts get a fresh accumulator,
+        // so a different epoch is NOT this message — a new renderer replaces the
+        // old one (whose `submit_epoch_ms` no longer matches, so it exits).
+        let already_rendering = {
+            let accs = app.accumulators.lock().await;
+            accs.get(session_id)
+                .map(|a| a.submit_epoch_ms == Some(epoch_ms))
+                .unwrap_or(false)
+        };
+        if already_rendering {
+            return;
+        }
+        let session_dir = {
+            let store = app.sessions.lock().await;
+            store
+                .entry_for_session(session_id)
+                .map(|e| e.directory.clone())
+                .unwrap_or_default()
+        };
+        // Card subtitle: the server's live title (ADR-0007), or the id-tail.
+        let title = app
+            .opencode
+            .session_info(session_id, None)
+            .await
+            .ok()
+            .and_then(|i| i.title)
+            .unwrap_or_default();
+        let clean = crate::feishu::card::clean_session_label(&title);
+        let id_tail: String = session_id
+            .strip_prefix("ses_")
+            .unwrap_or(session_id)
+            .chars()
+            .take(7)
+            .collect();
+        let subtitle = if clean.is_empty() {
+            id_tail
+        } else {
+            format!("{} · {}", clean, id_tail)
+        };
+
+        let mut acc = StreamAccumulator::new(&subtitle);
+        acc.submit_epoch_ms = Some(epoch_ms);
+        acc.session_id = Some(session_id.to_string());
+        acc.reply_to_message_id = Some(card_id.to_string());
+        acc.directory = if session_dir.is_empty() {
+            None
+        } else {
+            Some(session_dir)
+        };
+        // Keep the external message visible: the notification card is updated in
+        // place, so its preview would otherwise vanish when the reply renders.
+        if !preview.is_empty() {
+            acc.push_text(&format!("👤 {}", preview));
+        }
+        {
+            let mut accs = app.accumulators.lock().await;
+            accs.insert(session_id.to_string(), acc);
+        }
+        // Point the card-id map at the notification card: `flush_card` updates it.
+        app.card_message_ids
+            .lock()
+            .await
+            .insert(session_id.to_string(), card_id.to_string());
+        tracing::info!("external reply render armed for session {}", session_id);
+
+        let app = Arc::clone(app);
+        let sid = session_id.to_string();
+        tokio::spawn(async move {
+            external_render_loop(&app, sid, epoch_ms).await;
+        });
+    }
+}
+
+/// Incremental renderer for an external message's reply: poll the session,
+/// stream reasoning/tool/text into the notification card, then finalize it as
+/// Done when the model finishes. Exits when the turn completes, the accumulator
+/// was replaced (cola's own prompt or a newer external message), a newer user
+/// message starts a new turn, or the hard timeout elapses.
+async fn external_render_loop(app: &Arc<App>, session_id: String, epoch_ms: i64) {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(RENDER_TIMEOUT_SECS);
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(RENDER_POLL_MS)).await;
+        let msgs = match app.opencode.messages(&session_id).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("external render poll messages: {}", e);
+                continue;
+            }
+        };
+        // The accumulator was replaced (cola's own `run_prompt` inserted a fresh
+        // one, or a newer external message's renderer took over): exit so this
+        // turn isn't double-rendered into two cards.
+        let replaced = {
+            let accs = app.accumulators.lock().await;
+            accs.get(&session_id)
+                .map(|a| a.submit_epoch_ms != Some(epoch_ms))
+                .unwrap_or(true)
+        };
+        if replaced {
+            break;
+        }
+        // Stream the reply's reasoning/tools/text into the notification card.
+        let Some((new_parts, _, _)) = render_and_flush(app, &session_id, epoch_ms, &msgs).await else {
+            break;
+        };
+        if new_parts > 0 {
+            tracing::info!("external render: session {} gained parts", session_id);
+        }
+        // The model finished answering: finalize the card, then stop.
+        if external_turn_completed(&msgs, epoch_ms) {
+            finalize_done(app, &session_id).await;
+            tracing::info!("external reply rendered: session {} done", session_id);
+            break;
+        }
+        // A NEWER user message is a turn boundary — the poller notifies and arms
+        // a fresh renderer for it.
+        let newer_turn = msgs
+            .iter()
+            .filter(|m| m.info.role.as_deref() == Some("user"))
+            .filter_map(|m| m.info.time.as_ref().map(|t| t.created))
+            .any(|created| created > epoch_ms);
+        if newer_turn {
+            break;
+        }
+        // Safety net for messages that never trigger a run. If a partial reply
+        // was rendered, finalize it so the card never sits on an eternal
+        // spinner; otherwise leave the "有新消息" notification as-is.
+        if tokio::time::Instant::now() >= deadline {
+            let has_content = {
+                let accs = app.accumulators.lock().await;
+                accs.get(&session_id)
+                    .map(|a| !a.rendered_parts.is_empty() || !a.rendered_tool_states.is_empty())
+                    .unwrap_or(false)
+            };
+            if has_content {
+                finalize_done(app, &session_id).await;
+                tracing::info!(
+                    "external reply render timed out; finalized session {}",
+                    session_id
+                );
+            }
+            break;
+        }
+    }
+}
+
+/// Mark the accumulator's card Done and flush it — the terminal state for a
+/// reply that finished (or timed out with content rendered).
+async fn finalize_done(app: &Arc<App>, session_id: &str) {
+    {
+        let mut accs = app.accumulators.lock().await;
+        if let Some(acc) = accs.get_mut(session_id) {
+            acc.card_state = crate::feishu::card::CardState::Done;
+        }
+    }
+    flush_card(app, session_id).await;
+}
+
+/// Whether the model has finished answering the external message: an assistant
+/// message in this turn carries a `step-finish` part whose reason is NOT the
+/// pause to run tools. OpenCode's terminal finish reasons are "stop", "length",
+/// "content-filter", "error" and "unknown"; "tool-calls" only means the step
+/// ended to execute tools and the model will continue.
+fn external_turn_completed(msgs: &[crate::opencode::client::SessionMessage], epoch_ms: i64) -> bool {
+    msgs.iter()
+        .filter(|m| m.info.role.as_deref() == Some("assistant"))
+        .filter(|m| {
+            m.info
+                .time
+                .as_ref()
+                .map(|t| t.created >= epoch_ms)
+                .unwrap_or(false)
+        })
+        .flat_map(|m| m.parts.as_array().into_iter().flatten())
+        .any(|part| {
+            part.get("type").and_then(|t| t.as_str()) == Some("step-finish")
+                && part
+                    .get("reason")
+                    .and_then(|r| r.as_str())
+                    .is_some_and(|r| r != "tool-calls")
+        })
 }
 
 /// Preview of a user message, for the external-message notification card.
@@ -111,4 +325,90 @@ fn user_message_preview(msgs: &[crate::opencode::client::SessionMessage], create
         }
     }
     out.chars().take(80).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::opencode::client::{MessageInfo, MessageTime, SessionMessage};
+
+    fn msg(role: &str, created: i64, parts: serde_json::Value) -> SessionMessage {
+        SessionMessage {
+            info: MessageInfo {
+                id: format!("msg_{role}_{created}"),
+                role: Some(role.into()),
+                parent_id: None,
+                time: Some(MessageTime { created }),
+                model_id: None,
+                provider_id: None,
+                tokens: None,
+            },
+            parts,
+        }
+    }
+
+    fn finish(reason: &str) -> serde_json::Value {
+        serde_json::json!([{ "type": "step-finish", "reason": reason }])
+    }
+
+    #[test]
+    fn turn_completed_on_terminal_finish() {
+        // tool-calls pauses to execute tools — NOT complete.
+        let msgs = vec![
+            msg(
+                "user",
+                1000,
+                serde_json::json!([{ "type": "text", "text": "hi" }]),
+            ),
+            msg("assistant", 2000, finish("tool-calls")),
+        ];
+        assert!(!external_turn_completed(&msgs, 1000));
+
+        // A later step finishes with "stop" — complete.
+        let msgs = vec![
+            msg(
+                "user",
+                1000,
+                serde_json::json!([{ "type": "text", "text": "hi" }]),
+            ),
+            msg("assistant", 2000, finish("tool-calls")),
+            msg("assistant", 3000, finish("stop")),
+        ];
+        assert!(external_turn_completed(&msgs, 1000));
+
+        // Other terminal reasons count too.
+        assert!(external_turn_completed(
+            &[msg("assistant", 2000, finish("length"))],
+            1000
+        ));
+        assert!(external_turn_completed(
+            &[msg("assistant", 2000, finish("error"))],
+            1000
+        ));
+    }
+
+    #[test]
+    fn turn_completion_ignores_other_turns() {
+        // A step-finish BEFORE the external epoch belongs to an earlier turn.
+        let msgs = vec![msg("assistant", 500, finish("stop"))];
+        assert!(!external_turn_completed(&msgs, 1000));
+    }
+
+    #[test]
+    fn preview_is_content_of_the_latest_user_message() {
+        let msgs = vec![
+            msg(
+                "user",
+                1000,
+                serde_json::json!([{ "type": "text", "text": "第一条" }]),
+            ),
+            msg(
+                "user",
+                2000,
+                serde_json::json!([{ "type": "text", "text": "第二条，很长很长的内容" }]),
+            ),
+        ];
+        assert_eq!(user_message_preview(&msgs, 2000), "第二条，很长很长的内容");
+        assert_eq!(user_message_preview(&msgs, 1000), "第一条");
+    }
 }

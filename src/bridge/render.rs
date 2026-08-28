@@ -291,6 +291,41 @@ pub(crate) async fn flush_card(app: &Arc<App>, session_id: &str) {
     }
 }
 
+/// Poll the session's messages and render any new parts into the streaming
+/// card, flushing when something changed. The shared heart of both render
+/// loops — `render_poll_loop` (cola's own prompts) and the external-message
+/// renderer (`bridge::external`) — so the two never drift apart.
+///
+/// Returns `Some((new_parts, text_len, reasoning_len))` when the accumulator is
+/// still present (the statistics are for logging); `None` when it vanished (the
+/// caller should stop).
+pub(crate) async fn render_and_flush(
+    app: &Arc<App>,
+    session_id: &str,
+    epoch_ms: i64,
+    msgs: &[crate::opencode::client::SessionMessage],
+) -> Option<(usize, usize, usize)> {
+    // OpenCode auto-renames sessions after a turn; follow the server's live
+    // title so the card subtitle doesn't stay on the "new session" default.
+    app.refresh_session_title(session_id).await;
+    let (changed, new_parts, text_len, reasoning_len) = {
+        let mut accs = app.accumulators.lock().await;
+        let acc = accs.get_mut(session_id)?;
+        let before = acc.rendered_parts.len();
+        let changed = render_new_turn_parts(acc, msgs, epoch_ms);
+        (
+            changed,
+            acc.rendered_parts.len() - before,
+            acc.text.len(),
+            acc.reasoning.len(),
+        )
+    };
+    if changed {
+        flush_card(app, session_id).await;
+    }
+    Some((new_parts, text_len, reasoning_len))
+}
+
 /// Incremental renderer: while the synchronous prompt is in flight, poll the
 /// session's messages and flush the card as parts complete (reasoning, tools,
 /// text). `done` stops the loop once the prompt returns.
@@ -313,31 +348,20 @@ pub(crate) async fn render_poll_loop(
                 continue;
             }
         };
-        // OpenCode auto-renames sessions after a turn; follow the server's live
-        // title so the card subtitle doesn't stay on the "new session" default.
-        app.refresh_session_title(&session_id).await;
-        let (changed, parts_rendered, text_len, reasoning_len) = {
-            let mut accs = app.accumulators.lock().await;
-            let Some(acc) = accs.get_mut(&session_id) else {
-                continue;
-            };
-            let before = acc.rendered_parts.len();
-            let changed = render_new_turn_parts(acc, &msgs, epoch_ms);
-            (
-                changed,
-                acc.rendered_parts.len() - before,
-                acc.text.len(),
-                acc.reasoning.len(),
-            )
-        };
-        if changed {
-            tracing::info!(
-                "render poll: {} new parts, text={} reasoning={}",
-                parts_rendered,
-                text_len,
-                reasoning_len
-            );
-            flush_card(app, &session_id).await;
+        match render_and_flush(app, &session_id, epoch_ms, &msgs).await {
+            // Accumulator gone (turn completed and was cleaned up); keep polling
+            // until the prompt returns so late parts are still caught.
+            None => continue,
+            Some((new_parts, text_len, reasoning_len)) => {
+                if new_parts > 0 {
+                    tracing::info!(
+                        "render poll: {} new parts, text={} reasoning={}",
+                        new_parts,
+                        text_len,
+                        reasoning_len
+                    );
+                }
+            }
         }
     }
 }
