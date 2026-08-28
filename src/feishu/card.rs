@@ -577,13 +577,17 @@ pub fn build_permission_card(
     })
 }
 
-/// A display label for a session name: strips raw Feishu mention tokens
-/// (`@_user_N`) and drops the meaningless `/new`-generated `sess-<uuid>` default
-/// (the caller then shows the session ID instead). Used for card subtitles and
-/// notification cards.
+/// A display label for a session title: strips raw Feishu mention tokens
+/// (`@_user_N`) and drops meaningless default titles — the `/new`-generated
+/// `sess-<uuid>` and the server's `New session - <iso>` / `Child session - <iso>`
+/// placeholders (the caller then shows the session ID instead). Used for card
+/// subtitles and notification cards.
 pub fn clean_session_label(name: &str) -> String {
     let cleaned = crate::feishu::ws::strip_mention_tokens(name);
-    if cleaned.starts_with("sess-") && cleaned.len() == 41 {
+    if (cleaned.starts_with("sess-") && cleaned.len() == 41)
+        || cleaned.starts_with("New session - ")
+        || cleaned.starts_with("Child session - ")
+    {
         String::new()
     } else {
         cleaned

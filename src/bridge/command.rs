@@ -3,15 +3,19 @@
 pub enum Command {
     /// Change project directory for the current session
     Dir(String),
-    /// Switch to a named session in the current thread
+    /// Switch to a session by title/directory/id, adopting foreign sessions
     Switch(String),
-    /// List all sessions in the current thread
-    List,
+    /// List sessions in the shared store (`/list [keyword] [--all]`)
+    List { keyword: Option<String>, all: bool },
     /// Create a fresh session, optionally named
     New(Option<String>),
+    /// Adopt an arbitrary server session into this thread (`/attach <id|title> [--force]`)
+    Attach { query: String, force: bool },
+    /// Un-map the current thread's session (server session stays untouched)
+    Forget,
     /// Create a real Feishu topic backed by a fresh session rooted at `directory`.
     Topic { directory: String, name: Option<String> },
-    /// Rename the current session
+    /// Rename the current session (PATCHes the server title)
     Name(String),
     /// Interrupt the current session execution
     Stop,
@@ -66,7 +70,45 @@ pub fn parse_command(text: &str) -> Option<Command> {
             Some(p) => Some(Command::Switch(p.to_string())),
             None => Some(Command::Help(Some("switch".into()))),
         },
-        "/list" => Some(Command::List),
+        // `/list [keyword] [--all]` — keyword may be multiple words or a flag.
+        "/list" => {
+            let mut keyword = None;
+            let mut all = false;
+            if let Some(a) = arg {
+                let mut words: Vec<&str> = Vec::new();
+                for w in a.split_whitespace() {
+                    if w == "--all" {
+                        all = true;
+                    } else {
+                        words.push(w);
+                    }
+                }
+                if !words.is_empty() {
+                    keyword = Some(words.join(" "));
+                }
+            }
+            Some(Command::List { keyword, all })
+        }
+        // `/attach <id|title> [--force]`
+        "/attach" => match arg {
+            Some(a) => {
+                let words: Vec<&str> = a.split_whitespace().collect();
+                let force = words.contains(&"--force");
+                let query: String = words
+                    .iter()
+                    .filter(|w| **w != "--force")
+                    .cloned()
+                    .collect::<Vec<&str>>()
+                    .join(" ");
+                if query.is_empty() {
+                    Some(Command::Help(Some("attach".into())))
+                } else {
+                    Some(Command::Attach { query, force })
+                }
+            }
+            None => Some(Command::Help(Some("attach".into()))),
+        },
+        "/forget" => Some(Command::Forget),
         "/new" => Some(Command::New(arg.map(|s| s.to_string()))),
         "/topic" => match arg {
             Some(a) => {
@@ -124,11 +166,13 @@ pub fn help_text() -> String {
     "\
 **cola commands**
 `/dir <path>` · Open a new session in <path>
-`/switch <name>` · Switch to named session
-`/list` · List sessions in this thread
+`/switch <name>` · Switch to a session (adopts foreign ones)
+`/list [keyword] [--all]` · List recent sessions across the store
+`/attach <id|title> [--force]` · Take over a session into this chat
+`/forget` · Un-map this chat's session (server session stays)
 `/new [name]` · Create a new session
 `/topic <dir> [name]` · Create a new Feishu topic + session in <dir>
-`/name <name>` · Rename current session
+`/name <name>` · Rename current session (server-side)
 `/stop` · Interrupt execution
 `/compact` · Compact context
 `/agent <name>` · Switch agent
@@ -137,6 +181,8 @@ pub fn help_text() -> String {
 `/restart` · Restart cola (keeps startup args + log redirect)
 `/restart-opencode` · Restart the OpenCode server (only when cola started it)
 `/help <command>` · Show help for one command (e.g. `/help model`)
+
+话题规则：已绑定会话的话题里，`/list`、`/switch`、`/attach`、`/new`、`/dir` 被拒绝，请回主对话操作。从未绑定过会话的话题可以用它们来绑定该话题的唯一会话。
     "
     .to_string()
 }
@@ -148,18 +194,24 @@ pub fn command_help(name: &str) -> Option<String> {
             "/dir <path>\nOpen a NEW session in <path> (create a session rooted at that directory).\nExample: `/dir /root/proj/lib`"
         }
         "switch" => {
-            "/switch <name>\nSwitch to an existing named session in this thread. Run `/list` to see names.\nExample: `/switch backend`"
+            "/switch <keyword>\nSwitch to a session by title, directory or id. The current chat's sessions win; otherwise a unique match in the shared store is adopted. Ambiguous keywords list candidates.\nExample: `/switch backend`"
         }
         "list" => {
-            "/list\nList all sessions in this thread: name, id and directory, with the active one marked."
+            "/list [keyword] [--all]\nList recently-active sessions across the shared store (up to 15): title, directory, id and last activity. A keyword filters by title/directory/id; `--all` also shows sub-task child sessions.\nExample: `/list cola`"
+        }
+        "attach" => {
+            "/attach <id|title> [--force]\nTake over a session created outside Feishu into this chat. Resolution: exact id → unique id-prefix → unique title substring. If the session already belongs to another chat, show its owner and reject unless `--force`.\nExample: `/attach ses_abc123`"
+        }
+        "forget" => {
+            "/forget\nUn-map this chat's session. The server session stays untouched and can be adopted again.\nExample: `/forget`"
         }
         "new" => {
-            "/new [name]\nCreate a fresh session, optionally named. Without a name a generated one is used.\nExample: `/new api-refactor`"
+            "/new [name]\nCreate a fresh session, optionally named (the name is PATCHed server-side). Without a name the server generates one after the first message.\nExample: `/new api-refactor`"
         }
         "topic" => {
             "/topic <dir> [name]\nCreate a real Feishu topic backed by a new session rooted at <dir>. The topic is UI-separated from the current conversation, so you can switch between topics in the Feishu client. Reply inside the created topic to talk to that session.\nExample: `/topic /root/proj/lib api-refactor`"
         }
-        "name" => "/name <name>\nRename the current session.\nExample: `/name frontend`",
+        "name" => "/name <name>\nRename the current session server-side (visible to every client sharing the store).\nExample: `/name frontend`",
         "stop" => {
             "/stop\nInterrupt the current execution (aborts the running prompt, e.g. a stuck question or tool)."
         }
@@ -249,6 +301,29 @@ impl App {
         message_id: &str,
         kind: ConversationKind,
     ) -> crate::error::Result<()> {
+        // Topic single-session gate (ADR-0007): inside a topic that already has
+        // a session, the session-selection/creation commands are rejected. A
+        // topic that never had a session may use them — their outcome becomes
+        // that topic's single session.
+        if kind == ConversationKind::Topic {
+            let blocked = matches!(
+                cmd,
+                Command::Dir(_)
+                    | Command::Switch(_)
+                    | Command::List { .. }
+                    | Command::New(_)
+                    | Command::Attach { .. }
+            );
+            if blocked {
+                let has_session = self.sessions.lock().await.get_active(&thread_key).is_some();
+                if has_session {
+                    self.feishu
+                        .reply_text(message_id, "⚠️ 话题已绑定会话，请回主对话操作。")
+                        .await?;
+                    return Ok(());
+                }
+            }
+        }
         match cmd {
             Command::Dir(path) => {
                 let session = self
@@ -258,7 +333,6 @@ impl App {
                 let entry = SessionEntry {
                     thread_key: thread_key.clone(),
                     session_id: session.id.clone(),
-                    name: path.clone(),
                     directory: path.clone(),
                     agent: None,
                     auto_accept: false,
@@ -267,57 +341,33 @@ impl App {
                 let mut store = self.sessions.lock().await;
                 store.set_active(entry);
                 store.persist()?;
+                self.invalidate_session_list_cache().await;
                 self.feishu
                     .reply_text(message_id, &format!("Session moved to {}", path))
                     .await?;
             }
-            Command::Switch(name) => {
-                let mut store = self.sessions.lock().await;
-                if store.switch(&thread_key, &name).is_some() {
-                    self.feishu
-                        .reply_text(message_id, &format!("Switched to \"{}\"", name))
-                        .await?;
-                } else {
-                    self.feishu
-                        .reply_text(message_id, &format!("No session matching \"{}\"", name))
-                        .await?;
-                }
+            Command::Switch(keyword) => {
+                self.handle_switch(&thread_key, &keyword, message_id, kind).await?;
             }
-            Command::List => {
-                let store = self.sessions.lock().await;
-                let entries = store.list_thread(&thread_key);
-                if entries.is_empty() {
-                    self.feishu.reply_text(message_id, "No sessions.").await?;
-                    return Ok(());
-                }
-                let active_id = store.get_active(&thread_key).map(|e| &e.session_id);
-                let mut list = String::from("**Sessions:**\n");
-                for e in &entries {
-                    let mark = if active_id == Some(&e.session_id) {
-                        " (active)"
-                    } else {
-                        ""
-                    };
-                    list.push_str(&format!(
-                        "- {} [{}]{mark}\n  dir: {}\n",
-                        crate::feishu::ws::strip_mention_tokens(&e.name),
-                        &e.session_id[..e.session_id.len().min(12)],
-                        e.directory
-                    ));
-                }
-                self.feishu.reply_text(message_id, &list).await?;
+            Command::List { keyword, all } => {
+                self.handle_list(&thread_key, keyword.as_deref(), all, message_id)
+                    .await?;
             }
             Command::New(name) => {
-                let new_name = name.unwrap_or_else(|| format!("sess-{}", uuid::Uuid::new_v4()));
                 let directory = self.default_session_directory();
                 let session = self
                     .opencode
                     .create_session(&self.opencode.new_session_input(Some(&directory)))
                     .await?;
+                // Creation title policy (ADR-0007): `/new <name>` PATCHes the
+                // title immediately; `/new` (no name) leaves the server default
+                // so a title is auto-generated after the first message.
+                if let Some(n) = &name {
+                    self.opencode.update_session_title(&session.id, n).await?;
+                }
                 let entry = SessionEntry {
                     thread_key: thread_key.clone(),
                     session_id: session.id.clone(),
-                    name: new_name.clone(),
                     directory,
                     agent: None,
                     auto_accept: false,
@@ -326,9 +376,33 @@ impl App {
                 let mut store = self.sessions.lock().await;
                 store.set_active(entry);
                 store.persist()?;
+                self.invalidate_session_list_cache().await;
+                let label = name.unwrap_or_else(|| format!("sess-{}", uuid::Uuid::new_v4()));
                 self.feishu
-                    .reply_text(message_id, &format!("Created \"{}\".", new_name))
+                    .reply_text(message_id, &format!("Created \"{}\".", label))
                     .await?;
+            }
+            Command::Attach { query, force } => {
+                self.handle_attach(&thread_key, &query, force, message_id, kind)
+                    .await?;
+            }
+            Command::Forget => {
+                let mut store = self.sessions.lock().await;
+                let removed = store.remove_thread(&thread_key);
+                store.persist()?;
+                self.invalidate_session_list_cache().await;
+                if removed.is_empty() {
+                    self.feishu
+                        .reply_text(message_id, "当前没有映射的会话。")
+                        .await?;
+                } else {
+                    self.feishu
+                        .reply_text(
+                            message_id,
+                            "已解除本会话的映射（服务器会话仍保留，可用 `/list` 重新找到）。",
+                        )
+                        .await?;
+                }
             }
             Command::Topic { directory, name } => {
                 // Opening a topic from inside another topic would nest
@@ -346,6 +420,12 @@ impl App {
                     .opencode
                     .create_session(&self.opencode.new_session_input(Some(&directory)))
                     .await?;
+                // Creation title policy (ADR-0007): a named `/topic` PATCHes the
+                // title; without a name the server default is left for
+                // auto-generation. The display name only drives the anchor text.
+                if let Some(n) = &name {
+                    self.opencode.update_session_title(&session.id, n).await?;
+                }
                 let display_name = name.unwrap_or_else(|| {
                     directory
                         .trim_end_matches('/')
@@ -387,7 +467,6 @@ impl App {
                 let entry = crate::config::SessionEntry {
                     thread_key: topic_key,
                     session_id: session.id.clone(),
-                    name: display_name,
                     directory,
                     agent: None,
                     auto_accept: false,
@@ -396,6 +475,7 @@ impl App {
                 let mut store = self.sessions.lock().await;
                 store.set_active(entry);
                 store.persist()?;
+                self.invalidate_session_list_cache().await;
                 tracing::info!(
                     "topic: created topic {} for session {} in chat {}",
                     thread_id,
@@ -404,12 +484,12 @@ impl App {
                 );
             }
             Command::Name(name) => {
-                let mut store = self.sessions.lock().await;
-                if let Some(entry) = store.get_active(&thread_key) {
-                    let mut e = entry.clone();
-                    e.name = name.clone();
-                    store.set_active(e);
-                    store.persist()?;
+                // `/name` PATCHes the server title (ADR-0007): the change is
+                // visible to every client sharing the store, and the `/list`
+                // cache is invalidated so the new title shows immediately.
+                if let Some(id) = self.get_session_id(&thread_key).await {
+                    self.opencode.update_session_title(&id, &name).await?;
+                    self.invalidate_session_list_cache().await;
                 }
                 self.feishu
                     .reply_text(message_id, &format!("Renamed to \"{}\".", name))
@@ -561,6 +641,378 @@ impl App {
         }
         Ok(())
     }
+
+    /// `/switch <keyword>` — switch within the thread first, then adopt a unique
+    /// global match (ADR-0008). Resolution order:
+    /// 1. Current thread's mapped sessions (matched by title/directory/id);
+    ///    a unique hit switches without changing the mapping.
+    /// 2. Global store search (sub-task children excluded); a unique hit adopts
+    ///    into the current thread and becomes active.
+    /// 3. Multiple hits: list up to 8 candidates and point at `/attach`.
+    async fn handle_switch(
+        self: &Arc<Self>,
+        thread_key: &ThreadKey,
+        keyword: &str,
+        message_id: &str,
+        kind: ConversationKind,
+    ) -> crate::error::Result<()> {
+        let sessions = self.cached_session_list().await?;
+        let lower = keyword.to_lowercase();
+
+        // 1. Current thread's mapped sessions first.
+        let thread_ids: Vec<String> = {
+            let store = self.sessions.lock().await;
+            store
+                .list_thread(thread_key)
+                .into_iter()
+                .map(|e| e.session_id.clone())
+                .collect()
+        };
+        let thread_hits: Vec<&crate::opencode::SessionListInfo> = sessions
+            .iter()
+            .filter(|s| thread_ids.contains(&s.id) && matches_keyword(s, &lower))
+            .collect();
+        if thread_hits.len() == 1 {
+            let hit = thread_hits[0];
+            let mut store = self.sessions.lock().await;
+            if let Some(entry) = store
+                .list_thread(thread_key)
+                .into_iter()
+                .find(|e| e.session_id == hit.id)
+                .cloned()
+            {
+                store.set_active(entry);
+                store.persist()?;
+            }
+            self.feishu
+                .reply_text(message_id, &format!("Switched to \"{}\".", hit.title))
+                .await?;
+            return Ok(());
+        }
+        if thread_hits.len() > 1 {
+            let list = candidates_list("本会话匹配到多个，请用 `/attach <完整ID>` 指定：", &thread_hits);
+            self.feishu.reply_text(message_id, &list).await?;
+            return Ok(());
+        }
+
+        // 2. Global search, children excluded.
+        let global_hits: Vec<&crate::opencode::SessionListInfo> = sessions
+            .iter()
+            .filter(|s| !s.is_child() && matches_keyword(s, &lower))
+            .collect();
+        if global_hits.len() == 1 {
+            let hit = global_hits[0].clone();
+            self.adopt_session(thread_key, &hit, message_id, kind, false)
+                .await?;
+            return Ok(());
+        }
+        if global_hits.len() > 1 {
+            let list = candidates_list("找到多个会话，请用 `/attach <完整ID>` 指定：", &global_hits);
+            self.feishu.reply_text(message_id, &list).await?;
+            return Ok(());
+        }
+        self.feishu
+            .reply_text(message_id, &format!("No session matching \"{}\"", keyword))
+            .await?;
+        Ok(())
+    }
+
+    /// `/list [keyword] [--all]` — a cached, recently-active list of every
+    /// session in the shared store (ADR-0008), so sessions created outside
+    /// Feishu become visible. Sorted by last activity (client-side), capped at
+    /// 15; children and archived hidden unless `--all`.
+    async fn handle_list(
+        self: &Arc<Self>,
+        thread_key: &ThreadKey,
+        keyword: Option<&str>,
+        all: bool,
+        message_id: &str,
+    ) -> crate::error::Result<()> {
+        let sessions = self.cached_session_list().await?;
+        let lower = keyword.map(|k| k.to_lowercase());
+        let mut shown: Vec<crate::opencode::SessionListInfo> = sessions
+            .into_iter()
+            .filter(|s| {
+                if !all && (s.is_child() || s.time.as_ref().map(|t| t.is_archived()).unwrap_or(false)) {
+                    return false;
+                }
+                match &lower {
+                    Some(l) => matches_keyword(s, l),
+                    None => true,
+                }
+            })
+            .collect();
+        shown.sort_by(|a, b| {
+            let ub = b.time.as_ref().map(|t| t.updated).unwrap_or(0);
+            let ua = a.time.as_ref().map(|t| t.updated).unwrap_or(0);
+            ub.cmp(&ua)
+        });
+        shown.truncate(15);
+
+        if shown.is_empty() {
+            self.feishu
+                .reply_text(message_id, "No sessions matching the filter.")
+                .await?;
+            return Ok(());
+        }
+
+        let (active_id, mapped_ids) = {
+            let store = self.sessions.lock().await;
+            let active = store.get_active(thread_key).map(|e| e.session_id.clone());
+            let mapped: Vec<String> = store
+                .list_thread(thread_key)
+                .into_iter()
+                .map(|e| e.session_id.clone())
+                .collect();
+            (active, mapped)
+        };
+        let mut list = String::from("**Recent sessions:**\n");
+        for s in &shown {
+            let mark = if active_id.as_deref() == Some(&s.id) {
+                " (active)"
+            } else if mapped_ids.contains(&s.id) {
+                " (本会话)"
+            } else {
+                ""
+            };
+            let rel = s
+                .time
+                .as_ref()
+                .map(|t| relative_time(t.updated))
+                .unwrap_or_default();
+            list.push_str(&format!(
+                "- {} · {} · {}{}\n  {}\n",
+                title_or_id_tail(s),
+                s.directory,
+                id_tail(&s.id),
+                mark,
+                rel
+            ));
+        }
+        if !all {
+            list.push_str("\n`/list --all` 显示子任务会话（当前隐藏）。");
+        }
+        self.feishu.reply_text(message_id, &list).await?;
+        Ok(())
+    }
+
+    /// `/attach <id|title> [--force]` — take over an arbitrary server session
+    /// into the current thread (ADR-0008). Resolution: exact id → unique
+    /// id-prefix → unique title substring; multiple hits list candidates.
+    async fn handle_attach(
+        self: &Arc<Self>,
+        thread_key: &ThreadKey,
+        query: &str,
+        force: bool,
+        message_id: &str,
+        kind: ConversationKind,
+    ) -> crate::error::Result<()> {
+        let sessions = self.cached_session_list().await?;
+        let lower = query.to_lowercase();
+
+        // Exact id.
+        if let Some(s) = sessions.iter().find(|s| s.id == query) {
+            return self.adopt_session(thread_key, s, message_id, kind, force).await;
+        }
+        // Unique id-prefix.
+        let prefix: Vec<&crate::opencode::SessionListInfo> = sessions
+            .iter()
+            .filter(|s| s.id.to_lowercase().starts_with(&lower))
+            .collect();
+        if prefix.len() == 1 {
+            return self.adopt_session(thread_key, prefix[0], message_id, kind, force).await;
+        }
+        if prefix.len() > 1 {
+            let list = candidates_list("ID 前缀匹配到多个，请用完整 ID：", &prefix);
+            self.feishu.reply_text(message_id, &list).await?;
+            return Ok(());
+        }
+        // Unique title substring.
+        let titles: Vec<&crate::opencode::SessionListInfo> = sessions
+            .iter()
+            .filter(|s| s.title.to_lowercase().contains(&lower))
+            .collect();
+        if titles.len() == 1 {
+            return self.adopt_session(thread_key, titles[0], message_id, kind, force).await;
+        }
+        if titles.len() > 1 {
+            let list = candidates_list("标题匹配到多个，请用完整 ID：", &titles);
+            self.feishu.reply_text(message_id, &list).await?;
+            return Ok(());
+        }
+        self.feishu
+            .reply_text(message_id, &format!("No session matching \"{}\"", query))
+            .await?;
+        Ok(())
+    }
+
+    /// Adopt a server session as the current thread's session, honoring the
+    /// one-session-one-thread invariant (ADR-0007). Already the active session
+    /// → idempotent no-op. Mapped to another thread → rejected with an
+    /// actionable card unless `--force` (which steals the mapping). Copies
+    /// `directory` + `agent` from the server; `auto_accept` resets to false.
+    /// In a never-had-a-session topic, the fallback-card anchor is the
+    /// command's own reply inside the topic (`reply_in_thread`, ADR-0006).
+    async fn adopt_session(
+        self: &Arc<Self>,
+        thread_key: &ThreadKey,
+        info: &crate::opencode::SessionListInfo,
+        message_id: &str,
+        kind: ConversationKind,
+        force: bool,
+    ) -> crate::error::Result<()> {
+        // Idempotent: already the active session of this thread.
+        {
+            let store = self.sessions.lock().await;
+            if let Some(e) = store.get_active(thread_key)
+                && e.session_id == info.id
+            {
+                self.feishu
+                    .reply_text(message_id, &format!("Already active: \"{}\".", info.title))
+                    .await?;
+                return Ok(());
+            }
+        }
+        // Mapped to another thread: reject unless --force.
+        let owner = {
+            let store = self.sessions.lock().await;
+            store.thread_for_session(&info.id)
+        };
+        if let Some(owner_key) = owner
+            && owner_key != *thread_key
+        {
+            if !force {
+                let chat_name = self
+                    .feishu
+                    .chat_name(&owner_key.chat_id)
+                    .await
+                    .unwrap_or(None)
+                    .unwrap_or_else(|| owner_key.chat_id.clone());
+                let where_flag = if owner_key.thread_id != owner_key.chat_id {
+                    "话题"
+                } else {
+                    "主对话"
+                };
+                self.feishu
+                    .reply_text(
+                        message_id,
+                        &format!(
+                            "⚠️ 会话 `{}`（目录 `{}`）已被其他聊天占用：\n{}\n（{}，chat `{}`）\n\n可先请对方 `/forget` 解除，或使用 `/attach {} --force` 强行接管。",
+                            info.title,
+                            info.directory,
+                            chat_name,
+                            where_flag,
+                            owner_key.chat_id,
+                            info.id
+                        ),
+                    )
+                    .await?;
+                return Ok(());
+            }
+            // --force: steal the mapping; the other thread becomes sessionless.
+            let mut store = self.sessions.lock().await;
+            store.remove(&info.id);
+            store.persist()?;
+        }
+
+        let anchor = if kind == ConversationKind::Topic {
+            match self
+                .feishu
+                .reply_in_thread(
+                    message_id,
+                    &format!("📎 已接管会话 `{}`（目录 `{}`）。", info.title, info.directory),
+                )
+                .await
+            {
+                Ok((anchor, _)) => Some(anchor),
+                Err(e) => {
+                    tracing::warn!("attach: reply_in_thread failed: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let entry = SessionEntry {
+            thread_key: thread_key.clone(),
+            session_id: info.id.clone(),
+            directory: info.directory.clone(),
+            agent: info.agent.clone(),
+            auto_accept: false,
+            topic_anchor: anchor,
+        };
+        {
+            let mut store = self.sessions.lock().await;
+            store.set_active(entry);
+            store.persist()?;
+        }
+        self.invalidate_session_list_cache().await;
+        // In a topic the confirmation was already sent inside it (the
+        // `reply_in_thread` above doubles as the fallback-card anchor); don't
+        // reply twice.
+        if kind != ConversationKind::Topic {
+            self.feishu
+                .reply_text(
+                    message_id,
+                    &format!("已接管会话 `{}`（目录 `{}`）。", info.title, info.directory),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+/// The last 7 characters of a session id (display suffix).
+fn id_tail(id: &str) -> String {
+    id.strip_prefix("ses_")
+        .unwrap_or(id)
+        .chars()
+        .take(7)
+        .collect()
+}
+
+/// Case-insensitive keyword match on a session's title, directory or id
+/// (shared by `/list`, `/switch` and `/attach`).
+fn matches_keyword(s: &crate::opencode::SessionListInfo, lower: &str) -> bool {
+    s.title.to_lowercase().contains(lower)
+        || s.directory.to_lowercase().contains(lower)
+        || s.id.to_lowercase().contains(lower)
+}
+
+/// The "ambiguous match" candidate list shown when a keyword or id resolves to
+/// several sessions: `title · dir · id-tail`, capped at 8.
+fn candidates_list(header: &str, sessions: &[&crate::opencode::SessionListInfo]) -> String {
+    let mut list = String::from(header);
+    for s in sessions.iter().take(8) {
+        list.push_str(&format!("- {} · {} · {}\n", s.title, s.directory, id_tail(&s.id)));
+    }
+    list
+}
+
+/// A session's display title, falling back to the id-tail when the title is a
+/// meaningless default (`New session - ...`, `sess-<uuid>`, etc.).
+fn title_or_id_tail(s: &crate::opencode::SessionListInfo) -> String {
+    let cleaned = crate::feishu::card::clean_session_label(&s.title);
+    if cleaned.is_empty() {
+        id_tail(&s.id)
+    } else {
+        cleaned
+    }
+}
+
+/// Compact relative-time label for a millisecond timestamp.
+fn relative_time(ms: i64) -> String {
+    let now = chrono::Utc::now().timestamp_millis();
+    let secs = ((now - ms) / 1000).max(0);
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    }
 }
 
 #[cfg(test)]
@@ -601,8 +1053,59 @@ mod tests {
 
     #[test]
     fn parse_list() {
-        assert_eq!(parse_command("/list"), Some(Command::List));
-        assert_eq!(parse_command(" /list "), Some(Command::List));
+        assert_eq!(parse_command("/list"), Some(Command::List { keyword: None, all: false }));
+        assert_eq!(parse_command(" /list "), Some(Command::List { keyword: None, all: false }));
+    }
+
+    #[test]
+    fn parse_list_keyword_and_all() {
+        assert_eq!(
+            parse_command("/list cola"),
+            Some(Command::List {
+                keyword: Some("cola".into()),
+                all: false
+            })
+        );
+        assert_eq!(
+            parse_command("/list --all"),
+            Some(Command::List { keyword: None, all: true })
+        );
+        assert_eq!(
+            parse_command("/list cola --all"),
+            Some(Command::List {
+                keyword: Some("cola".into()),
+                all: true
+            })
+        );
+        assert_eq!(
+            parse_command("/list multi word"),
+            Some(Command::List {
+                keyword: Some("multi word".into()),
+                all: false
+            })
+        );
+    }
+
+    #[test]
+    fn parse_attach() {
+        assert_eq!(
+            parse_command("/attach ses_abc123"),
+            Some(Command::Attach { query: "ses_abc123".into(), force: false })
+        );
+        assert_eq!(
+            parse_command("/attach ses_abc123 --force"),
+            Some(Command::Attach { query: "ses_abc123".into(), force: true })
+        );
+        assert_eq!(
+            parse_command("/attach some title"),
+            Some(Command::Attach { query: "some title".into(), force: false })
+        );
+        assert_eq!(parse_command("/attach"), Some(Command::Help(Some("attach".into()))));
+    }
+
+    #[test]
+    fn parse_forget() {
+        assert_eq!(parse_command("/forget"), Some(Command::Forget));
     }
 
     #[test]
@@ -720,12 +1223,12 @@ mod tests {
 
     #[test]
     fn trailing_spaces_ignored() {
-        assert_eq!(parse_command("  /list  "), Some(Command::List));
+        assert_eq!(parse_command("  /list  "), Some(Command::List { keyword: None, all: false }));
     }
 
     #[test]
     fn case_insensitive_command() {
         assert_eq!(parse_command("/STOP"), Some(Command::Stop));
-        assert_eq!(parse_command("/List"), Some(Command::List));
+        assert_eq!(parse_command("/List"), Some(Command::List { keyword: None, all: false }));
     }
 }

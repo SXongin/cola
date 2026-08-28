@@ -1,6 +1,6 @@
 # 03 - `/list` global
 
-Status: needs-triage
+Status: resolved
 Type: task
 Blocked by: 01, 02
 
@@ -38,3 +38,6 @@ shared store, so sessions created outside Feishu become visible.
 
 - 01 - Session identity from server (drop `name`)
 - 02 - Canonical session list client
+## Comments
+
+Implemented in one pass (2026-08-28). All tickets done together in dependency order; see commit message. Verified by `cargo test` (222 passed) and `cargo clippy --all-targets` (clean).

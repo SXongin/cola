@@ -418,6 +418,37 @@ impl Client {
         Ok(name)
     }
 
+    /// The display name of a Feishu chat (`im:chat:readonly`), used by the
+    /// `/attach` rejection card to name the thread that currently owns a
+    /// session. Best-effort `Ok(None)` on failure so callers fall back to the
+    /// raw chat id.
+    ///
+    /// Response shape: `GET /im/v1/chats/{chat_id}` → `data.name`.
+    pub async fn chat_name(&self, chat_id: &str) -> crate::error::Result<Option<String>> {
+        let token = self.get_access_token().await?;
+        let url = format!("https://open.feishu.cn/open-apis/im/v1/chats/{}", chat_id);
+        let resp = self.http.get(url).bearer_auth(&token).send().await?;
+        let text = resp.text().await?;
+        let v: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| crate::error::BridgeError::Feishu(format!("parse chat info: {e} — body: {text}")))?;
+        let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            tracing::debug!(
+                "chat_name lookup failed ({code}): {}",
+                &text[..text.len().min(200)]
+            );
+            return Ok(None);
+        }
+        let name = v["data"]["name"].as_str().map(|s| s.to_string());
+        if name.is_none() {
+            tracing::debug!(
+                "chat_name lookup returned no name: {}",
+                &text[..text.len().min(300)]
+            );
+        }
+        Ok(name)
+    }
+
     /// Update (patch) an existing message card.
     pub async fn update_message(
         &self,

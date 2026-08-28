@@ -171,7 +171,6 @@ impl ConversationKind {
 pub struct SessionEntry {
     pub thread_key: ThreadKey,
     pub session_id: String,
-    pub name: String,
     pub directory: String,
     #[serde(default)]
     pub agent: Option<String>,

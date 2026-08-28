@@ -2,7 +2,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::bridge::command;
-use crate::bridge::core::SharedCore;
+use crate::bridge::core::{SessionListCache, SharedCore};
 use crate::bridge::render::{flush_card, render_new_turn_parts, render_parts, render_poll_loop};
 use crate::bridge::streaming::StreamAccumulator;
 use crate::config::{Config, ConversationKind, SessionEntry, ThreadKey};
@@ -243,20 +243,6 @@ impl App {
             self.feishu.reply_text(message_id, GROUP_LOBBY_GUIDANCE).await?;
         }
 
-        // A `/new` (no name) session starts as `sess-<uuid>`; name it after its
-        // first real prompt so the card subtitle isn't just an ID.
-        {
-            let mut store = self.sessions.lock().await;
-            if let Some(entry) = store.get_active(&thread_key)
-                && crate::feishu::card::clean_session_label(&entry.name).is_empty()
-            {
-                let mut e = entry.clone();
-                e.name = text.chars().take(50).collect();
-                store.set_active(e);
-                store.persist()?;
-            }
-        }
-
         let subtitle = self.session_subtitle(&thread_key, &text).await;
 
         // Supplement path: if this session already has a turn in flight, don't
@@ -312,24 +298,22 @@ impl App {
     }
 
     /// The session/thread name shown as the card subtitle, formatted as
-    /// `<name> · <id-tail>` (e.g. "你好 · 01ba0ed") so both the label and the
-    /// actual session are visible in p2p AND group chats. The OpenCode server's
-    /// OWN session title (what OpenChamber shows) is preferred — no reliance on
-    /// cola's `/new`-generated `sess-<uuid>` names. Stale names persisted before
-    /// mention stripping are cleaned, and the current prompt is never echoed
-    /// (the reply context already shows it).
+    /// `<title> · <id-tail>` (e.g. "你好 · 01ba0ed"). The OpenCode server's OWN
+    /// session title (what OpenChamber shows) is the single source of truth
+    /// (ADR-0007) — fetched on demand, never cached locally. While the server
+    /// still has the default `New session - ...` title (or the title is empty),
+    /// the id-tail alone identifies the session; the current prompt is never
+    /// echoed (the reply context already shows it).
     async fn session_subtitle(&self, thread_key: &ThreadKey, text: &str) -> String {
         let prompt_preview: String = text.chars().take(50).collect();
-        let (session_id, stored_name) = {
+        let session_id = {
             let store = self.sessions.lock().await;
             let Some(entry) = store.get_active(thread_key) else {
                 return String::new();
             };
-            (entry.session_id.clone(), entry.name.clone())
+            entry.session_id.clone()
         };
-        // Prefer the server's title (OpenChamber's), fall back to cola's stored
-        // name (e.g. the first-prompt preview when the server has no title yet).
-        let mut name = crate::feishu::card::clean_session_label(&stored_name);
+        let mut name = String::new();
         if let Ok(info) = self.opencode.session_info(&session_id, None).await
             && let Some(t) = info.title.filter(|t| !t.is_empty())
         {
@@ -767,7 +751,7 @@ impl App {
     async fn create_fresh_session(
         &self,
         thread_key: &ThreadKey,
-        text: &str,
+        _text: &str,
         directory: String,
     ) -> crate::error::Result<String> {
         let session = self
@@ -777,12 +761,6 @@ impl App {
         let entry = SessionEntry {
             thread_key: thread_key.clone(),
             session_id: session.id.clone(),
-            // Never persist a raw `@_user_N` mention token as the session name
-            // (defense in depth — callers normally pass already-stripped text).
-            name: crate::feishu::ws::strip_mention_tokens(text)
-                .chars()
-                .take(50)
-                .collect(),
             directory,
             agent: None,
             auto_accept: false,
@@ -791,7 +769,37 @@ impl App {
         let mut store = self.sessions.lock().await;
         store.set_active(entry);
         store.persist()?;
+        self.invalidate_session_list_cache().await;
         Ok(session.id)
+    }
+
+    /// The current `GET /session` snapshot, fetching (and caching for 30 s) when
+    /// missing or stale. Used by `/list`, `/switch` and `/attach` so rapid
+    /// reuse stays off the wire.
+    pub(crate) async fn cached_session_list(
+        &self,
+    ) -> crate::error::Result<Vec<crate::opencode::SessionListInfo>> {
+        let now = std::time::Instant::now();
+        {
+            let cache = self.session_list_cache.lock().await;
+            if let Some(c) = cache.as_ref()
+                && c.fresh()
+            {
+                return Ok(c.sessions.clone());
+            }
+        }
+        let sessions = self.opencode.list_sessions().await?;
+        *self.session_list_cache.lock().await = Some(SessionListCache {
+            fetched_at: now,
+            sessions: sessions.clone(),
+        });
+        Ok(sessions)
+    }
+
+    /// Drop the `/list` cache. Called whenever cola creates, adopts, forgets or
+    /// renames a session, so the next `/list`/`/switch`/`/attach` is fresh.
+    pub(crate) async fn invalidate_session_list_cache(&self) {
+        *self.session_list_cache.lock().await = None;
     }
 
     /// Handle a card action (permission Allow/Deny, question answer/reject,
@@ -922,6 +930,8 @@ mod test_support {
         pub calls: Arc<tokio::sync::Mutex<Vec<PlatformCall>>>,
         /// open_id → display name served by `user_name` (empty = lookup fails).
         pub user_names: std::collections::HashMap<String, String>,
+        /// chat_id → display name served by `chat_name` (absent = None).
+        pub chat_names: std::collections::HashMap<String, String>,
     }
 
     impl RecordingPlatform {
@@ -929,6 +939,7 @@ mod test_support {
             Self {
                 calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 user_names: std::collections::HashMap::new(),
+                chat_names: std::collections::HashMap::new(),
             }
         }
     }
@@ -1014,6 +1025,10 @@ mod test_support {
             Ok(self.user_names.get(open_id).cloned())
         }
 
+        async fn chat_name(&self, chat_id: &str) -> crate::error::Result<Option<String>> {
+            Ok(self.chat_names.get(chat_id).cloned())
+        }
+
         async fn bot_open_id(&self) -> crate::error::Result<String> {
             Ok("ou_test_bot".into())
         }
@@ -1047,7 +1062,9 @@ mod test_support {
         /// Records every `reply_permission` call: (request_id, reply).
         pub reply_permission_calls: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
         /// session_id → server title (simulates OpenChamber's session title).
-        pub session_titles: std::collections::HashMap<String, String>,
+        /// `std::sync::Mutex` for interior mutability: `update_session_title`
+        /// writes it through `&self` (the trait requires `&self`).
+        pub session_titles: std::sync::Mutex<std::collections::HashMap<String, String>>,
         /// Pending questions served by `list_questions`.
         pub questions: Vec<opencode::client::QuestionRequest>,
         /// Records `reply_question` calls: (request_id, answers).
@@ -1068,6 +1085,13 @@ mod test_support {
         /// child session_id → parent session_id, served by `session_info`
         /// (simulates sub-task sessions created by the `task` tool).
         pub session_parents: std::collections::HashMap<String, String>,
+        /// The shared store served by `list_sessions` (for `/list`, `/attach`,
+        /// `/switch` tests).
+        pub session_list: Vec<opencode::client::SessionListInfo>,
+        /// Records `update_session_title` calls: (session_id, title).
+        pub update_title_calls: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
+        /// Counts `list_sessions` invocations (asserts the 30 s cache).
+        pub list_sessions_calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl MockBackend {
@@ -1077,7 +1101,7 @@ mod test_support {
                 permissions: Vec::new(),
                 external_user_message: None,
                 reply_permission_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-                session_titles: std::collections::HashMap::new(),
+                session_titles: std::sync::Mutex::new(std::collections::HashMap::new()),
                 questions: Vec::new(),
                 reply_question_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 prompt_error: None,
@@ -1087,6 +1111,9 @@ mod test_support {
                 session_id: "ses_test".into(),
                 stale_session_404: false,
                 session_parents: std::collections::HashMap::new(),
+                session_list: Vec::new(),
+                update_title_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                list_sessions_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
     }
@@ -1121,6 +1148,26 @@ mod test_support {
                 cost: None,
                 time: None,
             })
+        }
+
+        async fn list_sessions(
+            &self,
+        ) -> crate::error::Result<Vec<opencode::client::SessionListInfo>> {
+            self.list_sessions_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.session_list.clone())
+        }
+
+        async fn update_session_title(&self, session_id: &str, title: &str) -> crate::error::Result<()> {
+            self.update_title_calls
+                .lock()
+                .await
+                .push((session_id.to_string(), title.to_string()));
+            self.session_titles
+                .lock()
+                .unwrap()
+                .insert(session_id.to_string(), title.to_string());
+            Ok(())
         }
 
         async fn prompt(
@@ -1254,7 +1301,7 @@ mod test_support {
             Ok(opencode::client::SessionInfo {
                 id: session_id.to_string(),
                 parent_id: self.session_parents.get(session_id).cloned(),
-                title: self.session_titles.get(session_id).cloned(),
+                title: self.session_titles.lock().unwrap().get(session_id).cloned(),
             })
         }
 
@@ -1634,7 +1681,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn subtitle_shows_name_and_id_tail() {
+    async fn subtitle_falls_back_to_id_tail_without_server_title() {
         let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
@@ -1646,7 +1693,6 @@ mod integration_tests {
             store.set_active(crate::config::SessionEntry {
                 thread_key: key.clone(),
                 session_id: "ses_01ba0ed03ffeRvYNWua6mg8d9c".into(),
-                name: "你好".into(),
                 directory: "/tmp/x".into(),
                 agent: None,
                 auto_accept: false,
@@ -1654,17 +1700,29 @@ mod integration_tests {
             });
         }
 
-        // A later message in the same session → name + id tail.
-        assert_eq!(app.session_subtitle(&key, "另一个问题").await, "你好 · 01ba0ed");
-        // First message (name == prompt preview) → no echo, but still the id.
+        // No server title → the id-tail alone identifies the session (no cola
+        // side name to fall back on; the current prompt is never echoed).
+        assert_eq!(app.session_subtitle(&key, "另一个问题").await, "01ba0ed");
         assert_eq!(app.session_subtitle(&key, "你好").await, "01ba0ed");
-        // `/new`-generated `sess-<uuid>` names are meaningless → just the ID tail.
+    }
+
+    /// A server default title (`New session - ...`) is treated as absent — the
+    /// id-tail is shown until the server generates a real title.
+    #[tokio::test]
+    async fn subtitle_ignores_server_default_title() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mock = MockBackend::new(realistic_parts());
+        mock.session_titles.lock().unwrap().insert("ses_00ea4e77cffez1fo4wrNuJyHF0".into(), "New session - 2026-08-28".into());
+        let (app, _) = build_app(cfg, mock).await;
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+
         {
             let mut store = app.sessions.lock().await;
             store.set_active(crate::config::SessionEntry {
                 thread_key: key.clone(),
                 session_id: "ses_00ea4e77cffez1fo4wrNuJyHF0".into(),
-                name: "sess-7a025fa5-74a1-44e0-b5c5-80b9a21f71bc".into(),
                 directory: "/tmp/y".into(),
                 agent: None,
                 auto_accept: false,
@@ -1681,9 +1739,8 @@ mod integration_tests {
         let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
-        let mut mock = MockBackend::new(realistic_parts());
-        mock.session_titles
-            .insert("ses_test".into(), "OpenChamber 显示的标题".into());
+        let mock = MockBackend::new(realistic_parts());
+        mock.session_titles.lock().unwrap().insert("ses_test".into(), "OpenChamber 显示的标题".into());
         let (app, _) = build_app(cfg, mock).await;
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
 
@@ -1692,7 +1749,6 @@ mod integration_tests {
             store.set_active(crate::config::SessionEntry {
                 thread_key: key.clone(),
                 session_id: "ses_test".into(),
-                name: "sess-7a025fa5-74a1-44e0-b5c5-80b9a21f71bc".into(),
                 directory: "/tmp/x".into(),
                 agent: None,
                 auto_accept: false,
@@ -1714,10 +1770,9 @@ mod integration_tests {
         let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
-        let mut mock = MockBackend::new(realistic_parts());
+        let mock = MockBackend::new(realistic_parts());
         // The server already has a final auto-generated title.
-        mock.session_titles
-            .insert("ses_test".into(), "修复登录鉴权问题".into());
+        mock.session_titles.lock().unwrap().insert("ses_test".into(), "修复登录鉴权问题".into());
         let backend = Arc::new(mock);
         let platform = Arc::new(RecordingPlatform::new());
         let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -1728,7 +1783,6 @@ mod integration_tests {
             store.set_active(crate::config::SessionEntry {
                 thread_key: key.clone(),
                 session_id: "ses_test".into(),
-                name: "sess-7a025fa5-74a1-44e0-b5c5-80b9a21f71bc".into(),
                 directory: "/tmp/x".into(),
                 agent: None,
                 auto_accept: false,
@@ -1975,7 +2029,6 @@ mod integration_tests {
             store.set_active(crate::config::SessionEntry {
                 thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
                 session_id: "ses_test".into(),
-                name: "aa".into(),
                 directory: "/tmp/aa".into(),
                 agent: None,
                 auto_accept: true,
@@ -2040,7 +2093,6 @@ mod integration_tests {
             store.set_active(crate::config::SessionEntry {
                 thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
                 session_id: "ses_test".into(),
-                name: "aa".into(),
                 directory: "/tmp/aa".into(),
                 agent: None,
                 auto_accept: false,
@@ -2102,7 +2154,6 @@ mod integration_tests {
             store.set_active(crate::config::SessionEntry {
                 thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
                 session_id: "ses_test".into(),
-                name: "aa".into(),
                 directory: "/tmp/aa".into(),
                 agent: None,
                 auto_accept: false,
@@ -2184,7 +2235,6 @@ mod integration_tests {
             store.set_active(crate::config::SessionEntry {
                 thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
                 session_id: "ses_ext".into(),
-                name: "共享会话".into(),
                 directory: "/tmp/ext".into(),
                 agent: None,
                 auto_accept: false,
@@ -2245,7 +2295,6 @@ mod integration_tests {
             store.set_active(crate::config::SessionEntry {
                 thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_topic_ext".into()),
                 session_id: "ses_ext".into(),
-                name: "话题会话".into(),
                 directory: "/tmp/ext".into(),
                 agent: None,
                 auto_accept: false,
@@ -2432,7 +2481,6 @@ mod integration_tests {
             store.set_active(crate::config::SessionEntry {
                 thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
                 session_id: "ses_test".into(),
-                name: "parent".into(),
                 directory: "/tmp/aa".into(),
                 agent: None,
                 auto_accept: false,
@@ -2509,7 +2557,6 @@ mod integration_tests {
             store.set_active(crate::config::SessionEntry {
                 thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_topic_1".into()),
                 session_id: "ses_topic".into(),
-                name: "topic-session".into(),
                 directory: "/tmp/topic".into(),
                 agent: None,
                 auto_accept: false,
@@ -2864,6 +2911,7 @@ mod integration_tests {
         let cfg = test_config(&dir.path().join("sessions.json"));
         let mut backend = MockBackend::new(realistic_parts());
         backend.session_id = "ses_topic".into();
+        let title_calls = backend.update_title_calls.clone();
         let (app, platform) = build_app(cfg, backend).await;
 
         app.handle_command(
@@ -2898,7 +2946,11 @@ mod integration_tests {
             .expect("topic thread_id should map to the new session");
         assert_eq!(entry.session_id, "ses_topic");
         assert_eq!(entry.directory, "/root/proj/lib");
-        assert_eq!(entry.name, "api-refactor");
+        // The named `/topic` PATCHed the server title (ADR-0007).
+        assert_eq!(
+            title_calls.lock().await.as_slice(),
+            &[("ses_topic".to_string(), "api-refactor".to_string())]
+        );
         // The topic anchor is the confirmation message INSIDE the topic; future
         // sent cards reply to it so they stay in the topic.
         assert_eq!(entry.topic_anchor.as_deref(), Some("msg_topic_reply"));
@@ -3125,7 +3177,6 @@ mod integration_tests {
             store.set_active(crate::config::SessionEntry {
                 thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
                 session_id: "ses_lobby".into(),
-                name: "lobby".into(),
                 directory: "/tmp/lobby".into(),
                 agent: None,
                 auto_accept: false,
@@ -3134,7 +3185,6 @@ mod integration_tests {
             store.set_active(crate::config::SessionEntry {
                 thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "omt_topic_1".into()),
                 session_id: "ses_topic".into(),
-                name: "topic".into(),
                 directory: "/tmp/topic".into(),
                 agent: None,
                 auto_accept: false,
@@ -3213,7 +3263,6 @@ mod integration_tests {
             store.set_active(crate::config::SessionEntry {
                 thread_key: crate::config::ThreadKey::new("oc_p2p_1".into(), "oc_p2p_1".into()),
                 session_id: "ses_top".into(),
-                name: "top".into(),
                 directory: "/tmp/top".into(),
                 agent: None,
                 auto_accept: false,
@@ -3222,7 +3271,6 @@ mod integration_tests {
             store.set_active(crate::config::SessionEntry {
                 thread_key: crate::config::ThreadKey::new("oc_p2p_1".into(), "omt_p2p_1".into()),
                 session_id: "ses_p2p_topic".into(),
-                name: "ptopic".into(),
                 directory: "/tmp/ptopic".into(),
                 agent: None,
                 auto_accept: false,
@@ -3289,7 +3337,6 @@ mod integration_tests {
             store.set_active(crate::config::SessionEntry {
                 thread_key: thread.clone(),
                 session_id: "ses_old2".into(),
-                name: "old2".into(),
                 directory: "/tmp/old2".into(),
                 agent: None,
                 auto_accept: false,
@@ -3298,7 +3345,6 @@ mod integration_tests {
             store.set_active(crate::config::SessionEntry {
                 thread_key: thread.clone(),
                 session_id: "ses_old".into(),
-                name: "old".into(),
                 directory: "/tmp/old".into(),
                 agent: None,
                 auto_accept: false,
@@ -3381,7 +3427,6 @@ mod integration_tests {
             store.set_active(crate::config::SessionEntry {
                 thread_key: thread,
                 session_id: "ses_1".into(),
-                name: "x".into(),
                 directory: "/work".into(),
                 agent: None,
                 auto_accept: false,
@@ -3720,7 +3765,6 @@ mod integration_tests {
             store.set_active(crate::config::SessionEntry {
                 thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
                 session_id: "ses_test".into(),
-                name: "aa".into(),
                 directory: "/tmp/aa".into(),
                 agent: None,
                 auto_accept: false,
@@ -3757,5 +3801,625 @@ mod integration_tests {
         );
         // The in-flight marker is preserved (still running).
         assert!(app.inflight.lock().await.contains("ses_test"));
+    }
+
+    // ===== Session discovery & adoption (ADR-0008) =====
+
+    /// A helper: a session in the shared store with the given title/dir/id.
+    fn list_session(
+        id: &str,
+        title: &str,
+        directory: &str,
+        updated: i64,
+    ) -> opencode::client::SessionListInfo {
+        opencode::client::SessionListInfo {
+            id: id.into(),
+            title: title.into(),
+            directory: directory.into(),
+            parent_id: None,
+            agent: None,
+            model: None,
+            time: Some(opencode::client::SessionTime {
+                created: updated,
+                updated,
+                archived: None,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_shows_global_sessions_marking_own() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![
+            list_session("ses_alpha01", "外部会话", "/tmp/ext", 100),
+            list_session("ses_beta02", "本地会话", "/work/cola", 300),
+        ];
+        let (app, platform) = build_app(cfg, backend).await;
+        // Our own lobby session, so /list marks it as active/本会话.
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+                session_id: "ses_beta02".into(),
+                directory: "/work/cola".into(),
+                agent: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+        }
+
+        app.handle_command(
+            Command::List { keyword: None, all: false },
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_list",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let calls = platform.calls.lock().await.clone();
+        let text = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("外部会话"), "external session visible: {text}");
+        assert!(text.contains("本地会话"), "own session visible: {text}");
+        // The newest (updated 300) sorts first; own session marked active.
+        let pos_ext = text.find("外部会话").unwrap();
+        let pos_local = text.find("本地会话").unwrap();
+        assert!(pos_local < pos_ext, "own (newer) session sorts first: {text}");
+        assert!(text.contains("(active)") || text.contains("本会话"));
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_keyword_and_hides_children() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![
+            list_session("ses_alpha01", "重写登录模块", "/work/auth", 100),
+            list_session("ses_beta02", "修 bug", "/work/cola", 300),
+            opencode::client::SessionListInfo {
+                parent_id: Some("ses_alpha01".into()),
+                ..list_session("ses_child09", "Child session - x", "/work/auth", 400)
+            },
+        ];
+        let (app, platform) = build_app(cfg, backend).await;
+
+        // Keyword filters by title.
+        app.handle_command(
+            Command::List { keyword: Some("登录".into()), all: false },
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_list",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+        let calls = platform.calls.lock().await.clone();
+        let text = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("重写登录模块"), "keyword match: {text}");
+        assert!(!text.contains("修 bug"), "non-matching title filtered: {text}");
+
+        // Without --all the child is hidden even though it is newest.
+        platform.calls.lock().await.clear();
+        app.handle_command(
+            Command::List { keyword: None, all: false },
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_list2",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+        let calls = platform.calls.lock().await.clone();
+        let text = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("Child session"), "child hidden by default: {text}");
+
+        // --all reveals the child.
+        platform.calls.lock().await.clear();
+        app.handle_command(
+            Command::List { keyword: None, all: true },
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_list3",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+        let calls = platform.calls.lock().await.clone();
+        let text = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("child09"), "child shown with --all: {text}");
+    }
+
+    /// Repeated `/list` within the 30 s TTL must not re-hit the server; an
+    /// external rename is only visible after invalidation/expiry.
+    #[tokio::test]
+    async fn list_is_cached_within_ttl_and_invalidated_on_rename() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session("ses_alpha01", "标题 A", "/work/a", 100)];
+        let calls_counter = backend.list_sessions_calls.clone();
+        let (app, _platform) = build_app(cfg, backend).await;
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: key.clone(),
+                session_id: "ses_alpha01".into(),
+                directory: "/work/a".into(),
+                agent: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+        }
+
+        // Two /list in a row → one server fetch.
+        app.handle_command(
+            Command::List { keyword: None, all: false },
+            key.clone(),
+            "m1",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+        app.handle_command(
+            Command::List { keyword: None, all: false },
+            key.clone(),
+            "m2",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls_counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // A rename invalidates the cache → next /list refetches.
+        app.handle_command(
+            Command::Name("新名字".into()),
+            key.clone(),
+            "m3",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+        app.handle_command(
+            Command::List { keyword: None, all: false },
+            key,
+            "m4",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls_counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn attach_adopts_foreign_session_by_id() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session(
+            "ses_foreign123abc",
+            "OpenChamber 里的任务",
+            "/work/foreign",
+            100,
+        )];
+        let (app, _platform) = build_app(cfg, backend).await;
+
+        app.handle_command(
+            Command::Attach { query: "ses_foreign123abc".into(), force: false },
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_attach",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        // The thread now maps to the foreign session with its directory.
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
+        assert_eq!(entry.session_id, "ses_foreign123abc");
+        assert_eq!(entry.directory, "/work/foreign");
+    }
+
+    #[tokio::test]
+    async fn attach_rejects_session_owned_by_another_thread_without_force() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session(
+            "ses_foreign123abc",
+            "OpenChamber 里的任务",
+            "/work/foreign",
+            100,
+        )];
+        let mut platform = RecordingPlatform::new();
+        platform.chat_names.insert("oc_group_other".into(), "隔壁群".into());
+        let platform = Arc::new(platform);
+        let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
+        // Another thread already owns the session.
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new(
+                    "oc_group_other".into(),
+                    "oc_group_other".into(),
+                ),
+                session_id: "ses_foreign123abc".into(),
+                directory: "/work/foreign".into(),
+                agent: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+        }
+
+        app.handle_command(
+            Command::Attach { query: "ses_foreign123abc".into(), force: false },
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_attach",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        // Rejected: the current thread still has no session.
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        assert!(app.sessions.lock().await.get_active(&key).is_none());
+        let calls = platform.calls.lock().await.clone();
+        let text = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("隔壁群"), "rejection names the owning chat: {text}");
+        assert!(text.contains("--force"), "rejection points at --force: {text}");
+    }
+
+    #[tokio::test]
+    async fn attach_force_steals_mapping_from_other_thread() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session(
+            "ses_foreign123abc",
+            "OpenChamber 里的任务",
+            "/work/foreign",
+            100,
+        )];
+        let (app, _platform) = build_app(cfg, backend).await;
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new(
+                    "oc_group_other".into(),
+                    "oc_group_other".into(),
+                ),
+                session_id: "ses_foreign123abc".into(),
+                directory: "/work/foreign".into(),
+                agent: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+        }
+
+        app.handle_command(
+            Command::Attach { query: "ses_foreign123abc".into(), force: true },
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_attach",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        // Stolen: current thread owns it, other thread is sessionless.
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        assert_eq!(
+            app.sessions.lock().await.get_active(&key).unwrap().session_id,
+            "ses_foreign123abc"
+        );
+        let other = crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into());
+        assert!(app.sessions.lock().await.get_active(&other).is_none());
+    }
+
+    #[tokio::test]
+    async fn forget_unmaps_thread_keeping_server_session() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+                session_id: "ses_test".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+        }
+
+        app.handle_command(
+            Command::Forget,
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_forget",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        assert!(app.sessions.lock().await.get_active(&key).is_none());
+    }
+
+    #[tokio::test]
+    async fn switch_adopts_unique_foreign_session() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session(
+            "ses_alpha01",
+            "唯一外部标题",
+            "/work/ext",
+            100,
+        )];
+        let (app, _platform) = build_app(cfg, backend).await;
+
+        app.handle_command(
+            Command::Switch("唯一外部标题".into()),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_switch",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
+        assert_eq!(entry.session_id, "ses_alpha01");
+        assert_eq!(entry.directory, "/work/ext");
+    }
+
+    #[tokio::test]
+    async fn switch_ambiguous_global_match_lists_candidates() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![
+            list_session("ses_alpha01", "任务 A", "/work/a", 100),
+            list_session("ses_beta02", "任务 B", "/work/b", 200),
+        ];
+        let (app, platform) = build_app(cfg, backend).await;
+
+        app.handle_command(
+            Command::Switch("任务".into()),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_switch",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        // Ambiguous → no adoption, candidates listed.
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        assert!(app.sessions.lock().await.get_active(&key).is_none());
+        let calls = platform.calls.lock().await.clone();
+        let text = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("/attach"), "points at /attach: {text}");
+    }
+
+    #[tokio::test]
+    async fn switch_prefers_threads_own_sessions() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![
+            list_session("ses_own1", "本项目会话", "/work/cola", 500),
+            list_session("ses_foreign", "本项目会话", "/other/place", 100),
+        ];
+        let (app, _platform) = build_app(cfg, backend).await;
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+                session_id: "ses_own1".into(),
+                directory: "/work/cola".into(),
+                agent: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+                session_id: "ses_other_own".into(),
+                directory: "/work/other".into(),
+                agent: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+        }
+
+        app.handle_command(
+            Command::Switch("本项目".into()),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_switch",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        // The thread's own session wins (mapping unchanged, just active).
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        assert_eq!(
+            app.sessions.lock().await.get_active(&key).unwrap().session_id,
+            "ses_own1"
+        );
+    }
+
+    #[tokio::test]
+    async fn name_patches_server_title() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        let title_calls = backend.update_title_calls.clone();
+        let (app, _platform) = build_app(cfg, backend).await;
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+                session_id: "ses_test".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+        }
+
+        app.handle_command(
+            Command::Name("新名字".into()),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_name",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            title_calls.lock().await.as_slice(),
+            &[("ses_test".to_string(), "新名字".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn topic_with_session_rejects_selection_commands() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session(
+            "ses_foreign123abc",
+            "外部会话",
+            "/work/ext",
+            100,
+        )];
+        let (app, platform) = build_app(cfg, backend).await;
+        // The topic already owns a session.
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
+                session_id: "ses_topic_owned".into(),
+                directory: "/work/topic".into(),
+                agent: None,
+                auto_accept: false,
+                topic_anchor: Some("msg_anchor".into()),
+            });
+        }
+        let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into());
+
+        for cmd in [
+            Command::List { keyword: None, all: false },
+            Command::Switch("外部".into()),
+            Command::Attach { query: "ses_foreign123abc".into(), force: false },
+            Command::New(None),
+            Command::Dir("/work/x".into()),
+        ] {
+            platform.calls.lock().await.clear();
+            app.handle_command(cmd.clone(), topic_key.clone(), "msg_topic", crate::config::ConversationKind::Topic)
+                .await
+                .unwrap();
+            let calls = platform.calls.lock().await.clone();
+            let text = calls
+                .iter()
+                .filter_map(|c| match c {
+                    PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                text.contains("回主对话操作"),
+                "{cmd:?} must be rejected in a bound topic: {text}"
+            );
+        }
+        // The topic's session mapping is untouched.
+        assert_eq!(
+            app.sessions.lock().await.get_active(&topic_key).unwrap().session_id,
+            "ses_topic_owned"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_topic_attach_adopts_with_in_topic_anchor() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session(
+            "ses_foreign123abc",
+            "外部会话",
+            "/work/ext",
+            100,
+        )];
+        let (app, _platform) = build_app(cfg, backend).await;
+        let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_fresh".into());
+
+        app.handle_command(
+            Command::Attach { query: "ses_foreign123abc".into(), force: false },
+            topic_key.clone(),
+            "msg_topic_cmd",
+            crate::config::ConversationKind::Topic,
+        )
+        .await
+        .unwrap();
+
+        // Adopted as the topic's single session, anchored to a reply inside it.
+        let entry = app.sessions.lock().await.get_active(&topic_key).cloned().unwrap();
+        assert_eq!(entry.session_id, "ses_foreign123abc");
+        assert_eq!(entry.topic_anchor.as_deref(), Some("msg_topic_reply"));
     }
 }

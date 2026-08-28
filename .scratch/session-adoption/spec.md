@@ -32,4 +32,4 @@ identity.
 | 06 | `/name` PATCH + creation title policy | 01, 02 |
 | 07 | Topic single-session gate | 01, 03, 04 |
 
-Triage state for each issue: `needs-triage`.
+Triage state for each issue: `resolved` — all tickets implemented (2026-08-28).

@@ -44,6 +44,9 @@ pub trait Platform: Send + Sync {
     /// The display name of a user (contact API), best-effort `Ok(None)` on failure.
     async fn user_name(&self, open_id: &str) -> Result<Option<String>>;
 
+    /// The display name of a chat (im API), best-effort `Ok(None)` on failure.
+    async fn chat_name(&self, chat_id: &str) -> Result<Option<String>>;
+
     /// The bot's own open_id, used to recognise @mentions of cola itself.
     async fn bot_open_id(&self) -> Result<String>;
 
@@ -95,6 +98,10 @@ impl Platform for Client {
 
     async fn user_name(&self, open_id: &str) -> Result<Option<String>> {
         Client::user_name(self, open_id).await
+    }
+
+    async fn chat_name(&self, chat_id: &str) -> Result<Option<String>> {
+        Client::chat_name(self, chat_id).await
     }
 
     async fn bot_open_id(&self) -> Result<String> {

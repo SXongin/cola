@@ -25,15 +25,15 @@ impl ExternalFlow {
     pub(crate) async fn poll_loop(&self, app: &Arc<App>) -> crate::error::Result<()> {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(8)).await;
-            let sessions: Vec<(String, crate::config::ThreadKey, String)> = app
+            let sessions: Vec<(String, crate::config::ThreadKey)> = app
                 .sessions
                 .lock()
                 .await
                 .all_entries()
                 .into_iter()
-                .map(|e| (e.session_id.clone(), e.thread_key.clone(), e.name.clone()))
+                .map(|e| (e.session_id.clone(), e.thread_key.clone()))
                 .collect();
-            for (sid, thread_key, name) in sessions {
+            for (sid, thread_key) in sessions {
                 // While cola is answering this session, any new message is cola's own.
                 if app.inflight.lock().await.contains(&sid) {
                     continue;
@@ -60,7 +60,16 @@ impl ExternalFlow {
                         let preview = user_message_preview(&msgs, latest);
                         drop(map);
                         tracing::info!("External message on session {}: {}", sid, preview);
-                        let card = crate::feishu::card::build_external_message_card(&name, &preview);
+                        // The card title is the server's session title (ADR-0007)
+                        // — fetched on demand, never a cola-side name.
+                        let title = app
+                            .opencode
+                            .session_info(&sid, None)
+                            .await
+                            .ok()
+                            .and_then(|i| i.title)
+                            .unwrap_or_default();
+                        let card = crate::feishu::card::build_external_message_card(&title, &preview);
                         // A topic session must be reached by replying to a
                         // message INSIDE the topic (the create API rejects
                         // `receive_id_type=thread_id`). Resolve an in-topic

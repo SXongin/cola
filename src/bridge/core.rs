@@ -7,6 +7,22 @@ use crate::bridge::streaming::StreamAccumulator;
 use crate::feishu;
 use crate::opencode;
 
+/// A cached `GET /session` snapshot with its fetch time. The 30 s TTL keeps
+/// `/list`/`/switch`/`/attach` off the wire for rapid reuse; cola invalidates
+/// it immediately on create/adopt/rename.
+#[derive(Clone)]
+pub struct SessionListCache {
+    pub fetched_at: std::time::Instant,
+    pub sessions: Vec<opencode::client::SessionListInfo>,
+}
+
+impl SessionListCache {
+    /// Whether the snapshot is still fresh (fetched within the TTL).
+    pub fn fresh(&self) -> bool {
+        self.fetched_at.elapsed() < std::time::Duration::from_secs(30)
+    }
+}
+
 /// State shared across every flow: the session map, the per-session streaming
 /// accumulators, the card-id map, the double-click guard, prompt serialization,
 /// and the two adapters. Owned by the bridge coordinator ([`super::App`]) and
@@ -27,6 +43,9 @@ pub struct SharedCore {
     pub work_dir: Option<String>,
     /// Whether to send the group completion notice (from `[bridge] group_completion_notice`).
     pub group_completion_notice: bool,
+    /// Cached `GET /session` snapshot for `/list`, `/switch`, `/attach`
+    /// (30 s TTL; invalidated on create/adopt/rename).
+    pub session_list_cache: Arc<Mutex<Option<SessionListCache>>>,
     pub opencode: Arc<dyn opencode::Backend>,
     pub feishu: Arc<dyn feishu::Platform>,
 }
@@ -50,6 +69,7 @@ impl SharedCore {
                 .clone()
                 .map(|p| p.to_string_lossy().to_string()),
             group_completion_notice: cfg.bridge.group_completion_notice,
+            session_list_cache: Arc::new(Mutex::new(None)),
             opencode,
             feishu,
         })

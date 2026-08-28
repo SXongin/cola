@@ -17,14 +17,14 @@ An AI code agent provider (e.g. OpenCode). Handles session management, prompt ex
 _Avoid_: Engine, model, provider
 
 **Session**:
-A single conversation thread with an AI backend. In Feishu, one thread maps to one session. A session has a directory (project) and an optional agent selection.
+A single conversation thread with an AI backend, identified by the server's session id and `title` (the server is the single source of truth for identity, ADR-0007). A session has a directory (project) and an optional agent selection. One session maps to at most one Feishu thread at a time.
 _Avoid_: Chat, conversation, room
 
 **Thread**:
-A Feishu topic, identified by `thread_id` (`omt_...`; called "话题/topic" in the Feishu UI). A message is a topic message IFF it carries `thread_id`. The boundary that isolates one session from another (group or p2p).
+A Feishu topic, identified by `thread_id` (`omt_...`; called "话题/topic" in the Feishu UI). A message is a topic message IFF it carries `thread_id`. A thread holds exactly one session; the boundary that isolates one session from another (group or p2p).
 
 **Lobby**:
-A chat's top-level conversation: messages sent directly in a group (or p2p top-level), carrying no `thread_id`. One lobby session per chat.
+A chat's top-level conversation: messages sent directly in a group (or p2p top-level), carrying no `thread_id`. Unlike a thread, a lobby may hold several sessions (switched via `/switch`).
 _Avoid_: Main channel, root session
 
 **Project**:
@@ -46,7 +46,7 @@ _Avoid_: Widget, component, bubble
 ## Relationships
 
 - A **Bot** contains one **Platform** and one or more **Backend** adapters
-- A **Thread** contains exactly one **Session**
+- A **Thread** contains exactly one **Session** (topics only; a **Lobby** may hold several)
 - A **Session** has one **Project** and one optional **Agent**
 - A **Session** receives many **Permissions** and **Questions**
 - The **Bridge** receives **Events** from a **Backend** and renders them as **Card** updates on the **Platform**
@@ -70,7 +70,7 @@ _Avoid_: Notification, message, signal
 ## Relationships
 
 - A **Bot** contains one **Platform** and one or more **Backend** adapters
-- A **Thread** contains exactly one **Session**
+- A **Thread** contains exactly one **Session** (topics only; a **Lobby** may hold several)
 - A **Session** has one **Project** and one optional **Agent**
 - A **Session** receives many **Permissions** and **Questions**
 - The **Bridge** receives **Events** from a **Backend** and renders them as **Card** updates on the **Platform**

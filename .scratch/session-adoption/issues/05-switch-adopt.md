@@ -1,6 +1,6 @@
 # 05 - `/switch` auto-adoption
 
-Status: needs-triage
+Status: resolved
 Type: task
 Blocked by: 03
 
@@ -35,3 +35,6 @@ command to both switch and take over foreign sessions.
 ## Blocked by
 
 - 03 - `/list` global
+## Comments
+
+Implemented in one pass (2026-08-28). All tickets done together in dependency order; see commit message. Verified by `cargo test` (222 passed) and `cargo clippy --all-targets` (clean).

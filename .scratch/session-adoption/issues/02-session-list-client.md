@@ -1,6 +1,6 @@
 # 02 - Canonical session list client
 
-Status: needs-triage
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -37,3 +37,6 @@ server calls the discovery commands need, replacing the legacy dead code.
 ## Blocked by
 
 None - can start immediately
+## Comments
+
+Implemented in one pass (2026-08-28). All tickets done together in dependency order; see commit message. Verified by `cargo test` (222 passed) and `cargo clippy --all-targets` (clean).

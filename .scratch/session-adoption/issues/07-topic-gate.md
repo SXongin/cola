@@ -1,6 +1,6 @@
 # 07 - Topic single-session gate
 
-Status: needs-triage
+Status: resolved
 Type: task
 Blocked by: 01, 03, 04
 
@@ -39,3 +39,6 @@ creation commands, with the fresh-topic exception, and update `/help`.
 - 01 - Session identity from server (drop `name`)
 - 03 - `/list` global
 - 04 - `/attach` + `/forget`
+## Comments
+
+Implemented in one pass (2026-08-28). All tickets done together in dependency order; see commit message. Verified by `cargo test` (222 passed) and `cargo clippy --all-targets` (clean).

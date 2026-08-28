@@ -109,15 +109,37 @@ impl Client {
         }
     }
 
-    /// List all sessions.
-    pub async fn list_sessions(&self) -> crate::error::Result<SessionsListOutput> {
+    /// List all sessions in the shared store (canonical: `GET /session`, no
+    /// `/api` prefix — the legacy `/api/session` path is dead code). Without a
+    /// `directory` query param the whole shared store is returned, one
+    /// `Session.Info` per session (camelCase: `id`, `title`, `directory`,
+    /// `parentID`, `time.created/updated`, `agent`, `model`).
+    pub async fn list_sessions(&self) -> crate::error::Result<Vec<SessionListInfo>> {
         let resp = self
             .http()
-            .get(self.url("/api/session"))
+            .get(self.url("/session"))
             .send()
             .await?
             .error_for_status()?;
         Ok(resp.json().await?)
+    }
+
+    /// Rename a session server-side (canonical: `PATCH /session/{id}` with
+    /// `{"title": ...}`). The change is visible to every client sharing the
+    /// store (OpenChamber, CLI).
+    pub async fn update_session_title(
+        &self,
+        session_id: &str,
+        title: &str,
+    ) -> crate::error::Result<()> {
+        let body = serde_json::json!({ "title": title });
+        self.http()
+            .patch(self.url(&format!("/session/{}", session_id)))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 
     /// Create a new session with an optional directory and agent.
@@ -503,9 +525,32 @@ pub struct CreateSessionResponse {
     pub data: Session,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct SessionsListOutput {
-    pub data: Vec<Session>,
+/// One entry from the canonical `GET /session` list — `Session.Info` with the
+/// fields the discovery commands need. Server JSON uses camelCase; serde
+/// renames are required (AGENTS.md pitfall #2).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionListInfo {
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub directory: String,
+    #[serde(rename = "parentID", default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub model: Option<serde_json::Value>,
+    #[serde(default)]
+    pub time: Option<SessionTime>,
+}
+
+impl SessionListInfo {
+    /// Sub-task child sessions (created by the `task` tool) keep a `parentID`
+    /// and are excluded from `/switch` auto-adoption and the default `/list`.
+    pub fn is_child(&self) -> bool {
+        self.parent_id.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -535,6 +580,15 @@ pub struct SessionInfo {
 pub struct SessionTime {
     pub created: i64,
     pub updated: i64,
+    /// When set, the session is archived (`time.archived`, a timestamp).
+    #[serde(default)]
+    pub archived: Option<i64>,
+}
+
+impl SessionTime {
+    pub fn is_archived(&self) -> bool {
+        self.archived.is_some()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1056,6 +1110,54 @@ fn parse_model(spec: &str) -> Option<ModelInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_session_list_info_camelcase_fixture() {
+        // A real `GET /session` entry (Session.Info, camelCase). ParentID/time
+        // must map onto the serde-renamed fields (AGENTS.md pitfall #2).
+        let json = r#"{
+            "id": "ses_alpha01",
+            "slug": "alpha",
+            "projectID": "proj_x",
+            "directory": "/work/cola",
+            "parentID": "ses_parent",
+            "title": "重写登录模块",
+            "agent": "build",
+            "model": {"id": "deepseek-v4-flash", "providerID": "opencode-go"},
+            "time": {"created": 1700000000000, "updated": 1700000100000},
+            "version": "1"
+        }"#;
+        let info: SessionListInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.id, "ses_alpha01");
+        assert_eq!(info.title, "重写登录模块");
+        assert_eq!(info.directory, "/work/cola");
+        assert_eq!(info.parent_id.as_deref(), Some("ses_parent"));
+        assert_eq!(info.agent.as_deref(), Some("build"));
+        assert_eq!(info.time.as_ref().unwrap().created, 1700000000000);
+        assert_eq!(info.time.as_ref().unwrap().updated, 1700000100000);
+        assert!(info.is_child());
+    }
+
+    #[test]
+    fn child_session_list_info_is_child() {
+        let info: SessionListInfo = serde_json::from_str(
+            r#"{"id":"ses_child","title":"Child session - x","directory":"/w",
+                "parentID":"ses_parent","time":{"created":1,"updated":2}}"#,
+        )
+        .unwrap();
+        assert!(info.is_child());
+        assert_eq!(info.parent_id.as_deref(), Some("ses_parent"));
+    }
+
+    #[test]
+    fn archived_session_time_reports_archived() {
+        let info: SessionListInfo = serde_json::from_str(
+            r#"{"id":"ses_a","title":"t","directory":"/w",
+                "time":{"created":1,"updated":2,"archived":3}}"#,
+        )
+        .unwrap();
+        assert!(info.time.as_ref().unwrap().is_archived());
+    }
 
     #[test]
     fn context_used_prefers_total_over_input_delta() {

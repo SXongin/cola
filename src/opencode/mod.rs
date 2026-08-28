@@ -2,8 +2,8 @@ pub mod client;
 pub mod types;
 
 pub use client::{
-    Client, CreateSessionInput, PermissionRequest, PromptResponse, QuestionRequest, Session, SessionInfo,
-    SessionMessage,
+    Client, CreateSessionInput, PermissionRequest, PromptResponse, QuestionRequest, Session,
+    SessionInfo, SessionListInfo, SessionMessage,
 };
 
 use crate::error::Result;
@@ -18,6 +18,12 @@ pub trait Backend: Send + Sync {
     fn new_session_input(&self, directory: Option<&str>) -> CreateSessionInput;
 
     async fn create_session(&self, input: &CreateSessionInput) -> Result<Session>;
+
+    /// List every session in the shared store (canonical `GET /session`).
+    async fn list_sessions(&self) -> Result<Vec<SessionListInfo>>;
+
+    /// Rename a session server-side (`PATCH /session/{id}` with a title).
+    async fn update_session_title(&self, session_id: &str, title: &str) -> Result<()>;
 
     async fn prompt(&self, session_id: &str, text: &str) -> Result<PromptResponse>;
 
@@ -77,6 +83,14 @@ impl Backend for Client {
 
     async fn create_session(&self, input: &CreateSessionInput) -> Result<Session> {
         Client::create_session(self, input).await
+    }
+
+    async fn list_sessions(&self) -> Result<Vec<SessionListInfo>> {
+        Client::list_sessions(self).await
+    }
+
+    async fn update_session_title(&self, session_id: &str, title: &str) -> Result<()> {
+        Client::update_session_title(self, session_id, title).await
     }
 
     async fn prompt(&self, session_id: &str, text: &str) -> Result<PromptResponse> {
