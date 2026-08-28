@@ -39,6 +39,12 @@ pub struct SharedCore {
     /// Session ids with a prompt currently in flight (serializes prompts per
     /// session so concurrent messages don't clobber each other's accumulators).
     pub inflight: Arc<Mutex<HashSet<String>>>,
+    /// Per-session model override (a parsed "provider/model") set by `/model`. The
+    /// OpenCode server has no model-switch endpoint, so `/model` records the
+    /// choice here and cola sends it as a per-prompt override on the next
+    /// message (the server honors `PromptInput.model`). Not persisted — on a
+    /// cola restart a session falls back to the configured default model.
+    pub session_models: Arc<Mutex<HashMap<String, opencode::client::ModelInfo>>>,
     /// Default directory for new sessions (from `[bridge] work_dir`).
     pub work_dir: Option<String>,
     /// Whether to send the group completion notice (from `[bridge] group_completion_notice`).
@@ -63,6 +69,7 @@ impl SharedCore {
             card_message_ids: Arc::new(Mutex::new(HashMap::new())),
             answered_requests: Arc::new(Mutex::new(HashSet::new())),
             inflight: Arc::new(Mutex::new(HashSet::new())),
+            session_models: Arc::new(Mutex::new(HashMap::new())),
             work_dir: cfg
                 .bridge
                 .work_dir

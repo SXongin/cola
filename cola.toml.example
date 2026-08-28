@@ -7,12 +7,16 @@
 # default store and rewrites this URL automatically (see README); this value is
 # the fallback / preferred port when none is running (cola starts its own).
 url = "http://localhost:4096"
-# username and password are optional (for basic auth)
+# username and password are optional (for basic auth). cola discovers both from
+# the running OpenCode server automatically (password + username from its env,
+# defaulting to "opencode"); only set them here to override that.
 # username = "opencode"
 # password = ""
 # Model cola's own sessions use by default. It must exist on the server cola
-# attaches to (usually `opencode/...`, matching the shared server's providers).
-model = "opencode-go/deepseek-v4-flash"
+# attaches to. Optional: when unset (or removed), cola does NOT pin a model and
+# the OpenCode server uses ITS default model — so on most setups you can just
+# delete this line.
+# model = "opencode/deepseek-v4-flash"
 
 [feishu]
 # Your Feishu custom app's credentials. Create one at

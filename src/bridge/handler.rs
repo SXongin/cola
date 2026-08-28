@@ -256,7 +256,15 @@ impl App {
         {
             let busy = self.inflight.lock().await.contains(&session_id);
             if busy {
-                match self.opencode.prompt_async(&session_id, &text).await {
+                match self
+                    .opencode
+                    .prompt_async(
+                        &session_id,
+                        &text,
+                        self.session_model_override(&session_id).await.as_ref(),
+                    )
+                    .await
+                {
                     Ok(()) => {
                         tracing::info!(
                             "supplement: session {} in-flight, message queued to merge into current turn",
@@ -295,6 +303,14 @@ impl App {
             is_group,
         })
         .await
+    }
+
+    /// The per-session model override set by `/model`, already parsed. `None` when
+    /// the session has no override (the client then falls back to the configured
+    /// default model, or the server's own default if none is configured).
+    /// Runtime-only: a cola restart clears overrides.
+    async fn session_model_override(&self, session_id: &str) -> Option<crate::opencode::client::ModelInfo> {
+        self.session_models.lock().await.get(session_id).cloned()
     }
 
     /// The session/thread name shown as the card subtitle, formatted as
@@ -461,7 +477,14 @@ impl App {
             render_poll_loop(&render_app, render_sid, epoch_ms, render_done).await;
         });
 
-        let mut prompt_resp = self.opencode.prompt(&session_id, &text).await;
+        let mut prompt_resp = self
+            .opencode
+            .prompt(
+                &session_id,
+                &text,
+                self.session_model_override(&session_id).await.as_ref(),
+            )
+            .await;
 
         // The mapped session may not exist on the current server — e.g. it was
         // created in an old, now-abandoned store. Clear the mapping, create a
@@ -512,7 +535,14 @@ impl App {
             let render_task2 = tokio::spawn(async move {
                 render_poll_loop(&render_app2, render_sid2, epoch_ms, render_done2).await;
             });
-            prompt_resp = self.opencode.prompt(&session_id, &text).await;
+            prompt_resp = self
+                .opencode
+                .prompt(
+                    &session_id,
+                    &text,
+                    self.session_model_override(&session_id).await.as_ref(),
+                )
+                .await;
             done2.store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = render_task2.await;
         } else {
@@ -1075,8 +1105,12 @@ mod test_support {
         pub fail_prompt_count: Arc<std::sync::atomic::AtomicUsize>,
         /// Records every `prompt` call's text (asserts retry re-submits).
         pub prompt_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
+        /// Records the model passed to each `prompt` call ("provider/model").
+        pub prompt_models: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
         /// Records every `prompt_async` call's text (asserts supplement path).
         pub prompt_async_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
+        /// Records the model passed to each `prompt_async` call.
+        pub prompt_async_models: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
         /// The session id `create_session` returns.
         pub session_id: String,
         /// When true, `prompt` 404s for any session id other than `session_id`
@@ -1107,7 +1141,9 @@ mod test_support {
                 prompt_error: None,
                 fail_prompt_count: std::sync::atomic::AtomicUsize::new(0).into(),
                 prompt_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                prompt_models: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 prompt_async_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                prompt_async_models: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 session_id: "ses_test".into(),
                 stale_session_404: false,
                 session_parents: std::collections::HashMap::new(),
@@ -1172,8 +1208,13 @@ mod test_support {
             &self,
             session_id: &str,
             text: &str,
+            _model: Option<&opencode::client::ModelInfo>,
         ) -> crate::error::Result<opencode::client::PromptResponse> {
             self.prompt_calls.lock().await.push(text.to_string());
+            self.prompt_models
+                .lock()
+                .await
+                .push(_model.map(|m| format!("{}/{}", m.provider_id, m.id)));
             if self.stale_session_404 && session_id != self.session_id {
                 return Err(crate::error::BridgeError::SessionNotFound(session_id.to_string()));
             }
@@ -1197,11 +1238,20 @@ mod test_support {
             })
         }
 
-        async fn prompt_async(&self, session_id: &str, text: &str) -> crate::error::Result<()> {
+        async fn prompt_async(
+            &self,
+            session_id: &str,
+            text: &str,
+            _model: Option<&opencode::client::ModelInfo>,
+        ) -> crate::error::Result<()> {
             self.prompt_async_calls
                 .lock()
                 .await
                 .push(format!("{}:{}", session_id, text));
+            self.prompt_async_models
+                .lock()
+                .await
+                .push(_model.map(|m| format!("{}/{}", m.provider_id, m.id)));
             Ok(())
         }
 
@@ -1312,9 +1362,6 @@ mod test_support {
         async fn switch_agent(&self, _s: &str, _a: &str) -> crate::error::Result<()> {
             Ok(())
         }
-        async fn switch_model(&self, _s: &str, _m: &str) -> crate::error::Result<()> {
-            Ok(())
-        }
         async fn reconnect(&self, _url: &str, _password: &str) -> crate::error::Result<()> {
             Ok(())
         }
@@ -1329,7 +1376,7 @@ mod test_support {
                 url: "http://localhost:1".into(),
                 username: None,
                 password: None,
-                model: "test/model".into(),
+                model: Some("test/model".into()),
             },
             feishu: crate::config::FeishuConfig {
                 app_id: "app".into(),
@@ -2920,10 +2967,12 @@ mod integration_tests {
         backend.session_id = "ses_topic".into();
         let title_calls = backend.update_title_calls.clone();
         let (app, platform) = build_app(cfg, backend).await;
+        let proj = tempfile::tempdir().unwrap();
+        let proj_dir = proj.path().to_string_lossy().to_string();
 
         app.handle_command(
             Command::Topic {
-                directory: "/root/proj/lib".into(),
+                directory: proj_dir.clone(),
                 name: Some("api-refactor".into()),
             },
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
@@ -2952,7 +3001,7 @@ mod integration_tests {
             .cloned()
             .expect("topic thread_id should map to the new session");
         assert_eq!(entry.session_id, "ses_topic");
-        assert_eq!(entry.directory, "/root/proj/lib");
+        assert_eq!(entry.directory, proj_dir);
         // The named `/topic` PATCHed the server title (ADR-0007).
         assert_eq!(
             title_calls.lock().await.as_slice(),
@@ -2981,9 +3030,11 @@ mod integration_tests {
         let (app, _platform) = build_app(cfg, backend).await;
 
         // Create the topic first.
+        let proj = tempfile::tempdir().unwrap();
+        let proj_dir = proj.path().to_string_lossy().to_string();
         app.handle_command(
             Command::Topic {
-                directory: "/root/proj/lib".into(),
+                directory: proj_dir,
                 name: None,
             },
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
@@ -4359,6 +4410,208 @@ mod integration_tests {
         assert_eq!(
             title_calls.lock().await.as_slice(),
             &[("ses_test".to_string(), "新名字".to_string())]
+        );
+    }
+
+    /// `/model <provider/model>` records a per-session override (the OpenCode
+    /// server has no model-switch endpoint) and the NEXT prompt carries it.
+    #[tokio::test]
+    async fn model_command_records_override_used_on_next_prompt() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        let prompt_models = backend.prompt_models.clone();
+        let (app, _platform) = build_app(cfg, backend).await;
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+                session_id: "ses_test".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+        }
+
+        app.handle_command(
+            Command::Model("opencode-go/deepseek-v4-flash".into()),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_model",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        // The override is recorded for the session, keyed by session id.
+        let stored = app.session_models.lock().await.get("ses_test").cloned();
+        assert_eq!(
+            stored.as_ref().map(|m| m.provider_id.as_str()),
+            Some("opencode-go")
+        );
+        assert_eq!(stored.as_ref().map(|m| m.id.as_str()), Some("deepseek-v4-flash"));
+        // The override is NOT applied to an unrelated session.
+        assert!(app.session_models.lock().await.get("ses_other").is_none());
+
+        // The next message prompts with the override as the model.
+        app.handle_message(
+            "msg_prompt".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "hi".into(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            prompt_models.lock().await.as_slice(),
+            &[Some("opencode-go/deepseek-v4-flash".to_string())]
+        );
+    }
+
+    /// `/model` with a malformed value gets immediate feedback instead of a
+    /// silent no-op.
+    #[tokio::test]
+    async fn model_command_rejects_malformed_value() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+                session_id: "ses_test".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+        }
+
+        app.handle_command(
+            Command::Model("not-a-model".into()),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_model",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let calls = platform.calls.lock().await.clone();
+        let text = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("⚠️") && text.contains("<provider>/<model>"),
+            "malformed /model must reply with format guidance: {text}"
+        );
+        // Nothing was recorded.
+        assert!(app.session_models.lock().await.is_empty());
+    }
+
+    /// The `/model` override also flows through the supplement (in-flight)
+    /// prompt_async path, not just the synchronous prompt.
+    #[tokio::test]
+    async fn model_override_flows_through_supplement_path() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        let async_models = backend.prompt_async_models.clone();
+        let async_calls = backend.prompt_async_calls.clone();
+        let (app, _platform) = build_app(cfg, backend).await;
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+                session_id: "ses_test".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+            store.persist().unwrap();
+        }
+        // Record the override, then mark the session busy so the next message
+        // takes the supplement path.
+        app.session_models.lock().await.insert(
+            "ses_test".into(),
+            opencode::client::parse_model("opencode-go/deepseek-v4-flash").unwrap(),
+        );
+        app.inflight.lock().await.insert("ses_test".into());
+
+        app.handle_message(
+            "msg_supp".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "补充内容".into(),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            async_calls.lock().await.as_slice(),
+            &["ses_test:补充内容".to_string()]
+        );
+        assert_eq!(
+            async_models.lock().await.as_slice(),
+            &[Some("opencode-go/deepseek-v4-flash".to_string())]
+        );
+    }
+
+    /// `/topic` with a nonexistent directory replies a clear error and creates
+    /// neither a topic nor a session (spec: validate before creating).
+    #[tokio::test]
+    async fn topic_command_rejects_nonexistent_directory() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+        app.handle_command(
+            Command::Topic {
+                directory: "/nonexistent/dir/xyz".into(),
+                name: None,
+            },
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_topic",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let calls = platform.calls.lock().await.clone();
+        let text = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("目录不存在") && text.contains("/nonexistent/dir/xyz"),
+            "/topic with a bad dir must reply a clear error: {text}"
+        );
+        // No topic was created and nothing was mapped.
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, PlatformCall::ReplyInThread { .. })),
+            "a topic must not be created for a bad directory: {calls:?}"
+        );
+        assert!(
+            app.sessions.lock().await.all_entries().is_empty(),
+            "no session mapping should be created: {:?}",
+            app.sessions.lock().await.all_entries()
         );
     }
 

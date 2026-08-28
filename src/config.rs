@@ -47,12 +47,12 @@ pub struct OpenCodeConfig {
     pub username: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
-    #[serde(default = "default_model")]
-    pub model: String,
-}
-
-fn default_model() -> String {
-    "opencode-go/deepseek-v4-flash".to_string()
+    /// Default model for new sessions, "provider/model". When unset, cola does
+    /// NOT pin a model — the OpenCode server uses its own default model (the
+    /// server falls back to `provider.defaultModel()`), so "不写 model" just
+    /// means "用 opencode 的默认模型".
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

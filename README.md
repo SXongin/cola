@@ -25,7 +25,8 @@ A bridge bot that brings the [OpenCode](https://opencode.ai) AI coding experienc
 ```toml
 [opencode]
 url = "http://localhost:4096"          # preferred/fallback port
-model = "opencode-go/deepseek-v4-flash" # must exist on the server cola attaches to
+# model is optional: unset → cola uses the OpenCode server's default model
+# model = "opencode/deepseek-v4-flash"
 
 [feishu]
 app_id = "cli_xxxxxxxxxxxx"

@@ -65,7 +65,7 @@ impl Client {
                 base_url: cfg.url.trim_end_matches('/').to_string(),
             })),
             username: cfg.username.clone(),
-            model: parse_model(&cfg.model),
+            model: cfg.model.as_deref().and_then(parse_model),
         }
     }
 
@@ -154,16 +154,20 @@ impl Client {
     /// Send a prompt to a session using the canonical OpenCode API:
     /// `POST /session/{id}/message` with `parts`. This is the same protocol
     /// OpenChamber/TUI use, so messages land in the shared message store.
-    pub async fn prompt(&self, session_id: &str, text: &str) -> crate::error::Result<PromptResponse> {
+    ///
+    /// `model` is a per-session override from `/model` (a parsed
+    /// "provider/model"); when None the configured default model applies, and
+    /// when neither is set the server uses its own default.
+    pub async fn prompt(
+        &self,
+        session_id: &str,
+        text: &str,
+        model: Option<&ModelInfo>,
+    ) -> crate::error::Result<PromptResponse> {
         let mut body = serde_json::json!({
             "parts": [{"type": "text", "text": text}],
         });
-        if let Some(model) = &self.model {
-            body["model"] = serde_json::json!({
-                "providerID": model.provider_id,
-                "modelID": model.id,
-            });
-        }
+        inject_model(&mut body, model, self.model.as_ref());
         let resp = self
             .http()
             .post(self.url(&format!("/session/{}/message", session_id)))
@@ -265,16 +269,16 @@ impl Client {
     /// send the new message here so it lands in the DB and the running loop
     /// picks it up at the next tool boundary (merged into the current turn),
     /// without a second synchronous prompt blocking the WS read loop.
-    pub async fn prompt_async(&self, session_id: &str, text: &str) -> crate::error::Result<()> {
+    pub async fn prompt_async(
+        &self,
+        session_id: &str,
+        text: &str,
+        model: Option<&ModelInfo>,
+    ) -> crate::error::Result<()> {
         let mut body = serde_json::json!({
             "parts": [{"type": "text", "text": text}],
         });
-        if let Some(model) = &self.model {
-            body["model"] = serde_json::json!({
-                "providerID": model.provider_id,
-                "modelID": model.id,
-            });
-        }
+        inject_model(&mut body, model, self.model.as_ref());
         let resp = self
             .http()
             .post(self.url(&format!("/session/{}/prompt_async", session_id)))
@@ -496,18 +500,6 @@ impl Client {
         let body = serde_json::json!({ "agent": agent });
         self.http()
             .post(self.url(&format!("/api/session/{}/agent", session_id)))
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(())
-    }
-
-    /// Switch the model for a session.
-    pub async fn switch_model(&self, session_id: &str, model: &str) -> crate::error::Result<()> {
-        let body = serde_json::json!({ "model": model });
-        self.http()
-            .post(self.url(&format!("/api/session/{}/model", session_id)))
             .json(&body)
             .send()
             .await?
@@ -1089,7 +1081,7 @@ pub struct QuestionRequest {
 }
 
 /// Parse "provider/model" (optionally "provider/model/variant") into ModelInfo.
-fn parse_model(spec: &str) -> Option<ModelInfo> {
+pub(crate) fn parse_model(spec: &str) -> Option<ModelInfo> {
     let mut parts = spec.splitn(3, '/');
     let provider = parts.next()?;
     let id = parts.next()?;
@@ -1101,6 +1093,18 @@ fn parse_model(spec: &str) -> Option<ModelInfo> {
         provider_id: provider.to_string(),
         variant: parts.next().map(|s| s.to_string()),
     })
+}
+
+/// Attach the effective model to a prompt body: a per-session override wins
+/// over the configured default; when neither is set the server uses its own
+/// default. Shared by `prompt` and `prompt_async`.
+fn inject_model(body: &mut serde_json::Value, override_: Option<&ModelInfo>, configured: Option<&ModelInfo>) {
+    if let Some(model) = override_.or(configured) {
+        body["model"] = serde_json::json!({
+            "providerID": model.provider_id,
+            "modelID": model.id,
+        });
+    }
 }
 
 #[cfg(test)]

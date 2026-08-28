@@ -247,6 +247,7 @@ pub fn command_help(name: &str) -> Option<String> {
 
 use crate::bridge::handler::App;
 use crate::config::{ConversationKind, SessionEntry, ThreadKey};
+use crate::feishu;
 use std::sync::Arc;
 
 /// Re-exec cola itself with the ORIGINAL startup args, inheriting stdio so a
@@ -328,14 +329,40 @@ impl App {
         }
         match cmd {
             Command::Dir(path) => {
-                let session = self
+                let Some(dir_str) = resolve_directory_or_reply(
+                    &*self.feishu,
+                    message_id,
+                    &path,
+                    "`/dir`；或先用 `/new` 在默认目录新建会话。",
+                )
+                .await?
+                else {
+                    return Ok(());
+                };
+                // `/dir` opens a NEW conversation rooted at `path` (matching
+                // OpenCode's per-directory sessions), not a rename of the old
+                // one. Create the session first so a failure is reported here
+                // instead of as a cryptic card error on the next message.
+                let session = match self
                     .opencode
-                    .create_session(&self.opencode.new_session_input(Some(&path)))
-                    .await?;
+                    .create_session(&self.opencode.new_session_input(Some(&dir_str)))
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.feishu
+                            .reply_text(
+                                message_id,
+                                &format!("⚠️ 创建会话失败（目录 `{}`）：{}", dir_str, e),
+                            )
+                            .await?;
+                        return Ok(());
+                    }
+                };
                 let entry = SessionEntry {
                     thread_key: thread_key.clone(),
                     session_id: session.id.clone(),
-                    directory: path.clone(),
+                    directory: dir_str.clone(),
                     agent: None,
                     auto_accept: false,
                     topic_anchor: None,
@@ -345,7 +372,13 @@ impl App {
                 store.persist()?;
                 self.invalidate_session_list_cache().await;
                 self.feishu
-                    .reply_text(message_id, &format!("Session moved to {}", path))
+                    .reply_text(
+                        message_id,
+                        &format!(
+                            "已切换目录并新建会话（目录 `{}`）。\n后续对话都会在这个目录下进行。",
+                            dir_str
+                        ),
+                    )
                     .await?;
             }
             Command::Switch(keyword) => {
@@ -417,9 +450,14 @@ impl App {
                         .await?;
                     return Ok(());
                 }
+                let Some(dir_str) =
+                    resolve_directory_or_reply(&*self.feishu, message_id, &directory, "`/topic`。").await?
+                else {
+                    return Ok(());
+                };
                 let session = self
                     .opencode
-                    .create_session(&self.opencode.new_session_input(Some(&directory)))
+                    .create_session(&self.opencode.new_session_input(Some(&dir_str)))
                     .await?;
                 // Creation title policy (ADR-0007): a named `/topic` PATCHes the
                 // title; without a name the server default is left for
@@ -428,12 +466,12 @@ impl App {
                     self.opencode.update_session_title(&session.id, n).await?;
                 }
                 let display_name = name.unwrap_or_else(|| {
-                    directory
+                    dir_str
                         .trim_end_matches('/')
                         .rsplit('/')
                         .next()
                         .filter(|s| !s.is_empty())
-                        .unwrap_or(&directory)
+                        .unwrap_or(&dir_str)
                         .to_string()
                 });
                 // Create a real topic anchored on the user's command message.
@@ -447,7 +485,7 @@ impl App {
                         message_id,
                         &format!(
                             "📌 已创建会话 `{}`（目录 `{}`）。\n请在本话题内回复，即可和这个会话对话。",
-                            display_name, directory
+                            display_name, dir_str
                         ),
                     )
                     .await?;
@@ -468,7 +506,7 @@ impl App {
                 let entry = crate::config::SessionEntry {
                     thread_key: topic_key,
                     session_id: session.id.clone(),
-                    directory,
+                    directory: dir_str,
                     agent: None,
                     auto_accept: false,
                     topic_anchor: Some(anchor),
@@ -568,10 +606,27 @@ impl App {
                 }
             }
             Command::Model(name) => {
+                // The OpenCode server has NO model-switch endpoint (the legacy
+                // `/api/session/{id}/model` route is gone), so `/model` records
+                // a per-session override here and cola sends it as a per-prompt
+                // model on the next message. Validate the shape up front so a
+                // typo gets immediate feedback instead of a silent no-op.
                 if let Some(id) = self.get_session_id(&thread_key).await {
-                    self.opencode.switch_model(&id, &name).await?;
+                    let Some(info) = crate::opencode::client::parse_model(&name) else {
+                        self.feishu
+                            .reply_text(
+                                message_id,
+                                &format!(
+                                    "⚠️ 模型格式应为 `<provider>/<model>`，例如 `/model opencode-go/deepseek-v4-flash`。\n收到：`{}`",
+                                    name
+                                ),
+                            )
+                            .await?;
+                        return Ok(());
+                    };
+                    self.session_models.lock().await.insert(id.clone(), info);
                     self.feishu
-                        .reply_text(message_id, &format!("Model: {}", name))
+                        .reply_text(message_id, &format!("Model: {}（下一条消息开始生效）", name))
                         .await?;
                 }
             }
@@ -972,6 +1027,59 @@ fn id_tail(id: &str) -> String {
     id.strip_prefix("ses_").unwrap_or(id).chars().take(7).collect()
 }
 
+/// Normalize a user-supplied directory for `/dir` / `/topic` into an absolute
+/// path the OpenCode server can route by: expand a leading `~`, resolve
+/// relative paths against the working directory, and canonicalize (`..`,
+/// symlinks) when the path exists. OpenCode sessions are keyed by their
+/// directory and the server fails on a session created with a `~`-style or
+/// relative path, so cola must hand it a real absolute directory.
+fn normalize_directory(input: &str) -> std::path::PathBuf {
+    let home = dirs::home_dir().unwrap_or_default();
+    let expanded = if input == "~" {
+        home.clone()
+    } else if let Some(rest) = input.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        std::path::PathBuf::from(input)
+    };
+    let expanded = if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir().unwrap_or_default().join(expanded)
+    };
+    // Canonicalize (resolving `..` and symlinks) when the directory exists;
+    // otherwise keep the normalized absolute form — the caller checks
+    // `is_dir()` and reports it as missing.
+    std::fs::canonicalize(&expanded).unwrap_or(expanded)
+}
+
+/// Normalize + validate a user-supplied directory for `/dir`/`/topic`. On a
+/// bad path replies a clear error and returns `None`; otherwise returns the
+/// normalized absolute directory string.
+async fn resolve_directory_or_reply(
+    feishu: &dyn feishu::Platform,
+    message_id: &str,
+    input: &str,
+    hint: &str,
+) -> crate::error::Result<Option<String>> {
+    let dir = normalize_directory(input);
+    if !dir.is_dir() {
+        feishu
+            .reply_text(
+                message_id,
+                &format!(
+                    "⚠️ 目录不存在：`{}`（解析为 `{}`）。\n请确认路径正确后再 {}",
+                    input,
+                    dir.display(),
+                    hint
+                ),
+            )
+            .await?;
+        return Ok(None);
+    }
+    Ok(Some(dir.to_string_lossy().to_string()))
+}
+
 /// Case-insensitive keyword match on a session's title, directory or id
 /// (shared by `/list`, `/switch` and `/attach`).
 fn matches_keyword(s: &crate::opencode::SessionListInfo, lower: &str) -> bool {
@@ -1270,5 +1378,42 @@ mod tests {
                 all: false
             })
         );
+    }
+
+    #[test]
+    fn normalize_directory_expands_tilde() {
+        let home = dirs::home_dir().unwrap();
+        let sub = normalize_directory("~/.cola");
+        assert!(
+            sub.starts_with(&home),
+            "~/.cola must expand under home: {}",
+            sub.display()
+        );
+        assert!(sub.ends_with(".cola"));
+        // Bare `~` resolves to home itself.
+        let home_only = normalize_directory("~");
+        assert_eq!(home_only, home);
+    }
+
+    #[test]
+    fn normalize_directory_makes_relative_absolute() {
+        let cwd = std::env::current_dir().unwrap();
+        let abs = normalize_directory("some/relative/dir");
+        assert!(
+            abs.starts_with(&cwd),
+            "relative path must resolve against cwd: {}",
+            abs.display()
+        );
+        assert!(abs.ends_with("some/relative/dir"));
+    }
+
+    #[test]
+    fn normalize_directory_keeps_existing_absolute_path() {
+        let cwd = std::env::current_dir().unwrap();
+        let abs = normalize_directory(&cwd.to_string_lossy());
+        assert_eq!(abs, cwd, "an existing absolute path canonicalizes to itself");
+        // A nonexistent absolute path is preserved (caller reports it missing).
+        let missing = normalize_directory("/nonexistent/dir/xyz");
+        assert_eq!(missing, std::path::PathBuf::from("/nonexistent/dir/xyz"));
     }
 }

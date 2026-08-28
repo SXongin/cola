@@ -2,8 +2,8 @@ pub mod client;
 pub mod types;
 
 pub use client::{
-    Client, CreateSessionInput, PermissionRequest, PromptResponse, QuestionRequest, Session, SessionInfo,
-    SessionListInfo, SessionMessage,
+    Client, CreateSessionInput, ModelInfo, PermissionRequest, PromptResponse, QuestionRequest, Session,
+    SessionInfo, SessionListInfo, SessionMessage,
 };
 
 use crate::error::Result;
@@ -25,12 +25,16 @@ pub trait Backend: Send + Sync {
     /// Rename a session server-side (`PATCH /session/{id}` with a title).
     async fn update_session_title(&self, session_id: &str, title: &str) -> Result<()>;
 
-    async fn prompt(&self, session_id: &str, text: &str) -> Result<PromptResponse>;
+    /// `model` is the per-session `/model` override (parsed "provider/model");
+    /// None → the configured default applies, and if that's also unset the
+    /// server uses its own default model.
+    async fn prompt(&self, session_id: &str, text: &str, model: Option<&ModelInfo>)
+    -> Result<PromptResponse>;
 
     /// Fire-and-forget prompt (OpenCode `prompt_async`): message persisted and
     /// a run forked, returns immediately. Used by the supplement path so a
     /// message sent mid-turn doesn't block.
-    async fn prompt_async(&self, session_id: &str, text: &str) -> Result<()>;
+    async fn prompt_async(&self, session_id: &str, text: &str, model: Option<&ModelInfo>) -> Result<()>;
 
     async fn reply_permission(&self, request_id: &str, reply: &str, directory: Option<&str>) -> Result<()>;
 
@@ -63,8 +67,6 @@ pub trait Backend: Send + Sync {
 
     async fn switch_agent(&self, session_id: &str, agent: &str) -> Result<()>;
 
-    async fn switch_model(&self, session_id: &str, model: &str) -> Result<()>;
-
     /// Re-point the backend at a different OpenCode server (port/password
     /// changed because the server was restarted/replaced at runtime). No-op for
     /// mocks.
@@ -93,12 +95,17 @@ impl Backend for Client {
         Client::update_session_title(self, session_id, title).await
     }
 
-    async fn prompt(&self, session_id: &str, text: &str) -> Result<PromptResponse> {
-        Client::prompt(self, session_id, text).await
+    async fn prompt(
+        &self,
+        session_id: &str,
+        text: &str,
+        model: Option<&ModelInfo>,
+    ) -> Result<PromptResponse> {
+        Client::prompt(self, session_id, text, model).await
     }
 
-    async fn prompt_async(&self, session_id: &str, text: &str) -> Result<()> {
-        Client::prompt_async(self, session_id, text).await
+    async fn prompt_async(&self, session_id: &str, text: &str, model: Option<&ModelInfo>) -> Result<()> {
+        Client::prompt_async(self, session_id, text, model).await
     }
 
     async fn reply_permission(&self, request_id: &str, reply: &str, directory: Option<&str>) -> Result<()> {
@@ -148,10 +155,6 @@ impl Backend for Client {
 
     async fn switch_agent(&self, session_id: &str, agent: &str) -> Result<()> {
         Client::switch_agent(self, session_id, agent).await
-    }
-
-    async fn switch_model(&self, session_id: &str, model: &str) -> Result<()> {
-        Client::switch_model(self, session_id, model).await
     }
 
     async fn reconnect(&self, url: &str, password: &str) -> Result<()> {

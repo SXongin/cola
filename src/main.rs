@@ -78,6 +78,14 @@ async fn resolve_opencode_server(cfg: &mut config::OpenCodeConfig) -> anyhow::Re
     if let Some(server) = bridge::discovery::select_server(&candidates, preferred_port).cloned() {
         cfg.url = format!("http://localhost:{}", server.port);
         cfg.password = Some(server.password);
+        // The server's effective username (OPENCODE_SERVER_USERNAME, default
+        // "opencode"). Without it cola sends no Authorization header and the
+        // server 401s even when the discovered password is correct. An
+        // explicitly configured username wins (a deliberate override, e.g.
+        // when the server env isn't readable on this platform).
+        if cfg.username.is_none() {
+            cfg.username = Some(server.username);
+        }
         tracing::info!("Attached to OpenCode server at {}", cfg.url);
         return Ok(());
     }
@@ -97,6 +105,11 @@ async fn resolve_opencode_server(cfg: &mut config::OpenCodeConfig) -> anyhow::Re
     wait_for_port(port).await?;
     cfg.url = format!("http://localhost:{}", port);
     cfg.password = Some(password);
+    // cola's own server strips an inherited username (self_start_command) and
+    // always uses the server default `opencode` — send exactly that, even if
+    // the user configured a different username (that override only applies to
+    // an ATTACHED server; cola's own server never accepts anything else).
+    cfg.username = Some(bridge::discovery::DEFAULT_SERVER_USERNAME.to_string());
     Ok(())
 }
 

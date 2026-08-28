@@ -270,6 +270,9 @@ impl QuestionFlow {
                         r.card = None;
                     }
                     r.toast = Some("已回答".to_string());
+                    if inline {
+                        flush_inline_card(app, &host, session_id).await;
+                    }
                     Some(r)
                 } else if inline {
                     // Inline: the streaming card re-renders with the updated
@@ -279,6 +282,11 @@ impl QuestionFlow {
                         toast: None,
                     };
                     r.toast = Some(format!("已记录答案，还有 {} 题未答", n - answered_count));
+                    // Re-render the streaming card NOW so the answered question
+                    // shows ✅/已选 and its buttons disappear. Without this the
+                    // card stays frozen: a question-blocked prompt produces no
+                    // new parts, so the render poll never flushes.
+                    flush_inline_card(app, &host, session_id).await;
                     Some(r)
                 } else {
                     // Still questions left: return an updated card that shows the
@@ -371,6 +379,9 @@ impl QuestionFlow {
                     r.card = None;
                 }
                 r.toast = Some("已提交".to_string());
+                if inline {
+                    flush_inline_card(app, &host, session_id).await;
+                }
                 Some(r)
             }
             "reject" => {
@@ -410,11 +421,22 @@ impl QuestionFlow {
                     r.card = None;
                 }
                 r.toast = Some("已拒绝回答".to_string());
+                if inline {
+                    flush_inline_card(app, &host, session_id).await;
+                }
                 Some(r)
             }
             _ => None,
         }
     }
+}
+
+/// Re-render the live streaming card so inline question state (✅/已选, removed
+/// buttons) shows immediately. A question-blocked prompt produces no new parts,
+/// so without an explicit flush the render poll never fires until the AI
+/// resumes — the card would stay frozen on the pre-answer state.
+async fn flush_inline_card(app: &Arc<App>, host: &Option<String>, session_id: &str) {
+    crate::bridge::render::flush_card(app, host.as_deref().unwrap_or(session_id)).await;
 }
 
 /// Record one answer into the partial-answer slots for a question request.

@@ -15,11 +15,21 @@ pub struct ServerCandidate {
     pub pid: i32,
     pub port: u16,
     pub password: String,
+    /// The server's EFFECTIVE basic-auth username: `OPENCODE_SERVER_USERNAME`
+    /// if the server sets it, else the server's own default `"opencode"` (see
+    /// opencode `packages/opencode/src/server/auth.ts`). cola must send Basic
+    /// auth with BOTH parts or the server answers 401 even when the password
+    /// matches (`authorized()` checks username equality too).
+    pub username: String,
     /// Whether the server reads the default store (the directory OpenCode
     /// itself resolves as its default data home — `$XDG_DATA_HOME` if set,
     /// else `~/.local/share` — on every platform).
     pub uses_default_store: bool,
 }
+
+/// The basic-auth username an `opencode serve` accepts. Mirrors the server's
+/// own default (`auth.ts`): `OPENCODE_SERVER_USERNAME` if set, else `opencode`.
+pub(crate) const DEFAULT_SERVER_USERNAME: &str = "opencode";
 
 /// The data directory OpenCode resolves as its default on every platform.
 ///
@@ -38,6 +48,17 @@ fn default_data_home() -> std::path::PathBuf {
                 .join(".local")
                 .join("share")
         })
+}
+
+/// The effective basic-auth username of a server, from its environment lines
+/// (`KEY=VALUE` pairs as sysinfo returns them). `OPENCODE_SERVER_USERNAME` if
+/// set, else the server's own default `"opencode"`.
+fn username_from_env(env: &[String]) -> String {
+    env.iter()
+        .find_map(|kv| kv.strip_prefix("OPENCODE_SERVER_USERNAME="))
+        .filter(|u| !u.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| DEFAULT_SERVER_USERNAME.to_string())
 }
 
 /// Scan for running `opencode serve` processes. Thin I/O — the interesting
@@ -83,6 +104,7 @@ pub fn scan_processes() -> Vec<ServerCandidate> {
                 .find_map(|kv| kv.strip_prefix("OPENCODE_SERVER_PASSWORD="))
                 .unwrap_or("")
                 .to_string();
+            let username = username_from_env(&env);
             let xdg = env
                 .iter()
                 .find_map(|kv| kv.strip_prefix("XDG_DATA_HOME="))
@@ -100,6 +122,7 @@ pub fn scan_processes() -> Vec<ServerCandidate> {
                 pid: proc_.pid().as_u32() as i32,
                 port,
                 password,
+                username,
                 uses_default_store,
             })
         })
@@ -148,7 +171,16 @@ pub fn self_start_command(port: u16, password: &str) -> SpawnCommand {
             "127.0.0.1".to_string(),
         ],
         env: vec![("OPENCODE_SERVER_PASSWORD".to_string(), password.to_string())],
-        remove_env: vec!["XDG_DATA_HOME".to_string()],
+        // The server MUST land on the DEFAULT store so sessions are shared with
+        // OpenChamber / the CLI: strip any inherited XDG_DATA_HOME rather than
+        // pinning a private one. Likewise strip an inherited username so the
+        // server uses its default `opencode` — cola's client sends exactly that,
+        // so a mismatched inherited username can't cause 401s against cola's
+        // own server.
+        remove_env: vec![
+            "XDG_DATA_HOME".to_string(),
+            "OPENCODE_SERVER_USERNAME".to_string(),
+        ],
     }
 }
 
@@ -397,6 +429,7 @@ mod tests {
             pid,
             port,
             password: password.into(),
+            username: DEFAULT_SERVER_USERNAME.into(),
             uses_default_store,
         }
     }
@@ -446,6 +479,9 @@ mod tests {
         // OpenChamber / the CLI: strip any inherited XDG_DATA_HOME rather than
         // pinning a private one.
         assert!(cmd.remove_env.contains(&"XDG_DATA_HOME".to_string()));
+        // A cola-spawned server must use the DEFAULT username `opencode`, so
+        // cola's own client (which sends that) never 401s against it.
+        assert!(cmd.remove_env.contains(&"OPENCODE_SERVER_USERNAME".to_string()));
     }
 
     #[test]
@@ -511,6 +547,41 @@ mod tests {
         assert!(!cmd.is_empty());
         // A non-existent pid yields no cmdline.
         assert!(process_cmd(999_999_999).is_none());
+    }
+
+    #[test]
+    fn username_defaults_to_opencode_when_unset() {
+        // A server started by OpenChamber sets only the password; the username
+        // then defaults to `opencode` server-side (auth.ts).
+        let env = vec![
+            "OPENCODE_SERVER_PASSWORD=secret".to_string(),
+            "PATH=/usr/bin".to_string(),
+        ];
+        assert_eq!(username_from_env(&env), "opencode");
+    }
+
+    #[test]
+    fn username_from_server_env_when_set() {
+        let env = vec![
+            "OPENCODE_SERVER_USERNAME=admin".to_string(),
+            "OPENCODE_SERVER_PASSWORD=secret".to_string(),
+        ];
+        assert_eq!(username_from_env(&env), "admin");
+    }
+
+    #[test]
+    fn username_ignores_empty_env_value() {
+        // An empty OPENCODE_SERVER_USERNAME must fall back to the default, not
+        // produce an empty credential (Basic with an empty username fails).
+        let env = vec!["OPENCODE_SERVER_USERNAME=".to_string()];
+        assert_eq!(username_from_env(&env), "opencode");
+    }
+
+    #[test]
+    fn username_defaults_when_env_unreadable() {
+        // macOS/Windows may hide another process's env; an empty env degrades
+        // to the default username, matching the server default.
+        assert_eq!(username_from_env(&[]), "opencode");
     }
 
     #[test]
