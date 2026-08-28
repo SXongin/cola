@@ -121,6 +121,7 @@ mod tests {
             session_id: session_id.into(),
             directory: dir.into(),
             agent: None,
+            model: None,
             auto_accept: false,
             topic_anchor: None,
         }

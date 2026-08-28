@@ -262,6 +262,7 @@ impl App {
                         &session_id,
                         &text,
                         self.session_model_override(&session_id).await.as_ref(),
+                        self.session_agent_override(&session_id).await.as_deref(),
                     )
                     .await
                 {
@@ -303,14 +304,6 @@ impl App {
             is_group,
         })
         .await
-    }
-
-    /// The per-session model override set by `/model`, already parsed. `None` when
-    /// the session has no override (the client then falls back to the configured
-    /// default model, or the server's own default if none is configured).
-    /// Runtime-only: a cola restart clears overrides.
-    async fn session_model_override(&self, session_id: &str) -> Option<crate::opencode::client::ModelInfo> {
-        self.session_models.lock().await.get(session_id).cloned()
     }
 
     /// The session/thread name shown as the card subtitle, formatted as
@@ -483,6 +476,7 @@ impl App {
                 &session_id,
                 &text,
                 self.session_model_override(&session_id).await.as_ref(),
+                self.session_agent_override(&session_id).await.as_deref(),
             )
             .await;
 
@@ -541,6 +535,7 @@ impl App {
                     &session_id,
                     &text,
                     self.session_model_override(&session_id).await.as_ref(),
+                    self.session_agent_override(&session_id).await.as_deref(),
                 )
                 .await;
             done2.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -793,6 +788,7 @@ impl App {
             session_id: session.id.clone(),
             directory,
             agent: None,
+            model: None,
             auto_accept: false,
             topic_anchor: None,
         };
@@ -1107,10 +1103,14 @@ mod test_support {
         pub prompt_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
         /// Records the model passed to each `prompt` call ("provider/model").
         pub prompt_models: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
+        /// Records the agent passed to each `prompt` call.
+        pub prompt_agents: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
         /// Records every `prompt_async` call's text (asserts supplement path).
         pub prompt_async_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
         /// Records the model passed to each `prompt_async` call.
         pub prompt_async_models: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
+        /// Records the agent passed to each `prompt_async` call.
+        pub prompt_async_agents: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
         /// The session id `create_session` returns.
         pub session_id: String,
         /// When true, `prompt` 404s for any session id other than `session_id`
@@ -1142,8 +1142,10 @@ mod test_support {
                 fail_prompt_count: std::sync::atomic::AtomicUsize::new(0).into(),
                 prompt_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 prompt_models: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                prompt_agents: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 prompt_async_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 prompt_async_models: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                prompt_async_agents: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 session_id: "ses_test".into(),
                 stale_session_404: false,
                 session_parents: std::collections::HashMap::new(),
@@ -1209,12 +1211,14 @@ mod test_support {
             session_id: &str,
             text: &str,
             _model: Option<&opencode::client::ModelInfo>,
+            agent: Option<&str>,
         ) -> crate::error::Result<opencode::client::PromptResponse> {
             self.prompt_calls.lock().await.push(text.to_string());
             self.prompt_models
                 .lock()
                 .await
                 .push(_model.map(|m| format!("{}/{}", m.provider_id, m.id)));
+            self.prompt_agents.lock().await.push(agent.map(|s| s.to_string()));
             if self.stale_session_404 && session_id != self.session_id {
                 return Err(crate::error::BridgeError::SessionNotFound(session_id.to_string()));
             }
@@ -1243,6 +1247,7 @@ mod test_support {
             session_id: &str,
             text: &str,
             _model: Option<&opencode::client::ModelInfo>,
+            agent: Option<&str>,
         ) -> crate::error::Result<()> {
             self.prompt_async_calls
                 .lock()
@@ -1252,6 +1257,10 @@ mod test_support {
                 .lock()
                 .await
                 .push(_model.map(|m| format!("{}/{}", m.provider_id, m.id)));
+            self.prompt_async_agents
+                .lock()
+                .await
+                .push(agent.map(|s| s.to_string()));
             Ok(())
         }
 
@@ -1357,9 +1366,6 @@ mod test_support {
             Ok(())
         }
         async fn compact(&self, _s: &str) -> crate::error::Result<()> {
-            Ok(())
-        }
-        async fn switch_agent(&self, _s: &str, _a: &str) -> crate::error::Result<()> {
             Ok(())
         }
         async fn reconnect(&self, _url: &str, _password: &str) -> crate::error::Result<()> {
@@ -1740,6 +1746,7 @@ mod integration_tests {
                 session_id: "ses_01ba0ed03ffeRvYNWua6mg8d9c".into(),
                 directory: "/tmp/x".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -1773,6 +1780,7 @@ mod integration_tests {
                 session_id: "ses_00ea4e77cffez1fo4wrNuJyHF0".into(),
                 directory: "/tmp/y".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -1802,6 +1810,7 @@ mod integration_tests {
                 session_id: "ses_test".into(),
                 directory: "/tmp/x".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -1839,6 +1848,7 @@ mod integration_tests {
                 session_id: "ses_test".into(),
                 directory: "/tmp/x".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -2085,6 +2095,7 @@ mod integration_tests {
                 session_id: "ses_test".into(),
                 directory: "/tmp/aa".into(),
                 agent: None,
+                model: None,
                 auto_accept: true,
                 topic_anchor: None,
             });
@@ -2149,6 +2160,7 @@ mod integration_tests {
                 session_id: "ses_test".into(),
                 directory: "/tmp/aa".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -2210,6 +2222,7 @@ mod integration_tests {
                 session_id: "ses_test".into(),
                 directory: "/tmp/aa".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -2291,6 +2304,7 @@ mod integration_tests {
                 session_id: "ses_ext".into(),
                 directory: "/tmp/ext".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -2351,6 +2365,7 @@ mod integration_tests {
                 session_id: "ses_ext".into(),
                 directory: "/tmp/ext".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -2537,6 +2552,7 @@ mod integration_tests {
                 session_id: "ses_test".into(),
                 directory: "/tmp/aa".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -2613,6 +2629,7 @@ mod integration_tests {
                 session_id: "ses_topic".into(),
                 directory: "/tmp/topic".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: Some("msg_in_topic_anchor".into()),
             });
@@ -3237,6 +3254,7 @@ mod integration_tests {
                 session_id: "ses_lobby".into(),
                 directory: "/tmp/lobby".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -3245,6 +3263,7 @@ mod integration_tests {
                 session_id: "ses_topic".into(),
                 directory: "/tmp/topic".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -3323,6 +3342,7 @@ mod integration_tests {
                 session_id: "ses_top".into(),
                 directory: "/tmp/top".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -3331,6 +3351,7 @@ mod integration_tests {
                 session_id: "ses_p2p_topic".into(),
                 directory: "/tmp/ptopic".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -3397,6 +3418,7 @@ mod integration_tests {
                 session_id: "ses_old2".into(),
                 directory: "/tmp/old2".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -3405,6 +3427,7 @@ mod integration_tests {
                 session_id: "ses_old".into(),
                 directory: "/tmp/old".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -3487,6 +3510,7 @@ mod integration_tests {
                 session_id: "ses_1".into(),
                 directory: "/work".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -3825,6 +3849,7 @@ mod integration_tests {
                 session_id: "ses_test".into(),
                 directory: "/tmp/aa".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -3904,6 +3929,7 @@ mod integration_tests {
                 session_id: "ses_beta02".into(),
                 directory: "/work/cola".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -4047,6 +4073,7 @@ mod integration_tests {
                 session_id: "ses_alpha01".into(),
                 directory: "/work/a".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -4159,6 +4186,7 @@ mod integration_tests {
                 session_id: "ses_foreign123abc".into(),
                 directory: "/work/foreign".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -4212,6 +4240,7 @@ mod integration_tests {
                 session_id: "ses_foreign123abc".into(),
                 directory: "/work/foreign".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -4252,6 +4281,7 @@ mod integration_tests {
                 session_id: "ses_test".into(),
                 directory: "/tmp/aa".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -4348,6 +4378,7 @@ mod integration_tests {
                 session_id: "ses_own1".into(),
                 directory: "/work/cola".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -4356,6 +4387,7 @@ mod integration_tests {
                 session_id: "ses_other_own".into(),
                 directory: "/work/other".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -4393,6 +4425,7 @@ mod integration_tests {
                 session_id: "ses_test".into(),
                 directory: "/tmp/aa".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -4430,6 +4463,7 @@ mod integration_tests {
                 session_id: "ses_test".into(),
                 directory: "/tmp/aa".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -4444,15 +4478,14 @@ mod integration_tests {
         .await
         .unwrap();
 
-        // The override is recorded for the session, keyed by session id.
-        let stored = app.session_models.lock().await.get("ses_test").cloned();
-        assert_eq!(
-            stored.as_ref().map(|m| m.provider_id.as_str()),
-            Some("opencode-go")
-        );
-        assert_eq!(stored.as_ref().map(|m| m.id.as_str()), Some("deepseek-v4-flash"));
+        // The override is recorded on the session's persisted entry.
+        let stored = {
+            let store = app.sessions.lock().await;
+            store.entry_for_session("ses_test").and_then(|e| e.model.clone())
+        };
+        assert_eq!(stored.as_deref(), Some("opencode-go/deepseek-v4-flash"));
         // The override is NOT applied to an unrelated session.
-        assert!(app.session_models.lock().await.get("ses_other").is_none());
+        assert!(app.sessions.lock().await.entry_for_session("ses_other").is_none());
 
         // The next message prompts with the override as the model.
         app.handle_message(
@@ -4485,6 +4518,7 @@ mod integration_tests {
                 session_id: "ses_test".into(),
                 directory: "/tmp/aa".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
@@ -4513,7 +4547,11 @@ mod integration_tests {
             "malformed /model must reply with format guidance: {text}"
         );
         // Nothing was recorded.
-        assert!(app.session_models.lock().await.is_empty());
+        let stored = {
+            let store = app.sessions.lock().await;
+            store.entry_for_session("ses_test").and_then(|e| e.model.clone())
+        };
+        assert!(stored.is_none(), "malformed /model must not record an override");
     }
 
     /// The `/model` override also flows through the supplement (in-flight)
@@ -4534,17 +4572,21 @@ mod integration_tests {
                 session_id: "ses_test".into(),
                 directory: "/tmp/aa".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: None,
             });
             store.persist().unwrap();
         }
-        // Record the override, then mark the session busy so the next message
-        // takes the supplement path.
-        app.session_models.lock().await.insert(
-            "ses_test".into(),
-            opencode::client::parse_model("opencode-go/deepseek-v4-flash").unwrap(),
-        );
+        // Record the override on the persisted entry, then mark the session
+        // busy so the next message takes the supplement path.
+        {
+            let mut store = app.sessions.lock().await;
+            let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+            let mut entry = store.get_active(&key).unwrap().clone();
+            entry.model = Some("opencode-go/deepseek-v4-flash".into());
+            store.set_active(entry);
+        }
         app.inflight.lock().await.insert("ses_test".into());
 
         app.handle_message(
@@ -4565,6 +4607,182 @@ mod integration_tests {
             async_models.lock().await.as_slice(),
             &[Some("opencode-go/deepseek-v4-flash".to_string())]
         );
+    }
+
+    /// `/agent <name>` records a per-session override (the OpenCode server has
+    /// no agent-switch endpoint) and the NEXT prompt carries it.
+    #[tokio::test]
+    async fn agent_command_records_override_used_on_next_prompt() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        let prompt_agents = backend.prompt_agents.clone();
+        let (app, _platform) = build_app(cfg, backend).await;
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+                session_id: "ses_test".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+        }
+
+        app.handle_command(
+            Command::Agent("primary".into()),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_agent",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        // The override is recorded on the session's persisted entry.
+        let stored = {
+            let store = app.sessions.lock().await;
+            store.entry_for_session("ses_test").and_then(|e| e.agent.clone())
+        };
+        assert_eq!(stored.as_deref(), Some("primary"));
+        // The override is NOT applied to an unrelated session.
+        assert!(app.sessions.lock().await.entry_for_session("ses_other").is_none());
+
+        // The next message prompts with the override as the agent.
+        app.handle_message(
+            "msg_prompt".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "hi".into(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            prompt_agents.lock().await.as_slice(),
+            &[Some("primary".to_string())]
+        );
+    }
+
+    /// The `/agent` override also flows through the supplement (in-flight)
+    /// prompt_async path, not just the synchronous prompt.
+    #[tokio::test]
+    async fn agent_override_flows_through_supplement_path() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        let async_agents = backend.prompt_async_agents.clone();
+        let async_calls = backend.prompt_async_calls.clone();
+        let (app, _platform) = build_app(cfg, backend).await;
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+                session_id: "ses_test".into(),
+                directory: "/tmp/aa".into(),
+                agent: Some("primary".into()),
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+            store.persist().unwrap();
+        }
+        app.inflight.lock().await.insert("ses_test".into());
+
+        app.handle_message(
+            "msg_supp".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "补充内容".into(),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            async_calls.lock().await.as_slice(),
+            &["ses_test:补充内容".to_string()]
+        );
+        assert_eq!(
+            async_agents.lock().await.as_slice(),
+            &[Some("primary".to_string())]
+        );
+    }
+
+    /// `/model` and `/agent` overrides are persisted in sessions.json, so a cola
+    /// restart (which reloads the store) keeps them.
+    #[tokio::test]
+    async fn model_override_persists_across_store_reload() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+                session_id: "ses_test".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+        }
+
+        app.handle_command(
+            Command::Model("opencode-go/deepseek-v4-flash".into()),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_model",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        // A freshly-loaded store (as after a restart) still has the override.
+        let reloaded = crate::bridge::session::SessionStore::new(dir.path().join("sessions.json")).unwrap();
+        let entry = reloaded
+            .entry_for_session("ses_test")
+            .expect("session mapping survives reload");
+        assert_eq!(entry.model.as_deref(), Some("opencode-go/deepseek-v4-flash"));
+    }
+
+    /// `/model`, `/agent`, `/stop` and `/compact` used to silently no-op on a
+    /// thread with no mapped session; they now reply a hint instead.
+    #[tokio::test]
+    async fn session_commands_reply_hint_without_mapped_session() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let kind = crate::config::ConversationKind::P2p;
+
+        for (cmd, msg) in [
+            (Command::Model("opencode-go/deepseek-v4-flash".into()), "msg_m"),
+            (Command::Agent("build".into()), "msg_a"),
+            (Command::Stop, "msg_s"),
+            (Command::Compact, "msg_c"),
+        ] {
+            app.handle_command(cmd, key.clone(), msg, kind).await.unwrap();
+        }
+
+        let text = platform
+            .calls
+            .lock()
+            .await
+            .clone()
+            .into_iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyText { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("还没有会话"), "every command must hint: {text}");
     }
 
     /// `/topic` with a nonexistent directory replies a clear error and creates
@@ -4631,6 +4849,7 @@ mod integration_tests {
                 session_id: "ses_topic_owned".into(),
                 directory: "/work/topic".into(),
                 agent: None,
+                model: None,
                 auto_accept: false,
                 topic_anchor: Some("msg_anchor".into()),
             });

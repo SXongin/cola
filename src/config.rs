@@ -172,8 +172,17 @@ pub struct SessionEntry {
     pub thread_key: ThreadKey,
     pub session_id: String,
     pub directory: String,
+    /// Per-session agent override set by `/agent`, sent as a per-prompt
+    /// `PromptInput.agent` on the next message. Persisted so it survives a cola
+    /// restart; when `None` the server's default agent applies.
     #[serde(default)]
     pub agent: Option<String>,
+    /// Per-session model override ("provider/model") set by `/model`, sent as a
+    /// per-prompt `PromptInput.model` on the next message. Persisted so it
+    /// survives a cola restart; when `None` the configured default (or the
+    /// server's own default) applies.
+    #[serde(default)]
+    pub model: Option<String>,
     /// When true, pending permission requests for this session are answered
     /// automatically (`/autoaccept`) instead of showing a Feishu card.
     #[serde(default)]

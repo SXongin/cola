@@ -175,8 +175,8 @@ pub fn help_text() -> String {
 `/name <name>` · Rename current session (server-side)
 `/stop` · Interrupt execution
 `/compact` · Compact context
-`/agent <name>` · Switch agent
-`/model <p/m>` · Switch model
+`/agent <name>` · Switch agent (takes effect next message)
+`/model <p/m>` · Switch model (takes effect next message)
 `/autoaccept` · Show auto-approve status; `/autoaccept on|off` switches
 `/restart` · Restart cola (keeps startup args + log redirect)
 `/restart-opencode` · Restart the OpenCode server (only when cola started it)
@@ -220,9 +220,11 @@ pub fn command_help(name: &str) -> Option<String> {
         "compact" => {
             "/compact\nCompact the current session's context: summarize older messages to free context window."
         }
-        "agent" => "/agent <name>\nSwitch the agent used by the current session.\nExample: `/agent build`",
+        "agent" => {
+            "/agent <name>\nSwitch the agent for the current session — a per-session override sent on the NEXT message (the OpenCode server has no agent-switch endpoint; the session's own/default agent otherwise). Persisted across restarts. Unknown agent names surface as an error on the next prompt.\nExample: `/agent build`"
+        }
         "model" => {
-            "/model <provider/model>\nSwitch the model for the current session.\nExample: `/model opencode-go/deepseek-v4-flash`"
+            "/model <provider/model>\nSwitch the model for the current session — a per-session override sent on the NEXT message (the server has no model-switch endpoint; unset = the configured default / server default). Persisted across restarts.\nExample: `/model opencode-go/deepseek-v4-flash`"
         }
         "autoaccept" => {
             "/autoaccept [on|off]\nShow or switch auto-allowing permission requests for this session (no permission cards).\nNo arg: show current state. `/autoaccept on` / `/autoaccept off` switch it.\nExample: `/autoaccept`"
@@ -364,6 +366,7 @@ impl App {
                     session_id: session.id.clone(),
                     directory: dir_str.clone(),
                     agent: None,
+                    model: None,
                     auto_accept: false,
                     topic_anchor: None,
                 };
@@ -406,6 +409,7 @@ impl App {
                     session_id: session.id.clone(),
                     directory,
                     agent: None,
+                    model: None,
                     auto_accept: false,
                     topic_anchor: None,
                 };
@@ -508,6 +512,7 @@ impl App {
                     session_id: session.id.clone(),
                     directory: dir_str,
                     agent: None,
+                    model: None,
                     auto_accept: false,
                     topic_anchor: Some(anchor),
                 };
@@ -589,46 +594,84 @@ impl App {
                 if let Some(id) = self.get_session_id(&thread_key).await {
                     self.opencode.interrupt(&id).await?;
                     self.feishu.reply_text(message_id, "Interrupted.").await?;
+                } else {
+                    self.feishu
+                        .reply_text(message_id, "当前没有正在执行的会话。")
+                        .await?;
                 }
             }
             Command::Compact => {
                 if let Some(id) = self.get_session_id(&thread_key).await {
                     self.opencode.compact(&id).await?;
                     self.feishu.reply_text(message_id, "Compacting...").await?;
+                } else {
+                    self.feishu
+                        .reply_text(message_id, "当前对话还没有会话，无需压缩。")
+                        .await?;
                 }
             }
             Command::Agent(name) => {
-                if let Some(id) = self.get_session_id(&thread_key).await {
-                    self.opencode.switch_agent(&id, &name).await?;
+                // The OpenCode server has no agent-switch endpoint (the legacy
+                // `/api/session/{id}/agent` route 500s, same as `/model`'s dead
+                // route), so `/agent` records a per-session override here — persisted
+                // in the SessionEntry so it survives a restart — and cola sends it as
+                // a per-prompt agent on the next message (the server honors
+                // `PromptInput.agent`). Unknown agent names surface as a clear error
+                // on the next prompt's card.
+                let entry = {
+                    let store = self.sessions.lock().await;
+                    store.get_active(&thread_key).cloned()
+                };
+                let Some(mut entry) = entry else {
                     self.feishu
-                        .reply_text(message_id, &format!("Agent: {}", name))
+                        .reply_text(message_id, "⚠️ 当前对话还没有会话，先用 `/new` 或 `/dir` 创建。")
                         .await?;
+                    return Ok(());
+                };
+                entry.agent = Some(name.clone());
+                {
+                    let mut store = self.sessions.lock().await;
+                    store.set_active(entry);
+                    store.persist()?;
                 }
+                self.feishu
+                    .reply_text(message_id, &format!("Agent: {}（下一条消息开始生效）", name))
+                    .await?;
             }
             Command::Model(name) => {
                 // The OpenCode server has NO model-switch endpoint (the legacy
                 // `/api/session/{id}/model` route is gone), so `/model` records
                 // a per-session override here and cola sends it as a per-prompt
                 // model on the next message. Validate the shape up front so a
-                // typo gets immediate feedback instead of a silent no-op.
-                if let Some(id) = self.get_session_id(&thread_key).await {
-                    let Some(info) = crate::opencode::client::parse_model(&name) else {
-                        self.feishu
-                            .reply_text(
-                                message_id,
-                                &format!(
-                                    "⚠️ 模型格式应为 `<provider>/<model>`，例如 `/model opencode-go/deepseek-v4-flash`。\n收到：`{}`",
-                                    name
-                                ),
-                            )
-                            .await?;
-                        return Ok(());
-                    };
-                    self.session_models.lock().await.insert(id.clone(), info);
+                // typo gets immediate feedback instead of a silent no-op. The
+                // override is persisted in the SessionEntry (survives restart).
+                let Some(_) = crate::opencode::client::parse_model(&name) else {
                     self.feishu
-                        .reply_text(message_id, &format!("Model: {}（下一条消息开始生效）", name))
+                        .reply_text(
+                            message_id,
+                            &format!(
+                                "⚠️ 模型格式应为 `<provider>/<model>`，例如 `/model opencode-go/deepseek-v4-flash`。\n收到：`{}`",
+                                name
+                            ),
+                        )
                         .await?;
+                    return Ok(());
+                };
+                let Some(mut entry) = self.sessions.lock().await.get_active(&thread_key).cloned() else {
+                    self.feishu
+                        .reply_text(message_id, "⚠️ 当前对话还没有会话，先用 `/new` 或 `/dir` 创建。")
+                        .await?;
+                    return Ok(());
+                };
+                entry.model = Some(name.clone());
+                {
+                    let mut store = self.sessions.lock().await;
+                    store.set_active(entry);
+                    store.persist()?;
                 }
+                self.feishu
+                    .reply_text(message_id, &format!("Model: {}（下一条消息开始生效）", name))
+                    .await?;
             }
             Command::Help(target) => {
                 let text = match target {
@@ -998,6 +1041,7 @@ impl App {
             session_id: info.id.clone(),
             directory: info.directory.clone(),
             agent: info.agent.clone(),
+            model: None,
             auto_accept: false,
             topic_anchor: anchor,
         };

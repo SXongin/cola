@@ -158,16 +158,22 @@ impl Client {
     /// `model` is a per-session override from `/model` (a parsed
     /// "provider/model"); when None the configured default model applies, and
     /// when neither is set the server uses its own default.
+    ///
+    /// `agent` is a per-session override from `/agent`; when Some the server
+    /// uses that agent for this turn (the session's own/default agent
+    /// otherwise).
     pub async fn prompt(
         &self,
         session_id: &str,
         text: &str,
         model: Option<&ModelInfo>,
+        agent: Option<&str>,
     ) -> crate::error::Result<PromptResponse> {
         let mut body = serde_json::json!({
             "parts": [{"type": "text", "text": text}],
         });
         inject_model(&mut body, model, self.model.as_ref());
+        inject_agent(&mut body, agent);
         let resp = self
             .http()
             .post(self.url(&format!("/session/{}/message", session_id)))
@@ -274,11 +280,13 @@ impl Client {
         session_id: &str,
         text: &str,
         model: Option<&ModelInfo>,
+        agent: Option<&str>,
     ) -> crate::error::Result<()> {
         let mut body = serde_json::json!({
             "parts": [{"type": "text", "text": text}],
         });
         inject_model(&mut body, model, self.model.as_ref());
+        inject_agent(&mut body, agent);
         let resp = self
             .http()
             .post(self.url(&format!("/session/{}/prompt_async", session_id)))
@@ -489,18 +497,6 @@ impl Client {
     pub async fn compact(&self, session_id: &str) -> crate::error::Result<()> {
         self.http()
             .post(self.url(&format!("/api/session/{}/compact", session_id)))
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(())
-    }
-
-    /// Switch the agent for a session.
-    pub async fn switch_agent(&self, session_id: &str, agent: &str) -> crate::error::Result<()> {
-        let body = serde_json::json!({ "agent": agent });
-        self.http()
-            .post(self.url(&format!("/api/session/{}/agent", session_id)))
-            .json(&body)
             .send()
             .await?
             .error_for_status()?;
@@ -1104,6 +1100,15 @@ fn inject_model(body: &mut serde_json::Value, override_: Option<&ModelInfo>, con
             "providerID": model.provider_id,
             "modelID": model.id,
         });
+    }
+}
+
+/// Attach the per-session agent override to a prompt body. When unset the
+/// server uses the session's own/default agent. Shared by `prompt` and
+/// `prompt_async`.
+fn inject_agent(body: &mut serde_json::Value, agent: Option<&str>) {
+    if let Some(a) = agent {
+        body["agent"] = serde_json::json!(a);
     }
 }
 

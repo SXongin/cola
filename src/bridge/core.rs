@@ -39,12 +39,6 @@ pub struct SharedCore {
     /// Session ids with a prompt currently in flight (serializes prompts per
     /// session so concurrent messages don't clobber each other's accumulators).
     pub inflight: Arc<Mutex<HashSet<String>>>,
-    /// Per-session model override (a parsed "provider/model") set by `/model`. The
-    /// OpenCode server has no model-switch endpoint, so `/model` records the
-    /// choice here and cola sends it as a per-prompt override on the next
-    /// message (the server honors `PromptInput.model`). Not persisted — on a
-    /// cola restart a session falls back to the configured default model.
-    pub session_models: Arc<Mutex<HashMap<String, opencode::client::ModelInfo>>>,
     /// Default directory for new sessions (from `[bridge] work_dir`).
     pub work_dir: Option<String>,
     /// Whether to send the group completion notice (from `[bridge] group_completion_notice`).
@@ -69,7 +63,6 @@ impl SharedCore {
             card_message_ids: Arc::new(Mutex::new(HashMap::new())),
             answered_requests: Arc::new(Mutex::new(HashSet::new())),
             inflight: Arc::new(Mutex::new(HashSet::new())),
-            session_models: Arc::new(Mutex::new(HashMap::new())),
             work_dir: cfg
                 .bridge
                 .work_dir
@@ -95,5 +88,29 @@ impl SharedCore {
                     .to_string_lossy()
                     .to_string()
             })
+    }
+
+    /// The per-session agent override set by `/agent` (from the persisted
+    /// `SessionEntry`). `None` when the session has no override — the server
+    /// then uses the session's own/default agent.
+    pub async fn session_agent_override(&self, session_id: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .await
+            .entry_for_session(session_id)
+            .and_then(|e| e.agent.clone())
+    }
+
+    /// The per-session model override set by `/model`, parsed from the
+    /// persisted "provider/model" string. `None` when the session has no
+    /// override (the client then falls back to the configured default model, or
+    /// the server's own default if none is configured).
+    pub async fn session_model_override(&self, session_id: &str) -> Option<opencode::client::ModelInfo> {
+        self.sessions
+            .lock()
+            .await
+            .entry_for_session(session_id)
+            .and_then(|e| e.model.as_deref())
+            .and_then(opencode::client::parse_model)
     }
 }
