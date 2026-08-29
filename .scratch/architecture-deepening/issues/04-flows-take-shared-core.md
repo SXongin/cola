@@ -10,11 +10,39 @@ narrowed dependency.
 
 **Blocked by:** 02 — DirectoryBackend seam.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Every flow constructs with the shared state + adapter mocks alone — no
+- [x] Every flow constructs with the shared state + adapter mocks alone — no
       coordinator needed.
-- [ ] No module pokes another flow's private state; that coupling is a method
+- [x] No module pokes another flow's private state; that coupling is a method
       call on the owning flow.
-- [ ] The module dependency graph is acyclic (no command↔coordinator cycle).
-- [ ] Full verification loop green.
+- [x] The module dependency graph is acyclic (no command↔coordinator cycle).
+- [x] Full verification loop green.
+
+## Answer
+
+All flows, pollers and the render pipeline now take `&Arc<SharedCore>` instead
+of `&Arc<App>`:
+
+- `render.rs`: `flush_card` / `render_and_flush` / `render_poll_loop` take the
+  core; `session_subtitle` and `refresh_session_title` moved out of the App as
+  free functions on the core.
+- `pollers.rs`: `reconnect_poll_loop`, `resolve_topic_anchor`,
+  `resolve_card_target`, `inline_host_session`, `mark_stale_cards` take the core.
+- `permission.rs` / `question.rs` / `external.rs`: `poll_loop` /
+  `handle_card_action` / `start_reply_render` take the core.
+- Coordinator-only helpers moved onto `SharedCore`: `get_session_id`,
+  `cached_session_list`, `invalidate_session_list_cache`,
+  `approve_pending_for_session` (+ private `session_descends_from`).
+- The cross-flow poke (`handler.rs` writing `external.last_user_msg_epoch`
+  directly) became `ExternalFlow::record_prompt_baseline`.
+- The command↔coordinator cycle is broken: `command.rs` no longer imports
+  `handler::App` — `handle_command` and its helpers are free functions taking
+  `&Arc<SharedCore>`. `Command::Forward` is intercepted by the coordinator
+  (`handle_message`), which owns the prompt pipeline.
+
+App keeps only coordination (message dispatch, prompt pipeline, retry) and the
+flows/pollers/render are constructible with SharedCore + adapter mocks alone.
+
+Verification: fmt clean, clippy `-D warnings` clean, 251 tests pass, release
+build succeeds.

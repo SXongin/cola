@@ -3,12 +3,14 @@ pub mod core;
 pub mod discovery;
 pub mod external;
 pub mod handler;
-pub mod permission;
 pub mod pollers;
-pub mod question;
 pub mod render;
+pub mod request;
 pub mod session;
 pub mod streaming;
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use handler::App;
 

@@ -2,18 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::bridge::handler::App;
+use crate::bridge::core::SharedCore;
 use crate::bridge::render::{flush_card, render_and_flush};
 use crate::bridge::streaming::StreamAccumulator;
-
-/// How often the external-message poller checks for new shared-store messages.
-const POLL_INTERVAL_SECS: u64 = 8;
-/// Poll cadence for the external-reply renderer (matches `render_poll_loop`).
-const RENDER_POLL_MS: u64 = 1500;
-/// How long the external-reply renderer waits for a reply before giving up. A
-/// message posted in OpenChamber may never actually be sent, so the loop idles
-/// and times out; the card then simply stays the "有新消息" notification.
-const RENDER_TIMEOUT_SECS: u64 = 600;
 
 /// The external-message flow: watches for user messages that were NOT sent by
 /// cola (someone posted from OpenChamber or another client on the shared store)
@@ -22,34 +13,61 @@ const RENDER_TIMEOUT_SECS: u64 = 600;
 pub struct ExternalFlow {
     /// session_id → created time of the last user message cola knows about.
     pub last_user_msg_epoch: Arc<Mutex<HashMap<String, i64>>>,
+    /// External poll cadence (ms). Defaults to today's 8 s; tests store a small
+    /// value so every loop branch runs without sleeping real seconds.
+    pub poll_interval_ms: std::sync::atomic::AtomicU64,
+    /// External-reply render poll cadence (ms).
+    pub render_poll_ms: std::sync::atomic::AtomicU64,
+    /// How long the external-reply renderer waits for a reply before giving up
+    /// (ms). A message posted in OpenChamber may never actually be sent, so the
+    /// loop idles and times out; the card then simply stays the "有新消息"
+    /// notification. Injected small in tests to exercise the timeout branch.
+    pub render_timeout_ms: std::sync::atomic::AtomicU64,
 }
 
 impl ExternalFlow {
     pub fn new() -> Self {
         Self {
             last_user_msg_epoch: Arc::new(Mutex::new(HashMap::new())),
+            poll_interval_ms: std::sync::atomic::AtomicU64::new(8_000),
+            render_poll_ms: std::sync::atomic::AtomicU64::new(1_500),
+            render_timeout_ms: std::sync::atomic::AtomicU64::new(600_000),
         }
+    }
+
+    /// Record the user-message baseline after cola's own prompt completes, so
+    /// the external poller treats anything newer as posted by another client.
+    /// Owns `last_user_msg_epoch` — the prompt path calls this method instead
+    /// of poking the map directly.
+    pub(crate) async fn record_prompt_baseline(&self, session_id: &str, baseline: i64) {
+        self.last_user_msg_epoch
+            .lock()
+            .await
+            .insert(session_id.to_string(), baseline);
     }
 
     /// Independent poller: detects user messages not sent by cola and notifies
     /// the Feishu side. Started once at App startup.
-    pub(crate) async fn poll_loop(&self, app: &Arc<App>) -> crate::error::Result<()> {
+    pub(crate) async fn poll_loop(&self, core: &Arc<SharedCore>) -> crate::error::Result<()> {
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(POLL_INTERVAL_SECS)).await;
-            let sessions: Vec<(String, crate::config::ThreadKey)> = app
+            tokio::time::sleep(tokio::time::Duration::from_millis(
+                self.poll_interval_ms.load(std::sync::atomic::Ordering::Relaxed),
+            ))
+            .await;
+            let sessions: Vec<(String, crate::config::ThreadKey, String)> = core
                 .sessions
                 .lock()
                 .await
                 .all_entries()
                 .into_iter()
-                .map(|e| (e.session_id.clone(), e.thread_key.clone()))
+                .map(|e| (e.session_id.clone(), e.thread_key.clone(), e.directory.clone()))
                 .collect();
-            for (sid, thread_key) in sessions {
+            for (sid, thread_key, directory) in sessions {
                 // While cola is answering this session, any new message is cola's own.
-                if app.inflight.lock().await.contains(&sid) {
+                if core.inflight.lock().await.contains(&sid) {
                     continue;
                 }
-                let Ok(msgs) = app.opencode.messages(&sid).await else {
+                let Ok(msgs) = core.opencode.messages(&sid).await else {
                     continue;
                 };
                 let latest_user = msgs
@@ -73,9 +91,11 @@ impl ExternalFlow {
                         tracing::info!("External message on session {}: {}", sid, preview);
                         // The card title is the server's session title (ADR-0007)
                         // — fetched on demand, never a cola-side name.
-                        let title = app
+                        let title = core
                             .opencode
-                            .session_info(&sid, None)
+                            .clone()
+                            .for_directory(&directory)
+                            .session_info(&sid)
                             .await
                             .ok()
                             .and_then(|i| i.title)
@@ -87,17 +107,17 @@ impl ExternalFlow {
                         // anchor — the persisted `/topic` confirmation card, or
                         // the newest bot message in the thread. Non-topic
                         // sessions fall back to the chat top level.
-                        let anchor = crate::bridge::pollers::resolve_topic_anchor(app, &thread_key).await;
+                        let anchor = crate::bridge::pollers::resolve_topic_anchor(core, &thread_key).await;
                         let sent = match anchor {
-                            Some(anchor) => app.feishu.reply_card(&anchor, &card).await,
-                            None => app.feishu.send_card("chat_id", &thread_key.chat_id, &card).await,
+                            Some(anchor) => core.feishu.reply_card(&anchor, &card).await,
+                            None => core.feishu.send_card("chat_id", &thread_key.chat_id, &card).await,
                         };
                         match sent {
                             Ok(card_id) => {
                                 // Now render the model's reply INTO that card, so
                                 // the Feishu side sees the answer, not just the
                                 // notification.
-                                self.start_reply_render(app, &sid, latest, &card_id, &preview)
+                                self.start_reply_render(core, &sid, latest, &card_id, &preview)
                                     .await;
                             }
                             Err(e) => tracing::warn!("external message notify: {}", e),
@@ -116,7 +136,7 @@ impl ExternalFlow {
     /// message starts a new turn, or a hard timeout elapses.
     pub(crate) async fn start_reply_render(
         &self,
-        app: &Arc<App>,
+        core: &Arc<SharedCore>,
         session_id: &str,
         epoch_ms: i64,
         card_id: &str,
@@ -127,25 +147,28 @@ impl ExternalFlow {
         // so a different epoch is NOT this message — a new renderer replaces the
         // old one (whose `submit_epoch_ms` no longer matches, so it exits).
         let already_rendering = {
-            let accs = app.accumulators.lock().await;
-            accs.get(session_id)
-                .map(|a| a.submit_epoch_ms == Some(epoch_ms))
+            let cards = core.cards.lock().await;
+            cards
+                .get(session_id)
+                .map(|c| c.acc.submit_epoch_ms == Some(epoch_ms))
                 .unwrap_or(false)
         };
         if already_rendering {
             return;
         }
         let session_dir = {
-            let store = app.sessions.lock().await;
+            let store = core.sessions.lock().await;
             store
                 .entry_for_session(session_id)
                 .map(|e| e.directory.clone())
                 .unwrap_or_default()
         };
         // Card subtitle: the server's live title (ADR-0007), or the id-tail.
-        let title = app
+        let title = core
             .opencode
-            .session_info(session_id, None)
+            .clone()
+            .for_directory(session_dir.as_str())
+            .session_info(session_id)
             .await
             .ok()
             .and_then(|i| i.title)
@@ -178,20 +201,23 @@ impl ExternalFlow {
             acc.push_text(&format!("👤 {}", preview));
         }
         {
-            let mut accs = app.accumulators.lock().await;
-            accs.insert(session_id.to_string(), acc);
+            let mut cards = core.cards.lock().await;
+            cards.insert(
+                session_id.to_string(),
+                crate::bridge::streaming::CardSession {
+                    acc,
+                    card_message_id: Some(card_id.to_string()),
+                },
+            );
         }
-        // Point the card-id map at the notification card: `flush_card` updates it.
-        app.card_message_ids
-            .lock()
-            .await
-            .insert(session_id.to_string(), card_id.to_string());
         tracing::info!("external reply render armed for session {}", session_id);
 
-        let app = Arc::clone(app);
+        let core = Arc::clone(core);
         let sid = session_id.to_string();
+        let poll_ms = self.render_poll_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let timeout_ms = self.render_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
         tokio::spawn(async move {
-            external_render_loop(&app, sid, epoch_ms).await;
+            external_render_loop(&core, sid, epoch_ms, poll_ms, timeout_ms).await;
         });
     }
 }
@@ -201,11 +227,17 @@ impl ExternalFlow {
 /// Done when the model finishes. Exits when the turn completes, the accumulator
 /// was replaced (cola's own prompt or a newer external message), a newer user
 /// message starts a new turn, or the hard timeout elapses.
-async fn external_render_loop(app: &Arc<App>, session_id: String, epoch_ms: i64) {
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(RENDER_TIMEOUT_SECS);
+async fn external_render_loop(
+    core: &Arc<SharedCore>,
+    session_id: String,
+    epoch_ms: i64,
+    poll_ms: u64,
+    timeout_ms: u64,
+) {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
     loop {
-        tokio::time::sleep(tokio::time::Duration::from_millis(RENDER_POLL_MS)).await;
-        let msgs = match app.opencode.messages(&session_id).await {
+        tokio::time::sleep(tokio::time::Duration::from_millis(poll_ms)).await;
+        let msgs = match core.opencode.messages(&session_id).await {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!("external render poll messages: {}", e);
@@ -216,16 +248,17 @@ async fn external_render_loop(app: &Arc<App>, session_id: String, epoch_ms: i64)
         // one, or a newer external message's renderer took over): exit so this
         // turn isn't double-rendered into two cards.
         let replaced = {
-            let accs = app.accumulators.lock().await;
-            accs.get(&session_id)
-                .map(|a| a.submit_epoch_ms != Some(epoch_ms))
+            let cards = core.cards.lock().await;
+            cards
+                .get(&session_id)
+                .map(|c| c.acc.submit_epoch_ms != Some(epoch_ms))
                 .unwrap_or(true)
         };
         if replaced {
             break;
         }
         // Stream the reply's reasoning/tools/text into the notification card.
-        let Some((new_parts, _, _)) = render_and_flush(app, &session_id, epoch_ms, &msgs).await else {
+        let Some((new_parts, _, _)) = render_and_flush(core, &session_id, epoch_ms, &msgs).await else {
             break;
         };
         if new_parts > 0 {
@@ -233,7 +266,7 @@ async fn external_render_loop(app: &Arc<App>, session_id: String, epoch_ms: i64)
         }
         // The model finished answering: finalize the card, then stop.
         if external_turn_completed(&msgs, epoch_ms) {
-            finalize_done(app, &session_id).await;
+            finalize_done(core, &session_id).await;
             tracing::info!("external reply rendered: session {} done", session_id);
             break;
         }
@@ -252,13 +285,14 @@ async fn external_render_loop(app: &Arc<App>, session_id: String, epoch_ms: i64)
         // spinner; otherwise leave the "有新消息" notification as-is.
         if tokio::time::Instant::now() >= deadline {
             let has_content = {
-                let accs = app.accumulators.lock().await;
-                accs.get(&session_id)
-                    .map(|a| !a.rendered_parts.is_empty() || !a.rendered_tool_states.is_empty())
+                let cards = core.cards.lock().await;
+                cards
+                    .get(&session_id)
+                    .map(|c| !c.acc.rendered_parts.is_empty() || !c.acc.rendered_tool_states.is_empty())
                     .unwrap_or(false)
             };
             if has_content {
-                finalize_done(app, &session_id).await;
+                finalize_done(core, &session_id).await;
                 tracing::info!(
                     "external reply render timed out; finalized session {}",
                     session_id
@@ -271,14 +305,14 @@ async fn external_render_loop(app: &Arc<App>, session_id: String, epoch_ms: i64)
 
 /// Mark the accumulator's card Done and flush it — the terminal state for a
 /// reply that finished (or timed out with content rendered).
-async fn finalize_done(app: &Arc<App>, session_id: &str) {
+async fn finalize_done(core: &Arc<SharedCore>, session_id: &str) {
     {
-        let mut accs = app.accumulators.lock().await;
-        if let Some(acc) = accs.get_mut(session_id) {
-            acc.card_state = crate::feishu::card::CardState::Done;
+        let mut cards = core.cards.lock().await;
+        if let Some(card) = cards.get_mut(session_id) {
+            card.acc.card_state = crate::feishu::card::CardState::Done;
         }
     }
-    flush_card(app, session_id).await;
+    flush_card(core, session_id).await;
 }
 
 /// Whether the model has finished answering the external message: an assistant

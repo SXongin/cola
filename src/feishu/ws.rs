@@ -11,18 +11,55 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 const MAX_RECONNECT_DELAY_SECS: u64 = 30;
 
+/// Bounded event-id dedupe for Feishu's at-least-once delivery. Capped so the
+/// set cannot grow without bound; on overflow the whole set is cleared — the
+/// 5-minute age filter makes stale ids worthless anyway, and a cleared window
+/// only means a handful of genuinely duplicate events slip through to the age
+/// filter (which skips anything old).
+pub struct DedupeSet {
+    events: HashSet<String>,
+    cap: usize,
+}
+
+impl DedupeSet {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            events: HashSet::new(),
+            cap,
+        }
+    }
+
+    /// Insert `id`, returning true when it was already present (a re-delivery
+    /// that must not be dispatched again).
+    pub fn check_and_insert(&mut self, id: &str) -> bool {
+        if self.events.contains(id) {
+            return true;
+        }
+        if self.events.len() >= self.cap {
+            self.events.clear();
+        }
+        self.events.insert(id.to_string());
+        false
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+}
+
 /// State the ws platform owns, folded out of the bridge core: event-id dedupe
 /// (Feishu re-delivers at-least-once) and cola's own open_id (needed to strip
 /// the bot's own @mention from prompt text).
 pub struct WsState {
-    seen_event_ids: Mutex<HashSet<String>>,
+    seen_event_ids: Mutex<DedupeSet>,
     bot_open_id: Mutex<Option<String>>,
 }
 
 impl WsState {
     pub fn new() -> Self {
         Self {
-            seen_event_ids: Mutex::new(HashSet::new()),
+            seen_event_ids: Mutex::new(DedupeSet::new(10_000)),
             bot_open_id: Mutex::new(None),
         }
     }
@@ -610,6 +647,95 @@ fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Value> {
     Some(val)
 }
 
+/// What a WS frame needs from the connection handler, decided purely (no socket
+/// I/O). The handler maps each outcome to the actual writes/reads.
+pub enum FrameAction {
+    /// Answer the server's heartbeat ping with a pong.
+    Pong,
+    /// Send the plain event ack (deduped / stale / unparseable / non-message
+    /// event) — Feishu re-delivers unacked events forever, so even a skipped
+    /// event must be acked.
+    Ack,
+    /// Ack, then dispatch a `im.message.receive_v1` to the bridge.
+    Message(Box<MessageReceiveEvent>),
+    /// Dispatch a `card.action.trigger`; the ack's payload carries the sink
+    /// result (built by the caller, which owns the socket).
+    CardAction(serde_json::Value),
+    /// Nothing to send (control/card/unknown frame types).
+    None,
+}
+
+/// The pure per-frame decision: dedupe by event id, the 5-minute age filter,
+/// type dispatch, a single typed parse, and the what-to-ack / what-to-dispatch
+/// call. Everything except the socket reads/writes.
+///
+/// `seen` is the (bounded) dedupe set; `bot_open_id` lets the message parse
+/// strip the bot's own @mention placeholder.
+fn process_frame(frame: &ParsedFrame, seen: &mut DedupeSet) -> FrameAction {
+    let msg_type = frame.headers.get("type").map(|s| s.as_str()).unwrap_or("unknown");
+    match msg_type {
+        "ping" => FrameAction::Pong,
+        "event" => {
+            let payload = &frame.payload;
+            // Single typed parse of the event header: type routing first.
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) else {
+                // Unparseable event — still ack, so it stops being re-delivered.
+                return FrameAction::Ack;
+            };
+            let event_type = v
+                .get("header")
+                .and_then(|h| h.get("event_type"))
+                .and_then(|t| t.as_str())
+                .unwrap_or_default();
+
+            if event_type == "im.message.receive_v1" {
+                // Dedup by event_id from the JSON payload (stable across retries).
+                let event_id = v
+                    .get("header")
+                    .and_then(|h| h.get("event_id"))
+                    .and_then(|e| e.as_str())
+                    .map(|s| s.to_string());
+                if let Some(ref eid) = event_id
+                    && seen.check_and_insert(eid)
+                {
+                    tracing::info!("Deduped event_id={}", &eid[..eid.len().min(30)]);
+                    return FrameAction::Ack;
+                }
+                // Skip events older than 5 minutes (Feishu replays old unacked
+                // events after an outage).
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let event_age = v
+                    .get("header")
+                    .and_then(|h| h.get("create_time"))
+                    .and_then(|c| c.as_str())
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .map(|ct| now_ms - ct);
+                if let Some(age_ms) = event_age
+                    && age_ms > 300_000
+                {
+                    tracing::info!("Skipping old event (age={}s)", age_ms / 1000);
+                    return FrameAction::Ack;
+                }
+                // One typed parse — never re-parse the raw payload later.
+                match serde_json::from_slice::<MessageReceiveEvent>(payload) {
+                    Ok(event) => FrameAction::Message(Box::new(event)),
+                    Err(_) => FrameAction::Ack,
+                }
+            } else if event_type == "card.action.trigger" {
+                match extract_card_action_value(payload) {
+                    Some(value) => FrameAction::CardAction(value),
+                    None => FrameAction::Ack,
+                }
+            } else {
+                // Any other event type (bot added, message recalled, ...) still
+                // needs an ack, otherwise Feishu re-delivers it forever.
+                FrameAction::Ack
+            }
+        }
+        _ => FrameAction::None,
+    }
+}
+
 async fn handle_binary_frame(
     data: &[u8],
     ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
@@ -625,10 +751,13 @@ async fn handle_binary_frame(
         }
     };
 
-    let msg_type = frame.headers.get("type").map(|s| s.as_str()).unwrap_or("unknown");
+    let action = {
+        let mut seen = state.seen_event_ids.lock().await;
+        process_frame(&frame, &mut seen)
+    };
 
-    match msg_type {
-        "ping" => {
+    match action {
+        FrameAction::Pong => {
             tracing::debug!("WS ping (heartbeat)");
             // Answer the server's keepalive ping so it doesn't consider the
             // connection dead. The Lark SDK sends a pong for every ping.
@@ -640,170 +769,117 @@ async fn handle_binary_frame(
                 tracing::warn!("WS pong send failed: {}", e);
             }
         }
-        "event" => {
+        FrameAction::Ack => send_event_ack(ws, &frame).await,
+        FrameAction::Message(event) => {
+            // Ack EVERY message event first: at-least-once, an unacked event is
+            // re-delivered forever and a client that never acks is eventually
+            // treated as dead.
+            send_event_ack(ws, &frame).await;
+            let Some(event_data) = event.event else {
+                return Ok(());
+            };
+            let Some(msg_data) = event_data.message else {
+                return Ok(());
+            };
             let payload = &frame.payload;
             let payload_str = String::from_utf8_lossy(payload);
             tracing::info!(
                 "WS event payload: {}",
                 &payload_str.chars().take(300).collect::<String>()
             );
+            tracing::info!("WS event: type=im.message.receive_v1");
 
-            let event_type = serde_json::from_slice::<serde_json::Value>(payload)
-                .ok()
-                .and_then(|v| {
-                    v.get("header")?
-                        .get("event_type")?
-                        .as_str()
-                        .map(|s| s.to_string())
+            let mut text = parse_message_content(&msg_data);
+            // Replace @mention placeholders (`@_user_N`) with real names so the
+            // AI sees who was referenced; the bot's own mention is dropped.
+            // Feishu otherwise leaks opaque `@_user_1` tokens into the prompt.
+            if !msg_data.mentions.is_empty() {
+                let bot_id = state.bot_open_id(feishu).await.unwrap_or_default();
+                if let Some(eid) = event.header.as_ref().and_then(|h| h.event_id.clone())
+                    && is_mentioned(&msg_data.mentions, &bot_id)
+                {
+                    tracing::info!("event {} mentions bot", eid);
+                }
+                text = strip_mentions(&text, &msg_data.mentions, &bot_id);
+            }
+            let thread_id = msg_data.thread_id.clone();
+            // Who sent the message: needed for the group completion notice.
+            let sender_open_id = event_data
+                .sender
+                .as_ref()
+                .and_then(|s| s.sender_id.as_ref())
+                .and_then(|i| i.open_id.clone());
+            tracing::info!(
+                "Message: chat={} type={} thread={} text={}",
+                msg_data.chat_id,
+                msg_data.chat_type,
+                thread_id.as_deref().unwrap_or("-"),
+                &text.chars().take(50).collect::<String>()
+            );
+            // Images embedded in this message (image/post) are downloaded on the
+            // spawned task so the WS read loop keeps reading (heartbeats, new
+            // messages, card actions) while a download is in flight.
+            let image_keys = extract_image_keys(&msg_data.content, &msg_data.message_type);
+            let msg_id = msg_data.message_id.clone();
+            let chat_id = msg_data.chat_id.clone();
+            let chat_type = msg_data.chat_type.clone();
+            let parent_id = msg_data.parent_id.clone();
+            let sink = sink.clone();
+            let feishu = feishu.clone();
+            tokio::spawn(async move {
+                let mut images = Vec::new();
+                for key in &image_keys {
+                    match feishu.download_image(&msg_id, key).await {
+                        Ok(img) => images.push(img),
+                        Err(e) => tracing::warn!("download image {} failed: {}", key, e),
+                    }
+                }
+                sink.handle_message(crate::bridge::IncomingMessage {
+                    message_id: msg_id,
+                    chat_id,
+                    chat_type,
+                    thread_id,
+                    parent_id,
+                    text,
+                    images,
+                    requester_open_id: sender_open_id,
                 })
-                .unwrap_or_default();
-
-            tracing::info!("WS event: type={}", event_type);
-
-            if event_type == "im.message.receive_v1" {
-                // Ack EVERY event first. Feishu's long-connection protocol is
-                // at-least-once: an unacked event is re-delivered (and re-delivered),
-                // and a client that never acks is eventually treated as dead and
-                // stops receiving new events entirely. Without this the bot appears
-                // unresponsive to all new messages.
-                send_event_ack(ws, &frame).await;
-
-                // Dedup by event_id from JSON payload (stable across retries)
-                let event_id = serde_json::from_slice::<serde_json::Value>(payload)
-                    .ok()
-                    .and_then(|v| v.get("header")?.get("event_id")?.as_str().map(|s| s.to_string()));
-
-                if let Some(ref eid) = event_id {
-                    let mut seen = state.seen_event_ids.lock().await;
-                    if seen.contains(eid) {
-                        tracing::info!("Deduped event_id={}", &eid[..eid.len().min(30)]);
-                        return Ok(());
-                    }
-                    seen.insert(eid.clone());
-                }
-
-                // Filter: skip events older than 5 minutes (Feishu replays old unacked events)
-                let now_ms = chrono::Utc::now().timestamp_millis();
-                let event_age = serde_json::from_slice::<serde_json::Value>(payload)
-                    .ok()
-                    .and_then(|v| v.get("header")?.get("create_time")?.as_str()?.parse::<i64>().ok())
-                    .map(|ct| now_ms - ct);
-
-                if let Some(age_ms) = event_age
-                    && age_ms > 300_000
+                .await;
+            });
+        }
+        FrameAction::CardAction(value) => {
+            // Ack ALWAYS — even an unparseable card action must be acked,
+            // otherwise Feishu re-delivers it forever (pitfall 8).
+            tracing::debug!("card action value: {:?}", value.to_string());
+            let result = sink.handle_card_action(value).await;
+            let resp = build_response_frame(&frame, result.as_ref());
+            if let Some(resp_bytes) = resp {
+                if let Err(e) = ws
+                    .send(tokio_tungstenite::tungstenite::Message::Binary(resp_bytes.into()))
+                    .await
                 {
-                    tracing::info!("Skipping old event (age={}s)", age_ms / 1000);
-                    return Ok(());
+                    tracing::warn!("WS response send failed: {}", e);
+                } else {
+                    tracing::info!("Sent card action ack");
                 }
-
-                if let Ok(event) = serde_json::from_slice::<MessageReceiveEvent>(payload)
-                    && let Some(event_data) = event.event
-                    && let Some(msg_data) = event_data.message
-                {
-                    let mut text = parse_message_content(&msg_data);
-                    // Replace @mention placeholders (`@_user_N`) with real
-                    // names so the AI sees who was referenced; the bot's own
-                    // mention is dropped. Feishu otherwise leaks opaque
-                    // `@_user_1` tokens into the prompt.
-                    if !msg_data.mentions.is_empty() {
-                        let bot_id = state.bot_open_id(feishu).await.unwrap_or_default();
-                        if let Some(eid) = event.header.as_ref().and_then(|h| h.event_id.clone())
-                            && is_mentioned(&msg_data.mentions, &bot_id)
-                        {
-                            tracing::info!("event {} mentions bot", eid);
-                        }
-                        text = strip_mentions(&text, &msg_data.mentions, &bot_id);
-                    }
-                    let thread_id = msg_data.thread_id.clone();
-                    // Who sent the message: needed for the group completion
-                    // notice (reply/@ the requester when a group turn ends).
-                    let sender_open_id = event_data
-                        .sender
-                        .as_ref()
-                        .and_then(|s| s.sender_id.as_ref())
-                        .and_then(|i| i.open_id.clone());
-                    tracing::info!(
-                        "Message: chat={} type={} thread={} text={}",
-                        msg_data.chat_id,
-                        msg_data.chat_type,
-                        thread_id.as_deref().unwrap_or("-"),
-                        &text.chars().take(50).collect::<String>()
-                    );
-                    // Images embedded in this message (image/post) are
-                    // downloaded on the spawned task so the WS read loop keeps
-                    // reading (heartbeats, new messages, card actions) while a
-                    // download is in flight.
-                    let image_keys = extract_image_keys(&msg_data.content, &msg_data.message_type);
-                    let msg_id = msg_data.message_id.clone();
-                    let chat_id = msg_data.chat_id.clone();
-                    let chat_type = msg_data.chat_type.clone();
-                    let parent_id = msg_data.parent_id.clone();
-                    let sink = sink.clone();
-                    let feishu = feishu.clone();
-                    tokio::spawn(async move {
-                        let mut images = Vec::new();
-                        for key in &image_keys {
-                            match feishu.download_image(&msg_id, key).await {
-                                Ok(img) => images.push(img),
-                                Err(e) => tracing::warn!("download image {} failed: {}", key, e),
-                            }
-                        }
-                        sink.handle_message(crate::bridge::IncomingMessage {
-                            message_id: msg_id,
-                            chat_id,
-                            chat_type,
-                            thread_id,
-                            parent_id,
-                            text,
-                            images,
-                            requester_open_id: sender_open_id,
-                        })
-                        .await;
-                    });
-                }
-            } else if event_type == "card.action.trigger" {
-                // Ack ALWAYS — even an unparseable card action must be acked,
-                // otherwise Feishu re-delivers it forever (pitfall 8).
-                let action_value = extract_card_action_value(payload);
-                tracing::debug!(
-                    "card action value: {:?}",
-                    action_value.as_ref().map(|v| v.to_string())
-                );
-                let result = match action_value {
-                    Some(value) => sink.handle_card_action(value).await,
-                    None => None,
-                };
-                let resp = build_response_frame(&frame, result.as_ref());
-                if let Some(resp_bytes) = resp {
-                    if let Err(e) = ws
-                        .send(tokio_tungstenite::tungstenite::Message::Binary(resp_bytes.into()))
-                        .await
-                    {
-                        tracing::warn!("WS response send failed: {}", e);
-                    } else {
-                        tracing::info!("Sent card action ack");
-                    }
-                }
-            } else {
-                // Any other event type (bot added, message recalled, ...) still
-                // needs an ack, otherwise Feishu re-delivers it forever.
-                send_event_ack(ws, &frame).await;
             }
         }
-        "card" => {
-            tracing::debug!("WS card action");
-        }
-        other => {
-            tracing::debug!("WS unknown type: {} headers={:?}", other, frame.headers);
+        FrameAction::None => {
+            tracing::debug!("WS frame ignored (type={:?})", frame.headers.get("type"));
         }
     }
 
     Ok(())
 }
 
-fn parse_message_content(msg: &MessageData) -> String {
-    if msg.message_type == "text"
-        && let Ok(content) = serde_json::from_str::<serde_json::Value>(&msg.content)
+/// The readable text of a message payload — shared by the live receive path and
+/// the quoted-context fetch so "what is this message's text" is defined once.
+/// Text messages carry `{"text": "..."}`; cards/interactive/post messages may
+/// embed user text (extracted once, never duplicated); anything else degrades
+/// to a per-type placeholder instead of leaking raw content JSON.
+fn message_text(message_type: &str, content: &str) -> String {
+    if message_type == "text"
+        && let Ok(content) = serde_json::from_str::<serde_json::Value>(content)
     {
         return content["text"].as_str().unwrap_or("").to_string();
     }
@@ -811,13 +887,17 @@ fn parse_message_content(msg: &MessageData) -> String {
     // sometimes wraps input in a card: {"title":"","content":[[{"tag":"text",
     // "text":"..."}]]}). Without extracting it, the raw JSON leaks into the
     // prompt and shows up verbatim on the OpenChamber side.
-    if let Some(text) = extract_card_text(&msg.content) {
+    if let Some(text) = extract_card_text(content) {
         return text;
     }
     // No readable text — never leak raw content JSON (`{"image_key":...}`) into
     // the prompt. A per-type placeholder tells the model what kind of message
     // it was instead of wasting tokens on opaque JSON.
-    message_placeholder(&msg.message_type)
+    message_placeholder(message_type)
+}
+
+fn parse_message_content(msg: &MessageData) -> String {
+    message_text(&msg.message_type, &msg.content)
 }
 
 /// A human-readable placeholder for a message with no extractable text,
@@ -890,14 +970,7 @@ pub(crate) async fn quoted_context(
     message_id: &str,
 ) -> crate::error::Result<crate::feishu::client::MessageContext> {
     let msg = feishu.get_message(message_id).await?;
-    let raw = if msg.msg_type == "text" {
-        serde_json::from_str::<serde_json::Value>(&msg.content)
-            .ok()
-            .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()))
-            .unwrap_or_default()
-    } else {
-        extract_card_text(&msg.content).unwrap_or_default()
-    };
+    let raw = message_text(&msg.msg_type, &msg.content);
     let mut ctx = crate::feishu::client::MessageContext {
         text: strip_mentions(&raw, &msg.mentions, ""),
         images: Vec::new(),
@@ -1544,4 +1617,152 @@ mod tests {
         assert_eq!(value["answer"], "/b");
         assert_eq!(value["question_index"], 1);
     }
+}
+
+// --- process_frame: pure dedupe / age / dispatch decisions ---
+
+/// Build a frame whose payload is the given JSON, typed "event".
+#[cfg(test)]
+fn event_frame(payload: &[u8]) -> ParsedFrame {
+    let mut bytes = Vec::new();
+    encode_varint_field(&mut bytes, 1, 1);
+    encode_varint_field(&mut bytes, 3, 1);
+    encode_varint_field(&mut bytes, 4, 1);
+    let mut hdr = Vec::new();
+    encode_string_field(&mut hdr, 1, "type");
+    encode_string_field(&mut hdr, 2, "event");
+    encode_bytes_field(&mut bytes, 5, &hdr);
+    encode_bytes_field(&mut bytes, 8, payload);
+    parse_frame(&bytes).expect("frame parses")
+}
+
+#[cfg(test)]
+fn receive_payload(event_id: &str, create_time_ms: i64) -> Vec<u8> {
+    format!(
+            r#"{{"header":{{"event_id":"{}","event_type":"im.message.receive_v1","create_time":"{}"}},"event":{{"sender":{{"sender_id":{{"open_id":"ou_1"}}}},"message":{{"message_id":"om_1","chat_id":"oc_1","chat_type":"p2p","message_type":"text","content":"{{\"text\":\"hi\"}}"}}}}}}"#,
+            event_id, create_time_ms
+        )
+        .into_bytes()
+}
+
+#[test]
+fn process_frame_routes_ping_and_unknown() {
+    // ping → Pong.
+    let frame = ParsedFrame {
+        seq_id: 1,
+        log_id: 0,
+        service: 1,
+        method: 1,
+        headers: HashMap::from([("type".to_string(), "ping".to_string())]),
+        payload_encoding: None,
+        payload_type: None,
+        payload: Vec::new(),
+        log_id_new: None,
+    };
+    assert!(matches!(
+        process_frame(&frame, &mut DedupeSet::new(10)),
+        FrameAction::Pong
+    ));
+
+    // Unknown type → None (no ack, no dispatch).
+    let frame = ParsedFrame {
+        seq_id: 1,
+        log_id: 0,
+        service: 1,
+        method: 1,
+        headers: HashMap::from([("type".to_string(), "card".to_string())]),
+        payload_encoding: None,
+        payload_type: None,
+        payload: Vec::new(),
+        log_id_new: None,
+    };
+    assert!(matches!(
+        process_frame(&frame, &mut DedupeSet::new(10)),
+        FrameAction::None
+    ));
+}
+
+#[test]
+fn process_frame_dispatches_fresh_message() {
+    let frame = event_frame(&receive_payload("e_fresh", chrono::Utc::now().timestamp_millis()));
+    let mut seen = DedupeSet::new(10);
+    match process_frame(&frame, &mut seen) {
+        FrameAction::Message(ev) => {
+            let msg = ev.event.unwrap().message.unwrap();
+            assert_eq!(parse_message_content(&msg), "hi");
+        }
+        other => panic!("expected Message, got {:?}", std::mem::discriminant(&other)),
+    }
+}
+
+#[test]
+fn process_frame_dedupes_a_replayed_event_but_acks_it() {
+    let frame = event_frame(&receive_payload("e_dup", chrono::Utc::now().timestamp_millis()));
+    let mut seen = DedupeSet::new(10);
+    // First delivery: dispatched.
+    assert!(matches!(
+        process_frame(&frame, &mut seen),
+        FrameAction::Message(_)
+    ));
+    // Re-delivery: acked (so Feishu stops) but NOT dispatched again.
+    assert!(matches!(process_frame(&frame, &mut seen), FrameAction::Ack));
+}
+
+#[test]
+fn process_frame_acks_stale_events_without_dispatch() {
+    let old = chrono::Utc::now().timestamp_millis() - 400_000;
+    let frame = event_frame(&receive_payload("e_old", old));
+    let mut seen = DedupeSet::new(10);
+    assert!(matches!(process_frame(&frame, &mut seen), FrameAction::Ack));
+}
+
+#[test]
+fn process_frame_acks_unparseable_and_unknown_events() {
+    // Unparseable payload → ack (stop re-delivery), no dispatch.
+    let frame = event_frame(b"not json");
+    assert!(matches!(
+        process_frame(&frame, &mut DedupeSet::new(10)),
+        FrameAction::Ack
+    ));
+    // Parseable but a non-message event type → ack, no dispatch.
+    let payload = br#"{"header":{"event_type":"bot.added_v1"}}"#;
+    let frame = event_frame(payload);
+    assert!(matches!(
+        process_frame(&frame, &mut DedupeSet::new(10)),
+        FrameAction::Ack
+    ));
+}
+
+#[test]
+fn process_frame_routes_card_actions() {
+    let payload = br#"{
+            "header": { "event_type": "card.action.trigger", "event_id": "e_card" },
+            "event": {
+                "action": {
+                    "tag": "button",
+                    "value": { "action": "perm", "reply": "once", "request_id": "p1", "session_id": "s1" }
+                }
+            }
+        }"#;
+    let frame = event_frame(payload);
+    match process_frame(&frame, &mut DedupeSet::new(10)) {
+        FrameAction::CardAction(v) => assert_eq!(v["request_id"], "p1"),
+        other => panic!("expected CardAction, got {:?}", std::mem::discriminant(&other)),
+    }
+}
+
+// --- DedupeSet: bounded, evicts on overflow ---
+
+#[test]
+fn dedupe_set_evicts_when_over_cap() {
+    let mut seen = DedupeSet::new(3);
+    assert!(!seen.check_and_insert("a"));
+    assert!(!seen.check_and_insert("b"));
+    assert!(!seen.check_and_insert("c"));
+    assert_eq!(seen.len(), 3);
+    // Inserting a 4th clears the window first.
+    assert!(!seen.check_and_insert("d"));
+    assert_eq!(seen.len(), 1);
+    // The evicted ids are no longer "seen".
+    assert!(!seen.check_and_insert("a"));
 }

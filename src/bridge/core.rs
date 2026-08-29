@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::bridge::session::SessionStore;
-use crate::bridge::streaming::StreamAccumulator;
+use crate::config::ThreadKey;
 use crate::feishu;
 use crate::opencode;
 
@@ -23,21 +23,22 @@ impl SessionListCache {
     }
 }
 
-/// State shared across every flow: the session map, the per-session streaming
-/// accumulators, the card-id map, the double-click guard, prompt serialization,
-/// and the two adapters. Owned by the bridge coordinator ([`super::App`]) and
-/// passed by handle to the flow modules that need it.
+/// State shared across every flow: the session map, the per-session live cards
+/// ([`CardSession`] — accumulator + card identity in one place), the
+/// double-click guard, prompt serialization, and the two adapters. Owned by the
+/// bridge coordinator ([`super::App`]) and passed by handle to the flow modules
+/// that need it.
 pub struct SharedCore {
     pub sessions: Arc<Mutex<SessionStore>>,
-    pub accumulators: Arc<Mutex<HashMap<String, StreamAccumulator>>>,
-    pub card_message_ids: Arc<Mutex<HashMap<String, String>>>,
+    /// session_id → the session's one live card (accumulator + card id chain).
+    pub cards: Arc<Mutex<HashMap<String, crate::bridge::streaming::CardSession>>>,
     /// request ids already answered on the permission/question cards. Guards
     /// against double-click races (two card callbacks before the result card
     /// replaces the buttons): a second click on the same request is ignored
     /// server-side instead of re-replying.
     pub answered_requests: Arc<Mutex<HashSet<String>>>,
     /// Session ids with a prompt currently in flight (serializes prompts per
-    /// session so concurrent messages don't clobber each other's accumulators).
+    /// session so concurrent messages don't clobber each other's cards).
     pub inflight: Arc<Mutex<HashSet<String>>>,
     /// Default directory for new sessions (from `[bridge] work_dir`).
     pub work_dir: Option<String>,
@@ -59,8 +60,7 @@ impl SharedCore {
         let session_store = SessionStore::new(cfg.bridge.session_file.clone())?;
         Ok(Self {
             sessions: Arc::new(Mutex::new(session_store)),
-            accumulators: Arc::new(Mutex::new(HashMap::new())),
-            card_message_ids: Arc::new(Mutex::new(HashMap::new())),
+            cards: Arc::new(Mutex::new(HashMap::new())),
             answered_requests: Arc::new(Mutex::new(HashSet::new())),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             work_dir: cfg
@@ -112,5 +112,96 @@ impl SharedCore {
             .entry_for_session(session_id)
             .and_then(|e| e.model.as_deref())
             .and_then(opencode::client::parse_model)
+    }
+
+    /// The session mapped to a thread (if any).
+    pub async fn get_session_id(&self, thread_key: &ThreadKey) -> Option<String> {
+        self.sessions
+            .lock()
+            .await
+            .get_active(thread_key)
+            .map(|e| e.session_id.clone())
+    }
+
+    /// The current `GET /session` snapshot, fetching (and caching for 30 s) when
+    /// missing or stale. Used by `/list`, `/switch` and `/attach` so rapid
+    /// reuse stays off the wire.
+    pub(crate) async fn cached_session_list(&self) -> crate::error::Result<Vec<opencode::SessionListInfo>> {
+        let now = std::time::Instant::now();
+        {
+            let cache = self.session_list_cache.lock().await;
+            if let Some(c) = cache.as_ref()
+                && c.fresh()
+            {
+                return Ok(c.sessions.clone());
+            }
+        }
+        let sessions = self.opencode.list_sessions().await?;
+        *self.session_list_cache.lock().await = Some(SessionListCache {
+            fetched_at: now,
+            sessions: sessions.clone(),
+        });
+        Ok(sessions)
+    }
+
+    /// Drop the `/list` cache. Called whenever cola creates, adopts, forgets or
+    /// renames a session, so the next `/list`/`/switch`/`/attach` is fresh.
+    pub(crate) async fn invalidate_session_list_cache(&self) {
+        *self.session_list_cache.lock().await = None;
+    }
+
+    /// After `/autoaccept on`: answer every permission request that is ALREADY
+    /// pending for `session_id` (or one of its sub-task child sessions) with
+    /// "once". The permission poller's `seen` set skips requests it has already
+    /// surfaced, so enabling autoaccept would otherwise leave old cards hanging
+    /// forever. Returns how many requests were approved.
+    pub(crate) async fn approve_pending_for_session(&self, session_id: &str, directory: &str) -> usize {
+        let Ok(perms) = self
+            .opencode
+            .clone()
+            .for_directory(directory)
+            .list_permissions()
+            .await
+        else {
+            return 0;
+        };
+        let mut approved = 0usize;
+        for p in &perms {
+            // Match the session itself or a sub-task child (its parent chain).
+            let Some(sid) = p.session_id.clone() else { continue };
+            if sid != session_id && !self.session_descends_from(&sid, session_id, directory).await {
+                continue;
+            }
+            match self
+                .opencode
+                .clone()
+                .for_directory(directory)
+                .reply_permission(&p.request_id, "once")
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        "Auto-accepted pending permission {} on session {} ({})",
+                        p.request_id,
+                        sid,
+                        p.permission.as_deref().unwrap_or("?")
+                    );
+                    approved += 1;
+                }
+                Err(e) => tracing::warn!("auto-accept pending {} on session {}: {}", p.request_id, sid, e),
+            }
+        }
+        approved
+    }
+
+    /// Whether `candidate` is `root` or a sub-task child reachable by walking
+    /// up its parent chain (sub-task child sessions carry their own sessionID).
+    async fn session_descends_from(&self, candidate: &str, root: &str, directory: &str) -> bool {
+        crate::bridge::pollers::walk_parent_chain(self, candidate, Some(directory), |current| {
+            let current = current.to_string();
+            async move { (current == root).then_some(true) }
+        })
+        .await
+        .unwrap_or(false)
     }
 }

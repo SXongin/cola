@@ -6,8 +6,78 @@ pub use client::{
     SessionInfo, SessionListInfo, SessionMessage,
 };
 
+use std::sync::Arc;
+
 use crate::error::Result;
 use async_trait::async_trait;
+
+/// A directory-scoped handle to the OpenCode backend. Instance routing lives
+/// here: the handle carries the directory, so a caller cannot silently omit
+/// `?directory=` and scope a request to the wrong server instance (ADR-0010).
+/// Directory-scoped calls (permissions, questions, session info) take no
+/// directory argument — the handle owns it.
+#[async_trait]
+pub trait DirectoryBackend: Send + Sync {
+    async fn list_permissions(&self) -> Result<Vec<PermissionRequest>>;
+
+    async fn reply_permission(&self, request_id: &str, reply: &str) -> Result<()>;
+
+    async fn list_questions(&self) -> Result<Vec<QuestionRequest>>;
+
+    async fn reply_question(&self, request_id: &str, answers: &[Vec<String>]) -> Result<()>;
+
+    async fn reject_question(&self, request_id: &str) -> Result<()>;
+
+    async fn session_info(&self, session_id: &str) -> Result<SessionInfo>;
+}
+
+/// The single concrete [`DirectoryBackend`]: wraps any [`Backend`] and forwards
+/// the carried directory into its directory-scoped methods. Both the real
+/// [`Client`] and test mocks produce this via [`Backend::for_directory`], so
+/// the directory-scoped seam is implemented once.
+pub struct BackendDirectory {
+    backend: Arc<dyn Backend>,
+    directory: String,
+}
+
+impl BackendDirectory {
+    pub(crate) fn new(backend: Arc<dyn Backend>, directory: String) -> Self {
+        Self { backend, directory }
+    }
+}
+
+#[async_trait]
+impl DirectoryBackend for BackendDirectory {
+    async fn list_permissions(&self) -> Result<Vec<PermissionRequest>> {
+        self.backend.list_permissions(Some(&self.directory)).await
+    }
+
+    async fn reply_permission(&self, request_id: &str, reply: &str) -> Result<()> {
+        self.backend
+            .reply_permission(request_id, reply, Some(&self.directory))
+            .await
+    }
+
+    async fn list_questions(&self) -> Result<Vec<QuestionRequest>> {
+        self.backend.list_questions(Some(&self.directory)).await
+    }
+
+    async fn reply_question(&self, request_id: &str, answers: &[Vec<String>]) -> Result<()> {
+        self.backend
+            .reply_question(request_id, answers, Some(&self.directory))
+            .await
+    }
+
+    async fn reject_question(&self, request_id: &str) -> Result<()> {
+        self.backend
+            .reject_question(request_id, Some(&self.directory))
+            .await
+    }
+
+    async fn session_info(&self, session_id: &str) -> Result<SessionInfo> {
+        self.backend.session_info(session_id, Some(&self.directory)).await
+    }
+}
 
 /// The OpenCode backend, abstracted so tests can drive the bridge with canned
 /// responses instead of a live server. The real implementation is
@@ -92,6 +162,12 @@ pub trait Backend: Send + Sync {
     /// The base URL this backend currently targets (used by the reconnect loop
     /// to detect a changed server).
     fn base_url(&self) -> String;
+
+    /// A directory-scoped handle for instance-routed calls (permissions,
+    /// questions, session info). The returned handle owns the directory, so no
+    /// call site can silently omit it and hit the server cwd instance
+    /// (ADR-0010).
+    fn for_directory(self: Arc<Self>, directory: &str) -> Arc<dyn DirectoryBackend>;
 }
 
 #[async_trait]
@@ -186,5 +262,9 @@ impl Backend for Client {
 
     fn base_url(&self) -> String {
         Client::base_url(self)
+    }
+
+    fn for_directory(self: Arc<Self>, directory: &str) -> Arc<dyn DirectoryBackend> {
+        Arc::new(BackendDirectory::new(self, directory.to_string()))
     }
 }

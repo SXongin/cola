@@ -1,7 +1,96 @@
 use std::sync::Arc;
 
-use crate::bridge::handler::App;
+use crate::bridge::core::SharedCore;
 use crate::bridge::streaming::StreamAccumulator;
+
+/// The session/thread name shown as the card subtitle, formatted as
+/// `<title> · <id-tail>` (e.g. "你好 · 01ba0ed"). The OpenCode server's OWN
+/// session title (what OpenChamber shows) is the single source of truth
+/// (ADR-0007) — fetched on demand, never cached locally. While the server
+/// still has the default `New session - ...` title (or the title is empty),
+/// the id-tail alone identifies the session; the current prompt is never
+/// echoed (the reply context already shows it).
+pub(crate) async fn session_subtitle(
+    core: &SharedCore,
+    thread_key: &crate::config::ThreadKey,
+    text: &str,
+) -> String {
+    let prompt_preview: String = text.chars().take(50).collect();
+    let entry = {
+        let store = core.sessions.lock().await;
+        store.get_active(thread_key).cloned()
+    };
+    let Some(entry) = entry else {
+        return String::new();
+    };
+    let session_id = entry.session_id.clone();
+    let mut name = String::new();
+    if let Ok(info) = core
+        .opencode
+        .clone()
+        .for_directory(&entry.directory)
+        .session_info(&session_id)
+        .await
+        && let Some(t) = info.title.filter(|t| !t.is_empty())
+    {
+        name = crate::feishu::card::clean_session_label(&t);
+    }
+    let id_tail: String = session_id
+        .strip_prefix("ses_")
+        .unwrap_or(&session_id)
+        .chars()
+        .take(7)
+        .collect();
+    if name.is_empty() || name == prompt_preview {
+        // No echo of the current prompt, but still identify the session.
+        id_tail
+    } else {
+        format!("{} · {}", name, id_tail)
+    }
+}
+
+/// Refresh the streaming card's subtitle from the server's live session
+/// title, returning true if it changed (and the card was re-flushed).
+///
+/// OpenCode/OpenChamber automatically summarize and rename a session after a
+/// turn; cola's card subtitle is only captured when the prompt starts, so it
+/// would otherwise stay on the "new session" default title until restart.
+/// Called periodically from the render poll loop, so the title follows the
+/// server within a poll interval.
+pub(crate) async fn refresh_session_title(core: &Arc<SharedCore>, session_id: &str) -> bool {
+    // Only meaningful while a turn is actively streaming on a live card.
+    let acc_present = core.cards.lock().await.contains_key(session_id);
+    if !acc_present {
+        return false;
+    }
+    let thread_key = core.sessions.lock().await.thread_for_session(session_id);
+    let Some(thread_key) = thread_key else {
+        return false;
+    };
+    // The subtitle is formatted with the session id-tail; recompute it now
+    // and keep whatever the server currently reports.
+    let fresh = session_subtitle(core, &thread_key, "").await;
+    if fresh.is_empty() {
+        return false;
+    }
+    let mut cards = core.cards.lock().await;
+    let Some(card) = cards.get_mut(session_id) else {
+        return false;
+    };
+    if card.acc.title == fresh {
+        return false;
+    }
+    tracing::info!(
+        "session {} title updated: {:?} -> {:?}",
+        session_id,
+        card.acc.title,
+        fresh
+    );
+    card.acc.title = fresh;
+    drop(cards);
+    flush_card(core, session_id).await;
+    true
+}
 
 /// Extract the user-visible output of a tool part. Tries the historical
 /// `state.output` / `state.metadata.output`, then the current schema:
@@ -232,22 +321,22 @@ pub(crate) fn render_new_turn_parts(
 /// Upper bound on continuation cards sent for one flush (each is a new message).
 const MAX_CARD_CHAIN: usize = 8;
 
-pub(crate) async fn flush_card(app: &Arc<App>, session_id: &str) {
+pub(crate) async fn flush_card(core: &Arc<SharedCore>, session_id: &str) {
     for _ in 0..MAX_CARD_CHAIN {
         let (card, full) = {
-            let mut accs = app.accumulators.lock().await;
-            match accs.get_mut(session_id) {
-                Some(acc) => acc.build_card_with_split(),
+            let mut cards = core.cards.lock().await;
+            match cards.get_mut(session_id) {
+                Some(card) => card.acc.build_card_with_split(),
                 None => return,
             }
         };
         let card_id = {
-            let ids = app.card_message_ids.lock().await;
-            ids.get(session_id).cloned()
+            let cards = core.cards.lock().await;
+            cards.get(session_id).and_then(|c| c.card_message_id.clone())
         };
         let Some(card_id) = card_id else { return };
         if !full {
-            if let Err(e) = app.feishu.update_message(&card_id, &card).await {
+            if let Err(e) = core.feishu.update_message(&card_id, &card).await {
                 tracing::warn!("Card update failed: {}", e);
             }
             return;
@@ -258,26 +347,28 @@ pub(crate) async fn flush_card(app: &Arc<App>, session_id: &str) {
         // subsequent updates. `build_card_with_split` already advanced
         // `render_from` past the split point, so the continuation holds only the
         // remaining content — nothing is lost.
-        if let Err(e) = app.feishu.update_message(&card_id, &card).await {
+        if let Err(e) = core.feishu.update_message(&card_id, &card).await {
             tracing::warn!("Card split update failed: {}", e);
         }
         let reply_to = {
-            let accs = app.accumulators.lock().await;
-            accs.get(session_id).and_then(|a| a.reply_to_message_id.clone())
+            let cards = core.cards.lock().await;
+            cards
+                .get(session_id)
+                .and_then(|c| c.acc.reply_to_message_id.clone())
         };
         let Some(reply_to) = reply_to else { return };
         let (cont_card, cont_full) = {
-            let mut accs = app.accumulators.lock().await;
-            accs.get_mut(session_id)
-                .map(|acc| acc.build_card_with_split())
+            let mut cards = core.cards.lock().await;
+            cards
+                .get_mut(session_id)
+                .map(|c| c.acc.build_card_with_split())
                 .unwrap_or((serde_json::json!({}), false))
         };
-        match app.feishu.reply_card(&reply_to, &cont_card).await {
+        match core.feishu.reply_card(&reply_to, &cont_card).await {
             Ok(new_id) => {
-                app.card_message_ids
-                    .lock()
-                    .await
-                    .insert(session_id.to_string(), new_id);
+                if let Some(card) = core.cards.lock().await.get_mut(session_id) {
+                    card.card_message_id = Some(new_id);
+                }
                 if !cont_full {
                     return;
                 }
@@ -300,28 +391,28 @@ pub(crate) async fn flush_card(app: &Arc<App>, session_id: &str) {
 /// still present (the statistics are for logging); `None` when it vanished (the
 /// caller should stop).
 pub(crate) async fn render_and_flush(
-    app: &Arc<App>,
+    core: &Arc<SharedCore>,
     session_id: &str,
     epoch_ms: i64,
     msgs: &[crate::opencode::client::SessionMessage],
 ) -> Option<(usize, usize, usize)> {
     // OpenCode auto-renames sessions after a turn; follow the server's live
     // title so the card subtitle doesn't stay on the "new session" default.
-    app.refresh_session_title(session_id).await;
+    refresh_session_title(core, session_id).await;
     let (changed, new_parts, text_len, reasoning_len) = {
-        let mut accs = app.accumulators.lock().await;
-        let acc = accs.get_mut(session_id)?;
-        let before = acc.rendered_parts.len();
-        let changed = render_new_turn_parts(acc, msgs, epoch_ms);
+        let mut cards = core.cards.lock().await;
+        let card = cards.get_mut(session_id)?;
+        let before = card.acc.rendered_parts.len();
+        let changed = render_new_turn_parts(&mut card.acc, msgs, epoch_ms);
         (
             changed,
-            acc.rendered_parts.len() - before,
-            acc.text.len(),
-            acc.reasoning.len(),
+            card.acc.rendered_parts.len() - before,
+            card.acc.text.len(),
+            card.acc.reasoning.len(),
         )
     };
     if changed {
-        flush_card(app, session_id).await;
+        flush_card(core, session_id).await;
     }
     Some((new_parts, text_len, reasoning_len))
 }
@@ -330,7 +421,7 @@ pub(crate) async fn render_and_flush(
 /// session's messages and flush the card as parts complete (reasoning, tools,
 /// text). `done` stops the loop once the prompt returns.
 pub(crate) async fn render_poll_loop(
-    app: &Arc<App>,
+    core: &Arc<SharedCore>,
     session_id: String,
     epoch_ms: i64,
     done: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -341,14 +432,14 @@ pub(crate) async fn render_poll_loop(
         if done.load(Ordering::SeqCst) {
             return;
         }
-        let msgs = match app.opencode.messages(&session_id).await {
+        let msgs = match core.opencode.messages(&session_id).await {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!("render poll messages: {}", e);
                 continue;
             }
         };
-        match render_and_flush(app, &session_id, epoch_ms, &msgs).await {
+        match render_and_flush(core, &session_id, epoch_ms, &msgs).await {
             // Accumulator gone (turn completed and was cleaned up); keep polling
             // until the prompt returns so late parts are still caught.
             None => continue,
