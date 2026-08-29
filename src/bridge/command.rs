@@ -734,8 +734,25 @@ impl App {
                 }
             }
             Command::Forward(text) => {
-                self.handle_prompt(thread_key, text, message_id, kind, None, false)
-                    .await?;
+                // Forward an unrecognized slash command as prompt text. No
+                // reply linkage or images: a plain text user message.
+                let msg = crate::bridge::IncomingMessage {
+                    message_id: message_id.to_string(),
+                    chat_id: thread_key.chat_id.clone(),
+                    chat_type: match kind {
+                        crate::config::ConversationKind::P2p => "p2p".into(),
+                        _ => "group".into(),
+                    },
+                    thread_id: match kind {
+                        crate::config::ConversationKind::Topic => Some(thread_key.thread_id.clone()),
+                        _ => None,
+                    },
+                    parent_id: None,
+                    text,
+                    images: vec![],
+                    requester_open_id: None,
+                };
+                self.handle_prompt(thread_key, msg, kind).await?;
             }
         }
         Ok(())

@@ -166,11 +166,12 @@ impl Client {
         &self,
         session_id: &str,
         text: &str,
+        images: &[ImageInput],
         model: Option<&ModelInfo>,
         agent: Option<&str>,
     ) -> crate::error::Result<PromptResponse> {
         let mut body = serde_json::json!({
-            "parts": [{"type": "text", "text": text}],
+            "parts": build_parts(text, images),
         });
         inject_model(&mut body, model, self.model.as_ref());
         inject_agent(&mut body, agent);
@@ -279,11 +280,12 @@ impl Client {
         &self,
         session_id: &str,
         text: &str,
+        images: &[ImageInput],
         model: Option<&ModelInfo>,
         agent: Option<&str>,
     ) -> crate::error::Result<()> {
         let mut body = serde_json::json!({
-            "parts": [{"type": "text", "text": text}],
+            "parts": build_parts(text, images),
         });
         inject_model(&mut body, model, self.model.as_ref());
         inject_agent(&mut body, agent);
@@ -604,6 +606,31 @@ pub struct Location {
 #[derive(Debug, Deserialize)]
 pub struct PromptOutput {
     pub data: PromptResponse,
+}
+
+/// An image attached to a prompt, sent as a data-URL `file` part
+/// (`{type:"file", mime, url:"data:<mime>;base64,..."}`). Requires a
+/// vision-capable model; unsupported models surface an error.
+#[derive(Debug, Clone)]
+pub struct ImageInput {
+    pub mime: String,
+    pub data_base64: String,
+}
+
+/// The prompt `parts` array: a text part followed by one data-URL `file` part
+/// per image. OpenCode decodes the data URL and normalizes the image before
+/// handing it to a vision-capable model (FilePartInput). Shared by `prompt`
+/// and `prompt_async`.
+fn build_parts(text: &str, images: &[ImageInput]) -> Vec<serde_json::Value> {
+    let mut parts = vec![serde_json::json!({ "type": "text", "text": text })];
+    for img in images {
+        parts.push(serde_json::json!({
+            "type": "file",
+            "mime": img.mime,
+            "url": format!("data:{};base64,{}", img.mime, img.data_base64),
+        }));
+    }
+    parts
 }
 
 #[derive(Debug, Deserialize)]

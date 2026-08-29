@@ -729,20 +729,35 @@ async fn handle_binary_frame(
                         thread_id.as_deref().unwrap_or("-"),
                         &text.chars().take(50).collect::<String>()
                     );
-                    // Handle the message on a separate task so the WS read loop
-                    // keeps reading (heartbeats, new messages, card actions) while
-                    // a prompt is in flight. Blocking here wedges the entire
-                    // connection and Feishu eventually drops it (CLOSE-WAIT).
+                    // Images embedded in this message (image/post) are
+                    // downloaded on the spawned task so the WS read loop keeps
+                    // reading (heartbeats, new messages, card actions) while a
+                    // download is in flight.
+                    let image_keys = extract_image_keys(&msg_data.content, &msg_data.message_type);
+                    let msg_id = msg_data.message_id.clone();
+                    let chat_id = msg_data.chat_id.clone();
+                    let chat_type = msg_data.chat_type.clone();
+                    let parent_id = msg_data.parent_id.clone();
                     let sink = sink.clone();
+                    let feishu = feishu.clone();
                     tokio::spawn(async move {
-                        sink.handle_message(
-                            msg_data.message_id,
-                            msg_data.chat_id,
-                            msg_data.chat_type,
+                        let mut images = Vec::new();
+                        for key in &image_keys {
+                            match feishu.download_image(&msg_id, key).await {
+                                Ok(img) => images.push(img),
+                                Err(e) => tracing::warn!("download image {} failed: {}", key, e),
+                            }
+                        }
+                        sink.handle_message(crate::bridge::IncomingMessage {
+                            message_id: msg_id,
+                            chat_id,
+                            chat_type,
                             thread_id,
+                            parent_id,
                             text,
-                            sender_open_id,
-                        )
+                            images,
+                            requester_open_id: sender_open_id,
+                        })
                         .await;
                     });
                 }
@@ -799,7 +814,101 @@ fn parse_message_content(msg: &MessageData) -> String {
     if let Some(text) = extract_card_text(&msg.content) {
         return text;
     }
-    msg.content.clone()
+    // No readable text — never leak raw content JSON (`{"image_key":...}`) into
+    // the prompt. A per-type placeholder tells the model what kind of message
+    // it was instead of wasting tokens on opaque JSON.
+    message_placeholder(&msg.message_type)
+}
+
+/// A human-readable placeholder for a message with no extractable text,
+/// replacing what would otherwise leak raw content JSON into the prompt.
+fn message_placeholder(message_type: &str) -> String {
+    let label = match message_type {
+        "image" => "图片",
+        "video" | "media" => "视频",
+        "audio" => "语音",
+        "file" => "文件",
+        "sticker" => "表情",
+        "share_chat" | "share_user" => "分享",
+        "merged_forward" => "合并转发",
+        _ => "其他消息",
+    };
+    format!("[{label}]")
+}
+
+/// The image keys embedded in a message's content: for `image` messages the
+/// content is `{"image_key":"..."}`; for rich-text `post` messages elements
+/// carry `tag: "img"` with an `image_key`. Empty when nothing is downloadable.
+fn extract_image_keys(content: &str, message_type: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(content) else {
+        return Vec::new();
+    };
+    if message_type == "image" {
+        return v
+            .get("image_key")
+            .and_then(|k| k.as_str())
+            .map(|k| vec![k.to_string()])
+            .unwrap_or_default();
+    }
+    let mut out = Vec::new();
+    collect_image_keys(&v, &mut out);
+    out
+}
+
+fn collect_image_keys(v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::Object(map) => {
+            if map.get("tag").and_then(|t| t.as_str()) == Some("img")
+                && let Some(k) = map.get("image_key").and_then(|k| k.as_str())
+            {
+                out.push(k.to_string());
+            }
+            for val in map.values() {
+                collect_image_keys(val, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for val in arr {
+                collect_image_keys(val, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Fetch + parse a message for quote injection (Quoted Context): fetch it by
+/// id, extract its text (mention placeholders → names), and download any
+/// images it embeds. The returned context is prepended to the reply's prompt so
+/// the model sees what the reply answers — including when the parent is missing
+/// from session history (lobby-session switch, compaction).
+///
+/// The bot's own @mention in the quoted text is not stripped (resolving the bot
+/// id would add an API call per quote); a quoted bot mention keeps its display
+/// name, which is fine for context.
+pub(crate) async fn quoted_context(
+    feishu: &Arc<dyn Platform>,
+    message_id: &str,
+) -> crate::error::Result<crate::feishu::client::MessageContext> {
+    let msg = feishu.get_message(message_id).await?;
+    let raw = if msg.msg_type == "text" {
+        serde_json::from_str::<serde_json::Value>(&msg.content)
+            .ok()
+            .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()))
+            .unwrap_or_default()
+    } else {
+        extract_card_text(&msg.content).unwrap_or_default()
+    };
+    let mut ctx = crate::feishu::client::MessageContext {
+        text: strip_mentions(&raw, &msg.mentions, ""),
+        images: Vec::new(),
+    };
+    for key in extract_image_keys(&msg.content, &msg.msg_type) {
+        match feishu.download_image(message_id, &key).await {
+            Ok(img) => ctx.images.push(img),
+            Err(e) => tracing::warn!("quoted context: download image {} failed: {}", key, e),
+        }
+    }
+    Ok(ctx)
 }
 
 /// Extract the user-visible text from a card/interactive message JSON. The
@@ -921,7 +1030,63 @@ mod tests {
             content: r#"{"image_key": "abc123"}"#.into(),
             mentions: vec![],
         };
-        assert_eq!(parse_message_content(&msg), r#"{"image_key": "abc123"}"#);
+        // Raw content JSON must never leak into the prompt — a placeholder.
+        assert_eq!(parse_message_content(&msg), "[图片]");
+    }
+
+    #[test]
+    fn placeholders_cover_each_media_type() {
+        let cases = [
+            ("image", "[图片]"),
+            ("video", "[视频]"),
+            ("media", "[视频]"),
+            ("audio", "[语音]"),
+            ("file", "[文件]"),
+            ("sticker", "[表情]"),
+            ("share_chat", "[分享]"),
+            ("merged_forward", "[合并转发]"),
+            ("unknown_type", "[其他消息]"),
+        ];
+        for (msg_type, expected) in cases {
+            let msg = MessageData {
+                message_id: "msg_m".into(),
+                root_id: None,
+                parent_id: None,
+                thread_id: None,
+                chat_id: "chat_1".into(),
+                chat_type: "p2p".into(),
+                message_type: msg_type.into(),
+                content: r#"{"some_key":"xyz"}"#.into(),
+                mentions: vec![],
+            };
+            assert_eq!(parse_message_content(&msg), expected, "for type {msg_type}");
+        }
+    }
+
+    #[test]
+    fn image_keys_extracted_for_image_and_post_messages() {
+        // Standalone image message.
+        let keys = extract_image_keys(r#"{"image_key":"img_a"}"#, "image");
+        assert_eq!(keys, vec!["img_a"]);
+
+        // Post (rich text) with text + image elements — the "screenshot +
+        // caption" composer shape.
+        let post = r#"{"title":"","content":[[{"tag":"text","text":"看看这个报错"}],[{"tag":"img","image_key":"img_b"}]]}"#;
+        assert_eq!(extract_image_keys(post, "post"), vec!["img_b"]);
+
+        // Text messages carry no image keys.
+        assert!(extract_image_keys(r#"{"text":"hi"}"#, "text").is_empty());
+
+        // Unparseable content degrades to empty.
+        assert!(extract_image_keys("not json", "image").is_empty());
+    }
+
+    #[test]
+    fn image_keys_ignores_non_img_image_key_fields() {
+        // A generic `image_key` field NOT under a `tag:"img"` element must not
+        // be treated as a downloadable image.
+        let v = r#"{"extra":{"image_key":"not_an_element"}}"#;
+        assert!(extract_image_keys(v, "post").is_empty());
     }
 
     /// Feishu sometimes delivers the user's input as a CARD (msg_type

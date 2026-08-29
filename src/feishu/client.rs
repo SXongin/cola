@@ -532,6 +532,99 @@ impl Client {
             Ok(resp.data.items)
         }
     }
+
+    /// Fetch a message by id (`GET /im/v1/messages/{id}`), returning the fields
+    /// cola needs for quote injection. `card_msg_content_type=raw_card_content`
+    /// keeps the raw card JSON (so interactive cards yield extractable text)
+    /// instead of a template that discards the content.
+    ///
+    /// Requires the `im:message` permission. Any failure (missing permission,
+    /// deleted message) surfaces as an error; callers degrade to text-only.
+    pub async fn get_message(&self, message_id: &str) -> crate::error::Result<FeishuMessage> {
+        let token = self.get_access_token().await?;
+        let resp = self
+            .http
+            .get(format!(
+                "https://open.feishu.cn/open-apis/im/v1/messages/{}?card_msg_content_type=raw_card_content",
+                message_id
+            ))
+            .bearer_auth(&token)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await?;
+        let text = resp.text().await?;
+        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+            crate::error::BridgeError::Feishu(format!("parse get_message: {e} — body: {text}"))
+        })?;
+        let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            return Err(crate::error::BridgeError::Feishu(format!(
+                "get message error {code}: {}",
+                &text[..text.len().min(300)]
+            )));
+        }
+        let Some(item) = v["data"]["items"].get(0) else {
+            return Err(crate::error::BridgeError::Feishu(format!(
+                "get message error: no data for {message_id} — body: {}",
+                &text[..text.len().min(300)]
+            )));
+        };
+        let mentions: Vec<crate::feishu::event::Mention> = serde_json::from_value(
+            item.get("mentions")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+        )
+        .unwrap_or_default();
+        Ok(FeishuMessage {
+            msg_type: item
+                .get("msg_type")
+                .and_then(|m| m.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            content: item["body"]["content"].as_str().unwrap_or_default().to_string(),
+            mentions,
+        })
+    }
+
+    /// Download an image embedded in a message (`GET /im/v1/messages/{id}/resources/{key}?type=image`),
+    /// returning its bytes and the server-declared content type. Requires the
+    /// `im:resource` permission; callers degrade to a `[图片]` placeholder on error.
+    pub async fn download_image(
+        &self,
+        message_id: &str,
+        image_key: &str,
+    ) -> crate::error::Result<ImageAttachment> {
+        let token = self.get_access_token().await?;
+        let resp = self
+            .http
+            .get(format!(
+                "https://open.feishu.cn/open-apis/im/v1/messages/{}/resources/{}?type=image",
+                message_id, image_key
+            ))
+            .bearer_auth(&token)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(crate::error::BridgeError::Feishu(format!(
+                "download image failed: {status}: {}",
+                &text[..text.len().min(300)]
+            )));
+        }
+        let mime = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("image/png")
+            .to_string();
+        let bytes = resp.bytes().await?;
+        Ok(ImageAttachment {
+            mime,
+            data: bytes.to_vec(),
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -595,6 +688,32 @@ pub struct ChatMessage {
     pub sender: Option<ChatMessageSender>,
     #[serde(default)]
     pub body: Option<serde_json::Value>,
+}
+
+/// A message fetched by id (`get_message`), carrying the fields cola needs for
+/// quote injection: the message type, raw content and mentions.
+#[derive(Debug, Clone)]
+pub struct FeishuMessage {
+    pub msg_type: String,
+    pub content: String,
+    pub mentions: Vec<crate::feishu::event::Mention>,
+}
+
+/// A downloaded Feishu image, ready to be attached to a prompt as a vision
+/// file part.
+#[derive(Debug, Clone)]
+pub struct ImageAttachment {
+    pub mime: String,
+    pub data: Vec<u8>,
+}
+
+/// The prompt-relevant content of a Feishu message: extracted text plus any
+/// images downloaded from it. Produced for quoted/replied parents so the model
+/// sees what the reply answers.
+#[derive(Debug, Clone)]
+pub struct MessageContext {
+    pub text: String,
+    pub images: Vec<ImageAttachment>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

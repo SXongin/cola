@@ -23,6 +23,20 @@ const GROUP_LOBBY_GUIDANCE: &str = "\
 // shell log redirect (`cola ... > test.log 2>&1`) carries into the new process.
 // The current process then calls `std::process::exit(0)` right after.
 
+/// Convert downloaded platform images into OpenCode `ImageInput`s (data-URL
+/// `file` parts). Empty for text-only turns; the retry path loses images (they
+/// are not persisted on the accumulator) and sends text alone.
+fn image_inputs(images: &[crate::feishu::client::ImageAttachment]) -> Vec<opencode::client::ImageInput> {
+    use base64::Engine;
+    images
+        .iter()
+        .map(|img| opencode::client::ImageInput {
+            mime: img.mime.clone(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(&img.data),
+        })
+        .collect()
+}
+
 /// Everything `run_prompt` needs for one turn. Built by `handle_prompt` for a
 /// fresh message and by the error-card "retry" action (which reuses the
 /// existing card id + stored prompt).
@@ -35,6 +49,8 @@ struct PromptContext {
     existing_card_id: Option<String>,
     requester_open_id: Option<String>,
     is_group: bool,
+    /// Downloaded images attached to this turn (Image Attachments).
+    images: Vec<crate::feishu::client::ImageAttachment>,
 }
 
 /// The bridge coordinator. Owns the state shared by every flow ([`SharedCore`])
@@ -70,18 +86,9 @@ impl Deref for App {
 
 #[async_trait::async_trait]
 impl crate::bridge::EventSink for App {
-    async fn handle_message(
-        &self,
-        message_id: String,
-        chat_id: String,
-        chat_type: String,
-        thread_id: Option<String>,
-        text: String,
-        requester_open_id: Option<String>,
-    ) {
+    async fn handle_message(&self, msg: crate::bridge::IncomingMessage) {
         if let Some(app) = self.self_arc() {
-            app.handle_message(message_id, chat_id, chat_type, thread_id, text, requester_open_id)
-                .await;
+            app.handle_message(msg).await;
         }
     }
 
@@ -200,28 +207,16 @@ impl App {
         Ok(())
     }
 
-    pub async fn handle_message(
-        self: &Arc<Self>,
-        message_id: String,
-        chat_id: String,
-        chat_type: String,
-        thread_id: Option<String>,
-        text: String,
-        requester_open_id: Option<String>,
-    ) {
-        let kind = ConversationKind::classify(&chat_type, thread_id.as_deref());
-        let thread_key = kind.thread_key(&chat_id, thread_id.as_deref());
-        if let Some(cmd) = command::parse_command(&text) {
-            if let Err(e) = self.handle_command(cmd, thread_key, &message_id, kind).await {
+    pub async fn handle_message(self: &Arc<Self>, msg: crate::bridge::IncomingMessage) {
+        let kind = ConversationKind::classify(&msg.chat_type, msg.thread_id.as_deref());
+        let thread_key = kind.thread_key(&msg.chat_id, msg.thread_id.as_deref());
+        if let Some(cmd) = command::parse_command(&msg.text) {
+            if let Err(e) = self.handle_command(cmd, thread_key, &msg.message_id, kind).await {
                 tracing::error!("Cmd: {}", e);
             }
             return;
         }
-        let is_group = chat_type == "group";
-        if let Err(e) = self
-            .handle_prompt(thread_key, text, &message_id, kind, requester_open_id, is_group)
-            .await
-        {
+        if let Err(e) = self.handle_prompt(thread_key, msg, kind).await {
             tracing::error!("Prompt: {}", e);
         }
     }
@@ -229,18 +224,50 @@ impl App {
     pub(crate) async fn handle_prompt(
         self: &Arc<Self>,
         thread_key: ThreadKey,
-        text: String,
-        message_id: &str,
+        msg: crate::bridge::IncomingMessage,
         kind: ConversationKind,
-        requester_open_id: Option<String>,
-        is_group: bool,
     ) -> crate::error::Result<()> {
+        let crate::bridge::IncomingMessage {
+            message_id,
+            chat_type,
+            parent_id,
+            text,
+            images,
+            requester_open_id,
+            ..
+        } = msg;
+        let is_group = chat_type == "group";
+        let mut text = text;
+        let mut images = images;
+
+        // Quoted Context: when this message replies to another, fetch the
+        // parent and prepend it so the model sees what the reply answers —
+        // including parents missing from session history (lobby-session switch,
+        // compaction). Depth-1 with a short timeout; any failure degrades to
+        // text-only (the pre-change behavior).
+        if let Some(pid) = parent_id.as_deref() {
+            let fetch = feishu::ws::quoted_context(&self.feishu, pid);
+            let fetch = tokio::time::timeout(std::time::Duration::from_millis(1500), fetch);
+            match fetch.await {
+                Ok(Ok(ctx)) => {
+                    if !ctx.text.is_empty() {
+                        let capped: String = ctx.text.chars().take(2000).collect();
+                        text = format!("[引用消息]:\n{}\n\n{}", capped, text);
+                    }
+                    // Quoted images come first, then the reply's own images.
+                    images.splice(0..0, ctx.images);
+                }
+                Ok(Err(e)) => tracing::debug!("quoted context fetch failed for {}: {}", pid, e),
+                Err(_) => tracing::debug!("quoted context fetch timed out for {}", pid),
+            }
+        }
+
         let (session_id, created) = self.get_or_create_session(&thread_key, &text).await?;
 
         // First message on a group's top level created a lobby session: reply
         // once with guidance so the user knows each topic isolates a session.
         if created && kind == ConversationKind::GroupLobby {
-            self.feishu.reply_text(message_id, GROUP_LOBBY_GUIDANCE).await?;
+            self.feishu.reply_text(&message_id, GROUP_LOBBY_GUIDANCE).await?;
         }
 
         let subtitle = self.session_subtitle(&thread_key, &text).await;
@@ -256,11 +283,13 @@ impl App {
         {
             let busy = self.inflight.lock().await.contains(&session_id);
             if busy {
+                let image_inputs = image_inputs(&images);
                 match self
                     .opencode
                     .prompt_async(
                         &session_id,
                         &text,
+                        &image_inputs,
                         self.session_model_override(&session_id).await.as_ref(),
                         self.session_agent_override(&session_id).await.as_deref(),
                     )
@@ -275,7 +304,7 @@ impl App {
                             let _ = self
                                 .feishu
                                 .reply_text(
-                                    message_id,
+                                    &message_id,
                                     "📨 已收到补充，将并入当前处理。若当前轮已结束，会作为下一条消息继续。",
                                 )
                                 .await;
@@ -285,7 +314,7 @@ impl App {
                         tracing::warn!("supplement: prompt_async failed: {}", e);
                         let _ = self
                             .feishu
-                            .reply_text(message_id, "⚠️ 补充消息发送失败，请稍后重试。")
+                            .reply_text(&message_id, "⚠️ 补充消息发送失败，请稍后重试。")
                             .await;
                     }
                 }
@@ -297,11 +326,12 @@ impl App {
             session_id,
             thread_key,
             text,
-            message_id: message_id.to_string(),
+            message_id,
             subtitle,
             existing_card_id: None,
             requester_open_id,
             is_group,
+            images,
         })
         .await
     }
@@ -399,6 +429,7 @@ impl App {
             existing_card_id,
             requester_open_id,
             is_group,
+            images,
         } = ctx;
         // Serialize prompts per session: if one is already in flight, don't let
         // a second message overwrite its accumulator (the two would race on the
@@ -475,6 +506,7 @@ impl App {
             .prompt(
                 &session_id,
                 &text,
+                &image_inputs(&images),
                 self.session_model_override(&session_id).await.as_ref(),
                 self.session_agent_override(&session_id).await.as_deref(),
             )
@@ -534,6 +566,7 @@ impl App {
                 .prompt(
                     &session_id,
                     &text,
+                    &image_inputs(&images),
                     self.session_model_override(&session_id).await.as_ref(),
                     self.session_agent_override(&session_id).await.as_deref(),
                 )
@@ -888,6 +921,7 @@ impl App {
                         existing_card_id: Some(card_id),
                         requester_open_id: requester,
                         is_group,
+                        images: Vec::new(),
                     })
                     .await
                 {
@@ -958,6 +992,10 @@ mod test_support {
         pub user_names: std::collections::HashMap<String, String>,
         /// chat_id → display name served by `chat_name` (absent = None).
         pub chat_names: std::collections::HashMap<String, String>,
+        /// message_id → quoted-parent content served by `get_message` (absent =
+        /// the default text parent). Lets tests script quote-injection cases.
+        pub quoted_messages:
+            std::sync::Mutex<std::collections::HashMap<String, crate::feishu::client::FeishuMessage>>,
     }
 
     impl RecordingPlatform {
@@ -966,6 +1004,7 @@ mod test_support {
                 calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 user_names: std::collections::HashMap::new(),
                 chat_names: std::collections::HashMap::new(),
+                quoted_messages: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
         }
     }
@@ -1076,6 +1115,34 @@ mod test_support {
                 body: None,
             }])
         }
+
+        async fn get_message(
+            &self,
+            message_id: &str,
+        ) -> crate::error::Result<crate::feishu::client::FeishuMessage> {
+            // The mock serves parents via `quoted_messages`; a missing entry is
+            // a hard failure (like a real `im:message` permission error) so
+            // degradation paths are testable.
+            self.quoted_messages
+                .lock()
+                .unwrap()
+                .get(message_id)
+                .cloned()
+                .ok_or_else(|| {
+                    crate::error::BridgeError::Feishu(format!("mock: no quoted message {message_id}"))
+                })
+        }
+
+        async fn download_image(
+            &self,
+            _message_id: &str,
+            _image_key: &str,
+        ) -> crate::error::Result<crate::feishu::client::ImageAttachment> {
+            Ok(crate::feishu::client::ImageAttachment {
+                mime: "image/png".into(),
+                data: vec![1, 2, 3, 4],
+            })
+        }
     }
 
     /// Serves scripted parts/permissions instead of a live OpenCode server.
@@ -1115,12 +1182,16 @@ mod test_support {
         pub fail_prompt_count: Arc<std::sync::atomic::AtomicUsize>,
         /// Records every `prompt` call's text (asserts retry re-submits).
         pub prompt_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
+        /// Records the number of images attached to each `prompt` call.
+        pub prompt_images: Arc<tokio::sync::Mutex<Vec<usize>>>,
         /// Records the model passed to each `prompt` call ("provider/model").
         pub prompt_models: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
         /// Records the agent passed to each `prompt` call.
         pub prompt_agents: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
         /// Records every `prompt_async` call's text (asserts supplement path).
         pub prompt_async_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
+        /// Records the number of images attached to each `prompt_async` call.
+        pub prompt_async_images: Arc<tokio::sync::Mutex<Vec<usize>>>,
         /// Records the model passed to each `prompt_async` call.
         pub prompt_async_models: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
         /// Records the agent passed to each `prompt_async` call.
@@ -1158,9 +1229,11 @@ mod test_support {
                 prompt_error: None,
                 fail_prompt_count: std::sync::atomic::AtomicUsize::new(0).into(),
                 prompt_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                prompt_images: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 prompt_models: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 prompt_agents: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 prompt_async_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                prompt_async_images: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 prompt_async_models: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 prompt_async_agents: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 session_id: "ses_test".into(),
@@ -1227,10 +1300,12 @@ mod test_support {
             &self,
             session_id: &str,
             text: &str,
+            images: &[opencode::client::ImageInput],
             _model: Option<&opencode::client::ModelInfo>,
             agent: Option<&str>,
         ) -> crate::error::Result<opencode::client::PromptResponse> {
             self.prompt_calls.lock().await.push(text.to_string());
+            self.prompt_images.lock().await.push(images.len());
             self.prompt_models
                 .lock()
                 .await
@@ -1263,6 +1338,7 @@ mod test_support {
             &self,
             session_id: &str,
             text: &str,
+            images: &[opencode::client::ImageInput],
             _model: Option<&opencode::client::ModelInfo>,
             agent: Option<&str>,
         ) -> crate::error::Result<()> {
@@ -1270,6 +1346,7 @@ mod test_support {
                 .lock()
                 .await
                 .push(format!("{}:{}", session_id, text));
+            self.prompt_async_images.lock().await.push(images.len());
             self.prompt_async_models
                 .lock()
                 .await
@@ -1485,6 +1562,27 @@ mod integration_tests {
         (app, platform)
     }
 
+    /// Build a plain text `IncomingMessage` for tests (no parent, no images).
+    fn incoming(
+        message_id: String,
+        chat_id: String,
+        chat_type: String,
+        thread_id: Option<String>,
+        text: String,
+        requester: Option<String>,
+    ) -> crate::bridge::IncomingMessage {
+        crate::bridge::IncomingMessage {
+            message_id,
+            chat_id,
+            chat_type,
+            thread_id,
+            parent_id: None,
+            text,
+            images: vec![],
+            requester_open_id: requester,
+        }
+    }
+
     /// Create a temp work dir, set it as the process cwd (sessions are created
     /// in cwd, and tests must never operate in the cola repo) and return it.
     /// The returned TempDir must stay alive for the test's duration.
@@ -1501,14 +1599,14 @@ mod integration_tests {
         let cfg = test_config(&dir.path().join("sessions.json"));
         let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_1".into(),
             "chat_1".into(),
             "p2p".into(),
             None,
             "分析一下目录".into(),
             None,
-        )
+        ))
         .await;
 
         let calls = platform.calls.lock().await.clone();
@@ -1546,14 +1644,14 @@ mod integration_tests {
         backend.prompt_error = Some("Streaming response failed: [503] The request queue is full.".into());
         let (app, platform) = build_app(cfg, backend).await;
 
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_1".into(),
             "chat_1".into(),
             "p2p".into(),
             None,
             "hi".into(),
             None,
-        )
+        ))
         .await;
 
         let calls = platform.calls.lock().await.clone();
@@ -1588,14 +1686,14 @@ mod integration_tests {
         let platform = Arc::new(RecordingPlatform::new());
         let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
 
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_1".into(),
             "chat_1".into(),
             "p2p".into(),
             None,
             "hi".into(),
             None,
-        )
+        ))
         .await;
 
         // The error card must carry a retry button.
@@ -1666,14 +1764,14 @@ mod integration_tests {
         let cfg = test_config(&dir.path().join("sessions.json"));
         let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_1".into(),
             "oc_group_1".into(),
             "group".into(),
             None,
             "hi".into(),
             Some("ou_requester".into()),
-        )
+        ))
         .await;
 
         let calls = platform.calls.lock().await.clone();
@@ -1717,14 +1815,14 @@ mod integration_tests {
             .unwrap(),
         );
 
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_1".into(),
             "oc_group_1".into(),
             "group".into(),
             None,
             "hi".into(),
             Some("ou_requester".into()),
-        )
+        ))
         .await;
 
         let calls = platform.calls.lock().await.clone();
@@ -1758,14 +1856,14 @@ mod integration_tests {
         let cfg = test_config(&dir.path().join("sessions.json"));
         let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_1".into(),
             "oc_p2p_1".into(),
             "p2p".into(),
             None,
             "hi".into(),
             Some("ou_user".into()),
-        )
+        ))
         .await;
 
         let calls = platform.calls.lock().await.clone();
@@ -1940,14 +2038,14 @@ mod integration_tests {
         let cfg = test_config(&dir.path().join("sessions.json"));
         let (app, platform) = build_app(cfg, MockBackend::new(long_answer_parts())).await;
 
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_1".into(),
             "oc_p2p_1".into(),
             "p2p".into(),
             None,
             "hi".into(),
             None,
-        )
+        ))
         .await;
 
         let calls = platform.calls.lock().await.clone();
@@ -1991,14 +2089,14 @@ mod integration_tests {
         let cfg = test_config(&dir.path().join("sessions.json"));
         let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_1".into(),
             "oc_p2p_1".into(),
             "p2p".into(),
             None,
             "hi".into(),
             None,
-        )
+        ))
         .await;
 
         let calls = platform.calls.lock().await.clone();
@@ -2029,14 +2127,14 @@ mod integration_tests {
         let (app, _platform) = build_app(cfg, backend).await;
 
         // Seed a session + accumulator so the poller has a reply target.
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_1".into(),
             "chat_1".into(),
             "p2p".into(),
             None,
             "hi".into(),
             None,
-        )
+        ))
         .await;
 
         // Run the permission poller briefly.
@@ -2661,14 +2759,14 @@ mod integration_tests {
         let (app, _platform) = build_app(cfg, backend).await;
 
         // Seed the parent session so it maps child → parent → chat.
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_1".into(),
             "chat_1".into(),
             "p2p".into(),
             None,
             "hi".into(),
             None,
-        )
+        ))
         .await;
 
         tokio::spawn({
@@ -2922,14 +3020,14 @@ mod integration_tests {
                 .await
                 .expect("send prompt to group");
             self.app
-                .handle_message(
+                .handle_message(incoming(
                     sent_msg_id.clone(),
                     self.group_chat_id.clone(),
                     "group".into(),
                     None,
                     prompt.to_string(),
                     None,
-                )
+                ))
                 .await;
             sent_msg_id
         }
@@ -3186,14 +3284,14 @@ mod integration_tests {
         // No chdir: the session directory must come from [bridge] work_dir, not
         // the process cwd.
         let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_1".into(),
             "chat_1".into(),
             "p2p".into(),
             None,
             "hi".into(),
             None,
-        )
+        ))
         .await;
 
         let thread = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
@@ -3297,14 +3395,14 @@ mod integration_tests {
         .unwrap();
 
         // Now a message arrives inside that topic (thread_id = the mapped one).
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_in_topic".into(),
             "chat_1".into(),
             "p2p".into(),
             Some("omt_created_topic".into()),
             "帮我看看这个目录".into(),
             None,
-        )
+        ))
         .await;
 
         // It must reuse the topic session (ses_topic), not create a new one.
@@ -3363,14 +3461,14 @@ mod integration_tests {
         let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
         // A top-level group message (no thread_id) is the group "lobby".
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_1".into(),
             "oc_group_1".into(),
             "group".into(),
             None,
             "hi".into(),
             None,
-        )
+        ))
         .await;
 
         // Guidance text is replied once.
@@ -3407,23 +3505,23 @@ mod integration_tests {
         let cfg = test_config(&dir.path().join("sessions.json"));
         let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_1".into(),
             "oc_group_1".into(),
             "group".into(),
             None,
             "hi".into(),
             None,
-        )
+        ))
         .await;
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_2".into(),
             "oc_group_1".into(),
             "group".into(),
             None,
             "again".into(),
             None,
-        )
+        ))
         .await;
 
         let calls = platform.calls.lock().await.clone();
@@ -3449,14 +3547,14 @@ mod integration_tests {
         let cfg = test_config(&dir.path().join("sessions.json"));
         let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_1".into(),
             "oc_p2p_1".into(),
             "p2p".into(),
             None,
             "hi".into(),
             None,
-        )
+        ))
         .await;
 
         let calls = platform.calls.lock().await.clone();
@@ -3507,23 +3605,23 @@ mod integration_tests {
 
         // Lobby message routes to the lobby session; topic message routes to
         // the topic session — never creating or switching across.
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_1".into(),
             "oc_group_1".into(),
             "group".into(),
             None,
             "hi".into(),
             None,
-        )
+        ))
         .await;
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_2".into(),
             "oc_group_1".into(),
             "group".into(),
             Some("omt_topic_1".into()),
             "refactor".into(),
             None,
-        )
+        ))
         .await;
 
         let store = app.sessions.lock().await;
@@ -3593,23 +3691,23 @@ mod integration_tests {
             store.persist().unwrap();
         }
 
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_1".into(),
             "oc_p2p_1".into(),
             "p2p".into(),
             None,
             "hi".into(),
             None,
-        )
+        ))
         .await;
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_2".into(),
             "oc_p2p_1".into(),
             "p2p".into(),
             Some("omt_p2p_1".into()),
             "topic hi".into(),
             None,
-        )
+        ))
         .await;
 
         let store = app.sessions.lock().await;
@@ -3669,14 +3767,14 @@ mod integration_tests {
             store.persist().unwrap();
         }
 
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_1".into(),
             "chat_1".into(),
             "p2p".into(),
             None,
             "hi".into(),
             None,
-        )
+        ))
         .await;
 
         // The prompt on the stale session 404s; cola must recreate the session
@@ -3978,14 +4076,14 @@ mod integration_tests {
         let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
 
         // Seed a session + active accumulator (an in-flight turn).
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_1".into(),
             "chat_1".into(),
             "p2p".into(),
             None,
             "hi".into(),
             None,
-        )
+        ))
         .await;
         assert!(
             app.accumulators.lock().await.contains_key("ses_test"),
@@ -4092,14 +4190,14 @@ mod integration_tests {
         }
         app.inflight.lock().await.insert("ses_test".to_string());
 
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_sup".into(),
             "chat_1".into(),
             "p2p".into(),
             None,
             "补充一下，改用方案 B".into(),
             None,
-        )
+        ))
         .await;
 
         // prompt_async was called with the supplement text.
@@ -4723,14 +4821,14 @@ mod integration_tests {
         assert!(app.sessions.lock().await.entry_for_session("ses_other").is_none());
 
         // The next message prompts with the override as the model.
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_prompt".into(),
             "chat_1".into(),
             "p2p".into(),
             None,
             "hi".into(),
             None,
-        )
+        ))
         .await;
         assert_eq!(
             prompt_models.lock().await.as_slice(),
@@ -4824,14 +4922,14 @@ mod integration_tests {
         }
         app.inflight.lock().await.insert("ses_test".into());
 
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_supp".into(),
             "chat_1".into(),
             "p2p".into(),
             None,
             "补充内容".into(),
             None,
-        )
+        ))
         .await;
 
         assert_eq!(
@@ -4886,14 +4984,14 @@ mod integration_tests {
         assert!(app.sessions.lock().await.entry_for_session("ses_other").is_none());
 
         // The next message prompts with the override as the agent.
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_prompt".into(),
             "chat_1".into(),
             "p2p".into(),
             None,
             "hi".into(),
             None,
-        )
+        ))
         .await;
         assert_eq!(
             prompt_agents.lock().await.as_slice(),
@@ -4927,14 +5025,14 @@ mod integration_tests {
         }
         app.inflight.lock().await.insert("ses_test".into());
 
-        app.handle_message(
+        app.handle_message(incoming(
             "msg_supp".into(),
             "chat_1".into(),
             "p2p".into(),
             None,
             "补充内容".into(),
             None,
-        )
+        ))
         .await;
 
         assert_eq!(
@@ -5165,5 +5263,147 @@ mod integration_tests {
         let entry = app.sessions.lock().await.get_active(&topic_key).cloned().unwrap();
         assert_eq!(entry.session_id, "ses_foreign123abc");
         assert_eq!(entry.topic_anchor.as_deref(), Some("msg_topic_reply"));
+    }
+
+    /// A reply injects its parent's text as Quoted Context, prefixed ahead of
+    /// the user's own message so the model sees what the reply answers.
+    #[tokio::test]
+    async fn reply_injects_quoted_parent_text() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        let prompt_calls = backend.prompt_calls.clone();
+        let prompt_images = backend.prompt_images.clone();
+        let platform = RecordingPlatform::new();
+        platform.quoted_messages.lock().unwrap().insert(
+            "om_parent".into(),
+            crate::feishu::client::FeishuMessage {
+                msg_type: "text".into(),
+                content: r#"{"text":"父消息：看看这个报错 @_user_1"}"#.into(),
+                mentions: vec![crate::feishu::event::Mention {
+                    key: Some("@_user_1".into()),
+                    id: Some(crate::feishu::event::MentionId {
+                        open_id: Some("ou_other".into()),
+                    }),
+                    name: Some("李明".into()),
+                }],
+            },
+        );
+        let app = Arc::new(App::new(cfg, Arc::new(backend), Arc::new(platform)).unwrap());
+
+        app.handle_message(crate::bridge::IncomingMessage {
+            message_id: "msg_reply".into(),
+            chat_id: "chat_1".into(),
+            chat_type: "p2p".into(),
+            thread_id: None,
+            parent_id: Some("om_parent".into()),
+            text: "还是不行".into(),
+            images: vec![],
+            requester_open_id: None,
+        })
+        .await;
+
+        let calls = prompt_calls.lock().await.clone();
+        assert_eq!(
+            calls,
+            vec!["[引用消息]:\n父消息：看看这个报错 @李明\n\n还是不行".to_string()]
+        );
+        // The text parent carries no images.
+        assert_eq!(*prompt_images.lock().await, vec![0]);
+    }
+
+    /// A reply to an IMAGE message downloads the quoted image and attaches it as
+    /// an Image Attachment (prompt_images > 0).
+    #[tokio::test]
+    async fn reply_to_image_downloads_quoted_image() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        let prompt_images = backend.prompt_images.clone();
+        let platform = RecordingPlatform::new();
+        platform.quoted_messages.lock().unwrap().insert(
+            "om_img_parent".into(),
+            crate::feishu::client::FeishuMessage {
+                msg_type: "image".into(),
+                content: r#"{"image_key":"img_q"}"#.into(),
+                mentions: vec![],
+            },
+        );
+        let app = Arc::new(App::new(cfg, Arc::new(backend), Arc::new(platform)).unwrap());
+
+        app.handle_message(crate::bridge::IncomingMessage {
+            message_id: "msg_r".into(),
+            chat_id: "chat_1".into(),
+            chat_type: "p2p".into(),
+            thread_id: None,
+            parent_id: Some("om_img_parent".into()),
+            text: "把这里放大看看".into(),
+            images: vec![],
+            requester_open_id: None,
+        })
+        .await;
+
+        assert_eq!(*prompt_images.lock().await, vec![1]);
+    }
+
+    /// An incoming image message attaches its downloaded image; the text is the
+    /// `[图片]` placeholder (never raw JSON).
+    #[tokio::test]
+    async fn image_message_attaches_image_and_placeholder() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        let prompt_calls = backend.prompt_calls.clone();
+        let prompt_images = backend.prompt_images.clone();
+        let app = Arc::new(App::new(cfg, Arc::new(backend), Arc::new(RecordingPlatform::new())).unwrap());
+
+        app.handle_message(crate::bridge::IncomingMessage {
+            message_id: "msg_img".into(),
+            chat_id: "chat_1".into(),
+            chat_type: "p2p".into(),
+            thread_id: None,
+            parent_id: None,
+            text: "[图片]".into(),
+            images: vec![crate::feishu::client::ImageAttachment {
+                mime: "image/png".into(),
+                data: vec![1, 2, 3],
+            }],
+            requester_open_id: None,
+        })
+        .await;
+
+        assert_eq!(*prompt_images.lock().await, vec![1]);
+        assert_eq!(*prompt_calls.lock().await, vec!["[图片]".to_string()]);
+    }
+
+    /// Quote-injection failures degrade to text-only (the pre-change behavior).
+    #[tokio::test]
+    async fn reply_degrades_when_quote_fetch_fails() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        let prompt_calls = backend.prompt_calls.clone();
+        let app = Arc::new(App::new(cfg, Arc::new(backend), Arc::new(RecordingPlatform::new())).unwrap());
+
+        // `om_missing` is not in `quoted_messages` → get_message fails → the
+        // reply reaches the model without any quote prefix.
+        app.handle_message(crate::bridge::IncomingMessage {
+            message_id: "msg_d".into(),
+            chat_id: "chat_1".into(),
+            chat_type: "p2p".into(),
+            thread_id: None,
+            parent_id: Some("om_missing".into()),
+            text: "hi".into(),
+            images: vec![],
+            requester_open_id: None,
+        })
+        .await;
+
+        let calls = prompt_calls.lock().await.clone();
+        assert_eq!(calls, vec!["hi".to_string()]);
     }
 }

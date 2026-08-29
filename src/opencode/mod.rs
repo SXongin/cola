@@ -31,21 +31,26 @@ pub trait Backend: Send + Sync {
     ///
     /// `agent` is the per-session `/agent` override; None → the server uses the
     /// session's own/default agent.
+    ///
+    /// `images` are attached as data-URL `file` parts; requires a vision-capable
+    /// model (unsupported models surface an error).
     async fn prompt(
         &self,
         session_id: &str,
         text: &str,
+        images: &[client::ImageInput],
         model: Option<&ModelInfo>,
         agent: Option<&str>,
     ) -> Result<PromptResponse>;
 
     /// Fire-and-forget prompt (OpenCode `prompt_async`): message persisted and
     /// a run forked, returns immediately. Used by the supplement path so a
-    /// message sent mid-turn doesn't block.
+    /// message sent mid-turn doesn't block. Same `images` semantics as `prompt`.
     async fn prompt_async(
         &self,
         session_id: &str,
         text: &str,
+        images: &[client::ImageInput],
         model: Option<&ModelInfo>,
         agent: Option<&str>,
     ) -> Result<()>;
@@ -111,20 +116,22 @@ impl Backend for Client {
         &self,
         session_id: &str,
         text: &str,
+        images: &[client::ImageInput],
         model: Option<&ModelInfo>,
         agent: Option<&str>,
     ) -> Result<PromptResponse> {
-        Client::prompt(self, session_id, text, model, agent).await
+        Client::prompt(self, session_id, text, images, model, agent).await
     }
 
     async fn prompt_async(
         &self,
         session_id: &str,
         text: &str,
+        images: &[client::ImageInput],
         model: Option<&ModelInfo>,
         agent: Option<&str>,
     ) -> Result<()> {
-        Client::prompt_async(self, session_id, text, model, agent).await
+        Client::prompt_async(self, session_id, text, images, model, agent).await
     }
 
     async fn reply_permission(&self, request_id: &str, reply: &str, directory: Option<&str>) -> Result<()> {
