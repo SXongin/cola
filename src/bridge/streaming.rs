@@ -325,28 +325,39 @@ impl StreamAccumulator {
     /// `MAX_CARD_JSON_CHARS`, or the accumulated text over
     /// `MAX_CARD_TEXT_CHARS` (Feishu caps total card size too, not just the
     /// element count). Returns `timeline.len()` when everything fits.
+    ///
+    /// The size estimate is in **UTF-8 bytes** — Feishu rejects on bytes, not
+    /// characters, so CJK content (3 bytes/char) counts 3x what a char-count
+    /// estimate would. It adds each element's serialized JSON overhead
+    /// (measured ~260-340 bytes for a collapsible panel, ~35 for a markdown
+    /// element) so the estimate trails the real card size by only a few
+    /// hundred bytes — the `MAX_CARD_JSON_CHARS` margin absorbs the rest.
     fn estimate_split_index(&self, start: usize) -> usize {
+        // Byte length of the first `n` chars (mirrors `truncate_md`, which caps
+        // rendered content by characters).
+        let first_n_bytes = |s: &str, n: usize| s.chars().take(n).map(|c| c.len_utf8()).sum::<usize>();
         let mut comps = 0usize;
         let mut size = 0usize;
         let mut card_text = 0usize;
         for (i, item) in self.timeline.iter().enumerate().skip(start) {
             let (c, s, t) = match item {
-                TimelineItem::Reasoning(r) => (4, 200 + r.chars().count().min(800), 0),
+                TimelineItem::Reasoning(r) => (4, 300 + first_n_bytes(r, 800), 0),
                 TimelineItem::Tool(call_id) => {
                     let panel_size = self.tools.get(call_id).map(|p| {
                         let input = p
                             .input
                             .as_ref()
-                            .map(|x| x.to_string().chars().count().min(400))
+                            .map(|x| x.to_string())
+                            .map(|s| first_n_bytes(&s, 400))
                             .unwrap_or(0);
                         let output = p
                             .output
                             .as_deref()
-                            .map(|x| x.chars().count().min(crate::feishu::card::TOOL_OUTPUT_MAX_CHARS))
+                            .map(|s| first_n_bytes(s, crate::feishu::card::TOOL_OUTPUT_MAX_CHARS))
                             .unwrap_or(0);
-                        200 + input + output
+                        400 + input + output
                     });
-                    (4, panel_size.unwrap_or(200), 0)
+                    (4, panel_size.unwrap_or(400), 0)
                 }
                 // Text is chunked to ≤ MAX_CARD_TEXT_CHARS per item, so a
                 // single item never exceeds the per-card budget; the budget
@@ -356,7 +367,7 @@ impl StreamAccumulator {
                 TimelineItem::Text(t) => {
                     let chars = t.chars().count();
                     let elements = chars.div_ceil(crate::feishu::card::MAX_ELEMENT_TEXT_CHARS);
-                    (elements, chars, chars)
+                    (elements, t.len() + 40, chars)
                 }
             };
             comps += c;
@@ -931,6 +942,105 @@ mod tests {
             rest.to_string().contains("最后的结论。"),
             "conclusion must appear on a continuation"
         );
+    }
+
+    /// Feishu rejects cards whose serialized body approaches 30KB (documented
+    /// limit; a real 44KB card fails with 230099 / "create universal card
+    /// fail"). A turn heavy on tool panels must split on the JSON-size budget —
+    /// not just the component count — so every card stays under the cap.
+    #[test]
+    fn card_splits_on_json_size_budget() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Done;
+        // Each full-size tool panel serializes to ~3.4KB; 12 of them (~41KB of
+        // body) exceed MAX_CARD_JSON_CHARS but not MAX_CARD_COMPONENTS, so only
+        // the size budget can catch the overflow.
+        let big_output = "o".repeat(crate::feishu::card::TOOL_OUTPUT_MAX_CHARS);
+        for i in 0..12 {
+            acc.push_tool(
+                &format!("call_{}", i),
+                ToolPanel {
+                    name: format!("tool{}", i),
+                    status: "completed".into(),
+                    input: Some(serde_json::json!("in")),
+                    output: Some(big_output.clone()),
+                },
+            );
+        }
+        acc.push_text("最后的结论。");
+
+        let mut cards = Vec::new();
+        let mut full = true;
+        while full {
+            let (card, f) = acc.build_card_with_split();
+            full = f;
+            cards.push(card);
+        }
+        assert!(cards.len() >= 2, "12 big panels must split: {}", cards.len());
+        for (i, card) in cards.iter().enumerate() {
+            let bytes = serde_json::to_string(card).unwrap().len();
+            assert!(
+                bytes < crate::feishu::card::FEISHU_CARD_LIMIT_BYTES,
+                "card {} exceeds Feishu's 30KB card limit: {} bytes",
+                i,
+                bytes
+            );
+        }
+        let last = cards.last().unwrap();
+        assert!(
+            last.to_string().contains("最后的结论。"),
+            "conclusion must survive on a continuation: {}",
+            last
+        );
+    }
+
+    /// The size budget is measured in UTF-8 BYTES, not characters: a CJK panel
+    /// is ~3 bytes per char, so a card that "fits" by char count can still blow
+    /// past Feishu's byte limit. A card heavy on Chinese tool output must split
+    /// on the byte budget.
+    #[test]
+    fn card_splits_on_byte_budget_for_multibyte_content() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Done;
+        // 7 panels of Chinese output: the CHAR estimate is 7 * ~3.4K = ~23.8K
+        // chars (fits under MAX_CARD_JSON_CHARS), but the BYTE estimate is
+        // 7 * ~9.4K = ~66K bytes (way over) — a char-counted estimate would
+        // wrongly ship one ~66KB card and Feishu would reject it.
+        let cjk_output = "中".repeat(crate::feishu::card::TOOL_OUTPUT_MAX_CHARS);
+        for i in 0..7 {
+            acc.push_tool(
+                &format!("call_{}", i),
+                ToolPanel {
+                    name: format!("tool{}", i),
+                    status: "completed".into(),
+                    input: Some(serde_json::json!("入参")),
+                    output: Some(cjk_output.clone()),
+                },
+            );
+        }
+        acc.push_text("最后的结论。");
+
+        let mut cards = Vec::new();
+        let mut full = true;
+        while full {
+            let (card, f) = acc.build_card_with_split();
+            full = f;
+            cards.push(card);
+        }
+        assert!(
+            cards.len() >= 2,
+            "CJK panels must split on bytes: {}",
+            cards.len()
+        );
+        for (i, card) in cards.iter().enumerate() {
+            let bytes = serde_json::to_string(card).unwrap().len();
+            assert!(
+                bytes < crate::feishu::card::FEISHU_CARD_LIMIT_BYTES,
+                "card {} exceeds Feishu's 30KB card limit: {} bytes",
+                i,
+                bytes
+            );
+        }
     }
 
     /// A long answer flows across continuation cards instead of being truncated

@@ -30,10 +30,23 @@ pub const MAX_CARD_TEXT_CHARS: usize = 6000;
 /// finalized with a "to be continued" marker and a fresh continuation card is
 /// sent instead.
 pub const MAX_CARD_COMPONENTS: usize = 150;
-/// Estimated JSON size ceiling for a card body (Feishu caps total card size,
-/// not just the element count — roughly 150KB). A streaming card also splits
-/// when the estimate crosses this.
-pub const MAX_CARD_JSON_CHARS: usize = 100_000;
+/// Feishu's documented ceiling for a card's serialized body (the message API
+/// rejects cards above it; ~30KB, returned as `230099` / "create universal
+/// card fail" 200800). `MAX_CARD_JSON_CHARS` keeps cards under this by a
+/// comfortable margin, since the split estimate trails the real serialized
+/// size by the un-accounted tail (footer, inline buttons) plus per-element
+/// overhead.
+pub const FEISHU_CARD_LIMIT_BYTES: usize = 30_000;
+/// Estimated JSON size ceiling for a card body. Feishu's documented card limit
+/// is [`FEISHU_CARD_LIMIT_BYTES`], and the message API rejects cards far below
+/// the old 100KB assumption — a real 44KB card fails with 230099 / "create
+/// universal card fail" (200800). A streaming card splits when the estimate
+/// crosses this, keeping every card comfortably under the 30KB cap (the
+/// estimate trails the serialized size by a few hundred bytes per element, so
+/// the margin absorbs it). The 5KB gap to the hard limit covers the tail
+/// sections (footer, inline permission/question buttons) the estimate doesn't
+/// count.
+pub const MAX_CARD_JSON_CHARS: usize = FEISHU_CARD_LIMIT_BYTES - 5_000;
 /// A single text element; bound it so a very long reply never pushes the card
 /// over Feishu's total card size / element limits. Reasoning, tool input/output
 /// and the question are already truncated per-element.
