@@ -43,6 +43,14 @@ _Avoid_: Poll, survey, prompt
 A Feishu interactive message card. Evolves through states (loading → reasoning → running → streaming → done) and uses collapsible panels for secondary content.
 _Avoid_: Widget, component, bubble
 
+**Quoted Context**:
+The parent message's content (text + attached images) that a reply answers, fetched from the platform and prepended to the prompt. Makes the reply relationship explicit and covers parents missing from session history (lobby-switch, compaction). Distinct from the user's own message text, which is the prompt's primary content.
+_Avoid_: Quote, reference, reply context
+
+**Image Attachment**:
+A platform image (a standalone image message, an image inside a rich-text message, or a quoted image) downloaded by the platform and attached to a prompt as a vision file part. Requires a vision-capable model; unsupported models surface an error.
+_Avoid_: Picture, media, attachment file
+
 ## Relationships
 
 - A **Bot** contains one **Platform** and one or more **Backend** adapters
@@ -50,6 +58,7 @@ _Avoid_: Widget, component, bubble
 - A **Session** has one **Project** and one optional **Agent**
 - A **Session** receives many **Permissions** and **Questions**
 - The **Bridge** receives **Events** from a **Backend** and renders them as **Card** updates on the **Platform**
+- A prompt's **Quoted Context** and **Image Attachment**s enrich the **Session** the reply belongs to
 
 ## Example dialogue
 
