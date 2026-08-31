@@ -16,6 +16,26 @@ _Avoid_: Client, frontend, channel
 An AI code agent provider (e.g. OpenCode). Handles session management, prompt execution, and event streaming.
 _Avoid_: Engine, model, provider
 
+**Shared Store**:
+The default OpenCode data directory (`~/.local/share/opencode`; `$XDG_DATA_HOME` when set) that every client — cola, OpenChamber, the CLI — reads and writes. The single source of truth for sessions; cola's "one server" invariant is about who serves this store.
+_Avoid_: Database, data dir, state directory
+
+**Owned Server**:
+An `opencode serve` process that cola itself spawned (pid recorded in `~/.cola/self-opencode.pid`). Only an Owned Server may be killed, restarted, or reaped by cola; everything else is someone else's process.
+_Avoid_: Managed server, our server, private server
+
+**Coexistent Server**:
+A default-store `opencode serve` started by someone else — OpenChamber's managed server or a manual launch. cola attaches to it and serves through it, but never kills or restarts it.
+_Avoid_: Foreign server, external server, shared server
+
+**Yield**:
+The act of terminating an Owned Server and re-attaching to a Coexistent Server, so the Shared Store returns to exactly one server. Deferred while a session is in flight (a mid-stream generation must not be truncated).
+_Avoid_: Give way, step down, hand over
+
+**Lazy Start**:
+Spawning an Owned Server only at the moment a server is actually needed (a prompt is about to be sent and no server exists), never proactively at boot. Boot-time behavior is attach-only unless `start_server = "eager"`.
+_Avoid_: On-demand start, deferred start
+
 **Session**:
 A single conversation thread with an AI backend, identified by the server's session id and `title` (the server is the single source of truth for identity, ADR-0007). A session has a directory (project) and an optional agent selection. One session maps to at most one Feishu thread at a time.
 _Avoid_: Chat, conversation, room

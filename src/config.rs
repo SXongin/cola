@@ -40,11 +40,35 @@ pub struct Config {
     pub bridge: BridgeConfig,
 }
 
+/// When cola starts an `opencode serve` of its own (ADR-0013).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerStartPolicy {
+    /// Lazy: attach at boot, spawn an Owned Server only at the moment a prompt
+    /// actually needs one and discovery finds no server. The default.
+    #[default]
+    Auto,
+    /// Attach-only: cola never spawns an Owned Server. If no server exists the
+    /// bot replies that OpenCode is unavailable.
+    Never,
+    /// The old behavior: spawn an Owned Server at boot when none is running.
+    Eager,
+}
+
+impl ServerStartPolicy {
+    /// Whether a demand-time lazy spawn is allowed (`Never` forbids it).
+    pub fn spawns_when_needed(self) -> bool {
+        !matches!(self, Self::Never)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenCodeConfig {
     /// Preferred/fallback port. Optional: discovery rewrites the effective
     /// endpoint to whatever server it finds on the shared store, so an absent
-    /// `url` just means "use the default `http://localhost:4096`".
+    /// `url` just means "use the default `http://localhost:4096`". In a
+    /// coexistence setup it is only a tiebreaker among servers of the same
+    /// class (ADR-0013).
     #[serde(default)]
     pub url: Option<String>,
     /// Default model for new sessions, "provider/model". When unset, cola does
@@ -53,6 +77,22 @@ pub struct OpenCodeConfig {
     /// means "用 opencode 的默认模型".
     #[serde(default)]
     pub model: Option<String>,
+    /// When cola may start its own `opencode serve` (ADR-0013): `auto` (lazy,
+    /// the default), `never` (attach-only), `eager` (spawn at boot).
+    #[serde(default)]
+    pub start_server: ServerStartPolicy,
+}
+
+impl OpenCodeConfig {
+    /// The preferred port from `[opencode] url`, if parseable. A tiebreaker in
+    /// `pick_server` among servers of the same class (ADR-0013), never an
+    /// absolute pin.
+    pub fn preferred_port(&self) -> Option<u16> {
+        self.url
+            .as_deref()
+            .and_then(|u| u.rsplit(':').next())
+            .and_then(|s| s.parse().ok())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,6 +304,23 @@ mod tests {
         // Old sessions.json entries used `root_id`; the serde alias keeps them loadable.
         let key: ThreadKey = serde_json::from_str(r#"{"chat_id":"oc_1","root_id":"omt_old"}"#).unwrap();
         assert_eq!(key.thread_id, "omt_old");
+    }
+
+    #[test]
+    fn start_server_policy_deserializes_three_states() {
+        let parse = |s: &str| toml::from_str::<OpenCodeConfig>(s).unwrap().start_server;
+        assert_eq!(parse(r#"start_server = "auto""#), ServerStartPolicy::Auto);
+        assert_eq!(parse(r#"start_server = "never""#), ServerStartPolicy::Never);
+        assert_eq!(parse(r#"start_server = "eager""#), ServerStartPolicy::Eager);
+    }
+
+    #[test]
+    fn start_server_defaults_to_auto() {
+        let cfg: OpenCodeConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.start_server, ServerStartPolicy::Auto);
+        assert!(cfg.start_server.spawns_when_needed());
+        assert!(!ServerStartPolicy::Never.spawns_when_needed());
+        assert!(ServerStartPolicy::Eager.spawns_when_needed());
     }
 
     #[test]

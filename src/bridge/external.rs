@@ -54,6 +54,11 @@ impl ExternalFlow {
                 self.poll_interval_ms.load(std::sync::atomic::Ordering::Relaxed),
             ))
             .await;
+            // Serverless (Lazy Start hasn't attached/spawned yet): nothing to
+            // watch on the store — skip quietly.
+            if core.opencode.base_url().is_empty() {
+                continue;
+            }
             let sessions: Vec<(String, crate::config::ThreadKey, String)> = core
                 .sessions
                 .lock()

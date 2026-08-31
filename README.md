@@ -5,7 +5,7 @@ A bridge bot that brings the [OpenCode](https://opencode.ai) AI coding experienc
 ## How it works
 
 - **Platform** = Feishu (long connection WebSocket, interactive cards).
-- **Backend** = a running `opencode serve` instance. cola discovers one already running on the **default store** (so sessions stay shared with OpenChamber / the CLI — see [Known pitfalls](AGENTS.md#known-pitfalls-learned-the-hard-way)) and attaches to it. If none is running, cola starts its own.
+- **Backend** = a running `opencode serve` instance. cola discovers one already running on the **default store** (so sessions stay shared with OpenChamber / the CLI — see [Known pitfalls](AGENTS.md#known-pitfalls-learned-the-hard-way)) and attaches to it. If none is running, cola **lazily starts its own** at the moment a message needs it (a Coexistent Server — e.g. OpenChamber's — always wins over cola's own, which cola then yields; see [ADR-0013](docs/adr/0013-server-ownership-yield-and-lazy-start.md)).
 - **Bridge** = the coordinator: one Feishu thread maps to one OpenCode session; card updates stream live as parts complete.
 
 ## Prerequisites
@@ -34,6 +34,7 @@ values:
 ```toml
 [opencode]
 url = "http://localhost:4096"    # preferred/fallback port (default 4096)
+start_server = "auto"            # auto|lazy (default), never (attach-only), eager (spawn at boot)
 # model is optional: unset → cola uses the OpenCode server's default model
 # model = "opencode/deepseek-v4-flash"
 
@@ -43,9 +44,17 @@ url = "http://localhost:4096"    # preferred/fallback port (default 4096)
 # log_days = 14                       # daily log retention
 ```
 
-`opencode.url` is only a preferred port: cola discovers whatever server is
-running on the shared store and attaches to it automatically (username and
-password are read from the server's environment, so nothing to configure).
+`opencode.url` is only a preferred port — a tiebreaker when several servers of
+the same kind are running: cola attaches to whatever server is running on the
+shared store automatically (username and password are read from the server's
+environment, so nothing to configure), and a server cola did **not** start
+(OpenChamber's, a manual one) wins over cola's own.
+
+`opencode.start_server` controls when cola may start its own `opencode serve`:
+`auto` (default) attaches at boot and spawns an own server only at the moment a
+message needs one and none is running; `never` is attach-only (cola replies that
+OpenCode is unavailable when no server exists); `eager` restores the old
+start-at-boot behavior.
 
 ## Run
 
@@ -54,7 +63,24 @@ cargo build --release
 nohup ./target/release/cola --config cola.toml >/dev/null 2>&1 &
 ```
 
-cola needs the OpenCode server it attaches to to be running; it discovers it automatically (see above), so no manual `opencode serve` needed if the binary is on `PATH`.
+cola attaches to an already-running OpenCode server automatically (see above);
+with the default `auto` policy it starts its own server on demand, so no manual
+`opencode serve` is needed if the binary is on `PATH`.
+
+## Autostart
+
+Register cola to start at boot/login with `cola autostart` (one command per
+platform; the launcher runs the `cola` binary itself — Lazy Start handles the
+OpenCode server):
+
+- **Linux**: `cola autostart enable` writes a systemd **user** unit and enables
+  it. Run `loginctl enable-linger $USER` (printed as a hint) so the service
+  runs without a logged-in desktop session.
+- **macOS**: writes and loads a LaunchAgent.
+- **Windows**: writes an `HKCU\...\Run` registry value.
+
+`cola autostart disable` removes the registration; `cola autostart status`
+shows whether it is installed.
 
 ## Logs
 

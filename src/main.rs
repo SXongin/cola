@@ -1,3 +1,4 @@
+mod autostart;
 mod bridge;
 mod config;
 mod error;
@@ -28,6 +29,19 @@ struct Cli {
     /// itself via `/restart`.
     #[arg(long)]
     replace: bool,
+
+    #[command(subcommand)]
+    subcommand: Option<Subcommand>,
+}
+
+/// Manage cola's boot-time launcher (ADR-0013): install / remove / query it.
+#[derive(clap::Subcommand)]
+enum Subcommand {
+    /// Register cola to start at boot/login, or manage an existing registration.
+    Autostart {
+        #[command(subcommand)]
+        action: autostart::AutostartAction,
+    },
 }
 
 /// The default append log file, used when `--log-file` is not given.
@@ -64,66 +78,46 @@ fn resolve_config_or_exit(explicit: &Option<String>) -> std::path::PathBuf {
     }
 }
 
-/// Resolve which OpenCode server cola talks to.
+/// Resolve which OpenCode server cola attaches to, honoring the `start_server`
+/// policy (ADR-0013).
 ///
 /// The invariant is the STORE: sessions are shared only when cola, OpenChamber
 /// and the CLI read the same data directory (`~/.local/share/opencode`). So
 /// cola attaches to whatever `opencode serve` is already running on the default
-/// store (OpenChamber's managed server, a manual one — whoever started it) and
-/// only starts its own when none exists. A server on a custom store is never
-/// touched. Returns the resolved endpoint + credentials (discovery always
-/// supplies both username and password).
+/// store (OpenChamber's, a manual one — whoever started it), a
+/// Coexistent Server winning over cola's Owned. `eager` additionally spawns
+/// cola's own server at boot when none exists. `auto` (lazy) and `never`
+/// return `None` when nothing runs — `auto` spawns on first demand (Lazy
+/// Start), `never` stays attach-only. Returns the resolved endpoint +
+/// credentials (discovery always supplies both username and password).
 async fn resolve_opencode_server(
     cfg: &config::OpenCodeConfig,
-) -> anyhow::Result<bridge::discovery::ResolvedServer> {
-    let preferred_port = cfg
-        .url
-        .as_deref()
-        .and_then(|u| u.rsplit(':').next())
-        .and_then(|s| s.parse().ok());
+) -> anyhow::Result<Option<bridge::discovery::ResolvedServer>> {
     let candidates = bridge::discovery::scan_processes();
-
-    if let Some(server) = bridge::discovery::select_server(&candidates, preferred_port).cloned() {
+    let self_pid = bridge::discovery::self_spawned_pid();
+    if let Some(server) = bridge::discovery::pick_server(&candidates, cfg.preferred_port(), self_pid) {
         tracing::info!("Attached to OpenCode server at http://localhost:{}", server.port);
-        return Ok(bridge::discovery::ResolvedServer {
+        return Ok(Some(bridge::discovery::ResolvedServer {
             url: format!("http://localhost:{}", server.port),
-            username: server.username,
-            password: server.password,
-        });
+            username: server.username.clone(),
+            password: server.password.clone(),
+        }));
     }
 
-    // No shared server running — start our own on the default store.
-    let port = {
-        let mut p = preferred_port.unwrap_or(4096);
-        // Skip ports already held by a foreign (custom-store) server.
-        while candidates.iter().any(|c| c.port == p) {
-            p += 1;
+    if cfg.start_server == config::ServerStartPolicy::Eager {
+        let spawned = bridge::discovery::spawn_own_server(cfg.preferred_port()).await?;
+        tracing::info!("Started cola's own OpenCode server at {}", spawned.url);
+        return Ok(Some(spawned));
+    }
+
+    tracing::info!(
+        "No shared OpenCode server running; {}",
+        match cfg.start_server {
+            config::ServerStartPolicy::Never => "attach-only mode (`start_server = \"never\"`)",
+            _ => "lazy start — attach to a server or spawn an Owned Server at the first prompt",
         }
-        p
-    };
-    let password = "cola-secret".to_string();
-    tracing::info!("No shared OpenCode server found; starting one on port {}", port);
-    spawn_self_server(port, &password)?;
-    wait_for_port(port).await?;
-    // cola's own server strips an inherited username (self_start_command) and
-    // always uses the server default `opencode` — send exactly that.
-    tracing::info!("Started cola's own OpenCode server at http://localhost:{}", port);
-    Ok(bridge::discovery::ResolvedServer {
-        url: format!("http://localhost:{}", port),
-        username: bridge::discovery::DEFAULT_SERVER_USERNAME.to_string(),
-        password,
-    })
-}
-
-/// Spawn cola's own `opencode serve` (default store, so sessions stay shared).
-fn spawn_self_server(port: u16, password: &str) -> anyhow::Result<()> {
-    bridge::discovery::spawn_self_server(port, password)?;
-    Ok(())
-}
-
-/// Wait until the self-started server accepts connections.
-async fn wait_for_port(port: u16) -> anyhow::Result<()> {
-    bridge::discovery::wait_for_port(port).await
+    );
+    Ok(None)
 }
 
 /// Path of the singleton lock file — created atomically at startup so a second
@@ -311,6 +305,12 @@ impl Drop for SingletonLock {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // Autostart registration doesn't need a config, a log file, or the
+    // singleton lock — handle it before any of that machinery.
+    if let Some(Subcommand::Autostart { action }) = cli.subcommand {
+        return autostart::run(action);
+    }
+
     // Config first: `[bridge] log_days` feeds the daily-rotating log writer.
     let config_path = resolve_config_or_exit(&cli.config);
     let cfg = config::load(&config_path)?;
@@ -370,7 +370,10 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(
         "cola starting — OpenCode: {}, Feishu app: {}",
-        server.url,
+        server
+            .as_ref()
+            .map(|s| s.url.as_str())
+            .unwrap_or("<lazy — attach or spawn at the first prompt>"),
         cfg.feishu.app_id
     );
 

@@ -707,6 +707,11 @@ impl RequestFlow {
                 self.poll_interval_ms.load(std::sync::atomic::Ordering::Relaxed),
             ))
             .await;
+            // Serverless (Lazy Start hasn't attached/spawned yet): there is
+            // nothing to poll — skip quietly until a server appears.
+            if core.opencode.base_url().is_empty() {
+                continue;
+            }
             // Pending requests live in the server instance for the session's
             // directory; `GET /permission` / `GET /question` must be scoped with
             // `?directory=` or they only see the server cwd instance. Check every

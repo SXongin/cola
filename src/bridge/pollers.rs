@@ -3,38 +3,176 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::bridge::core::SharedCore;
+use crate::bridge::discovery::{self, ServerCandidate};
 use crate::bridge::handler::CardActionResult;
+use crate::config::ServerStartPolicy;
 
-/// How often the server-reconnect loop rescans `/proc` for a changed server.
+/// How often the server-reconcile loop rescans for a changed or newly-appeared
+/// server (the same cadence the old reconnect loop used).
 const RECONNECT_POLL_INTERVAL_SECS: u64 = 5;
 
-/// Independent poller: detects when the OpenCode server cola is attached to has
-/// been restarted/replaced (another tool like OpenChamber manages it, so its
-/// pid, port and password can change under us), and re-points the client at the
-/// new server.
-///
-/// Without this, cola keeps hammering the dead port and every request 502s —
-/// messages arrive on the WS but prompts/permissions never work again until a
-/// manual cola restart. Started once at App startup.
-pub(crate) async fn reconnect_poll_loop(core: &Arc<SharedCore>) -> crate::error::Result<()> {
-    let mut current = core.opencode.base_url();
+/// Whether any session has a prompt in flight (a turn is streaming). The yield
+/// is deferred while busy so killing an Owned Server never truncates a
+/// mid-stream generation (ADR-0013).
+async fn busy(core: &SharedCore) -> bool {
+    !core.inflight.lock().await.is_empty()
+}
+
+/// Whether the server cola is currently attached to is its Owned Server
+/// (pid matches `self_pid`). None/false when serverless or attached to a
+/// Coexistent Server.
+fn current_is_owned(candidates: &[ServerCandidate], self_pid: Option<i32>, current: &str) -> bool {
+    let Some(self_pid) = self_pid else { return false };
+    let Some(port) = current.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) else {
+        return false;
+    };
+    candidates.iter().any(|c| c.port == port && c.pid == self_pid)
+}
+
+/// Terminate cola's Owned Server (verified by pid against the live candidates)
+/// and forget it, so the Shared Store returns to one server once cola attached
+/// to a Coexistent one. The yield (ADR-0013). The pid file is cleared only
+/// after the process is confirmed dead (SIGTERM, escalating to SIGKILL) — a
+/// lingering process cola lost the record of could never be reaped.
+async fn reap_owned_server(candidates: &[ServerCandidate], self_pid: Option<i32>) {
+    let Some(self_pid) = self_pid else { return };
+    if !candidates.iter().any(|c| c.pid == self_pid) {
+        return;
+    }
+    tracing::info!("yielding: terminating own OpenCode server (pid {})", self_pid);
+    if let Err(e) = discovery::terminate_process(self_pid) {
+        tracing::warn!("yield: failed to terminate Owned Server {}: {}", self_pid, e);
+        return;
+    }
+    if wait_dead(self_pid, 5000).await {
+        discovery::clear_self_spawned();
+        return;
+    }
+    tracing::warn!(
+        "yield: Owned Server {} did not exit on SIGTERM; sending SIGKILL",
+        self_pid
+    );
+    let _ = discovery::force_kill(self_pid);
+    if wait_dead(self_pid, 5000).await {
+        discovery::clear_self_spawned();
+    } else {
+        tracing::warn!(
+            "yield: Owned Server {} did not exit after SIGKILL; keeping its pid record",
+            self_pid
+        );
+    }
+}
+
+/// Poll until a process is dead (not alive / not a zombie), within `timeout_ms`.
+async fn wait_dead(pid: i32, timeout_ms: u64) -> bool {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
     loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(RECONNECT_POLL_INTERVAL_SECS)).await;
-        let candidates = crate::bridge::discovery::scan_processes();
-        let Some(server) = crate::bridge::discovery::select_server(&candidates, None) else {
-            continue;
-        };
-        let url = format!("http://localhost:{}", server.port);
-        if url == current {
-            continue;
+        if !discovery::process_alive(pid) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// One pass of the server-ownership reconcile (ADR-0013): attach to the
+/// preferred default-store server (a Coexistent Server over cola's Owned),
+/// lazily spawn an Owned Server when `allow_spawn` and none exists, and reap a
+/// leftover Owned Server once a Coexistent Server is the pick. The reconnect
+/// loop runs this with `allow_spawn=false` on a cadence; the Lazy Start hook
+/// runs it with `allow_spawn=true` at the moment a server is needed.
+///
+/// Returns whether a server is attached (or was just started).
+async fn reconcile(core: &Arc<SharedCore>, allow_spawn: bool) -> crate::error::Result<bool> {
+    let candidates = discovery::scan_processes();
+    let self_pid = discovery::self_spawned_pid();
+    let Some(server) = discovery::pick_server(&candidates, core.preferred_port, self_pid) else {
+        // No default-store server at all. Lazy Start: spawn an Owned Server on
+        // demand; otherwise stay serverless (the caller replies that OpenCode
+        // is unavailable).
+        if allow_spawn && core.server_start.spawns_when_needed() {
+            let spawned = discovery::spawn_own_server(core.preferred_port)
+                .await
+                .map_err(|e| crate::error::BridgeError::OpenCode(format!("lazy start failed: {e}")))?;
+            core.opencode.reconnect(&spawned.url, &spawned.password).await?;
+            tracing::info!("lazily started own OpenCode server at {}", spawned.url);
+            return Ok(true);
+        }
+        // The attached server, if any, is gone — go serverless so a later
+        // message re-attaches or lazily spawns instead of 502ing against the
+        // dead endpoint forever.
+        if !core.opencode.base_url().is_empty() {
+            tracing::warn!("attached OpenCode server is gone; going serverless");
+            core.opencode.reconnect("", "").await?;
+        }
+        return Ok(false);
+    };
+    let url = format!("http://localhost:{}", server.port);
+    let current = core.opencode.base_url();
+    let pick_is_owned = self_pid == Some(server.pid);
+
+    if url != current {
+        let current_is_owned = current_is_owned(&candidates, self_pid, &current);
+        if current_is_owned && !pick_is_owned && busy(core).await {
+            // Defer the yield: keep streaming on our Owned Server until idle,
+            // so the in-flight generation isn't truncated.
+            return Ok(true);
         }
         tracing::warn!("OpenCode server changed ({} -> {}); reconnecting", current, url);
-        if let Err(e) = core.opencode.reconnect(&url, &server.password).await {
-            tracing::warn!("reconnect to {} failed: {}", url, e);
-            continue; // keep the old endpoint; retry next tick
-        }
-        current = url;
+        core.opencode.reconnect(&url, &server.password).await?;
     }
+
+    // Attached to the preferred server. If it's a Coexistent Server, reap a
+    // leftover Owned Server (the yield) — but never while a turn is in flight.
+    if !pick_is_owned {
+        if busy(core).await {
+            return Ok(true);
+        }
+        reap_owned_server(&candidates, self_pid).await;
+    }
+    Ok(true)
+}
+
+/// Independent poller: the OpenCode server cola attaches to is managed by
+/// another tool like OpenChamber, which can restart it (new pid/port/password)
+/// or raise a Coexistent Server after cola started its own. Reconcile every few
+/// seconds so cola re-attaches instead of 502ing against a dead port forever,
+/// and yields its Owned Server when a Coexistent one appears. Never spawns —
+/// Lazy Start is the demand path.
+pub(crate) async fn reconnect_poll_loop(core: &Arc<SharedCore>) -> crate::error::Result<()> {
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(RECONNECT_POLL_INTERVAL_SECS)).await;
+        let _guard = core.server_lock.lock().await;
+        if let Err(e) = reconcile(core, false).await {
+            tracing::warn!("server reconcile failed: {}", e);
+        }
+    }
+}
+
+/// Lazy Start hook (ADR-0013): called at the moment a message needs a server.
+/// Attaches if a default-store server exists, spawns an Owned Server if none
+/// does and the policy allows (`auto`/`eager`), and reports false when
+/// attach-only (`never`) and no server exists. No-op for test mocks (they have
+/// no process to spawn). Returns whether a server is ready.
+pub(crate) async fn ensure_server(core: &Arc<SharedCore>) -> crate::error::Result<bool> {
+    if !core.opencode.can_self_start_server() {
+        return Ok(true);
+    }
+    if core.server_start == ServerStartPolicy::Never {
+        // Attach-only: a non-empty base_url means we're attached to someone
+        // else's server; otherwise stay serverless.
+        return Ok(!core.opencode.base_url().is_empty());
+    }
+    // Already attached — the reconcile loop re-points us within a few seconds
+    // if that server dies or a Coexistent one appears, so don't rescan the
+    // process table on every message.
+    if !core.opencode.base_url().is_empty() {
+        return Ok(true);
+    }
+    let _guard = core.server_lock.lock().await;
+    reconcile(core, true).await
 }
 
 /// Where to deliver a permission/question card.
@@ -255,6 +393,27 @@ mod tests {
     use super::*;
     use crate::bridge::test_support::{MockBackend, RecordingPlatform, test_config};
     use std::sync::Arc;
+
+    fn cand(pid: i32, port: u16) -> ServerCandidate {
+        ServerCandidate {
+            pid,
+            port,
+            username: "opencode".into(),
+            password: "x".into(),
+            uses_default_store: true,
+        }
+    }
+
+    #[test]
+    fn current_is_owned_only_when_pid_and_port_match() {
+        let servers = vec![cand(7, 4096)];
+        assert!(current_is_owned(&servers, Some(7), "http://localhost:4096"));
+        assert!(!current_is_owned(&servers, Some(8), "http://localhost:4096"));
+        assert!(!current_is_owned(&servers, None, "http://localhost:4096"));
+        assert!(!current_is_owned(&servers, Some(7), "http://localhost:4097"));
+        assert!(!current_is_owned(&servers, Some(7), "http://mock"));
+        assert!(!current_is_owned(&servers, Some(7), ""));
+    }
 
     /// A shared core whose `session_info` serves the given parent map, so the
     /// walker hops over scripted parent chains.

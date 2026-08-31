@@ -142,20 +142,35 @@ pub fn scan_processes() -> Vec<ServerCandidate> {
         .collect()
 }
 
-/// Pick the server cola should attach to.
+/// Pick the server cola should attach to (ADR-0013).
 ///
 /// Only default-store servers are eligible (a custom-store server is someone
-/// else's data — attaching would both break sharing and couple cola to a
-/// foreign runtime). Among eligible servers, the configured port wins; the
-/// first eligible otherwise.
-pub fn select_server(
+/// else's data — attaching would both break sharing and couple cola to that
+/// runtime). Among eligible servers a Coexistent Server (pid != `self_pid`)
+/// always wins over cola's Owned Server (pid == `self_pid`), so cola steps
+/// aside as soon as OpenChamber (or a manual `opencode serve`) raises one;
+/// within the winning class the configured port wins, else the lowest port.
+/// Deterministic — the reconnect loop never flaps between two default-store
+/// servers.
+pub fn pick_server(
     candidates: &[ServerCandidate],
     preferred_port: Option<u16>,
+    self_pid: Option<i32>,
 ) -> Option<&ServerCandidate> {
-    let eligible: Vec<&ServerCandidate> = candidates.iter().filter(|c| c.uses_default_store).collect();
+    let mut eligible: Vec<&ServerCandidate> = candidates.iter().filter(|c| c.uses_default_store).collect();
+    // Deterministic across scans: sysinfo enumerates processes in randomized
+    // order, so taking `first()` unsorted would make the reconnect loop flap
+    // between two servers of the same class (ADR-0013).
+    eligible.sort_by_key(|c| c.port);
+    let coexist: Vec<&ServerCandidate> = eligible
+        .iter()
+        .copied()
+        .filter(|c| Some(c.pid) != self_pid)
+        .collect();
+    let class = if coexist.is_empty() { eligible } else { coexist };
     preferred_port
-        .and_then(|p| eligible.iter().find(|c| c.port == p).copied())
-        .or_else(|| eligible.first().copied())
+        .and_then(|p| class.iter().find(|c| c.port == p).copied())
+        .or_else(|| class.first().copied())
 }
 
 /// The command cola runs to start its own OpenCode server on the default store.
@@ -242,6 +257,12 @@ fn read_self_spawned_pid_in(path: &std::path::Path) -> Option<i32> {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|s| s.trim().parse().ok())
+}
+
+/// The recorded pid of cola's Owned Server, if any. Not verified live — use
+/// [`is_self_spawned`] when liveness matters (e.g. before deciding to kill).
+pub fn self_spawned_pid() -> Option<i32> {
+    read_self_spawned_pid_in(&self_spawned_pid_path())
 }
 
 /// Whether the pid of the server cola is attached to is a server cola itself
@@ -374,6 +395,30 @@ pub async fn wait_for_port(port: u16) -> anyhow::Result<()> {
     anyhow::bail!("OpenCode server did not start on port {}", port)
 }
 
+/// Start cola's own `opencode serve` on the default store, skipping ports
+/// already held by a running server, and wait until it accepts connections.
+/// Used by Lazy Start (`auto`/`eager` policies) and `/restart-opencode`. The
+/// result is a [`ResolvedServer`] like any other — an Owned Server is just the
+/// endpoint cola attaches to (ADR-0013).
+pub async fn spawn_own_server(preferred_port: Option<u16>) -> anyhow::Result<ResolvedServer> {
+    let candidates = scan_processes();
+    let mut port = preferred_port.unwrap_or(4096);
+    // Skip ports already held by a custom-store server (someone else's data).
+    while candidates.iter().any(|c| c.port == port) {
+        port += 1;
+    }
+    let password = "cola-secret".to_string();
+    spawn_self_server(port, &password)?;
+    wait_for_port(port).await?;
+    Ok(ResolvedServer {
+        url: format!("http://localhost:{}", port),
+        // cola's own server strips an inherited username (self_start_command)
+        // and always uses the server default `opencode` — send exactly that.
+        username: DEFAULT_SERVER_USERNAME.to_string(),
+        password,
+    })
+}
+
 /// Outcome of `/restart-opencode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartOutcome {
@@ -393,12 +438,14 @@ pub enum RestartOutcome {
 /// to reply that the server needs a manual restart.
 pub async fn restart_self_spawned_server() -> anyhow::Result<RestartOutcome> {
     let candidates = scan_processes();
-    let Some(server) = select_server(&candidates, None).cloned() else {
+    let eligible: Vec<&ServerCandidate> = candidates.iter().filter(|c| c.uses_default_store).collect();
+    if eligible.is_empty() {
         return Ok(RestartOutcome::NoServer);
-    };
-    if !is_self_spawned(server.pid) {
-        return Ok(RestartOutcome::NotOwned);
     }
+    // A coexistent server is running but cola owns nothing — never touch it.
+    let Some(server) = eligible.iter().find(|c| is_self_spawned(c.pid)).copied() else {
+        return Ok(RestartOutcome::NotOwned);
+    };
     // Kill our own server, wait for the port to release, re-raise it on the same
     // port/password, and wait until it accepts connections again.
     let _ = clear_self_spawned();
@@ -448,33 +495,79 @@ mod tests {
     }
 
     #[test]
-    fn select_server_prefers_default_store() {
+    fn pick_server_prefers_default_store() {
         let custom = cand(1, 4096, "custom", false);
         let def = cand(2, 4001, "default", true);
         let servers = [custom, def];
-        let chosen = select_server(&servers, None).unwrap();
+        let chosen = pick_server(&servers, None, None).unwrap();
         assert_eq!(chosen.port, 4001);
     }
 
     #[test]
-    fn select_server_prefers_configured_port_among_default_store() {
+    fn pick_server_prefers_configured_port_among_same_class() {
         let a = cand(1, 4001, "x", true);
         let b = cand(2, 4096, "y", true);
         let servers = [a, b];
-        let chosen = select_server(&servers, Some(4096)).unwrap();
+        let chosen = pick_server(&servers, Some(4096), None).unwrap();
         assert_eq!(chosen.port, 4096);
     }
 
     #[test]
-    fn select_server_never_hijacks_custom_store() {
+    fn pick_server_never_hijacks_custom_store() {
         let custom = cand(1, 4096, "custom", false);
         let servers = [custom];
-        assert!(select_server(&servers, Some(4096)).is_none());
+        assert!(pick_server(&servers, Some(4096), None).is_none());
     }
 
     #[test]
-    fn select_server_empty_returns_none() {
-        assert!(select_server(&[], Some(4096)).is_none());
+    fn pick_server_empty_returns_none() {
+        assert!(pick_server(&[], Some(4096), None).is_none());
+    }
+
+    #[test]
+    fn pick_server_prefers_coexistent_over_owned() {
+        // cola's Owned Server (pid matches self_pid) loses to a Coexistent
+        // Server, even when the Owned one sits on the configured port.
+        let owned = cand(1, 4096, "cola-secret", true);
+        let coexist = cand(2, 52137, "openchamber", true);
+        let servers = [owned, coexist];
+        let chosen = pick_server(&servers, Some(4096), Some(1)).unwrap();
+        assert_eq!(chosen.pid, 2, "a coexistent server must win over the owned one");
+    }
+
+    #[test]
+    fn pick_server_keeps_owned_when_no_coexistent() {
+        // No coexistent server: cola attaches to its Owned Server, honoring the
+        // configured port among the same class.
+        let owned = cand(1, 4096, "cola-secret", true);
+        let servers = [owned];
+        let chosen = pick_server(&servers, Some(4096), Some(1)).unwrap();
+        assert_eq!(chosen.pid, 1);
+    }
+
+    #[test]
+    fn pick_server_owned_not_matched_self_pid_is_coexistent() {
+        // self_pid is only the recorded Owned Server; a different pid on the
+        // same store is coexist(ent) — it wins.
+        let owned = cand(1, 4096, "cola-secret", true);
+        let other = cand(9, 4002, "manual", true);
+        let servers = [owned, other];
+        let chosen = pick_server(&servers, None, Some(1)).unwrap();
+        assert_eq!(chosen.pid, 9);
+    }
+
+    #[test]
+    fn pick_server_is_deterministic_within_a_class() {
+        // Two coexistent servers and no preferred port: the lowest port wins
+        // regardless of the (randomized) scan order, so the reconnect loop
+        // never flaps between them (ADR-0013).
+        let a = cand(1, 4096, "x", true);
+        let b = cand(2, 52137, "y", true);
+        assert_eq!(
+            pick_server(&[a.clone(), b.clone()], None, None).unwrap().port,
+            4096
+        );
+        assert_eq!(pick_server(&[b, a], None, None).unwrap().port, 4096);
     }
 
     #[test]

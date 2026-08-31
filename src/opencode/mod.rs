@@ -168,8 +168,16 @@ pub trait Backend: Send + Sync {
     async fn reconnect(&self, url: &str, password: &str) -> Result<()>;
 
     /// The base URL this backend currently targets (used by the reconnect loop
-    /// to detect a changed server).
+    /// to detect a changed server). Empty when serverless (Lazy Start hasn't
+    /// attached or spawned yet).
     fn base_url(&self) -> String;
+
+    /// Whether this backend can lazily start its own OpenCode server when none
+    /// is running. The real [`Client`] can; test mocks cannot (there is no
+    /// process to spawn), so the Lazy Start hook is a no-op in tests.
+    fn can_self_start_server(&self) -> bool {
+        false
+    }
 
     /// A directory-scoped handle for instance-routed calls (permissions,
     /// questions, session info). The returned handle owns the directory, so no
@@ -278,6 +286,10 @@ impl Backend for Client {
 
     fn base_url(&self) -> String {
         Client::base_url(self)
+    }
+
+    fn can_self_start_server(&self) -> bool {
+        true
     }
 
     fn for_directory(self: Arc<Self>, directory: &str) -> Arc<dyn DirectoryBackend> {

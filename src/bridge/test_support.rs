@@ -570,6 +570,7 @@ pub fn test_config(session_file: &std::path::Path) -> crate::config::Config {
         opencode: crate::config::OpenCodeConfig {
             url: Some("http://localhost:1".into()),
             model: Some("test/model".into()),
+            start_server: crate::config::ServerStartPolicy::Auto,
         },
         feishu: crate::config::FeishuConfig {
             app_id: "app".into(),

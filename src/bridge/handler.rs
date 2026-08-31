@@ -277,6 +277,34 @@ impl App {
             requester_open_id,
             ..
         } = msg;
+        // Lazy Start (ADR-0013): a prompt is the moment a server is needed.
+        // Attach to an existing default-store server, or spawn an Owned Server
+        // when none exists (unless `start_server = "never"`). Serverless means
+        // the bot has no OpenCode to answer with — tell the user instead of
+        // failing silently inside the prompt flow. Commands never trigger this
+        // (so `/restart-opencode` still reports NoServer/NotOwned properly).
+        match crate::bridge::pollers::ensure_server(&self.core).await {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = self
+                    .feishu
+                    .reply_text(
+                        &message_id,
+                        "⚠️ 当前没有可用的 OpenCode server，且 `start_server = \"never\"`。\
+                          \n请启动 OpenChamber（或手动 `opencode serve`），或把配置改为 `start_server = \"auto\"`。",
+                    )
+                    .await;
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!("ensure server failed: {}", e);
+                let _ = self
+                    .feishu
+                    .reply_text(&message_id, &format!("⚠️ 启动 OpenCode server 失败：{e}"))
+                    .await;
+                return Ok(());
+            }
+        }
         let is_group = chat_type == "group";
         let mut text = text;
         let mut images = images;

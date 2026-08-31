@@ -49,6 +49,16 @@ pub struct SharedCore {
     pub session_list_cache: Arc<Mutex<Option<SessionListCache>>>,
     pub opencode: Arc<dyn opencode::Backend>,
     pub feishu: Arc<dyn feishu::Platform>,
+    /// When cola may spawn its own `opencode serve` (`auto`/`never`/`eager`,
+    /// ADR-0013). Drives the Lazy Start hook and the yield decision.
+    pub server_start: crate::config::ServerStartPolicy,
+    /// Preferred port from `[opencode] url`, a tiebreaker among servers of the
+    /// same class in `pick_server` (ADR-0013).
+    pub preferred_port: Option<u16>,
+    /// Serializes every server mutation — Lazy Start spawns, the reconnect
+    /// loop's re-attach/yield — so concurrent first messages can't double-spawn
+    /// or race a yield with a reconnect.
+    pub server_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SharedCore {
@@ -72,6 +82,9 @@ impl SharedCore {
             session_list_cache: Arc::new(Mutex::new(None)),
             opencode,
             feishu,
+            server_start: cfg.opencode.start_server,
+            preferred_port: cfg.opencode.preferred_port(),
+            server_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 

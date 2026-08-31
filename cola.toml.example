@@ -11,6 +11,13 @@
 # only the preferred port (and the fallback when none is running, cola starts
 # its own on http://localhost:4096). Optional.
 # url = "http://localhost:4096"
+# When cola may start its own `opencode serve` (ADR-0013):
+#   auto  — Lazy Start (default): attach at boot, spawn an own server only at
+#           the moment a prompt needs one and none is running.
+#   never — attach-only: never spawn. If no server exists, cola replies that
+#           OpenCode is unavailable.
+#   eager — the old behavior: spawn an own server at boot when none is running.
+# start_server = "auto"
 # Model cola's own sessions use by default. It must exist on the server cola
 # attaches to. Optional: when unset (or removed), cola does NOT pin a model and
 # the OpenCode server uses ITS default model — so on most setups you can just

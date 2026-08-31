@@ -57,13 +57,28 @@ impl Clone for Client {
 }
 
 impl Client {
-    pub fn new(model: Option<&str>, server: crate::bridge::discovery::ResolvedServer) -> Self {
+    /// Build a client bound to a server, or serverless (None) when Lazy Start
+    /// hasn't spawned one yet (ADR-0013). A serverless client has an empty
+    /// `base_url` and does no requests until `reconnect` points it at a real
+    /// server; the username is still pinned so a later reconnect carries Basic
+    /// auth with both parts.
+    pub fn new(model: Option<&str>, server: Option<crate::bridge::discovery::ResolvedServer>) -> Self {
+        let username = server
+            .as_ref()
+            .map(|s| s.username.clone())
+            .unwrap_or_else(|| crate::bridge::discovery::DEFAULT_SERVER_USERNAME.to_string());
         Self {
             http: Arc::new(std::sync::RwLock::new(HttpHandle {
-                client: build_http_client(&Some(server.username.clone()), &Some(server.password.clone())),
-                base_url: server.url.trim_end_matches('/').to_string(),
+                client: build_http_client(
+                    &Some(username.clone()),
+                    &server.as_ref().map(|s| s.password.clone()),
+                ),
+                base_url: server
+                    .as_ref()
+                    .map(|s| s.url.trim_end_matches('/').to_string())
+                    .unwrap_or_default(),
             })),
-            username: Some(server.username),
+            username: Some(username),
             model: model.and_then(parse_model),
         }
     }
