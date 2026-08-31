@@ -7,9 +7,9 @@ use crate::config::ThreadKey;
 use crate::feishu;
 use crate::opencode;
 
-/// A cached `GET /session` snapshot with its fetch time. The 30 s TTL keeps
-/// `/list`/`/switch`/`/attach` off the wire for rapid reuse; cola invalidates
-/// it immediately on create/adopt/rename.
+/// A cached session-list snapshot (cross-store, most recently active first)
+/// with its fetch time. The 30 s TTL keeps `/list`/`/switch`/`/attach` off the
+/// wire for rapid reuse; cola invalidates it immediately on create/adopt/rename.
 #[derive(Clone)]
 pub struct SessionListCache {
     pub fetched_at: std::time::Instant,
@@ -44,7 +44,7 @@ pub struct SharedCore {
     pub work_dir: Option<String>,
     /// Whether to send the group completion notice (from `[bridge] group_completion_notice`).
     pub group_completion_notice: bool,
-    /// Cached `GET /session` snapshot for `/list`, `/switch`, `/attach`
+    /// Cached session-list snapshot for `/list`, `/switch`, `/attach`
     /// (30 s TTL; invalidated on create/adopt/rename).
     pub session_list_cache: Arc<Mutex<Option<SessionListCache>>>,
     pub opencode: Arc<dyn opencode::Backend>,

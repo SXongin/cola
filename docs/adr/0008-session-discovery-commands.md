@@ -8,10 +8,12 @@ How a user finds and takes over sessions that were not created in Feishu
 - Users cannot see or adopt sessions created outside Feishu even though they
   share the same default store: `/list` and `/switch` only read the current
   thread's `SessionStore` entries.
-- The server's `GET /session` returns the whole shared store (all directories)
-  with `title`, `directory`, `parentID`, `time`; it sorts by `time_created` and
-  supports server-side `search` (title `LIKE`) and `limit`, but **not**
-  `time_updated` ordering.
+- The server's `GET /session` is **project-scoped**: it returns only the
+  sessions of the project the server instance runs in (its cwd), NOT the whole
+  shared store. Cross-project listing lives at the experimental
+  `GET /experimental/session` (`Session.GlobalInfo`, sorted by
+  `time_updated` desc, sub-task children and archived excluded by default).
+  Both carry `title`, `directory`, `parentID`, `time`.
 - Current scale: ~174 sessions, ~70 KB of `Session.Info` JSON over a localhost
   GET (<50 ms). The display is capped regardless of store size.
 - The `Session.Info` of a sub-task child shows `parentID`; its title is always
@@ -25,8 +27,10 @@ How a user finds and takes over sessions that were not created in Feishu
 ## Decision
 
 - **`/list [keyword] [--all]`**
-  - Pulls `GET /session` (all directories) into an in-memory cache with a 30 s
-    TTL, invalidated immediately when cola creates/adopts/renames a session.
+  - Pulls the cross-store session list (`GET /experimental/session`, falling
+    back to project-scoped `GET /session` on servers without it) into an
+    in-memory cache with a 30 s TTL, invalidated immediately when cola
+    creates/adopts/renames a session.
   - Sorts client-side by `time.updated`; shows at most 15 entries.
   - Keyword: case-insensitive substring match on `title` / `directory` / id.
   - Children (`parentID` set) and archived sessions hidden by default; `--all`
@@ -61,9 +65,10 @@ How a user finds and takes over sessions that were not created in Feishu
   list cache (ADR-0007 title policy).
 - **External-notification card title** (`bridge/external.rs`) switches from the
   stored `name` to the server title.
-- **Cleanup**: `list_sessions` moves to the canonical `GET /session` (no `/api`
-  prefix) and starts parsing `Session.Info[]`; dead store helpers are enabled or
-  removed.
+- **Cleanup**: `list_sessions` moves to the cross-project
+  `GET /experimental/session` (falling back to `GET /session` for older
+  servers) and starts parsing `Session.GlobalInfo[]`; dead store helpers are
+  enabled or removed.
 
 ## Why
 

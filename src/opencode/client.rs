@@ -123,19 +123,32 @@ impl Client {
         }
     }
 
-    /// List all sessions in the shared store (canonical: `GET /session`, no
-    /// `/api` prefix — the legacy `/api/session` path is dead code). Without a
-    /// `directory` query param the whole shared store is returned, one
-    /// `Session.Info` per session (camelCase: `id`, `title`, `directory`,
-    /// `parentID`, `time.created/updated`, `agent`, `model`).
+    /// List sessions across the shared store, most recently active first.
+    ///
+    /// Uses the cross-project list `GET /experimental/session`
+    /// (`Session.GlobalInfo` — camelCase: `id`, `title`, `directory`,
+    /// `parentID`, `time.created/updated`, `agent`, `model`; sub-task children
+    /// and archived sessions excluded by default). The plain `GET /session` is
+    /// PROJECT-scoped: it only returns the server's *own* directory's project
+    /// (the instance's cwd), so cola's sessions in another project never
+    /// appear — the "recent" list instead shows stale sessions from the server's
+    /// project. We fall back to it only for servers too old to expose the
+    /// experimental route.
     pub async fn list_sessions(&self) -> crate::error::Result<Vec<SessionListInfo>> {
-        let resp = self
-            .http()
-            .get(self.url("/session"))
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(resp.json().await?)
+        let resp = self.http().get(self.url("/experimental/session")).send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            tracing::warn!(
+                "server lacks GET /experimental/session; falling back to project-scoped GET /session"
+            );
+            let resp = self
+                .http()
+                .get(self.url("/session"))
+                .send()
+                .await?
+                .error_for_status()?;
+            return Ok(resp.json().await?);
+        }
+        Ok(resp.error_for_status()?.json().await?)
     }
 
     /// Rename a session server-side (canonical: `PATCH /session/{id}` with
