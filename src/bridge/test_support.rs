@@ -261,6 +261,11 @@ pub struct MockBackend {
     pub update_title_calls: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
     /// Counts `list_sessions` invocations (asserts the 30 s cache).
     pub list_sessions_calls: Arc<std::sync::atomic::AtomicUsize>,
+    /// Available agents served by `list_agents` (for the `/agent` card).
+    pub agents: Vec<opencode::client::AgentInfo>,
+    /// Available models grouped by provider, served by `list_models` (for the
+    /// `/model` card).
+    pub provider_models: Vec<opencode::client::ProviderModels>,
 }
 
 impl MockBackend {
@@ -292,6 +297,8 @@ impl MockBackend {
             session_list: Vec::new(),
             update_title_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             list_sessions_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            agents: Vec::new(),
+            provider_models: Vec::new(),
         }
     }
 }
@@ -491,6 +498,14 @@ impl opencode::Backend for MockBackend {
         Ok(Some(100_000))
     }
 
+    async fn list_agents(&self) -> Vec<opencode::client::AgentInfo> {
+        self.agents.clone()
+    }
+
+    async fn list_models(&self) -> Vec<opencode::client::ProviderModels> {
+        self.provider_models.clone()
+    }
+
     async fn reply_question(
         &self,
         request_id: &str,
@@ -553,9 +568,7 @@ impl opencode::Backend for MockBackend {
 pub fn test_config(session_file: &std::path::Path) -> crate::config::Config {
     crate::config::Config {
         opencode: crate::config::OpenCodeConfig {
-            url: "http://localhost:1".into(),
-            username: None,
-            password: None,
+            url: Some("http://localhost:1".into()),
             model: Some("test/model".into()),
         },
         feishu: crate::config::FeishuConfig {
@@ -566,6 +579,7 @@ pub fn test_config(session_file: &std::path::Path) -> crate::config::Config {
             session_file: session_file.to_path_buf(),
             work_dir: None,
             group_completion_notice: true,
+            log_days: 14,
         },
     }
 }
@@ -598,7 +612,7 @@ pub fn long_answer_parts() -> serde_json::Value {
 
 pub(crate) mod integration_tests {
     use super::*;
-    use crate::bridge::command::Command;
+    use crate::bridge::command::{Command, SwitchAction};
 
     async fn build_app(
         cfg: crate::config::Config,
@@ -2470,7 +2484,94 @@ pub(crate) mod integration_tests {
         assert_eq!(entry.directory, work.to_string_lossy().to_string());
     }
 
-    /// `/topic <dir>` creates a real Feishu topic (via reply_in_thread) backed
+    /// `/new` in a conversation whose active session lives in a project must
+    /// inherit that project's directory (ADR-0012) — NOT the configured
+    /// work_dir. Only a conversation with no session falls back to work_dir.
+    #[tokio::test]
+    async fn new_command_inherits_active_sessions_directory() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(&dir.path().join("sessions.json"));
+        let work = dir.path().join("work");
+        cfg.bridge.work_dir = Some(work.clone());
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+        let thread_key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let proj = tempfile::tempdir().unwrap();
+        let proj_dir = proj.path().to_string_lossy().to_string();
+
+        // First `/dir <proj>` roots a session in the project.
+        crate::bridge::command::handle_command(
+            &app.core,
+            crate::bridge::command::Command::Dir(proj_dir.clone()),
+            thread_key.clone(),
+            "msg_dir",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        // Then `/new` must stay in the project, not jump back to work_dir.
+        crate::bridge::command::handle_command(
+            &app.core,
+            crate::bridge::command::Command::New(None),
+            thread_key.clone(),
+            "msg_new",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let entry = app
+            .sessions
+            .lock()
+            .await
+            .get_active(&thread_key)
+            .cloned()
+            .expect("a session should be active after /new");
+        assert_eq!(
+            entry.directory, proj_dir,
+            "/new must inherit the active session's directory, not work_dir"
+        );
+        assert_ne!(
+            entry.directory,
+            work.to_string_lossy().to_string(),
+            "/new must NOT fall back to work_dir when a session is active"
+        );
+    }
+
+    /// `/new` in a conversation with NO active session still falls back to the
+    /// configured work_dir (the fresh-machine / fresh-topic case).
+    #[tokio::test]
+    async fn new_command_falls_back_to_work_dir_without_active_session() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(&dir.path().join("sessions.json"));
+        let work = dir.path().join("work");
+        cfg.bridge.work_dir = Some(work.clone());
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+        let thread_key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            crate::bridge::command::Command::New(None),
+            thread_key.clone(),
+            "msg_new",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let entry = app
+            .sessions
+            .lock()
+            .await
+            .get_active(&thread_key)
+            .cloned()
+            .expect("a session should be active after /new");
+        assert_eq!(entry.directory, work.to_string_lossy().to_string());
+    }
     /// by a new session rooted at <dir>, maps the returned thread_id to that
     /// session, and leaves the lobby conversation untouched.
     #[tokio::test]
@@ -3447,10 +3548,10 @@ pub(crate) mod integration_tests {
 
         crate::bridge::command::handle_command(
             &app.core,
-            Command::List {
+            Command::Switch(SwitchAction::List {
                 keyword: None,
                 all: false,
-            },
+            }),
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             "msg_list",
             crate::config::ConversationKind::P2p,
@@ -3495,10 +3596,10 @@ pub(crate) mod integration_tests {
         // Keyword filters by title.
         crate::bridge::command::handle_command(
             &app.core,
-            Command::List {
+            Command::Switch(SwitchAction::List {
                 keyword: Some("登录".into()),
                 all: false,
-            },
+            }),
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             "msg_list",
             crate::config::ConversationKind::P2p,
@@ -3521,10 +3622,10 @@ pub(crate) mod integration_tests {
         platform.calls.lock().await.clear();
         crate::bridge::command::handle_command(
             &app.core,
-            Command::List {
+            Command::Switch(SwitchAction::List {
                 keyword: None,
                 all: false,
-            },
+            }),
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             "msg_list2",
             crate::config::ConversationKind::P2p,
@@ -3546,10 +3647,10 @@ pub(crate) mod integration_tests {
         platform.calls.lock().await.clear();
         crate::bridge::command::handle_command(
             &app.core,
-            Command::List {
+            Command::Switch(SwitchAction::List {
                 keyword: None,
                 all: true,
-            },
+            }),
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             "msg_list3",
             crate::config::ConversationKind::P2p,
@@ -3596,10 +3697,10 @@ pub(crate) mod integration_tests {
         // Two /list in a row → one server fetch.
         crate::bridge::command::handle_command(
             &app.core,
-            Command::List {
+            Command::Switch(SwitchAction::List {
                 keyword: None,
                 all: false,
-            },
+            }),
             key.clone(),
             "m1",
             crate::config::ConversationKind::P2p,
@@ -3608,10 +3709,10 @@ pub(crate) mod integration_tests {
         .unwrap();
         crate::bridge::command::handle_command(
             &app.core,
-            Command::List {
+            Command::Switch(SwitchAction::List {
                 keyword: None,
                 all: false,
-            },
+            }),
             key.clone(),
             "m2",
             crate::config::ConversationKind::P2p,
@@ -3632,10 +3733,10 @@ pub(crate) mod integration_tests {
         .unwrap();
         crate::bridge::command::handle_command(
             &app.core,
-            Command::List {
+            Command::Switch(SwitchAction::List {
                 keyword: None,
                 all: false,
-            },
+            }),
             key,
             "m4",
             crate::config::ConversationKind::P2p,
@@ -3661,10 +3762,10 @@ pub(crate) mod integration_tests {
 
         crate::bridge::command::handle_command(
             &app.core,
-            Command::Attach {
+            Command::Switch(SwitchAction::Attach {
                 query: "ses_foreign123abc".into(),
                 force: false,
-            },
+            }),
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             "msg_attach",
             crate::config::ConversationKind::P2p,
@@ -3713,10 +3814,10 @@ pub(crate) mod integration_tests {
 
         crate::bridge::command::handle_command(
             &app.core,
-            Command::Attach {
+            Command::Switch(SwitchAction::Attach {
                 query: "ses_foreign123abc".into(),
                 force: false,
-            },
+            }),
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             "msg_attach",
             crate::config::ConversationKind::P2p,
@@ -3768,10 +3869,10 @@ pub(crate) mod integration_tests {
 
         crate::bridge::command::handle_command(
             &app.core,
-            Command::Attach {
+            Command::Switch(SwitchAction::Attach {
                 query: "ses_foreign123abc".into(),
                 force: true,
-            },
+            }),
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             "msg_attach",
             crate::config::ConversationKind::P2p,
@@ -3810,7 +3911,7 @@ pub(crate) mod integration_tests {
 
         crate::bridge::command::handle_command(
             &app.core,
-            Command::Forget,
+            Command::Switch(SwitchAction::Forget),
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             "msg_forget",
             crate::config::ConversationKind::P2p,
@@ -3833,7 +3934,7 @@ pub(crate) mod integration_tests {
 
         crate::bridge::command::handle_command(
             &app.core,
-            Command::Switch("唯一外部标题".into()),
+            Command::Switch(SwitchAction::Match("唯一外部标题".into())),
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             "msg_switch",
             crate::config::ConversationKind::P2p,
@@ -3861,7 +3962,7 @@ pub(crate) mod integration_tests {
 
         crate::bridge::command::handle_command(
             &app.core,
-            Command::Switch("任务".into()),
+            Command::Switch(SwitchAction::Match("任务".into())),
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             "msg_switch",
             crate::config::ConversationKind::P2p,
@@ -3881,7 +3982,7 @@ pub(crate) mod integration_tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("/attach"), "points at /attach: {text}");
+        assert!(text.contains("/switch"), "points at /switch: {text}");
     }
 
     #[tokio::test]
@@ -3919,7 +4020,7 @@ pub(crate) mod integration_tests {
 
         crate::bridge::command::handle_command(
             &app.core,
-            Command::Switch("本项目".into()),
+            Command::Switch(SwitchAction::Match("本项目".into())),
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             "msg_switch",
             crate::config::ConversationKind::P2p,
@@ -3933,6 +4034,317 @@ pub(crate) mod integration_tests {
             app.sessions.lock().await.get_active(&key).unwrap().session_id,
             "ses_own1"
         );
+    }
+
+    /// `/switch` (no args) sends the interactive session card: a search form,
+    /// one row per session with a switch/adopt button, and a "＋new" footer.
+    #[tokio::test]
+    async fn switch_no_arg_sends_session_card() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![
+            list_session("ses_alpha01", "重写登录", "/work/auth", 100),
+            list_session("ses_beta02", "修 bug", "/work/cola", 300),
+        ];
+        let (app, platform) = build_app(cfg, backend).await;
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Switch(SwitchAction::Card),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_switch_card",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let calls = platform.calls.lock().await.clone();
+        let card = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyCard { card, .. } => Some(card.clone()),
+                _ => None,
+            })
+            .next()
+            .expect("a switch card should be sent");
+        let text = card.to_string();
+        assert!(text.contains("会话管理"), "header: {text}");
+        assert!(text.contains("重写登录"), "session row: {text}");
+        assert!(text.contains("修 bug"), "session row: {text}");
+        assert!(text.contains("接管"), "adopt button: {text}");
+        assert!(text.contains("＋ 新建会话"), "new button: {text}");
+        assert!(text.contains("switch_search"), "search form: {text}");
+    }
+
+    /// A `/switch` card "adopt" action maps the session into the thread and
+    /// returns a refreshed card + toast in the ack.
+    #[tokio::test]
+    async fn switch_card_adopt_action_maps_session() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session("ses_alpha01", "重写登录", "/work/auth", 100)];
+        let (app, _platform) = build_app(cfg, backend).await;
+
+        let value = serde_json::json!({
+            "action": "switch",
+            "op": "adopt",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "session_id": "ses_alpha01",
+        });
+        let result = app
+            .handle_card_action(value)
+            .await
+            .expect("switch adopt should return a result");
+        assert!(
+            result.card.is_some(),
+            "adopt returns a refreshed card: {:?}",
+            result.card
+        );
+        assert!(
+            result.toast.clone().unwrap_or_default().contains("接管"),
+            "adopt toasts: {:?}",
+            result.toast
+        );
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        assert_eq!(
+            app.sessions.lock().await.get_active(&key).unwrap().session_id,
+            "ses_alpha01"
+        );
+    }
+
+    /// A `/switch` card "new" action creates a session in the current project
+    /// (equivalent to `/new`) and maps it as active.
+    #[tokio::test]
+    async fn switch_card_new_action_creates_session_in_current_project() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        // Root an existing session in /work/proj so "current project" is set.
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: key.clone(),
+                session_id: "ses_old".into(),
+                directory: "/work/proj".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+        }
+
+        let value = serde_json::json!({
+            "action": "switch",
+            "op": "new",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+        });
+        let result = app
+            .handle_card_action(value)
+            .await
+            .expect("switch new should return a result");
+        assert!(result.card.is_some(), "new returns a refreshed card");
+        let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
+        assert_ne!(entry.session_id, "ses_old", "a fresh session is created");
+        assert_eq!(entry.directory, "/work/proj", "inherits the current project");
+    }
+
+    /// `/model` (no args) sends the model-picker card with one button per model.
+    #[tokio::test]
+    async fn model_no_arg_sends_picker_card() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.provider_models = vec![crate::opencode::client::ProviderModels {
+            provider: "opencode".into(),
+            models: vec!["deepseek-v4-flash".into(), "gpt-4o".into()],
+        }];
+        let (app, platform) = build_app(cfg, backend).await;
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::ModelCard,
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_model_card",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let calls = platform.calls.lock().await.clone();
+        let card = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyCard { card, .. } => Some(card.clone()),
+                _ => None,
+            })
+            .next()
+            .expect("a model card should be sent");
+        let text = card.to_string();
+        assert!(text.contains("选择模型"), "header: {text}");
+        assert!(
+            text.contains("opencode/deepseek-v4-flash"),
+            "model button: {text}"
+        );
+        assert!(text.contains("opencode/gpt-4o"), "model button: {text}");
+    }
+
+    /// A `/model` picker-card button records the per-session override.
+    #[tokio::test]
+    async fn model_card_button_records_override() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: key.clone(),
+                session_id: "ses_test".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+        }
+
+        let value = serde_json::json!({
+            "action": "model",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "value": "opencode/deepseek-v4-flash",
+        });
+        let result = app.handle_card_action(value).await.expect("model card action");
+        assert!(result.card.is_some(), "refreshed card returned");
+        let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
+        assert_eq!(entry.model.as_deref(), Some("opencode/deepseek-v4-flash"));
+    }
+
+    /// `/agent` (no args) sends the agent-picker card; a button records the
+    /// per-session override.
+    #[tokio::test]
+    async fn agent_card_picker_and_button() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.agents = vec![crate::opencode::client::AgentInfo {
+            name: "build".into(),
+            description: Some("build agent".into()),
+            mode: Some("primary".into()),
+            hidden: Some(false),
+        }];
+        let (app, platform) = build_app(cfg, backend).await;
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: key.clone(),
+                session_id: "ses_test".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+        }
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::AgentCard,
+            key.clone(),
+            "msg_agent_card",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+        let calls = platform.calls.lock().await.clone();
+        let card = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyCard { card, .. } => Some(card.clone()),
+                _ => None,
+            })
+            .next()
+            .expect("an agent card should be sent");
+        assert!(card.to_string().contains("build"), "agent button: {card}");
+
+        let value = serde_json::json!({
+            "action": "agent",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "value": "build",
+        });
+        let result = app.handle_card_action(value).await.expect("agent card action");
+        assert!(result.card.is_some(), "refreshed card returned");
+        let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
+        assert_eq!(entry.agent.as_deref(), Some("build"));
+    }
+
+    /// `/autoaccept` (no args) sends the toggle card; a button flips the flag.
+    #[tokio::test]
+    async fn autoaccept_card_toggles_flag() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: key.clone(),
+                session_id: "ses_test".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+        }
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::AutoAccept(crate::bridge::command::AutoAcceptAction::Status),
+            key.clone(),
+            "msg_aa",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+        let calls = platform.calls.lock().await.clone();
+        let card = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyCard { card, .. } => Some(card.clone()),
+                _ => None,
+            })
+            .next()
+            .expect("an autoaccept card should be sent");
+        assert!(card.to_string().contains("自动审批"), "toggle card: {card}");
+
+        let value = serde_json::json!({
+            "action": "autoaccept",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "value": "on",
+        });
+        let result = app
+            .handle_card_action(value)
+            .await
+            .expect("autoaccept card action");
+        assert!(result.card.is_some(), "refreshed card returned");
+        let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
+        assert!(entry.auto_accept, "flag should flip on");
     }
 
     #[tokio::test]
@@ -4390,15 +4802,15 @@ pub(crate) mod integration_tests {
         let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into());
 
         for cmd in [
-            Command::List {
+            Command::Switch(SwitchAction::List {
                 keyword: None,
                 all: false,
-            },
-            Command::Switch("外部".into()),
-            Command::Attach {
+            }),
+            Command::Switch(SwitchAction::Match("外部".into())),
+            Command::Switch(SwitchAction::Attach {
                 query: "ses_foreign123abc".into(),
                 force: false,
-            },
+            }),
             Command::New(None),
             Command::Dir("/work/x".into()),
         ] {
@@ -4450,10 +4862,10 @@ pub(crate) mod integration_tests {
 
         crate::bridge::command::handle_command(
             &app.core,
-            Command::Attach {
+            Command::Switch(SwitchAction::Attach {
                 query: "ses_foreign123abc".into(),
                 force: false,
-            },
+            }),
             topic_key.clone(),
             "msg_topic_cmd",
             crate::config::ConversationKind::Topic,

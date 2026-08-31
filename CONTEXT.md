@@ -28,7 +28,7 @@ A chat's top-level conversation: messages sent directly in a group (or p2p top-l
 _Avoid_: Main channel, root session
 
 **Project**:
-A working directory on the filesystem where OpenCode operates. A property of a session, not of the bot. Switched via `/dir`.
+A working directory on the filesystem where OpenCode operates. A property of a session, not of the bot. A conversation's current project is the directory of its active session (derived, never stored separately); `/new` inherits it and falls back to the default directory only when the conversation has no session. Sessions created outside a conversation still carry their own directory.
 _Avoid_: Workspace, repo
 
 **Permission**:
@@ -69,7 +69,7 @@ _Avoid_: Picture, media, attachment file
 > **Domain expert:** "The Bridge pauses the Card stream, renders a Permission card with action buttons, and waits for the user to reply. Once resolved, streaming resumes."
 
 **Command**:
-A slash-prefixed instruction (e.g. `/dir`, `/switch`, `/compact`). cola parses its own commands locally and forwards unrecognized ones to the Backend as prompt text.
+A slash-prefixed instruction (e.g. `/new`, `/dir`, `/switch`, `/compact`). Every command supports two forms: a text-direct form (an argument that completes the action in one step) and a card form (no argument pops an interactive card for strong-interaction commands like `/switch`, `/model`, `/agent`, `/autoaccept`, `/help`). cola parses its own commands locally and forwards unrecognized ones to the Backend as prompt text.
 _Avoid_: Slash command, action, operation
 
 **Event**:

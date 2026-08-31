@@ -606,22 +606,33 @@ fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Value> {
     let mut val = match a.get("value").cloned() {
         Some(value) => value,
         None => {
-            // Form submit callbacks don't always deliver the button `value`; the
-            // routing payload is encoded in the button `name`
-            // ("submit|<req>|<ses>|<qi>|<dir>") — rebuild the value from it.
             let name = a.get("name").and_then(|n| n.as_str())?;
             let parts: Vec<&str> = name.split('|').collect();
-            if parts.len() != 5 || parts[0] != "submit" {
+            if parts.len() == 3 && parts[0] == "switchsearch" {
+                // `/switch` card search form: the button carries the routing
+                // ("switchsearch|<chat>|<thread>"), the typed keyword arrives
+                // as `form_value.search` below.
+                serde_json::json!({
+                    "action": "switch",
+                    "op": "search",
+                    "chat_id": parts[1],
+                    "thread_id": parts[2],
+                })
+            } else if parts.len() != 5 || parts[0] != "submit" {
+                // Form submit callbacks don't always deliver the button `value`;
+                // the routing payload is encoded in the button `name`
+                // ("submit|<req>|<ses>|<qi>|<dir>") — rebuild the value from it.
                 return None;
+            } else {
+                serde_json::json!({
+                    "action": "question",
+                    "reply": "answer",
+                    "request_id": parts[1],
+                    "session_id": parts[2],
+                    "question_index": parts[3].parse::<u64>().ok()?,
+                    "directory": parts[4],
+                })
             }
-            serde_json::json!({
-                "action": "question",
-                "reply": "answer",
-                "request_id": parts[1],
-                "session_id": parts[2],
-                "question_index": parts[3].parse::<u64>().ok()?,
-                "directory": parts[4],
-            })
         }
     };
     if let Some(opt) = a.get("option").and_then(|o| o.as_str()) {
@@ -642,6 +653,13 @@ fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Value> {
                 val["answer"] = serde_json::Value::String(s.to_string());
                 break;
             }
+        }
+        // `/switch` card search: the typed keyword from the search input.
+        if val.get("action").and_then(|v| v.as_str()) == Some("switch")
+            && val.get("op").and_then(|v| v.as_str()) == Some("search")
+            && let Some(s) = fv.get("search").and_then(|v| v.as_str())
+        {
+            val["keyword"] = serde_json::Value::String(s.to_string());
         }
     }
     Some(val)

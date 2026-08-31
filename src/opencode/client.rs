@@ -1,6 +1,5 @@
 #![allow(dead_code)] // protocol types — field coverage matches server contract
 
-use crate::config::OpenCodeConfig;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -58,14 +57,14 @@ impl Clone for Client {
 }
 
 impl Client {
-    pub fn new(cfg: OpenCodeConfig) -> Self {
+    pub fn new(model: Option<&str>, server: crate::bridge::discovery::ResolvedServer) -> Self {
         Self {
             http: Arc::new(std::sync::RwLock::new(HttpHandle {
-                client: build_http_client(&cfg.username, &cfg.password),
-                base_url: cfg.url.trim_end_matches('/').to_string(),
+                client: build_http_client(&Some(server.username.clone()), &Some(server.password.clone())),
+                base_url: server.url.trim_end_matches('/').to_string(),
             })),
-            username: cfg.username.clone(),
-            model: cfg.model.as_deref().and_then(parse_model),
+            username: Some(server.username),
+            model: model.and_then(parse_model),
         }
     }
 
@@ -469,6 +468,52 @@ impl Client {
         Ok(())
     }
 
+    /// Available agents (`GET /agent`), each with a `name`. Best-effort: an
+    /// unreadable/cached failure returns an empty list so the `/agent` card can
+    /// degrade to a plain text prompt.
+    pub async fn list_agents(&self) -> Vec<crate::opencode::client::AgentInfo> {
+        let Ok(resp) = self.http().get(self.url("/agent")).send().await else {
+            return Vec::new();
+        };
+        let Ok(text) = resp.text().await else {
+            return Vec::new();
+        };
+        serde_json::from_str::<Vec<crate::opencode::client::AgentInfo>>(&text).unwrap_or_default()
+    }
+
+    /// Available models (`GET /provider`), grouped as `provider → model ids`.
+    /// Best-effort: an unreadable/cached failure returns an empty map so the
+    /// `/model` card can degrade to a plain text prompt.
+    pub async fn list_models(&self) -> Vec<crate::opencode::client::ProviderModels> {
+        let Ok(resp) = self.http().get(self.url("/provider")).send().await else {
+            return Vec::new();
+        };
+        let Ok(text) = resp.text().await else {
+            return Vec::new();
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return Vec::new();
+        };
+        let Some(all) = v.get("all").and_then(|a| a.as_array()) else {
+            return Vec::new();
+        };
+        all.iter()
+            .filter_map(|prov| {
+                let id = prov.get("id").and_then(|i| i.as_str())?.to_string();
+                let models: Vec<String> = prov
+                    .get("models")
+                    .and_then(|m| m.as_object())
+                    .map(|m| m.keys().cloned().collect())
+                    .unwrap_or_default();
+                if models.is_empty() {
+                    None
+                } else {
+                    Some(crate::opencode::client::ProviderModels { provider: id, models })
+                }
+            })
+            .collect()
+    }
+
     /// Reject a question request (canonical: `POST /question/{id}/reject`).
     pub async fn reject_question(
         &self,
@@ -537,6 +582,28 @@ impl SessionListInfo {
     pub fn is_child(&self) -> bool {
         self.parent_id.is_some()
     }
+}
+
+/// An available agent (`GET /agent`, `Agent.Info`): `name`, `mode`
+/// (`primary`/`subagent`/`all`), optional `description`. Used by the `/agent`
+/// card to offer a picker.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentInfo {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub hidden: Option<bool>,
+}
+
+/// A provider's available models (`GET /provider`), rendered as one `/model`
+/// card row per provider with each model as a selectable option.
+#[derive(Debug, Clone)]
+pub struct ProviderModels {
+    pub provider: String,
+    pub models: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

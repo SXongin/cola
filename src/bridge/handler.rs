@@ -110,6 +110,24 @@ pub struct CardActionResult {
     pub toast: Option<String>,
 }
 
+/// The thread a card callback routes to. Every cola card button carries its
+/// `chat_id` + `thread_id` in the value payload so the ack can route the choice
+/// back to the right conversation.
+fn thread_key_from_value(value: &serde_json::Value) -> crate::config::ThreadKey {
+    crate::config::ThreadKey::new(
+        value
+            .get("chat_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        value
+            .get("thread_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    )
+}
+
 impl App {
     pub fn new(
         cfg: Config,
@@ -721,8 +739,330 @@ impl App {
             "perm" => self.permission.handle_card_action(&self.core, &value).await,
             "question" => self.question.handle_card_action(&self.core, &value).await,
             "retry" => self.handle_retry_action(&value).await,
+            "switch" => self.handle_switch_card_action(&self.core, &value).await,
+            "agent" => self.handle_agent_card_action(&self.core, &value).await,
+            "model" => self.handle_model_card_action(&self.core, &value).await,
+            "autoaccept" => self.handle_autoaccept_card_action(&self.core, &value).await,
+            "help" => self.handle_help_card_action(&self.core, &value).await,
             _ => None,
         }
+    }
+
+    /// Handle a `/switch` card button (ADR-0012, issue 04): adopt a session,
+    /// create a new one, or re-search. Returns the refreshed card so the ack
+    /// patches the card in place, plus a Toast for instant feedback.
+    async fn handle_switch_card_action(
+        self: &Arc<Self>,
+        core: &Arc<SharedCore>,
+        value: &serde_json::Value,
+    ) -> Option<CardActionResult> {
+        let op = value.get("op").and_then(|v| v.as_str()).unwrap_or("");
+        let thread_key = thread_key_from_value(value);
+        let session_id = value.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+        let keyword = value
+            .get("keyword")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        match op {
+            "adopt" => {
+                // Adopt/switch the target session into this thread. Unlike the
+                // text `/switch <id>`, the card carries no `--force`: a session
+                // owned by another thread is rejected with a Toast (the owner
+                // chat is shown for the user to resolve).
+                let sessions = core.cached_session_list().await.ok()?;
+                let target = sessions.iter().find(|s| s.id == session_id)?.clone();
+                let already_active = {
+                    let store = core.sessions.lock().await;
+                    store
+                        .get_active(&thread_key)
+                        .map(|e| e.session_id == target.id)
+                        .unwrap_or(false)
+                };
+                if already_active {
+                    return Some(CardActionResult {
+                        card: Some(self.build_switch_card_for(core, &thread_key, &keyword).await),
+                        toast: Some("已在当前会话".to_string()),
+                    });
+                }
+                // Mapped to another thread → reject (no --force from the card).
+                let owner = {
+                    let store = core.sessions.lock().await;
+                    store.thread_for_session(&target.id)
+                };
+                if let Some(owner_key) = owner
+                    && owner_key != thread_key
+                {
+                    let chat_name = core
+                        .feishu
+                        .chat_name(&owner_key.chat_id)
+                        .await
+                        .unwrap_or(None)
+                        .unwrap_or_else(|| owner_key.chat_id.clone());
+                    return Some(CardActionResult {
+                        card: None,
+                        toast: Some(format!(
+                            "该会话被 {} 占用，请先请对方解除，或用 `/switch <ID> --force`",
+                            chat_name
+                        )),
+                    });
+                }
+                let entry = crate::config::SessionEntry {
+                    thread_key: thread_key.clone(),
+                    session_id: target.id.clone(),
+                    directory: target.directory.clone(),
+                    agent: target.agent.clone(),
+                    model: None,
+                    auto_accept: false,
+                    topic_anchor: None,
+                };
+                {
+                    let mut store = core.sessions.lock().await;
+                    store.set_active(entry);
+                    if let Err(e) = store.persist() {
+                        tracing::warn!("switch card adopt: persist failed: {}", e);
+                    }
+                }
+                core.invalidate_session_list_cache().await;
+                let toast = format!("已接管「{}」", crate::bridge::command::title_or_id_tail(&target));
+                Some(CardActionResult {
+                    card: Some(self.build_switch_card_for(core, &thread_key, &keyword).await),
+                    toast: Some(toast),
+                })
+            }
+            "new" => {
+                // Fresh session in the current project (equivalent to `/new`).
+                let directory = {
+                    let store = core.sessions.lock().await;
+                    store
+                        .get_active(&thread_key)
+                        .map(|e| e.directory.clone())
+                        .filter(|d| !d.is_empty())
+                        .unwrap_or_else(|| core.default_session_directory())
+                };
+                match core
+                    .opencode
+                    .create_session(&core.opencode.new_session_input(Some(&directory)))
+                    .await
+                {
+                    Ok(session) => {
+                        let entry = crate::config::SessionEntry {
+                            thread_key: thread_key.clone(),
+                            session_id: session.id.clone(),
+                            directory,
+                            agent: None,
+                            model: None,
+                            auto_accept: false,
+                            topic_anchor: None,
+                        };
+                        {
+                            let mut store = core.sessions.lock().await;
+                            store.set_active(entry);
+                            if let Err(e) = store.persist() {
+                                tracing::warn!("switch card new: persist failed: {}", e);
+                            }
+                        }
+                        core.invalidate_session_list_cache().await;
+                        Some(CardActionResult {
+                            card: Some(self.build_switch_card_for(core, &thread_key, "").await),
+                            toast: Some("已新建会话".to_string()),
+                        })
+                    }
+                    Err(e) => {
+                        tracing::warn!("switch card new session failed: {}", e);
+                        None
+                    }
+                }
+            }
+            "search" => {
+                // A search is an explicit refresh request: drop the session-list
+                // cache so the re-filter sees newly created/adopted sessions.
+                core.invalidate_session_list_cache().await;
+                Some(CardActionResult {
+                    card: Some(self.build_switch_card_for(core, &thread_key, &keyword).await),
+                    toast: None,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Rebuild the `/switch` card for a thread with the given search keyword.
+    async fn build_switch_card_for(
+        self: &Arc<Self>,
+        core: &Arc<SharedCore>,
+        thread_key: &ThreadKey,
+        keyword: &str,
+    ) -> serde_json::Value {
+        let (shown, active_id, mapped_ids) =
+            crate::bridge::command::switch_card_data(core, thread_key, keyword).await;
+        crate::feishu::card::build_switch_card(thread_key, &shown, keyword, active_id.as_deref(), &mapped_ids)
+    }
+
+    /// Handle an `/agent` picker-card button: record the per-session override
+    /// and refresh the card.
+    async fn handle_agent_card_action(
+        self: &Arc<Self>,
+        core: &Arc<SharedCore>,
+        value: &serde_json::Value,
+    ) -> Option<CardActionResult> {
+        let agent = value
+            .get("value")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let thread_key = thread_key_from_value(value);
+        let Some(mut entry) = core.sessions.lock().await.get_active(&thread_key).cloned() else {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("当前对话还没有会话".to_string()),
+            });
+        };
+        entry.agent = Some(agent.clone());
+        {
+            let mut store = core.sessions.lock().await;
+            store.set_active(entry);
+            if let Err(e) = store.persist() {
+                tracing::warn!("agent card: persist failed: {}", e);
+            }
+        }
+        let agents = core.opencode.list_agents().await;
+        Some(CardActionResult {
+            card: Some(crate::feishu::card::build_agent_card(&thread_key, &agents)),
+            toast: Some(format!("Agent: {agent}（下一条消息开始生效）")),
+        })
+    }
+
+    /// Handle a `/model` picker-card button: record the per-session override
+    /// and refresh the card.
+    async fn handle_model_card_action(
+        self: &Arc<Self>,
+        core: &Arc<SharedCore>,
+        value: &serde_json::Value,
+    ) -> Option<CardActionResult> {
+        let model = value
+            .get("value")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let thread_key = thread_key_from_value(value);
+        if crate::opencode::client::parse_model(&model).is_none() {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("模型格式应为 <provider>/<model>".to_string()),
+            });
+        }
+        let Some(mut entry) = core.sessions.lock().await.get_active(&thread_key).cloned() else {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("当前对话还没有会话".to_string()),
+            });
+        };
+        entry.model = Some(model.clone());
+        {
+            let mut store = core.sessions.lock().await;
+            store.set_active(entry);
+            if let Err(e) = store.persist() {
+                tracing::warn!("model card: persist failed: {}", e);
+            }
+        }
+        let providers = core.opencode.list_models().await;
+        Some(CardActionResult {
+            card: Some(crate::feishu::card::build_model_card(&thread_key, &providers)),
+            toast: Some(format!("Model: {model}（下一条消息开始生效）")),
+        })
+    }
+
+    /// Handle an `/autoaccept` toggle-card button: switch the flag and refresh
+    /// the card.
+    async fn handle_autoaccept_card_action(
+        self: &Arc<Self>,
+        core: &Arc<SharedCore>,
+        value: &serde_json::Value,
+    ) -> Option<CardActionResult> {
+        let on = value.get("value").and_then(|v| v.as_str()) == Some("on");
+        let thread_key = thread_key_from_value(value);
+        let current_entry = {
+            let store = core.sessions.lock().await;
+            store.get_active(&thread_key).cloned()
+        };
+        if on && let Some(e) = &current_entry {
+            core.approve_pending_for_session(&e.session_id, &e.directory)
+                .await;
+        }
+        if let Some(mut e) = current_entry {
+            e.auto_accept = on;
+            let mut store = core.sessions.lock().await;
+            store.set_active(e);
+            if let Err(e) = store.persist() {
+                tracing::warn!("autoaccept card: persist failed: {}", e);
+            }
+        }
+        let current_on = core
+            .sessions
+            .lock()
+            .await
+            .get_active(&thread_key)
+            .map(|e| e.auto_accept)
+            .unwrap_or(false);
+        Some(CardActionResult {
+            card: Some(crate::feishu::card::build_autoaccept_card(
+                &thread_key,
+                current_on,
+            )),
+            toast: Some(if on {
+                "已开启自动审批".to_string()
+            } else {
+                "已关闭自动审批".to_string()
+            }),
+        })
+    }
+
+    /// Handle a `/help` navigation-card button: re-run the command text in the
+    /// same thread (the card is patched to a brief confirmation; the command's
+    /// own reply/card follows).
+    async fn handle_help_card_action(
+        self: &Arc<Self>,
+        core: &Arc<SharedCore>,
+        value: &serde_json::Value,
+    ) -> Option<CardActionResult> {
+        let cmd = value.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+        let thread_key = thread_key_from_value(value);
+        if cmd.is_empty() {
+            return None;
+        }
+        // Re-run the command text through the normal message pipeline (it has
+        // no message_id to reply to, so pass an empty anchor — the command's
+        // output goes to the thread top-level).
+        let text = if cmd.starts_with('/') {
+            cmd.to_string()
+        } else {
+            format!("/{cmd}")
+        };
+        let incoming = crate::bridge::IncomingMessage {
+            message_id: String::new(),
+            chat_id: thread_key.chat_id.clone(),
+            chat_type: "p2p".to_string(),
+            thread_id: if thread_key.thread_id == thread_key.chat_id {
+                None
+            } else {
+                Some(thread_key.thread_id.clone())
+            },
+            parent_id: None,
+            text,
+            images: Vec::new(),
+            requester_open_id: None,
+        };
+        core.invalidate_session_list_cache().await;
+        let app = Arc::clone(self);
+        tokio::spawn(async move {
+            app.handle_message(incoming).await;
+        });
+        Some(CardActionResult {
+            card: Some(crate::feishu::card::build_help_card(&thread_key)),
+            toast: Some("已执行".to_string()),
+        })
     }
 
     /// Re-submit a failed prompt on the SAME card (error-card "retry" button).

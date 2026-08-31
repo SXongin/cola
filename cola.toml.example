@@ -1,17 +1,16 @@
 # cola configuration
 # Copy to cola.toml and fill in your values. cola.toml is gitignored because
 # it holds your real Feishu app secret.
+#
+# The ONLY required values are the Feishu credentials below. Everything else
+# is optional.
 
 [opencode]
-# The OpenCode server cola talks to. cola discovers a running server on the
-# default store and rewrites this URL automatically (see README); this value is
-# the fallback / preferred port when none is running (cola starts its own).
-url = "http://localhost:4096"
-# username and password are optional (for basic auth). cola discovers both from
-# the running OpenCode server automatically (password + username from its env,
-# defaulting to "opencode"); only set them here to override that.
-# username = "opencode"
-# password = ""
+# Preferred/fallback port for the OpenCode server. cola discovers a running
+# server on the default store and attaches to it automatically; this value is
+# only the preferred port (and the fallback when none is running, cola starts
+# its own on http://localhost:4096). Optional.
+# url = "http://localhost:4096"
 # Model cola's own sessions use by default. It must exist on the server cola
 # attaches to. Optional: when unset (or removed), cola does NOT pin a model and
 # the OpenCode server uses ITS default model — so on most setups you can just
@@ -28,10 +27,14 @@ app_secret = "your-app-secret"
 [bridge]
 # Path to the session mapping file (chat thread <-> OpenCode session).
 # session_file = "~/.cola/sessions.json"
-# Default directory for new sessions (instead of cola's working directory).
-# `/dir` still overrides per session. Leave unset to fall back to the cwd.
+# Default directory for new sessions when the conversation has no active
+# session (a fresh chat, or after /forget). Leave unset to fall back to the
+# cwd. /new inherits the active session's directory; /dir still overrides
+# per session.
 # work_dir = "/path/to/a/project"
 # In group chats, reply to the requester's message with a short completion
 # notice (the streaming card is patched in place, so it does not push a new
 # notification). Set false to disable.
 # group_completion_notice = true
+# How many days of rotated daily logs to keep (default 14).
+# log_days = 14

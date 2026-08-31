@@ -2,6 +2,7 @@ mod bridge;
 mod config;
 mod error;
 mod feishu;
+mod logging;
 mod opencode;
 
 use clap::Parser;
@@ -63,31 +64,32 @@ fn resolve_config_or_exit(explicit: &Option<String>) -> std::path::PathBuf {
     }
 }
 
-/// Resolve which OpenCode server cola talks to, mutating the config.
+/// Resolve which OpenCode server cola talks to.
 ///
 /// The invariant is the STORE: sessions are shared only when cola, OpenChamber
 /// and the CLI read the same data directory (`~/.local/share/opencode`). So
 /// cola attaches to whatever `opencode serve` is already running on the default
 /// store (OpenChamber's managed server, a manual one — whoever started it) and
 /// only starts its own when none exists. A server on a custom store is never
-/// touched.
-async fn resolve_opencode_server(cfg: &mut config::OpenCodeConfig) -> anyhow::Result<()> {
-    let preferred_port = cfg.url.rsplit(':').next().and_then(|s| s.parse().ok());
+/// touched. Returns the resolved endpoint + credentials (discovery always
+/// supplies both username and password).
+async fn resolve_opencode_server(
+    cfg: &config::OpenCodeConfig,
+) -> anyhow::Result<bridge::discovery::ResolvedServer> {
+    let preferred_port = cfg
+        .url
+        .as_deref()
+        .and_then(|u| u.rsplit(':').next())
+        .and_then(|s| s.parse().ok());
     let candidates = bridge::discovery::scan_processes();
 
     if let Some(server) = bridge::discovery::select_server(&candidates, preferred_port).cloned() {
-        cfg.url = format!("http://localhost:{}", server.port);
-        cfg.password = Some(server.password);
-        // The server's effective username (OPENCODE_SERVER_USERNAME, default
-        // "opencode"). Without it cola sends no Authorization header and the
-        // server 401s even when the discovered password is correct. An
-        // explicitly configured username wins (a deliberate override, e.g.
-        // when the server env isn't readable on this platform).
-        if cfg.username.is_none() {
-            cfg.username = Some(server.username);
-        }
-        tracing::info!("Attached to OpenCode server at {}", cfg.url);
-        return Ok(());
+        tracing::info!("Attached to OpenCode server at http://localhost:{}", server.port);
+        return Ok(bridge::discovery::ResolvedServer {
+            url: format!("http://localhost:{}", server.port),
+            username: server.username,
+            password: server.password,
+        });
     }
 
     // No shared server running — start our own on the default store.
@@ -99,18 +101,18 @@ async fn resolve_opencode_server(cfg: &mut config::OpenCodeConfig) -> anyhow::Re
         }
         p
     };
-    let password = cfg.password.clone().unwrap_or_else(|| "cola-secret".to_string());
+    let password = "cola-secret".to_string();
     tracing::info!("No shared OpenCode server found; starting one on port {}", port);
     spawn_self_server(port, &password)?;
     wait_for_port(port).await?;
-    cfg.url = format!("http://localhost:{}", port);
-    cfg.password = Some(password);
     // cola's own server strips an inherited username (self_start_command) and
-    // always uses the server default `opencode` — send exactly that, even if
-    // the user configured a different username (that override only applies to
-    // an ATTACHED server; cola's own server never accepts anything else).
-    cfg.username = Some(bridge::discovery::DEFAULT_SERVER_USERNAME.to_string());
-    Ok(())
+    // always uses the server default `opencode` — send exactly that.
+    tracing::info!("Started cola's own OpenCode server at http://localhost:{}", port);
+    Ok(bridge::discovery::ResolvedServer {
+        url: format!("http://localhost:{}", port),
+        username: bridge::discovery::DEFAULT_SERVER_USERNAME.to_string(),
+        password,
+    })
 }
 
 /// Spawn cola's own `opencode serve` (default store, so sessions stay shared).
@@ -309,21 +311,21 @@ impl Drop for SingletonLock {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // Config first: `[bridge] log_days` feeds the daily-rotating log writer.
+    let config_path = resolve_config_or_exit(&cli.config);
+    let cfg = config::load(&config_path)?;
+
     // Logs always append to a file (default ~/.cola/cola.log; --log-file
     // overrides) so a restart keeps history instead of wiping it like a shell
-    // `>` redirect does. The file is ANSI-free. When stdout is a real terminal
-    // it mirrors the logs too (with ANSI); a redirected stdout gets no cola
-    // logs, so the redirect target stays clean and the file is authoritative.
+    // `>` redirect does. The file is ANSI-free and rotates daily: yesterday's
+    // content moves to cola-YYYY-MM-DD.log, older files are swept after
+    // `log_days`. When stdout is a real terminal it mirrors the logs too (with
+    // ANSI); a redirected stdout gets no cola logs, so the redirect target
+    // stays clean and the file is authoritative.
     let log_path = cli.log_file.clone().unwrap_or_else(default_log_path);
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
+    let daily = logging::DailyLog::new(log_path.clone(), cfg.bridge.log_days)?;
     let file_layer = tracing_subscriber::fmt::layer()
-        .with_writer(file)
+        .with_writer(daily)
         .with_ansi(false);
     let stdout_layer = std::io::stdout()
         .is_terminal()
@@ -334,10 +336,6 @@ async fn main() -> anyhow::Result<()> {
         .with(stdout_layer)
         .init();
     tracing::info!("logging to {}", log_path.display());
-
-    let config_path = resolve_config_or_exit(&cli.config);
-
-    let mut cfg = config::load(&config_path)?;
 
     // Grab the singleton lock BEFORE touching the network or the store — a
     // duplicate cola must die before it can double-connect to the Feishu WS. A
@@ -368,17 +366,17 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    resolve_opencode_server(&mut cfg.opencode).await?;
+    let server = resolve_opencode_server(&cfg.opencode).await?;
 
     tracing::info!(
         "cola starting — OpenCode: {}, Feishu app: {}",
-        cfg.opencode.url,
+        server.url,
         cfg.feishu.app_id
     );
 
     let feishu_client = feishu::Client::new(cfg.feishu.clone());
 
-    let opencode_client = opencode::Client::new(cfg.opencode.clone());
+    let opencode_client = opencode::Client::new(cfg.opencode.model.as_deref(), server);
     let app = Arc::new(bridge::App::new(
         cfg.clone(),
         Arc::new(opencode_client),

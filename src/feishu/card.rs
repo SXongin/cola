@@ -126,14 +126,18 @@ fn tool_panel_element(tool: &ToolPanel) -> serde_json::Value {
     if let Some(i) = &tool.input {
         let formatted = format_tool_input(&tool.name, i);
         if !formatted.is_empty() {
-            content.push_str(&format!("**Input**\n{}\n", truncate_md(&formatted, 400)));
+            // Trailing blank line so a multi-line input (edit diff, skill
+            // metadata list) can't swallow the Output section as a markdown
+            // lazy continuation of its last list line — Feishu would render
+            // `**Output**` glued to the last input line.
+            content.push_str(&format!("**Input**\n{}\n\n", truncate_md(&formatted, 400)));
         }
     }
     if let Some(ref o) = tool.output {
         let (header, lang, body) = format_tool_output(&tool.name, o);
         content.push_str("**Output**\n");
         if let Some(h) = &header {
-            content.push_str(&format!("{}\n", h));
+            content.push_str(&format!("{}\n\n", h));
         }
         let body = truncate_md(&body, TOOL_OUTPUT_MAX_CHARS);
         // File content (read) and anything with long lines render as a fenced
@@ -838,6 +842,411 @@ pub fn build_question_card(
         "body": { "elements": elements }
     })
 }
+/// One row of the `/switch` session card: a `column_set` with the session
+/// text on the left and a switch/adopt button on the right. Each row's button
+/// carries the routing payload (`action: "switch"`, `op: "adopt"`, thread_key,
+/// target session id).
+fn switch_card_row(
+    text: &str,
+    btn_text: &str,
+    thread_key: &crate::config::ThreadKey,
+    session_id: &str,
+) -> serde_json::Value {
+    json!({
+        "tag": "column_set",
+        "flex_mode": "none",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 5,
+                "vertical_align": "center",
+                "elements": [ { "tag": "markdown", "content": text } ]
+            },
+            {
+                "tag": "column",
+                "width": "auto",
+                "vertical_align": "center",
+                "elements": [
+                    {
+                        "tag": "button",
+                        "text": { "tag": "plain_text", "content": btn_text },
+                        "type": "default",
+                        "value": {
+                            "action": "switch",
+                            "op": "adopt",
+                            "chat_id": thread_key.chat_id,
+                            "thread_id": thread_key.thread_id,
+                            "session_id": session_id,
+                        },
+                    }
+                ],
+            }
+        ]
+    })
+}
+
+/// A generic option-picker card: one button per option. Shared by the
+/// `/agent`, `/model` and `/autoaccept` dual-form cards. Each button carries
+/// the given `action` tag + the routing payload (thread_key) + the option
+/// value, so the ack routes the choice back to the right thread.
+fn option_picker_card(
+    header: &str,
+    intro: &str,
+    thread_key: &crate::config::ThreadKey,
+    action: &str,
+    options: &[(String, String)],
+) -> serde_json::Value {
+    let mut elements: Vec<serde_json::Value> = vec![json!({ "tag": "markdown", "content": intro })];
+    for (label, value) in options {
+        elements.push(json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": label },
+            "type": "default",
+            "width": "fill",
+            "value": {
+                "action": action,
+                "chat_id": thread_key.chat_id,
+                "thread_id": thread_key.thread_id,
+                "value": value,
+            },
+        }));
+    }
+    json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true },
+        "header": {
+            "title": { "tag": "plain_text", "content": header },
+            "template": "blue"
+        },
+        "body": { "elements": elements }
+    })
+}
+
+/// The `/agent` picker card: one button per available agent. Falls back to an
+/// empty intro when no agents are listed (the backend is unreachable).
+pub fn build_agent_card(
+    thread_key: &crate::config::ThreadKey,
+    agents: &[crate::opencode::client::AgentInfo],
+) -> serde_json::Value {
+    let intro = if agents.is_empty() {
+        "_(没有可用 agent)_"
+    } else {
+        "**选择 agent**（下一条消息开始生效）："
+    };
+    let options: Vec<(String, String)> = agents
+        .iter()
+        .filter(|a| a.hidden != Some(true))
+        .map(|a| (a.name.clone(), a.name.clone()))
+        .collect();
+    option_picker_card("🤖 选择 Agent", intro, thread_key, "agent", &options)
+}
+
+/// The `/model` picker card: one button per `provider/model`. Falls back to an
+/// empty intro when no models are listed (the backend is unreachable).
+pub fn build_model_card(
+    thread_key: &crate::config::ThreadKey,
+    providers: &[crate::opencode::client::ProviderModels],
+) -> serde_json::Value {
+    let intro = if providers.is_empty() {
+        "_(没有可用模型)_"
+    } else {
+        "**选择模型**（下一条消息开始生效）："
+    };
+    let mut options: Vec<(String, String)> = Vec::new();
+    for p in providers {
+        for m in &p.models {
+            options.push((format!("{}/{}", p.provider, m), format!("{}/{}", p.provider, m)));
+        }
+    }
+    option_picker_card("🎯 选择模型", intro, thread_key, "model", &options)
+}
+
+/// The `/autoaccept` toggle card: two buttons showing the current state.
+pub fn build_autoaccept_card(thread_key: &crate::config::ThreadKey, current_on: bool) -> serde_json::Value {
+    let intro = format!(
+        "**当前自动审批：{}**\n自动审批开启后，本会话的权限请求不再弹卡，直接 Allow。",
+        if current_on { "🔁 开" } else { "❌ 关" }
+    );
+    let options = vec![
+        ("🔁 开启自动审批".to_string(), "on".to_string()),
+        ("❌ 关闭自动审批".to_string(), "off".to_string()),
+    ];
+    option_picker_card("🔁 自动审批", &intro, thread_key, "autoaccept", &options)
+}
+
+/// The `/help` navigation card: commands grouped by 会话 / 操作 / 运维, each
+/// with a "试试" button that fires the command (delivered as a `/cmd` text into
+/// the same thread), plus a hint that card-able commands also open a card.
+pub fn build_help_card(thread_key: &crate::config::ThreadKey) -> serde_json::Value {
+    /// A single help-card row. `card` is `Some(bare_command)` for card-able
+    /// commands — the "看卡" button runs that command with no args, which pops
+    /// its interactive card; `None` commands get only a "试试" button.
+    struct HelpRow<'a> {
+        label: &'a str,
+        cmd: &'a str,
+        card: Option<&'a str>,
+    }
+    struct HelpGroup<'a> {
+        title: &'a str,
+        rows: &'a [HelpRow<'a>],
+    }
+    let groups: &[HelpGroup] = &[
+        HelpGroup {
+            title: "📂 会话",
+            rows: &[
+                HelpRow {
+                    label: "/new [名字]",
+                    cmd: "/new",
+                    card: None,
+                },
+                HelpRow {
+                    label: "/dir <路径> [名字]",
+                    cmd: "/dir",
+                    card: None,
+                },
+                HelpRow {
+                    label: "/switch · 卡片",
+                    cmd: "/switch",
+                    card: Some("/switch"),
+                },
+                HelpRow {
+                    label: "/topic <目录> [名字]",
+                    cmd: "/topic",
+                    card: None,
+                },
+                HelpRow {
+                    label: "/name <新名>",
+                    cmd: "/name",
+                    card: None,
+                },
+            ],
+        },
+        HelpGroup {
+            title: "⚙️ 操作",
+            rows: &[
+                HelpRow {
+                    label: "/agent · 卡片",
+                    cmd: "/agent",
+                    card: Some("/agent"),
+                },
+                HelpRow {
+                    label: "/model · 卡片",
+                    cmd: "/model",
+                    card: Some("/model"),
+                },
+                HelpRow {
+                    label: "/autoaccept · 卡片",
+                    cmd: "/autoaccept",
+                    card: Some("/autoaccept"),
+                },
+                HelpRow {
+                    label: "/stop",
+                    cmd: "/stop",
+                    card: None,
+                },
+                HelpRow {
+                    label: "/compact",
+                    cmd: "/compact",
+                    card: None,
+                },
+            ],
+        },
+        HelpGroup {
+            title: "🛠 运维",
+            rows: &[
+                HelpRow {
+                    label: "/help <命令>",
+                    cmd: "/help",
+                    card: Some("/help"),
+                },
+                HelpRow {
+                    label: "/restart",
+                    cmd: "/restart",
+                    card: None,
+                },
+                HelpRow {
+                    label: "/restart-opencode",
+                    cmd: "/restart-opencode",
+                    card: None,
+                },
+            ],
+        },
+    ];
+    let mut elements: Vec<serde_json::Value> = Vec::new();
+    for group in groups {
+        elements.push(json!({ "tag": "markdown", "content": format!("**{}**", group.title) }));
+        for row in group.rows {
+            let mut buttons: Vec<serde_json::Value> = vec![json!({
+                "tag": "button",
+                "text": { "tag": "plain_text", "content": "试试" },
+                "type": "default",
+                "value": {
+                    "action": "help",
+                    "chat_id": thread_key.chat_id,
+                    "thread_id": thread_key.thread_id,
+                    "cmd": row.cmd,
+                },
+            })];
+            if let Some(card_cmd) = row.card {
+                buttons.push(json!({
+                    "tag": "button",
+                    "text": { "tag": "plain_text", "content": "看卡" },
+                    "type": "primary",
+                    "value": {
+                        "action": "help",
+                        "chat_id": thread_key.chat_id,
+                        "thread_id": thread_key.thread_id,
+                        "cmd": card_cmd,
+                    },
+                }));
+            }
+            elements.push(json!({
+                "tag": "column_set",
+                "flex_mode": "none",
+                "columns": [
+                    {
+                        "tag": "column",
+                        "width": "weighted",
+                        "weight": 5,
+                        "vertical_align": "center",
+                        "elements": [ { "tag": "markdown", "content": row.label } ]
+                    },
+                    {
+                        "tag": "column",
+                        "width": "auto",
+                        "vertical_align": "center",
+                        "elements": buttons,
+                    }
+                ]
+            }));
+        }
+    }
+    elements.push(json!({ "tag": "note", "elements": [ { "tag": "plain_text", "content": "带 · 卡片的命令支持无参弹卡，也支持文本直达（如 /switch <关键字>）。" } ] }));
+    json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true },
+        "header": {
+            "title": { "tag": "plain_text", "content": "📖 cola 命令" },
+            "template": "blue"
+        },
+        "body": { "elements": elements }
+    })
+}
+
+/// Build the interactive `/switch` session card (ADR-0012, issue 04): a
+/// search box, up to `MAX_SWITCH_ROWS` session rows (each with a
+/// switch/adopt button), and a "＋new" footer button that creates a fresh
+/// session in the current project (equivalent to `/new`). `keyword` is the
+/// active filter (empty = all); `active_id`/`mapped_ids` drive the row
+/// labels and buttons.
+pub const MAX_SWITCH_ROWS: usize = 6;
+
+pub fn build_switch_card(
+    thread_key: &crate::config::ThreadKey,
+    sessions: &[crate::opencode::client::SessionListInfo],
+    keyword: &str,
+    active_id: Option<&str>,
+    mapped_ids: &[String],
+) -> serde_json::Value {
+    let mut elements: Vec<serde_json::Value> = Vec::new();
+
+    // Search form: an input + a submit button. The routing payload rides in the
+    // button's `name` (form submits don't always deliver the button `value`),
+    // and the typed keyword arrives as `form_value.search`.
+    elements.push(json!({
+        "tag": "form",
+        "name": "switch_search",
+        "elements": [
+            {
+                "tag": "input",
+                "name": "search",
+                "placeholder": { "tag": "plain_text", "content": "🔍 搜索标题 / 目录 / ID" },
+                "value": { "tag": "plain_text", "content": keyword },
+                "max_length": 100,
+                "width": "fill",
+            },
+            {
+                "tag": "button",
+                "text": { "tag": "plain_text", "content": "搜索" },
+                "type": "primary",
+                "form_action_type": "submit",
+                "name": format!("switchsearch|{}|{}", thread_key.chat_id, thread_key.thread_id),
+                "value": {
+                    "action": "switch",
+                    "op": "search",
+                    "chat_id": thread_key.chat_id,
+                    "thread_id": thread_key.thread_id,
+                },
+            },
+        ],
+    }));
+
+    if sessions.is_empty() {
+        elements.push(json!({ "tag": "markdown", "content": "_(无匹配会话)_" }));
+    } else {
+        let header = if keyword.is_empty() {
+            "**最近会话**"
+        } else {
+            &format!("**匹配 `{keyword}` 的会话**")
+        };
+        elements.push(json!({ "tag": "markdown", "content": header }));
+        for s in sessions.iter().take(MAX_SWITCH_ROWS) {
+            let label = crate::bridge::command::title_or_id_tail(s);
+            let text = if active_id == Some(s.id.as_str()) {
+                format!(
+                    "{label} · {} · {}\n_(active)_",
+                    s.directory,
+                    crate::bridge::command::id_tail(&s.id)
+                )
+            } else if mapped_ids.contains(&s.id) {
+                format!(
+                    "{label} · {} · {}\n_(本会话)_",
+                    s.directory,
+                    crate::bridge::command::id_tail(&s.id)
+                )
+            } else {
+                format!(
+                    "{label} · {} · {}",
+                    s.directory,
+                    crate::bridge::command::id_tail(&s.id)
+                )
+            };
+            let btn = if active_id == Some(s.id.as_str()) {
+                "✅ 当前"
+            } else if mapped_ids.contains(&s.id) {
+                "切换"
+            } else {
+                "接管"
+            };
+            elements.push(switch_card_row(&text, btn, thread_key, &s.id));
+        }
+    }
+
+    // Footer: "＋new" creates a fresh session in the current project.
+    elements.push(json!({
+        "tag": "button",
+        "text": { "tag": "plain_text", "content": "＋ 新建会话" },
+        "type": "primary",
+        "value": {
+            "action": "switch",
+            "op": "new",
+            "chat_id": thread_key.chat_id,
+            "thread_id": thread_key.thread_id,
+        },
+    }));
+
+    json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true },
+        "header": {
+            "title": { "tag": "plain_text", "content": "📂 会话管理" },
+            "template": "blue"
+        },
+        "body": { "elements": elements }
+    })
+}
+
 fn truncate_md(text: &str, max_len: usize) -> String {
     if text.len() <= max_len {
         text.to_string()
@@ -1501,6 +1910,45 @@ mod tests {
         );
     }
 
+    /// Regression: a tool whose input renders as markdown LIST lines (edit's
+    /// `- old`/`+ new`, skill's `- name: ...`) must NOT swallow the Output
+    /// marker as a lazy continuation of the last list line — Feishu then glues
+    /// `**Output**` to the end of the input. A blank line between the sections
+    /// keeps them on separate visual lines.
+    #[test]
+    fn tool_panel_input_and_output_separated_by_blank_line() {
+        let tool = ToolPanel {
+            name: "edit".into(),
+            status: "completed".into(),
+            input: Some(json!({
+                "filePath": "src/main.rs",
+                "oldString": "let a = 1;",
+                "newString": "let a = 2;"
+            })),
+            output: Some("Edited file successfully: src/main.rs".into()),
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        let md = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .expect("panel markdown content");
+        // The last input list line and the Output marker must not be adjacent —
+        // a single newline would make `**Output**` a lazy continuation of the
+        // `+ let a = 2;` list item and Feishu would render them on one line.
+        assert!(
+            md.contains("+ let a = 2;\n\n**Output**\n"),
+            "Input and Output sections must be separated by a blank line: {:?}",
+            md
+        );
+        assert!(
+            !md.contains("+ let a = 2;\n**Output**"),
+            "no glued marker: {:?}",
+            md
+        );
+    }
+
     #[test]
     fn tool_input_string_shows_as_is() {
         // A bare string input (non-object) renders directly.
@@ -1542,5 +1990,26 @@ mod tests {
         assert_eq!(first_chunk(&long, 10), format!("{}…", "a".repeat(10)));
         // Only the first line of multi-line input is shown.
         assert_eq!(first_chunk("first line\nsecond line", 100), "first line");
+    }
+
+    /// The `/help` card shows a "看卡" button for card-able commands (switch,
+    /// agent, model, autoaccept, help) and only "试试" for one-step commands.
+    #[test]
+    fn help_card_kan_kha_button_only_for_card_able_commands() {
+        let key = crate::config::ThreadKey::new("oc_chat".into(), "oc_chat".into());
+        let card = build_help_card(&key);
+        let text = card.to_string();
+        // Card-able commands get both buttons.
+        for cmd in ["/switch", "/agent", "/model", "/autoaccept", "/help"] {
+            assert!(
+                text.contains(&format!("\"cmd\":\"{}\"", cmd)),
+                "missing card-able command {cmd}: {text}"
+            );
+        }
+        // "看卡" appears (one per card-able row) but "试试" outnumbers it.
+        let kan_kha = text.matches("看卡").count();
+        let shishi = text.matches("试试").count();
+        assert!(kan_kha >= 5, "every card-able command shows 看卡, got {kan_kha}");
+        assert!(shishi > kan_kha, "试试 on every row: {shishi} vs {kan_kha}");
     }
 }

@@ -3,16 +3,11 @@
 pub enum Command {
     /// Change project directory for the current session
     Dir(String),
-    /// Switch to a session by title/directory/id, adopting foreign sessions
-    Switch(String),
-    /// List sessions in the shared store (`/list [keyword] [--all]`)
-    List { keyword: Option<String>, all: bool },
+    /// Session management (`/switch ...`): match, list, forget, adopt, or the
+    /// interactive card. Absorbed the old `/list`, `/attach`, `/forget`.
+    Switch(SwitchAction),
     /// Create a fresh session, optionally named
     New(Option<String>),
-    /// Adopt an arbitrary server session into this thread (`/attach <id|title> [--force]`)
-    Attach { query: String, force: bool },
-    /// Un-map the current thread's session (server session stays untouched)
-    Forget,
     /// Create a real Feishu topic backed by a fresh session rooted at `directory`.
     Topic { directory: String, name: Option<String> },
     /// Rename the current session (PATCHes the server title)
@@ -23,8 +18,12 @@ pub enum Command {
     Compact,
     /// Switch agent in the current session
     Agent(String),
+    /// `/agent` (no args) — interactive agent-picker card.
+    AgentCard,
     /// Switch model in the current session
     Model(String),
+    /// `/model` (no args) — interactive model-picker card.
+    ModelCard,
     /// Auto-accept of permission requests for the current session.
     AutoAccept(AutoAcceptAction),
     /// Restart cola itself, preserving startup args and the log redirect.
@@ -36,6 +35,23 @@ pub enum Command {
     Help(Option<String>),
     /// Forward unrecognized slash command to OpenCode as prompt text
     Forward(String),
+}
+
+/// What `/switch` should do (ADR-0012). The text-direct forms all share the
+/// session store; the no-arg form pops the interactive card.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SwitchAction {
+    /// `/switch` (no args) — the interactive session card (issue 04).
+    Card,
+    /// `/switch <keyword>` — matching rules: thread's sessions first, then a
+    /// unique global match is adopted (ADR-0008).
+    Match(String),
+    /// `/switch list [keyword] [--all]` — the old `/list`.
+    List { keyword: Option<String>, all: bool },
+    /// `/switch forget` — the old `/forget`.
+    Forget,
+    /// `/switch <id|title> [--force]` — the old `/attach`.
+    Attach { query: String, force: bool },
 }
 
 /// What `/autoaccept` should do: report the current state, or switch it.
@@ -67,48 +83,46 @@ pub fn parse_command(text: &str) -> Option<Command> {
             None => Some(Command::Help(Some("dir".into()))),
         },
         "/switch" => match arg {
-            Some(p) => Some(Command::Switch(p.to_string())),
-            None => Some(Command::Help(Some("switch".into()))),
-        },
-        // `/list [keyword] [--all]` — keyword may be multiple words or a flag.
-        "/list" => {
-            let mut keyword = None;
-            let mut all = false;
-            if let Some(a) = arg {
+            // `/switch` (no args) — the interactive session card.
+            None => Some(Command::Switch(SwitchAction::Card)),
+            Some(a) => {
                 let mut words: Vec<&str> = Vec::new();
+                let mut force = false;
                 for w in a.split_whitespace() {
-                    if w == "--all" {
-                        all = true;
+                    if w == "--force" {
+                        force = true;
                     } else {
                         words.push(w);
                     }
                 }
-                if !words.is_empty() {
-                    keyword = Some(words.join(" "));
+                // `/switch list [keyword] [--all]` — the old `/list`.
+                if words.first().map(|w| w.to_lowercase()) == Some("list".into()) {
+                    let mut keyword = None;
+                    let mut all = false;
+                    for w in words.iter().skip(1) {
+                        if *w == "--all" {
+                            all = true;
+                        } else {
+                            keyword =
+                                Some(keyword.map_or_else(|| w.to_string(), |k: String| format!("{k} {w}")));
+                        }
+                    }
+                    return Some(Command::Switch(SwitchAction::List { keyword, all }));
                 }
-            }
-            Some(Command::List { keyword, all })
-        }
-        // `/attach <id|title> [--force]`
-        "/attach" => match arg {
-            Some(a) => {
-                let words: Vec<&str> = a.split_whitespace().collect();
-                let force = words.contains(&"--force");
-                let query: String = words
-                    .iter()
-                    .filter(|w| **w != "--force")
-                    .cloned()
-                    .collect::<Vec<&str>>()
-                    .join(" ");
+                // `/switch forget` — the old `/forget`.
+                if words.first().map(|w| w.to_lowercase()) == Some("forget".into()) && words.len() == 1 {
+                    return Some(Command::Switch(SwitchAction::Forget));
+                }
+                let query = words.join(" ");
                 if query.is_empty() {
-                    Some(Command::Help(Some("attach".into())))
+                    Some(Command::Switch(SwitchAction::Card))
+                } else if force {
+                    Some(Command::Switch(SwitchAction::Attach { query, force }))
                 } else {
-                    Some(Command::Attach { query, force })
+                    Some(Command::Switch(SwitchAction::Match(query)))
                 }
             }
-            None => Some(Command::Help(Some("attach".into()))),
         },
-        "/forget" => Some(Command::Forget),
         "/new" => Some(Command::New(arg.map(|s| s.to_string()))),
         "/topic" => match arg {
             Some(a) => {
@@ -135,11 +149,11 @@ pub fn parse_command(text: &str) -> Option<Command> {
         "/compact" => Some(Command::Compact),
         "/agent" => match arg {
             Some(p) => Some(Command::Agent(p.to_string())),
-            None => Some(Command::Help(Some("agent".into()))),
+            None => Some(Command::AgentCard),
         },
         "/model" => match arg {
             Some(p) => Some(Command::Model(p.to_string())),
-            None => Some(Command::Help(Some("model".into()))),
+            None => Some(Command::ModelCard),
         },
         // `/autoaccept` reports the current state; `/autoaccept on|off` switches.
         "/autoaccept" => match arg {
@@ -165,12 +179,13 @@ pub fn parse_command(text: &str) -> Option<Command> {
 pub fn help_text() -> String {
     "\
 **cola commands**
-`/dir <path>` · Open a new session in <path>
-`/switch <name>` · Switch to a session (adopts foreign ones)
-`/list [keyword] [--all]` · List recent sessions across the store
-`/attach <id|title> [--force]` · Take over a session into this chat
-`/forget` · Un-map this chat's session (server session stays)
-`/new [name]` · Create a new session
+`/dir <path> [name]` · Switch to a project + new session there
+`/switch` · Session card: browse / search / adopt / new
+`/switch <kw>` · Switch to a session by name/dir/id (adopts foreign ones)
+`/switch list [kw] [--all]` · List recent sessions across the store
+`/switch <id> [--force]` · Take over a session by id/title
+`/switch forget` · Un-map this chat's session (server session stays)
+`/new [name]` · New session in the current project (no session → default dir)
 `/topic <dir> [name]` · Create a new Feishu topic + session in <dir>
 `/name <name>` · Rename current session (server-side)
 `/stop` · Interrupt execution
@@ -182,7 +197,7 @@ pub fn help_text() -> String {
 `/restart-opencode` · Restart the OpenCode server (only when cola started it)
 `/help <command>` · Show help for one command (e.g. `/help model`)
 
-话题规则：已绑定会话的话题里，`/list`、`/switch`、`/attach`、`/new`、`/dir` 被拒绝，请回主对话操作。从未绑定过会话的话题可以用它们来绑定该话题的唯一会话。
+话题规则：已绑定会话的话题里，`/switch`、`/new`、`/dir` 被拒绝，请回主对话操作。从未绑定过会话的话题可以用它们来绑定该话题的唯一会话。
     "
     .to_string()
 }
@@ -191,22 +206,22 @@ pub fn help_text() -> String {
 pub fn command_help(name: &str) -> Option<String> {
     let text = match name.to_lowercase().as_str() {
         "dir" => {
-            "/dir <path>\nOpen a NEW session in <path> (create a session rooted at that directory).\nExample: `/dir /root/proj/lib`"
+            "/dir <path> [name]\nSwitch to a project: open a NEW session rooted at <path> (create a session rooted at that directory).\nExample: `/dir /root/proj/lib`"
         }
         "switch" => {
-            "/switch <keyword>\nSwitch to a session by title, directory or id. The current chat's sessions win; otherwise a unique match in the shared store is adopted. Ambiguous keywords list candidates.\nExample: `/switch backend`"
+            "/switch [action]\nSession management card and text forms.\n- `/switch` (no arg) — interactive session card (browse / search / adopt / new)\n- `/switch <keyword>` — switch by title/directory/id; the current chat's sessions win, otherwise a unique global match is adopted. Ambiguous keywords list candidates.\n- `/switch list [keyword] [--all]` — list recent sessions across the store (up to 15)\n- `/switch <id|title> [--force]` — take over a session (exact id → id-prefix → title; reject if owned by another chat unless `--force`)\n- `/switch forget` — un-map this chat's session (server session stays)\nExamples: `/switch backend`, `/switch list cola`, `/switch ses_abc --force`"
         }
         "list" => {
-            "/list [keyword] [--all]\nList recently-active sessions across the shared store (up to 15): title, directory, id and last activity. A keyword filters by title/directory/id; `--all` also shows sub-task child sessions.\nExample: `/list cola`"
+            "/switch list [keyword] [--all]\nList recently-active sessions across the shared store (up to 15): title, directory, id and last activity. A keyword filters by title/directory/id; `--all` also shows sub-task child sessions.\nExample: `/switch list cola`"
         }
         "attach" => {
-            "/attach <id|title> [--force]\nTake over a session created outside Feishu into this chat. Resolution: exact id → unique id-prefix → unique title substring. If the session already belongs to another chat, show its owner and reject unless `--force`.\nExample: `/attach ses_abc123`"
+            "/switch <id|title> [--force]\nTake over a session created outside Feishu into this chat. Resolution: exact id → unique id-prefix → unique title substring. If the session already belongs to another chat, show its owner and reject unless `--force`.\nExample: `/switch ses_abc123`"
         }
         "forget" => {
-            "/forget\nUn-map this chat's session. The server session stays untouched and can be adopted again.\nExample: `/forget`"
+            "/switch forget\nUn-map this chat's session. The server session stays untouched and can be adopted again.\nExample: `/switch forget`"
         }
         "new" => {
-            "/new [name]\nCreate a fresh session, optionally named (the name is PATCHed server-side). Without a name the server generates one after the first message.\nExample: `/new api-refactor`"
+            "/new [name]\nCreate a fresh session in the current project (the active session's directory); with no active session, the default directory (`work_dir` or cwd). Optionally named (the name is PATCHed server-side); without a name the server generates one after the first message.\nExample: `/new api-refactor`"
         }
         "topic" => {
             "/topic <dir> [name]\nCreate a real Feishu topic backed by a new session rooted at <dir>. The topic is UI-separated from the current conversation, so you can switch between topics in the Feishu client. Reply inside the created topic to talk to that session.\nExample: `/topic /root/proj/lib api-refactor`"
@@ -314,14 +329,7 @@ pub(crate) async fn handle_command(
     // topic that never had a session may use them — their outcome becomes
     // that topic's single session.
     if kind == ConversationKind::Topic {
-        let blocked = matches!(
-            cmd,
-            Command::Dir(_)
-                | Command::Switch(_)
-                | Command::List { .. }
-                | Command::New(_)
-                | Command::Attach { .. }
-        );
+        let blocked = matches!(cmd, Command::Dir(_) | Command::Switch(_) | Command::New(_));
         if blocked {
             let has_session = core.sessions.lock().await.get_active(&thread_key).is_some();
             if has_session {
@@ -387,14 +395,22 @@ pub(crate) async fn handle_command(
                 )
                 .await?;
         }
-        Command::Switch(keyword) => {
-            handle_switch(core, &thread_key, &keyword, message_id, kind).await?;
-        }
-        Command::List { keyword, all } => {
-            handle_list(core, &thread_key, keyword.as_deref(), all, message_id).await?;
+        Command::Switch(action) => {
+            handle_switch_action(core, &thread_key, action, message_id, kind).await?;
         }
         Command::New(name) => {
-            let directory = core.default_session_directory();
+            // The current project follows the active session (ADR-0012): `/new`
+            // stays in the project the user is already working in. Only when
+            // the conversation has no session (fresh topic, after `/forget`,
+            // adopted-away) does it fall back to the default directory.
+            let directory = {
+                let store = core.sessions.lock().await;
+                store
+                    .get_active(&thread_key)
+                    .map(|e| e.directory.clone())
+                    .filter(|d| !d.is_empty())
+                    .unwrap_or_else(|| core.default_session_directory())
+            };
             let session = core
                 .opencode
                 .create_session(&core.opencode.new_session_input(Some(&directory)))
@@ -422,25 +438,6 @@ pub(crate) async fn handle_command(
             core.feishu
                 .reply_text(message_id, &format!("Created \"{}\".", label))
                 .await?;
-        }
-        Command::Attach { query, force } => {
-            handle_attach(core, &thread_key, &query, force, message_id, kind).await?;
-        }
-        Command::Forget => {
-            let mut store = core.sessions.lock().await;
-            let removed = store.remove_thread(&thread_key);
-            store.persist()?;
-            core.invalidate_session_list_cache().await;
-            if removed.is_empty() {
-                core.feishu.reply_text(message_id, "当前没有映射的会话。").await?;
-            } else {
-                core.feishu
-                    .reply_text(
-                        message_id,
-                        "已解除本会话的映射（服务器会话仍保留，可用 `/list` 重新找到）。",
-                    )
-                    .await?;
-            }
         }
         Command::Topic { directory, name } => {
             // Opening a topic from inside another topic would nest
@@ -550,14 +547,7 @@ pub(crate) async fn handle_command(
             };
             match action {
                 crate::bridge::command::AutoAcceptAction::Status => {
-                    let state = if entry.as_ref().map(|e| e.auto_accept).unwrap_or(false) {
-                        "开"
-                    } else {
-                        "关"
-                    };
-                    core.feishu
-                        .reply_text(message_id, &format!("🔁 当前会话自动审批：{}。", state))
-                        .await?;
+                    send_autoaccept_card(core, &thread_key, message_id).await?;
                     return Ok(());
                 }
                 crate::bridge::command::AutoAcceptAction::Set(on) => {
@@ -610,6 +600,9 @@ pub(crate) async fn handle_command(
                     .await?;
             }
         }
+        Command::AgentCard => {
+            send_agent_card(core, &thread_key, message_id).await?;
+        }
         Command::Agent(name) => {
             // The OpenCode server has no agent-switch endpoint (the legacy
             // `/api/session/{id}/agent` route 500s, same as `/model`'s dead
@@ -637,6 +630,9 @@ pub(crate) async fn handle_command(
             core.feishu
                 .reply_text(message_id, &format!("Agent: {}（下一条消息开始生效）", name))
                 .await?;
+        }
+        Command::ModelCard => {
+            send_model_card(core, &thread_key, message_id).await?;
         }
         Command::Model(name) => {
             // The OpenCode server has NO model-switch endpoint (the legacy
@@ -674,14 +670,19 @@ pub(crate) async fn handle_command(
                 .await?;
         }
         Command::Help(target) => {
-            let text = match target {
-                Some(name) => match command_help(&name) {
-                    Some(h) => h,
-                    None => format!("未知命令 `{}`。\n\n{}", name, help_text()),
-                },
-                None => help_text(),
-            };
-            core.feishu.reply_text(message_id, &text).await?;
+            match target {
+                // No target: the interactive navigation card (ADR-0012, issue 05).
+                None => {
+                    send_help_card(core, &thread_key, message_id).await?;
+                }
+                Some(name) => {
+                    let text = match command_help(&name) {
+                        Some(h) => h,
+                        None => format!("未知命令 `{}`。\n\n{}", name, help_text()),
+                    };
+                    core.feishu.reply_text(message_id, &text).await?;
+                }
+            }
         }
         Command::Restart => {
             // Reply BEFORE exiting, then re-exec ourselves with the SAME
@@ -742,6 +743,164 @@ pub(crate) async fn handle_command(
     Ok(())
 }
 
+/// Dispatch a `/switch` action (ADR-0012). The text-direct forms share the
+/// old command handlers; the no-arg form pops the interactive session card.
+async fn handle_switch_action(
+    core: &Arc<SharedCore>,
+    thread_key: &ThreadKey,
+    action: SwitchAction,
+    message_id: &str,
+    kind: ConversationKind,
+) -> crate::error::Result<()> {
+    match action {
+        SwitchAction::Card => {
+            send_switch_card(core, thread_key, "", message_id).await?;
+            Ok(())
+        }
+        SwitchAction::Match(keyword) => handle_switch(core, thread_key, &keyword, message_id, kind).await,
+        SwitchAction::List { keyword, all } => {
+            handle_list(core, thread_key, keyword.as_deref(), all, message_id).await
+        }
+        SwitchAction::Forget => {
+            let mut store = core.sessions.lock().await;
+            let removed = store.remove_thread(thread_key);
+            store.persist()?;
+            core.invalidate_session_list_cache().await;
+            if removed.is_empty() {
+                core.feishu.reply_text(message_id, "当前没有映射的会话。").await?;
+            } else {
+                core.feishu
+                    .reply_text(
+                        message_id,
+                        "已解除本会话的映射（服务器会话仍保留，可用 `/switch list` 重新找到）。",
+                    )
+                    .await?;
+            }
+            Ok(())
+        }
+        SwitchAction::Attach { query, force } => {
+            handle_attach(core, thread_key, &query, force, message_id, kind).await
+        }
+    }
+}
+
+/// Fetch + shape the data the `/switch` card renders: the session list
+/// (children and archived excluded, filtered by `keyword`, sorted by last
+/// activity) plus the thread's active + mapped session ids. Shared by the text
+/// send path (`send_switch_card`) and the card ack refresh
+/// (`App::build_switch_card_for`) so both render from one source of truth.
+pub(crate) async fn switch_card_data(
+    core: &Arc<SharedCore>,
+    thread_key: &ThreadKey,
+    keyword: &str,
+) -> (Vec<crate::opencode::SessionListInfo>, Option<String>, Vec<String>) {
+    let sessions = core.cached_session_list().await.unwrap_or_default();
+    let lower = keyword.to_lowercase();
+    let mut shown: Vec<crate::opencode::SessionListInfo> = sessions
+        .into_iter()
+        .filter(|s| {
+            !s.is_child()
+                && !s.time.as_ref().map(|t| t.is_archived()).unwrap_or(false)
+                && if lower.is_empty() {
+                    true
+                } else {
+                    matches_keyword(s, &lower)
+                }
+        })
+        .collect();
+    shown.sort_by(|a, b| {
+        let ub = b.time.as_ref().map(|t| t.updated).unwrap_or(0);
+        let ua = a.time.as_ref().map(|t| t.updated).unwrap_or(0);
+        ub.cmp(&ua)
+    });
+    let (active_id, mapped_ids) = {
+        let store = core.sessions.lock().await;
+        let active = store.get_active(thread_key).map(|e| e.session_id.clone());
+        let mapped: Vec<String> = store
+            .list_thread(thread_key)
+            .into_iter()
+            .map(|e| e.session_id.clone())
+            .collect();
+        (active, mapped)
+    };
+    (shown, active_id, mapped_ids)
+}
+
+/// Build and send the interactive `/switch` session card (ADR-0012, issue 04).
+/// Renders the filtered session list (via `switch_card_data`) and replies with
+/// the card.
+async fn send_switch_card(
+    core: &Arc<SharedCore>,
+    thread_key: &ThreadKey,
+    keyword: &str,
+    message_id: &str,
+) -> crate::error::Result<()> {
+    let (shown, active_id, mapped_ids) = switch_card_data(core, thread_key, keyword).await;
+    let card = crate::feishu::card::build_switch_card(
+        thread_key,
+        &shown,
+        keyword,
+        active_id.as_deref(),
+        &mapped_ids,
+    );
+    core.feishu.reply_card(message_id, &card).await?;
+    Ok(())
+}
+
+/// Send the `/agent` picker card (ADR-0012, issue 05): one button per agent.
+async fn send_agent_card(
+    core: &Arc<SharedCore>,
+    thread_key: &ThreadKey,
+    message_id: &str,
+) -> crate::error::Result<()> {
+    let agents = core.opencode.list_agents().await;
+    let card = crate::feishu::card::build_agent_card(thread_key, &agents);
+    core.feishu.reply_card(message_id, &card).await?;
+    Ok(())
+}
+
+/// Send the `/model` picker card (ADR-0012, issue 05): one button per model.
+async fn send_model_card(
+    core: &Arc<SharedCore>,
+    thread_key: &ThreadKey,
+    message_id: &str,
+) -> crate::error::Result<()> {
+    let providers = core.opencode.list_models().await;
+    let card = crate::feishu::card::build_model_card(thread_key, &providers);
+    core.feishu.reply_card(message_id, &card).await?;
+    Ok(())
+}
+
+/// Send the `/autoaccept` toggle card (ADR-0012, issue 05).
+async fn send_autoaccept_card(
+    core: &Arc<SharedCore>,
+    thread_key: &ThreadKey,
+    message_id: &str,
+) -> crate::error::Result<()> {
+    let current_on = {
+        let store = core.sessions.lock().await;
+        store
+            .get_active(thread_key)
+            .map(|e| e.auto_accept)
+            .unwrap_or(false)
+    };
+    let card = crate::feishu::card::build_autoaccept_card(thread_key, current_on);
+    core.feishu.reply_card(message_id, &card).await?;
+    Ok(())
+}
+
+/// Send the `/help` navigation card (ADR-0012, issue 05): commands grouped by
+/// role with a "试试" button each.
+async fn send_help_card(
+    core: &Arc<SharedCore>,
+    thread_key: &ThreadKey,
+    message_id: &str,
+) -> crate::error::Result<()> {
+    let card = crate::feishu::card::build_help_card(thread_key);
+    core.feishu.reply_card(message_id, &card).await?;
+    Ok(())
+}
+
 /// `/switch <keyword>` — switch within the thread first, then adopt a unique
 /// global match (ADR-0008). Resolution order:
 /// 1. Current thread's mapped sessions (matched by title/directory/id);
@@ -790,7 +949,7 @@ async fn handle_switch(
         return Ok(());
     }
     if thread_hits.len() > 1 {
-        let list = candidates_list("本会话匹配到多个，请用 `/attach <完整ID>` 指定：", &thread_hits);
+        let list = candidates_list("本会话匹配到多个，请用 `/switch <完整ID>` 指定：", &thread_hits);
         core.feishu.reply_text(message_id, &list).await?;
         return Ok(());
     }
@@ -806,13 +965,13 @@ async fn handle_switch(
         return Ok(());
     }
     if global_hits.len() > 1 {
-        let list = candidates_list("找到多个会话，请用 `/attach <完整ID>` 指定：", &global_hits);
+        let list = candidates_list("找到多个会话，请用 `/switch <完整ID>` 指定：", &global_hits);
         core.feishu.reply_text(message_id, &list).await?;
         return Ok(());
     }
-    core.feishu
-        .reply_text(message_id, &format!("No session matching \"{}\"", keyword))
-        .await?;
+    // No match: send the interactive card pre-filtered by the keyword, so the
+    // user sees the empty result AND can adjust the search / start fresh.
+    send_switch_card(core, thread_key, keyword, message_id).await?;
     Ok(())
 }
 
@@ -996,7 +1155,7 @@ async fn adopt_session(
                     .reply_text(
                         message_id,
                         &format!(
-                            "⚠️ 会话 `{}`（目录 `{}`）已被其他聊天占用：\n{}\n（{}，chat `{}`）\n\n可先请对方 `/forget` 解除，或使用 `/attach {} --force` 强行接管。",
+                            "⚠️ 会话 `{}`（目录 `{}`）已被其他聊天占用：\n{}\n（{}，chat `{}`）\n\n可先请对方 `/switch forget` 解除，或使用 `/switch {} --force` 强行接管。",
                             info.title,
                             info.directory,
                             chat_name,
@@ -1062,7 +1221,7 @@ async fn adopt_session(
 }
 
 /// The last 7 characters of a session id (display suffix).
-fn id_tail(id: &str) -> String {
+pub(crate) fn id_tail(id: &str) -> String {
     id.strip_prefix("ses_").unwrap_or(id).chars().take(7).collect()
 }
 
@@ -1120,8 +1279,8 @@ async fn resolve_directory_or_reply(
 }
 
 /// Case-insensitive keyword match on a session's title, directory or id
-/// (shared by `/list`, `/switch` and `/attach`).
-fn matches_keyword(s: &crate::opencode::SessionListInfo, lower: &str) -> bool {
+/// (shared by `/list`, `/switch`, `/attach` and the `/switch` card).
+pub(crate) fn matches_keyword(s: &crate::opencode::SessionListInfo, lower: &str) -> bool {
     s.title.to_lowercase().contains(lower)
         || s.directory.to_lowercase().contains(lower)
         || s.id.to_lowercase().contains(lower)
@@ -1139,7 +1298,7 @@ fn candidates_list(header: &str, sessions: &[&crate::opencode::SessionListInfo])
 
 /// A session's display title, falling back to the id-tail when the title is a
 /// meaningless default (`New session - ...`, `sess-<uuid>`, etc.).
-fn title_or_id_tail(s: &crate::opencode::SessionListInfo) -> String {
+pub(crate) fn title_or_id_tail(s: &crate::opencode::SessionListInfo) -> String {
     let cleaned = crate::feishu::card::clean_session_label(&s.title);
     if cleaned.is_empty() {
         id_tail(&s.id)
@@ -1183,104 +1342,97 @@ mod tests {
     fn parse_dir_missing_arg_shows_dir_help() {
         assert_eq!(parse_command("/dir"), Some(Command::Help(Some("dir".into()))));
         assert_eq!(parse_command("/name"), Some(Command::Help(Some("name".into()))));
-        assert_eq!(parse_command("/model"), Some(Command::Help(Some("model".into()))));
-        assert_eq!(parse_command("/agent"), Some(Command::Help(Some("agent".into()))));
-        assert_eq!(
-            parse_command("/switch"),
-            Some(Command::Help(Some("switch".into())))
-        );
+    }
+
+    #[test]
+    fn parse_agent_model_no_arg_is_card() {
+        assert_eq!(parse_command("/model"), Some(Command::ModelCard));
+        assert_eq!(parse_command("/agent"), Some(Command::AgentCard));
     }
 
     #[test]
     fn parse_switch() {
         assert_eq!(
             parse_command("/switch backend"),
-            Some(Command::Switch("backend".into()))
+            Some(Command::Switch(SwitchAction::Match("backend".into())))
         );
     }
 
     #[test]
-    fn parse_list() {
+    fn parse_switch_no_arg_is_card() {
         assert_eq!(
-            parse_command("/list"),
-            Some(Command::List {
-                keyword: None,
-                all: false
-            })
-        );
-        assert_eq!(
-            parse_command(" /list "),
-            Some(Command::List {
-                keyword: None,
-                all: false
-            })
+            parse_command("/switch"),
+            Some(Command::Switch(SwitchAction::Card))
         );
     }
 
     #[test]
-    fn parse_list_keyword_and_all() {
+    fn parse_switch_list() {
         assert_eq!(
-            parse_command("/list cola"),
-            Some(Command::List {
+            parse_command("/switch list"),
+            Some(Command::Switch(SwitchAction::List {
+                keyword: None,
+                all: false
+            }))
+        );
+        assert_eq!(
+            parse_command(" /switch list "),
+            Some(Command::Switch(SwitchAction::List {
+                keyword: None,
+                all: false
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_switch_list_keyword_and_all() {
+        assert_eq!(
+            parse_command("/switch list cola"),
+            Some(Command::Switch(SwitchAction::List {
                 keyword: Some("cola".into()),
                 all: false
-            })
+            }))
         );
         assert_eq!(
-            parse_command("/list --all"),
-            Some(Command::List {
+            parse_command("/switch list --all"),
+            Some(Command::Switch(SwitchAction::List {
                 keyword: None,
                 all: true
-            })
+            }))
         );
         assert_eq!(
-            parse_command("/list cola --all"),
-            Some(Command::List {
+            parse_command("/switch list cola --all"),
+            Some(Command::Switch(SwitchAction::List {
                 keyword: Some("cola".into()),
                 all: true
-            })
+            }))
         );
         assert_eq!(
-            parse_command("/list multi word"),
-            Some(Command::List {
+            parse_command("/switch list multi word"),
+            Some(Command::Switch(SwitchAction::List {
                 keyword: Some("multi word".into()),
                 all: false
-            })
+            }))
         );
     }
 
     #[test]
-    fn parse_attach() {
+    fn parse_switch_attach() {
         assert_eq!(
-            parse_command("/attach ses_abc123"),
-            Some(Command::Attach {
-                query: "ses_abc123".into(),
-                force: false
-            })
-        );
-        assert_eq!(
-            parse_command("/attach ses_abc123 --force"),
-            Some(Command::Attach {
+            parse_command("/switch ses_abc123 --force"),
+            Some(Command::Switch(SwitchAction::Attach {
                 query: "ses_abc123".into(),
                 force: true
-            })
-        );
-        assert_eq!(
-            parse_command("/attach some title"),
-            Some(Command::Attach {
-                query: "some title".into(),
-                force: false
-            })
-        );
-        assert_eq!(
-            parse_command("/attach"),
-            Some(Command::Help(Some("attach".into())))
+            }))
         );
     }
 
     #[test]
-    fn parse_forget() {
-        assert_eq!(parse_command("/forget"), Some(Command::Forget));
+    fn parse_switch_forget() {
+        assert_eq!(
+            parse_command("/switch forget"),
+            Some(Command::Switch(SwitchAction::Forget))
+        );
     }
 
     #[test]
@@ -1399,11 +1551,11 @@ mod tests {
     #[test]
     fn trailing_spaces_ignored() {
         assert_eq!(
-            parse_command("  /list  "),
-            Some(Command::List {
+            parse_command("  /switch list  "),
+            Some(Command::Switch(SwitchAction::List {
                 keyword: None,
                 all: false
-            })
+            }))
         );
     }
 
@@ -1411,11 +1563,11 @@ mod tests {
     fn case_insensitive_command() {
         assert_eq!(parse_command("/STOP"), Some(Command::Stop));
         assert_eq!(
-            parse_command("/List"),
-            Some(Command::List {
+            parse_command("/Switch List"),
+            Some(Command::Switch(SwitchAction::List {
                 keyword: None,
                 all: false
-            })
+            }))
         );
     }
 

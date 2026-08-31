@@ -23,21 +23,29 @@ A bridge bot that brings the [OpenCode](https://opencode.ai) AI coding experienc
 ## Configuration
 
 ```toml
-[opencode]
-url = "http://localhost:4096"          # preferred/fallback port
-# model is optional: unset → cola uses the OpenCode server's default model
-# model = "opencode/deepseek-v4-flash"
-
 [feishu]
 app_id = "cli_xxxxxxxxxxxx"
 app_secret = "your-app-secret"
+```
+
+Only the Feishu credentials are required. Optional `[opencode]` / `[bridge]`
+values:
+
+```toml
+[opencode]
+url = "http://localhost:4096"    # preferred/fallback port (default 4096)
+# model is optional: unset → cola uses the OpenCode server's default model
+# model = "opencode/deepseek-v4-flash"
 
 [bridge]
 # session_file = "~/.cola/sessions.json"
-# work_dir = "/path/to/a/project"
+# work_dir = "/path/to/a/project"    # default project when a conversation has no session
+# log_days = 14                       # daily log retention
 ```
 
-`opencode.url`/`password` are a fallback: cola rewrites them to whatever server it discovers running on the default store.
+`opencode.url` is only a preferred port: cola discovers whatever server is
+running on the shared store and attaches to it automatically (username and
+password are read from the server's environment, so nothing to configure).
 
 ## Run
 
@@ -50,7 +58,7 @@ cola needs the OpenCode server it attaches to to be running; it discovers it aut
 
 ## Logs
 
-cola always appends to a log file — by default `~/.cola/cola.log` (no ANSI codes), overridable with `--log-file`. A restart never wipes history (append, not overwrite). When stdout is a real terminal, logs also mirror there; a redirected stdout gets no cola logs, keeping the redirect target clean.
+cola always appends to a log file — by default `~/.cola/cola.log` (no ANSI codes), overridable with `--log-file`. A restart never wipes history (append, not overwrite). Logs rotate **daily**: yesterday's content moves to `cola-YYYY-MM-DD.log` and older files are swept after `[bridge] log_days` (default 14). Cross-day sessions are queried with `grep session_id=... cola-*.log`. When stdout is a real terminal, logs also mirror there; a redirected stdout gets no cola logs, keeping the redirect target clean.
 
 ## Singleton lock & restart
 
@@ -62,7 +70,7 @@ Only one cola may run at a time (two would double-handle Feishu events). The loc
 
 ## Commands
 
-In Feishu: `/dir <path>`, `/switch <name>`, `/list [keyword] [--all]`, `/attach <id|title> [--force]`, `/forget`, `/new [name]`, `/topic <dir> [name]`, `/name <name>`, `/stop`, `/compact`, `/agent <name>`, `/model <provider/model>`, `/autoaccept [on|off]`, `/restart`, `/restart-opencode`, `/help`. Unrecognized `/...` commands are forwarded to OpenCode.
+In Feishu: `/dir <path>`, `/switch`, `/switch <kw>`, `/switch list [kw] [--all]`, `/switch <id> [--force]`, `/switch forget`, `/new [name]`, `/topic <dir> [name]`, `/name <name>`, `/stop`, `/compact`, `/agent <name>`, `/model <p/m>`, `/autoaccept [on|off]`, `/restart`, `/restart-opencode`, `/help`. Unrecognized `/...` commands are forwarded to OpenCode.
 
 `/agent` and `/model` set per-session overrides sent with the next message and persisted across restarts. `/restart-opencode` restarts only an OpenCode server **cola itself started**; a server launched by another tool is left alone.
 

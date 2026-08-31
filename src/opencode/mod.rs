@@ -147,6 +147,14 @@ pub trait Backend: Send + Sync {
     /// when the provider/model can't be resolved.
     async fn model_context_window(&self, provider: &str, model: &str) -> Result<Option<i64>>;
 
+    /// Available agents (`GET /agent`), for the `/agent` card picker. Empty on
+    /// failure (the card degrades to a text prompt).
+    async fn list_agents(&self) -> Vec<client::AgentInfo>;
+
+    /// Available models grouped by provider (`GET /provider`), for the `/model`
+    /// card picker. Empty on failure (the card degrades to a text prompt).
+    async fn list_models(&self) -> Vec<client::ProviderModels>;
+
     /// Fetch a session's info (exposes the parent chain for sub-task sessions).
     async fn session_info(&self, session_id: &str, directory: Option<&str>) -> Result<SessionInfo>;
 
@@ -241,6 +249,14 @@ impl Backend for Client {
 
     async fn model_context_window(&self, provider: &str, model: &str) -> Result<Option<i64>> {
         Client::model_context_window(self, provider, model).await
+    }
+
+    async fn list_agents(&self) -> Vec<client::AgentInfo> {
+        Client::list_agents(self).await
+    }
+
+    async fn list_models(&self) -> Vec<client::ProviderModels> {
+        Client::list_models(self).await
     }
 
     async fn session_info(&self, session_id: &str, directory: Option<&str>) -> Result<SessionInfo> {

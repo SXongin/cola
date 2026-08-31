@@ -31,6 +31,19 @@ pub struct ServerCandidate {
 /// own default (`auth.ts`): `OPENCODE_SERVER_USERNAME` if set, else `opencode`.
 pub(crate) const DEFAULT_SERVER_USERNAME: &str = "opencode";
 
+/// The fully-resolved OpenCode server cola talks to: endpoint + credentials.
+/// Produced by `resolve_opencode_server` (attach to a discovered shared server,
+/// or start cola's own) and consumed by the HTTP client. Unlike the old config
+/// fields, this carries BOTH username and password — discovery always supplies
+/// both, so the client never silently sends unauthenticated requests (the
+/// server 401s without a username even when the password matches).
+#[derive(Debug, Clone)]
+pub struct ResolvedServer {
+    pub url: String,
+    pub username: String,
+    pub password: String,
+}
+
 /// The data directory OpenCode resolves as its default on every platform.
 ///
 /// OpenCode uses the `xdg-basedir` package, which computes `$XDG_DATA_HOME` if

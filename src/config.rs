@@ -42,11 +42,11 @@ pub struct Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenCodeConfig {
-    pub url: String,
+    /// Preferred/fallback port. Optional: discovery rewrites the effective
+    /// endpoint to whatever server it finds on the shared store, so an absent
+    /// `url` just means "use the default `http://localhost:4096`".
     #[serde(default)]
-    pub username: Option<String>,
-    #[serde(default)]
-    pub password: Option<String>,
+    pub url: Option<String>,
     /// Default model for new sessions, "provider/model". When unset, cola does
     /// NOT pin a model — the OpenCode server uses its own default model (the
     /// server falls back to `provider.defaultModel()`), so "不写 model" just
@@ -74,6 +74,10 @@ pub struct BridgeConfig {
     /// not push a new notification). p2p chats don't need it.
     #[serde(default = "default_group_completion_notice")]
     pub group_completion_notice: bool,
+    /// How many days of rotated daily logs to keep (default 14). Older
+    /// `cola-YYYY-MM-DD.log` files are swept on startup and at each rotation.
+    #[serde(default = "default_log_days")]
+    pub log_days: u32,
 }
 
 impl Default for BridgeConfig {
@@ -82,12 +86,17 @@ impl Default for BridgeConfig {
             session_file: default_session_file(),
             work_dir: None,
             group_completion_notice: default_group_completion_notice(),
+            log_days: default_log_days(),
         }
     }
 }
 
 fn default_group_completion_notice() -> bool {
     true
+}
+
+fn default_log_days() -> u32 {
+    14
 }
 
 fn default_session_file() -> PathBuf {
