@@ -51,26 +51,31 @@ impl DailyLog {
     fn rotate_if_needed(&self) -> io::Result<()> {
         let today = today_str();
         let mut st = self.state.lock().unwrap();
-        if st.day.as_deref() == Some(&today) {
-            return Ok(());
-        }
-        // Close the previous day's file and rename it to cola-YYYY-MM-DD.log.
-        let prev_day = st.day.take();
-        st.file.take();
-        if let Some(day) = prev_day {
-            let dated = dated_path(&self.base, &day);
-            if self.base.exists() && !dated.exists() {
-                let _ = std::fs::rename(&self.base, &dated);
+        if st.day.as_deref() != Some(&today) {
+            // Close the previous day's file and rename it to cola-YYYY-MM-DD.log.
+            let prev_day = st.day.take();
+            st.file.take();
+            if let Some(day) = prev_day {
+                let dated = dated_path(&self.base, &day);
+                if self.base.exists() && !dated.exists() {
+                    let _ = std::fs::rename(&self.base, &dated);
+                }
             }
+            st.day = Some(today.clone());
+            self.sweep();
         }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.base)?;
-        st.day = Some(today);
-        st.file = Some(file);
+        // Open the file on the FIRST write even when the seeded day already
+        // equals today (a same-day restart): the previous code returned early
+        // with `file = None`, so every write silently returned Ok(0) and all
+        // logs were dropped until a midnight rollover.
+        if st.file.is_none() {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.base)?;
+            st.file = Some(file);
+        }
         drop(st);
-        self.sweep();
         Ok(())
     }
 
@@ -243,6 +248,19 @@ mod tests {
             "day seeded from file mtime"
         );
         assert_eq!(std::fs::read_to_string(&base).unwrap(), "old\n");
+    }
+
+    #[test]
+    fn same_day_restart_still_appends() {
+        let (_dir, base) = tmp_log();
+        // Regression: a restart the SAME day seeds `day` from the existing
+        // file's mtime, and the first write used to return Ok(0) without ever
+        // opening the file — logs silently dropped until a midnight rollover.
+        std::fs::write(&base, b"old\n").unwrap();
+        let log = DailyLog::new(base.clone(), 14).unwrap();
+        log.make_writer().write_all(b"line\n").unwrap();
+        let content = std::fs::read_to_string(&base).unwrap();
+        assert_eq!(content, "old\nline\n", "same-day restart must append");
     }
 
     #[test]
