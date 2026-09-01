@@ -41,8 +41,8 @@ pub struct CardSession {
     pub acc: StreamAccumulator,
     pub card_message_id: Option<String>,
     /// The header signature of the last flush, compared on each poll so the
-    /// card is re-flushed when the progress timer / silence / state changes
-    /// even with no new content (ADR-0014).
+    /// card is re-flushed when the progress timer / state changes even with no
+    /// new content (ADR-0014).
     pub last_header_sig: String,
 }
 
@@ -138,9 +138,6 @@ pub struct StreamAccumulator {
     /// When the current phase started (wall clock); the header timer counts up
     /// from here.
     pub phase_started_at: Option<std::time::Instant>,
-    /// When the last content part was rendered; the header shows the growing
-    /// silence to distinguish "emitting" from "silent".
-    pub last_content_at: Option<std::time::Instant>,
 }
 
 impl StreamAccumulator {
@@ -159,7 +156,6 @@ impl StreamAccumulator {
             // timer counts from here (ADR-0014).
             current_phase: Some(HeaderPhase::Loading),
             phase_started_at: Some(std::time::Instant::now()),
-            last_content_at: None,
             ..Default::default()
         }
     }
@@ -191,20 +187,13 @@ impl StreamAccumulator {
         }
     }
 
-    /// Record that new visible content (reasoning/text/tool) was rendered.
-    pub fn mark_content(&mut self) {
-        self.last_content_at = Some(std::time::Instant::now());
-    }
-
     /// Progress inputs for the header (ADR-0014): waiting flag, phase timer,
-    /// silence since last content, and reasoning length. Elapsed is whole
-    /// seconds so the header signature changes at most once per second — the
-    /// flush throttle.
+    /// and reasoning length. Elapsed is whole seconds so the header signature
+    /// changes at most once per second — the flush throttle.
     pub fn header_progress(&self) -> crate::feishu::card::HeaderProgress {
         crate::feishu::card::HeaderProgress {
             waiting: !self.pending_permissions.is_empty() || !self.pending_questions.is_empty(),
             elapsed: self.phase_started_at.map(|t| t.elapsed().as_secs()),
-            silence: self.last_content_at.map(|t| t.elapsed().as_secs()),
             reasoning_chars: self.reasoning.chars().count(),
         }
     }
@@ -931,16 +920,5 @@ mod tests {
             "pending permission must flip the header: {}",
             acc.header_sig()
         );
-    }
-
-    /// `mark_content` seeds the silence clock: right after content, the header
-    /// progress reports a small/some silence instead of None.
-    #[test]
-    fn mark_content_then_header_progress_reports_silence() {
-        let mut acc = StreamAccumulator::new("test");
-        assert_eq!(acc.header_progress().silence, None, "no content yet → no silence");
-        acc.mark_content();
-        let silence = acc.header_progress().silence;
-        assert!(silence.is_some(), "content must seed the silence clock");
     }
 }

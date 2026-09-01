@@ -101,9 +101,9 @@ fn format_chars(n: usize) -> String {
 /// text and tool panels can be interleaved chronologically.
 /// Progress/liveness signals for the card header (ADR-0014): whether the turn
 /// is paused waiting for a permission/question, how long the current phase has
-/// run, how long since content last arrived, and the reasoning text length.
-/// Bundled so they travel through the builder, the header renderer, and the
-/// accumulator as one unit instead of four loose values.
+/// run, and the reasoning text length. Bundled so they travel through the
+/// builder, the header renderer, and the accumulator as one unit instead of
+/// three loose values.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HeaderProgress {
     /// A permission/question is pending: the header shows "等待你的授权/回答"
@@ -111,9 +111,6 @@ pub struct HeaderProgress {
     pub waiting: bool,
     /// Seconds the current phase (thinking/reasoning/tool/streaming) has run.
     pub elapsed: Option<u64>,
-    /// Seconds since the last content arrived (None = nothing rendered yet).
-    /// Shown once a turn has been silent for a few seconds.
-    pub silence: Option<u64>,
     /// Reasoning text length, shown on the thinking header as real progress.
     pub reasoning_chars: usize,
 }
@@ -129,9 +126,9 @@ pub struct CardBuilder {
     /// JSON 2.0 buttons shown only on the Error card (e.g. a retry action).
     error_buttons: Vec<CardActionButton>,
     /// Progress/liveness inputs for the header (ADR-0014): the waiting flag,
-    /// the phase timer, the silence since last content, and the reasoning
-    /// length. When absent (all defaults) the header renders the plain phase
-    /// label — non-streaming builders (permission/switch cards) stay unchanged.
+    /// the phase timer, and the reasoning length. When absent (all defaults)
+    /// the header renders the plain phase label — non-streaming builders
+    /// (permission/switch cards) stay unchanged.
     progress: HeaderProgress,
 }
 
@@ -443,10 +440,10 @@ impl CardBuilder {
     }
 
     /// Progress/liveness inputs for the header (ADR-0014): a waiting flag for
-    /// pending permission/question interactions, the phase timer, the silence
-    /// since last content, and the reasoning length. When absent the header
-    /// renders the plain phase label — builders that don't set progress (e.g.
-    /// permission/switch cards) stay unchanged.
+    /// pending permission/question interactions, the phase timer, and the
+    /// reasoning length. When absent the header renders the plain phase label —
+    /// builders that don't set progress (e.g. permission/switch cards) stay
+    /// unchanged.
     pub fn with_progress(mut self, progress: HeaderProgress) -> Self {
         self.progress = progress;
         self
@@ -591,13 +588,6 @@ pub(crate) fn header_title_and_template(
         CardState::Loading | CardState::Reasoning | CardState::Streaming => {
             if let Some(e) = progress.elapsed {
                 title.push_str(&format!(" {}", fmt_elapsed(e)));
-            }
-            // A turn that has been silent for a few seconds shows the growing
-            // silence: honest "still alive, not emitting" vs "emitting".
-            if let Some(s) = progress.silence
-                && s >= 3
-            {
-                title.push_str(&format!(" · 静默 {}", fmt_elapsed(s)));
             }
             // Reasoning is streamed incrementally by OpenCode, so its length is
             // real progress during the thinking phase.
@@ -1744,7 +1734,6 @@ mod tests {
             .with_state(CardState::Loading)
             .with_progress(HeaderProgress {
                 elapsed: Some(83),
-                silence: Some(5),
                 ..Default::default()
             })
             .build();
@@ -1754,12 +1743,11 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_header_shows_timer_silence_and_length() {
+    fn reasoning_header_shows_timer_and_length() {
         let card = CardBuilder::new()
             .with_state(CardState::Reasoning)
             .with_progress(HeaderProgress {
                 elapsed: Some(83),
-                silence: Some(5),
                 reasoning_chars: 2100,
                 ..Default::default()
             })
@@ -1767,7 +1755,6 @@ mod tests {
         let header = card["header"]["title"]["content"].as_str().unwrap();
         assert!(header.contains("推理中"), "{}", header);
         assert!(header.contains("1m23s"), "timer missing: {}", header);
-        assert!(header.contains("静默 5s"), "silence missing: {}", header);
         assert!(header.contains("2.1k字"), "reasoning length missing: {}", header);
         assert_eq!(card["header"]["template"].as_str().unwrap(), "blue");
     }
@@ -1781,7 +1768,6 @@ mod tests {
             .with_progress(HeaderProgress {
                 waiting: true,
                 elapsed: Some(83),
-                silence: Some(5),
                 ..Default::default()
             })
             .build();
@@ -1793,39 +1779,9 @@ mod tests {
     }
 
     #[test]
-    fn silence_is_hidden_until_three_seconds() {
-        // Sub-3s silence is noise ("0s前"); the header only surfaces it once a
-        // turn has genuinely gone quiet.
-        let quiet = CardBuilder::new()
-            .with_state(CardState::Streaming)
-            .with_progress(HeaderProgress {
-                elapsed: Some(10),
-                silence: Some(2),
-                ..Default::default()
-            })
-            .build();
-        let header = quiet["header"]["title"]["content"].as_str().unwrap();
-        assert!(!header.contains("静默"), "premature silence: {}", header);
-        let loud = CardBuilder::new()
-            .with_state(CardState::Streaming)
-            .with_progress(HeaderProgress {
-                elapsed: Some(10),
-                silence: Some(3),
-                ..Default::default()
-            })
-            .build();
-        assert!(
-            loud["header"]["title"]["content"]
-                .as_str()
-                .unwrap()
-                .contains("静默 3s")
-        );
-    }
-
-    #[test]
     fn header_changes_with_progress_and_state() {
-        // The render poll flushes when the header changes: the timer tick, a
-        // silence crossing, and a state change must all yield distinct headers.
+        // The render poll flushes when the header changes: the timer tick and a
+        // state change must each yield distinct headers.
         let header_of = |state: CardState, progress: HeaderProgress| {
             CardBuilder::new()
                 .with_state(state)
@@ -1839,28 +1795,18 @@ mod tests {
             elapsed,
             ..Default::default()
         };
-        let silent = |silence: Option<u64>| HeaderProgress {
-            elapsed: Some(10),
-            silence,
-            ..Default::default()
-        };
         assert_ne!(
             header_of(CardState::Streaming, tick(Some(0))),
             header_of(CardState::Streaming, tick(Some(1))),
             "timer tick must change the header"
         );
         assert_ne!(
-            header_of(CardState::Streaming, silent(Some(2))),
-            header_of(CardState::Streaming, silent(Some(3))),
-            "silence threshold must change the header"
-        );
-        assert_ne!(
-            header_of(CardState::Streaming, silent(Some(3))),
+            header_of(CardState::Streaming, tick(Some(1))),
             header_of(
                 CardState::Streaming,
                 HeaderProgress {
                     waiting: true,
-                    ..silent(Some(3))
+                    ..tick(Some(1))
                 }
             ),
             "waiting must change the header"
