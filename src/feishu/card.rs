@@ -618,7 +618,9 @@ fn collapsible_panel(title: &str, content: &str) -> serde_json::Value {
 
 /// The three permission buttons (Allow Once / Allow Always / Deny), as body
 /// elements. Shared by the standalone permission card and the inline section on
-/// the streaming card.
+/// the streaming card. A fourth button turns on the session's Auto-Accept
+/// (cola-side, `/autoaccept`), distinct from "Allow Always" which is a
+/// backend-side per-type rule.
 pub fn permission_buttons(
     session_id: &str,
     request_id: &str,
@@ -641,6 +643,7 @@ pub fn permission_buttons(
         json!({ "tag": "button", "text": { "tag": "plain_text", "content": "✅ Allow Once" }, "type": "primary", "value": btn_value("once", "✅ Allowed once", "green") }),
         json!({ "tag": "button", "text": { "tag": "plain_text", "content": "🔁 Allow Always" }, "type": "default", "value": btn_value("always", "✅ Allowed always", "green") }),
         json!({ "tag": "button", "text": { "tag": "plain_text", "content": "🚫 Deny" }, "type": "danger", "value": btn_value("reject", "🚫 Denied", "red") }),
+        json!({ "tag": "button", "text": { "tag": "plain_text", "content": "⚡ 开启自动授权" }, "type": "primary", "value": btn_value("autoaccept", "✅ 已开启自动授权", "blue") }),
     ]
 }
 
@@ -2241,7 +2244,7 @@ mod tests {
         // element 0 = description markdown, rest = buttons
         assert!(elements[0]["content"].as_str().unwrap().contains("AI 想要执行"));
         let buttons: Vec<_> = elements.iter().filter(|e| e["tag"] == "button").collect();
-        assert_eq!(buttons.len(), 3);
+        assert_eq!(buttons.len(), 4);
         let values: Vec<_> = buttons.iter().map(|a| &a["value"]).collect();
         // Each button must carry the reply + request_id + session_id so the
         // card callback can route the answer back.
@@ -2255,6 +2258,10 @@ mod tests {
         assert_eq!(reject["perm_color"], "red");
         let always = values.iter().find(|v| v["reply"] == "always").unwrap();
         assert!(always["perm_label"].as_str().unwrap().contains("always"));
+        // The Auto-Accept toggle carries the session id so it can flip the flag.
+        let autoaccept = values.iter().find(|v| v["reply"] == "autoaccept").unwrap();
+        assert_eq!(autoaccept["session_id"], "ses_abc");
+        assert_eq!(autoaccept["request_id"], "per_123");
     }
 
     #[test]

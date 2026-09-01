@@ -205,7 +205,7 @@ impl RequestKind for PermissionKind {
         &self,
         flow: &RequestFlow,
         core: &Arc<SharedCore>,
-        _session_id: &str,
+        session_id: &str,
         req_id: &str,
         reply: &str,
         value: &serde_json::Value,
@@ -219,6 +219,44 @@ impl RequestKind for PermissionKind {
             .and_then(|v| v.as_str())
             .unwrap_or("green");
         let perm_body = value.get("perm_body").and_then(|v| v.as_str()).unwrap_or("");
+
+        // "开启自动授权": turn on the session's Auto-Accept and approve the
+        // current (plus any other) pending permission in one interaction — no
+        // new message, unlike typing `/autoaccept on`. The backend never sees
+        // "autoaccept" as a reply; `set_auto_accept` approves the pending ones
+        // with "once" and flips the cola-side flag.
+        if reply == "autoaccept" {
+            let dir = match directory {
+                Some(d) => d.to_string(),
+                None => core
+                    .sessions
+                    .lock()
+                    .await
+                    .directory_for_session(session_id)
+                    .unwrap_or_default(),
+            };
+            if !flow.is_answered(core, req_id).await {
+                flow.mark_answered(core, req_id).await;
+                let approved = core.set_auto_accept(session_id, &dir, true).await;
+                flow.sent_cards.lock().await.remove(req_id);
+                if let Some(host) = host
+                    && let Some(acc) = core.cards.lock().await.get_mut(host).map(|c| &mut c.acc)
+                {
+                    acc.pending_permissions.retain(|p| p.request_id != req_id);
+                }
+                tracing::info!(
+                    "Auto-Accept enabled via permission card on session {} (approved {})",
+                    session_id,
+                    approved
+                );
+            }
+            let mut r = result_card("✅ 已开启自动授权", "blue", "该会话后续权限请求将自动批准。");
+            if inline {
+                r.card = None;
+            }
+            r.toast = Some("已开启自动授权".to_string());
+            return Some(r);
+        }
 
         // Double-click guard: once answered, a second click only re-serves the
         // result.

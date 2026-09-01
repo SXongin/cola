@@ -163,6 +163,40 @@ impl SharedCore {
         *self.session_list_cache.lock().await = None;
     }
 
+    /// Turn a session's Auto-Accept flag on/off, resolving the owning session
+    /// (which may be a parent of a sub-task child) and approving any
+    /// already-pending permissions when turning on. Mirrors `/autoaccept` and is
+    /// shared by the permission-card toggle so both paths stay in lockstep.
+    /// Returns how many pending requests were approved.
+    pub(crate) async fn set_auto_accept(&self, session_id: &str, directory: &str, on: bool) -> usize {
+        let approved = if on {
+            self.approve_pending_for_session(session_id, directory).await
+        } else {
+            0
+        };
+        // Resolve the SessionStore entry that owns the flag: `session_id`
+        // itself, or its nearest ancestor (sub-task children are not in the
+        // store, ADR-0010). Walking the chain makes a child's card flip the
+        // parent's flag, consistent with `should_auto_accept`.
+        let owner = crate::bridge::pollers::walk_parent_chain(self, session_id, Some(directory), |current| {
+            let current = current.to_string();
+            async move {
+                let sessions = self.sessions.lock().await;
+                sessions.entry_for_session(&current).cloned()
+            }
+        })
+        .await;
+        if let Some(mut entry) = owner {
+            entry.auto_accept = on;
+            let mut store = self.sessions.lock().await;
+            store.set_active(entry);
+            if let Err(e) = store.persist() {
+                tracing::warn!("set_auto_accept: persist failed: {}", e);
+            }
+        }
+        approved
+    }
+
     /// After `/autoaccept on`: answer every permission request that is ALREADY
     /// pending for `session_id` (or one of its sub-task child sessions) with
     /// "once". The permission poller's `seen` set skips requests it has already

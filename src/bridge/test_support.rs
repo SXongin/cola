@@ -1292,6 +1292,123 @@ pub(crate) mod integration_tests {
         );
     }
 
+    /// Clicking "开启自动授权" on a permission card turns on the session's
+    /// Auto-Accept (cola-side `/autoaccept`) AND approves the current pending
+    /// permission — all without posting a new message. The backend sees the
+    /// normal "once" reply, never "autoaccept".
+    #[tokio::test]
+    async fn autoaccept_toggle_on_permission_card_flips_flag_and_approves() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.permissions = vec![opencode::client::PermissionRequest {
+            request_id: "per_aa_toggle".into(),
+            session_id: Some("ses_test".into()),
+            permission: Some("bash".into()),
+            patterns: vec!["ls -la".into()],
+            metadata: None,
+            always: Vec::new(),
+        }];
+        let perm_calls = backend.reply_permission_calls.clone();
+        let (app, platform) = build_app(cfg, backend).await;
+
+        // Seed a session (auto_accept defaults to false) + a live streaming card
+        // so the poller surfaces the permission INLINE.
+        app.handle_message(incoming(
+            "msg_1".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "hi".into(),
+            None,
+        ))
+        .await;
+
+        tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.permission
+                    .poll_interval_ms
+                    .store(50, std::sync::atomic::Ordering::Relaxed);
+                let _ = app.permission.poll_loop(&app.core).await;
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Permission inlined on the streaming card, auto_accept still off.
+        assert_eq!(
+            app.cards
+                .lock()
+                .await
+                .get("ses_test")
+                .unwrap()
+                .acc
+                .pending_permissions
+                .len(),
+            1
+        );
+        assert!(
+            !app.sessions
+                .lock()
+                .await
+                .entry_for_session("ses_test")
+                .unwrap()
+                .auto_accept
+        );
+
+        // Click the toggle.
+        let value = serde_json::json!({
+            "action": "perm",
+            "reply": "autoaccept",
+            "session_id": "ses_test",
+            "request_id": "per_aa_toggle",
+            "perm_label": "✅ 已开启自动授权",
+            "perm_color": "blue",
+            "perm_body": "bash",
+        });
+        let result = app.handle_card_action(value).await.expect("toggle result");
+        assert!(
+            result.card.is_none(),
+            "inline toggle must not replace the streaming card"
+        );
+        assert_eq!(result.toast.as_deref(), Some("已开启自动授权"));
+
+        // Current permission approved with "once"; flag flipped and persisted.
+        let calls = perm_calls.lock().await.clone();
+        assert_eq!(
+            calls,
+            vec![("per_aa_toggle".to_string(), "once".to_string())],
+            "the pending permission should be approved once"
+        );
+        assert!(
+            app.sessions
+                .lock()
+                .await
+                .entry_for_session("ses_test")
+                .unwrap()
+                .auto_accept,
+            "auto_accept flag should flip on"
+        );
+        assert!(
+            app.cards
+                .lock()
+                .await
+                .get("ses_test")
+                .unwrap()
+                .acc
+                .pending_permissions
+                .is_empty(),
+            "inline section removed after the toggle"
+        );
+        // No NEW message: only the loading card + final card, no text reply.
+        let sent = platform.calls.lock().await.clone();
+        assert!(
+            !sent.iter().any(|c| matches!(c, PlatformCall::ReplyText { .. })),
+            "toggle must not send a new message"
+        );
+    }
+
     #[tokio::test]
     async fn auto_accept_session_answers_permission_without_card() {
         let _wd = test_work_dir();
