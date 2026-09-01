@@ -59,6 +59,14 @@ _Avoid_: Workspace, repo
 A request from the AI backend to perform an action on a resource. Presented to the user as an interactive card with Allow/Deny/Always options.
 _Avoid_: Approval, authorization, consent
 
+**Auto-Accept**:
+cola's per-session blanket flag (`auto_accept` in the SessionStore, `/autoaccept`). When on, cola answers EVERY pending permission for that session with "once" automatically — no permission card is surfaced at all. Lives in cola's store and persists. Distinct from the backend's per-type "Always" rule: Auto-Accept is session-wide (all permission types) and cola-side, while "Always" is scoped to one permission type, lives on the backend instance, and makes the backend skip the ask entirely.
+_Avoid_: Auto-approve mode, always-allow (that is the backend's per-type rule, not this)
+
+**Permission Toggle**:
+The "开启自动授权" control on a permission card (inline or standalone). One click turns on the session's Auto-Accept and simultaneously approves the current pending permission, without producing a new message. Turning it off is still done via `/autoaccept off`.
+_Avoid_: Auto-authorize button, approve-all switch
+
 **Question**:
 A structured multi-choice prompt from the AI backend, distinct from permissions. User selects options to reply.
 _Avoid_: Poll, survey, prompt
