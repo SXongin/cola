@@ -9,6 +9,23 @@ pub struct Client {
     access_token: std::sync::Mutex<Option<CachedToken>>,
 }
 
+/// Read a response body, surfacing the HTTP status and a body snippet on any
+/// failure. Feishu (or an intermediary proxy) can answer with non-JSON bodies
+/// — HTML error pages, block pages — and a bare decode error ("error decoding
+/// response body") hides that; the diagnostic makes the actual cause visible
+/// in the logs.
+async fn read_body_with_diag(resp: reqwest::Response, what: &str) -> crate::error::Result<String> {
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(crate::error::BridgeError::Feishu(format!(
+            "{what} HTTP {status}: {}",
+            text.chars().take(200).collect::<String>()
+        )));
+    }
+    Ok(text)
+}
+
 struct CachedToken {
     token: String,
     expires_at: chrono::DateTime<chrono::Utc>,
@@ -40,15 +57,21 @@ impl Client {
             "app_secret": self.app_secret,
         });
 
-        let resp: TokenResponse = self
-            .http
-            .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let text = read_body_with_diag(
+            self.http
+                .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
+                .json(&body)
+                .send()
+                .await?,
+            "token",
+        )
+        .await?;
+        let resp: TokenResponse = serde_json::from_str(&text).map_err(|e| {
+            crate::error::BridgeError::Feishu(format!(
+                "parse token response: {e} — body: {}",
+                text.chars().take(200).collect::<String>()
+            ))
+        })?;
 
         if resp.code != 0 {
             return Err(crate::error::BridgeError::Feishu(format!(
@@ -81,18 +104,25 @@ impl Client {
             "content": card.to_string()
         });
 
-        let resp: MessageResponse = self
-            .http
-            .post(format!(
-                "https://open.feishu.cn/open-apis/im/v1/messages/{}/reply",
-                message_id
+        let text = read_body_with_diag(
+            self.http
+                .post(format!(
+                    "https://open.feishu.cn/open-apis/im/v1/messages/{}/reply",
+                    message_id
+                ))
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await?,
+            "reply card",
+        )
+        .await?;
+        let resp: MessageResponse = serde_json::from_str(&text).map_err(|e| {
+            crate::error::BridgeError::Feishu(format!(
+                "parse reply card response: {e} — body: {}",
+                text.chars().take(200).collect::<String>()
             ))
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
+        })?;
 
         if resp.code != 0 {
             Err(crate::error::BridgeError::Feishu(format!(
