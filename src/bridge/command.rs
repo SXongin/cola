@@ -1940,7 +1940,15 @@ mod tests {
             "an existing absolute path canonicalizes to itself"
         );
         // A nonexistent absolute path is preserved (caller reports it missing).
-        let missing = normalize_directory("/nonexistent/dir/xyz");
-        assert_eq!(missing, std::path::PathBuf::from("/nonexistent/dir/xyz"));
+        // The parent (a tempdir) exists but the leaf does not, so canonicalize
+        // fails and normalize_directory keeps the expanded absolute form. This
+        // is platform-neutral (no Unix-root assumption like `/nonexistent`).
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("nonexistent-subdir");
+        let missing = normalize_directory(&target.to_string_lossy());
+        assert_eq!(
+            missing, target,
+            "a nonexistent absolute path is preserved for the caller to report"
+        );
     }
 }
