@@ -202,6 +202,11 @@ pub struct MockBackend {
     /// When set, `messages` returns this as a fresh user message (simulates
     /// a message posted from OpenChamber).
     pub external_user_message: Option<String>,
+    /// Per-session fresh user messages (simulates an external message posted on
+    /// a SPECIFIC session). Takes precedence over `external_user_message` when
+    /// a session has an entry, so tests can script an external message on a
+    /// historical (non-active) session while the active one has none.
+    pub external_user_messages: std::collections::HashMap<String, String>,
     /// When set, `messages` returns this as the assistant reply to the
     /// external user message (simulates OpenCode answering it), replacing the
     /// default assistant turn. Returned only once `external_reply_ready`
@@ -274,6 +279,7 @@ impl MockBackend {
             parts,
             permissions: Vec::new(),
             external_user_message: None,
+            external_user_messages: std::collections::HashMap::new(),
             external_reply_parts: None,
             external_reply_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             external_user_created: Arc::new(std::sync::Mutex::new(None)),
@@ -425,7 +431,12 @@ impl opencode::Backend for MockBackend {
         // reply is also set (and `external_reply_ready` has flipped), return
         // it as the assistant turn — simulates OpenCode answering the
         // shared-store message.
-        if let Some(text) = &self.external_user_message {
+        let text = self
+            .external_user_messages
+            .get(_session_id)
+            .cloned()
+            .or_else(|| self.external_user_message.clone());
+        if let Some(text) = text {
             // Stable created time: captured once, so the same message is not
             // seen as "new" on every poll.
             let created = {
@@ -1560,6 +1571,190 @@ pub(crate) mod integration_tests {
             notify.to_string().contains("OpenChamber 里发的消息"),
             "notification should preview the message: {}",
             notify
+        );
+    }
+
+    /// ADR-0017: an external message on a HISTORICAL (non-active) lobby session
+    /// must NOT be notified into the chat — only the thread's active session is
+    /// synced. Its baseline is also cleared so a later /switch back re-baselines.
+    #[tokio::test]
+    async fn external_message_to_historical_session_is_not_notified() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut mock = MockBackend::new(realistic_parts());
+        // External message ONLY on the historical session; the active session
+        // has none (otherwise BOTH would get an external message and the test
+        // couldn't isolate the historical one being suppressed).
+        mock.external_user_messages
+            .insert("ses_historical".into(), "历史会话的外部消息".to_string());
+        let (app, platform) = build_app(cfg, mock).await;
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+
+        // Active session A; historical session B mapped to the SAME lobby.
+        {
+            let mut store = app.sessions.lock().await;
+            // set_active pushes to the front, so the LAST call is the active one.
+            store.set_active(crate::config::SessionEntry {
+                thread_key: key.clone(),
+                session_id: "ses_historical".into(),
+                directory: "/tmp/hist".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+            store.set_active(crate::config::SessionEntry {
+                thread_key: key.clone(),
+                session_id: "ses_active".into(),
+                directory: "/tmp/active".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+            store.persist().unwrap();
+        }
+        // The ACTIVE session is `ses_active` (last set_active pushes to front).
+        assert_eq!(
+            app.sessions.lock().await.get_active(&key).unwrap().session_id,
+            "ses_active"
+        );
+        // Both sessions have a baseline from before the external message.
+        let baseline = chrono::Utc::now().timestamp_millis() - 60_000;
+        app.external
+            .last_user_msg_epoch
+            .lock()
+            .await
+            .insert("ses_active".into(), baseline);
+        app.external
+            .last_user_msg_epoch
+            .lock()
+            .await
+            .insert("ses_historical".into(), baseline);
+
+        app.external
+            .poll_interval_ms
+            .store(50, std::sync::atomic::Ordering::Relaxed);
+        tokio::spawn({
+            let app = app.clone();
+            async move {
+                let _ = app.external.poll_loop(&app.core).await;
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // No notification card at all: the only external message is on the
+        // historical session, which must be suppressed.
+        let calls = platform.calls.lock().await.clone();
+        assert!(
+            !calls.iter().any(|c| match c {
+                PlatformCall::SendCard { card, .. } | PlatformCall::ReplyCard { card, .. } => {
+                    card.to_string().contains("有新消息")
+                }
+                _ => false,
+            }),
+            "historical session external message must NOT be notified: {calls:?}"
+        );
+        // The historical session's baseline was cleared (ready to re-baseline
+        // silently when it becomes active again).
+        assert!(
+            !app.external
+                .last_user_msg_epoch
+                .lock()
+                .await
+                .contains_key("ses_historical"),
+            "historical session baseline should be cleared"
+        );
+    }
+
+    /// ADR-0017: switching back to a historical session makes it the active one
+    /// and re-baselines SILENTLY — external messages received while it was
+    /// inactive are marked read, not replayed as a stale notification.
+    #[tokio::test]
+    async fn reactivated_session_rebaselines_silently() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut mock = MockBackend::new(realistic_parts());
+        // The external message is on the session that is being REACTIVATED.
+        mock.external_user_messages
+            .insert("ses_old".into(), "离开期间的外部消息".to_string());
+        let (app, platform) = build_app(cfg, mock).await;
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+
+        {
+            let mut store = app.sessions.lock().await;
+            // set_active pushes to the front, so the LAST call is the active one
+            // (ses_old, the session being reactivated by /switch).
+            store.set_active(crate::config::SessionEntry {
+                thread_key: key.clone(),
+                session_id: "ses_new".into(),
+                directory: "/tmp/new".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+            store.set_active(crate::config::SessionEntry {
+                thread_key: key.clone(),
+                session_id: "ses_old".into(),
+                directory: "/tmp/old".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+            store.persist().unwrap();
+        }
+        // ses_old is the active session after the /switch back.
+        assert_eq!(
+            app.sessions.lock().await.get_active(&key).unwrap().session_id,
+            "ses_old"
+        );
+        // While ses_old was historical, the poller cleared its baseline (see the
+        // test above). So on the first poll after reactivation the map has NO
+        // entry for it → first-observation path → silent re-baseline, no notify.
+        assert!(
+            !app.external
+                .last_user_msg_epoch
+                .lock()
+                .await
+                .contains_key("ses_old"),
+            "precondition: baseline was cleared while inactive"
+        );
+
+        app.external
+            .poll_interval_ms
+            .store(50, std::sync::atomic::Ordering::Relaxed);
+        tokio::spawn({
+            let app = app.clone();
+            async move {
+                let _ = app.external.poll_loop(&app.core).await;
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // No notification: the external message was marked read on first
+        // observation (silent re-baseline), not replayed as stale.
+        let calls = platform.calls.lock().await.clone();
+        assert!(
+            !calls.iter().any(|c| match c {
+                PlatformCall::SendCard { card, .. } | PlatformCall::ReplyCard { card, .. } => {
+                    card.to_string().contains("有新消息")
+                }
+                _ => false,
+            }),
+            "reactivated session must re-baseline silently, no notification: {calls:?}"
+        );
+        // The baseline is now recorded for the reactivated session.
+        assert!(
+            app.external
+                .last_user_msg_epoch
+                .lock()
+                .await
+                .contains_key("ses_old"),
+            "reactivated session should have a recorded baseline"
         );
     }
 

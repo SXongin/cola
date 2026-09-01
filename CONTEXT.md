@@ -47,6 +47,10 @@ A Feishu topic, identified by `thread_id` (`omt_...`; called "话题/topic" in t
 A chat's top-level conversation: messages sent directly in a group (or p2p top-level), carrying no `thread_id`. Unlike a thread, a lobby may hold several sessions (switched via `/switch`).
 _Avoid_: Main channel, root session
 
+**Active Session**:
+The single session of a thread that lobby messages route to and that external-message sync follows. Exactly one per thread at a time (the SessionStore's first entry for the thread); `/switch` and `/new` promote a session to active, and cola derives the conversation's current project from it.
+_Avoid_: Current session, latest session, selected session
+
 **Project**:
 A working directory on the filesystem where OpenCode operates. A property of a session, not of the bot. A conversation's current project is the directory of its active session (derived, never stored separately); `/new` inherits it and falls back to the default directory only when the conversation has no session. Sessions created outside a conversation still carry their own directory.
 _Avoid_: Workspace, repo

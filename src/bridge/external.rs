@@ -59,15 +59,46 @@ impl ExternalFlow {
             if core.opencode.base_url().is_empty() {
                 continue;
             }
-            let sessions: Vec<(String, crate::config::ThreadKey, String)> = core
-                .sessions
-                .lock()
-                .await
-                .all_entries()
-                .into_iter()
-                .map(|e| (e.session_id.clone(), e.thread_key.clone(), e.directory.clone()))
-                .collect();
+            // Only each thread's ACTIVE session is synced (ADR-0017): a lobby
+            // (p2p/group) can stack several sessions via /new and /switch, and
+            // notifying for a historical one would interleave its cards with the
+            // current conversation's. Historical sessions are skipped AND their
+            // baseline cleared, so switching back to one re-baselines silently
+            // (external messages received while it was inactive are marked read,
+            // not replayed).
+            //
+            // `active` and `sessions` are derived from ONE store snapshot so a
+            // session activated mid-poll can't slip through as active-but-unchecked.
+            let (active, sessions): (
+                std::collections::HashSet<String>,
+                Vec<(String, crate::config::ThreadKey, String)>,
+            ) = {
+                let store = core.sessions.lock().await;
+                let active = store
+                    .all_entries()
+                    .into_iter()
+                    .filter(|e| {
+                        store
+                            .get_active(&e.thread_key)
+                            .map(|a| a.session_id == e.session_id)
+                            .unwrap_or(false)
+                    })
+                    .map(|e| e.session_id.clone())
+                    .collect();
+                let sessions = store
+                    .all_entries()
+                    .into_iter()
+                    .map(|e| (e.session_id.clone(), e.thread_key.clone(), e.directory.clone()))
+                    .collect();
+                (active, sessions)
+            };
             for (sid, thread_key, directory) in sessions {
+                if !active.contains(&sid) {
+                    // Historical (non-active) session: stop syncing it and drop
+                    // its baseline so a later /switch back re-baselines silently.
+                    self.last_user_msg_epoch.lock().await.remove(&sid);
+                    continue;
+                }
                 // While cola is answering this session, any new message is cola's own.
                 if core.inflight.lock().await.contains(&sid) {
                     continue;
