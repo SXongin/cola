@@ -94,9 +94,13 @@ Only one cola may run at a time (two would double-handle Feishu events). The loc
 - Starting interactively (a terminal): cola asks `旧实例 PID x 在运行，是否替换它并接管？[y/N]`.
 - `/restart` re-execs cola itself with `--replace`, so the new process always takes over the lock.
 
+## Self-update
+
+`/update` (Feishu) or `cola update [--check]` checks GitHub Releases for a newer cola. If one exists it downloads the binary for your platform, verifies it against the release's `SHA256SUMS`, replaces the running binary and restarts. Platforms without a prebuilt binary (e.g. Linux aarch64) report that instead of failing. Under a systemd unit the restart hands back to `Restart=on-failure`; elsewhere cola re-execs itself.
+
 ## Commands
 
-In Feishu: `/dir <path>`, `/switch`, `/switch <kw>`, `/switch list [kw] [--all]`, `/switch <id> [--force]`, `/switch forget`, `/new [name]`, `/topic <dir> [name]`, `/name <name>`, `/stop`, `/compact`, `/agent <name>`, `/model <p/m>`, `/autoaccept [on|off]`, `/restart`, `/restart-opencode`, `/help`. Unrecognized `/...` commands are forwarded to OpenCode.
+In Feishu: `/dir <path>`, `/switch`, `/switch <kw>`, `/switch list [kw] [--all]`, `/switch <id> [--force]`, `/switch forget`, `/new [name]`, `/topic <dir> [name]`, `/name <name>`, `/stop`, `/compact`, `/agent <name>`, `/model <p/m>`, `/autoaccept [on|off]`, `/restart`, `/restart-opencode`, `/update`, `/help`. Unrecognized `/...` commands are forwarded to OpenCode.
 
 `/agent` and `/model` set per-session overrides sent with the next message and persisted across restarts. `/restart-opencode` restarts only an OpenCode server **cola itself started**; a server launched by another tool is left alone.
 
@@ -121,4 +125,4 @@ Tagging a version publishes a release with the compiled binary for all three pla
 git tag 1.2.3 && git push origin 1.2.3
 ```
 
-`.github/workflows/release.yml` builds the release binary, packages it as `cola-<version>-x86_64-unknown-linux-gnu.tar.gz` plus a `SHA256SUMS` file, and attaches both to a GitHub release with auto-generated notes.
+`.github/workflows/release.yml` builds the release binary, packages it as `cola-<version>-<target>.tar.gz` plus a `SHA256SUMS` file, and attaches both to a GitHub release with auto-generated notes. It also enforces `Cargo.toml`'s `version` matching the tag — the binary's embedded version drives self-update, so a mismatch would report "update available" forever.

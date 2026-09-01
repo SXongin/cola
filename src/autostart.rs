@@ -37,6 +37,26 @@ pub fn run(action: AutostartAction) -> anyhow::Result<()> {
     }
 }
 
+/// The command that restarts a running cola through its OS supervisor, when one
+/// is registered for this platform (systemd user unit / launchd agent).
+/// `None` when there is no supervisor (Windows' `Run` key has no restart
+/// facility) or none is installed. Used by the self-update CLI (ADR-0015) so
+/// the restarted daemon stays supervised instead of dying with the terminal.
+pub(crate) fn supervisor_restart_command() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::supervisor_restart_command()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::supervisor_restart_command()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
 /// The absolute path of the running cola binary — what the launcher starts.
 fn exe_path() -> anyhow::Result<String> {
     let exe = std::env::current_exe().context("cannot resolve own executable path")?;
@@ -159,6 +179,14 @@ mod linux {
         anyhow::ensure!(status.success(), "`{prog} {what}` failed with {}", status);
         Ok(())
     }
+
+    /// The command that restarts a running cola via systemd, when the user unit
+    /// is installed (`cola autostart enable` wrote it).
+    pub(super) fn supervisor_restart_command() -> Option<String> {
+        unit_path()
+            .exists()
+            .then(|| format!("systemctl --user restart {UNIT_NAME}"))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -274,6 +302,14 @@ mod macos {
             _ => println!("  launchd: not loaded — run `cola autostart enable`"),
         }
         Ok(())
+    }
+
+    /// The command that restarts a running cola via launchd, when the agent is
+    /// installed (`cola autostart enable` wrote the plist).
+    pub(super) fn supervisor_restart_command() -> Option<String> {
+        plist_path()
+            .exists()
+            .then(|| format!("launchctl kickstart -k gui/{}/{}", uid(), LABEL))
     }
 }
 

@@ -1335,6 +1335,11 @@ pub fn build_help_card(thread_key: &crate::config::ThreadKey) -> serde_json::Val
                     cmd: "/restart-opencode",
                     card: None,
                 },
+                HelpRow {
+                    label: "/update",
+                    cmd: "/update",
+                    card: None,
+                },
             ],
         },
     ];

@@ -30,6 +30,13 @@ base64 = "0.22"
 async-trait = "0.1"
 indexmap = "2"
 sysinfo = "0.39"
-
-[dev-dependencies]
+semver = "1"
+sha2 = "0.10"
 tempfile = "3"
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+flate2 = "1"
+tar = "0.4"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }

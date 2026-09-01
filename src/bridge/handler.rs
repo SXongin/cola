@@ -154,23 +154,53 @@ impl App {
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         // Let the EventSink trait impl recover a &Arc<App> from &self.
         let _ = self.self_weak.set(Arc::downgrade(&self));
-        // After a `/restart`, announce it in the chat that requested it.
+        // After a `/restart` or self-update, announce it in the chat that
+        // requested it. `/update` writes kind="update" + the new version.
         let notify_path = command::restart_notify_path();
         if let Ok(raw) = std::fs::read_to_string(&notify_path)
             && let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
             && let Some(chat_id) = v.get("chat_id").and_then(|c| c.as_str())
         {
             let _ = std::fs::remove_file(&notify_path);
+            let (title, body) = match v.get("kind").and_then(|k| k.as_str()) {
+                Some("update") => {
+                    let version = v.get("version").and_then(|s| s.as_str()).unwrap_or("");
+                    (
+                        format!("✅ 已更新到 {version}"),
+                        format!("cola 已更新到 {version} 并重启完成。"),
+                    )
+                }
+                _ => ("♻️ 已重启".to_string(), "cola 已重启完成。".to_string()),
+            };
             let card = serde_json::json!({
                 "schema": "2.0",
                 "config": { "wide_screen_mode": true },
-                "header": { "title": { "tag": "plain_text", "content": "♻️ 已重启" }, "template": "green" },
-                "body": { "elements": [ { "tag": "markdown", "content": "cola 已重启完成。" } ] }
+                "header": { "title": { "tag": "plain_text", "content": title }, "template": "green" },
+                "body": { "elements": [ { "tag": "markdown", "content": body } ] }
             });
             match self.feishu.send_card("chat_id", chat_id, &card).await {
                 Ok(_) => tracing::info!("announced restart in chat {}", chat_id),
                 Err(e) => tracing::warn!("restart announce failed: {}", e),
             }
+        }
+
+        // Silent startup self-update check (ADR-0015): log when a new version
+        // exists; never sends a card. Fire-and-forget — a dead network or a
+        // rate limit only costs a debug log line.
+        {
+            tokio::spawn(async move {
+                match crate::update::check().await {
+                    Ok(crate::update::UpdateCheck::Available(info)) => {
+                        tracing::info!(
+                            "新版本 {} 可用（当前 {}）—— 发送 /update 更新。",
+                            info.latest,
+                            info.current
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::debug!("update check failed: {e}"),
+                }
+            });
         }
 
         // Discover cola's own open_id so @mentions of the bot can be recognised

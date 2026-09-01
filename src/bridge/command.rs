@@ -31,6 +31,9 @@ pub enum Command {
     /// Restart the OpenCode server — but only when cola started it. A server
     /// another tool launched is never touched.
     RestartOpenCode,
+    /// Self-update from GitHub Releases (ADR-0015): check, download, verify,
+    /// replace the running binary, and restart.
+    Update,
     /// Show available commands, or help for one command (`/help <cmd>`).
     Help(Option<String>),
     /// Forward unrecognized slash command to OpenCode as prompt text
@@ -169,6 +172,7 @@ pub fn parse_command(text: &str) -> Option<Command> {
         },
         "/restart" => Some(Command::Restart),
         "/restart-opencode" => Some(Command::RestartOpenCode),
+        "/update" => Some(Command::Update),
         "/help" => Some(Command::Help(arg.map(|s| s.to_lowercase()))),
         // `/init`, `/review`, or any unknown /command — forward to OpenCode
         _ => Some(Command::Forward(trimmed.to_string())),
@@ -195,6 +199,7 @@ pub fn help_text() -> String {
 `/autoaccept` · Show auto-approve status; `/autoaccept on|off` switches
 `/restart` · Restart cola (keeps startup args + log redirect)
 `/restart-opencode` · Restart the OpenCode server (only when cola started it)
+`/update` · Check for and apply a cola self-update from GitHub Releases
 `/help <command>` · Show help for one command (e.g. `/help model`)
 
 话题规则：已绑定会话的话题里，`/switch`、`/new`、`/dir` 被拒绝，请回主对话操作。从未绑定过会话的话题可以用它们来绑定该话题的唯一会话。
@@ -250,6 +255,9 @@ pub fn command_help(name: &str) -> Option<String> {
         "restart-opencode" => {
             "/restart-opencode\nRestart the OpenCode server. cola only restarts a server IT started; a server launched by another tool is left alone and needs a manual restart."
         }
+        "update" => {
+            "/update\nCheck GitHub Releases for a newer cola; if one exists, download, verify (SHA256SUMS), replace the running binary and restart. When running as a systemd unit, the restart hands back to `Restart=on-failure`; otherwise the new process re-execs with --replace. If already on the latest version, it reports that and does nothing."
+        }
         "help" => {
             "/help [command]\nList all commands, or show detailed help for one.\nExample: `/help model`"
         }
@@ -273,7 +281,7 @@ use std::sync::Arc;
 /// even while the old process lingers (briefly alive, then a zombie until the
 /// launching shell reaps it). The current process then calls
 /// `std::process::exit(0)` right after.
-fn restart_process() -> std::io::Result<()> {
+pub(crate) fn restart_process() -> std::io::Result<()> {
     use std::process::{Command, Stdio};
     let mut exe = std::env::current_exe()?;
     // If the binary was replaced by a rebuild while we're running,
@@ -311,6 +319,19 @@ pub(crate) fn restart_notify_path() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join(".cola")
         .join("restart-notify.json")
+}
+
+/// Report self-update progress as Feishu text replies (ADR-0015).
+struct FeishuUpdateReporter<'a> {
+    feishu: &'a Arc<dyn crate::feishu::Platform>,
+    message_id: &'a str,
+}
+
+#[async_trait::async_trait]
+impl<'a> crate::update::UpdateReporter for FeishuUpdateReporter<'a> {
+    async fn report(&self, msg: String) {
+        let _ = self.feishu.reply_text(self.message_id, &msg).await;
+    }
 }
 
 /// Execute a parsed slash command against the shared core. Unrecognized
@@ -732,6 +753,27 @@ pub(crate) async fn handle_command(
                         .reply_text(message_id, &format!("重启 OpenCode 失败：{}", e))
                         .await?;
                 }
+            }
+        }
+        Command::Update => {
+            // Self-update (ADR-0015): progress reports come back as text
+            // replies; on success write the announce file (the new process
+            // announces "已更新到 X" in this chat) and restart.
+            let reporter = FeishuUpdateReporter {
+                feishu: &core.feishu,
+                message_id,
+            };
+            if let crate::update::UpdateOutcome::Updated(new_version) =
+                crate::update::run_update(&reporter, crate::update::UpdateMode::Apply).await
+            {
+                core.feishu.reply_text(message_id, "正在重启…").await?;
+                let notify = serde_json::json!({
+                    "chat_id": thread_key.chat_id,
+                    "kind": "update",
+                    "version": new_version.to_string(),
+                });
+                let _ = std::fs::write(restart_notify_path(), notify.to_string());
+                crate::update::restart();
             }
         }
         Command::Forward(_) => {
@@ -1443,6 +1485,8 @@ mod tests {
     fn parse_restart() {
         assert_eq!(parse_command("/restart"), Some(Command::Restart));
         assert_eq!(parse_command("/restart now"), Some(Command::Restart));
+        assert_eq!(parse_command("/update"), Some(Command::Update));
+        assert_eq!(parse_command("/update now"), Some(Command::Update));
     }
 
     #[test]

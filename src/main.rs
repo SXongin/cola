@@ -5,6 +5,7 @@ mod error;
 mod feishu;
 mod logging;
 mod opencode;
+mod update;
 
 use clap::Parser;
 use std::io::IsTerminal;
@@ -41,6 +42,12 @@ enum Subcommand {
     Autostart {
         #[command(subcommand)]
         action: autostart::AutostartAction,
+    },
+    /// Check for and apply a self-update from GitHub Releases (ADR-0015).
+    Update {
+        /// Only check for an update; download and apply nothing.
+        #[arg(long)]
+        check: bool,
     },
 }
 
@@ -295,6 +302,15 @@ fn stale_lock_owner(path: &std::path::Path) -> Option<i32> {
     if pid_alive(pid) { None } else { Some(pid) }
 }
 
+/// The PID of a live cola daemon holding the singleton lock, if any. Used by
+/// `cola update` to decide whether to talk about "restart" (a daemon is
+/// running) or "start" (nothing is running) after replacing the binary.
+fn running_daemon_pid() -> Option<i32> {
+    let raw = std::fs::read_to_string(lock_file_path()).ok()?;
+    let pid = raw.trim().parse::<i32>().ok()?;
+    (pid_alive(pid) && is_cola_process(pid)).then_some(pid)
+}
+
 impl Drop for SingletonLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
@@ -309,6 +325,11 @@ async fn main() -> anyhow::Result<()> {
     // singleton lock — handle it before any of that machinery.
     if let Some(Subcommand::Autostart { action }) = cli.subcommand {
         return autostart::run(action);
+    }
+    // Self-update is the same: no config, no log file, no lock (it may even run
+    // to fix a bot whose config is broken). It prints its own progress.
+    if let Some(Subcommand::Update { check }) = cli.subcommand {
+        return update_cli(check).await;
     }
 
     // Config first: `[bridge] log_days` feeds the daily-rotating log writer.
@@ -388,6 +409,36 @@ async fn main() -> anyhow::Result<()> {
 
     app.run().await?;
 
+    Ok(())
+}
+
+/// Print progress to stdout for the `cola update` CLI.
+struct CliReporter;
+
+#[async_trait::async_trait]
+impl update::UpdateReporter for CliReporter {
+    async fn report(&self, msg: String) {
+        println!("{msg}");
+    }
+}
+
+/// `cola update [--check]`: report the update situation; on an available
+/// update, download, verify and replace the binary. The daemon is then
+/// restarted through its OS supervisor when one is registered; otherwise the
+/// user gets a hint that depends on whether a daemon is actually running —
+/// `/restart` in Feishu only makes sense when one is (ADR-0015).
+async fn update_cli(check_only: bool) -> anyhow::Result<()> {
+    let mode = if check_only {
+        update::UpdateMode::Check
+    } else {
+        update::UpdateMode::Apply
+    };
+    if let update::UpdateOutcome::Updated(v) = update::run_update(&CliReporter, mode).await {
+        match update::restart_cli(running_daemon_pid().is_some()) {
+            None => println!("已更新到 {v}，已通过系统监督者重启。"),
+            Some(hint) => println!("已更新到 {v}。{hint}"),
+        }
+    }
     Ok(())
 }
 
