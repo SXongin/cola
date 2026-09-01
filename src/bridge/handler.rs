@@ -939,6 +939,86 @@ impl App {
                     toast: None,
                 })
             }
+            "topic_adopt" => {
+                // "建话题接管" (ADR-0016): open a NEW Feishu topic around an
+                // existing session, in one gesture from the session card. The
+                // topic anchors on the card's own message (`open_message_id`,
+                // threaded through by `extract_card_action_value`), so fallback
+                // cards can reply inside it. No `--force` from the card: a
+                // session owned by another thread is rejected with a Toast.
+                let Some(open_message_id) = value.get("open_message_id").and_then(|v| v.as_str()) else {
+                    return Some(CardActionResult {
+                        card: None,
+                        toast: Some("无法创建话题（缺少卡片消息引用）".to_string()),
+                    });
+                };
+                let open_message_id = open_message_id.to_string();
+                let sessions = core.cached_session_list().await.ok()?;
+                let target = sessions.iter().find(|s| s.id == session_id)?.clone();
+                if target.is_child() {
+                    return Some(CardActionResult {
+                        card: None,
+                        toast: Some("子任务会话不支持接管".to_string()),
+                    });
+                }
+                let owner = {
+                    let store = core.sessions.lock().await;
+                    store.thread_for_session(&target.id)
+                };
+                if let Some(owner_key) = owner
+                    && owner_key != thread_key
+                {
+                    let chat_name = core
+                        .feishu
+                        .chat_name(&owner_key.chat_id)
+                        .await
+                        .unwrap_or(None)
+                        .unwrap_or_else(|| owner_key.chat_id.clone());
+                    return Some(CardActionResult {
+                        card: None,
+                        toast: Some(format!(
+                            "会话被 {} 占用，请用 `/topic --adopt <ID> --force`",
+                            chat_name
+                        )),
+                    });
+                }
+                // Create a topic anchored on the card message and map the
+                // adopted session to the new topic's ThreadKey (shared with the
+                // text `/topic --adopt` form, ADR-0016).
+                let new_thread_id = match crate::bridge::command::create_topic_and_map_adopted(
+                    core,
+                    &thread_key,
+                    &target,
+                    &open_message_id,
+                )
+                .await
+                {
+                    Ok(Some(id)) => id,
+                    Ok(None) => {
+                        return Some(CardActionResult {
+                            card: None,
+                            toast: Some("创建话题失败（未返回 thread_id）".to_string()),
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("switch card topic_adopt: create topic failed: {}", e);
+                        return Some(CardActionResult {
+                            card: None,
+                            toast: Some("创建话题失败".to_string()),
+                        });
+                    }
+                };
+                tracing::info!(
+                    "switch card topic_adopt: created topic {} for session {} in chat {}",
+                    new_thread_id,
+                    target.id,
+                    thread_key.chat_id
+                );
+                Some(CardActionResult {
+                    card: Some(self.build_switch_card_for(core, &thread_key, &keyword).await),
+                    toast: Some("已建话题接管".to_string()),
+                })
+            }
             _ => None,
         }
     }

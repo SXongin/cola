@@ -100,7 +100,7 @@ Only one cola may run at a time (two would double-handle Feishu events). The loc
 
 ## Commands
 
-In Feishu: `/dir <path>`, `/switch`, `/switch <kw>`, `/switch list [kw] [--all]`, `/switch <id> [--force]`, `/switch forget`, `/new [name]`, `/topic <dir> [name]`, `/name <name>`, `/stop`, `/compact`, `/agent <name>`, `/model <p/m>`, `/autoaccept [on|off]`, `/restart`, `/restart-opencode`, `/update`, `/help`. Unrecognized `/...` commands are forwarded to OpenCode.
+In Feishu: `/dir <path>`, `/switch`, `/switch <kw>`, `/switch list [kw] [--all]`, `/switch <id> [--force]`, `/switch forget`, `/new [name]`, `/topic <dir> [name]`, `/topic --adopt <kw> [--force]`, `/name <name>`, `/stop`, `/compact`, `/agent <name>`, `/model <p/m>`, `/autoaccept [on|off]`, `/restart`, `/restart-opencode`, `/update`, `/help`. Unrecognized `/...` commands are forwarded to OpenCode.
 
 `/agent` and `/model` set per-session overrides sent with the next message and persisted across restarts. `/restart-opencode` restarts only an OpenCode server **cola itself started**; a server launched by another tool is left alone.
 

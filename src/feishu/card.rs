@@ -917,8 +917,10 @@ pub fn build_question_card(
     })
 }
 /// One row of the `/switch` session card: a `column_set` with the session
-/// text on the left and a switch/adopt button on the right. Each row's button
-/// carries the routing payload (`action: "switch"`, `op: "adopt"`, thread_key,
+/// text on the left and action button(s) on the right. The primary button
+/// switches/adopts into the current thread (`op: "adopt"`); a second "建话题接管"
+/// button (`op: "topic_adopt"`) opens a new Feishu topic around the session
+/// (ADR-0016). Each button carries the routing payload (action, op, thread_key,
 /// target session id).
 fn switch_card_row(
     text: &str,
@@ -926,6 +928,32 @@ fn switch_card_row(
     thread_key: &crate::config::ThreadKey,
     session_id: &str,
 ) -> serde_json::Value {
+    let actions = vec![
+        json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": btn_text },
+            "type": "default",
+            "value": {
+                "action": "switch",
+                "op": "adopt",
+                "chat_id": thread_key.chat_id,
+                "thread_id": thread_key.thread_id,
+                "session_id": session_id,
+            },
+        }),
+        json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": "建话题接管" },
+            "type": "default",
+            "value": {
+                "action": "switch",
+                "op": "topic_adopt",
+                "chat_id": thread_key.chat_id,
+                "thread_id": thread_key.thread_id,
+                "session_id": session_id,
+            },
+        }),
+    ];
     json!({
         "tag": "column_set",
         "flex_mode": "none",
@@ -943,16 +971,8 @@ fn switch_card_row(
                 "vertical_align": "center",
                 "elements": [
                     {
-                        "tag": "button",
-                        "text": { "tag": "plain_text", "content": btn_text },
-                        "type": "default",
-                        "value": {
-                            "action": "switch",
-                            "op": "adopt",
-                            "chat_id": thread_key.chat_id,
-                            "thread_id": thread_key.thread_id,
-                            "session_id": session_id,
-                        },
+                        "tag": "action",
+                        "actions": actions,
                     }
                 ],
             }

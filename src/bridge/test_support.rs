@@ -2720,6 +2720,400 @@ pub(crate) mod integration_tests {
         assert!(store.all_entries().is_empty());
     }
 
+    // ===== /topic --adopt (ADR-0016) =====
+
+    /// `/topic --adopt <kw>` resolves an existing session and opens a NEW topic
+    /// around it, mapping the adopted session to the new topic's ThreadKey.
+    #[tokio::test]
+    async fn topic_adopt_opens_topic_around_existing_session() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session(
+            "ses_foreign123abc",
+            "重写登录模块",
+            "/work/auth",
+            100,
+        )];
+        let (app, platform) = build_app(cfg, backend).await;
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::TopicAdopt {
+                keyword: "重写登录".into(),
+                force: false,
+            },
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_topic_adopt",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        // The topic is created via reply_in_thread on the command message.
+        let calls = platform.calls.lock().await.clone();
+        assert!(
+            calls.iter().any(|c| matches!(c, PlatformCall::ReplyInThread { message_id, .. } if message_id == "msg_topic_adopt")),
+            "expected reply_in_thread on the command message, got {calls:?}"
+        );
+
+        // The new topic's thread_id maps to the ADOPTED session (not a new one),
+        // with the in-topic confirmation as the fallback-card anchor.
+        let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
+        let entry = app
+            .sessions
+            .lock()
+            .await
+            .get_active(&topic_key)
+            .cloned()
+            .expect("topic thread_id should map to the adopted session");
+        assert_eq!(entry.session_id, "ses_foreign123abc");
+        assert_eq!(entry.directory, "/work/auth");
+        assert_eq!(entry.topic_anchor.as_deref(), Some("msg_topic_reply"));
+        // The lobby is untouched (no session created for it).
+        let lobby_key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        assert!(app.sessions.lock().await.get_active(&lobby_key).is_none());
+    }
+
+    /// `/topic --adopt` rejects a child (sub-task) session.
+    #[tokio::test]
+    async fn topic_adopt_rejects_child_session() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![opencode::client::SessionListInfo {
+            parent_id: Some("ses_parent".into()),
+            ..list_session("ses_child09", "Child session - x", "/work/auth", 100)
+        }];
+        let (app, platform) = build_app(cfg, backend).await;
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::TopicAdopt {
+                keyword: "ses_child09".into(),
+                force: false,
+            },
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_topic_adopt",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let calls = platform.calls.lock().await.clone();
+        let text = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("子任务"), "rejection mentions sub-task: {text}");
+        assert!(
+            calls
+                .iter()
+                .all(|c| !matches!(c, PlatformCall::ReplyInThread { .. })),
+            "no topic created for a child session: {calls:?}"
+        );
+        assert!(app.sessions.lock().await.all_entries().is_empty());
+    }
+
+    /// `/topic --adopt` of a session mapped to another thread rejects with an
+    /// actionable note pointing at the text `--force`, unless `--force` is given.
+    #[tokio::test]
+    async fn topic_adopt_rejects_owned_session_without_force() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session("ses_owned", "被占用的会话", "/work/auth", 100)];
+        let mut platform = RecordingPlatform::new();
+        platform
+            .chat_names
+            .insert("oc_group_other".into(), "隔壁群".into());
+        let platform = Arc::new(platform);
+        let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into()),
+                session_id: "ses_owned".into(),
+                directory: "/work/auth".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+        }
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::TopicAdopt {
+                keyword: "ses_owned".into(),
+                force: false,
+            },
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_topic_adopt",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let calls = platform.calls.lock().await.clone();
+        let text = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("隔壁群"), "rejection names the owning chat: {text}");
+        assert!(
+            text.contains("--force"),
+            "rejection points at /topic --adopt ... --force: {text}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|c| !matches!(c, PlatformCall::ReplyInThread { .. })),
+            "no topic created for an owned session: {calls:?}"
+        );
+    }
+
+    /// `/topic --adopt ... --force` steals a session mapped to another thread:
+    /// the other thread becomes sessionless, the new topic owns it.
+    #[tokio::test]
+    async fn topic_adopt_force_steals_mapping() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session("ses_owned", "被占用的会话", "/work/auth", 100)];
+        let (app, _platform) = build_app(cfg, backend).await;
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into()),
+                session_id: "ses_owned".into(),
+                directory: "/work/auth".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+        }
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::TopicAdopt {
+                keyword: "ses_owned".into(),
+                force: true,
+            },
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_topic_adopt",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
+        assert_eq!(
+            app.sessions
+                .lock()
+                .await
+                .get_active(&topic_key)
+                .map(|e| e.session_id.as_str()),
+            Some("ses_owned"),
+            "new topic owns the stolen session"
+        );
+        let other_key = crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into());
+        assert!(
+            app.sessions.lock().await.get_active(&other_key).is_none(),
+            "the old owner thread becomes sessionless"
+        );
+    }
+
+    /// `/topic --adopt` (no arg) pops the session-picker card (the `/switch`
+    /// card), whose rows carry the "建话题接管" button.
+    #[tokio::test]
+    async fn topic_adopt_no_arg_sends_switch_card() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session("ses_alpha01", "重写登录", "/work/auth", 100)];
+        let (app, platform) = build_app(cfg, backend).await;
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::TopicAdoptCard,
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_card",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let calls = platform.calls.lock().await.clone();
+        let card = calls
+            .iter()
+            .find_map(|c| match c {
+                PlatformCall::ReplyCard { card, .. } => Some(card.clone()),
+                _ => None,
+            })
+            .expect("a session card is sent");
+        let card_str = card.to_string();
+        assert!(
+            card_str.contains("建话题接管"),
+            "card rows offer 建话题接管: {card_str}"
+        );
+        assert!(
+            card_str.contains("ses_alpha01"),
+            "card lists the session: {card_str}"
+        );
+    }
+
+    /// The switch card's "建话题接管" op opens a topic anchored on the card's own
+    /// message (`open_message_id`) and maps the session to the new topic key.
+    #[tokio::test]
+    async fn switch_card_topic_adopt_action_creates_topic() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session("ses_alpha01", "重写登录", "/work/auth", 100)];
+        let (app, _platform) = build_app(cfg, backend).await;
+
+        let value = serde_json::json!({
+            "action": "switch",
+            "op": "topic_adopt",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "session_id": "ses_alpha01",
+            "open_message_id": "om_switch_card",
+        });
+        let result = app
+            .handle_card_action(value)
+            .await
+            .expect("topic_adopt should return a result");
+        assert!(result.card.is_some(), "topic_adopt refreshes the card");
+        assert!(
+            result.toast.clone().unwrap_or_default().contains("话题"),
+            "topic_adopt toasts: {:?}",
+            result.toast
+        );
+
+        // The new topic (thread_id from the mock reply_in_thread) owns the session.
+        let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
+        let entry = app
+            .sessions
+            .lock()
+            .await
+            .get_active(&topic_key)
+            .cloned()
+            .expect("topic_adopt maps the session to the new topic");
+        assert_eq!(entry.session_id, "ses_alpha01");
+        assert_eq!(entry.directory, "/work/auth");
+        assert_eq!(entry.topic_anchor.as_deref(), Some("msg_topic_reply"));
+        // The lobby thread itself got no session.
+        let lobby_key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        assert!(app.sessions.lock().await.get_active(&lobby_key).is_none());
+    }
+
+    /// The switch card's "建话题接管" op rejects a session mapped to another
+    /// thread with a Toast (no --force from the card).
+    #[tokio::test]
+    async fn switch_card_topic_adopt_rejects_owned_session() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session("ses_owned", "被占用的会话", "/work/auth", 100)];
+        let mut platform = RecordingPlatform::new();
+        platform
+            .chat_names
+            .insert("oc_group_other".into(), "隔壁群".into());
+        let platform = Arc::new(platform);
+        let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into()),
+                session_id: "ses_owned".into(),
+                directory: "/work/auth".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+            });
+        }
+
+        let value = serde_json::json!({
+            "action": "switch",
+            "op": "topic_adopt",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "session_id": "ses_owned",
+            "open_message_id": "om_switch_card",
+        });
+        let result = app
+            .handle_card_action(value)
+            .await
+            .expect("topic_adopt should return a result");
+        assert!(
+            result.toast.clone().unwrap_or_default().contains("占用"),
+            "owned session rejected with a Toast: {:?}",
+            result.toast
+        );
+        // The lobby thread got no session and no new topic was created for it.
+        let lobby_key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        assert!(app.sessions.lock().await.get_active(&lobby_key).is_none());
+        let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
+        assert!(
+            app.sessions.lock().await.get_active(&topic_key).is_none(),
+            "no new topic mapping for an owned session"
+        );
+    }
+
+    /// The switch card's "建话题接管" op fails gracefully when the card action
+    /// carries no `open_message_id` (the anchor needed to create the topic).
+    #[tokio::test]
+    async fn switch_card_topic_adopt_missing_open_message_id() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session("ses_alpha01", "重写登录", "/work/auth", 100)];
+        let (app, _platform) = build_app(cfg, backend).await;
+
+        let value = serde_json::json!({
+            "action": "switch",
+            "op": "topic_adopt",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "session_id": "ses_alpha01",
+        });
+        let result = app
+            .handle_card_action(value)
+            .await
+            .expect("topic_adopt should return a result");
+        assert_eq!(result.card, None, "no card refresh on failure");
+        assert!(
+            result
+                .toast
+                .clone()
+                .unwrap_or_default()
+                .contains("缺少卡片消息引用"),
+            "missing open_message_id surfaces a hint: {:?}",
+            result.toast
+        );
+        assert!(app.sessions.lock().await.all_entries().is_empty());
+    }
+
     #[tokio::test]
     async fn group_root_message_creates_lobby_session_and_shows_guidance() {
         let _wd = test_work_dir();

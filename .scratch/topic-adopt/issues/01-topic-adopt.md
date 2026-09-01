@@ -1,6 +1,6 @@
 # 01 - `/topic --adopt`: open a new topic around an existing session
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -55,3 +55,10 @@ backing session is an **existing** server session, in one gesture.
       text `--force`.
 - [ ] `cargo test --workspace --locked` green, `cargo clippy --all-targets`
       clean, `cargo fmt --all -- --check` clean.
+## Comments
+
+Implemented 2026-09-01. `Command::TopicAdopt`/`TopicAdoptCard` + `handle_topic_adopt`
+(text form) and a `topic_adopt` op on the `/switch` card (card form); shared
+`resolve_session` helper extracted from `handle_attach`; `open_message_id`
+threaded through `extract_card_action_value`. 12 new tests (298 total green),
+clippy/fmt clean. See commit message.

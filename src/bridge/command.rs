@@ -10,6 +10,13 @@ pub enum Command {
     New(Option<String>),
     /// Create a real Feishu topic backed by a fresh session rooted at `directory`.
     Topic { directory: String, name: Option<String> },
+    /// Create a real Feishu topic whose backing session is an EXISTING server
+    /// session (ADR-0016): resolve by keyword, adopt, and map to the new topic.
+    /// `force` steals a session mapped to another thread.
+    TopicAdopt { keyword: String, force: bool },
+    /// `/topic --adopt` (no keyword) — the interactive session-picker card,
+    /// whose per-row button creates a topic around the chosen session.
+    TopicAdoptCard,
     /// Rename the current session (PATCHes the server title)
     Name(String),
     /// Interrupt the current session execution
@@ -129,17 +136,37 @@ pub fn parse_command(text: &str) -> Option<Command> {
         "/new" => Some(Command::New(arg.map(|s| s.to_string()))),
         "/topic" => match arg {
             Some(a) => {
-                // `/topic <dir>` or `/topic <dir> <name>`
-                let mut it = a.splitn(2, ' ');
-                let dir = it.next().unwrap_or("").trim();
-                let name = it.next().map(|s| s.trim()).filter(|s| !s.is_empty());
-                if dir.is_empty() {
-                    Some(Command::Help(Some("topic".into())))
+                // `/topic --adopt <keyword> [--force]` — adopt an existing
+                // session into a new topic; `/topic --adopt` pops the card.
+                if a.split_whitespace().next() == Some("--adopt") {
+                    let mut words: Vec<&str> = Vec::new();
+                    let mut force = false;
+                    for w in a.split_whitespace().skip(1) {
+                        if w == "--force" {
+                            force = true;
+                        } else {
+                            words.push(w);
+                        }
+                    }
+                    let keyword = words.join(" ");
+                    if keyword.is_empty() {
+                        Some(Command::TopicAdoptCard)
+                    } else {
+                        Some(Command::TopicAdopt { keyword, force })
+                    }
                 } else {
-                    Some(Command::Topic {
-                        directory: dir.to_string(),
-                        name: name.map(|s| s.to_string()),
-                    })
+                    // `/topic <dir>` or `/topic <dir> <name>`
+                    let mut it = a.splitn(2, ' ');
+                    let dir = it.next().unwrap_or("").trim();
+                    let name = it.next().map(|s| s.trim()).filter(|s| !s.is_empty());
+                    if dir.is_empty() {
+                        Some(Command::Help(Some("topic".into())))
+                    } else {
+                        Some(Command::Topic {
+                            directory: dir.to_string(),
+                            name: name.map(|s| s.to_string()),
+                        })
+                    }
                 }
             }
             None => Some(Command::Help(Some("topic".into()))),
@@ -191,6 +218,7 @@ pub fn help_text() -> String {
 `/switch forget` · Un-map this chat's session (server session stays)
 `/new [name]` · New session in the current project (no session → default dir)
 `/topic <dir> [name]` · Create a new Feishu topic + session in <dir>
+`/topic --adopt <kw> [--force]` · Open a topic around an existing session
 `/name <name>` · Rename current session (server-side)
 `/stop` · Interrupt execution
 `/compact` · Compact context
@@ -229,7 +257,7 @@ pub fn command_help(name: &str) -> Option<String> {
             "/new [name]\nCreate a fresh session in the current project (the active session's directory); with no active session, the default directory (`work_dir` or cwd). Optionally named (the name is PATCHed server-side); without a name the server generates one after the first message.\nExample: `/new api-refactor`"
         }
         "topic" => {
-            "/topic <dir> [name]\nCreate a real Feishu topic backed by a new session rooted at <dir>. The topic is UI-separated from the current conversation, so you can switch between topics in the Feishu client. Reply inside the created topic to talk to that session.\nExample: `/topic /root/proj/lib api-refactor`"
+            "/topic <dir> [name]\nCreate a real Feishu topic backed by a new session rooted at <dir>. The topic is UI-separated from the current conversation, so you can switch between topics in the Feishu client. Reply inside the created topic to talk to that session.\nExample: `/topic /root/proj/lib api-refactor`\n\n/topic --adopt <keyword> [--force]\nOpen a topic around an EXISTING session instead of creating a new one. Resolution: exact id → unique id-prefix → unique title substring (the whole remaining arg is the keyword, so multi-word titles match). Child (sub-task) sessions are rejected. If the session belongs to another chat, reject unless `--force` (which steals the mapping). No argument pops the session card — each row's 建话题接管 button does the same.\nExample: `/topic --adopt 重写登录模块`"
         }
         "name" => {
             "/name <name>\nRename the current session server-side (visible to every client sharing the store).\nExample: `/name frontend`"
@@ -544,6 +572,35 @@ pub(crate) async fn handle_command(
                 session.id,
                 thread_key.chat_id
             );
+        }
+        Command::TopicAdopt { keyword, force } => {
+            // Opening a topic from inside another topic would nest
+            // confusingly; only create topics from a non-topic message.
+            if kind == ConversationKind::Topic {
+                core.feishu
+                    .reply_text(
+                        message_id,
+                        "⚠️ /topic --adopt 只能从会话顶层使用，不能在话题里开话题。请在主会话里发 /topic --adopt <会话>。",
+                    )
+                    .await?;
+                return Ok(());
+            }
+            handle_topic_adopt(core, &thread_key, &keyword, force, message_id).await?;
+        }
+        Command::TopicAdoptCard => {
+            if kind == ConversationKind::Topic {
+                core.feishu
+                    .reply_text(
+                        message_id,
+                        "⚠️ /topic --adopt 只能从会话顶层使用，不能在话题里开话题。请在主会话里发 /topic --adopt。",
+                    )
+                    .await?;
+                return Ok(());
+            }
+            // Reuse the `/switch` session card, whose per-row button now also
+            // offers "建话题接管" (ADR-0016). The card action handler creates
+            // the topic via the card's own `open_message_id`.
+            send_switch_card(core, &thread_key, "", message_id).await?;
         }
         Command::Name(name) => {
             // `/name` PATCHes the server title (ADR-0007): the change is
@@ -1100,6 +1157,53 @@ async fn handle_list(
     Ok(())
 }
 
+/// Resolution outcome for a session keyword, shared by `/attach` and
+/// `/topic --adopt` (ADR-0016). Exact id wins, then unique id-prefix, then
+/// unique title substring — the same order both commands documented.
+enum SessionResolution<'a> {
+    /// Exactly one session matched.
+    Hit(&'a crate::opencode::SessionListInfo),
+    /// Several sessions matched; the caller should list candidates.
+    Ambiguous(Vec<&'a crate::opencode::SessionListInfo>),
+    /// Nothing matched.
+    None,
+}
+
+/// Resolve a session keyword against the shared store: exact id → unique
+/// id-prefix → unique title substring (shared by `/attach` and
+/// `/topic --adopt`). Child sessions are NOT excluded here — exclusion is a
+/// per-command policy (ADR-0008, ADR-0016).
+fn resolve_session<'a>(
+    sessions: &'a [crate::opencode::SessionListInfo],
+    query: &str,
+) -> SessionResolution<'a> {
+    let lower = query.to_lowercase();
+    if let Some(s) = sessions.iter().find(|s| s.id == query) {
+        return SessionResolution::Hit(s);
+    }
+    let prefix: Vec<&crate::opencode::SessionListInfo> = sessions
+        .iter()
+        .filter(|s| s.id.to_lowercase().starts_with(&lower))
+        .collect();
+    if prefix.len() == 1 {
+        return SessionResolution::Hit(prefix[0]);
+    }
+    if prefix.len() > 1 {
+        return SessionResolution::Ambiguous(prefix);
+    }
+    let titles: Vec<&crate::opencode::SessionListInfo> = sessions
+        .iter()
+        .filter(|s| s.title.to_lowercase().contains(&lower))
+        .collect();
+    if titles.len() == 1 {
+        return SessionResolution::Hit(titles[0]);
+    }
+    if titles.len() > 1 {
+        return SessionResolution::Ambiguous(titles);
+    }
+    SessionResolution::None
+}
+
 /// `/attach <id|title> [--force]` — take over an arbitrary server session
 /// into the current thread (ADR-0008). Resolution: exact id → unique
 /// id-prefix → unique title substring; multiple hits list candidates.
@@ -1112,42 +1216,175 @@ async fn handle_attach(
     kind: ConversationKind,
 ) -> crate::error::Result<()> {
     let sessions = core.cached_session_list().await?;
-    let lower = query.to_lowercase();
+    match resolve_session(&sessions, query) {
+        SessionResolution::Hit(s) => adopt_session(core, thread_key, s, message_id, kind, force).await,
+        SessionResolution::Ambiguous(hits) => {
+            let list = candidates_list("找到多个会话，请用完整 ID：", &hits);
+            core.feishu.reply_text(message_id, &list).await?;
+            Ok(())
+        }
+        SessionResolution::None => {
+            core.feishu
+                .reply_text(message_id, &format!("No session matching \"{}\"", query))
+                .await?;
+            Ok(())
+        }
+    }
+}
 
-    // Exact id.
-    if let Some(s) = sessions.iter().find(|s| s.id == query) {
-        return adopt_session(core, thread_key, s, message_id, kind, force).await;
-    }
-    // Unique id-prefix.
-    let prefix: Vec<&crate::opencode::SessionListInfo> = sessions
-        .iter()
-        .filter(|s| s.id.to_lowercase().starts_with(&lower))
-        .collect();
-    if prefix.len() == 1 {
-        return adopt_session(core, thread_key, prefix[0], message_id, kind, force).await;
-    }
-    if prefix.len() > 1 {
-        let list = candidates_list("ID 前缀匹配到多个，请用完整 ID：", &prefix);
-        core.feishu.reply_text(message_id, &list).await?;
+/// `/topic --adopt <keyword> [--force]` (ADR-0016): open a real Feishu topic
+/// whose backing session is an EXISTING server session, in one gesture.
+/// Resolves the session (`resolve_session`), rejects child sessions, honors
+/// `--force` for a session mapped to another thread, then creates the topic
+/// via `reply_in_thread` on the command message and maps the adopted session
+/// to the NEW topic's `ThreadKey` (anchor = the in-topic confirmation).
+async fn handle_topic_adopt(
+    core: &Arc<SharedCore>,
+    thread_key: &ThreadKey,
+    keyword: &str,
+    force: bool,
+    message_id: &str,
+) -> crate::error::Result<()> {
+    let sessions = core.cached_session_list().await?;
+    let info = match resolve_session(&sessions, keyword) {
+        SessionResolution::Hit(s) => s.clone(),
+        SessionResolution::Ambiguous(hits) => {
+            let list = candidates_list("找到多个会话，请用完整 ID：", &hits);
+            core.feishu.reply_text(message_id, &list).await?;
+            return Ok(());
+        }
+        SessionResolution::None => {
+            core.feishu
+                .reply_text(message_id, &format!("No session matching \"{}\"", keyword))
+                .await?;
+            return Ok(());
+        }
+    };
+    // Child sessions (sub-task contexts) are never adoptable (ADR-0016): the
+    // server allows POSTing to them, but OpenChamber does not either and the
+    // task-derived temporary context is meaningless to drive.
+    if info.is_child() {
+        core.feishu
+            .reply_text(
+                message_id,
+                &format!("⚠️ 会话 `{}` 是子任务会话，不支持接管。", info.title),
+            )
+            .await?;
         return Ok(());
     }
-    // Unique title substring.
-    let titles: Vec<&crate::opencode::SessionListInfo> = sessions
-        .iter()
-        .filter(|s| s.title.to_lowercase().contains(&lower))
-        .collect();
-    if titles.len() == 1 {
-        return adopt_session(core, thread_key, titles[0], message_id, kind, force).await;
+    // Mapped to another thread: reject unless --force (mirrors adopt_session).
+    let owner = {
+        let store = core.sessions.lock().await;
+        store.thread_for_session(&info.id)
+    };
+    if let Some(owner_key) = owner
+        && owner_key != *thread_key
+    {
+        if !force {
+            let chat_name = core
+                .feishu
+                .chat_name(&owner_key.chat_id)
+                .await
+                .unwrap_or(None)
+                .unwrap_or_else(|| owner_key.chat_id.clone());
+            let where_flag = if owner_key.thread_id != owner_key.chat_id {
+                "话题"
+            } else {
+                "主对话"
+            };
+            core.feishu
+                    .reply_text(
+                        message_id,
+                        &format!(
+                            "⚠️ 会话 `{}`（目录 `{}`）已被其他聊天占用：\n{}\n（{}，chat `{}`）\n\n可先请对方 `/switch forget` 解除，或使用 `/topic --adopt {} --force` 强行接管。",
+                            info.title,
+                            info.directory,
+                            chat_name,
+                            where_flag,
+                            owner_key.chat_id,
+                            info.id
+                        ),
+                    )
+                    .await?;
+            return Ok(());
+        }
+        // --force: steal the mapping; the other thread becomes sessionless.
+        let mut store = core.sessions.lock().await;
+        store.remove(&info.id);
+        store.persist()?;
     }
-    if titles.len() > 1 {
-        let list = candidates_list("标题匹配到多个，请用完整 ID：", &titles);
-        core.feishu.reply_text(message_id, &list).await?;
-        return Ok(());
+    // Create a real topic anchored on the command message and map the adopted
+    // session to the new topic's ThreadKey.
+    match create_topic_and_map_adopted(core, thread_key, &info, message_id).await {
+        Ok(Some(thread_id)) => {
+            tracing::info!(
+                "topic-adopt: created topic {} for adopted session {} in chat {}",
+                thread_id,
+                info.id,
+                thread_key.chat_id
+            );
+            Ok(())
+        }
+        Ok(None) => {
+            // No thread_id from the platform — report and point at the fallback.
+            core.feishu
+                .reply_text(
+                    message_id,
+                    "⚠️ 当前会话不支持创建话题（未返回 thread_id）。请改用 `/switch <id>` 接管到当前会话。",
+                )
+                .await?;
+            Ok(())
+        }
+        Err(e) => Err(e),
     }
-    core.feishu
-        .reply_text(message_id, &format!("No session matching \"{}\"", query))
+}
+
+/// Create a real Feishu topic anchored on `message_id` via `reply_in_thread`
+/// (ADR-0006), then map the adopted `info` session to the NEW topic's
+/// `ThreadKey` with the in-topic confirmation as the fallback-card anchor.
+/// Returns the new topic's `thread_id`, or `None` when the platform returns no
+/// thread_id (the caller decides the message). Shared by the text `/topic
+/// --adopt` form and the switch card's "建话题接管" op (ADR-0016).
+pub(crate) async fn create_topic_and_map_adopted(
+    core: &Arc<SharedCore>,
+    thread_key: &ThreadKey,
+    info: &crate::opencode::SessionListInfo,
+    message_id: &str,
+) -> crate::error::Result<Option<String>> {
+    let (anchor, thread_id) = core
+        .feishu
+        .reply_in_thread(
+            message_id,
+            &format!(
+                "📌 已接管会话 `{}`（目录 `{}`）。\n请在本话题内回复，即可和这个会话对话。",
+                info.title, info.directory
+            ),
+        )
         .await?;
-    Ok(())
+    let Some(thread_id) = thread_id else {
+        tracing::warn!(
+            "topic-adopt: no thread_id returned in chat {}; not mapping session",
+            thread_key.chat_id
+        );
+        return Ok(None);
+    };
+    let topic_key = crate::config::ThreadKey::new(thread_key.chat_id.clone(), thread_id.clone());
+    let entry = SessionEntry {
+        thread_key: topic_key,
+        session_id: info.id.clone(),
+        directory: info.directory.clone(),
+        agent: info.agent.clone(),
+        model: None,
+        auto_accept: false,
+        topic_anchor: Some(anchor),
+    };
+    {
+        let mut store = core.sessions.lock().await;
+        store.set_active(entry);
+        store.persist()?;
+    }
+    core.invalidate_session_list_cache().await;
+    Ok(Some(thread_id))
 }
 
 /// Adopt a server session as the current thread's session, honoring the
@@ -1530,6 +1767,45 @@ mod tests {
         assert_eq!(
             parse_command("/topic "),
             Some(Command::Help(Some("topic".into())))
+        );
+    }
+
+    #[test]
+    fn parse_topic_adopt_keyword() {
+        assert_eq!(
+            parse_command("/topic --adopt 重写登录模块"),
+            Some(Command::TopicAdopt {
+                keyword: "重写登录模块".into(),
+                force: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_topic_adopt_force() {
+        assert_eq!(
+            parse_command("/topic --adopt ses_abc123 --force"),
+            Some(Command::TopicAdopt {
+                keyword: "ses_abc123".into(),
+                force: true,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_topic_adopt_no_keyword_is_card() {
+        assert_eq!(parse_command("/topic --adopt"), Some(Command::TopicAdoptCard));
+        assert_eq!(parse_command("/topic --adopt  "), Some(Command::TopicAdoptCard));
+    }
+
+    #[test]
+    fn parse_topic_adopt_multi_word_title() {
+        assert_eq!(
+            parse_command("/topic --adopt rewrite login module"),
+            Some(Command::TopicAdopt {
+                keyword: "rewrite login module".into(),
+                force: false,
+            })
         );
     }
 
