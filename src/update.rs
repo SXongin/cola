@@ -220,8 +220,6 @@ fn extract_binary(archive: &[u8], dest_dir: &Path) -> anyhow::Result<PathBuf> {
 /// Extract the `cola` binary from the release zip into `dest_dir`.
 #[cfg(target_os = "windows")]
 fn extract_binary(archive: &[u8], dest_dir: &Path) -> anyhow::Result<PathBuf> {
-    use std::io::Read;
-
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(archive)).context("open release zip")?;
     let mut dest: Option<PathBuf> = None;
     for i in 0..zip.len() {

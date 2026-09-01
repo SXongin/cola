@@ -1905,9 +1905,15 @@ mod tests {
             sub.display()
         );
         assert!(sub.ends_with(".cola"));
-        // Bare `~` resolves to home itcore.
+        // Bare `~` resolves to home itself. normalize_directory canonicalizes,
+        // which can normalize the home spelling (\\?\ prefix on Windows), so
+        // compare against the canonicalized home.
         let home_only = normalize_directory("~");
-        assert_eq!(home_only, home);
+        assert_eq!(
+            home_only,
+            std::fs::canonicalize(&home).unwrap_or_else(|_| home.clone()),
+            "bare ~ must resolve to home"
+        );
     }
 
     #[test]
@@ -1926,7 +1932,13 @@ mod tests {
     fn normalize_directory_keeps_existing_absolute_path() {
         let cwd = std::env::current_dir().unwrap();
         let abs = normalize_directory(&cwd.to_string_lossy());
-        assert_eq!(abs, cwd, "an existing absolute path canonicalizes to itself");
+        // normalize_directory canonicalizes the cwd; on Windows that adds a
+        // \\?\ verbatim prefix, so compare against the canonicalized form.
+        assert_eq!(
+            abs,
+            std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone()),
+            "an existing absolute path canonicalizes to itself"
+        );
         // A nonexistent absolute path is preserved (caller reports it missing).
         let missing = normalize_directory("/nonexistent/dir/xyz");
         assert_eq!(missing, std::path::PathBuf::from("/nonexistent/dir/xyz"));

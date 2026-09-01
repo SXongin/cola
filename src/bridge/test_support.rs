@@ -2527,8 +2527,13 @@ pub(crate) mod integration_tests {
             .get_active(&thread_key)
             .cloned()
             .expect("a session should be active after /new");
+        // normalize_directory canonicalizes the project path (resolving
+        // /private/var on macOS and \\?\ / 8.3 short names on Windows), so
+        // compare against the canonicalized form — not the raw tempdir path.
+        let canonical = std::fs::canonicalize(proj.path()).unwrap();
         assert_eq!(
-            entry.directory, proj_dir,
+            entry.directory,
+            canonical.to_string_lossy(),
             "/new must inherit the active session's directory, not work_dir"
         );
         assert_ne!(
@@ -2616,7 +2621,13 @@ pub(crate) mod integration_tests {
             .cloned()
             .expect("topic thread_id should map to the new session");
         assert_eq!(entry.session_id, "ses_topic");
-        assert_eq!(entry.directory, proj_dir);
+        // normalize_directory canonicalizes the project path (resolving
+        // /private/var on macOS and \\?\ / 8.3 short names on Windows), so
+        // compare against the canonicalized form — not the raw tempdir path.
+        assert_eq!(
+            entry.directory,
+            std::fs::canonicalize(proj.path()).unwrap().to_string_lossy()
+        );
         // The named `/topic` PATCHed the server title (ADR-0007).
         assert_eq!(
             title_calls.lock().await.as_slice(),
