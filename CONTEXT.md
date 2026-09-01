@@ -60,7 +60,7 @@ A structured multi-choice prompt from the AI backend, distinct from permissions.
 _Avoid_: Poll, survey, prompt
 
 **Card**:
-A Feishu interactive message card. Evolves through states (loading → reasoning → running → streaming → done) and uses collapsible panels for secondary content.
+A Feishu interactive message card. Evolves through states (loading → reasoning → running → streaming → done), uses collapsible panels for secondary content, and shows progress in its header (phase timer, silence, reasoning length) so a slow turn is distinguishable from a dead one — including a "等待你的授权/回答" state while a permission or question is pending.
 _Avoid_: Widget, component, bubble
 
 **Quoted Context**:

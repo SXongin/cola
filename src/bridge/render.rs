@@ -156,12 +156,14 @@ fn render_part(acc: &mut StreamAccumulator, part: &serde_json::Value) {
                 acc.push_text(t);
             }
             acc.card_state = crate::feishu::card::CardState::Streaming;
+            acc.mark_content();
         }
         Some("reasoning") => {
             if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
                 acc.push_reasoning(t);
             }
             acc.card_state = crate::feishu::card::CardState::Reasoning;
+            acc.mark_content();
         }
         Some("tool") => {
             let name = part.get("tool").and_then(|v| v.as_str()).unwrap_or("tool");
@@ -193,12 +195,15 @@ fn render_part(acc: &mut StreamAccumulator, part: &serde_json::Value) {
             if status == "running" {
                 acc.card_state = crate::feishu::card::CardState::Streaming;
             }
+            acc.mark_content();
         }
         Some("step-start") | Some("step-finish") | Some("patch") => {
             // No visible content for these
         }
         _ => {}
     }
+    // card_state / running-tool changes reset the header phase timer.
+    acc.refresh_phase();
 }
 
 /// Render a batch of parts into the accumulator, skipping anything already
@@ -399,19 +404,29 @@ pub(crate) async fn render_and_flush(
     // OpenCode auto-renames sessions after a turn; follow the server's live
     // title so the card subtitle doesn't stay on the "new session" default.
     refresh_session_title(core, session_id).await;
-    let (changed, new_parts, text_len, reasoning_len) = {
+    let (changed, header_changed, new_parts, text_len, reasoning_len) = {
         let mut cards = core.cards.lock().await;
         let card = cards.get_mut(session_id)?;
         let before = card.acc.rendered_parts.len();
         let changed = render_new_turn_parts(&mut card.acc, msgs, epoch_ms);
+        // Re-flush when the header changed even without new content: the
+        // progress timer/silence keeps ticking, so a silent turn still proves
+        // it is alive (ADR-0014). Whole-second timestamps bound this to at
+        // most one flush per second.
+        let sig = card.acc.header_sig();
+        let header_changed = sig != card.last_header_sig;
+        if header_changed {
+            card.last_header_sig = sig;
+        }
         (
             changed,
+            header_changed,
             card.acc.rendered_parts.len() - before,
             card.acc.text.len(),
             card.acc.reasoning.len(),
         )
     };
-    if changed {
+    if changed || header_changed {
         flush_card(core, session_id).await;
     }
     Some((new_parts, text_len, reasoning_len))
@@ -462,6 +477,38 @@ mod tests {
     use super::*;
     use crate::bridge::streaming::StreamAccumulator;
     use crate::feishu::card::CardState;
+
+    #[test]
+    fn render_part_marks_content_and_tracks_header_phase() {
+        use crate::bridge::streaming::HeaderPhase;
+        use crate::opencode::client::{MessageInfo, MessageTime, SessionMessage};
+
+        let epoch = 0;
+        let mut acc = StreamAccumulator::new("test");
+        acc.submit_epoch_ms = Some(epoch);
+        assert_eq!(acc.last_content_at, None, "no content yet");
+        assert_eq!(acc.current_phase, Some(HeaderPhase::Loading));
+
+        let msgs = vec![SessionMessage {
+            info: MessageInfo {
+                id: "a1".into(),
+                role: Some("assistant".into()),
+                parent_id: None,
+                time: Some(MessageTime { created: 100 }),
+                model_id: None,
+                provider_id: None,
+                tokens: None,
+            },
+            parts: serde_json::json!([
+                { "type": "reasoning", "text": "Let me think" },
+                { "type": "text", "text": "Answer" },
+            ]),
+        }];
+
+        assert!(render_new_turn_parts(&mut acc, &msgs, epoch));
+        assert!(acc.last_content_at.is_some(), "content must be marked");
+        assert_eq!(acc.current_phase, Some(HeaderPhase::Streaming));
+    }
 
     #[test]
     fn render_parts_shows_reasoning_and_tool_output() {

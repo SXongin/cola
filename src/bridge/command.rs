@@ -859,15 +859,19 @@ async fn send_agent_card(
     Ok(())
 }
 
-/// Send the `/model` picker card (ADR-0012, issue 05): one button per model.
+/// Send the `/model` provider-picker cards (ADR-0012, issue 05): step 1 of a
+/// two-level provider → model flow, chunked so any provider count stays under
+/// Feishu's card limits.
 async fn send_model_card(
     core: &Arc<SharedCore>,
     thread_key: &ThreadKey,
     message_id: &str,
 ) -> crate::error::Result<()> {
     let providers = core.opencode.list_models().await;
-    let card = crate::feishu::card::build_model_card(thread_key, &providers);
-    core.feishu.reply_card(message_id, &card).await?;
+    let cards = crate::feishu::card::build_model_provider_cards(thread_key, &providers);
+    for card in cards {
+        core.feishu.reply_card(message_id, &card).await?;
+    }
     Ok(())
 }
 

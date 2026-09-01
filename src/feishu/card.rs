@@ -72,9 +72,52 @@ pub(crate) fn chunk_text(text: &str, max: usize) -> Vec<String> {
     chunks
 }
 
+/// Format a duration in seconds for the header's live timer (ADR-0014):
+/// `42s`, `1m23s`, `2h5m`, `3d4h`. Whole seconds, so a header signature built
+/// from it changes at most once per second — the natural flush throttle.
+pub(crate) fn fmt_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else if secs < 86_400 {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!("{}d{}h", secs / 86_400, (secs % 86_400) / 3600)
+    }
+}
+
+/// A compact reasoning-length label for the thinking header: `832字`, `2.1k字`.
+fn format_chars(n: usize) -> String {
+    if n >= 1000 {
+        format!("{:.1}k字", n as f64 / 1000.0)
+    } else {
+        format!("{n}字")
+    }
+}
+
 /// Builds Feishu interactive card JSON (v2 schema with collapsible panels).
 /// Body elements are appended in the order the builder methods are called, so
 /// text and tool panels can be interleaved chronologically.
+/// Progress/liveness signals for the card header (ADR-0014): whether the turn
+/// is paused waiting for a permission/question, how long the current phase has
+/// run, how long since content last arrived, and the reasoning text length.
+/// Bundled so they travel through the builder, the header renderer, and the
+/// accumulator as one unit instead of four loose values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HeaderProgress {
+    /// A permission/question is pending: the header shows "等待你的授权/回答"
+    /// instead of the phase label — the turn is paused, not stuck.
+    pub waiting: bool,
+    /// Seconds the current phase (thinking/reasoning/tool/streaming) has run.
+    pub elapsed: Option<u64>,
+    /// Seconds since the last content arrived (None = nothing rendered yet).
+    /// Shown once a turn has been silent for a few seconds.
+    pub silence: Option<u64>,
+    /// Reasoning text length, shown on the thinking header as real progress.
+    pub reasoning_chars: usize,
+}
+
 pub struct CardBuilder {
     state: CardState,
     /// Tool panels in call order (also drives the header's running-tool hint).
@@ -85,6 +128,11 @@ pub struct CardBuilder {
     subtitle: Option<String>,
     /// JSON 2.0 buttons shown only on the Error card (e.g. a retry action).
     error_buttons: Vec<CardActionButton>,
+    /// Progress/liveness inputs for the header (ADR-0014): the waiting flag,
+    /// the phase timer, the silence since last content, and the reasoning
+    /// length. When absent (all defaults) the header renders the plain phase
+    /// label — non-streaming builders (permission/switch cards) stay unchanged.
+    progress: HeaderProgress,
 }
 
 /// A JSON 2.0 button (tag: `button`, sits directly in `body.elements`).
@@ -390,7 +438,18 @@ impl CardBuilder {
             footer: None,
             subtitle: None,
             error_buttons: Vec::new(),
+            progress: HeaderProgress::default(),
         }
+    }
+
+    /// Progress/liveness inputs for the header (ADR-0014): a waiting flag for
+    /// pending permission/question interactions, the phase timer, the silence
+    /// since last content, and the reasoning length. When absent the header
+    /// renders the plain phase label — builders that don't set progress (e.g.
+    /// permission/switch cards) stay unchanged.
+    pub fn with_progress(mut self, progress: HeaderProgress) -> Self {
+        self.progress = progress;
+        self
     }
 
     /// The session/thread name, shown as the card's subtitle so the header can
@@ -476,7 +535,8 @@ impl CardBuilder {
             }
         }
 
-        let (header_title, template) = self.header_info();
+        let running = self.tools.iter().find(|t| t.status == "running");
+        let (header_title, template) = header_title_and_template(&self.state, running, &self.progress);
         let mut header = serde_json::json!({
             "title": { "tag": "plain_text", "content": header_title },
             "template": template
@@ -494,36 +554,60 @@ impl CardBuilder {
             "body": { "elements": elements }
         })
     }
+}
 
-    /// Dynamic header: the card is a reply, so the header shows only the state
-    /// (the question already sits in the reply context above). The session name
-    /// goes in the subtitle.
-    fn header_info(&self) -> (String, &'static str) {
-        match self.state {
-            CardState::Loading => ("⏳ 思考中...".to_string(), "blue"),
-            CardState::Reasoning => ("💭 推理中...".to_string(), "blue"),
-            CardState::Streaming => {
-                if let Some(tool) = self.tools.iter().find(|t| t.status == "running") {
-                    // One icon only: `status_icon` already marks running/pending
-                    // with ⏳, so an extra hardcoded 🔧 would show TWO icons
-                    // (e.g. "🔧 ⏳ bench") on long-running tools.
-                    (format!("{} {}", tool.status_icon(), tool.name), "orange")
-                } else {
-                    ("✍️ 回复中...".to_string(), "blue")
-                }
-            }
-            // A split card is finalized; its content continues in the next card.
-            CardState::Continued => ("⏳ 部分完成，继续中…".to_string(), "blue"),
-            CardState::Done => {
-                // The turn itself finished. Individual tool failures are shown
-                // on their own panels (❌ + reason); they don't make the whole
-                // turn a failure — the model routinely retries or works around
-                // a failed tool call and still completes the task.
-                ("✅ 完成".to_string(), "green")
-            }
-            CardState::Error => ("❌ 出错".to_string(), "red"),
-        }
+/// Header title + template for a card. `running_tool` is the tool currently
+/// running (from the builder's tools), driving the "⏳ tool" streaming header.
+/// Active states append the progress signals passed in from the accumulator;
+/// `progress.waiting` (a pending permission/question) overrides the phase label
+/// entirely.
+pub(crate) fn header_title_and_template(
+    state: &CardState,
+    running_tool: Option<&ToolPanel>,
+    progress: &HeaderProgress,
+) -> (String, &'static str) {
+    if progress.waiting {
+        return ("⏳ 等待你的授权/回答".to_string(), "orange");
     }
+    let (label, template) = match state {
+        CardState::Loading => ("⏳ 思考中".to_string(), "blue"),
+        CardState::Reasoning => ("💭 推理中".to_string(), "blue"),
+        CardState::Streaming => {
+            if let Some(tool) = running_tool {
+                // One icon only: `status_icon` already marks running/pending
+                // with ⏳, so an extra hardcoded 🔧 would show TWO icons
+                // (e.g. "🔧 ⏳ bench") on long-running tools.
+                (format!("{} {}", tool.status_icon(), tool.name), "orange")
+            } else {
+                ("✍️ 回复中".to_string(), "blue")
+            }
+        }
+        CardState::Continued => ("⏳ 部分完成，继续中…".to_string(), "blue"),
+        CardState::Done => ("✅ 完成".to_string(), "green"),
+        CardState::Error => ("❌ 出错".to_string(), "red"),
+    };
+    let mut title = label;
+    match state {
+        CardState::Loading | CardState::Reasoning | CardState::Streaming => {
+            if let Some(e) = progress.elapsed {
+                title.push_str(&format!(" {}", fmt_elapsed(e)));
+            }
+            // A turn that has been silent for a few seconds shows the growing
+            // silence: honest "still alive, not emitting" vs "emitting".
+            if let Some(s) = progress.silence
+                && s >= 3
+            {
+                title.push_str(&format!(" · 静默 {}", fmt_elapsed(s)));
+            }
+            // Reasoning is streamed incrementally by OpenCode, so its length is
+            // real progress during the thinking phase.
+            if *state == CardState::Reasoning && progress.reasoning_chars > 0 {
+                title.push_str(&format!(" · {}", format_chars(progress.reasoning_chars)));
+            }
+        }
+        _ => {}
+    }
+    (title, template)
 }
 
 /// Build a collapsible panel (v2), folded by default.
@@ -897,19 +981,79 @@ fn option_picker_card(
     action: &str,
     options: &[(String, String)],
 ) -> serde_json::Value {
+    picker_card(header, intro, thread_key, action, None, false, options)
+}
+
+/// The `/model` picker-card back button's value: clicking it returns from a
+/// provider's model page to the full provider list. A named constant (not a
+/// bare string literal) so the handler's comparison cannot typo-silently break
+/// navigation.
+pub(crate) const PICKER_BACK_TO_PROVIDERS: &str = "__providers__";
+
+/// The two levels of the `/model` picker card (ADR-0012 issue 05): a
+/// `Provider` button on the provider-list page (its `value` is a provider id,
+/// or [`PICKER_BACK_TO_PROVIDERS`] to go back); a `Model` button records the
+/// per-session override. Serialized as the callback's `level` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PickerLevel {
+    Provider,
+    Model,
+}
+
+impl PickerLevel {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            PickerLevel::Provider => "provider",
+            PickerLevel::Model => "model",
+        }
+    }
+}
+
+/// A picker card whose buttons carry an optional `level` (two-step navigation
+/// for the `/model` provider → model flow) and an optional leading "back"
+/// button. Each button's callback payload is `{action, chat_id, thread_id,
+/// [level], value}`.
+fn picker_card(
+    header: &str,
+    intro: &str,
+    thread_key: &crate::config::ThreadKey,
+    action: &str,
+    level: Option<PickerLevel>,
+    back: bool,
+    options: &[(String, String)],
+) -> serde_json::Value {
     let mut elements: Vec<serde_json::Value> = vec![json!({ "tag": "markdown", "content": intro })];
-    for (label, value) in options {
+    if back {
         elements.push(json!({
             "tag": "button",
-            "text": { "tag": "plain_text", "content": label },
+            "text": { "tag": "plain_text", "content": "← 返回全部 provider" },
             "type": "default",
             "width": "fill",
             "value": {
                 "action": action,
                 "chat_id": thread_key.chat_id,
                 "thread_id": thread_key.thread_id,
-                "value": value,
+                "level": PickerLevel::Provider.as_str(),
+                "value": PICKER_BACK_TO_PROVIDERS,
             },
+        }));
+    }
+    for (label, value) in options {
+        let mut payload = json!({
+            "action": action,
+            "chat_id": thread_key.chat_id,
+            "thread_id": thread_key.thread_id,
+            "value": value,
+        });
+        if let Some(l) = level {
+            payload["level"] = json!(l.as_str());
+        }
+        elements.push(json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": label },
+            "type": "default",
+            "width": "fill",
+            "value": payload,
         }));
     }
     json!({
@@ -942,24 +1086,145 @@ pub fn build_agent_card(
     option_picker_card("🤖 选择 Agent", intro, thread_key, "agent", &options)
 }
 
-/// The `/model` picker card: one button per `provider/model`. Falls back to an
-/// empty intro when no models are listed (the backend is unreachable).
-pub fn build_model_card(
+/// The `/model` picker, step 1: one card page per set of `provider` buttons.
+/// Falls back to an empty intro when no providers are listed (the backend is
+/// unreachable).
+///
+/// A shared OpenCode server advertises providers across every model source it
+/// knows (gateways included) — hundreds of providers and thousands of models,
+/// which in a single button-per-model card blows past Feishu's 30KB / component
+/// ceilings and the send fails silently (the `/model` command "does nothing").
+/// The flow is therefore two-step: pick a provider here, then one of its
+/// models ([`build_model_picker_cards`]); every card is chunked to stay under
+/// the card budgets, and any model stays selectable via the
+/// `/model <provider/model>` text form.
+pub fn build_model_provider_cards(
     thread_key: &crate::config::ThreadKey,
     providers: &[crate::opencode::client::ProviderModels],
-) -> serde_json::Value {
-    let intro = if providers.is_empty() {
-        "_(没有可用模型)_"
-    } else {
-        "**选择模型**（下一条消息开始生效）："
-    };
-    let mut options: Vec<(String, String)> = Vec::new();
-    for p in providers {
-        for m in &p.models {
-            options.push((format!("{}/{}", p.provider, m), format!("{}/{}", p.provider, m)));
-        }
+) -> Vec<serde_json::Value> {
+    let options: Vec<(String, String)> = providers
+        .iter()
+        .map(|p| (p.provider.clone(), p.provider.clone()))
+        .collect();
+    if options.is_empty() {
+        return vec![picker_card(
+            "🎯 选择模型",
+            "_(没有可用模型)_",
+            thread_key,
+            "model",
+            Some(PickerLevel::Provider),
+            false,
+            &[],
+        )];
     }
-    option_picker_card("🎯 选择模型", intro, thread_key, "model", &options)
+    chunk_picker_cards(
+        "🎯 选择模型",
+        &format!("**选择 provider**（共 {} 个）：", options.len()),
+        thread_key,
+        "model",
+        Some(PickerLevel::Provider),
+        false,
+        &options,
+    )
+}
+
+/// The `/model` picker, step 2: one card page per set of `provider/model`
+/// buttons for a single chosen provider. Carries a leading "← 返回全部
+/// provider" button so the user can back out of a wrong provider.
+pub fn build_model_picker_cards(
+    thread_key: &crate::config::ThreadKey,
+    provider: &str,
+    models: &[String],
+) -> Vec<serde_json::Value> {
+    // The provider is already chosen (step 1), so the button LABEL shows just
+    // the model name — a `provider/model` label truncates in Feishu's button
+    // width. The callback VALUE keeps the full `provider/model` the handler
+    // records as the override.
+    let options: Vec<(String, String)> = models
+        .iter()
+        .map(|m| (m.clone(), format!("{provider}/{m}")))
+        .collect();
+    if options.is_empty() {
+        return vec![picker_card(
+            &format!("🎯 {provider}"),
+            "_(该 provider 没有可用模型)_",
+            thread_key,
+            "model",
+            Some(PickerLevel::Model),
+            true,
+            &[],
+        )];
+    }
+    chunk_picker_cards(
+        &format!("🎯 {provider}"),
+        "**选择 model**（下一条消息开始生效）：",
+        thread_key,
+        "model",
+        Some(PickerLevel::Model),
+        true,
+        &options,
+    )
+}
+
+/// Max picker buttons per card. Feishu counts each button's inner `plain_text`
+/// as a separate element against the JSON 2.0 ceiling of 200 elements+components
+/// (error 300305 / 11310 "element exceeds the limit" — measured via the cardkit
+/// create API at 99 buttons max with an intro markdown). 80 keeps a comfortable
+/// margin including the back button's two elements.
+pub const MAX_PICKER_BUTTONS_PER_CARD: usize = 80;
+
+/// Build picker cards from `options`, chunking so each card stays under
+/// Feishu's component and JSON-size ceilings. Each card beyond the first
+/// carries a page hint so the user knows there is more.
+fn chunk_picker_cards(
+    header: &str,
+    intro: &str,
+    thread_key: &crate::config::ThreadKey,
+    action: &str,
+    level: Option<PickerLevel>,
+    back: bool,
+    options: &[(String, String)],
+) -> Vec<serde_json::Value> {
+    let mut pages: Vec<&[(String, String)]> = Vec::new();
+    let mut start = 0usize;
+    while start < options.len() {
+        // Estimate JSON bytes like the streaming splitter (a button is ~200
+        // bytes + the label's UTF-8); bound the button COUNT by the picker
+        // budget, not the streaming 150-component constant — buttons cost ~2
+        // elements each against Feishu's 200-element ceiling.
+        let mut bytes = intro.len() + 64;
+        let mut end = start;
+        while end < options.len()
+            && end - start < MAX_PICKER_BUTTONS_PER_CARD
+            && bytes + 200 + options[end].0.len() * 2 <= MAX_CARD_JSON_CHARS
+        {
+            bytes += 200 + options[end].0.len() * 2;
+            end += 1;
+        }
+        if end == start {
+            end = start + 1; // a single oversized option still gets its own card
+        }
+        pages.push(&options[start..end]);
+        start = end;
+    }
+    let n_pages = pages.len();
+    let mut cards: Vec<serde_json::Value> = Vec::with_capacity(n_pages);
+    for (i, page) in pages.into_iter().enumerate() {
+        let mut intro_text = intro.to_string();
+        if n_pages > 1 {
+            intro_text.push_str(&format!("（第 {} / {} 页）", i + 1, n_pages));
+        }
+        cards.push(picker_card(
+            header,
+            &intro_text,
+            thread_key,
+            action,
+            level,
+            back,
+            page,
+        ));
+    }
+    cards
 }
 
 /// The `/autoaccept` toggle card: two buttons showing the current state.
@@ -1294,6 +1559,82 @@ mod tests {
         );
     }
 
+    /// A provider list of any size must never build a card over Feishu's
+    /// ceilings: the `/model` picker chunks into pages under the byte budget.
+    #[test]
+    fn provider_cards_chunk_without_exceeding_feishu_limits() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        // A shared server advertising hundreds of providers.
+        let providers: Vec<crate::opencode::client::ProviderModels> = (0..212)
+            .map(|p| crate::opencode::client::ProviderModels {
+                provider: format!("provider-{p}"),
+                models: vec!["m".into()],
+            })
+            .collect();
+        let cards = build_model_provider_cards(&key, &providers);
+        assert!(cards.len() > 1, "huge provider list must split: {}", cards.len());
+        let mut total_buttons = 0;
+        for card in &cards {
+            let elements = card["body"]["elements"].as_array().unwrap();
+            let buttons = elements.iter().filter(|e| e["tag"] == "button").count();
+            total_buttons += buttons;
+            assert!(
+                buttons <= MAX_PICKER_BUTTONS_PER_CARD,
+                "page over ceiling: {buttons}"
+            );
+            assert!(
+                card.to_string().len() <= FEISHU_CARD_LIMIT_BYTES,
+                "page over bytes"
+            );
+        }
+        assert_eq!(total_buttons, providers.len(), "every provider gets a button");
+    }
+
+    /// The model picker for one provider carries a back button and honors the
+    /// card budgets even for a provider with hundreds of models.
+    #[test]
+    fn model_picker_chunks_and_has_back_button() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let models: Vec<String> = (0..400).map(|i| format!("model-{i}")).collect();
+        let cards = build_model_picker_cards(&key, "opencode", &models);
+        assert!(cards.len() > 1, "huge model list must split: {}", cards.len());
+        let first = &cards[0];
+        let buttons = first["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["tag"] == "button")
+            .count();
+        // The first card also carries the "back" button, so model buttons are
+        // one fewer than the total button count.
+        assert!(buttons - 1 <= MAX_PICKER_BUTTONS_PER_CARD);
+        assert!(
+            first.to_string().contains("返回全部 provider"),
+            "model picker must offer a way back"
+        );
+        let payload = &first["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["tag"] == "button")
+            .unwrap()["value"];
+        assert_eq!(payload["level"].as_str(), Some("provider"), "back button level");
+        assert_eq!(payload["value"].as_str(), Some("__providers__"));
+        assert!(first.to_string().contains("opencode/model-0"));
+        for card in &cards {
+            assert!(card.to_string().len() <= FEISHU_CARD_LIMIT_BYTES);
+        }
+    }
+
+    /// An empty provider list degrades to a single "no models" card, not zero.
+    #[test]
+    fn provider_cards_degrade_to_empty_intro() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let cards = build_model_provider_cards(&key, &[]);
+        assert_eq!(cards.len(), 1);
+        assert!(cards[0].to_string().contains("没有可用模型"));
+    }
+
     #[test]
     fn tool_panel_completed_is_collapsible() {
         let tool = ToolPanel {
@@ -1375,6 +1716,149 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("503")
+        );
+    }
+
+    #[test]
+    fn fmt_elapsed_formats_durations() {
+        assert_eq!(fmt_elapsed(0), "0s");
+        assert_eq!(fmt_elapsed(42), "42s");
+        assert_eq!(fmt_elapsed(83), "1m23s");
+        assert_eq!(fmt_elapsed(3700), "1h1m");
+        assert_eq!(fmt_elapsed(90_000), "1d1h");
+    }
+
+    #[test]
+    fn loading_header_with_progress_shows_timer() {
+        // Without progress inputs the header is the plain phase label (existing
+        // builders/tests unchanged).
+        let plain = CardBuilder::new().with_state(CardState::Loading).build();
+        assert_eq!(plain["header"]["title"]["content"].as_str().unwrap(), "⏳ 思考中");
+        // With a phase timer the active header counts up.
+        let card = CardBuilder::new()
+            .with_state(CardState::Loading)
+            .with_progress(HeaderProgress {
+                elapsed: Some(83),
+                silence: Some(5),
+                ..Default::default()
+            })
+            .build();
+        let header = card["header"]["title"]["content"].as_str().unwrap();
+        assert!(header.contains("思考中"), "{}", header);
+        assert!(header.contains("1m23s"), "timer missing: {}", header);
+    }
+
+    #[test]
+    fn reasoning_header_shows_timer_silence_and_length() {
+        let card = CardBuilder::new()
+            .with_state(CardState::Reasoning)
+            .with_progress(HeaderProgress {
+                elapsed: Some(83),
+                silence: Some(5),
+                reasoning_chars: 2100,
+                ..Default::default()
+            })
+            .build();
+        let header = card["header"]["title"]["content"].as_str().unwrap();
+        assert!(header.contains("推理中"), "{}", header);
+        assert!(header.contains("1m23s"), "timer missing: {}", header);
+        assert!(header.contains("静默 5s"), "silence missing: {}", header);
+        assert!(header.contains("2.1k字"), "reasoning length missing: {}", header);
+        assert_eq!(card["header"]["template"].as_str().unwrap(), "blue");
+    }
+
+    #[test]
+    fn waiting_header_overrides_phase() {
+        // A pending permission/question pauses the turn: the header says the
+        // truth — it's waiting for the user, not stuck.
+        let card = CardBuilder::new()
+            .with_state(CardState::Reasoning)
+            .with_progress(HeaderProgress {
+                waiting: true,
+                elapsed: Some(83),
+                silence: Some(5),
+                ..Default::default()
+            })
+            .build();
+        assert_eq!(
+            card["header"]["title"]["content"].as_str().unwrap(),
+            "⏳ 等待你的授权/回答"
+        );
+        assert_eq!(card["header"]["template"].as_str().unwrap(), "orange");
+    }
+
+    #[test]
+    fn silence_is_hidden_until_three_seconds() {
+        // Sub-3s silence is noise ("0s前"); the header only surfaces it once a
+        // turn has genuinely gone quiet.
+        let quiet = CardBuilder::new()
+            .with_state(CardState::Streaming)
+            .with_progress(HeaderProgress {
+                elapsed: Some(10),
+                silence: Some(2),
+                ..Default::default()
+            })
+            .build();
+        let header = quiet["header"]["title"]["content"].as_str().unwrap();
+        assert!(!header.contains("静默"), "premature silence: {}", header);
+        let loud = CardBuilder::new()
+            .with_state(CardState::Streaming)
+            .with_progress(HeaderProgress {
+                elapsed: Some(10),
+                silence: Some(3),
+                ..Default::default()
+            })
+            .build();
+        assert!(
+            loud["header"]["title"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("静默 3s")
+        );
+    }
+
+    #[test]
+    fn header_changes_with_progress_and_state() {
+        // The render poll flushes when the header changes: the timer tick, a
+        // silence crossing, and a state change must all yield distinct headers.
+        let header_of = |state: CardState, progress: HeaderProgress| {
+            CardBuilder::new()
+                .with_state(state)
+                .with_progress(progress)
+                .build()["header"]["title"]["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let tick = |elapsed: Option<u64>| HeaderProgress {
+            elapsed,
+            ..Default::default()
+        };
+        let silent = |silence: Option<u64>| HeaderProgress {
+            elapsed: Some(10),
+            silence,
+            ..Default::default()
+        };
+        assert_ne!(
+            header_of(CardState::Streaming, tick(Some(0))),
+            header_of(CardState::Streaming, tick(Some(1))),
+            "timer tick must change the header"
+        );
+        assert_ne!(
+            header_of(CardState::Streaming, silent(Some(2))),
+            header_of(CardState::Streaming, silent(Some(3))),
+            "silence threshold must change the header"
+        );
+        assert_ne!(
+            header_of(CardState::Streaming, silent(Some(3))),
+            header_of(
+                CardState::Streaming,
+                HeaderProgress {
+                    waiting: true,
+                    ..silent(Some(3))
+                }
+            ),
+            "waiting must change the header"
         );
     }
 

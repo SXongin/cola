@@ -209,10 +209,7 @@ impl ExternalFlow {
             let mut cards = core.cards.lock().await;
             cards.insert(
                 session_id.to_string(),
-                crate::bridge::streaming::CardSession {
-                    acc,
-                    card_message_id: Some(card_id.to_string()),
-                },
+                crate::bridge::streaming::CardSession::new(acc, Some(card_id.to_string())),
             );
         }
         tracing::info!("external reply render armed for session {}", session_id);

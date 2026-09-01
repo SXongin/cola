@@ -1079,10 +1079,7 @@ pub(crate) mod integration_tests {
             let mut cards = app.cards.lock().await;
             cards.insert(
                 "ses_test".into(),
-                crate::bridge::streaming::CardSession {
-                    acc,
-                    card_message_id: None,
-                },
+                crate::bridge::streaming::CardSession::new(acc, None),
             );
         }
 
@@ -4157,7 +4154,8 @@ pub(crate) mod integration_tests {
         assert_eq!(entry.directory, "/work/proj", "inherits the current project");
     }
 
-    /// `/model` (no args) sends the model-picker card with one button per model.
+    /// `/model` (no args) sends the provider-picker card (step 1 of the
+    /// two-level flow): one button per provider, not per model.
     #[tokio::test]
     async fn model_no_arg_sends_picker_card() {
         let _wd = test_work_dir();
@@ -4191,20 +4189,28 @@ pub(crate) mod integration_tests {
             .expect("a model card should be sent");
         let text = card.to_string();
         assert!(text.contains("选择模型"), "header: {text}");
+        assert!(text.contains("选择 provider"), "intro: {text}");
+        assert!(text.contains("\"value\":\"opencode\""), "provider button: {text}");
         assert!(
-            text.contains("opencode/deepseek-v4-flash"),
-            "model button: {text}"
+            !text.contains("deepseek-v4-flash"),
+            "step 1 must not show models: {text}"
         );
-        assert!(text.contains("opencode/gpt-4o"), "model button: {text}");
     }
 
-    /// A `/model` picker-card button records the per-session override.
+    /// A `/model` provider-picker button (level `provider`) opens that
+    /// provider's model picker; a model button (level `model`) records the
+    /// per-session override.
     #[tokio::test]
     async fn model_card_button_records_override() {
         let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
-        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.provider_models = vec![crate::opencode::client::ProviderModels {
+            provider: "opencode".into(),
+            models: vec!["deepseek-v4-flash".into(), "gpt-4o".into()],
+        }];
+        let (app, _platform) = build_app(cfg, backend).await;
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
         {
             let mut store = app.sessions.lock().await;
@@ -4219,16 +4225,75 @@ pub(crate) mod integration_tests {
             });
         }
 
-        let value = serde_json::json!({
+        // Step 1: pick a provider → the ack card becomes that provider's model
+        // picker.
+        let provider = serde_json::json!({
             "action": "model",
+            "level": "provider",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "value": "opencode",
+        });
+        let step1 = app
+            .handle_card_action(provider)
+            .await
+            .expect("provider card action");
+        let step1_card = step1.card.expect("provider click swaps in the model picker");
+        let text1 = step1_card.to_string();
+        assert!(
+            text1.contains("opencode/deepseek-v4-flash"),
+            "model button: {text1}"
+        );
+        assert!(text1.contains("返回全部 provider"), "back button: {text1}");
+
+        // Step 2: pick a model → the override is recorded (toast only, no card).
+        let model = serde_json::json!({
+            "action": "model",
+            "level": "model",
             "chat_id": "chat_1",
             "thread_id": "chat_1",
             "value": "opencode/deepseek-v4-flash",
         });
-        let result = app.handle_card_action(value).await.expect("model card action");
-        assert!(result.card.is_some(), "refreshed card returned");
+        let step2 = app.handle_card_action(model).await.expect("model card action");
+        assert!(step2.card.is_none(), "selection is toast-only");
         let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
         assert_eq!(entry.model.as_deref(), Some("opencode/deepseek-v4-flash"));
+    }
+
+    /// The model picker's back button (level `provider`, `__providers__`)
+    /// returns to the full provider list.
+    #[tokio::test]
+    async fn model_picker_back_button_returns_to_providers() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.provider_models = vec![
+            crate::opencode::client::ProviderModels {
+                provider: "opencode".into(),
+                models: vec!["deepseek-v4-flash".into()],
+            },
+            crate::opencode::client::ProviderModels {
+                provider: "openrouter".into(),
+                models: vec!["gpt-4o".into()],
+            },
+        ];
+        let (app, _platform) = build_app(cfg, backend).await;
+        let value = serde_json::json!({
+            "action": "model",
+            "level": "provider",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "value": "__providers__",
+        });
+        let result = app.handle_card_action(value).await.expect("back action");
+        let card = result.card.expect("back returns a card");
+        let text = card.to_string();
+        assert!(text.contains("opencode") && text.contains("openrouter"), "{text}");
+        assert!(
+            !text.contains("deepseek-v4-flash"),
+            "provider list, not models: {text}"
+        );
     }
 
     /// `/agent` (no args) sends the agent-picker card; a button records the

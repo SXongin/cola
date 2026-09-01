@@ -40,6 +40,35 @@ pub struct PendingQuestion {
 pub struct CardSession {
     pub acc: StreamAccumulator,
     pub card_message_id: Option<String>,
+    /// The header signature of the last flush, compared on each poll so the
+    /// card is re-flushed when the progress timer / silence / state changes
+    /// even with no new content (ADR-0014).
+    pub last_header_sig: String,
+}
+
+impl CardSession {
+    /// New session card: the header signature starts empty so the first poll
+    /// always flushes (stamping the progress timer). `card_message_id` is the
+    /// live card to update in place.
+    pub fn new(acc: StreamAccumulator, card_message_id: Option<String>) -> Self {
+        Self {
+            acc,
+            card_message_id,
+            last_header_sig: String::new(),
+        }
+    }
+}
+
+/// The header phase driving the live progress timer. Distinct from
+/// [`CardState`]: it tracks whether the card is actively working (thinking /
+/// reasoning / a running tool / streaming text) so the timer resets exactly
+/// when the visible phase changes (ADR-0014).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeaderPhase {
+    Loading,
+    Reasoning,
+    Tool,
+    Streaming,
 }
 
 /// Accumulates streaming state for one session.
@@ -102,6 +131,16 @@ pub struct StreamAccumulator {
     /// Epoch (ms) when this turn's prompt was submitted. Parts written at or
     /// after this time belong to this turn.
     pub submit_epoch_ms: Option<i64>,
+    /// ADR-0014: progress/liveness signals for the header.
+    /// The active header phase; None when the turn is not actively working
+    /// (Done/Error/Continued show no timer).
+    pub current_phase: Option<HeaderPhase>,
+    /// When the current phase started (wall clock); the header timer counts up
+    /// from here.
+    pub phase_started_at: Option<std::time::Instant>,
+    /// When the last content part was rendered; the header shows the growing
+    /// silence to distinguish "emitting" from "silent".
+    pub last_content_at: Option<std::time::Instant>,
 }
 
 impl StreamAccumulator {
@@ -116,8 +155,70 @@ impl StreamAccumulator {
             rendered_parts: std::collections::HashSet::new(),
             rendered_tool_states: std::collections::HashMap::new(),
             submit_epoch_ms: None,
+            // The card starts loading the moment it is created; the header
+            // timer counts from here (ADR-0014).
+            current_phase: Some(HeaderPhase::Loading),
+            phase_started_at: Some(std::time::Instant::now()),
+            last_content_at: None,
             ..Default::default()
         }
+    }
+
+    /// The header phase for the current state: None when the turn finished or
+    /// errored (no timer shown).
+    pub fn active_phase(&self) -> Option<HeaderPhase> {
+        match self.card_state {
+            CardState::Loading => Some(HeaderPhase::Loading),
+            CardState::Reasoning => Some(HeaderPhase::Reasoning),
+            CardState::Streaming => {
+                if self.tools.values().any(|t| t.status == "running") {
+                    Some(HeaderPhase::Tool)
+                } else {
+                    Some(HeaderPhase::Streaming)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Reset the phase timer whenever the active header phase changes.
+    /// Idempotent — safe to call after every mutation.
+    pub fn refresh_phase(&mut self) {
+        let new = self.active_phase();
+        if new != self.current_phase {
+            self.current_phase = new;
+            self.phase_started_at = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Record that new visible content (reasoning/text/tool) was rendered.
+    pub fn mark_content(&mut self) {
+        self.last_content_at = Some(std::time::Instant::now());
+    }
+
+    /// Progress inputs for the header (ADR-0014): waiting flag, phase timer,
+    /// silence since last content, and reasoning length. Elapsed is whole
+    /// seconds so the header signature changes at most once per second — the
+    /// flush throttle.
+    pub fn header_progress(&self) -> crate::feishu::card::HeaderProgress {
+        crate::feishu::card::HeaderProgress {
+            waiting: !self.pending_permissions.is_empty() || !self.pending_questions.is_empty(),
+            elapsed: self.phase_started_at.map(|t| t.elapsed().as_secs()),
+            silence: self.last_content_at.map(|t| t.elapsed().as_secs()),
+            reasoning_chars: self.reasoning.chars().count(),
+        }
+    }
+
+    /// The card header's signature (title + template), compared across polls
+    /// to decide whether the header changed enough to re-flush (ADR-0014).
+    pub fn header_sig(&self) -> String {
+        let running = self.tools.values().find(|t| t.status == "running");
+        let (title, template) = crate::feishu::card::header_title_and_template(
+            &self.card_state,
+            running,
+            &self.header_progress(),
+        );
+        format!("{}|{}", title, template)
     }
 
     /// Append a text chunk, keeping it in the chronological timeline (merging
@@ -167,6 +268,9 @@ impl StreamAccumulator {
         if is_new {
             self.timeline.push(TimelineItem::Tool(call_id.to_string()));
         }
+        // A running-tool phase starts/exits here (running → completed), so the
+        // header timer must follow even though card_state stays Streaming.
+        self.refresh_phase();
     }
 
     /// Build the whole card (tests + simple callers). Assembles the full
@@ -271,7 +375,9 @@ impl StreamAccumulator {
         state_override: Option<CardState>,
     ) -> serde_json::Value {
         let state = state_override.unwrap_or_else(|| self.card_state.clone());
-        let mut builder = CardBuilder::new().with_state(state);
+        let mut builder = CardBuilder::new()
+            .with_state(state)
+            .with_progress(self.header_progress());
 
         // The card is a reply to the user's message, so the session/thread name
         // goes in the subtitle and the question is NOT echoed again.
@@ -759,5 +865,82 @@ mod tests {
         );
         assert_eq!(acc.tools.len(), 1);
         assert_eq!(acc.timeline.len(), 1, "one tool marker, no duplicates");
+    }
+
+    /// The header phase (ADR-0014) follows state transitions: Loading until the
+    /// first part, Reasoning while thinking, and a running tool gets its own
+    /// Tool phase whose timer resets when it completes.
+    #[test]
+    fn header_phase_follows_state_transitions() {
+        let mut acc = StreamAccumulator::new("test");
+        assert_eq!(acc.active_phase(), Some(HeaderPhase::Loading));
+        acc.card_state = CardState::Reasoning;
+        acc.refresh_phase();
+        assert_eq!(acc.active_phase(), Some(HeaderPhase::Reasoning));
+        acc.card_state = CardState::Streaming;
+        acc.refresh_phase();
+        assert_eq!(acc.active_phase(), Some(HeaderPhase::Streaming));
+        // A running tool is its own phase.
+        acc.push_tool(
+            "call_1",
+            ToolPanel {
+                name: "bash".into(),
+                status: "running".into(),
+                input: Some(serde_json::json!("cargo test")),
+                output: None,
+            },
+        );
+        assert_eq!(acc.active_phase(), Some(HeaderPhase::Tool));
+        // Tool completes → back to plain streaming (timer resets).
+        acc.push_tool(
+            "call_1",
+            ToolPanel {
+                name: "bash".into(),
+                status: "completed".into(),
+                input: Some(serde_json::json!("cargo test")),
+                output: Some("ok".into()),
+            },
+        );
+        assert_eq!(acc.active_phase(), Some(HeaderPhase::Streaming));
+        // Finished turns show no timer phase.
+        acc.card_state = CardState::Done;
+        acc.refresh_phase();
+        assert_eq!(acc.active_phase(), None);
+    }
+
+    /// The header signature carries the phase label, and flips to a waiting
+    /// state when a permission/question is pending inline.
+    #[test]
+    fn header_sig_reflects_waiting_and_phase() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Reasoning;
+        acc.refresh_phase();
+        assert!(
+            acc.header_sig().contains("推理中"),
+            "reasoning phase in sig: {}",
+            acc.header_sig()
+        );
+        acc.pending_permissions.push(PendingPermission {
+            session_id: "s".into(),
+            request_id: "p".into(),
+            body: "bash".into(),
+            directory: "/w".into(),
+        });
+        assert!(
+            acc.header_sig().contains("等待你的授权"),
+            "pending permission must flip the header: {}",
+            acc.header_sig()
+        );
+    }
+
+    /// `mark_content` seeds the silence clock: right after content, the header
+    /// progress reports a small/some silence instead of None.
+    #[test]
+    fn mark_content_then_header_progress_reports_silence() {
+        let mut acc = StreamAccumulator::new("test");
+        assert_eq!(acc.header_progress().silence, None, "no content yet → no silence");
+        acc.mark_content();
+        let silence = acc.header_progress().silence;
+        assert!(silence.is_some(), "content must seed the silence clock");
     }
 }

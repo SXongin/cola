@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::bridge::command;
 use crate::bridge::core::SharedCore;
 use crate::bridge::render::{flush_card, render_new_turn_parts, render_parts, render_poll_loop};
-use crate::bridge::streaming::{CardSession, StreamAccumulator};
+use crate::bridge::streaming::StreamAccumulator;
 use crate::config::{Config, ConversationKind, SessionEntry, ThreadKey};
 use crate::feishu;
 use crate::opencode;
@@ -481,10 +481,7 @@ impl App {
             let mut cards = self.cards.lock().await;
             cards.insert(
                 session_id.clone(),
-                CardSession {
-                    acc,
-                    card_message_id: new_card_id,
-                },
+                crate::bridge::streaming::CardSession::new(acc, new_card_id),
             );
         }
 
@@ -962,20 +959,42 @@ impl App {
         })
     }
 
-    /// Handle a `/model` picker-card button: record the per-session override
-    /// and refresh the card.
+    /// Handle a `/model` picker-card button. Two levels (the provider → model
+    /// flow): a `level: "provider"` button either opens a provider's model list
+    /// or (`value == PICKER_BACK_TO_PROVIDERS`) returns to the full provider
+    /// list; a `level: "model"` button records the per-session override.
     async fn handle_model_card_action(
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
         value: &serde_json::Value,
     ) -> Option<CardActionResult> {
-        let model = value
+        let thread_key = thread_key_from_value(value);
+        let picked = value
             .get("value")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let thread_key = thread_key_from_value(value);
-        if crate::opencode::client::parse_model(&model).is_none() {
+
+        // Level 1: provider navigation — build and swap in the next picker page.
+        if value.get("level").and_then(|v| v.as_str())
+            == Some(crate::feishu::card::PickerLevel::Provider.as_str())
+        {
+            let providers = core.opencode.list_models().await;
+            let cards = if picked == crate::feishu::card::PICKER_BACK_TO_PROVIDERS {
+                crate::feishu::card::build_model_provider_cards(&thread_key, &providers)
+            } else {
+                let models: Vec<String> = providers
+                    .iter()
+                    .find(|p| p.provider == picked)
+                    .map(|p| p.models.clone())
+                    .unwrap_or_default();
+                crate::feishu::card::build_model_picker_cards(&thread_key, &picked, &models)
+            };
+            return Some(Self::picker_pages_result(core, &thread_key, cards).await);
+        }
+
+        // Level 2: a concrete model — record the override.
+        if crate::opencode::client::parse_model(&picked).is_none() {
             return Some(CardActionResult {
                 card: None,
                 toast: Some("模型格式应为 <provider>/<model>".to_string()),
@@ -987,7 +1006,7 @@ impl App {
                 toast: Some("当前对话还没有会话".to_string()),
             });
         };
-        entry.model = Some(model.clone());
+        entry.model = Some(picked.clone());
         {
             let mut store = core.sessions.lock().await;
             store.set_active(entry);
@@ -995,11 +1014,28 @@ impl App {
                 tracing::warn!("model card: persist failed: {}", e);
             }
         }
-        let providers = core.opencode.list_models().await;
         Some(CardActionResult {
-            card: Some(crate::feishu::card::build_model_card(&thread_key, &providers)),
-            toast: Some(format!("Model: {model}（下一条消息开始生效）")),
+            card: None,
+            toast: Some(format!("Model: {picked}（下一条消息开始生效）")),
         })
+    }
+
+    /// Turn a page of picker cards into a card-action result: the FIRST card
+    /// replaces the clicked one in place (via the ack); the remaining pages are
+    /// posted into the chat so the full picker stays visible.
+    async fn picker_pages_result(
+        core: &Arc<SharedCore>,
+        thread_key: &ThreadKey,
+        cards: Vec<serde_json::Value>,
+    ) -> CardActionResult {
+        let (first, rest) = cards.split_first().map_or((None, &[][..]), |(f, r)| (Some(f), r));
+        for card in rest {
+            let _ = core.feishu.send_card("chat_id", &thread_key.chat_id, card).await;
+        }
+        CardActionResult {
+            card: first.cloned(),
+            toast: None,
+        }
     }
 
     /// Handle an `/autoaccept` toggle-card button: switch the flag and refresh

@@ -512,6 +512,12 @@ impl Client {
     /// Available models (`GET /provider`), grouped as `provider → model ids`.
     /// Best-effort: an unreadable/cached failure returns an empty map so the
     /// `/model` card can degrade to a plain text prompt.
+    ///
+    /// Only providers the server reports as `connected` (real credentials —
+    /// `GET /provider` returns `connected: [ids]`) are surfaced: a shared
+    /// server advertises hundreds of providers most of which have no API key,
+    /// and a `/model` picker over all of them is unusable. When the response
+    /// has no `connected` field (older server) every provider is kept.
     pub async fn list_models(&self) -> Vec<crate::opencode::client::ProviderModels> {
         let Ok(resp) = self.http().get(self.url("/provider")).send().await else {
             return Vec::new();
@@ -525,7 +531,16 @@ impl Client {
         let Some(all) = v.get("all").and_then(|a| a.as_array()) else {
             return Vec::new();
         };
+        let connected: Option<std::collections::HashSet<String>> = v
+            .get("connected")
+            .and_then(|c| c.as_array())
+            .map(|ids| ids.iter().filter_map(|i| i.as_str()).map(String::from).collect());
         all.iter()
+            .filter(|prov| {
+                connected
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(prov.get("id").and_then(|i| i.as_str()).unwrap_or("")))
+            })
             .filter_map(|prov| {
                 let id = prov.get("id").and_then(|i| i.as_str())?.to_string();
                 let models: Vec<String> = prov
