@@ -119,7 +119,7 @@ Read `AGENTS.md` before touching the OpenCode server API, Feishu card/WS integra
 
 ## CI & releases
 
-GitHub Actions runs the four gates above on every push to `main` and every pull request (`.github/workflows/ci.yml`). clippy, test and build run on all three platforms (Linux/macOS/Windows); runtime discovery and the singleton lock are cross-platform via `sysinfo` (no `/proc` dependency). A `Dependency audit` job runs `cargo-deny` on every PR too. See `docs/adr/0005-cross-platform-process-discovery.md` for the design.
+GitHub Actions runs the four gates above on every push to `main` and every pull request (`.github/workflows/ci.yml`). A single `Check` job per platform (Linux/macOS/Windows) runs clippy, test and build in sequence so the shared cargo cache compiles dependencies once per OS; runtime discovery and the singleton lock are cross-platform via `sysinfo` (no `/proc` dependency). A `Dependency audit` job runs `cargo-deny` on every PR too. See `docs/adr/0005-cross-platform-process-discovery.md` for the design.
 
 Tagging a version publishes a release with the compiled binary for all three platforms. Tags follow strict semver without a `v` prefix:
 
