@@ -83,6 +83,14 @@ _Avoid_: Quote, reference, reply context
 A platform image (a standalone image message, an image inside a rich-text message, or a quoted image) downloaded by the platform and attached to a prompt as a vision file part. Requires a vision-capable model; unsupported models surface an error.
 _Avoid_: Picture, media, attachment file
 
+**Turn Footer**:
+The Card footer line summarizing what a turn ran on: working directory (project basename), git branch and dirty state, the answering model, and context-window usage. The directory/branch half is captured when the turn starts and shows from the first card; the model and context usage appear only when the turn completes.
+_Avoid_: Tail, footer bar, status line
+
+**Dirty**:
+A git working tree that differs from HEAD — including untracked files — as measured by `git status --porcelain`. Shown as ⚠ on the Turn Footer. Captured at turn start, so it reflects the state the AI operated on, not the changes the AI itself made.
+_Avoid_: Uncommitted, modified
+
 ## Relationships
 
 - A **Bot** contains one **Platform** and one or more **Backend** adapters
