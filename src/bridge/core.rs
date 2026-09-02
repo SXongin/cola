@@ -167,12 +167,13 @@ impl SharedCore {
     /// (which may be a parent of a sub-task child) and approving any
     /// already-pending permissions when turning on. Mirrors `/autoaccept` and is
     /// shared by the permission-card toggle so both paths stay in lockstep.
-    /// Returns how many pending requests were approved.
-    pub(crate) async fn set_auto_accept(&self, session_id: &str, directory: &str, on: bool) -> usize {
+    /// Returns the ids of the pending requests that were approved (empty when
+    /// `on` is false), so the caller can drop their inline card sections.
+    pub(crate) async fn set_auto_accept(&self, session_id: &str, directory: &str, on: bool) -> Vec<String> {
         let approved = if on {
             self.approve_pending_for_session(session_id, directory).await
         } else {
-            0
+            Vec::new()
         };
         // Resolve the SessionStore entry that owns the flag: `session_id`
         // itself, or its nearest ancestor (sub-task children are not in the
@@ -201,8 +202,8 @@ impl SharedCore {
     /// pending for `session_id` (or one of its sub-task child sessions) with
     /// "once". The permission poller's `seen` set skips requests it has already
     /// surfaced, so enabling autoaccept would otherwise leave old cards hanging
-    /// forever. Returns how many requests were approved.
-    pub(crate) async fn approve_pending_for_session(&self, session_id: &str, directory: &str) -> usize {
+    /// forever. Returns the ids of the requests that were approved.
+    pub(crate) async fn approve_pending_for_session(&self, session_id: &str, directory: &str) -> Vec<String> {
         let Ok(perms) = self
             .opencode
             .clone()
@@ -210,9 +211,9 @@ impl SharedCore {
             .list_permissions()
             .await
         else {
-            return 0;
+            return Vec::new();
         };
-        let mut approved = 0usize;
+        let mut approved = Vec::new();
         for p in &perms {
             // Match the session itself or a sub-task child (its parent chain).
             let Some(sid) = p.session_id.clone() else { continue };
@@ -233,7 +234,7 @@ impl SharedCore {
                         sid,
                         p.permission.as_deref().unwrap_or("?")
                     );
-                    approved += 1;
+                    approved.push(p.request_id.clone());
                 }
                 Err(e) => tracing::warn!("auto-accept pending {} on session {}: {}", p.request_id, sid, e),
             }

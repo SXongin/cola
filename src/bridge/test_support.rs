@@ -1254,19 +1254,19 @@ pub(crate) mod integration_tests {
             card_text
         );
         assert!(
-            card_text.contains("Allow Once"),
+            card_text.contains("允许一次"),
             "allow button missing: {}",
             card_text
         );
 
-        // Simulate the user clicking "Allow Once" — answered inline, so the ack
+        // Simulate the user clicking "允许一次" — answered inline, so the ack
         // carries a toast but must NOT replace the streaming card.
         let value = serde_json::json!({
             "action": "perm",
             "reply": "once",
             "session_id": "ses_test",
             "request_id": "per_1",
-            "perm_label": "✅ Allowed once",
+            "perm_label": "✅ 已允许一次",
             "perm_color": "green",
             "perm_body": "bash",
         });
@@ -1302,14 +1302,27 @@ pub(crate) mod integration_tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
         let mut backend = MockBackend::new(realistic_parts());
-        backend.permissions = vec![opencode::client::PermissionRequest {
-            request_id: "per_aa_toggle".into(),
-            session_id: Some("ses_test".into()),
-            permission: Some("bash".into()),
-            patterns: vec!["ls -la".into()],
-            metadata: None,
-            always: Vec::new(),
-        }];
+        backend.permissions = vec![
+            opencode::client::PermissionRequest {
+                request_id: "per_aa_toggle".into(),
+                session_id: Some("ses_test".into()),
+                permission: Some("bash".into()),
+                patterns: vec!["ls -la".into()],
+                metadata: None,
+                always: Vec::new(),
+            },
+            // A second, already-pending request for the same session — the
+            // toggle approves it too and must drop its inline section in the
+            // same interaction, not leave it lingering until the next poll.
+            opencode::client::PermissionRequest {
+                request_id: "per_aa_other".into(),
+                session_id: Some("ses_test".into()),
+                permission: Some("edit".into()),
+                patterns: vec!["src/main.rs".into()],
+                metadata: None,
+                always: Vec::new(),
+            },
+        ];
         let perm_calls = backend.reply_permission_calls.clone();
         let (app, platform) = build_app(cfg, backend).await;
 
@@ -1346,7 +1359,7 @@ pub(crate) mod integration_tests {
                 .acc
                 .pending_permissions
                 .len(),
-            1
+            2
         );
         assert!(
             !app.sessions
@@ -1374,12 +1387,16 @@ pub(crate) mod integration_tests {
         );
         assert_eq!(result.toast.as_deref(), Some("已开启自动授权"));
 
-        // Current permission approved with "once"; flag flipped and persisted.
-        let calls = perm_calls.lock().await.clone();
+        // Both pending permissions approved with "once"; flag flipped.
+        let mut calls = perm_calls.lock().await.clone();
+        calls.sort();
         assert_eq!(
             calls,
-            vec![("per_aa_toggle".to_string(), "once".to_string())],
-            "the pending permission should be approved once"
+            vec![
+                ("per_aa_other".to_string(), "once".to_string()),
+                ("per_aa_toggle".to_string(), "once".to_string()),
+            ],
+            "the toggle should approve the current AND other pending permissions"
         );
         assert!(
             app.sessions
@@ -1399,7 +1416,7 @@ pub(crate) mod integration_tests {
                 .acc
                 .pending_permissions
                 .is_empty(),
-            "inline section removed after the toggle"
+            "ALL inline sections removed after the toggle, not just the clicked one"
         );
         // No NEW message: only the loading card + final card, no text reply.
         let sent = platform.calls.lock().await.clone();
@@ -1463,7 +1480,7 @@ pub(crate) mod integration_tests {
         assert!(
             !sent.iter().any(|c| {
                 if let PlatformCall::ReplyCard { card, .. } = c {
-                    card.to_string().contains("Permission Required")
+                    card.to_string().contains("权限请求")
                 } else {
                     false
                 }
@@ -2314,7 +2331,7 @@ pub(crate) mod integration_tests {
         // inline section (no replacement card — the streaming card re-renders).
         let mut value = value;
         value["reply"] = serde_json::json!("once");
-        value["perm_label"] = serde_json::json!("✅ Allowed once");
+        value["perm_label"] = serde_json::json!("✅ 已允许一次");
         value["perm_color"] = serde_json::json!("green");
         let result = app.handle_card_action(value).await;
         assert!(result.is_some(), "reply should succeed for subtask session");

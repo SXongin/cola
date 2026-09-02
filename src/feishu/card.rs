@@ -616,9 +616,9 @@ fn collapsible_panel(title: &str, content: &str) -> serde_json::Value {
     })
 }
 
-/// The three permission buttons (Allow Once / Allow Always / Deny), as body
-/// elements. Shared by the standalone permission card and the inline section on
-/// the streaming card. A fourth button turns on the session's Auto-Accept
+/// The four permission buttons (Allow Once / Allow Always / Deny / Auto-Accept),
+/// as body elements. Shared by the standalone permission card and the inline
+/// section on the streaming card. The fourth turns on the session's Auto-Accept
 /// (cola-side, `/autoaccept`), distinct from "Allow Always" which is a
 /// backend-side per-type rule.
 pub fn permission_buttons(
@@ -640,9 +640,9 @@ pub fn permission_buttons(
         })
     };
     vec![
-        json!({ "tag": "button", "text": { "tag": "plain_text", "content": "✅ Allow Once" }, "type": "primary", "value": btn_value("once", "✅ Allowed once", "green") }),
-        json!({ "tag": "button", "text": { "tag": "plain_text", "content": "🔁 Allow Always" }, "type": "default", "value": btn_value("always", "✅ Allowed always", "green") }),
-        json!({ "tag": "button", "text": { "tag": "plain_text", "content": "🚫 Deny" }, "type": "danger", "value": btn_value("reject", "🚫 Denied", "red") }),
+        json!({ "tag": "button", "text": { "tag": "plain_text", "content": "✅ 允许一次" }, "type": "primary", "value": btn_value("once", "✅ 已允许一次", "green") }),
+        json!({ "tag": "button", "text": { "tag": "plain_text", "content": "🔁 始终允许" }, "type": "default", "value": btn_value("always", "✅ 已始终允许", "green") }),
+        json!({ "tag": "button", "text": { "tag": "plain_text", "content": "🚫 拒绝" }, "type": "danger", "value": btn_value("reject", "🚫 已拒绝", "red") }),
         json!({ "tag": "button", "text": { "tag": "plain_text", "content": "⚡ 开启自动授权" }, "type": "primary", "value": btn_value("autoaccept", "✅ 已开启自动授权", "blue") }),
     ]
 }
@@ -664,7 +664,7 @@ pub fn build_permission_card(
         "schema": "2.0",
         "config": { "wide_screen_mode": true },
         "header": {
-            "title": { "tag": "plain_text", "content": "🔐 Permission Required" },
+            "title": { "tag": "plain_text", "content": "🔐 权限请求" },
             "template": "orange"
         },
         "body": { "elements": elements }
@@ -2235,7 +2235,7 @@ mod tests {
         let card = build_permission_card("ses_abc", "per_123", "AI 想要执行 bash", "/tmp/proj/lib");
         assert_eq!(
             card["header"]["title"]["content"].as_str().unwrap(),
-            "🔐 Permission Required"
+            "🔐 权限请求"
         );
         // JSON 2.0: body.elements hold the markdown + buttons directly (no v1
         // action row).
@@ -2251,13 +2251,13 @@ mod tests {
         let once = values.iter().find(|v| v["reply"] == "once").unwrap();
         assert_eq!(once["request_id"], "per_123");
         assert_eq!(once["session_id"], "ses_abc");
-        assert_eq!(once["perm_label"], "✅ Allowed once");
+        assert_eq!(once["perm_label"], "✅ 已允许一次");
         assert_eq!(once["perm_color"], "green");
         assert!(once["perm_body"].as_str().unwrap().contains("bash"));
         let reject = values.iter().find(|v| v["reply"] == "reject").unwrap();
         assert_eq!(reject["perm_color"], "red");
         let always = values.iter().find(|v| v["reply"] == "always").unwrap();
-        assert!(always["perm_label"].as_str().unwrap().contains("always"));
+        assert!(always["perm_label"].as_str().unwrap().contains("始终允许"));
         // The Auto-Accept toggle carries the session id so it can flip the flag.
         let autoaccept = values.iter().find(|v| v["reply"] == "autoaccept").unwrap();
         assert_eq!(autoaccept["session_id"], "ses_abc");

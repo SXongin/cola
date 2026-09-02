@@ -633,6 +633,7 @@ pub(crate) async fn handle_command(
                         if let Some(e) = &entry {
                             core.approve_pending_for_session(&e.session_id, &e.directory)
                                 .await
+                                .len()
                         } else {
                             0
                         }

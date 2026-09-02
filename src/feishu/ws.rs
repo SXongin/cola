@@ -1446,7 +1446,7 @@ mod tests {
         let result = crate::bridge::handler::CardActionResult {
             card: Some(serde_json::json!({
                 "schema": "2.0",
-                "header": { "title": { "tag": "plain_text", "content": "✅ Allowed once" }, "template": "green" },
+                "header": { "title": { "tag": "plain_text", "content": "✅ 已允许一次" }, "template": "green" },
                 "body": { "elements": [] }
             })),
             toast: Some("已允许本次执行".to_string()),
@@ -1470,7 +1470,7 @@ mod tests {
         assert_eq!(inner["card"]["data"]["schema"], "2.0");
         assert_eq!(
             inner["card"]["data"]["header"]["title"]["content"],
-            "✅ Allowed once"
+            "✅ 已允许一次"
         );
     }
 

@@ -238,16 +238,15 @@ impl RequestKind for PermissionKind {
             if !flow.is_answered(core, req_id).await {
                 flow.mark_answered(core, req_id).await;
                 let approved = core.set_auto_accept(session_id, &dir, true).await;
-                flow.sent_cards.lock().await.remove(req_id);
-                if let Some(host) = host
-                    && let Some(acc) = core.cards.lock().await.get_mut(host).map(|c| &mut c.acc)
-                {
-                    acc.pending_permissions.retain(|p| p.request_id != req_id);
-                }
+                // Drop every inline section the toggle just approved (not just
+                // the clicked one) so the streaming card re-renders without
+                // them synchronously — the poller would otherwise leave them
+                // lingering until the next poll notices the requests vanished.
+                drop_surfaced(flow, core, host, &approved).await;
                 tracing::info!(
                     "Auto-Accept enabled via permission card on session {} (approved {})",
                     session_id,
-                    approved
+                    approved.len()
                 );
             }
             let mut r = result_card("✅ 已开启自动授权", "blue", "该会话后续权限请求将自动批准。");
@@ -290,12 +289,7 @@ impl RequestKind for PermissionKind {
                 ));
             }
             tracing::info!("Permission reply sent: {} session={}", reply, req_id);
-            flow.sent_cards.lock().await.remove(req_id);
-            if let Some(host) = host
-                && let Some(acc) = core.cards.lock().await.get_mut(host).map(|c| &mut c.acc)
-            {
-                acc.pending_permissions.retain(|p| p.request_id != req_id);
-            }
+            drop_surfaced(flow, core, host, &[req_id.to_string()]).await;
         }
         // Result card: shows the decision, no buttons.
         let label = if !perm_label.is_empty() { perm_label } else { reply };
@@ -904,6 +898,25 @@ fn failed_result_card(inline: bool, body: &str, toast: &str) -> CardActionResult
     }
     r.toast = Some(toast.to_string());
     r
+}
+
+/// Drop surfaced cards for a set of answered request ids: remove the ids from
+/// the flow's `sent_cards` (so the poller doesn't keep delivering their cards)
+/// and strip their sections from the host streaming card's inline accumulator.
+/// A single request passes one id; the Auto-Accept toggle passes every id it
+/// approved so all inline sections re-render away at once.
+async fn drop_surfaced(flow: &RequestFlow, core: &Arc<SharedCore>, host: &Option<String>, ids: &[String]) {
+    {
+        let mut sent = flow.sent_cards.lock().await;
+        for id in ids {
+            sent.remove(id);
+        }
+    }
+    if let Some(host) = host
+        && let Some(acc) = core.cards.lock().await.get_mut(host).map(|c| &mut c.acc)
+    {
+        acc.pending_permissions.retain(|p| !ids.contains(&p.request_id));
+    }
 }
 
 /// Re-render the live streaming card so inline question state (✅/已选, removed

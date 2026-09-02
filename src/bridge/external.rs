@@ -74,22 +74,18 @@ impl ExternalFlow {
                 Vec<(String, crate::config::ThreadKey, String)>,
             ) = {
                 let store = core.sessions.lock().await;
-                let active = store
-                    .all_entries()
-                    .into_iter()
-                    .filter(|e| {
-                        store
-                            .get_active(&e.thread_key)
-                            .map(|a| a.session_id == e.session_id)
-                            .unwrap_or(false)
-                    })
-                    .map(|e| e.session_id.clone())
-                    .collect();
-                let sessions = store
-                    .all_entries()
-                    .into_iter()
-                    .map(|e| (e.session_id.clone(), e.thread_key.clone(), e.directory.clone()))
-                    .collect();
+                let mut active = std::collections::HashSet::new();
+                let mut sessions = Vec::new();
+                for e in store.all_entries() {
+                    if store
+                        .get_active(&e.thread_key)
+                        .map(|a| a.session_id == e.session_id)
+                        .unwrap_or(false)
+                    {
+                        active.insert(e.session_id.clone());
+                    }
+                    sessions.push((e.session_id.clone(), e.thread_key.clone(), e.directory.clone()));
+                }
                 (active, sessions)
             };
             for (sid, thread_key, directory) in sessions {
