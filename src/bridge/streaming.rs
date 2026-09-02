@@ -102,10 +102,16 @@ pub struct StreamAccumulator {
     pub context_ratio: Option<f64>,
     /// Working directory of the session, shown in the card footer.
     pub directory: Option<String>,
+    /// Project name (directory basename) for the Turn Footer's 📁 segment.
+    pub project_name: Option<String>,
+    /// Git branch at turn start (short commit hash when detached).
+    pub branch: Option<String>,
+    /// Working tree was dirty at turn start, including untracked files. Only
+    /// set alongside `branch` (ADR-0019: the halves are omitted together).
+    pub dirty: bool,
     /// The session/thread name; shown as the card subtitle so the header can
     /// stay focused on state (the question is already in the reply context).
     pub title: String,
-    pub token_cost: Option<(i64, i64)>,
     pub error: Option<String>,
     pub reply_to_message_id: Option<String>,
     /// This turn's session id, carried on the error-card retry button so the
@@ -158,6 +164,22 @@ impl StreamAccumulator {
             phase_started_at: Some(std::time::Instant::now()),
             ..Default::default()
         }
+    }
+
+    /// Capture the turn's work context (ADR-0019): project name, git branch and
+    /// dirty state — measured BEFORE the prompt runs, so the dirty flag reflects
+    /// the state the AI operates on, not the changes it leaves behind. Best
+    /// effort: an empty or non-git directory leaves the fields unset.
+    pub async fn attach_work_context(&mut self, dir: &str) {
+        if dir.is_empty() {
+            self.directory = None;
+            return;
+        }
+        self.directory = Some(dir.to_string());
+        self.project_name = crate::git::project_name(dir);
+        let state = crate::git::read_state(dir).await;
+        self.branch = state.branch;
+        self.dirty = state.dirty;
     }
 
     /// The header phase for the current state: None when the turn finished or
@@ -458,13 +480,28 @@ impl StreamAccumulator {
                     value: serde_json::json!({ "action": "retry", "session_id": sid }),
                 }]);
             }
+        }
 
-            // Card footer: working directory · model · context usage. Gives the
-            // user at-a-glance context for what this turn ran on.
-            let mut footer_parts: Vec<String> = Vec::new();
-            if let Some(dir) = &self.directory {
-                footer_parts.push(format!("📁 {}", crate::feishu::ws::strip_mention_tokens(dir)));
+        // Card footer — work context (ADR-0019). The 📁 segment (project ·
+        // branch · dirty) is captured at turn start and shows on every card,
+        // so a wrong-branch run is visible before it completes; the model
+        // and context-window ratio are end-of-turn facts, so they append
+        // only on the final card (include_tail).
+        let mut footer_parts: Vec<String> = Vec::new();
+        if let Some(dir) = &self.directory {
+            let name = self.project_name.as_deref().unwrap_or(dir);
+            let mut segment = format!("📁 {}", crate::feishu::ws::strip_mention_tokens(name));
+            match (&self.branch, self.dirty) {
+                (Some(branch), true) => segment.push_str(&format!(" · {} ⚠", branch)),
+                (Some(branch), false) => segment.push_str(&format!(" · {}", branch)),
+                // git.rs guarantees dirty is only set alongside a branch
+                // (ADR-0019: the halves are omitted together), so a missing
+                // branch renders just the project name.
+                (None, _) => {}
             }
+            footer_parts.push(segment);
+        }
+        if include_tail {
             if let Some(model) = &self.model_id {
                 let label = match self.provider_id.as_deref() {
                     Some(p) => format!("{}/{}", p, model),
@@ -475,11 +512,9 @@ impl StreamAccumulator {
             if let Some(ratio) = self.context_ratio {
                 footer_parts.push(format!("📊 上下文 {:.0}%", ratio * 100.0));
             }
-            if !footer_parts.is_empty() {
-                builder = builder.with_footer(&footer_parts.join(" · "));
-            } else if let Some((input, output)) = self.token_cost {
-                builder = builder.with_footer(&format!("Tokens: {}入 {}出", input, output));
-            }
+        }
+        if !footer_parts.is_empty() {
+            builder = builder.with_footer(&footer_parts.join(" · "));
         }
 
         builder.build()
@@ -514,6 +549,83 @@ mod tests {
             text
         );
         assert!(text.contains("📊 上下文 36%"), "ratio missing: {}", text);
+    }
+
+    /// The work-context 📁 segment (ADR-0019): project basename + branch + dirty
+    /// marker, merged into one segment on the footer.
+    #[test]
+    fn card_footer_shows_project_branch_and_dirty() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Done;
+        acc.directory = Some("/root/workspace/dev/cola".into());
+        acc.project_name = Some("cola".into());
+        acc.branch = Some("main".into());
+        acc.dirty = true;
+        acc.push_text("结果");
+
+        let text = acc.build_card().to_string();
+        assert!(text.contains("📁 cola · main ⚠"), "missing: {}", text);
+    }
+
+    #[test]
+    fn card_footer_branch_shows_clean_without_marker() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Done;
+        acc.directory = Some("/root/workspace/dev/cola".into());
+        acc.project_name = Some("cola".into());
+        acc.branch = Some("main".into());
+        acc.dirty = false;
+        acc.push_text("结果");
+
+        let text = acc.build_card().to_string();
+        assert!(text.contains("📁 cola · main"), "missing: {}", text);
+        assert!(!text.contains("⚠"), "clean tree must not show ⚠: {}", text);
+    }
+
+    /// Non-git directory: only the project name, no branch/dirty halves.
+    #[test]
+    fn card_footer_non_git_shows_project_only() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Done;
+        acc.directory = Some("/tmp/plain-dir".into());
+        acc.project_name = Some("plain-dir".into());
+        acc.push_text("结果");
+
+        let text = acc.build_card().to_string();
+        assert!(text.contains("📁 plain-dir"), "missing: {}", text);
+        assert!(!text.contains("⚠"), "no dirty marker expected: {}", text);
+    }
+
+    /// ADR-0019: the 📁 segment renders on every card (include_tail=false),
+    /// while model/context only append on the final card.
+    #[test]
+    fn work_context_shows_before_final_card_but_model_does_not() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Streaming;
+        acc.directory = Some("/root/workspace/dev/cola".into());
+        acc.project_name = Some("cola".into());
+        acc.branch = Some("feat/x".into());
+        acc.dirty = true;
+        acc.provider_id = Some("opencode-go".into());
+        acc.model_id = Some("deepseek-v4-flash".into());
+        acc.context_ratio = Some(0.36);
+        acc.push_text("结果");
+
+        let mid = acc
+            .build_card_inner(0, acc.timeline.len(), false, None)
+            .to_string();
+        assert!(mid.contains("📁 cola · feat/x ⚠"), "mid missing: {}", mid);
+        assert!(!mid.contains("🤖"), "model must not show mid-turn: {}", mid);
+        assert!(!mid.contains("📊"), "ratio must not show mid-turn: {}", mid);
+
+        acc.card_state = CardState::Done;
+        let final_card = acc.build_card().to_string();
+        assert!(
+            final_card.contains("🤖 opencode-go/deepseek-v4-flash"),
+            "final: {}",
+            final_card
+        );
+        assert!(final_card.contains("📊 上下文 36%"), "final: {}", final_card);
     }
 
     /// While the card fits the component budget, successive flushes must

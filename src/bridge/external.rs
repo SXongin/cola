@@ -222,11 +222,7 @@ impl ExternalFlow {
         acc.submit_epoch_ms = Some(epoch_ms);
         acc.session_id = Some(session_id.to_string());
         acc.reply_to_message_id = Some(card_id.to_string());
-        acc.directory = if session_dir.is_empty() {
-            None
-        } else {
-            Some(session_dir)
-        };
+        acc.attach_work_context(&session_dir).await;
         // Keep the external message visible: the notification card is updated in
         // place, so its preview would otherwise vanish when the reply renders.
         if !preview.is_empty() {

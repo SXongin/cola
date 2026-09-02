@@ -503,11 +503,7 @@ impl App {
             acc.prompt = Some(text.clone());
             acc.requester_open_id = requester_open_id;
             acc.is_group = is_group;
-            acc.directory = if session_dir.is_empty() {
-                None
-            } else {
-                Some(session_dir)
-            };
+            acc.attach_work_context(&session_dir).await;
             let mut cards = self.cards.lock().await;
             cards.insert(
                 session_id.clone(),

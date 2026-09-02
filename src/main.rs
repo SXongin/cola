@@ -3,6 +3,7 @@ mod bridge;
 mod config;
 mod error;
 mod feishu;
+mod git;
 mod logging;
 mod opencode;
 mod update;
