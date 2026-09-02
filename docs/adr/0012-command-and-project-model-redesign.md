@@ -21,4 +21,7 @@ Consequences: config simplifies (`url` optional, `username`/`password` deleted,
 keep N days) with cross-day sessions queried by `grep session_id=... cola-*.log`,
 and the session file's structure is unchanged — only its semantics shift. Cards
 are only used where interaction is strong (`/switch`, `/model`, `/agent`,
-`/autoaccept`, `/help`); one-step commands stay text.
+`/autoaccept`) or where a reference is useful (`/help` — a buttonless command
+manual, detail stays text via `/help <command>`, and a failed card falls back to
+the plain-text help so `/help` never dies silently); one-step commands stay
+text.

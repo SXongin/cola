@@ -103,6 +103,21 @@ impl SharedCore {
             })
     }
 
+    /// The conversation's current project (ADR-0012): the active session's
+    /// directory, falling back to the default directory only when the
+    /// conversation has no session. Single definition of "current project",
+    /// shared by `/new`, the bare `/topic` form, and the `/switch` card's
+    /// "new session" action.
+    pub async fn current_project_directory(&self, thread_key: &ThreadKey) -> String {
+        self.sessions
+            .lock()
+            .await
+            .get_active(thread_key)
+            .map(|e| e.directory.clone())
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| self.default_session_directory())
+    }
+
     /// The per-session agent override set by `/agent` (from the persisted
     /// `SessionEntry`). `None` when the session has no override — the server
     /// then uses the session's own/default agent.

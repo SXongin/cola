@@ -52,7 +52,7 @@ The single session of a thread that lobby messages route to and that external-me
 _Avoid_: Current session, latest session, selected session
 
 **Project**:
-A working directory on the filesystem where OpenCode operates. A property of a session, not of the bot. A conversation's current project is the directory of its active session (derived, never stored separately); `/new` inherits it and falls back to the default directory only when the conversation has no session. Sessions created outside a conversation still carry their own directory.
+A working directory on the filesystem where OpenCode operates. A property of a session, not of the bot. A conversation's current project is the directory of its active session (derived, never stored separately); `/new` and the bare `/topic` form inherit it and fall back to the default directory only when the conversation has no session. Sessions created outside a conversation still carry their own directory.
 _Avoid_: Workspace, repo
 
 **Permission**:
@@ -101,8 +101,12 @@ _Avoid_: Picture, media, attachment file
 > **Domain expert:** "The Bridge pauses the Card stream, renders a Permission card with action buttons, and waits for the user to reply. Once resolved, streaming resumes."
 
 **Command**:
-A slash-prefixed instruction (e.g. `/new`, `/dir`, `/switch`, `/compact`). Every command supports two forms: a text-direct form (an argument that completes the action in one step) and a card form (no argument pops an interactive card for strong-interaction commands like `/switch`, `/model`, `/agent`, `/autoaccept`, `/help`). cola parses its own commands locally and forwards unrecognized ones to the Backend as prompt text.
+A slash-prefixed instruction (e.g. `/new`, `/dir`, `/switch`, `/compact`). Every command supports two forms: a text-direct form (an argument that completes the action in one step) and a card form (no argument pops a card — an **Interactive Card** for strong-interaction commands like `/switch`, `/model`, `/agent`, `/autoaccept`, or a **Reference Card** for `/help`). cola parses its own commands locally and forwards unrecognized ones to the Backend as prompt text.
 _Avoid_: Slash command, action, operation
+
+**Reference Card**:
+A read-only **Card** whose only job is to present information: no buttons, no state change. `/help` is the only one — a grouped command manual; detail for a single command stays text via `/help <command>`. Distinct from an **Interactive Card**, which drives state changes through buttons (Permission, Question, `/switch`, `/model`, `/agent`, `/autoaccept`).
+_Avoid_: Manual card, static card
 
 **Event**:
 A typed protocol message from the Backend via SSE. Drives Card state transitions.

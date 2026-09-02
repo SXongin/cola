@@ -8,8 +8,14 @@ pub enum Command {
     Switch(SwitchAction),
     /// Create a fresh session, optionally named
     New(Option<String>),
-    /// Create a real Feishu topic backed by a fresh session rooted at `directory`.
-    Topic { directory: String, name: Option<String> },
+    /// Create a real Feishu topic backed by a fresh session. `directory` is
+    /// `None` for the bare `/topic` form, which inherits the conversation's
+    /// current project (the active session's directory, ADR-0012) instead of an
+    /// explicit path.
+    Topic {
+        directory: Option<String>,
+        name: Option<String>,
+    },
     /// Create a real Feishu topic whose backing session is an EXISTING server
     /// session (ADR-0016): resolve by keyword, adopt, and map to the new topic.
     /// `force` steals a session mapped to another thread.
@@ -163,13 +169,18 @@ pub fn parse_command(text: &str) -> Option<Command> {
                         Some(Command::Help(Some("topic".into())))
                     } else {
                         Some(Command::Topic {
-                            directory: dir.to_string(),
+                            directory: Some(dir.to_string()),
                             name: name.map(|s| s.to_string()),
                         })
                     }
                 }
             }
-            None => Some(Command::Help(Some("topic".into()))),
+            // `/topic` (no args) — a topic in the conversation's current
+            // project (the active session's directory), like `/new`.
+            None => Some(Command::Topic {
+                directory: None,
+                name: None,
+            }),
         },
         "/name" => match arg {
             Some(p) => Some(Command::Name(p.to_string())),
@@ -217,7 +228,7 @@ pub fn help_text() -> String {
 `/switch <id> [--force]` · Take over a session by id/title
 `/switch forget` · Un-map this chat's session (server session stays)
 `/new [name]` · New session in the current project (no session → default dir)
-`/topic <dir> [name]` · Create a new Feishu topic + session in <dir>
+`/topic [dir] [name]` · Create a new Feishu topic + session in <dir> (bare `/topic` uses the current project)
 `/topic --adopt <kw> [--force]` · Open a topic around an existing session
 `/name <name>` · Rename current session (server-side)
 `/stop` · Interrupt execution
@@ -257,7 +268,7 @@ pub fn command_help(name: &str) -> Option<String> {
             "/new [name]\nCreate a fresh session in the current project (the active session's directory); with no active session, the default directory (`work_dir` or cwd). Optionally named (the name is PATCHed server-side); without a name the server generates one after the first message.\nExample: `/new api-refactor`"
         }
         "topic" => {
-            "/topic <dir> [name]\nCreate a real Feishu topic backed by a new session rooted at <dir>. The topic is UI-separated from the current conversation, so you can switch between topics in the Feishu client. Reply inside the created topic to talk to that session.\nExample: `/topic /root/proj/lib api-refactor`\n\n/topic --adopt <keyword> [--force]\nOpen a topic around an EXISTING session instead of creating a new one. Resolution: exact id → unique id-prefix → unique title substring (the whole remaining arg is the keyword, so multi-word titles match). Child (sub-task) sessions are rejected. If the session belongs to another chat, reject unless `--force` (which steals the mapping). No argument pops the session card — each row's 建话题接管 button does the same.\nExample: `/topic --adopt 重写登录模块`"
+            "/topic [dir] [name]\nCreate a real Feishu topic backed by a new session. The topic is UI-separated from the current conversation, so you can switch between topics in the Feishu client. Reply inside the created topic to talk to that session.\n- `/topic` (no args) — new session in the CURRENT PROJECT (the active session's directory, like `/new`; falls back to the default directory when the conversation has no session)\n- `/topic <dir>` — new session rooted at <dir>\n- `/topic <dir> <name>` — also name the session\nExample: `/topic /root/proj/lib api-refactor`\n\n/topic --adopt <keyword> [--force]\nOpen a topic around an EXISTING session instead of creating a new one. Resolution: exact id → unique id-prefix → unique title substring (the whole remaining arg is the keyword, so multi-word titles match). Child (sub-task) sessions are rejected. If the session belongs to another chat, reject unless `--force` (which steals the mapping). No argument pops the session card — each row's 建话题接管 button does the same.\nExample: `/topic --adopt 重写登录模块`"
         }
         "name" => {
             "/name <name>\nRename the current session server-side (visible to every client sharing the store).\nExample: `/name frontend`"
@@ -452,14 +463,7 @@ pub(crate) async fn handle_command(
             // stays in the project the user is already working in. Only when
             // the conversation has no session (fresh topic, after `/forget`,
             // adopted-away) does it fall back to the default directory.
-            let directory = {
-                let store = core.sessions.lock().await;
-                store
-                    .get_active(&thread_key)
-                    .map(|e| e.directory.clone())
-                    .filter(|d| !d.is_empty())
-                    .unwrap_or_else(|| core.default_session_directory())
-            };
+            let directory = core.current_project_directory(&thread_key).await;
             let session = core
                 .opencode
                 .create_session(&core.opencode.new_session_input(Some(&directory)))
@@ -500,10 +504,19 @@ pub(crate) async fn handle_command(
                     .await?;
                 return Ok(());
             }
-            let Some(dir_str) =
-                resolve_directory_or_reply(&*core.feishu, message_id, &directory, "`/topic`。").await?
-            else {
-                return Ok(());
+            // Bare `/topic` (directory: None) inherits the conversation's
+            // current project, exactly like `/new`; an explicit directory goes
+            // through the same existence check as `/dir`.
+            let dir_str = match directory {
+                Some(dir) => {
+                    let Some(d) =
+                        resolve_directory_or_reply(&*core.feishu, message_id, &dir, "`/topic`。").await?
+                    else {
+                        return Ok(());
+                    };
+                    d
+                }
+                None => core.current_project_directory(&thread_key).await,
             };
             let session = core
                 .opencode
@@ -750,9 +763,9 @@ pub(crate) async fn handle_command(
         }
         Command::Help(target) => {
             match target {
-                // No target: the interactive navigation card (ADR-0012, issue 05).
+                // No target: the buttonless reference card (ADR-0012, issue 05).
                 None => {
-                    send_help_card(core, &thread_key, message_id).await?;
+                    send_help_card(core, message_id).await?;
                 }
                 Some(name) => {
                     let text = match command_help(&name) {
@@ -993,16 +1006,20 @@ async fn send_autoaccept_card(
     Ok(())
 }
 
-/// Send the `/help` navigation card (ADR-0012, issue 05): commands grouped by
-/// role with a "试试" button each.
-async fn send_help_card(
-    core: &Arc<SharedCore>,
-    thread_key: &ThreadKey,
-    message_id: &str,
-) -> crate::error::Result<()> {
-    let card = crate::feishu::card::build_help_card(thread_key);
-    core.feishu.reply_card(message_id, &card).await?;
-    Ok(())
+/// Send the `/help` reference card (a pure command manual, no buttons; detail
+/// stays text via `/help <command>`). If the card fails to send (e.g. Feishu
+/// rejects the schema), fall back to the plain-text `help_text()` so the user
+/// always gets something instead of a silent dead `/help`.
+async fn send_help_card(core: &Arc<SharedCore>, message_id: &str) -> crate::error::Result<()> {
+    let card = crate::feishu::card::build_help_card();
+    match core.feishu.reply_card(message_id, &card).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            tracing::warn!("help card failed ({}), falling back to text", e);
+            core.feishu.reply_text(message_id, &help_text()).await?;
+            Ok(())
+        }
+    }
 }
 
 /// `/switch <keyword>` — switch within the thread first, then adopt a unique
@@ -1745,7 +1762,7 @@ mod tests {
         assert_eq!(
             parse_command("/topic /root/proj/lib api-refactor"),
             Some(Command::Topic {
-                directory: "/root/proj/lib".into(),
+                directory: Some("/root/proj/lib".into()),
                 name: Some("api-refactor".into()),
             })
         );
@@ -1756,18 +1773,29 @@ mod tests {
         assert_eq!(
             parse_command("/topic /root/proj/lib"),
             Some(Command::Topic {
-                directory: "/root/proj/lib".into(),
+                directory: Some("/root/proj/lib".into()),
                 name: None,
             })
         );
     }
 
+    /// Bare `/topic` inherits the current project (directory: None), resolved
+    /// at command time — it no longer shows help.
     #[test]
-    fn parse_topic_missing_arg_shows_help() {
-        assert_eq!(parse_command("/topic"), Some(Command::Help(Some("topic".into()))));
+    fn parse_topic_bare_uses_current_project() {
+        assert_eq!(
+            parse_command("/topic"),
+            Some(Command::Topic {
+                directory: None,
+                name: None,
+            })
+        );
         assert_eq!(
             parse_command("/topic "),
-            Some(Command::Help(Some("topic".into())))
+            Some(Command::Topic {
+                directory: None,
+                name: None,
+            })
         );
     }
 

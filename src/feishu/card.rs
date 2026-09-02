@@ -1253,159 +1253,61 @@ pub fn build_autoaccept_card(thread_key: &crate::config::ThreadKey, current_on: 
     option_picker_card("🔁 自动审批", &intro, thread_key, "autoaccept", &options)
 }
 
-/// The `/help` navigation card: commands grouped by 会话 / 操作 / 运维, each
-/// with a "试试" button that fires the command (delivered as a `/cmd` text into
-/// the same thread), plus a hint that card-able commands also open a card.
-pub fn build_help_card(thread_key: &crate::config::ThreadKey) -> serde_json::Value {
-    /// A single help-card row. `card` is `Some(bare_command)` for card-able
-    /// commands — the "看卡" button runs that command with no args, which pops
-    /// its interactive card; `None` commands get only a "试试" button.
-    struct HelpRow<'a> {
-        label: &'a str,
-        cmd: &'a str,
-        card: Option<&'a str>,
-    }
-    struct HelpGroup<'a> {
-        title: &'a str,
-        rows: &'a [HelpRow<'a>],
-    }
-    let groups: &[HelpGroup] = &[
-        HelpGroup {
-            title: "📂 会话",
-            rows: &[
-                HelpRow {
-                    label: "/new [名字]",
-                    cmd: "/new",
-                    card: None,
-                },
-                HelpRow {
-                    label: "/dir <路径> [名字]",
-                    cmd: "/dir",
-                    card: None,
-                },
-                HelpRow {
-                    label: "/switch · 卡片",
-                    cmd: "/switch",
-                    card: Some("/switch"),
-                },
-                HelpRow {
-                    label: "/topic <目录> [名字]",
-                    cmd: "/topic",
-                    card: None,
-                },
-                HelpRow {
-                    label: "/name <新名>",
-                    cmd: "/name",
-                    card: None,
-                },
+/// The `/help` reference card: a pure command manual grouped by 会话 / 操作 /
+/// 运维, one line per command with a short description. No buttons — reading is
+/// its only job (previously the "试试"/"看卡" buttons made it an execution
+/// launcher, which mixed concerns and was hard to keep consistent). Detail for a
+/// single command stays text via `/help <command>`.
+pub fn build_help_card() -> serde_json::Value {
+    let groups: &[(&str, &[(&str, &str)])] = &[
+        (
+            "📂 会话",
+            &[
+                ("/new [名字]", "在当前项目新建会话"),
+                ("/dir <路径> [名字]", "切换项目，在新目录开会话"),
+                (
+                    "/switch [关键字]",
+                    "会话卡片，或按名称/目录/ID 切换（含 list / forget）",
+                ),
+                ("/topic [目录] [名字]", "新话题 + 新会话（无参用当前项目目录）"),
+                ("/topic --adopt <关键字> [--force]", "围绕已有会话开话题"),
+                ("/name <名字>", "重命名当前会话"),
             ],
-        },
-        HelpGroup {
-            title: "⚙️ 操作",
-            rows: &[
-                HelpRow {
-                    label: "/agent · 卡片",
-                    cmd: "/agent",
-                    card: Some("/agent"),
-                },
-                HelpRow {
-                    label: "/model · 卡片",
-                    cmd: "/model",
-                    card: Some("/model"),
-                },
-                HelpRow {
-                    label: "/autoaccept · 卡片",
-                    cmd: "/autoaccept",
-                    card: Some("/autoaccept"),
-                },
-                HelpRow {
-                    label: "/stop",
-                    cmd: "/stop",
-                    card: None,
-                },
-                HelpRow {
-                    label: "/compact",
-                    cmd: "/compact",
-                    card: None,
-                },
+        ),
+        (
+            "⚙️ 操作",
+            &[
+                ("/agent <名字>", "切换 agent（下条消息生效）"),
+                ("/model <提供方/模型>", "切换模型（下条消息生效）"),
+                ("/autoaccept [on|off]", "查看或切换自动授权"),
+                ("/stop", "中断当前执行"),
+                ("/compact", "压缩上下文"),
             ],
-        },
-        HelpGroup {
-            title: "🛠 运维",
-            rows: &[
-                HelpRow {
-                    label: "/help <命令>",
-                    cmd: "/help",
-                    card: Some("/help"),
-                },
-                HelpRow {
-                    label: "/restart",
-                    cmd: "/restart",
-                    card: None,
-                },
-                HelpRow {
-                    label: "/restart-opencode",
-                    cmd: "/restart-opencode",
-                    card: None,
-                },
-                HelpRow {
-                    label: "/update",
-                    cmd: "/update",
-                    card: None,
-                },
+        ),
+        (
+            "🛠 运维",
+            &[
+                ("/help [命令]", "全部命令，或单命令详情"),
+                ("/restart", "重启 cola"),
+                ("/restart-opencode", "重启 OpenCode 服务器（仅 cola 启动的）"),
+                ("/update", "检查并应用自更新"),
             ],
-        },
+        ),
     ];
     let mut elements: Vec<serde_json::Value> = Vec::new();
-    for group in groups {
-        elements.push(json!({ "tag": "markdown", "content": format!("**{}**", group.title) }));
-        for row in group.rows {
-            let mut buttons: Vec<serde_json::Value> = vec![json!({
-                "tag": "button",
-                "text": { "tag": "plain_text", "content": "试试" },
-                "type": "default",
-                "value": {
-                    "action": "help",
-                    "chat_id": thread_key.chat_id,
-                    "thread_id": thread_key.thread_id,
-                    "cmd": row.cmd,
-                },
-            })];
-            if let Some(card_cmd) = row.card {
-                buttons.push(json!({
-                    "tag": "button",
-                    "text": { "tag": "plain_text", "content": "看卡" },
-                    "type": "primary",
-                    "value": {
-                        "action": "help",
-                        "chat_id": thread_key.chat_id,
-                        "thread_id": thread_key.thread_id,
-                        "cmd": card_cmd,
-                    },
-                }));
-            }
+    for (title, rows) in groups {
+        elements.push(json!({ "tag": "markdown", "content": format!("**{title}**") }));
+        for (cmd, desc) in *rows {
             elements.push(json!({
-                "tag": "column_set",
-                "flex_mode": "none",
-                "columns": [
-                    {
-                        "tag": "column",
-                        "width": "weighted",
-                        "weight": 5,
-                        "vertical_align": "center",
-                        "elements": [ { "tag": "markdown", "content": row.label } ]
-                    },
-                    {
-                        "tag": "column",
-                        "width": "auto",
-                        "vertical_align": "center",
-                        "elements": buttons,
-                    }
-                ]
+                "tag": "markdown",
+                "content": format!("`{cmd}` · {desc}"),
             }));
         }
     }
-    elements.push(json!({ "tag": "note", "elements": [ { "tag": "plain_text", "content": "带 · 卡片的命令支持无参弹卡，也支持文本直达（如 /switch <关键字>）。" } ] }));
+    elements.push(json!({
+        "tag": "markdown",
+        "content": "详细用法发 `/help <命令>`，如 `/help switch`。群话题规则见首次引导。",
+    }));
     json!({
         "schema": "2.0",
         "config": { "wide_screen_mode": true },
@@ -2454,24 +2356,54 @@ mod tests {
         assert_eq!(first_chunk("first line\nsecond line", 100), "first line");
     }
 
-    /// The `/help` card shows a "看卡" button for card-able commands (switch,
-    /// agent, model, autoaccept, help) and only "试试" for one-step commands.
+    /// The `/help` card is a pure command manual: every command appears with a
+    /// description, and there are NO buttons (no "试试"/"看卡", no `button`
+    /// elements) — reading is its only job.
     #[test]
-    fn help_card_kan_kha_button_only_for_card_able_commands() {
-        let key = crate::config::ThreadKey::new("oc_chat".into(), "oc_chat".into());
-        let card = build_help_card(&key);
+    fn help_card_is_a_buttonless_command_manual() {
+        let card = build_help_card();
         let text = card.to_string();
-        // Card-able commands get both buttons.
-        for cmd in ["/switch", "/agent", "/model", "/autoaccept", "/help"] {
-            assert!(
-                text.contains(&format!("\"cmd\":\"{}\"", cmd)),
-                "missing card-able command {cmd}: {text}"
-            );
+        // Every top-level command is listed once.
+        for cmd in [
+            "/new",
+            "/dir",
+            "/switch",
+            "/topic",
+            "/name",
+            "/agent",
+            "/model",
+            "/autoaccept",
+            "/stop",
+            "/compact",
+            "/help",
+            "/restart",
+            "/restart-opencode",
+            "/update",
+        ] {
+            assert!(text.contains(cmd), "missing command {cmd} in help card: {text}");
         }
-        // "看卡" appears (one per card-able row) but "试试" outnumbers it.
-        let kan_kha = text.matches("看卡").count();
-        let shishi = text.matches("试试").count();
-        assert!(kan_kha >= 5, "every card-able command shows 看卡, got {kan_kha}");
-        assert!(shishi > kan_kha, "试试 on every row: {shishi} vs {kan_kha}");
+        // Pure reference: no execution/preview buttons anywhere.
+        assert!(
+            !text.contains("试试") && !text.contains("看卡"),
+            "help card must be buttonless: {text}"
+        );
+        assert!(
+            !text.contains("\"tag\":\"button\"") && !text.contains("\"tag\": \"button\""),
+            "help card must not embed buttons: {text}"
+        );
+    }
+
+    /// The `/help` card must stay schema-V2-compatible: the `note` element is
+    /// no longer supported (Feishu rejects the card with ErrCode 200861), which
+    /// silently killed `/help` (the 400 only landed in the log). The footer hint
+    /// renders as `markdown` instead.
+    #[test]
+    fn help_card_has_no_schema_v2_unsupported_note() {
+        let card = build_help_card();
+        let text = card.to_string();
+        assert!(
+            !text.contains("\"tag\":\"note\"") && !text.contains("\"tag\": \"note\""),
+            "help card must not use the schema-V2-unsupported note element: {text}"
+        );
     }
 }

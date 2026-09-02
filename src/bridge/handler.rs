@@ -798,7 +798,6 @@ impl App {
             "agent" => self.handle_agent_card_action(&self.core, &value).await,
             "model" => self.handle_model_card_action(&self.core, &value).await,
             "autoaccept" => self.handle_autoaccept_card_action(&self.core, &value).await,
-            "help" => self.handle_help_card_action(&self.core, &value).await,
             _ => None,
         }
     }
@@ -888,14 +887,7 @@ impl App {
             }
             "new" => {
                 // Fresh session in the current project (equivalent to `/new`).
-                let directory = {
-                    let store = core.sessions.lock().await;
-                    store
-                        .get_active(&thread_key)
-                        .map(|e| e.directory.clone())
-                        .filter(|d| !d.is_empty())
-                        .unwrap_or_else(|| core.default_session_directory())
-                };
+                let directory = core.current_project_directory(&thread_key).await;
                 match core
                     .opencode
                     .create_session(&core.opencode.new_session_input(Some(&directory)))
@@ -1190,52 +1182,6 @@ impl App {
             } else {
                 "已关闭自动审批".to_string()
             }),
-        })
-    }
-
-    /// Handle a `/help` navigation-card button: re-run the command text in the
-    /// same thread (the card is patched to a brief confirmation; the command's
-    /// own reply/card follows).
-    async fn handle_help_card_action(
-        self: &Arc<Self>,
-        core: &Arc<SharedCore>,
-        value: &serde_json::Value,
-    ) -> Option<CardActionResult> {
-        let cmd = value.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
-        let thread_key = thread_key_from_value(value);
-        if cmd.is_empty() {
-            return None;
-        }
-        // Re-run the command text through the normal message pipeline (it has
-        // no message_id to reply to, so pass an empty anchor — the command's
-        // output goes to the thread top-level).
-        let text = if cmd.starts_with('/') {
-            cmd.to_string()
-        } else {
-            format!("/{cmd}")
-        };
-        let incoming = crate::bridge::IncomingMessage {
-            message_id: String::new(),
-            chat_id: thread_key.chat_id.clone(),
-            chat_type: "p2p".to_string(),
-            thread_id: if thread_key.thread_id == thread_key.chat_id {
-                None
-            } else {
-                Some(thread_key.thread_id.clone())
-            },
-            parent_id: None,
-            text,
-            images: Vec::new(),
-            requester_open_id: None,
-        };
-        core.invalidate_session_list_cache().await;
-        let app = Arc::clone(self);
-        tokio::spawn(async move {
-            app.handle_message(incoming).await;
-        });
-        Some(CardActionResult {
-            card: Some(crate::feishu::card::build_help_card(&thread_key)),
-            toast: Some("已执行".to_string()),
         })
     }
 

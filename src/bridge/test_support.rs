@@ -2921,7 +2921,7 @@ pub(crate) mod integration_tests {
         crate::bridge::command::handle_command(
             &app.core,
             Command::Topic {
-                directory: proj_dir.clone(),
+                directory: Some(proj_dir.clone()),
                 name: Some("api-refactor".into()),
             },
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
@@ -2972,6 +2972,75 @@ pub(crate) mod integration_tests {
         assert!(app.sessions.lock().await.get_active(&lobby_key).is_none());
     }
 
+    /// Bare `/topic` (no args) creates the topic session in the conversation's
+    /// CURRENT PROJECT — the active session's directory — instead of demanding
+    /// an explicit `<dir>`, exactly like `/new` (ADR-0012 project model).
+    #[tokio::test]
+    async fn topic_command_bare_inherits_current_project_directory() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_id = "ses_topic".into();
+        let (app, platform) = build_app(cfg, backend).await;
+        let proj = tempfile::tempdir().unwrap();
+        let proj_dir = proj.path().to_string_lossy().to_string();
+
+        let thread_key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+
+        // Root a session in the project with `/dir`; it becomes the active
+        // session whose directory bare `/topic` must inherit.
+        crate::bridge::command::handle_command(
+            &app.core,
+            crate::bridge::command::Command::Dir(proj_dir.clone()),
+            thread_key.clone(),
+            "msg_dir",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        // Bare `/topic` — no directory given.
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Topic {
+                directory: None,
+                name: None,
+            },
+            thread_key.clone(),
+            "msg_topic",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        // The topic is created on the command message, like the explicit form.
+        let calls = platform.calls.lock().await.clone();
+        assert!(
+            calls.iter().any(
+                |c| matches!(c, PlatformCall::ReplyInThread { message_id, .. } if message_id == "msg_topic")
+            ),
+            "expected a reply_in_thread on the command message, got {calls:?}"
+        );
+
+        // The topic session lives in the inherited project directory.
+        let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
+        let entry = app
+            .sessions
+            .lock()
+            .await
+            .get_active(&topic_key)
+            .cloned()
+            .expect("bare /topic should map the created topic to its session");
+        assert_eq!(entry.session_id, "ses_topic");
+        assert_eq!(
+            entry.directory,
+            std::fs::canonicalize(proj.path()).unwrap().to_string_lossy(),
+            "bare /topic must inherit the active session's directory"
+        );
+        assert_eq!(entry.topic_anchor.as_deref(), Some("msg_topic_reply"));
+    }
+
     /// A message sent INSIDE the created topic routes to the topic's session,
     /// not to a fresh lobby session.
     #[tokio::test]
@@ -2990,7 +3059,7 @@ pub(crate) mod integration_tests {
         crate::bridge::command::handle_command(
             &app.core,
             Command::Topic {
-                directory: proj_dir,
+                directory: Some(proj_dir),
                 name: None,
             },
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
@@ -3037,7 +3106,7 @@ pub(crate) mod integration_tests {
         crate::bridge::command::handle_command(
             &app.core,
             Command::Topic {
-                directory: "/root/proj/lib".into(),
+                directory: Some("/root/proj/lib".into()),
                 name: None,
             },
             crate::config::ThreadKey::new("chat_1".into(), "omt_existing".into()),
@@ -5541,7 +5610,7 @@ pub(crate) mod integration_tests {
         crate::bridge::command::handle_command(
             &app.core,
             Command::Topic {
-                directory: "/nonexistent/dir/xyz".into(),
+                directory: Some("/nonexistent/dir/xyz".into()),
                 name: None,
             },
             crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
