@@ -22,15 +22,12 @@ jobs:
       - run: cargo fmt --all -- --check
 
   check:
-    # One job per OS: clippy, test and build share a single cargo cache, so
-    # dependencies are compiled once per platform instead of once per gate
-    # (a cold run previously compiled all ~270 deps three times per OS).
-    name: Check (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    # Full gates (clippy + test + release build) on the primary platform; they
+    # share one cargo cache so dependencies compile once instead of once per
+    # gate. A separate clippy/test/build job per OS serialized the gates on the
+    # critical path and made warm runs slower.
+    name: Check
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -43,6 +40,21 @@ jobs:
         run: cargo test --workspace --locked
       - name: Build (release)
         run: cargo build --release --locked
+
+  test:
+    # Compile + test only on the other platforms: catches platform quirks
+    # cheaply. Full release builds still run on all three in release.yml.
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
 
   audit:
     name: Dependency audit
