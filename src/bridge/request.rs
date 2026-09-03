@@ -359,13 +359,22 @@ impl RequestKind for QuestionKind {
         flow: &RequestFlow,
         _core: &Arc<SharedCore>,
         req: &PendingRequest,
-        _dir: &str,
+        dir: &str,
     ) -> bool {
         if let PendingRequest::Question(q) = req {
             flow.question_requests
                 .lock()
                 .await
                 .insert(q.id.clone(), q.clone());
+            // Record the owning directory: the submit-button `name` on the
+            // question card no longer carries it (Feishu caps `name` at 100
+            // chars), so a value-less form-submit callback re-resolves it here
+            // instead of the session store (sub-task child sessions aren't in
+            // it — see pitfall 11).
+            flow.question_dirs
+                .lock()
+                .await
+                .insert(q.id.clone(), dir.to_string());
         }
         false
     }
@@ -518,6 +527,7 @@ impl RequestKind for QuestionKind {
                         answers
                     );
                     flow.question_requests.lock().await.remove(req_id);
+                    flow.question_dirs.lock().await.remove(req_id);
                     flow.sent_cards.lock().await.remove(req_id);
                     if inline
                         && let Some(acc) = core
@@ -644,6 +654,7 @@ impl RequestKind for QuestionKind {
                     answers
                 );
                 flow.question_requests.lock().await.remove(req_id);
+                flow.question_dirs.lock().await.remove(req_id);
                 if inline
                     && let Some(acc) = core
                         .cards
@@ -693,6 +704,7 @@ impl RequestKind for QuestionKind {
                 }
                 tracing::info!("Question rejected: {}", req_id);
                 flow.question_requests.lock().await.remove(req_id);
+                flow.question_dirs.lock().await.remove(req_id);
                 flow.question_partial.lock().await.remove(req_id);
                 flow.sent_cards.lock().await.remove(req_id);
                 if inline
@@ -735,6 +747,10 @@ pub struct RequestFlow {
     /// request_id → pending question request (question kind only; the AI asks
     /// the user and cola posts the answer back from the question card).
     pub question_requests: Arc<Mutex<HashMap<String, opencode::client::QuestionRequest>>>,
+    /// request_id → owning directory (question kind only). Filled at poll time
+    /// (where `dir` is known) as the fallback for form-submit callbacks whose
+    /// card `name` no longer carries the directory (see question_elements).
+    pub question_dirs: Arc<Mutex<HashMap<String, String>>>,
     /// request_id → answers recorded so far (None = not answered yet; question
     /// kind only). A request is only submitted once EVERY question has an
     /// answer (or the user clicks "submit/skip"), because `reply_question`
@@ -749,6 +765,7 @@ impl RequestFlow {
             poll_interval_ms: std::sync::atomic::AtomicU64::new(3000),
             sent_cards: Arc::new(Mutex::new(HashMap::new())),
             question_requests: Arc::new(Mutex::new(HashMap::new())),
+            question_dirs: Arc::new(Mutex::new(HashMap::new())),
             question_partial: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -894,19 +911,26 @@ impl RequestFlow {
         value: &serde_json::Value,
     ) -> Option<CardActionResult> {
         let session_id = value.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+        let request_id = value.get("request_id").and_then(|v| v.as_str());
+        let req_id = request_id?;
         let directory = value
             .get("directory")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         let directory = match directory {
             Some(d) => Some(d),
-            None => core.sessions.lock().await.directory_for_session(session_id),
+            None => {
+                let from_store = core.sessions.lock().await.directory_for_session(session_id);
+                if from_store.is_some() {
+                    from_store
+                } else {
+                    self.question_dirs.lock().await.get(req_id).cloned()
+                }
+            }
         };
         let directory = directory.as_deref();
 
         let reply = value.get("reply").and_then(|v| v.as_str()).unwrap_or("reject");
-        let request_id = value.get("request_id").and_then(|v| v.as_str());
-        let req_id = request_id?;
         // Inline interaction: the session (or its sub-task parent chain) has a
         // live streaming card, so the result is NOT returned as a replacement
         // card — the streaming card re-renders itself on the next poll.
