@@ -72,7 +72,7 @@ pub enum HeaderPhase {
 }
 
 /// Accumulates streaming state for one session.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct StreamAccumulator {
     pub card_state: CardState,
     pub text: String,

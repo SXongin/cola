@@ -4110,8 +4110,10 @@ pub(crate) mod integration_tests {
     }
 
     /// A question raised during an active turn is surfaced INLINE on the
-    /// streaming card; answering it only toasts (no card replacement) and the
-    /// streaming card re-renders with the updated partial answers.
+    /// streaming card; answering one of several only toasts and returns the
+    /// re-rendered streaming card (markers/已选 in the callback response — the
+    /// mechanism Feishu actually refreshes the clicked card with), while the
+    /// final answer finalizes the request and drops the inline section.
     #[tokio::test]
     async fn inline_question_answered_on_streaming_card() {
         let _wd = test_work_dir();
@@ -4198,7 +4200,16 @@ pub(crate) mod integration_tests {
         });
         let r1 = app.handle_card_action(value).await.expect("result");
         assert_eq!(r1.toast.as_deref(), Some("已记录答案，还有 1 题未答"));
-        assert!(r1.card.is_none(), "inline answer must not replace the card");
+        // The returned card is the RE-RENDERED streaming card (markers in the
+        // callback response — the reliable card-update mechanism). Feishu's
+        // PATCH alone leaves the clicked card on its pre-answer state.
+        let r1_card = r1
+            .card
+            .as_ref()
+            .expect("inline answer must return the rebuilt card");
+        let r1_text = r1_card.to_string();
+        assert!(r1_text.contains("已选：/a"), "marker missing: {}", r1_text);
+        assert!(!r1_text.contains("已选：main"), "q2 must stay open: {}", r1_text);
         assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
         // The accumulator's inline question reflects the partial answer.
         let pending = app
