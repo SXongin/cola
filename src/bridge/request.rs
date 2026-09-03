@@ -531,17 +531,40 @@ impl RequestKind for QuestionKind {
                     Some(r)
                 } else if inline {
                     // Inline: the streaming card re-renders with the updated
-                    // partial answers — toast only.
+                    // partial answers. Return the re-rendered card IN the
+                    // callback response so Feishu updates the CLICKED card in
+                    // place — the same mechanism standalone question cards use,
+                    // and the only one that reliably refreshes the body after an
+                    // interaction. A separate PATCH around the callback leaves
+                    // the card on its pre-answer state (the markers/已选 never
+                    // become visible), while a PATCH before the click did add the
+                    // buttons.
                     let mut r = CardActionResult {
                         card: None,
                         toast: None,
                     };
                     r.toast = Some(format!("已记录答案，还有 {} 题未答", n - answered_count));
-                    // Re-render the streaming card NOW so the answered question
-                    // shows ✅/已选 and its buttons disappear. Without this the
-                    // card stays frozen: a question-blocked prompt produces no
-                    // new parts, so the render poll never flushes.
-                    flush_inline_card(core, host, session_id).await;
+                    // Build on a CLONE so a card-component-limit split can't
+                    // advance the live accumulator's `render_from` from inside
+                    // the click handler (flush_card owns that flow). Only take
+                    // the card when it fits without splitting; otherwise fall
+                    // back to the PATCH re-render, which finalizes the card and
+                    // sends the continuation card.
+                    let rebuilt = {
+                        let mut cards = core.cards.lock().await;
+                        cards.get_mut(host.as_deref().unwrap_or(session_id)).map(|c| {
+                            let mut probe = c.acc.clone();
+                            probe.build_card_with_split()
+                        })
+                    };
+                    match rebuilt {
+                        Some((card, false)) => r.card = Some(card),
+                        _ => {
+                            // Split needed, or no live accumulator (the turn
+                            // ended between the click and now): PATCH re-render.
+                            flush_inline_card(core, host, session_id).await;
+                        }
+                    }
                     Some(r)
                 } else {
                     // Still questions left: return an updated card that shows the
