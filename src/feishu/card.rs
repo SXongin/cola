@@ -882,9 +882,15 @@ pub fn question_elements(
                         "form_action_type": "submit",
                         // Form submit callbacks don't always carry the button
                         // `value`, so the routing payload is ALSO encoded in the
-                        // `name` ("submit|req|ses|qi|dir") — ws.rs rebuilds the
-                        // value from it when `action.value` is absent.
-                        "name": format!("submit|{}|{}|{}|{}", request_id, session_id, qi, directory),
+                        // `name` ("submit|req|ses|qi") — ws.rs rebuilds the
+                        // value from it when `action.value` is absent. The
+                        // directory is deliberately NOT in the name: Feishu
+                        // caps `name` at 100 chars and `submit|req|ses|qi|dir`
+                        // overflows on deep paths, killing the whole card update
+                        // (ErrCode 11310 "name exceed the default maximum 100").
+                        // The handler re-resolves the directory from the store /
+                        // request flow when the fallback fires.
+                        "name": format!("submit|{}|{}|{}", request_id, session_id, qi),
                         "value": {
                             "action": "question",
                             "reply": "answer",

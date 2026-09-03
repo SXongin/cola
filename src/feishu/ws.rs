@@ -618,20 +618,25 @@ fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Value> {
                     "chat_id": parts[1],
                     "thread_id": parts[2],
                 })
-            } else if parts.len() != 5 || parts[0] != "submit" {
+            } else if parts[0] != "submit" || !(parts.len() == 4 || parts.len() == 5) {
                 // Form submit callbacks don't always deliver the button `value`;
                 // the routing payload is encoded in the button `name`
-                // ("submit|<req>|<ses>|<qi>|<dir>") — rebuild the value from it.
+                // ("submit|<req>|<ses>|<qi>[|<dir>]") — rebuild the value from it.
+                // The trailing directory is legacy (dropped so the name stays
+                // under Feishu's 100-char limit); the handler re-resolves it.
                 return None;
             } else {
-                serde_json::json!({
+                let mut val = serde_json::json!({
                     "action": "question",
                     "reply": "answer",
                     "request_id": parts[1],
                     "session_id": parts[2],
                     "question_index": parts[3].parse::<u64>().ok()?,
-                    "directory": parts[4],
-                })
+                });
+                if let Some(dir) = parts.get(4) {
+                    val["directory"] = serde_json::Value::String(dir.to_string());
+                }
+                val
             }
         }
     };
@@ -1595,9 +1600,36 @@ mod tests {
     }
 
     /// Form submit callbacks may omit `action.value` entirely — the routing
-    /// payload is then rebuilt from the button `name`.
+    /// payload is then rebuilt from the button `name`. The directory is no
+    /// longer part of the name (Feishu caps `name` at 100 chars), so the rebuilt
+    /// value carries no `directory`; the handler re-resolves it.
     #[test]
     fn form_submit_without_value_rebuilds_routing_from_name() {
+        let payload = r#"{
+            "schema": "2.0",
+            "event": {
+                "action": {
+                    "tag": "button",
+                    "name": "submit|que_1|ses_1|0",
+                    "form_value": {
+                        "custom_0": "自定义答案"
+                    }
+                }
+            }
+        }"#;
+        let value = extract_card_action_value(payload.as_bytes()).expect("value extracted");
+        assert_eq!(value["answer"], "自定义答案");
+        assert_eq!(value["question_index"], 0);
+        assert_eq!(value["request_id"], "que_1");
+        assert_eq!(value["session_id"], "ses_1");
+        assert!(value.get("directory").is_none(), "directory dropped from name");
+        assert_eq!(value["reply"], "answer");
+    }
+
+    /// Legacy cards still carry the directory as a 5th name segment; keep
+    /// parsing them so in-flight cards from before the change keep working.
+    #[test]
+    fn form_submit_without_value_accepts_legacy_directory_segment() {
         let payload = r#"{
             "schema": "2.0",
             "event": {
@@ -1612,11 +1644,8 @@ mod tests {
         }"#;
         let value = extract_card_action_value(payload.as_bytes()).expect("value extracted");
         assert_eq!(value["answer"], "自定义答案");
-        assert_eq!(value["question_index"], 0);
-        assert_eq!(value["request_id"], "que_1");
-        assert_eq!(value["session_id"], "ses_1");
         assert_eq!(value["directory"], "/tmp/proj");
-        assert_eq!(value["reply"], "answer");
+        assert_eq!(value["session_id"], "ses_1");
     }
 
     /// A plain button click keeps its value untouched (no option/form_value).
