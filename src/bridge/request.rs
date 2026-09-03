@@ -456,11 +456,24 @@ impl RequestKind for QuestionKind {
                 let Some(n) = n else {
                     return None; // stale card for an already-submitted request
                 };
+                // Multi-select questions toggle a label in the answer set on
+                // each click (never auto-finalize); single-select replaces the
+                // answer as before.
+                let (multi, has_multi) = {
+                    let reqs = flow.question_requests.lock().await;
+                    let qs = &reqs.get(req_id).map(|r| r.questions.clone()).unwrap_or_default();
+                    let multi = qs.get(index).is_some_and(|q| q.multiple == Some(true));
+                    let has_multi = qs.iter().any(|q| q.multiple == Some(true));
+                    (multi, has_multi)
+                };
                 // Record this question's answer.
                 let (answered_count, slot) = {
                     let mut partial = flow.question_partial.lock().await;
-                    let (count, slot) = record_answer(&mut partial, req_id, n, index, &answer);
-                    (count, slot)
+                    if multi {
+                        record_toggle_answer(&mut partial, req_id, n, index, &answer)
+                    } else {
+                        record_answer(&mut partial, req_id, n, index, &answer)
+                    }
                 };
                 // Keep the inline card's partial answers in sync.
                 if inline
@@ -478,7 +491,7 @@ impl RequestKind for QuestionKind {
                 {
                     pq.answers = slot.clone();
                 }
-                if answered_count == n {
+                if answered_count == n && !has_multi {
                     // All questions answered → submit the whole request.
                     flow.mark_answered(core, req_id).await;
                     let answers: Vec<Vec<String>> = flow
@@ -543,7 +556,7 @@ impl RequestKind for QuestionKind {
                         card: None,
                         toast: None,
                     };
-                    r.toast = Some(format!("已记录答案，还有 {} 题未答", n - answered_count));
+                    r.toast = Some(answer_recorded_toast(n - answered_count));
                     // Build on a CLONE so a card-component-limit split can't
                     // advance the live accumulator's `render_from` from inside
                     // the click handler (flush_card owns that flow). Only take
@@ -593,7 +606,7 @@ impl RequestKind for QuestionKind {
                         card: Some(card),
                         toast: None,
                     };
-                    r.toast = Some(format!("已记录答案，还有 {} 题未答", remaining));
+                    r.toast = Some(answer_recorded_toast(remaining));
                     Some(r)
                 }
             }
@@ -1073,6 +1086,44 @@ fn record_answer(
     (count, slot.clone())
 }
 
+/// Multi-select variant of `record_answer`: each click toggles the label in the
+/// question's answer set (add if absent, remove if present). Toggling the last
+/// label off reverts the slot to `None` (the question is open again). Used only
+/// for questions with `multiple: true`, which never auto-finalize on a click.
+fn record_toggle_answer(
+    partial: &mut HashMap<String, Vec<Option<Vec<String>>>>,
+    req_id: &str,
+    n: usize,
+    index: usize,
+    answer: &str,
+) -> (usize, Vec<Option<Vec<String>>>) {
+    let slot = partial.entry(req_id.to_string()).or_insert_with(|| vec![None; n]);
+    if index < n {
+        let current = slot[index].get_or_insert_with(Vec::new);
+        if let Some(pos) = current.iter().position(|l| l == answer) {
+            current.remove(pos);
+        } else {
+            current.push(answer.to_string());
+        }
+        if current.is_empty() {
+            slot[index] = None;
+        }
+    }
+    let count = slot.iter().filter(|a| a.is_some()).count();
+    (count, slot.clone())
+}
+
+/// Toast after recording an answer. `remaining == 0` only happens when every
+/// slot holds a selection but the request is NOT auto-submitting — i.e. a
+/// multi-select question is still awaiting an explicit submit click.
+fn answer_recorded_toast(remaining: usize) -> String {
+    if remaining == 0 {
+        "已记录答案，请点击提交".to_string()
+    } else {
+        format!("已记录答案，还有 {} 题未答", remaining)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1121,5 +1172,34 @@ mod tests {
         record_answer(&mut partial, "q1", 1, 0, "a");
         let (count, _) = record_answer(&mut partial, "q2", 1, 0, "b");
         assert_eq!(count, 1); // q2 has its own slots
+    }
+
+    #[test]
+    fn record_toggle_answer_adds_then_removes_labels() {
+        let mut partial = HashMap::new();
+        // First toggle adds the label.
+        let (count, slot) = record_toggle_answer(&mut partial, "q1", 1, 0, "a");
+        assert_eq!(count, 1);
+        assert_eq!(slot, vec![Some(vec!["a".to_string()])]);
+        // Second toggle accumulates a second label.
+        let (count, slot) = record_toggle_answer(&mut partial, "q1", 1, 0, "b");
+        assert_eq!(count, 1);
+        assert_eq!(slot, vec![Some(vec!["a".to_string(), "b".to_string()])]);
+        // Toggling one off keeps the other.
+        let (count, slot) = record_toggle_answer(&mut partial, "q1", 1, 0, "a");
+        assert_eq!(count, 1);
+        assert_eq!(slot, vec![Some(vec!["b".to_string()])]);
+        // Toggling the last off reverts the slot to None (question open again).
+        let (count, slot) = record_toggle_answer(&mut partial, "q1", 1, 0, "b");
+        assert_eq!(count, 0);
+        assert_eq!(slot, vec![None]);
+    }
+
+    #[test]
+    fn record_toggle_answer_out_of_range_index_is_ignored() {
+        let mut partial = HashMap::new();
+        let (count, slot) = record_toggle_answer(&mut partial, "q1", 2, 99, "x");
+        assert_eq!(count, 0);
+        assert_eq!(slot, vec![None, None]);
     }
 }

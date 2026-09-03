@@ -4109,6 +4109,103 @@ pub(crate) mod integration_tests {
         assert_eq!(calls[0].1, vec![vec!["/a".to_string()], vec!["main".to_string()]]);
     }
 
+    /// A multi-select question (`multiple: true`) never finalizes on a click:
+    /// each option click toggles the label in the answer set, the returned card
+    /// shows the running selection (已选) and a submit button, and only an
+    /// explicit submit replies with the accumulated set.
+    #[tokio::test]
+    async fn multi_select_question_toggles_until_submit() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = Arc::new(MockBackend::new(realistic_parts()));
+        let app = Arc::new(App::new(cfg, backend.clone(), Arc::new(RecordingPlatform::new())).unwrap());
+
+        app.question.question_requests.lock().await.insert(
+            "que_multi".into(),
+            opencode::client::QuestionRequest {
+                id: "que_multi".into(),
+                session_id: "ses_1".into(),
+                questions: vec![opencode::client::QuestionInfo {
+                    question: "选择水果".into(),
+                    header: "水果".into(),
+                    options: vec![
+                        opencode::client::QuestionOption {
+                            label: "苹果".into(),
+                            description: String::new(),
+                        },
+                        opencode::client::QuestionOption {
+                            label: "香蕉".into(),
+                            description: String::new(),
+                        },
+                        opencode::client::QuestionOption {
+                            label: "橙子".into(),
+                            description: String::new(),
+                        },
+                    ],
+                    multiple: Some(true),
+                    custom: None,
+                }],
+            },
+        );
+
+        let value = |answer: &str| {
+            serde_json::json!({
+                "action": "question",
+                "reply": "answer",
+                "request_id": "que_multi",
+                "session_id": "ses_1",
+                "directory": "/work",
+                "question_index": 0,
+                "answer": answer,
+            })
+        };
+
+        // Click 苹果 → NOT submitted (multi-select toggles, never auto-submits).
+        let r1 = app.handle_card_action(value("苹果")).await.expect("result");
+        assert_eq!(r1.toast.as_deref(), Some("已记录答案，请点击提交"));
+        let c1 = r1.card.as_ref().expect("re-rendered card").to_string();
+        assert!(c1.contains("已选：苹果"), "marker missing: {}", c1);
+        assert!(c1.contains("可多选"), "multi hint missing: {}", c1);
+        assert!(c1.contains("✅ 提交"), "submit button missing: {}", c1);
+        // The selected button shows its ✅/checked state in the card JSON.
+        assert!(
+            c1.contains("\"content\":\"✅ 苹果\""),
+            "selected button state missing: {}",
+            c1
+        );
+        assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
+
+        // Click 香蕉 → accumulates a second label.
+        let r2 = app.handle_card_action(value("香蕉")).await.expect("result");
+        let c2 = r2.card.as_ref().expect("re-rendered card").to_string();
+        assert!(c2.contains("已选：苹果、香蕉"), "accumulate failed: {}", c2);
+        assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
+
+        // Click 苹果 again → toggles it OFF, only 香蕉 remains.
+        let r3 = app.handle_card_action(value("苹果")).await.expect("result");
+        let c3 = r3.card.as_ref().expect("re-rendered card").to_string();
+        assert!(c3.contains("已选：香蕉"), "toggle off failed: {}", c3);
+        assert!(!c3.contains("已选：苹果、香蕉"), "toggle off kept 苹果: {}", c3);
+        assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
+
+        // Submit → replies with the accumulated set.
+        let submit = app
+            .handle_card_action(serde_json::json!({
+                "action": "question",
+                "reply": "submit",
+                "request_id": "que_multi",
+                "session_id": "ses_1",
+                "directory": "/work",
+            }))
+            .await
+            .expect("result");
+        assert_eq!(submit.toast.as_deref(), Some("已提交"));
+        let calls = backend.reply_question_calls.lock().await.clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, vec![vec!["香蕉".to_string()]]);
+    }
+
     /// A question raised during an active turn is surfaced INLINE on the
     /// streaming card; answering one of several only toasts and returns the
     /// re-rendered streaming card (markers/已选 in the callback response — the
