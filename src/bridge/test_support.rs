@@ -4206,6 +4206,82 @@ pub(crate) mod integration_tests {
         assert_eq!(calls[0].1, vec![vec!["香蕉".to_string()]]);
     }
 
+    /// A multi-select question can be submitted with an EMPTY selection ("不选"):
+    /// the submit button is always present for multi-select, and submitting with
+    /// nothing toggled replies with an empty answer set.
+    #[tokio::test]
+    async fn multi_select_can_submit_empty_selection() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = Arc::new(MockBackend::new(realistic_parts()));
+        let app = Arc::new(App::new(cfg, backend.clone(), Arc::new(RecordingPlatform::new())).unwrap());
+
+        app.question.question_requests.lock().await.insert(
+            "que_empty".into(),
+            opencode::client::QuestionRequest {
+                id: "que_empty".into(),
+                session_id: "ses_1".into(),
+                questions: vec![opencode::client::QuestionInfo {
+                    question: "选择水果".into(),
+                    header: "水果".into(),
+                    options: vec![opencode::client::QuestionOption {
+                        label: "苹果".into(),
+                        description: String::new(),
+                    }],
+                    multiple: Some(true),
+                    custom: None,
+                }],
+            },
+        );
+
+        // Toggle 苹果 on, then off → back to an open question with NO selection.
+        app.handle_card_action(serde_json::json!({
+            "action": "question",
+            "reply": "answer",
+            "request_id": "que_empty",
+            "session_id": "ses_1",
+            "directory": "/work",
+            "question_index": 0,
+            "answer": "苹果",
+        }))
+        .await;
+        let r2 = app
+            .handle_card_action(serde_json::json!({
+                "action": "question",
+                "reply": "answer",
+                "request_id": "que_empty",
+                "session_id": "ses_1",
+                "directory": "/work",
+                "question_index": 0,
+                "answer": "苹果",
+            }))
+            .await
+            .expect("result");
+        // The re-rendered card has NO selection but STILL shows the submit
+        // button, so "不选" is expressible.
+        let c2 = r2.card.as_ref().expect("re-rendered card").to_string();
+        assert!(!c2.contains("已选"), "selection must be cleared: {}", c2);
+        assert!(c2.contains("✅ 提交"), "submit must stay visible: {}", c2);
+        assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
+
+        // Submitting with nothing selected replies with an empty set.
+        let submit = app
+            .handle_card_action(serde_json::json!({
+                "action": "question",
+                "reply": "submit",
+                "request_id": "que_empty",
+                "session_id": "ses_1",
+                "directory": "/work",
+            }))
+            .await
+            .expect("result");
+        assert_eq!(submit.toast.as_deref(), Some("已提交"));
+        let calls = backend.reply_question_calls.lock().await.clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, vec![Vec::<String>::new()]);
+    }
+
     /// A question raised during an active turn is surfaced INLINE on the
     /// streaming card; answering one of several only toasts and returns the
     /// re-rendered streaming card (markers/已选 in the callback response — the
