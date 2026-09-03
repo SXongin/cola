@@ -740,11 +740,15 @@ pub fn question_summary(questions: &[crate::opencode::client::QuestionInfo]) -> 
 /// Build the interactive question card (JSON 2.0). Options render as buttons
 /// when few, or collapse into a folding `overflow` group when many; a question
 /// that allows a custom answer (`custom`, default true) gets an input box in a
-/// form container. Already-answered questions (`answered[i] == Some(labels)`)
-/// render as a static "已选" line instead of buttons, so answering one question
-/// never silently submits the others. A submit button appears when some (but
-/// not all) questions are answered; a reject button sits at the bottom. The
-/// card callback (`action: "question"`) posts the answer back to the session.
+/// form container. A multi-select question (`multiple`) renders its options as
+/// toggle buttons instead: each click adds/removes the label and the card shows
+/// the running selection ("已选"), finalized by an explicit submit. Already-
+/// answered single-select questions (`answered[i] == Some(labels)`) render as a
+/// static "已选" line instead of buttons, so answering one question never
+/// silently submits the others. A submit button appears when some (but not all)
+/// questions are answered, or when any multi-select question holds a selection;
+/// a reject button sits at the bottom. The card callback (`action: "question"`)
+/// posts the answer back to the session.
 /// The body elements of a question prompt: a markdown summary (with ✅ on
 /// answered questions), option buttons (or a folding `overflow` when many),
 /// a custom-answer input form, an optional "submit/skip" button, and a reject
@@ -757,13 +761,22 @@ pub fn question_elements(
     directory: &str,
     answered: &[Option<Vec<String>>],
 ) -> Vec<serde_json::Value> {
+    // A multi-select question (`multiple`) is NEVER finalized by clicking an
+    // option: clicks toggle labels in its answer set until the user submits.
+    // Single-select questions are finalized the moment an option is clicked.
+    let is_multi = |i: usize| -> bool { questions.get(i).is_some_and(|q| q.multiple == Some(true)) };
     let is_answered = |qi: usize| -> bool { answered.get(qi).and_then(|a| a.as_ref()).is_some() };
     let mut markdown = String::new();
     for (i, q) in questions.iter().enumerate() {
-        if is_answered(i) {
+        if is_answered(i) && !is_multi(i) {
             markdown.push_str(&format!("✅ **{}. {}**\n", i + 1, q.question));
         } else {
-            markdown.push_str(&format!("**{}. {}**\n", i + 1, q.question));
+            markdown.push_str(&format!(
+                "**{}. {}{}**\n",
+                i + 1,
+                q.question,
+                if is_multi(i) { "（可多选）" } else { "" }
+            ));
         }
         for opt in &q.options {
             if opt.description.is_empty() {
@@ -784,10 +797,12 @@ pub fn question_elements(
     // answer shape.
     let mut elements: Vec<serde_json::Value> = vec![json!({ "tag": "markdown", "content": markdown })];
     for (qi, q) in questions.iter().enumerate() {
-        if is_answered(qi) {
+        if is_answered(qi) && !is_multi(qi) {
             continue;
         }
-        if q.options.len() > MAX_VISIBLE_OPTIONS {
+        // Multi-select stays on buttons (clicks toggle); only single-select
+        // collapses into an `overflow` when there are many options.
+        if !is_multi(qi) && q.options.len() > MAX_VISIBLE_OPTIONS {
             let options: Vec<serde_json::Value> = q
                 .options
                 .iter()
@@ -812,10 +827,24 @@ pub fn question_elements(
             }));
         } else {
             for opt in &q.options {
+                // Multi-select buttons show their selected state so the user
+                // can see what's already picked while still toggling.
+                let selected = is_multi(qi)
+                    && answered
+                        .get(qi)
+                        .and_then(|a| a.as_ref())
+                        .is_some_and(|labels| labels.iter().any(|l| l == &opt.label));
                 elements.push(json!({
                     "tag": "button",
-                    "text": { "tag": "plain_text", "content": opt.label },
-                    "type": "default",
+                    "text": {
+                        "tag": "plain_text",
+                        "content": if selected {
+                            format!("✅ {}", opt.label)
+                        } else {
+                            opt.label.clone()
+                        },
+                    },
+                    "type": if selected { "primary" } else { "default" },
                     "value": {
                         "action": "question",
                         "reply": "answer",
@@ -831,8 +860,9 @@ pub fn question_elements(
 
         // Free-text answer (OpenCode questions allow custom by default). The
         // typed text arrives in `action.form_value`; ws.rs injects it into the
-        // button's `answer` field so the handler stays unchanged.
-        if q.custom.unwrap_or(true) {
+        // button's `answer` field so the handler stays unchanged. Multi-select
+        // questions keep the button set (custom additions are an edge case).
+        if !is_multi(qi) && q.custom.unwrap_or(true) {
             let input_name = format!("custom_{}", qi);
             elements.push(json!({
                 "tag": "form",
@@ -869,10 +899,19 @@ pub fn question_elements(
         }
     }
     let answered_count = answered.iter().filter(|a| a.is_some()).count();
-    if answered_count > 0 && answered_count < questions.len() {
+    let has_multi = questions.iter().any(|q| q.multiple == Some(true));
+    // Submit appears once something is picked, either because questions remain
+    // open (single-select "跳过剩余") or because a multi-select question needs
+    // an explicit submit even when every slot already holds a selection.
+    if answered_count > 0 && (answered_count < questions.len() || has_multi) {
+        let label = if answered_count == questions.len() {
+            "✅ 提交"
+        } else {
+            "✅ 提交（跳过剩余）"
+        };
         elements.push(json!({
             "tag": "button",
-            "text": { "tag": "plain_text", "content": "✅ 提交（跳过剩余）" },
+            "text": { "tag": "plain_text", "content": label },
             "type": "primary",
             "value": {
                 "action": "question",
