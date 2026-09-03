@@ -900,11 +900,14 @@ pub fn question_elements(
     }
     let answered_count = answered.iter().filter(|a| a.is_some()).count();
     let has_multi = questions.iter().any(|q| q.multiple == Some(true));
-    // Submit appears once something is picked, either because questions remain
-    // open (single-select "跳过剩余") or because a multi-select question needs
-    // an explicit submit even when every slot already holds a selection.
-    if answered_count > 0 && (answered_count < questions.len() || has_multi) {
-        let label = if answered_count == questions.len() {
+    // Submit appears when something is picked while questions remain open
+    // (single-select "跳过剩余"), and ALWAYS for a request containing a
+    // multi-select question — so the user can explicitly submit an empty
+    // selection ("不选") as well as a full one. Without the multi-select case
+    // the button vanishes at zero selections and "none" is unexpressible.
+    let show_submit = (answered_count > 0 && answered_count < questions.len()) || has_multi;
+    if show_submit {
+        let label = if has_multi {
             "✅ 提交"
         } else {
             "✅ 提交（跳过剩余）"
