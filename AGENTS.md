@@ -59,7 +59,7 @@ install or re-sync manually at any time:
 `lefthook.yml` wires up:
 
 - **pre-commit**: `cargo fmt --all -- --check` + `cargo clippy --workspace --all-targets -- -D warnings`. Both only fire when staged files touch `*.rs`, so docs/`.scratch`-only commits stay fast.
-- **commit-msg**: Conventional Commits validation (`scripts/check-commit-msg.sh`).
+- **commit-msg**: Conventional Commits validation (`cargo xtask check-commit-msg`).
 - **pre-push**: `cargo xtask audit` — dependency audit via cargo-deny (`deny.toml`). Install cargo-deny with `cargo install cargo-deny`.
 
 Standard local verification loop before pushing (CI's Format job is `cargo fmt --all -- --check` — clippy and rustc do NOT check formatting, so a clean clippy does not mean a clean fmt):

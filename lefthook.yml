@@ -19,7 +19,7 @@ pre-commit:
 commit-msg:
   commands:
     conventional-commits:
-      run: scripts/check-commit-msg.sh {1}
+      run: cargo xtask check-commit-msg {1}
 
 pre-push:
   commands:

@@ -26,7 +26,7 @@ automatically (`pre-commit`: fmt + clippy on staged `*.rs`; `pre-push`: audit).
 ## Commits
 
 Follow Conventional Commits — see `CONTRIBUTING.md`. The format is enforced by
-`scripts/check-commit-msg.sh` (subject ≤ 72 chars).
+`cargo xtask check-commit-msg` (subject ≤ 72 chars).
 
 ## Code conventions
 
