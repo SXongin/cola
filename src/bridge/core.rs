@@ -142,6 +142,85 @@ impl SharedCore {
             .and_then(opencode::client::parse_model)
     }
 
+    /// The per-session `/think` variant override (from the persisted
+    /// `SessionEntry`). `None` when unset — the server's default for whatever
+    /// model runs this turn.
+    pub async fn session_variant_override(&self, session_id: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .await
+            .entry_for_session(session_id)
+            .and_then(|e| e.variant.clone())
+    }
+
+    /// The model the NEXT turn will actually run, resolved session override →
+    /// configured default → server-recorded session model (`GET /session/{id}`).
+    /// `None` only when every rung fails (no override, no config, server
+    /// unreachable) — the `/think` card then tells the user to `/model` first.
+    /// Returns `(provider, model)`.
+    pub async fn effective_model(&self, session_id: &str) -> Option<(String, String)> {
+        // 1. The session's own `/model` override.
+        if let Some(m) = self.session_model_override(session_id).await {
+            return Some((m.provider_id, m.id));
+        }
+        // 2. The configured default (`[opencode] model`).
+        if let Some(m) = self.opencode.configured_default_model() {
+            return Some((m.provider_id, m.id));
+        }
+        // 3. What the server actually recorded for the session.
+        let directory = self
+            .sessions
+            .lock()
+            .await
+            .entry_for_session(session_id)
+            .map(|e| e.directory.clone());
+        if let Some(dir) = directory
+            && let Ok(info) = self.opencode.session_info(session_id, Some(&dir)).await
+            && let Some(m) = info.model
+        {
+            return Some((m.provider_id, m.id));
+        }
+        None
+    }
+
+    /// The declared variants of a provider/model, per `GET /provider`.
+    /// Best-effort: `None` when the model can't be found in the advertised
+    /// catalog (callers then leave a stored variant in place rather than
+    /// destroying it on an unknown).
+    pub async fn model_variants(&self, provider: &str, model: &str) -> Option<Vec<String>> {
+        self.opencode
+            .list_models()
+            .await
+            .into_iter()
+            .find(|p| p.provider == provider)
+            .and_then(|p| p.models.into_iter().find(|m| m.id == model))
+            .map(|m| m.variants)
+    }
+
+    /// Auto-clear the `/think` variant when switching a session to a model that
+    /// doesn't declare it (ADR-0020): a leftover variant would make every prompt
+    /// fail with a server `VariantUnavailableError`. Shared by the `/model` text
+    /// form and the `/model` picker card. Returns the cleared variant name, or
+    /// `None` when the variant survives. Best-effort: a model not found in the
+    /// advertised catalog is left alone (can't be judged, so it is not
+    /// destroyed — the server error is the fallback).
+    pub async fn clear_variant_for_model(
+        &self,
+        entry: &mut crate::config::SessionEntry,
+        model_spec: &str,
+    ) -> Option<String> {
+        if let Some(v) = entry.variant.clone()
+            && let Some(m) = crate::opencode::client::parse_model(model_spec)
+            && let Some(variants) = self.model_variants(&m.provider_id, &m.id).await
+            && !variants.iter().any(|x| x == &v)
+        {
+            entry.variant = None;
+            Some(v)
+        } else {
+            None
+        }
+    }
+
     /// The session mapped to a thread (if any).
     pub async fn get_session_id(&self, thread_key: &ThreadKey) -> Option<String> {
         self.sessions

@@ -241,6 +241,8 @@ pub struct MockBackend {
     pub prompt_images: Arc<tokio::sync::Mutex<Vec<usize>>>,
     /// Records the model passed to each `prompt` call ("provider/model").
     pub prompt_models: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
+    /// Records the variant passed to each `prompt` call (the `/think` override).
+    pub prompt_variants: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
     /// Records the agent passed to each `prompt` call.
     pub prompt_agents: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
     /// Records every `prompt_async` call's text (asserts supplement path).
@@ -249,6 +251,8 @@ pub struct MockBackend {
     pub prompt_async_images: Arc<tokio::sync::Mutex<Vec<usize>>>,
     /// Records the model passed to each `prompt_async` call.
     pub prompt_async_models: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
+    /// Records the variant passed to each `prompt_async` call.
+    pub prompt_async_variants: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
     /// Records the agent passed to each `prompt_async` call.
     pub prompt_async_agents: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
     /// The session id `create_session` returns.
@@ -271,6 +275,12 @@ pub struct MockBackend {
     /// Available models grouped by provider, served by `list_models` (for the
     /// `/model` card).
     pub provider_models: Vec<opencode::client::ProviderModels>,
+    /// The configured default model served by `configured_default_model` (the
+    /// second rung of the `/think` effective-model resolution).
+    pub default_model: Option<opencode::client::ModelInfo>,
+    /// The server-recorded session model served by `session_info` (the third
+    /// rung of the `/think` effective-model resolution).
+    pub session_model: Option<opencode::client::SessionModel>,
 }
 
 impl MockBackend {
@@ -292,10 +302,12 @@ impl MockBackend {
             prompt_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_images: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_models: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            prompt_variants: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_agents: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_async_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_async_images: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_async_models: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            prompt_async_variants: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_async_agents: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             session_id: "ses_test".into(),
             stale_session_404: false,
@@ -305,6 +317,8 @@ impl MockBackend {
             list_sessions_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             agents: Vec::new(),
             provider_models: Vec::new(),
+            default_model: None,
+            session_model: None,
         }
     }
 }
@@ -365,6 +379,7 @@ impl opencode::Backend for MockBackend {
         text: &str,
         images: &[opencode::client::ImageInput],
         _model: Option<&opencode::client::ModelInfo>,
+        variant: Option<&str>,
         agent: Option<&str>,
     ) -> crate::error::Result<opencode::client::PromptResponse> {
         self.prompt_calls.lock().await.push(text.to_string());
@@ -373,6 +388,10 @@ impl opencode::Backend for MockBackend {
             .lock()
             .await
             .push(_model.map(|m| format!("{}/{}", m.provider_id, m.id)));
+        self.prompt_variants
+            .lock()
+            .await
+            .push(variant.map(|v| v.to_string()));
         self.prompt_agents.lock().await.push(agent.map(|s| s.to_string()));
         if self.stale_session_404 && session_id != self.session_id {
             return Err(crate::error::BridgeError::SessionNotFound(session_id.to_string()));
@@ -403,6 +422,7 @@ impl opencode::Backend for MockBackend {
         text: &str,
         images: &[opencode::client::ImageInput],
         _model: Option<&opencode::client::ModelInfo>,
+        variant: Option<&str>,
         agent: Option<&str>,
     ) -> crate::error::Result<()> {
         self.prompt_async_calls
@@ -414,6 +434,10 @@ impl opencode::Backend for MockBackend {
             .lock()
             .await
             .push(_model.map(|m| format!("{}/{}", m.provider_id, m.id)));
+        self.prompt_async_variants
+            .lock()
+            .await
+            .push(variant.map(|v| v.to_string()));
         self.prompt_async_agents
             .lock()
             .await
@@ -509,6 +533,10 @@ impl opencode::Backend for MockBackend {
         Ok(Some(100_000))
     }
 
+    fn configured_default_model(&self) -> Option<opencode::client::ModelInfo> {
+        self.default_model.clone()
+    }
+
     async fn list_agents(&self) -> Vec<opencode::client::AgentInfo> {
         self.agents.clone()
     }
@@ -555,6 +583,7 @@ impl opencode::Backend for MockBackend {
             id: session_id.to_string(),
             parent_id: self.session_parents.get(session_id).cloned(),
             title: self.session_titles.lock().unwrap().get(session_id).cloned(),
+            model: self.session_model.clone(),
         })
     }
 
@@ -625,6 +654,14 @@ pub fn long_answer_parts() -> serde_json::Value {
 pub(crate) mod integration_tests {
     use super::*;
     use crate::bridge::command::{Command, SwitchAction};
+
+    /// Build a `ModelOption` with the given id and declared variants.
+    fn model_option(id: &str, variants: &[&str]) -> crate::opencode::client::ModelOption {
+        crate::opencode::client::ModelOption {
+            id: id.to_string(),
+            variants: variants.iter().map(|s| s.to_string()).collect(),
+        }
+    }
 
     async fn build_app(
         cfg: crate::config::Config,
@@ -967,6 +1004,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
         }
 
@@ -1007,6 +1045,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
         }
         assert_eq!(
@@ -1040,6 +1079,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
         }
         assert_eq!(
@@ -1078,6 +1118,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
         }
 
@@ -1454,6 +1495,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: true,
                 topic_anchor: None,
+                variant: None,
             });
             store.persist().unwrap();
         }
@@ -1522,6 +1564,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
             store.persist().unwrap();
         }
@@ -1585,6 +1628,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
             store.persist().unwrap();
         }
@@ -1671,6 +1715,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
             store.persist().unwrap();
         }
@@ -1737,6 +1782,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
             store.set_active(crate::config::SessionEntry {
                 thread_key: key.clone(),
@@ -1746,6 +1792,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
             store.persist().unwrap();
         }
@@ -1829,6 +1876,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
             store.set_active(crate::config::SessionEntry {
                 thread_key: key.clone(),
@@ -1838,6 +1886,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
             store.persist().unwrap();
         }
@@ -1919,6 +1968,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
             store.persist().unwrap();
         }
@@ -1992,6 +2042,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
             store.persist().unwrap();
         }
@@ -2181,6 +2232,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
             store.persist().unwrap();
         }
@@ -2388,6 +2440,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
             store.persist().unwrap();
         }
@@ -2468,6 +2521,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: Some("msg_in_topic_anchor".into()),
+                variant: None,
             });
             store.persist().unwrap();
         }
@@ -3255,6 +3309,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
         }
 
@@ -3313,6 +3368,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
         }
 
@@ -3458,6 +3514,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
         }
 
@@ -3660,6 +3717,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
             store.set_active(crate::config::SessionEntry {
                 thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "omt_topic_1".into()),
@@ -3669,6 +3727,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
             store.persist().unwrap();
         }
@@ -3748,6 +3807,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
             store.set_active(crate::config::SessionEntry {
                 thread_key: crate::config::ThreadKey::new("oc_p2p_1".into(), "omt_p2p_1".into()),
@@ -3757,6 +3817,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
             store.persist().unwrap();
         }
@@ -3824,6 +3885,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
             store.set_active(crate::config::SessionEntry {
                 thread_key: thread.clone(),
@@ -3833,6 +3895,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
             store.persist().unwrap();
         }
@@ -3916,6 +3979,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
         }
 
@@ -4448,6 +4512,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
             store.persist().unwrap();
         }
@@ -4528,6 +4593,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
         }
 
@@ -4676,6 +4742,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
         }
 
@@ -4794,6 +4861,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
         }
 
@@ -4849,6 +4917,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
         }
 
@@ -4891,6 +4960,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
         }
 
@@ -4991,6 +5061,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
             store.set_active(crate::config::SessionEntry {
                 thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
@@ -5000,6 +5071,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
         }
 
@@ -5122,6 +5194,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
         }
 
@@ -5151,7 +5224,10 @@ pub(crate) mod integration_tests {
         let mut backend = MockBackend::new(realistic_parts());
         backend.provider_models = vec![crate::opencode::client::ProviderModels {
             provider: "opencode".into(),
-            models: vec!["deepseek-v4-flash".into(), "gpt-4o".into()],
+            models: vec![
+                model_option("deepseek-v4-flash", &[]),
+                model_option("gpt-4o", &[]),
+            ],
         }];
         let (app, platform) = build_app(cfg, backend).await;
 
@@ -5195,7 +5271,10 @@ pub(crate) mod integration_tests {
         let mut backend = MockBackend::new(realistic_parts());
         backend.provider_models = vec![crate::opencode::client::ProviderModels {
             provider: "opencode".into(),
-            models: vec!["deepseek-v4-flash".into(), "gpt-4o".into()],
+            models: vec![
+                model_option("deepseek-v4-flash", &[]),
+                model_option("gpt-4o", &[]),
+            ],
         }];
         let (app, _platform) = build_app(cfg, backend).await;
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
@@ -5209,6 +5288,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
         }
 
@@ -5258,11 +5338,11 @@ pub(crate) mod integration_tests {
         backend.provider_models = vec![
             crate::opencode::client::ProviderModels {
                 provider: "opencode".into(),
-                models: vec!["deepseek-v4-flash".into()],
+                models: vec![model_option("deepseek-v4-flash", &[])],
             },
             crate::opencode::client::ProviderModels {
                 provider: "openrouter".into(),
-                models: vec!["gpt-4o".into()],
+                models: vec![model_option("gpt-4o", &[])],
             },
         ];
         let (app, _platform) = build_app(cfg, backend).await;
@@ -5309,6 +5389,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
         }
 
@@ -5362,6 +5443,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
         }
 
@@ -5418,6 +5500,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
         }
 
@@ -5457,6 +5540,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
         }
 
@@ -5495,6 +5579,409 @@ pub(crate) mod integration_tests {
         );
     }
 
+    /// `/think <variant>` records a per-session override (the OpenCode server
+    /// has no thinking-level endpoint) and the NEXT prompt carries it as the
+    /// per-prompt `variant`.
+    #[tokio::test]
+    async fn think_command_records_variant_used_on_next_prompt() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        let prompt_variants = backend.prompt_variants.clone();
+        let (app, _platform) = build_app(cfg, backend).await;
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: key.clone(),
+                session_id: "ses_test".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                model: Some("opencode-go/deepseek-v4-flash".into()),
+                auto_accept: false,
+                topic_anchor: None,
+                variant: None,
+            });
+        }
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Think("high".into()),
+            key.clone(),
+            "msg_think",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let stored = {
+            let store = app.sessions.lock().await;
+            store
+                .entry_for_session("ses_test")
+                .and_then(|e| e.variant.clone())
+        };
+        assert_eq!(stored.as_deref(), Some("high"));
+
+        // The next message prompts with the variant.
+        app.handle_message(incoming(
+            "msg_prompt".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "hi".into(),
+            None,
+        ))
+        .await;
+        assert_eq!(
+            prompt_variants.lock().await.as_slice(),
+            &[Some("high".to_string())]
+        );
+    }
+
+    /// `/think` validates the variant against the effective model's declared
+    /// set: an undeclared value is rejected with feedback and nothing is stored.
+    #[tokio::test]
+    async fn think_command_rejects_undeclared_variant() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.provider_models = vec![crate::opencode::client::ProviderModels {
+            provider: "opencode-go".into(),
+            models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
+        }];
+        let (app, platform) = build_app(cfg, backend).await;
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: key.clone(),
+                session_id: "ses_test".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                model: Some("opencode-go/deepseek-v4-flash".into()),
+                auto_accept: false,
+                topic_anchor: None,
+                variant: None,
+            });
+        }
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Think("medium".into()),
+            key.clone(),
+            "msg_think",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let calls = platform.calls.lock().await.clone();
+        let text = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .next()
+            .expect("a rejection reply should be sent");
+        assert!(text.contains("不支持思考等级"), "rejection: {text}");
+        assert!(
+            app.sessions
+                .lock()
+                .await
+                .entry_for_session("ses_test")
+                .and_then(|e| e.variant.clone())
+                .is_none(),
+            "an undeclared variant must not be stored"
+        );
+    }
+
+    /// `/think default` (and `off`/`reset`) clears the override.
+    #[tokio::test]
+    async fn think_command_clears_variant_with_default() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: key.clone(),
+                session_id: "ses_test".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+                variant: Some("high".into()),
+            });
+        }
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Think("default".into()),
+            key.clone(),
+            "msg_think",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            app.sessions
+                .lock()
+                .await
+                .entry_for_session("ses_test")
+                .and_then(|e| e.variant.clone())
+                .is_none(),
+            "default must clear the variant"
+        );
+    }
+
+    /// `/think` (no args) sends the variant-picker card listing the effective
+    /// model's declared variants.
+    #[tokio::test]
+    async fn think_no_arg_sends_variant_card() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.provider_models = vec![crate::opencode::client::ProviderModels {
+            provider: "opencode-go".into(),
+            models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
+        }];
+        let (app, platform) = build_app(cfg, backend).await;
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: key.clone(),
+                session_id: "ses_test".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                model: Some("opencode-go/deepseek-v4-flash".into()),
+                auto_accept: false,
+                topic_anchor: None,
+                variant: Some("high".into()),
+            });
+        }
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::ThinkCard,
+            key.clone(),
+            "msg_think_card",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let calls = platform.calls.lock().await.clone();
+        let card = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyCard { card, .. } => Some(card.clone()),
+                _ => None,
+            })
+            .next()
+            .expect("a think card should be sent");
+        let text = card.to_string();
+        assert!(text.contains("思考等级"), "header: {text}");
+        assert!(text.contains("opencode-go/deepseek-v4-flash"), "model: {text}");
+        assert!(text.contains("默认（清除）"), "default option: {text}");
+        assert!(text.contains("\"value\":\"low\""), "variant low: {text}");
+        assert!(text.contains("\"value\":\"high\""), "variant high: {text}");
+        assert!(text.contains("当前思考等级"), "current label: {text}");
+    }
+
+    /// A `/think` card button records the chosen variant and refreshes the
+    /// card; "default" clears it.
+    #[tokio::test]
+    async fn think_card_button_records_variant() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.provider_models = vec![crate::opencode::client::ProviderModels {
+            provider: "opencode-go".into(),
+            models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
+        }];
+        let (app, _platform) = build_app(cfg, backend).await;
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: key.clone(),
+                session_id: "ses_test".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                model: Some("opencode-go/deepseek-v4-flash".into()),
+                auto_accept: false,
+                topic_anchor: None,
+                variant: None,
+            });
+        }
+
+        let value = serde_json::json!({
+            "action": "think",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "value": "high",
+        });
+        let result = app.handle_card_action(value).await.expect("think card action");
+        assert!(result.card.is_some(), "refreshed card returned");
+        let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
+        assert_eq!(entry.variant.as_deref(), Some("high"));
+
+        // "default" clears it.
+        let clear = serde_json::json!({
+            "action": "think",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "value": "default",
+        });
+        app.handle_card_action(clear).await.expect("think clear action");
+        assert!(
+            app.sessions
+                .lock()
+                .await
+                .get_active(&key)
+                .and_then(|e| e.variant.clone())
+                .is_none(),
+            "default must clear the variant"
+        );
+    }
+
+    /// Switching `/model` to a model that doesn't declare the current variant
+    /// auto-clears it (ADR-0020) instead of leaving every prompt to fail with a
+    /// server VariantUnavailableError.
+    #[tokio::test]
+    async fn model_switch_clears_undeclared_variant() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.provider_models = vec![
+            crate::opencode::client::ProviderModels {
+                provider: "opencode-go".into(),
+                models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
+            },
+            crate::opencode::client::ProviderModels {
+                provider: "openrouter".into(),
+                models: vec![model_option("other-model", &["low"])],
+            },
+        ];
+        let (app, _platform) = build_app(cfg, backend).await;
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: key.clone(),
+                session_id: "ses_test".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                model: Some("opencode-go/deepseek-v4-flash".into()),
+                auto_accept: false,
+                topic_anchor: None,
+                variant: Some("high".into()),
+            });
+        }
+
+        // Switching to the SAME model (declares high) keeps the variant.
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Model("opencode-go/deepseek-v4-flash".into()),
+            key.clone(),
+            "msg_model",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            app.sessions
+                .lock()
+                .await
+                .entry_for_session("ses_test")
+                .and_then(|e| e.variant.clone())
+                .as_deref(),
+            Some("high"),
+            "a still-declared variant must survive a model switch"
+        );
+
+        // A model that positively lacks the variant clears it.
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Model("openrouter/other-model".into()),
+            key.clone(),
+            "msg_model2",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+        assert!(
+            app.sessions
+                .lock()
+                .await
+                .entry_for_session("ses_test")
+                .and_then(|e| e.variant.clone())
+                .is_none(),
+            "a model that lacks the variant must clear it"
+        );
+    }
+
+    /// Switching `/model` to a model NOT in the advertised catalog leaves the
+    /// variant in place (best-effort: an unknown model can't be judged, so it is
+    /// not destroyed; the server's VariantUnavailableError is the fallback).
+    #[tokio::test]
+    async fn model_switch_keeps_variant_when_new_model_unknown() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.provider_models = vec![crate::opencode::client::ProviderModels {
+            provider: "opencode-go".into(),
+            models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
+        }];
+        let (app, _platform) = build_app(cfg, backend).await;
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: key.clone(),
+                session_id: "ses_test".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                model: Some("opencode-go/deepseek-v4-flash".into()),
+                auto_accept: false,
+                topic_anchor: None,
+                variant: Some("high".into()),
+            });
+        }
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Model("openrouter/other-model".into()),
+            key.clone(),
+            "msg_model",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            app.sessions
+                .lock()
+                .await
+                .entry_for_session("ses_test")
+                .and_then(|e| e.variant.clone())
+                .as_deref(),
+            Some("high"),
+            "an unknown model must not clear the variant"
+        );
+    }
+
     /// `/model` with a malformed value gets immediate feedback instead of a
     /// silent no-op.
     #[tokio::test]
@@ -5513,6 +6000,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
         }
 
@@ -5568,6 +6056,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
             store.persist().unwrap();
         }
@@ -5622,6 +6111,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
         }
 
@@ -5681,6 +6171,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
             store.persist().unwrap();
         }
@@ -5724,6 +6215,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             });
         }
 
@@ -5850,6 +6342,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: Some("msg_anchor".into()),
+                variant: None,
             });
         }
         let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into());

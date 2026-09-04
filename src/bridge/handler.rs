@@ -390,6 +390,7 @@ impl App {
                         &text,
                         &image_inputs,
                         self.session_model_override(&session_id).await.as_ref(),
+                        self.session_variant_override(&session_id).await.as_deref(),
                         self.session_agent_override(&session_id).await.as_deref(),
                     )
                     .await
@@ -521,6 +522,11 @@ impl App {
             render_poll_loop(&render_core, render_sid, epoch_ms, render_done).await;
         });
 
+        // Capture the variant actually sent this turn AT SEND TIME, not at
+        // finalization: a `/think` issued mid-generation must not retro-tag the
+        // card of a turn that was sent without it (same "capture at turn start"
+        // rule as the work-context 📁 half, ADR-0019).
+        let mut turn_variant = self.session_variant_override(&session_id).await;
         let mut prompt_resp = self
             .opencode
             .prompt(
@@ -528,6 +534,7 @@ impl App {
                 &text,
                 &image_inputs(&images),
                 self.session_model_override(&session_id).await.as_ref(),
+                turn_variant.as_deref(),
                 self.session_agent_override(&session_id).await.as_deref(),
             )
             .await;
@@ -569,6 +576,9 @@ impl App {
                 inflight.insert(fresh_id.clone());
             }
             session_id = fresh_id;
+            // The fresh session resets the per-session overrides, so the retry
+            // is sent without a variant — re-capture what THIS prompt carries.
+            turn_variant = self.session_variant_override(&session_id).await;
 
             let done2 = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let render_core2 = Arc::clone(&self.core);
@@ -584,6 +594,7 @@ impl App {
                     &text,
                     &image_inputs(&images),
                     self.session_model_override(&session_id).await.as_ref(),
+                    self.session_variant_override(&session_id).await.as_deref(),
                     self.session_agent_override(&session_id).await.as_deref(),
                 )
                 .await;
@@ -631,6 +642,11 @@ impl App {
                         }
                     }
                 }
+                // The footer model line shows `provider/model@variant`: the
+                // server reports the model but not the variant, so the variant
+                // comes from what cola actually sent this turn (the session
+                // store's `/think` override).
+                acc.variant = turn_variant;
                 if let Some(err) = &prompt_err {
                     acc.error = Some(err.clone());
                     acc.card_state = crate::feishu::card::CardState::Error;
@@ -772,6 +788,7 @@ impl App {
             model: None,
             auto_accept: false,
             topic_anchor: None,
+            variant: None,
         };
         let mut store = self.sessions.lock().await;
         store.set_active(entry);
@@ -793,6 +810,7 @@ impl App {
             "switch" => self.handle_switch_card_action(&self.core, &value).await,
             "agent" => self.handle_agent_card_action(&self.core, &value).await,
             "model" => self.handle_model_card_action(&self.core, &value).await,
+            "think" => self.handle_think_card_action(&self.core, &value).await,
             "autoaccept" => self.handle_autoaccept_card_action(&self.core, &value).await,
             _ => None,
         }
@@ -866,6 +884,7 @@ impl App {
                     model: None,
                     auto_accept: false,
                     topic_anchor: None,
+                    variant: None,
                 };
                 {
                     let mut store = core.sessions.lock().await;
@@ -898,6 +917,7 @@ impl App {
                             model: None,
                             auto_accept: false,
                             topic_anchor: None,
+                            variant: None,
                         };
                         {
                             let mut store = core.sessions.lock().await;
@@ -1081,7 +1101,7 @@ impl App {
             let cards = if picked == crate::feishu::card::PICKER_BACK_TO_PROVIDERS {
                 crate::feishu::card::build_model_provider_cards(&thread_key, &providers)
             } else {
-                let models: Vec<String> = providers
+                let models: Vec<crate::opencode::client::ModelOption> = providers
                     .iter()
                     .find(|p| p.provider == picked)
                     .map(|p| p.models.clone())
@@ -1105,6 +1125,9 @@ impl App {
             });
         };
         entry.model = Some(picked.clone());
+        // Auto-clear the `/think` variant when the new model doesn't declare
+        // it (ADR-0020), same as the `/model` text form.
+        let cleared_variant = core.clear_variant_for_model(&mut entry, &picked).await;
         {
             let mut store = core.sessions.lock().await;
             store.set_active(entry);
@@ -1112,9 +1135,65 @@ impl App {
                 tracing::warn!("model card: persist failed: {}", e);
             }
         }
+        let extra = cleared_variant
+            .map(|v| format!("（已清除思考等级 `{v}`：新模型不支持）"))
+            .unwrap_or_default();
         Some(CardActionResult {
             card: None,
-            toast: Some(format!("Model: {picked}（下一条消息开始生效）")),
+            toast: Some(format!("Model: {picked}（下一条消息开始生效）{}", extra)),
+        })
+    }
+
+    /// Handle a `/think` card button: record the chosen variant (or clear it
+    /// via "default") as the session's per-prompt override, then refresh the
+    /// card so the current selection updates. Best-effort validation: a pick is
+    /// rejected only when the effective model is resolvable AND positively
+    /// lacks the variant (ADR-0020); unknown models fall through to the
+    /// server's `VariantUnavailableError`.
+    async fn handle_think_card_action(
+        self: &Arc<Self>,
+        core: &Arc<SharedCore>,
+        value: &serde_json::Value,
+    ) -> Option<CardActionResult> {
+        let picked = value
+            .get("value")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let thread_key = thread_key_from_value(value);
+        let cleared = crate::bridge::command::is_clear_variant(&picked);
+        let Some(mut entry) = core.sessions.lock().await.get_active(&thread_key).cloned() else {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("当前对话还没有会话".to_string()),
+            });
+        };
+        if !cleared
+            && let Some((provider, model)) = core.effective_model(&entry.session_id).await
+            && let Some(variants) = core.model_variants(&provider, &model).await
+            && !variants.iter().any(|v| v == &picked)
+        {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some(format!("当前模型 `{provider}/{model}` 不支持思考等级 `{picked}`")),
+            });
+        }
+        entry.variant = if cleared { None } else { Some(picked.clone()) };
+        {
+            let mut store = core.sessions.lock().await;
+            store.set_active(entry);
+            if let Err(e) = store.persist() {
+                tracing::warn!("think card: persist failed: {}", e);
+            }
+        }
+        let (card, _error) = crate::bridge::command::think_card(core, &thread_key).await;
+        Some(CardActionResult {
+            card,
+            toast: Some(if cleared {
+                "已清除思考等级（回到模型默认）".to_string()
+            } else {
+                format!("Thinking: {}（下一条消息开始生效）", picked)
+            }),
         })
     }
 

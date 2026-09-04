@@ -232,6 +232,14 @@ pub struct SessionEntry {
     /// server's own default) applies.
     #[serde(default)]
     pub model: Option<String>,
+    /// Per-session thinking level ("variant", e.g. "high") set by `/think`,
+    /// sent as a per-prompt `PromptInput.variant` on the next message. A model
+    /// declares its own variant set — there is no universal scale (ADR-0020);
+    /// `None` means the server's default for whatever model runs this turn.
+    /// Persisted; cleared automatically when `/model` switches to a model that
+    /// doesn't declare the current variant.
+    #[serde(default)]
+    pub variant: Option<String>,
     /// When true, pending permission requests for this session are answered
     /// automatically (`/autoaccept`) instead of showing a Feishu card.
     #[serde(default)]

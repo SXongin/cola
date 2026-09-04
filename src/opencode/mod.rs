@@ -99,6 +99,9 @@ pub trait Backend: Send + Sync {
     /// None → the configured default applies, and if that's also unset the
     /// server uses its own default model.
     ///
+    /// `variant` is the per-session `/think` override; None → the server's
+    /// default variant (unset) for whatever model runs this turn.
+    ///
     /// `agent` is the per-session `/agent` override; None → the server uses the
     /// session's own/default agent.
     ///
@@ -110,6 +113,7 @@ pub trait Backend: Send + Sync {
         text: &str,
         images: &[client::ImageInput],
         model: Option<&ModelInfo>,
+        variant: Option<&str>,
         agent: Option<&str>,
     ) -> Result<PromptResponse>;
 
@@ -122,6 +126,7 @@ pub trait Backend: Send + Sync {
         text: &str,
         images: &[client::ImageInput],
         model: Option<&ModelInfo>,
+        variant: Option<&str>,
         agent: Option<&str>,
     ) -> Result<()>;
 
@@ -146,6 +151,11 @@ pub trait Backend: Send + Sync {
     /// compute the context-usage ratio for the card footer. Best-effort: None
     /// when the provider/model can't be resolved.
     async fn model_context_window(&self, provider: &str, model: &str) -> Result<Option<i64>>;
+
+    /// The model configured as cola's default (`[opencode] model`), if any —
+    /// the second rung of the `/think` effective-model resolution (session
+    /// override → configured default → server-recorded session model).
+    fn configured_default_model(&self) -> Option<client::ModelInfo>;
 
     /// Available agents (`GET /agent`), for the `/agent` card picker. Empty on
     /// failure (the card degrades to a text prompt).
@@ -210,9 +220,10 @@ impl Backend for Client {
         text: &str,
         images: &[client::ImageInput],
         model: Option<&ModelInfo>,
+        variant: Option<&str>,
         agent: Option<&str>,
     ) -> Result<PromptResponse> {
-        Client::prompt(self, session_id, text, images, model, agent).await
+        Client::prompt(self, session_id, text, images, model, variant, agent).await
     }
 
     async fn prompt_async(
@@ -221,9 +232,10 @@ impl Backend for Client {
         text: &str,
         images: &[client::ImageInput],
         model: Option<&ModelInfo>,
+        variant: Option<&str>,
         agent: Option<&str>,
     ) -> Result<()> {
-        Client::prompt_async(self, session_id, text, images, model, agent).await
+        Client::prompt_async(self, session_id, text, images, model, variant, agent).await
     }
 
     async fn reply_permission(&self, request_id: &str, reply: &str, directory: Option<&str>) -> Result<()> {
@@ -257,6 +269,10 @@ impl Backend for Client {
 
     async fn model_context_window(&self, provider: &str, model: &str) -> Result<Option<i64>> {
         Client::model_context_window(self, provider, model).await
+    }
+
+    fn configured_default_model(&self) -> Option<client::ModelInfo> {
+        Client::configured_default_model(self)
     }
 
     async fn list_agents(&self) -> Vec<client::AgentInfo> {
