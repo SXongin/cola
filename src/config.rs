@@ -34,6 +34,7 @@ pub fn resolve_config_path(explicit: Option<&str>, cwd: &Path, home: &Path) -> O
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
     pub opencode: OpenCodeConfig,
     pub feishu: FeishuConfig,
     #[serde(default)]
@@ -81,6 +82,16 @@ pub struct OpenCodeConfig {
     /// the default), `never` (attach-only), `eager` (spawn at boot).
     #[serde(default)]
     pub start_server: ServerStartPolicy,
+}
+
+impl Default for OpenCodeConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            model: None,
+            start_server: ServerStartPolicy::Auto,
+        }
+    }
 }
 
 impl OpenCodeConfig {
@@ -329,6 +340,42 @@ mod tests {
         assert!(cfg.start_server.spawns_when_needed());
         assert!(!ServerStartPolicy::Never.spawns_when_needed());
         assert!(ServerStartPolicy::Eager.spawns_when_needed());
+    }
+
+    #[test]
+    fn feishu_only_config_loads() {
+        // README's minimal config: only the Feishu credentials. `opencode` must
+        // default rather than fail with "missing field".
+        let toml_str = r#"
+            [feishu]
+            app_id = "cli_test"
+            app_secret = "secret"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.opencode.start_server, ServerStartPolicy::Auto);
+        assert!(cfg.opencode.url.is_none());
+        assert!(cfg.opencode.model.is_none());
+        assert_eq!(cfg.feishu.app_id, "cli_test");
+        assert_eq!(cfg.feishu.app_secret, "secret");
+    }
+
+    #[test]
+    fn feishu_plus_opencode_model_config_loads() {
+        // The historical issue #02 criterion: `[feishu]` + an `[opencode]` table
+        // holding only `model` — the other `[opencode]` fields must default.
+        let toml_str = r#"
+            [feishu]
+            app_id = "cli_test"
+            app_secret = "secret"
+
+            [opencode]
+            model = "opencode/deepseek-v4-flash"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.opencode.model.as_deref(), Some("opencode/deepseek-v4-flash"));
+        assert!(cfg.opencode.url.is_none());
+        assert_eq!(cfg.opencode.start_server, ServerStartPolicy::Auto);
+        assert_eq!(cfg.feishu.app_id, "cli_test");
     }
 
     #[test]
