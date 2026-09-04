@@ -37,6 +37,11 @@ pub enum Command {
     Model(String),
     /// `/model` (no args) — interactive model-picker card.
     ModelCard,
+    /// Set the thinking level (model-declared variant) in the current session:
+    /// a concrete variant name, or `default`/`off`/`reset` to clear it.
+    Think(String),
+    /// `/think` (no args) — interactive variant-picker card.
+    ThinkCard,
     /// Auto-accept of permission requests for the current session.
     AutoAccept(AutoAcceptAction),
     /// Restart cola itself, preserving startup args and the log redirect.
@@ -196,6 +201,13 @@ pub fn parse_command(text: &str) -> Option<Command> {
             Some(p) => Some(Command::Model(p.to_string())),
             None => Some(Command::ModelCard),
         },
+        // `/think` sets/clears the thinking level (a model-declared variant);
+        // `/think` (no args) pops the variant-picker card. `default`/`off`/
+        // `reset` all clear the override.
+        "/think" => match arg {
+            None => Some(Command::ThinkCard),
+            Some(p) => Some(Command::Think(p.to_string())),
+        },
         // `/autoaccept` reports the current state; `/autoaccept on|off` switches.
         "/autoaccept" => match arg {
             Some("on") | Some("true") | Some("1") => Some(Command::AutoAccept(AutoAcceptAction::Set(true))),
@@ -235,6 +247,7 @@ pub fn help_text() -> String {
 `/compact` · Compact context
 `/agent <name>` · Switch agent (takes effect next message)
 `/model <p/m>` · Switch model (takes effect next message)
+`/think [等级]` · Set/clear thinking level (per model; takes effect next message)
 `/autoaccept` · Show auto-approve status; `/autoaccept on|off` switches
 `/restart` · Restart cola (keeps startup args + log redirect)
 `/restart-opencode` · Restart the OpenCode server (only when cola started it)
@@ -284,6 +297,9 @@ pub fn command_help(name: &str) -> Option<String> {
         }
         "model" => {
             "/model <provider/model>\nSwitch the model for the current session — a per-session override sent on the NEXT message (the server has no model-switch endpoint; unset = the configured default / server default). Persisted across restarts.\nExample: `/model opencode-go/deepseek-v4-flash`"
+        }
+        "think" => {
+            "/think [等级]\nSet or clear the thinking level for the current session — a per-session override sent as `variant` on the NEXT message. Each model declares its own levels (e.g. `low`/`high`/`minimal`), so there is no universal scale: the card (`/think` alone) lists what the current model supports, and switching to a model that doesn't declare the current level clears it. `default`/`off`/`reset` clear the override (= the server's default for the model). Persisted across restarts.\nExample: `/think high`"
         }
         "autoaccept" => {
             "/autoaccept [on|off]\nShow or switch auto-allowing permission requests for this session (no permission cards).\nNo arg: show current state. `/autoaccept on` / `/autoaccept off` switch it.\nExample: `/autoaccept`"
@@ -373,6 +389,14 @@ impl<'a> crate::update::UpdateReporter for FeishuUpdateReporter<'a> {
     }
 }
 
+/// Whether a `/think` value means "clear the override" (ADR-0020). The card's
+/// "默认（清除）" button sends `default`; the text form also accepts `off` and
+/// `reset` as aliases. Defined once so the card handler and text handler can't
+/// drift apart on which values clear.
+pub(crate) fn is_clear_variant(value: &str) -> bool {
+    matches!(value, "default" | "off" | "reset")
+}
+
 /// Execute a parsed slash command against the shared core. Unrecognized
 /// `/command`s are intercepted by the message coordinator (which owns the
 /// prompt pipeline), so this never forwards — the `Command::Forward` arm below
@@ -440,6 +464,7 @@ pub(crate) async fn handle_command(
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             };
             let mut store = core.sessions.lock().await;
             store.set_active(entry);
@@ -482,6 +507,7 @@ pub(crate) async fn handle_command(
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                variant: None,
             };
             let mut store = core.sessions.lock().await;
             store.set_active(entry);
@@ -574,6 +600,7 @@ pub(crate) async fn handle_command(
                 model: None,
                 auto_accept: false,
                 topic_anchor: Some(anchor),
+                variant: None,
             };
             let mut store = core.sessions.lock().await;
             store.set_active(entry);
@@ -752,14 +779,71 @@ pub(crate) async fn handle_command(
                 return Ok(());
             };
             entry.model = Some(name.clone());
+            // Auto-clear the `/think` variant when the new model doesn't
+            // declare it (ADR-0020), shared with the `/model` picker card.
+            let cleared_variant = core.clear_variant_for_model(&mut entry, &name).await;
             {
                 let mut store = core.sessions.lock().await;
                 store.set_active(entry);
                 store.persist()?;
             }
+            let extra = cleared_variant
+                .map(|v| format!("（已清除思考等级 `{v}`：新模型不支持）"))
+                .unwrap_or_default();
             core.feishu
-                .reply_text(message_id, &format!("Model: {}（下一条消息开始生效）", name))
+                .reply_text(
+                    message_id,
+                    &format!("Model: {}（下一条消息开始生效）{}", name, extra),
+                )
                 .await?;
+        }
+        Command::ThinkCard => {
+            send_think_card(core, &thread_key, message_id).await?;
+        }
+        Command::Think(name) => {
+            // The OpenCode server has no thinking-level endpoint either —
+            // `/think` records a per-session variant override and cola sends it
+            // as a per-prompt `variant` on the next message. `default`/`off`/
+            // `reset` clear the override (the server's default for the model).
+            let Some(mut entry) = core.sessions.lock().await.get_active(&thread_key).cloned() else {
+                core.feishu
+                    .reply_text(message_id, "⚠️ 当前对话还没有会话，先用 `/new` 或 `/dir` 创建。")
+                    .await?;
+                return Ok(());
+            };
+            let cleared = is_clear_variant(&name);
+            if !cleared
+                && let Some((provider, model)) = core.effective_model(&entry.session_id).await
+                && let Some(variants) = core.model_variants(&provider, &model).await
+                && !variants.iter().any(|v| v == &name)
+            {
+                let available = if variants.is_empty() {
+                    "（无）".to_string()
+                } else {
+                    variants.join("、")
+                };
+                core.feishu
+                    .reply_text(
+                        message_id,
+                        &format!(
+                            "⚠️ 当前模型 `{provider}/{model}` 不支持思考等级 `{name}`。可用：{available}。"
+                        ),
+                    )
+                    .await?;
+                return Ok(());
+            }
+            entry.variant = if cleared { None } else { Some(name.clone()) };
+            {
+                let mut store = core.sessions.lock().await;
+                store.set_active(entry);
+                store.persist()?;
+            }
+            let msg = if cleared {
+                "已清除思考等级（回到模型默认）。".to_string()
+            } else {
+                format!("Thinking: {}（下一条消息开始生效）", name)
+            };
+            core.feishu.reply_text(message_id, &msg).await?;
         }
         Command::Help(target) => {
             match target {
@@ -984,6 +1068,60 @@ async fn send_model_card(
     let cards = crate::feishu::card::build_model_provider_cards(thread_key, &providers);
     for card in cards {
         core.feishu.reply_card(message_id, &card).await?;
+    }
+    Ok(())
+}
+
+/// Resolve what the `/think` card should show for a thread's active session:
+/// the effective model (override → configured default → server-recorded) and
+/// its declared variants. Returns `(card, error_text)` with exactly one set —
+/// an error text when the conversation has no session, no model can be
+/// resolved, or the model declares no variants (the caller then replies text
+/// instead of a card). Shared by the text send path and the card-ack refresh so
+/// both render the current selection from one source of truth.
+pub(crate) async fn think_card(
+    core: &Arc<SharedCore>,
+    thread_key: &ThreadKey,
+) -> (Option<serde_json::Value>, Option<String>) {
+    let Some(entry) = core.sessions.lock().await.get_active(thread_key).cloned() else {
+        return (
+            None,
+            Some("当前对话还没有会话，先用 `/new` 或 `/dir` 创建。".to_string()),
+        );
+    };
+    let Some((provider, model)) = core.effective_model(&entry.session_id).await else {
+        return (
+            None,
+            Some("无法确定当前模型，请先用 `/model` 选择模型。".to_string()),
+        );
+    };
+    let variants = core.model_variants(&provider, &model).await.unwrap_or_default();
+    if variants.is_empty() {
+        return (
+            None,
+            Some(format!("当前模型 `{provider}/{model}` 没有思考等级可选。")),
+        );
+    }
+    let current = entry.variant.clone();
+    let card =
+        crate::feishu::card::build_think_card(thread_key, &provider, &model, current.as_deref(), &variants);
+    (Some(card), None)
+}
+
+/// Send the `/think` variant-picker card, or a text explanation when no card
+/// applies (no session / no resolvable model / the model declares no variants).
+async fn send_think_card(
+    core: &Arc<SharedCore>,
+    thread_key: &ThreadKey,
+    message_id: &str,
+) -> crate::error::Result<()> {
+    let (card, error) = think_card(core, thread_key).await;
+    if let Some(c) = card {
+        core.feishu.reply_card(message_id, &c).await?;
+    } else {
+        core.feishu
+            .reply_text(message_id, &error.unwrap_or_default())
+            .await?;
     }
     Ok(())
 }
@@ -1395,6 +1533,7 @@ pub(crate) async fn create_topic_and_map_adopted(
         model: None,
         auto_accept: false,
         topic_anchor: Some(anchor),
+        variant: None,
     };
     {
         let mut store = core.sessions.lock().await;
@@ -1500,6 +1639,7 @@ async fn adopt_session(
         model: None,
         auto_accept: false,
         topic_anchor: anchor,
+        variant: None,
     };
     {
         let mut store = core.sessions.lock().await;
@@ -1649,6 +1789,16 @@ mod tests {
     fn parse_agent_model_no_arg_is_card() {
         assert_eq!(parse_command("/model"), Some(Command::ModelCard));
         assert_eq!(parse_command("/agent"), Some(Command::AgentCard));
+    }
+
+    #[test]
+    fn parse_think_no_arg_is_card_with_arg_is_value() {
+        assert_eq!(parse_command("/think"), Some(Command::ThinkCard));
+        assert_eq!(parse_command("/think high"), Some(Command::Think("high".into())));
+        assert_eq!(
+            parse_command("/think default"),
+            Some(Command::Think("default".into()))
+        );
     }
 
     #[test]
@@ -1888,6 +2038,7 @@ mod tests {
     #[test]
     fn command_help_known_and_unknown() {
         assert!(command_help("model").unwrap().contains("/model"));
+        assert!(command_help("think").unwrap().contains("/think"));
         assert!(command_help("dir").unwrap().contains("NEW session"));
         assert_eq!(command_help("nonexistent"), None);
     }

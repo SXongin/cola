@@ -123,6 +123,12 @@ impl Client {
         }
     }
 
+    /// The configured default model (`[opencode] model`), parsed at startup.
+    /// The second rung of the `/think` effective-model resolution.
+    pub fn configured_default_model(&self) -> Option<ModelInfo> {
+        self.model.clone()
+    }
+
     /// List sessions across the shared store, most recently active first.
     ///
     /// Uses the cross-project list `GET /experimental/session`
@@ -189,18 +195,24 @@ impl Client {
     /// `agent` is a per-session override from `/agent`; when Some the server
     /// uses that agent for this turn (the session's own/default agent
     /// otherwise).
+    ///
+    /// `variant` is the per-session `/think` override; when Some the server
+    /// applies that model-declared variant (e.g. "high") to whatever model runs
+    /// this turn. Independent of `model` — a variant can be set even when no
+    /// model override exists (the server default model then carries it).
     pub async fn prompt(
         &self,
         session_id: &str,
         text: &str,
         images: &[ImageInput],
         model: Option<&ModelInfo>,
+        variant: Option<&str>,
         agent: Option<&str>,
     ) -> crate::error::Result<PromptResponse> {
         let mut body = serde_json::json!({
             "parts": build_parts(text, images),
         });
-        inject_model(&mut body, model, self.model.as_ref());
+        inject_model(&mut body, model, self.model.as_ref(), variant);
         inject_agent(&mut body, agent);
         let resp = self
             .http()
@@ -309,12 +321,13 @@ impl Client {
         text: &str,
         images: &[ImageInput],
         model: Option<&ModelInfo>,
+        variant: Option<&str>,
         agent: Option<&str>,
     ) -> crate::error::Result<()> {
         let mut body = serde_json::json!({
             "parts": build_parts(text, images),
         });
-        inject_model(&mut body, model, self.model.as_ref());
+        inject_model(&mut body, model, self.model.as_ref(), variant);
         inject_agent(&mut body, agent);
         let resp = self
             .http()
@@ -509,9 +522,10 @@ impl Client {
         serde_json::from_str::<Vec<crate::opencode::client::AgentInfo>>(&text).unwrap_or_default()
     }
 
-    /// Available models (`GET /provider`), grouped as `provider → model ids`.
-    /// Best-effort: an unreadable/cached failure returns an empty map so the
-    /// `/model` card can degrade to a plain text prompt.
+    /// Available models (`GET /provider`), grouped as `provider → models`,
+    /// each with its declared variants. Best-effort: an unreadable/cached
+    /// failure returns an empty map so the `/model` card can degrade to a
+    /// plain text prompt.
     ///
     /// Only providers the server reports as `connected` (real credentials —
     /// `GET /provider` returns `connected: [ids]`) are surfaced: a shared
@@ -543,10 +557,27 @@ impl Client {
             })
             .filter_map(|prov| {
                 let id = prov.get("id").and_then(|i| i.as_str())?.to_string();
-                let models: Vec<String> = prov
+                let models: Vec<ModelOption> = prov
                     .get("models")
                     .and_then(|m| m.as_object())
-                    .map(|m| m.keys().cloned().collect())
+                    .map(|m| {
+                        m.iter()
+                            .map(|(model_id, m_info)| ModelOption {
+                                id: model_id.clone(),
+                                variants: m_info
+                                    .get("variants")
+                                    .and_then(|v| v.as_array())
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|v| {
+                                                v.get("id").and_then(|i| i.as_str()).map(String::from)
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
+                            })
+                            .collect()
+                    })
                     .unwrap_or_default();
                 if models.is_empty() {
                     None
@@ -642,11 +673,23 @@ pub struct AgentInfo {
 }
 
 /// A provider's available models (`GET /provider`), rendered as one `/model`
-/// card row per provider with each model as a selectable option.
+/// card row per provider. Each model carries its declared variants (the
+/// thinking-level options `/think` surfaces).
 #[derive(Debug, Clone)]
 pub struct ProviderModels {
     pub provider: String,
-    pub models: Vec<String>,
+    pub models: Vec<ModelOption>,
+}
+
+/// One selectable model under a provider.
+#[derive(Debug, Clone)]
+pub struct ModelOption {
+    pub id: String,
+    /// The model's declared variants (e.g. `["low", "medium", "high"]`),
+    /// empty when it declares none (`GET /provider` → `model.variants[].id`).
+    /// There is no universal scale — each model declares its own set
+    /// (ADR-0020).
+    pub variants: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -661,7 +704,8 @@ pub struct Session {
 }
 
 /// Minimal `Session.Info` (canonical `GET /session/{id}`) — enough to resolve
-/// a sub-task session's parent.
+/// a sub-task session's parent, and the session's server-recorded model (the
+/// last rung of the `/think` effective-model resolution).
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionInfo {
     pub id: String,
@@ -670,6 +714,18 @@ pub struct SessionInfo {
     /// The server-managed session title (what OpenChamber shows).
     #[serde(default)]
     pub title: Option<String>,
+    /// The model the server has recorded for the session
+    /// (`Session.Info.model`: `{id, providerID, variant?}`).
+    #[serde(default)]
+    pub model: Option<SessionModel>,
+}
+
+/// The model reference on a session (`Session.Info.model`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionModel {
+    #[serde(rename = "providerID")]
+    pub provider_id: String,
+    pub id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -927,30 +983,42 @@ pub struct QuestionRequest {
     pub questions: Vec<QuestionInfo>,
 }
 
-/// Parse "provider/model" (optionally "provider/model/variant") into ModelInfo.
+/// Parse "provider/model" into ModelInfo. A two-part split: model IDs may
+/// themselves contain slashes (gateway models like `openrouter/openai/o3`), so
+/// the provider is only the FIRST segment and the whole remainder is the model
+/// id. The variant is never part of this string — it lives in a separate
+/// SessionEntry field (ADR-0020) to keep the text form unambiguous.
 pub(crate) fn parse_model(spec: &str) -> Option<ModelInfo> {
-    let mut parts = spec.splitn(3, '/');
-    let provider = parts.next()?;
-    let id = parts.next()?;
+    let (provider, id) = spec.split_once('/')?;
     if provider.is_empty() || id.is_empty() {
         return None;
     }
     Some(ModelInfo {
         id: id.to_string(),
         provider_id: provider.to_string(),
-        variant: parts.next().map(|s| s.to_string()),
+        variant: None,
     })
 }
 
 /// Attach the effective model to a prompt body: a per-session override wins
 /// over the configured default; when neither is set the server uses its own
-/// default. Shared by `prompt` and `prompt_async`.
-fn inject_model(body: &mut serde_json::Value, override_: Option<&ModelInfo>, configured: Option<&ModelInfo>) {
+/// default. `variant` is independent — it is written whenever set, applying to
+/// whatever model the server runs this turn. Shared by `prompt` and
+/// `prompt_async`.
+fn inject_model(
+    body: &mut serde_json::Value,
+    override_: Option<&ModelInfo>,
+    configured: Option<&ModelInfo>,
+    variant: Option<&str>,
+) {
     if let Some(model) = override_.or(configured) {
         body["model"] = serde_json::json!({
             "providerID": model.provider_id,
             "modelID": model.id,
         });
+    }
+    if let Some(v) = variant {
+        body["variant"] = serde_json::json!(v);
     }
 }
 
@@ -1013,6 +1081,46 @@ mod tests {
         )
         .unwrap();
         assert!(info.time.as_ref().unwrap().is_archived());
+    }
+
+    #[test]
+    fn parse_model_two_part_split_keeps_slashed_model_ids() {
+        // Model ids may contain slashes (gateway models like
+        // `openrouter/openai/o3`): the provider is the FIRST segment and the
+        // whole remainder is the model. The variant is never part of this
+        // string (ADR-0020) — it lives in a separate session field.
+        let m = parse_model("openrouter/openai/o3").unwrap();
+        assert_eq!(m.provider_id, "openrouter");
+        assert_eq!(m.id, "openai/o3");
+        assert!(m.variant.is_none());
+
+        let simple = parse_model("opencode-go/deepseek-v4-flash").unwrap();
+        assert_eq!(simple.provider_id, "opencode-go");
+        assert_eq!(simple.id, "deepseek-v4-flash");
+
+        assert!(parse_model("no-slash").is_none());
+        assert!(parse_model("").is_none());
+    }
+
+    #[test]
+    fn inject_model_writes_variant_independently_of_model() {
+        // A variant is sent even when NO model is set (the server applies it to
+        // whatever model runs this turn); when a model IS set, both are written.
+        let mut body = serde_json::json!({ "parts": [] });
+        inject_model(&mut body, None, None, Some("high"));
+        assert_eq!(body["variant"], "high");
+        assert!(body.get("model").is_none(), "no model, only variant: {body}");
+
+        let mut body2 = serde_json::json!({ "parts": [] });
+        let model = parse_model("opencode-go/deepseek-v4-flash").unwrap();
+        inject_model(&mut body2, Some(&model), None, Some("high"));
+        assert_eq!(body2["model"]["modelID"], "deepseek-v4-flash");
+        assert_eq!(body2["variant"], "high");
+
+        // Unset variant leaves the body free of the field.
+        let mut body3 = serde_json::json!({ "parts": [] });
+        inject_model(&mut body3, None, None, None);
+        assert!(body3.get("variant").is_none());
     }
 
     #[test]

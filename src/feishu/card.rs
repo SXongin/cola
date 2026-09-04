@@ -1195,7 +1195,7 @@ pub fn build_model_provider_cards(
 pub fn build_model_picker_cards(
     thread_key: &crate::config::ThreadKey,
     provider: &str,
-    models: &[String],
+    models: &[crate::opencode::client::ModelOption],
 ) -> Vec<serde_json::Value> {
     // The provider is already chosen (step 1), so the button LABEL shows just
     // the model name — a `provider/model` label truncates in Feishu's button
@@ -1203,7 +1203,7 @@ pub fn build_model_picker_cards(
     // records as the override.
     let options: Vec<(String, String)> = models
         .iter()
-        .map(|m| (m.clone(), format!("{provider}/{m}")))
+        .map(|m| (m.id.clone(), format!("{provider}/{}", m.id)))
         .collect();
     if options.is_empty() {
         return vec![picker_card(
@@ -1301,6 +1301,31 @@ pub fn build_autoaccept_card(thread_key: &crate::config::ThreadKey, current_on: 
     option_picker_card("🔁 自动审批", &intro, thread_key, "autoaccept", &options)
 }
 
+/// The `/think` picker card (ADR-0020): the current model, its declared
+/// variants (each model's own set — no universal scale), and a "默认（清除）"
+/// button. `current` is the session's active variant (None = server default).
+/// Only built when `variants` is non-empty — the caller replies a text message
+/// for models that declare none.
+pub fn build_think_card(
+    thread_key: &crate::config::ThreadKey,
+    provider: &str,
+    model: &str,
+    current: Option<&str>,
+    variants: &[String],
+) -> serde_json::Value {
+    let label = format!("{provider}/{model}");
+    let current_label = current
+        .map(|v| format!("`{v}`"))
+        .unwrap_or_else(|| "默认".to_string());
+    let intro =
+        format!("**当前模型**：`{label}`\n**当前思考等级**：{current_label}\n选择后下一条消息开始生效：");
+    let mut options = vec![("默认（清除）".to_string(), "default".to_string())];
+    for v in variants {
+        options.push((v.clone(), v.clone()));
+    }
+    option_picker_card("🧠 思考等级", &intro, thread_key, "think", &options)
+}
+
 /// The `/help` reference card: a pure command manual grouped by 会话 / 操作 /
 /// 运维, one line per command with a short description. No buttons — reading is
 /// its only job (previously the "试试"/"看卡" buttons made it an execution
@@ -1327,6 +1352,7 @@ pub fn build_help_card() -> serde_json::Value {
             &[
                 ("/agent <名字>", "切换 agent（下条消息生效）"),
                 ("/model <提供方/模型>", "切换模型（下条消息生效）"),
+                ("/think [等级]", "设置/清除思考等级（下条消息生效）"),
                 ("/autoaccept [on|off]", "查看或切换自动授权"),
                 ("/stop", "中断当前执行"),
                 ("/compact", "压缩上下文"),
@@ -1536,7 +1562,10 @@ mod tests {
         let providers: Vec<crate::opencode::client::ProviderModels> = (0..212)
             .map(|p| crate::opencode::client::ProviderModels {
                 provider: format!("provider-{p}"),
-                models: vec!["m".into()],
+                models: vec![crate::opencode::client::ModelOption {
+                    id: "m".into(),
+                    variants: Vec::new(),
+                }],
             })
             .collect();
         let cards = build_model_provider_cards(&key, &providers);
@@ -1563,7 +1592,12 @@ mod tests {
     #[test]
     fn model_picker_chunks_and_has_back_button() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let models: Vec<String> = (0..400).map(|i| format!("model-{i}")).collect();
+        let models: Vec<crate::opencode::client::ModelOption> = (0..400)
+            .map(|i| crate::opencode::client::ModelOption {
+                id: format!("model-{i}"),
+                variants: Vec::new(),
+            })
+            .collect();
         let cards = build_model_picker_cards(&key, "opencode", &models);
         assert!(cards.len() > 1, "huge model list must split: {}", cards.len());
         let first = &cards[0];
@@ -1601,6 +1635,28 @@ mod tests {
         let cards = build_model_provider_cards(&key, &[]);
         assert_eq!(cards.len(), 1);
         assert!(cards[0].to_string().contains("没有可用模型"));
+    }
+
+    /// The `/think` card lists the current model, its declared variants, and a
+    /// "默认（清除）" button; each button carries the `think` action and the
+    /// routing payload.
+    #[test]
+    fn think_card_lists_model_and_variants() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let card = build_think_card(
+            &key,
+            "opencode-go",
+            "deepseek-v4-flash",
+            Some("high"),
+            &["low".into(), "high".into()],
+        );
+        let text = card.to_string();
+        assert!(text.contains("思考等级"), "header: {text}");
+        assert!(text.contains("opencode-go/deepseek-v4-flash"), "model: {text}");
+        assert!(text.contains("当前思考等级"), "current label: {text}");
+        assert!(text.contains("默认（清除）"), "default option: {text}");
+        assert!(text.contains("\"value\":\"high\""), "variant button: {text}");
+        assert!(text.contains("\"action\":\"think\""), "action tag: {text}");
     }
 
     #[test]

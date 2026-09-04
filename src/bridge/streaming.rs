@@ -95,6 +95,10 @@ pub struct StreamAccumulator {
     pub provider_id: Option<String>,
     /// Model ID of the model answering this turn (e.g. "deepseek-v4-flash").
     pub model_id: Option<String>,
+    /// The `/think` variant cola sent this turn (e.g. "high"), shown as
+    /// `model@variant` on the footer. Sourced from the session store — the
+    /// server reports the model but not the variant.
+    pub variant: Option<String>,
     /// Context tokens the model consumed this turn (includes cached prefix), for
     /// the context-usage ratio in the card footer.
     pub context_tokens: i64,
@@ -507,6 +511,13 @@ impl StreamAccumulator {
                     Some(p) => format!("{}/{}", p, model),
                     None => model.clone(),
                 };
+                // The variant appends as `provider/model@variant` — provider is
+                // part of model identity, and the variant is what cola sent
+                // this turn (ADR-0020).
+                let label = match &self.variant {
+                    Some(v) => format!("{}@{}", label, v),
+                    None => label,
+                };
                 footer_parts.push(format!("🤖 {}", label));
             }
             if let Some(ratio) = self.context_ratio {
@@ -549,6 +560,40 @@ mod tests {
             text
         );
         assert!(text.contains("📊 上下文 36%"), "ratio missing: {}", text);
+    }
+
+    /// The footer model line renders the full identity `provider/model@variant`
+    /// (ADR-0020): provider is part of model identity, and the variant is what
+    /// cola sent this turn. Without a variant the line is just `provider/model`.
+    #[test]
+    fn card_footer_shows_model_with_variant() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Done;
+        acc.directory = Some("/root/workspace/dev/cola".into());
+        acc.provider_id = Some("opencode-go".into());
+        acc.model_id = Some("deepseek-v4-flash".into());
+        acc.variant = Some("high".into());
+        acc.push_text("结果");
+
+        let card = acc.build_card();
+        let text = card.to_string();
+        assert!(
+            text.contains("🤖 opencode-go/deepseek-v4-flash@high"),
+            "model@variant missing: {}",
+            text
+        );
+
+        let mut no_variant = StreamAccumulator::new("test");
+        no_variant.card_state = CardState::Done;
+        no_variant.provider_id = Some("opencode-go".into());
+        no_variant.model_id = Some("deepseek-v4-flash".into());
+        no_variant.push_text("结果");
+        let text2 = no_variant.build_card().to_string();
+        assert!(
+            text2.contains("🤖 opencode-go/deepseek-v4-flash") && !text2.contains("@"),
+            "unset variant must not render @: {}",
+            text2
+        );
     }
 
     /// The work-context 📁 segment (ADR-0019): project basename + branch + dirty

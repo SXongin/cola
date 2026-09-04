@@ -55,6 +55,10 @@ _Avoid_: Current session, latest session, selected session
 A working directory on the filesystem where OpenCode operates. A property of a session, not of the bot. A conversation's current project is the directory of its active session (derived, never stored separately); `/new` and the bare `/topic` form inherit it and fall back to the default directory only when the conversation has no session. Sessions created outside a conversation still carry their own directory.
 _Avoid_: Workspace, repo
 
+**Variant**:
+A model-declared reasoning-effort setting (e.g. "low"/"high"/"minimal"), selectable per session via the `/think` command and sent to the backend as `PromptInput.variant`. Each model declares its own variant set — there is no universal scale across models — and "unset" means the server's default for that model. Selecting a model that doesn't declare the current session's variant clears it. The user-facing label on cards is "思考等级"/thinking; "variant" is the backend protocol term, never a command name.
+_Avoid_: Thinking level as the domain term (it's the presentation label); calling the command `/variant`
+
 **Permission**:
 A request from the AI backend to perform an action on a resource. Presented to the user as an interactive card with Allow/Deny/Always options.
 _Avoid_: Approval, authorization, consent
@@ -84,7 +88,7 @@ A platform image (a standalone image message, an image inside a rich-text messag
 _Avoid_: Picture, media, attachment file
 
 **Turn Footer**:
-The Card footer line summarizing what a turn ran on: working directory (project basename), git branch and dirty state, the answering model, and context-window usage. The directory/branch half is captured when the turn starts and shows from the first card; the model and context usage appear only when the turn completes.
+The Card footer line summarizing what a turn ran on: working directory (project basename), git branch and dirty state, the answering model, and context-window usage. The model line renders the full identity `provider/model@variant` (provider is part of model identity, not decoration). The directory/branch half is captured when the turn starts and shows from the first card; the model and context usage appear only when the turn completes.
 _Avoid_: Tail, footer bar, status line
 
 **Dirty**:
