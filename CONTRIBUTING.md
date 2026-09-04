@@ -14,9 +14,23 @@ assume it.
 - Keep PRs small and focused on one thing. A reviewable diff is more valuable
   than a big one.
 
+## Branch workflow
+
+**Never commit to `main` directly** — not even small fixes. Every change rides
+a feature branch to a PR:
+
+- Create a short descriptive branch off `main` (e.g. `fix/feishu-config-default`,
+  `docs/user-guide`). The branch name should say what it changes.
+- Do the work, commit in small Conventional Commits, push the branch, and open
+  a PR. `main` only receives merges.
+- One PR = one thing (see *Before you start*); keep the branch short-lived.
+
+This rule applies to agents too — check `git branch --show-current` before
+touching code, and branch off `main` when you are on it.
+
 ## Commit conventions
 
-Enforced locally by `scripts/check-commit-msg.sh` (via lefthook `commit-msg`) and
+Enforced locally by `cargo xtask check-commit-msg` (via lefthook `commit-msg`) and
 checked by anyone reviewing:
 
 - Subjects follow Conventional Commits: `<type>(<scope>)?: <subject>`
