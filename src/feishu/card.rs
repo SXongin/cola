@@ -967,23 +967,26 @@ pub fn build_question_card(
         "body": { "elements": elements }
     })
 }
-/// One row of the `/switch` session card: a `column_set` with the session
-/// text on the left and action button(s) on the right. The primary button
-/// switches/adopts into the current thread (`op: "adopt"`); a second "建话题接管"
-/// button (`op: "topic_adopt"`) opens a new Feishu topic around the session
-/// (ADR-0016). Each button carries the routing payload (action, op, thread_key,
-/// target session id).
+/// One session entry of the `/switch` card: a full-width text row followed by
+/// a button row underneath. The text row is its own `column_set` column (not a
+/// weighted column squeezed beside the buttons), so the session label and
+/// directory wrap naturally instead of being crushed into many narrow lines on
+/// mobile. The button row is a nested `column_set` with one auto-width column
+/// per button: the primary button switches/adopts into the current thread
+/// (`op: "adopt"`); a second "建话题接管" button (`op: "topic_adopt"`) opens a
+/// new Feishu topic around the session (ADR-0016). Each button carries the
+/// routing payload (action, op, thread_key, target session id).
 ///
 /// Schema 2.0 dropped the v1 `action` container (error 200861, "cards of
-/// schema V2 no longer support this capability"), so the button row is a
-/// nested `column_set` with one auto-width column per button — the same
-/// horizontal row the v1 `action` produced.
+/// schema V2 no longer support this capability"), so buttons never live in an
+/// `action` element — the button row is a `column_set` with one column per
+/// button.
 fn switch_card_row(
     text: &str,
     btn_text: &str,
     thread_key: &crate::config::ThreadKey,
     session_id: &str,
-) -> serde_json::Value {
+) -> Vec<serde_json::Value> {
     let btn_column = |op: &str, content: &str| {
         json!({
             "tag": "column",
@@ -1005,7 +1008,7 @@ fn switch_card_row(
             ],
         })
     };
-    json!({
+    let text_row = json!({
         "tag": "column_set",
         "flex_mode": "none",
         "columns": [
@@ -1015,22 +1018,16 @@ fn switch_card_row(
                 "weight": 5,
                 "vertical_align": "center",
                 "elements": [ { "tag": "markdown", "content": text } ]
-            },
-            {
-                "tag": "column",
-                "width": "auto",
-                "vertical_align": "center",
-                "elements": [
-                    {
-                        "tag": "column_set",
-                        "flex_mode": "none",
-                        "horizontal_spacing": "default",
-                        "columns": [ btn_column("adopt", btn_text), btn_column("topic_adopt", "建话题接管") ]
-                    }
-                ],
             }
         ]
-    })
+    });
+    let btn_row = json!({
+        "tag": "column_set",
+        "flex_mode": "none",
+        "horizontal_spacing": "default",
+        "columns": [ btn_column("adopt", btn_text), btn_column("topic_adopt", "建话题接管") ]
+    });
+    vec![text_row, btn_row]
 }
 
 /// A generic option-picker card: one button per option. Shared by the
@@ -1480,7 +1477,7 @@ pub fn build_switch_card(
             } else {
                 "接管"
             };
-            elements.push(switch_card_row(&text, btn, thread_key, &s.id));
+            elements.extend(switch_card_row(&text, btn, thread_key, &s.id));
         }
     }
 
@@ -2518,6 +2515,11 @@ mod tests {
     /// 200861, "cards of schema V2 no longer support this capability"), which
     /// killed the `/switch` card (the 400 only landed in the log). Row buttons
     /// render as a nested `column_set` instead, one column per button.
+    ///
+    /// Each session entry is two rows: a full-width text row, then a button row
+    /// beneath it — the text is NOT squeezed into a weighted column beside the
+    /// buttons, which crushed the label/directory into many narrow wrapped
+    /// lines on mobile.
     #[test]
     fn switch_card_has_no_schema_v2_unsupported_action_container() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
@@ -2538,15 +2540,24 @@ mod tests {
         );
         let elements = card["body"]["elements"].as_array().unwrap();
         let rows: Vec<&serde_json::Value> = elements.iter().filter(|e| e["tag"] == "column_set").collect();
-        assert_eq!(rows.len(), 1, "one column_set row per session list: {text}");
-        assert_eq!(rows[0]["columns"][1]["elements"][0]["tag"], "column_set");
         assert_eq!(
-            rows[0]["columns"][1]["elements"][0]["columns"]
-                .as_array()
-                .unwrap()
-                .len(),
+            rows.len(),
             2,
-            "both buttons side by side: {text}"
+            "one text row + one button row per session entry: {text}"
         );
+        let text_row_columns = rows[0]["columns"].as_array().unwrap();
+        assert_eq!(
+            text_row_columns.len(),
+            1,
+            "text row is a single full-width column: {text}"
+        );
+        assert_eq!(
+            text_row_columns[0]["elements"][0]["tag"], "markdown",
+            "text row renders the session label/directory: {text}"
+        );
+        let btn_columns = rows[1]["columns"].as_array().unwrap();
+        assert_eq!(btn_columns.len(), 2, "both buttons side by side: {text}");
+        assert_eq!(btn_columns[0]["elements"][0]["tag"], "button");
+        assert_eq!(btn_columns[1]["elements"][0]["tag"], "button");
     }
 }
