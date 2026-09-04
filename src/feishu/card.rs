@@ -971,11 +971,13 @@ pub fn build_question_card(
 /// a button row underneath. The text row is its own `column_set` column (not a
 /// weighted column squeezed beside the buttons), so the session label and
 /// directory wrap naturally instead of being crushed into many narrow lines on
-/// mobile. The button row is a nested `column_set` with one auto-width column
-/// per button: the primary button switches/adopts into the current thread
-/// (`op: "adopt"`); a second "建话题接管" button (`op: "topic_adopt"`) opens a
-/// new Feishu topic around the session (ADR-0016). Each button carries the
-/// routing payload (action, op, thread_key, target session id).
+/// mobile. The button row is a `column_set` with `flex_mode: "bisect"` (two
+/// equal columns, one per button) so the pair splits evenly on narrow
+/// screens instead of overflowing: the primary button switches/adopts into the
+/// current thread (`op: "adopt"`); a second "建话题接管" button
+/// (`op: "topic_adopt"`) opens a new Feishu topic around the session
+/// (ADR-0016). Each button carries the routing payload (action, op, thread_key,
+/// target session id).
 ///
 /// Schema 2.0 dropped the v1 `action` container (error 200861, "cards of
 /// schema V2 no longer support this capability"), so buttons never live in an
@@ -1023,7 +1025,7 @@ fn switch_card_row(
     });
     let btn_row = json!({
         "tag": "column_set",
-        "flex_mode": "none",
+        "flex_mode": "bisect",
         "horizontal_spacing": "default",
         "columns": [ btn_column("adopt", btn_text), btn_column("topic_adopt", "建话题接管") ]
     });
