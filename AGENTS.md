@@ -71,6 +71,7 @@ Standard local verification loop before pushing (CI's Format job is `cargo fmt -
 
 ## Contribution guidelines
 
+- **Branch workflow**: never commit to `main` directly — branch off `main`, work, push, and open a PR (`CONTRIBUTING.md` "Branch workflow"). Check `git branch --show-current` before editing.
 - **PR rules**: `CONTRIBUTING.md` — commit conventions, the pre-PR verification loop, and the PR description checklist. Follow it when creating commits or PRs.
 - **Coding standards**: `CODING_STANDARDS.md` — the source the `/code-review` skill's Standards axis reads (together with `CONTRIBUTING.md`).
 
