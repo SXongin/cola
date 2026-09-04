@@ -973,38 +973,38 @@ pub fn build_question_card(
 /// button (`op: "topic_adopt"`) opens a new Feishu topic around the session
 /// (ADR-0016). Each button carries the routing payload (action, op, thread_key,
 /// target session id).
+///
+/// Schema 2.0 dropped the v1 `action` container (error 200861, "cards of
+/// schema V2 no longer support this capability"), so the button row is a
+/// nested `column_set` with one auto-width column per button — the same
+/// horizontal row the v1 `action` produced.
 fn switch_card_row(
     text: &str,
     btn_text: &str,
     thread_key: &crate::config::ThreadKey,
     session_id: &str,
 ) -> serde_json::Value {
-    let actions = vec![
+    let btn_column = |op: &str, content: &str| {
         json!({
-            "tag": "button",
-            "text": { "tag": "plain_text", "content": btn_text },
-            "type": "default",
-            "value": {
-                "action": "switch",
-                "op": "adopt",
-                "chat_id": thread_key.chat_id,
-                "thread_id": thread_key.thread_id,
-                "session_id": session_id,
-            },
-        }),
-        json!({
-            "tag": "button",
-            "text": { "tag": "plain_text", "content": "建话题接管" },
-            "type": "default",
-            "value": {
-                "action": "switch",
-                "op": "topic_adopt",
-                "chat_id": thread_key.chat_id,
-                "thread_id": thread_key.thread_id,
-                "session_id": session_id,
-            },
-        }),
-    ];
+            "tag": "column",
+            "width": "auto",
+            "vertical_align": "center",
+            "elements": [
+                {
+                    "tag": "button",
+                    "text": { "tag": "plain_text", "content": content },
+                    "type": "default",
+                    "value": {
+                        "action": "switch",
+                        "op": op,
+                        "chat_id": thread_key.chat_id,
+                        "thread_id": thread_key.thread_id,
+                        "session_id": session_id,
+                    },
+                }
+            ],
+        })
+    };
     json!({
         "tag": "column_set",
         "flex_mode": "none",
@@ -1022,8 +1022,10 @@ fn switch_card_row(
                 "vertical_align": "center",
                 "elements": [
                     {
-                        "tag": "action",
-                        "actions": actions,
+                        "tag": "column_set",
+                        "flex_mode": "none",
+                        "horizontal_spacing": "default",
+                        "columns": [ btn_column("adopt", btn_text), btn_column("topic_adopt", "建话题接管") ]
                     }
                 ],
             }
@@ -2508,6 +2510,43 @@ mod tests {
         assert!(
             !text.contains("\"tag\":\"note\"") && !text.contains("\"tag\": \"note\""),
             "help card must not use the schema-V2-unsupported note element: {text}"
+        );
+    }
+
+    /// The `/switch` session card must stay schema-V2-compatible: schema 2.0
+    /// dropped the v1 `action` container (Feishu rejects the card with ErrCode
+    /// 200861, "cards of schema V2 no longer support this capability"), which
+    /// killed the `/switch` card (the 400 only landed in the log). Row buttons
+    /// render as a nested `column_set` instead, one column per button.
+    #[test]
+    fn switch_card_has_no_schema_v2_unsupported_action_container() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let sessions = vec![crate::opencode::client::SessionListInfo {
+            id: "ses_alpha01".into(),
+            title: "重写登录".into(),
+            directory: "/work/auth".into(),
+            parent_id: None,
+            agent: None,
+            model: None,
+            time: None,
+        }];
+        let card = build_switch_card(&key, &sessions, "", None, &[]);
+        let text = card.to_string();
+        assert!(
+            !text.contains("\"tag\":\"action\"") && !text.contains("\"tag\": \"action\""),
+            "switch card must not use the schema-V2-unsupported action container: {text}"
+        );
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let rows: Vec<&serde_json::Value> = elements.iter().filter(|e| e["tag"] == "column_set").collect();
+        assert_eq!(rows.len(), 1, "one column_set row per session list: {text}");
+        assert_eq!(rows[0]["columns"][1]["elements"][0]["tag"], "column_set");
+        assert_eq!(
+            rows[0]["columns"][1]["elements"][0]["columns"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2,
+            "both buttons side by side: {text}"
         );
     }
 }
