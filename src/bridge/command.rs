@@ -3,6 +3,8 @@
 pub enum Command {
     /// Change project directory for the current session
     Dir(String),
+    /// `/dir` (no args) — interactive Recent Directories card.
+    DirCard,
     /// Session management (`/switch ...`): match, list, forget, adopt, or the
     /// interactive card. Absorbed the old `/list`, `/attach`, `/forget`.
     Switch(SwitchAction),
@@ -101,7 +103,7 @@ pub fn parse_command(text: &str) -> Option<Command> {
         // instead of silently becoming an AI prompt.
         "/dir" => match arg {
             Some(p) => Some(Command::Dir(p.to_string())),
-            None => Some(Command::Help(Some("dir".into()))),
+            None => Some(Command::DirCard),
         },
         "/switch" => match arg {
             // `/switch` (no args) — the interactive session card.
@@ -263,7 +265,7 @@ pub fn help_text() -> String {
 pub fn command_help(name: &str) -> Option<String> {
     let text = match name.to_lowercase().as_str() {
         "dir" => {
-            "/dir <path> [name]\nSwitch to a project: open a NEW session rooted at <path> (create a session rooted at that directory).\nExample: `/dir /root/proj/lib`"
+            "/dir <path> [name]\nSwitch to a project: open a NEW session rooted at <path> (create a session rooted at that directory).\n- `/dir` (no arg) — Recent Directories card: pick a recently-used folder and switch there\nExample: `/dir /root/proj/lib`"
         }
         "switch" => {
             "/switch [action]\nSession management card and text forms.\n- `/switch` (no arg) — interactive session card (browse / search / adopt / new)\n- `/switch <keyword>` — switch by title/directory/id; the current chat's sessions win, otherwise a unique global match is adopted. Ambiguous keywords list candidates.\n- `/switch list [keyword] [--all]` — list recent sessions across the store (up to 15)\n- `/switch <id|title> [--force]` — take over a session (exact id → id-prefix → title; reject if owned by another chat unless `--force`)\n- `/switch forget` — un-map this chat's session (server session stays)\nExamples: `/switch backend`, `/switch list cola`, `/switch ses_abc --force`"
@@ -413,7 +415,10 @@ pub(crate) async fn handle_command(
     // topic that never had a session may use them — their outcome becomes
     // that topic's single session.
     if kind == ConversationKind::Topic {
-        let blocked = matches!(cmd, Command::Dir(_) | Command::Switch(_) | Command::New(_));
+        let blocked = matches!(
+            cmd,
+            Command::Dir(_) | Command::DirCard | Command::Switch(_) | Command::New(_)
+        );
         if blocked {
             let has_session = core.sessions.lock().await.get_active(&thread_key).is_some();
             if has_session {
@@ -479,6 +484,9 @@ pub(crate) async fn handle_command(
                     ),
                 )
                 .await?;
+        }
+        Command::DirCard => {
+            send_dir_card(core, &thread_key, message_id).await?;
         }
         Command::Switch(action) => {
             handle_switch_action(core, &thread_key, action, message_id, kind).await?;
@@ -1040,6 +1048,54 @@ async fn send_switch_card(
         active_id.as_deref(),
         &mapped_ids,
     );
+    core.feishu.reply_card(message_id, &card).await?;
+    Ok(())
+}
+
+/// Fetch + shape the data the `/dir` Recent Directories card renders: distinct
+/// directories of recently-active sessions (children and archived excluded,
+/// deduped by directory, sorted by last activity), plus the thread's current
+/// directory. Shared by the text send path (`send_dir_card`) and the card ack
+/// refresh (`App::build_dir_card_for`) so both render from one source of truth.
+pub(crate) async fn dir_card_data(
+    core: &Arc<SharedCore>,
+    thread_key: &ThreadKey,
+) -> (Vec<String>, Option<String>) {
+    let sessions = core.cached_session_list().await.unwrap_or_default();
+    // Directory -> latest activity. A directory's freshness is its most
+    // recently active session's `time.updated`.
+    let mut by_dir: Vec<(String, i64)> = Vec::new();
+    for s in sessions {
+        if s.is_child() || s.time.as_ref().map(|t| t.is_archived()).unwrap_or(false) {
+            continue;
+        }
+        let updated = s.time.as_ref().map(|t| t.updated).unwrap_or(0);
+        if let Some(entry) = by_dir.iter_mut().find(|(d, _)| *d == s.directory) {
+            entry.1 = entry.1.max(updated);
+        } else {
+            by_dir.push((s.directory, updated));
+        }
+    }
+    by_dir.sort_by_key(|(_, updated)| std::cmp::Reverse(*updated));
+    let dirs: Vec<String> = by_dir.into_iter().map(|(d, _)| d).collect();
+    let current_dir = core
+        .sessions
+        .lock()
+        .await
+        .get_active(thread_key)
+        .map(|e| e.directory.clone());
+    (dirs, current_dir)
+}
+
+/// Build and send the interactive `/dir` Recent Directories card. Renders the
+/// deduped directory list (via `dir_card_data`) and replies with the card.
+async fn send_dir_card(
+    core: &Arc<SharedCore>,
+    thread_key: &ThreadKey,
+    message_id: &str,
+) -> crate::error::Result<()> {
+    let (dirs, current_dir) = dir_card_data(core, thread_key).await;
+    let card = crate::feishu::card::build_dir_card(thread_key, &dirs, current_dir.as_deref());
     core.feishu.reply_card(message_id, &card).await?;
     Ok(())
 }
@@ -1780,8 +1836,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_dir_missing_arg_shows_dir_help() {
-        assert_eq!(parse_command("/dir"), Some(Command::Help(Some("dir".into()))));
+    fn parse_dir_missing_arg_is_dir_card() {
+        assert_eq!(parse_command("/dir"), Some(Command::DirCard));
         assert_eq!(parse_command("/name"), Some(Command::Help(Some("name".into()))));
     }
 

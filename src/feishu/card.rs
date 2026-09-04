@@ -983,6 +983,24 @@ pub fn build_question_card(
 /// schema V2 no longer support this capability"), so buttons never live in an
 /// `action` element — the button row is a `column_set` with one column per
 /// button.
+/// A full-width text row (schema-2.0 safe): a single weighted column holding a
+/// markdown element. Shared by the `/switch` and `/dir` card rows.
+fn card_text_row(text: &str) -> serde_json::Value {
+    json!({
+        "tag": "column_set",
+        "flex_mode": "none",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 5,
+                "vertical_align": "center",
+                "elements": [ { "tag": "markdown", "content": text } ]
+            }
+        ]
+    })
+}
+
 fn switch_card_row(
     text: &str,
     btn_text: &str,
@@ -1010,19 +1028,7 @@ fn switch_card_row(
             ],
         })
     };
-    let text_row = json!({
-        "tag": "column_set",
-        "flex_mode": "none",
-        "columns": [
-            {
-                "tag": "column",
-                "width": "weighted",
-                "weight": 5,
-                "vertical_align": "center",
-                "elements": [ { "tag": "markdown", "content": text } ]
-            }
-        ]
-    });
+    let text_row = card_text_row(text);
     let btn_row = json!({
         "tag": "column_set",
         "flex_mode": "bisect",
@@ -1338,7 +1344,10 @@ pub fn build_help_card() -> serde_json::Value {
             "📂 会话",
             &[
                 ("/new [名字]", "在当前项目新建会话"),
-                ("/dir <路径> [名字]", "切换项目，在新目录开会话"),
+                (
+                    "/dir [路径] [名字]",
+                    "切换项目，在新目录开会话（无参弹最近目录卡片）",
+                ),
                 (
                     "/switch [关键字]",
                     "会话卡片，或按名称/目录/ID 切换（含 list / forget）",
@@ -1505,6 +1514,106 @@ pub fn build_switch_card(
         },
         "body": { "elements": elements }
     })
+}
+
+/// The `/dir` Recent Directories card (no-arg form): one directory per entry,
+/// capped at [`MAX_SWITCH_ROWS`]. Each entry is two rows — a full-width text
+/// row (directory path, marked `当前` when it is the thread's active session
+/// directory) and a button row beneath it, mirroring the `/switch` card
+/// layout. The pick button carries the routing payload (action, op,
+/// thread_key, directory), so the ack re-roots the thread into that directory.
+/// Schema-2.0 safe: no v1 `action` container (see `switch_card_row`).
+pub fn build_dir_card(
+    thread_key: &crate::config::ThreadKey,
+    dirs: &[String],
+    current_dir: Option<&str>,
+) -> serde_json::Value {
+    let mut elements: Vec<serde_json::Value> = Vec::new();
+
+    if dirs.is_empty() {
+        elements.push(json!({
+            "tag": "markdown",
+            "content": "_(还没有最近目录。用 `/dir <路径>` 或 `/new` 创建会话。)_"
+        }));
+    } else {
+        elements.push(json!({ "tag": "markdown", "content": "**最近目录**" }));
+        for dir in dirs.iter().take(MAX_SWITCH_ROWS) {
+            let is_current = current_dir == Some(dir.as_str());
+            let text = if is_current {
+                format!("`{dir}`\n_(当前)_")
+            } else {
+                format!("`{dir}`")
+            };
+            let btn = if is_current {
+                "✅ 当前"
+            } else {
+                "切换到这里"
+            };
+            elements.extend(dir_card_row(&text, btn, thread_key, dir));
+        }
+        // Truncated entries aren't lost: `/switch` adopts an EXISTING session
+        // by directory, and `/new` then opens a fresh one in that project —
+        // the two-step path to a new session in an overflow directory.
+        if dirs.len() > MAX_SWITCH_ROWS {
+            elements.push(json!({
+                "tag": "markdown",
+                "content": format!(
+                    "_(还有 {} 个最近目录未显示。用 `/switch <路径>` 接管已有会话，再 `/new` 新建。)_",
+                    dirs.len() - MAX_SWITCH_ROWS
+                )
+            }));
+        }
+    }
+
+    json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true },
+        "header": {
+            "title": { "tag": "plain_text", "content": "📂 最近目录" },
+            "template": "blue"
+        },
+        "body": { "elements": elements }
+    })
+}
+
+/// One `/dir` card entry: a full-width text row plus a single-button row that
+/// re-roots the thread into the directory (`op: "pick"`). Mirrors the
+/// `/switch` card's two-row-per-entry layout (schema-2.0 safe, no `action`
+/// container).
+fn dir_card_row(
+    text: &str,
+    btn_text: &str,
+    thread_key: &crate::config::ThreadKey,
+    directory: &str,
+) -> Vec<serde_json::Value> {
+    let text_row = card_text_row(text);
+    let btn_row = json!({
+        "tag": "column_set",
+        "flex_mode": "none",
+        "horizontal_spacing": "default",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "auto",
+                "vertical_align": "center",
+                "elements": [
+                    {
+                        "tag": "button",
+                        "text": { "tag": "plain_text", "content": btn_text },
+                        "type": "primary",
+                        "value": {
+                            "action": "dir",
+                            "op": "pick",
+                            "chat_id": thread_key.chat_id,
+                            "thread_id": thread_key.thread_id,
+                            "directory": directory,
+                        },
+                    }
+                ]
+            }
+        ]
+    });
+    vec![text_row, btn_row]
 }
 
 fn truncate_md(text: &str, max_len: usize) -> String {
@@ -2561,5 +2670,108 @@ mod tests {
         assert_eq!(btn_columns.len(), 2, "both buttons side by side: {text}");
         assert_eq!(btn_columns[0]["elements"][0]["tag"], "button");
         assert_eq!(btn_columns[1]["elements"][0]["tag"], "button");
+    }
+
+    /// The `/dir` Recent Directories card must be schema-V2-compatible (no v1
+    /// `action` container — ErrCode 200861), with one text row + one button row
+    /// per directory, and each button carrying the pick routing payload.
+    #[test]
+    fn dir_card_has_no_schema_v2_unsupported_action_container() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let dirs = vec!["/work/auth".to_string(), "/work/billing".to_string()];
+        let card = build_dir_card(&key, &dirs, Some("/work/auth"));
+        let text = card.to_string();
+        assert!(
+            !text.contains("\"tag\":\"action\"") && !text.contains("\"tag\": \"action\""),
+            "dir card must not use the schema-V2-unsupported action container: {text}"
+        );
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let rows: Vec<&serde_json::Value> = elements.iter().filter(|e| e["tag"] == "column_set").collect();
+        assert_eq!(
+            rows.len(),
+            4,
+            "one text row + one button row per directory: {text}"
+        );
+        // The second entry's button carries the pick payload for its directory.
+        let btn = &rows[3]["columns"][0]["elements"][0];
+        assert_eq!(btn["tag"], "button");
+        assert_eq!(btn["value"]["action"], "dir");
+        assert_eq!(btn["value"]["op"], "pick");
+        assert_eq!(btn["value"]["directory"], "/work/billing");
+        assert_eq!(btn["value"]["chat_id"], "chat_1");
+        assert_eq!(btn["value"]["thread_id"], "chat_1");
+        // The current directory is marked, and its row reads "当前" not "切换".
+        let current_text = rows[0]["columns"][0]["elements"][0]["content"].as_str().unwrap();
+        assert!(
+            current_text.contains("当前"),
+            "current dir marked: {current_text}"
+        );
+        assert_eq!(
+            rows[1]["columns"][0]["elements"][0]["text"]["content"], "✅ 当前",
+            "current dir button reads 当前: {text}"
+        );
+        assert_eq!(
+            rows[3]["columns"][0]["elements"][0]["text"]["content"], "切换到这里",
+            "non-current dir button reads 切换到这里: {text}"
+        );
+    }
+
+    /// An empty Recent Directories list renders a hint and no buttons.
+    #[test]
+    fn dir_card_empty_state_is_buttonless_hint() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let card = build_dir_card(&key, &[], None);
+        let text = card.to_string();
+        assert!(text.contains("还没有最近目录"), "empty hint: {text}");
+        assert!(
+            !text.contains("\"tag\":\"button\"") && !text.contains("\"tag\": \"button\""),
+            "empty dir card has no buttons: {text}"
+        );
+    }
+
+    /// More than `MAX_SWITCH_ROWS` recent directories render only the most
+    /// recent six — the rest are silently dropped (same cap as the `/switch`
+    /// card).
+    #[test]
+    fn dir_card_caps_rows_at_max_switch_rows() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let dirs: Vec<String> = (1..=9).map(|i| format!("/work/proj{i}")).collect();
+        let card = build_dir_card(&key, &dirs, None);
+        let text = card.to_string();
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let rows: Vec<&serde_json::Value> = elements.iter().filter(|e| e["tag"] == "column_set").collect();
+        assert_eq!(
+            rows.len(),
+            MAX_SWITCH_ROWS * 2,
+            "one text row + one button row for each of the capped six: {text}"
+        );
+        assert!(text.contains("/work/proj1"), "most recent shown: {text}");
+        assert!(text.contains("/work/proj6"), "sixth most recent shown: {text}");
+        assert!(
+            !text.contains("/work/proj7"),
+            "seventh+ directory dropped: {text}"
+        );
+        assert!(
+            text.contains("还有 3 个最近目录未显示"),
+            "truncated count hints at the fallback: {text}"
+        );
+        assert!(
+            text.contains("/switch") && text.contains("接管") && text.contains("/new"),
+            "hint encodes the switch-then-new flow: {text}"
+        );
+    }
+
+    /// A Recent Directories card that fits under the cap shows no truncation
+    /// hint.
+    #[test]
+    fn dir_card_under_cap_has_no_truncation_hint() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let dirs = vec!["/work/auth".to_string(), "/work/billing".to_string()];
+        let card = build_dir_card(&key, &dirs, None);
+        let text = card.to_string();
+        assert!(
+            !text.contains("还有") && !text.contains("未显示"),
+            "no truncation hint under the cap: {text}"
+        );
     }
 }

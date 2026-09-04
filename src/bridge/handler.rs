@@ -808,6 +808,7 @@ impl App {
             "question" => self.question.handle_card_action(&self.core, &value).await,
             "retry" => self.handle_retry_action(&value).await,
             "switch" => self.handle_switch_card_action(&self.core, &value).await,
+            "dir" => self.handle_dir_card_action(&self.core, &value).await,
             "agent" => self.handle_agent_card_action(&self.core, &value).await,
             "model" => self.handle_model_card_action(&self.core, &value).await,
             "think" => self.handle_think_card_action(&self.core, &value).await,
@@ -1041,6 +1042,89 @@ impl App {
         let (shown, active_id, mapped_ids) =
             crate::bridge::command::switch_card_data(core, thread_key, keyword).await;
         crate::feishu::card::build_switch_card(thread_key, &shown, keyword, active_id.as_deref(), &mapped_ids)
+    }
+
+    /// Rebuild the `/dir` Recent Directories card for a thread.
+    async fn build_dir_card_for(
+        self: &Arc<Self>,
+        core: &Arc<SharedCore>,
+        thread_key: &ThreadKey,
+    ) -> serde_json::Value {
+        let (dirs, current_dir) = crate::bridge::command::dir_card_data(core, thread_key).await;
+        crate::feishu::card::build_dir_card(thread_key, &dirs, current_dir.as_deref())
+    }
+
+    /// Handle a `/dir` Recent Directories card button (`op: "pick"`): re-root
+    /// the thread into the picked directory by creating a NEW session there
+    /// (matching the text `/dir <path>` form). Clicking the current directory
+    /// is a no-op that just toasts. Refreshes the card in place so the new
+    /// directory shows as `当前`.
+    async fn handle_dir_card_action(
+        self: &Arc<Self>,
+        core: &Arc<SharedCore>,
+        value: &serde_json::Value,
+    ) -> Option<CardActionResult> {
+        let op = value.get("op").and_then(|v| v.as_str()).unwrap_or("");
+        let thread_key = thread_key_from_value(value);
+        let directory = value
+            .get("directory")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if op != "pick" || directory.is_empty() {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("无效操作".to_string()),
+            });
+        }
+        let current_dir = core
+            .sessions
+            .lock()
+            .await
+            .get_active(&thread_key)
+            .map(|e| e.directory.clone());
+        if current_dir.as_deref() == Some(directory.as_str()) {
+            return Some(CardActionResult {
+                card: Some(self.build_dir_card_for(core, &thread_key).await),
+                toast: Some("已在当前目录".to_string()),
+            });
+        }
+        let session = match core
+            .opencode
+            .create_session(&core.opencode.new_session_input(Some(&directory)))
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("dir card pick session failed: {}", e);
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some(format!("创建会话失败：{e}")),
+                });
+            }
+        };
+        let entry = crate::config::SessionEntry {
+            thread_key: thread_key.clone(),
+            session_id: session.id.clone(),
+            directory: directory.clone(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            variant: None,
+        };
+        {
+            let mut store = core.sessions.lock().await;
+            store.set_active(entry);
+            if let Err(e) = store.persist() {
+                tracing::warn!("dir card pick: persist failed: {}", e);
+            }
+        }
+        core.invalidate_session_list_cache().await;
+        Some(CardActionResult {
+            card: Some(self.build_dir_card_for(core, &thread_key).await),
+            toast: Some(format!("已切换目录并新建会话（`{directory}`）")),
+        })
     }
 
     /// Handle an `/agent` picker-card button: record the per-session override

@@ -3580,6 +3580,183 @@ pub(crate) mod integration_tests {
         assert!(app.sessions.lock().await.all_entries().is_empty());
     }
 
+    /// `dir_card_data` derives Recent Directories from the shared store:
+    /// children and archived sessions excluded, deduped by directory (keeping
+    /// the latest activity), sorted most-recent-first.
+    #[tokio::test]
+    async fn dir_card_data_dedupes_sorts_and_filters() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        let mut child = list_session("ses_child", "子任务", "/work/a", 999);
+        child.parent_id = Some("ses_root".into());
+        let mut archived = list_session("ses_arch", "归档", "/work/arch", 888);
+        archived.time = Some(opencode::client::SessionTime {
+            created: 1,
+            updated: 888,
+            archived: Some(1),
+        });
+        backend.session_list = vec![
+            list_session("ses_a1", "A1", "/work/a", 100),
+            list_session("ses_b", "B", "/work/b", 200),
+            list_session("ses_a2", "A2", "/work/a", 300),
+            child,
+            archived,
+        ];
+        let (app, _platform) = build_app(cfg, backend).await;
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+
+        let (dirs, current) = crate::bridge::command::dir_card_data(&app.core, &key).await;
+        assert_eq!(dirs, vec!["/work/a".to_string(), "/work/b".to_string()]);
+        assert_eq!(current, None);
+    }
+
+    /// The `/dir` Recent Directories card's `pick` op re-roots the thread into
+    /// the picked directory: it creates a NEW session there (matching the text
+    /// `/dir <path>` form), maps it active, and refreshes the card in place.
+    #[tokio::test]
+    async fn dir_card_pick_creates_session_and_refreshes_card() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![
+            list_session("ses_a", "项目A", "/work/a", 100),
+            list_session("ses_b", "项目B", "/work/b", 200),
+        ];
+        let (app, _platform) = build_app(cfg, backend).await;
+
+        let value = serde_json::json!({
+            "action": "dir",
+            "op": "pick",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "directory": "/work/b",
+        });
+        let result = app
+            .handle_card_action(value)
+            .await
+            .expect("dir pick should return a result");
+        assert!(result.card.is_some(), "dir pick refreshes the card");
+        assert!(
+            result.toast.clone().unwrap_or_default().contains("已切换目录"),
+            "dir pick toasts: {:?}",
+            result.toast
+        );
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let entry = app
+            .sessions
+            .lock()
+            .await
+            .get_active(&key)
+            .cloned()
+            .expect("dir pick maps the new session active");
+        assert_eq!(entry.directory, "/work/b");
+        // The refreshed card marks the new directory as current.
+        let card_str = result.card.unwrap().to_string();
+        assert!(
+            card_str.contains("当前"),
+            "refreshed card marks current: {card_str}"
+        );
+    }
+
+    /// Picking the directory the thread is ALREADY in is a no-op: a Toast, no
+    /// new session (mirrors the switch card's "已在当前会话").
+    #[tokio::test]
+    async fn dir_card_pick_current_directory_toasts_only() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session("ses_a", "项目A", "/work/a", 100)];
+        let (app, _platform) = build_app(cfg, backend).await;
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: key.clone(),
+                session_id: "ses_a".into(),
+                directory: "/work/a".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+                variant: None,
+            });
+        }
+
+        let value = serde_json::json!({
+            "action": "dir",
+            "op": "pick",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "directory": "/work/a",
+        });
+        let result = app
+            .handle_card_action(value)
+            .await
+            .expect("dir pick should return a result");
+        assert!(result.card.is_some(), "card still refreshes");
+        assert_eq!(
+            result.toast.as_deref(),
+            Some("已在当前目录"),
+            "current dir pick toasts: {:?}",
+            result.toast
+        );
+        // No new session was created: the active entry is unchanged.
+        let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
+        assert_eq!(entry.session_id, "ses_a");
+        assert_eq!(entry.directory, "/work/a");
+    }
+
+    /// A bare `/dir` in a bound topic is rejected like the other selection
+    /// commands — the Recent Directories card is still a Dir command.
+    #[tokio::test]
+    async fn dir_card_is_rejected_in_bound_topic() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into());
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: topic_key.clone(),
+                session_id: "ses_topic".into(),
+                directory: "/work/topic".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+                variant: None,
+            });
+        }
+        platform.calls.lock().await.clear();
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::DirCard,
+            topic_key.clone(),
+            "msg_topic",
+            crate::config::ConversationKind::Topic,
+        )
+        .await
+        .unwrap();
+        let calls = platform.calls.lock().await.clone();
+        let text = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("回主对话操作"),
+            "DirCard must be rejected in a bound topic: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn group_root_message_creates_lobby_session_and_shows_guidance() {
         let _wd = test_work_dir();
@@ -6359,6 +6536,7 @@ pub(crate) mod integration_tests {
             }),
             Command::New(None),
             Command::Dir("/work/x".into()),
+            Command::DirCard,
         ] {
             platform.calls.lock().await.clear();
             crate::bridge::command::handle_command(

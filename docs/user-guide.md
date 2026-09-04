@@ -171,6 +171,7 @@ detailed help for any of these.
 | Command | What it does |
 | --- | --- |
 | `/dir <path> [name]` | Switch to a project: open a NEW session rooted at `<path>` |
+| `/dir` | Recent Directories card: pick a recently-used folder and switch there |
 | `/switch` | Session card: browse / search / adopt / new |
 | `/switch <kw>` | Switch to a session by name/dir/id (adopts foreign ones) |
 | `/switch list [kw] [--all]` | List recent sessions across the shared store (up to 15) |

@@ -55,6 +55,10 @@ _Avoid_: Current session, latest session, selected session
 A working directory on the filesystem where OpenCode operates. A property of a session, not of the bot. A conversation's current project is the directory of its active session (derived, never stored separately); `/new` and the bare `/topic` form inherit it and fall back to the default directory only when the conversation has no session. Sessions created outside a conversation still carry their own directory.
 _Avoid_: Workspace, repo
 
+**Recent Directories** (「最近目录」):
+Directories of the most recently active sessions in the Shared Store, deduplicated by directory and sorted by last activity. A bare `/dir` (no argument) presents them as a picker card for one-tap re-rooting. The server's session list is the only source — cola records no folder history of its own.
+_Avoid_: Recently opened folders, folder history, recent projects
+
 **Variant**:
 A model-declared reasoning-effort setting (e.g. "low"/"high"/"minimal"), selectable per session via the `/think` command and sent to the backend as `PromptInput.variant`. Each model declares its own variant set — there is no universal scale across models — and "unset" means the server's default for that model. Selecting a model that doesn't declare the current session's variant clears it. The user-facing label on cards is "思考等级"/thinking; "variant" is the backend protocol term, never a command name.
 _Avoid_: Thinking level as the domain term (it's the presentation label); calling the command `/variant`
@@ -113,7 +117,7 @@ _Avoid_: Uncommitted, modified
 > **Domain expert:** "The Bridge pauses the Card stream, renders a Permission card with action buttons, and waits for the user to reply. Once resolved, streaming resumes."
 
 **Command**:
-A slash-prefixed instruction (e.g. `/new`, `/dir`, `/switch`, `/compact`). Every command supports two forms: a text-direct form (an argument that completes the action in one step) and a card form (no argument pops a card — an **Interactive Card** for strong-interaction commands like `/switch`, `/model`, `/agent`, `/autoaccept`, or a **Reference Card** for `/help`). cola parses its own commands locally and forwards unrecognized ones to the Backend as prompt text.
+A slash-prefixed instruction (e.g. `/new`, `/dir`, `/switch`, `/compact`). Every command supports two forms: a text-direct form (an argument that completes the action in one step) and a card form (no argument pops a card — an **Interactive Card** for strong-interaction commands like `/switch`, `/dir`, `/model`, `/agent`, `/autoaccept`, or a **Reference Card** for `/help`). cola parses its own commands locally and forwards unrecognized ones to the Backend as prompt text.
 _Avoid_: Slash command, action, operation
 
 **Reference Card**:
