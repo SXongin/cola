@@ -59,9 +59,11 @@ Extend `/topic` with an adopt mode:
 ## Risks / open questions
 
 - **Card path needs `open_message_id`**: `extract_card_action_value`
-  (src/feishu/ws.rs) currently drops the outer `card.action.trigger` payload
-  where `event.action.open_message_id` lives. The card "建话题接管" button must
-  thread that id through to the handler so it can `reply_in_thread` off the card
-  message itself.
+  (src/feishu/ws.rs) reads the card's own message id from the schema 2.0
+  callback's `event.context.open_message_id` (with a fallback to
+  `event.action.open_message_id` for older shapes) and threads it into the value
+  it hands the handler. The card "建话题接管" button relies on that id so the
+  handler can `reply_in_thread` off the card message itself.
+  ✅ Resolved by `fix(feishu): read card open_message_id from event.context`.
 - **Resolution ambiguity** (multiple hits) lists candidates and points at the
   full id, matching `/attach`; no silent auto-adopt of the wrong session.

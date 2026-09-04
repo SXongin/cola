@@ -667,11 +667,18 @@ fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Value> {
             val["keyword"] = serde_json::Value::String(s.to_string());
         }
     }
-    // The card's own message id (`card.action.trigger` carries it on the action
-    // object). `/topic --adopt`'s card button needs it to `reply_in_thread` off
+    // The card's own message id. In the schema 2.0 callback it lives on
+    // `event.context.open_message_id`; older shapes carried it on the action
+    // object. `/topic --adopt`'s card button needs it to `reply_in_thread` off
     // the card and create the topic (ADR-0016); without it there is no message
     // inside the new topic to anchor fallback cards on.
-    if let Some(open_message_id) = a.get("open_message_id").and_then(|m| m.as_str()) {
+    let open_message_id = v
+        .get("event")
+        .and_then(|e| e.get("context"))
+        .and_then(|c| c.get("open_message_id"))
+        .and_then(|m| m.as_str())
+        .or_else(|| a.get("open_message_id").and_then(|m| m.as_str()));
+    if let Some(open_message_id) = open_message_id {
         val["open_message_id"] = serde_json::Value::String(open_message_id.to_string());
     }
     Some(val)
@@ -1806,11 +1813,36 @@ fn process_frame_routes_card_actions() {
 }
 
 #[test]
-fn card_action_carries_open_message_id() {
+fn card_action_carries_open_message_id_from_context() {
     // `/topic --adopt`'s card button (ADR-0016) anchors the new topic on the
-    // card's own message id; it must survive extraction.
+    // card's own message id; the schema 2.0 callback carries it on
+    // `event.context.open_message_id`.
     let payload = br#"{
             "header": { "event_type": "card.action.trigger", "event_id": "e_card" },
+            "event": {
+                "action": {
+                    "tag": "button",
+                    "value": { "action": "switch", "op": "topic_adopt", "chat_id": "oc_1", "thread_id": "oc_1", "session_id": "ses_abc" }
+                },
+                "context": { "open_message_id": "om_switch_card", "open_chat_id": "oc_1" }
+            }
+        }"#;
+    let frame = event_frame(payload);
+    match process_frame(&frame, &mut DedupeSet::new(10)) {
+        FrameAction::CardAction(v) => {
+            assert_eq!(v["op"], "topic_adopt");
+            assert_eq!(v["open_message_id"], "om_switch_card");
+        }
+        other => panic!("expected CardAction, got {:?}", std::mem::discriminant(&other)),
+    }
+}
+
+#[test]
+fn card_action_falls_back_to_open_message_id_on_action() {
+    // Older callback shapes put the message id on the action object; the
+    // extraction still threads it through.
+    let payload = br#"{
+            "header": { "event_type": "card.action.trigger", "event_id": "e_card2" },
             "event": {
                 "action": {
                     "tag": "button",
@@ -1821,10 +1853,7 @@ fn card_action_carries_open_message_id() {
         }"#;
     let frame = event_frame(payload);
     match process_frame(&frame, &mut DedupeSet::new(10)) {
-        FrameAction::CardAction(v) => {
-            assert_eq!(v["op"], "topic_adopt");
-            assert_eq!(v["open_message_id"], "om_switch_card");
-        }
+        FrameAction::CardAction(v) => assert_eq!(v["open_message_id"], "om_switch_card"),
         other => panic!("expected CardAction, got {:?}", std::mem::discriminant(&other)),
     }
 }
