@@ -26,7 +26,7 @@ dirs = "6"
 url = "2"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
-base64 = "0.22"
+base64 = "0.23"
 async-trait = "0.1"
 indexmap = "2"
 sysinfo = "0.39"
