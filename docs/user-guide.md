@@ -223,3 +223,4 @@ the server use its own default.
 
 **I moved the cola binary and now autostart is broken.** Re-run
 `cola autostart enable` — the launcher snapshots the binary path at enable time.
+<!-- ruleset verification commit -->
