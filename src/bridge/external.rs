@@ -223,6 +223,16 @@ impl ExternalFlow {
         acc.session_id = Some(session_id.to_string());
         acc.reply_to_message_id = Some(card_id.to_string());
         acc.attach_work_context(&session_dir).await;
+        // Footer model@variant: capture the session's `/think` variant when the
+        // turn is ARMED, not when it finalizes — a `/think` issued mid-render
+        // must not retro-tag this card (same rule as the work-context half,
+        // ADR-0019).
+        acc.variant = core
+            .sessions
+            .lock()
+            .await
+            .entry_for_session(session_id)
+            .and_then(|e| e.variant.clone());
         // Keep the external message visible: the notification card is updated in
         // place, so its preview would otherwise vanish when the reply renders.
         if !preview.is_empty() {

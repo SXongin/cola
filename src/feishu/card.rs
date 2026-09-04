@@ -740,11 +740,15 @@ pub fn question_summary(questions: &[crate::opencode::client::QuestionInfo]) -> 
 /// Build the interactive question card (JSON 2.0). Options render as buttons
 /// when few, or collapse into a folding `overflow` group when many; a question
 /// that allows a custom answer (`custom`, default true) gets an input box in a
-/// form container. Already-answered questions (`answered[i] == Some(labels)`)
-/// render as a static "已选" line instead of buttons, so answering one question
-/// never silently submits the others. A submit button appears when some (but
-/// not all) questions are answered; a reject button sits at the bottom. The
-/// card callback (`action: "question"`) posts the answer back to the session.
+/// form container. A multi-select question (`multiple`) renders its options as
+/// toggle buttons instead: each click adds/removes the label and the card shows
+/// the running selection ("已选"), finalized by an explicit submit. Already-
+/// answered single-select questions (`answered[i] == Some(labels)`) render as a
+/// static "已选" line instead of buttons, so answering one question never
+/// silently submits the others. A submit button appears when some (but not all)
+/// questions are answered, or when any multi-select question holds a selection;
+/// a reject button sits at the bottom. The card callback (`action: "question"`)
+/// posts the answer back to the session.
 /// The body elements of a question prompt: a markdown summary (with ✅ on
 /// answered questions), option buttons (or a folding `overflow` when many),
 /// a custom-answer input form, an optional "submit/skip" button, and a reject
@@ -757,13 +761,22 @@ pub fn question_elements(
     directory: &str,
     answered: &[Option<Vec<String>>],
 ) -> Vec<serde_json::Value> {
+    // A multi-select question (`multiple`) is NEVER finalized by clicking an
+    // option: clicks toggle labels in its answer set until the user submits.
+    // Single-select questions are finalized the moment an option is clicked.
+    let is_multi = |i: usize| -> bool { questions.get(i).is_some_and(|q| q.multiple == Some(true)) };
     let is_answered = |qi: usize| -> bool { answered.get(qi).and_then(|a| a.as_ref()).is_some() };
     let mut markdown = String::new();
     for (i, q) in questions.iter().enumerate() {
-        if is_answered(i) {
+        if is_answered(i) && !is_multi(i) {
             markdown.push_str(&format!("✅ **{}. {}**\n", i + 1, q.question));
         } else {
-            markdown.push_str(&format!("**{}. {}**\n", i + 1, q.question));
+            markdown.push_str(&format!(
+                "**{}. {}{}**\n",
+                i + 1,
+                q.question,
+                if is_multi(i) { "（可多选）" } else { "" }
+            ));
         }
         for opt in &q.options {
             if opt.description.is_empty() {
@@ -784,10 +797,12 @@ pub fn question_elements(
     // answer shape.
     let mut elements: Vec<serde_json::Value> = vec![json!({ "tag": "markdown", "content": markdown })];
     for (qi, q) in questions.iter().enumerate() {
-        if is_answered(qi) {
+        if is_answered(qi) && !is_multi(qi) {
             continue;
         }
-        if q.options.len() > MAX_VISIBLE_OPTIONS {
+        // Multi-select stays on buttons (clicks toggle); only single-select
+        // collapses into an `overflow` when there are many options.
+        if !is_multi(qi) && q.options.len() > MAX_VISIBLE_OPTIONS {
             let options: Vec<serde_json::Value> = q
                 .options
                 .iter()
@@ -812,10 +827,24 @@ pub fn question_elements(
             }));
         } else {
             for opt in &q.options {
+                // Multi-select buttons show their selected state so the user
+                // can see what's already picked while still toggling.
+                let selected = is_multi(qi)
+                    && answered
+                        .get(qi)
+                        .and_then(|a| a.as_ref())
+                        .is_some_and(|labels| labels.iter().any(|l| l == &opt.label));
                 elements.push(json!({
                     "tag": "button",
-                    "text": { "tag": "plain_text", "content": opt.label },
-                    "type": "default",
+                    "text": {
+                        "tag": "plain_text",
+                        "content": if selected {
+                            format!("✅ {}", opt.label)
+                        } else {
+                            opt.label.clone()
+                        },
+                    },
+                    "type": if selected { "primary" } else { "default" },
                     "value": {
                         "action": "question",
                         "reply": "answer",
@@ -831,8 +860,9 @@ pub fn question_elements(
 
         // Free-text answer (OpenCode questions allow custom by default). The
         // typed text arrives in `action.form_value`; ws.rs injects it into the
-        // button's `answer` field so the handler stays unchanged.
-        if q.custom.unwrap_or(true) {
+        // button's `answer` field so the handler stays unchanged. Multi-select
+        // questions keep the button set (custom additions are an edge case).
+        if !is_multi(qi) && q.custom.unwrap_or(true) {
             let input_name = format!("custom_{}", qi);
             elements.push(json!({
                 "tag": "form",
@@ -852,9 +882,15 @@ pub fn question_elements(
                         "form_action_type": "submit",
                         // Form submit callbacks don't always carry the button
                         // `value`, so the routing payload is ALSO encoded in the
-                        // `name` ("submit|req|ses|qi|dir") — ws.rs rebuilds the
-                        // value from it when `action.value` is absent.
-                        "name": format!("submit|{}|{}|{}|{}", request_id, session_id, qi, directory),
+                        // `name` ("submit|req|ses|qi") — ws.rs rebuilds the
+                        // value from it when `action.value` is absent. The
+                        // directory is deliberately NOT in the name: Feishu
+                        // caps `name` at 100 chars and `submit|req|ses|qi|dir`
+                        // overflows on deep paths, killing the whole card update
+                        // (ErrCode 11310 "name exceed the default maximum 100").
+                        // The handler re-resolves the directory from the store /
+                        // request flow when the fallback fires.
+                        "name": format!("submit|{}|{}|{}", request_id, session_id, qi),
                         "value": {
                             "action": "question",
                             "reply": "answer",
@@ -869,10 +905,22 @@ pub fn question_elements(
         }
     }
     let answered_count = answered.iter().filter(|a| a.is_some()).count();
-    if answered_count > 0 && answered_count < questions.len() {
+    let has_multi = questions.iter().any(|q| q.multiple == Some(true));
+    // Submit appears when something is picked while questions remain open
+    // (single-select "跳过剩余"), and ALWAYS for a request containing a
+    // multi-select question — so the user can explicitly submit an empty
+    // selection ("不选") as well as a full one. Without the multi-select case
+    // the button vanishes at zero selections and "none" is unexpressible.
+    let show_submit = (answered_count > 0 && answered_count < questions.len()) || has_multi;
+    if show_submit {
+        let label = if has_multi {
+            "✅ 提交"
+        } else {
+            "✅ 提交（跳过剩余）"
+        };
         elements.push(json!({
             "tag": "button",
-            "text": { "tag": "plain_text", "content": "✅ 提交（跳过剩余）" },
+            "text": { "tag": "plain_text", "content": label },
             "type": "primary",
             "value": {
                 "action": "question",
@@ -919,45 +967,50 @@ pub fn build_question_card(
         "body": { "elements": elements }
     })
 }
-/// One row of the `/switch` session card: a `column_set` with the session
-/// text on the left and action button(s) on the right. The primary button
-/// switches/adopts into the current thread (`op: "adopt"`); a second "建话题接管"
-/// button (`op: "topic_adopt"`) opens a new Feishu topic around the session
+/// One session entry of the `/switch` card: a full-width text row followed by
+/// a button row underneath. The text row is its own `column_set` column (not a
+/// weighted column squeezed beside the buttons), so the session label and
+/// directory wrap naturally instead of being crushed into many narrow lines on
+/// mobile. The button row is a `column_set` with `flex_mode: "bisect"` (two
+/// equal columns, one per button) so the pair splits evenly on narrow
+/// screens instead of overflowing: the primary button switches/adopts into the
+/// current thread (`op: "adopt"`); a second "建话题接管" button
+/// (`op: "topic_adopt"`) opens a new Feishu topic around the session
 /// (ADR-0016). Each button carries the routing payload (action, op, thread_key,
 /// target session id).
+///
+/// Schema 2.0 dropped the v1 `action` container (error 200861, "cards of
+/// schema V2 no longer support this capability"), so buttons never live in an
+/// `action` element — the button row is a `column_set` with one column per
+/// button.
 fn switch_card_row(
     text: &str,
     btn_text: &str,
     thread_key: &crate::config::ThreadKey,
     session_id: &str,
-) -> serde_json::Value {
-    let actions = vec![
+) -> Vec<serde_json::Value> {
+    let btn_column = |op: &str, content: &str| {
         json!({
-            "tag": "button",
-            "text": { "tag": "plain_text", "content": btn_text },
-            "type": "default",
-            "value": {
-                "action": "switch",
-                "op": "adopt",
-                "chat_id": thread_key.chat_id,
-                "thread_id": thread_key.thread_id,
-                "session_id": session_id,
-            },
-        }),
-        json!({
-            "tag": "button",
-            "text": { "tag": "plain_text", "content": "建话题接管" },
-            "type": "default",
-            "value": {
-                "action": "switch",
-                "op": "topic_adopt",
-                "chat_id": thread_key.chat_id,
-                "thread_id": thread_key.thread_id,
-                "session_id": session_id,
-            },
-        }),
-    ];
-    json!({
+            "tag": "column",
+            "width": "auto",
+            "vertical_align": "center",
+            "elements": [
+                {
+                    "tag": "button",
+                    "text": { "tag": "plain_text", "content": content },
+                    "type": "default",
+                    "value": {
+                        "action": "switch",
+                        "op": op,
+                        "chat_id": thread_key.chat_id,
+                        "thread_id": thread_key.thread_id,
+                        "session_id": session_id,
+                    },
+                }
+            ],
+        })
+    };
+    let text_row = json!({
         "tag": "column_set",
         "flex_mode": "none",
         "columns": [
@@ -967,20 +1020,16 @@ fn switch_card_row(
                 "weight": 5,
                 "vertical_align": "center",
                 "elements": [ { "tag": "markdown", "content": text } ]
-            },
-            {
-                "tag": "column",
-                "width": "auto",
-                "vertical_align": "center",
-                "elements": [
-                    {
-                        "tag": "action",
-                        "actions": actions,
-                    }
-                ],
             }
         ]
-    })
+    });
+    let btn_row = json!({
+        "tag": "column_set",
+        "flex_mode": "bisect",
+        "horizontal_spacing": "default",
+        "columns": [ btn_column("adopt", btn_text), btn_column("topic_adopt", "建话题接管") ]
+    });
+    vec![text_row, btn_row]
 }
 
 /// A generic option-picker card: one button per option. Shared by the
@@ -1147,7 +1196,7 @@ pub fn build_model_provider_cards(
 pub fn build_model_picker_cards(
     thread_key: &crate::config::ThreadKey,
     provider: &str,
-    models: &[String],
+    models: &[crate::opencode::client::ModelOption],
 ) -> Vec<serde_json::Value> {
     // The provider is already chosen (step 1), so the button LABEL shows just
     // the model name — a `provider/model` label truncates in Feishu's button
@@ -1155,7 +1204,7 @@ pub fn build_model_picker_cards(
     // records as the override.
     let options: Vec<(String, String)> = models
         .iter()
-        .map(|m| (m.clone(), format!("{provider}/{m}")))
+        .map(|m| (m.id.clone(), format!("{provider}/{}", m.id)))
         .collect();
     if options.is_empty() {
         return vec![picker_card(
@@ -1253,6 +1302,31 @@ pub fn build_autoaccept_card(thread_key: &crate::config::ThreadKey, current_on: 
     option_picker_card("🔁 自动审批", &intro, thread_key, "autoaccept", &options)
 }
 
+/// The `/think` picker card (ADR-0020): the current model, its declared
+/// variants (each model's own set — no universal scale), and a "默认（清除）"
+/// button. `current` is the session's active variant (None = server default).
+/// Only built when `variants` is non-empty — the caller replies a text message
+/// for models that declare none.
+pub fn build_think_card(
+    thread_key: &crate::config::ThreadKey,
+    provider: &str,
+    model: &str,
+    current: Option<&str>,
+    variants: &[String],
+) -> serde_json::Value {
+    let label = format!("{provider}/{model}");
+    let current_label = current
+        .map(|v| format!("`{v}`"))
+        .unwrap_or_else(|| "默认".to_string());
+    let intro =
+        format!("**当前模型**：`{label}`\n**当前思考等级**：{current_label}\n选择后下一条消息开始生效：");
+    let mut options = vec![("默认（清除）".to_string(), "default".to_string())];
+    for v in variants {
+        options.push((v.clone(), v.clone()));
+    }
+    option_picker_card("🧠 思考等级", &intro, thread_key, "think", &options)
+}
+
 /// The `/help` reference card: a pure command manual grouped by 会话 / 操作 /
 /// 运维, one line per command with a short description. No buttons — reading is
 /// its only job (previously the "试试"/"看卡" buttons made it an execution
@@ -1279,6 +1353,7 @@ pub fn build_help_card() -> serde_json::Value {
             &[
                 ("/agent <名字>", "切换 agent（下条消息生效）"),
                 ("/model <提供方/模型>", "切换模型（下条消息生效）"),
+                ("/think [等级]", "设置/清除思考等级（下条消息生效）"),
                 ("/autoaccept [on|off]", "查看或切换自动授权"),
                 ("/stop", "中断当前执行"),
                 ("/compact", "压缩上下文"),
@@ -1404,7 +1479,7 @@ pub fn build_switch_card(
             } else {
                 "接管"
             };
-            elements.push(switch_card_row(&text, btn, thread_key, &s.id));
+            elements.extend(switch_card_row(&text, btn, thread_key, &s.id));
         }
     }
 
@@ -1488,7 +1563,10 @@ mod tests {
         let providers: Vec<crate::opencode::client::ProviderModels> = (0..212)
             .map(|p| crate::opencode::client::ProviderModels {
                 provider: format!("provider-{p}"),
-                models: vec!["m".into()],
+                models: vec![crate::opencode::client::ModelOption {
+                    id: "m".into(),
+                    variants: Vec::new(),
+                }],
             })
             .collect();
         let cards = build_model_provider_cards(&key, &providers);
@@ -1515,7 +1593,12 @@ mod tests {
     #[test]
     fn model_picker_chunks_and_has_back_button() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let models: Vec<String> = (0..400).map(|i| format!("model-{i}")).collect();
+        let models: Vec<crate::opencode::client::ModelOption> = (0..400)
+            .map(|i| crate::opencode::client::ModelOption {
+                id: format!("model-{i}"),
+                variants: Vec::new(),
+            })
+            .collect();
         let cards = build_model_picker_cards(&key, "opencode", &models);
         assert!(cards.len() > 1, "huge model list must split: {}", cards.len());
         let first = &cards[0];
@@ -1553,6 +1636,28 @@ mod tests {
         let cards = build_model_provider_cards(&key, &[]);
         assert_eq!(cards.len(), 1);
         assert!(cards[0].to_string().contains("没有可用模型"));
+    }
+
+    /// The `/think` card lists the current model, its declared variants, and a
+    /// "默认（清除）" button; each button carries the `think` action and the
+    /// routing payload.
+    #[test]
+    fn think_card_lists_model_and_variants() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let card = build_think_card(
+            &key,
+            "opencode-go",
+            "deepseek-v4-flash",
+            Some("high"),
+            &["low".into(), "high".into()],
+        );
+        let text = card.to_string();
+        assert!(text.contains("思考等级"), "header: {text}");
+        assert!(text.contains("opencode-go/deepseek-v4-flash"), "model: {text}");
+        assert!(text.contains("当前思考等级"), "current label: {text}");
+        assert!(text.contains("默认（清除）"), "default option: {text}");
+        assert!(text.contains("\"value\":\"high\""), "variant button: {text}");
+        assert!(text.contains("\"action\":\"think\""), "action tag: {text}");
     }
 
     #[test]
@@ -2405,5 +2510,56 @@ mod tests {
             !text.contains("\"tag\":\"note\"") && !text.contains("\"tag\": \"note\""),
             "help card must not use the schema-V2-unsupported note element: {text}"
         );
+    }
+
+    /// The `/switch` session card must stay schema-V2-compatible: schema 2.0
+    /// dropped the v1 `action` container (Feishu rejects the card with ErrCode
+    /// 200861, "cards of schema V2 no longer support this capability"), which
+    /// killed the `/switch` card (the 400 only landed in the log). Row buttons
+    /// render as a nested `column_set` instead, one column per button.
+    ///
+    /// Each session entry is two rows: a full-width text row, then a button row
+    /// beneath it — the text is NOT squeezed into a weighted column beside the
+    /// buttons, which crushed the label/directory into many narrow wrapped
+    /// lines on mobile.
+    #[test]
+    fn switch_card_has_no_schema_v2_unsupported_action_container() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let sessions = vec![crate::opencode::client::SessionListInfo {
+            id: "ses_alpha01".into(),
+            title: "重写登录".into(),
+            directory: "/work/auth".into(),
+            parent_id: None,
+            agent: None,
+            model: None,
+            time: None,
+        }];
+        let card = build_switch_card(&key, &sessions, "", None, &[]);
+        let text = card.to_string();
+        assert!(
+            !text.contains("\"tag\":\"action\"") && !text.contains("\"tag\": \"action\""),
+            "switch card must not use the schema-V2-unsupported action container: {text}"
+        );
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let rows: Vec<&serde_json::Value> = elements.iter().filter(|e| e["tag"] == "column_set").collect();
+        assert_eq!(
+            rows.len(),
+            2,
+            "one text row + one button row per session entry: {text}"
+        );
+        let text_row_columns = rows[0]["columns"].as_array().unwrap();
+        assert_eq!(
+            text_row_columns.len(),
+            1,
+            "text row is a single full-width column: {text}"
+        );
+        assert_eq!(
+            text_row_columns[0]["elements"][0]["tag"], "markdown",
+            "text row renders the session label/directory: {text}"
+        );
+        let btn_columns = rows[1]["columns"].as_array().unwrap();
+        assert_eq!(btn_columns.len(), 2, "both buttons side by side: {text}");
+        assert_eq!(btn_columns[0]["elements"][0]["tag"], "button");
+        assert_eq!(btn_columns[1]["elements"][0]["tag"], "button");
     }
 }

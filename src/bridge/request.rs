@@ -359,13 +359,22 @@ impl RequestKind for QuestionKind {
         flow: &RequestFlow,
         _core: &Arc<SharedCore>,
         req: &PendingRequest,
-        _dir: &str,
+        dir: &str,
     ) -> bool {
         if let PendingRequest::Question(q) = req {
             flow.question_requests
                 .lock()
                 .await
                 .insert(q.id.clone(), q.clone());
+            // Record the owning directory: the submit-button `name` on the
+            // question card no longer carries it (Feishu caps `name` at 100
+            // chars), so a value-less form-submit callback re-resolves it here
+            // instead of the session store (sub-task child sessions aren't in
+            // it — see pitfall 11).
+            flow.question_dirs
+                .lock()
+                .await
+                .insert(q.id.clone(), dir.to_string());
         }
         false
     }
@@ -456,11 +465,24 @@ impl RequestKind for QuestionKind {
                 let Some(n) = n else {
                     return None; // stale card for an already-submitted request
                 };
+                // Multi-select questions toggle a label in the answer set on
+                // each click (never auto-finalize); single-select replaces the
+                // answer as before.
+                let (multi, has_multi) = {
+                    let reqs = flow.question_requests.lock().await;
+                    let qs = &reqs.get(req_id).map(|r| r.questions.clone()).unwrap_or_default();
+                    let multi = qs.get(index).is_some_and(|q| q.multiple == Some(true));
+                    let has_multi = qs.iter().any(|q| q.multiple == Some(true));
+                    (multi, has_multi)
+                };
                 // Record this question's answer.
                 let (answered_count, slot) = {
                     let mut partial = flow.question_partial.lock().await;
-                    let (count, slot) = record_answer(&mut partial, req_id, n, index, &answer);
-                    (count, slot)
+                    if multi {
+                        record_toggle_answer(&mut partial, req_id, n, index, &answer)
+                    } else {
+                        record_answer(&mut partial, req_id, n, index, &answer)
+                    }
                 };
                 // Keep the inline card's partial answers in sync.
                 if inline
@@ -478,7 +500,7 @@ impl RequestKind for QuestionKind {
                 {
                     pq.answers = slot.clone();
                 }
-                if answered_count == n {
+                if answered_count == n && !has_multi {
                     // All questions answered → submit the whole request.
                     flow.mark_answered(core, req_id).await;
                     let answers: Vec<Vec<String>> = flow
@@ -505,6 +527,7 @@ impl RequestKind for QuestionKind {
                         answers
                     );
                     flow.question_requests.lock().await.remove(req_id);
+                    flow.question_dirs.lock().await.remove(req_id);
                     flow.sent_cards.lock().await.remove(req_id);
                     if inline
                         && let Some(acc) = core
@@ -531,17 +554,40 @@ impl RequestKind for QuestionKind {
                     Some(r)
                 } else if inline {
                     // Inline: the streaming card re-renders with the updated
-                    // partial answers — toast only.
+                    // partial answers. Return the re-rendered card IN the
+                    // callback response so Feishu updates the CLICKED card in
+                    // place — the same mechanism standalone question cards use,
+                    // and the only one that reliably refreshes the body after an
+                    // interaction. A separate PATCH around the callback leaves
+                    // the card on its pre-answer state (the markers/已选 never
+                    // become visible), while a PATCH before the click did add the
+                    // buttons.
                     let mut r = CardActionResult {
                         card: None,
                         toast: None,
                     };
-                    r.toast = Some(format!("已记录答案，还有 {} 题未答", n - answered_count));
-                    // Re-render the streaming card NOW so the answered question
-                    // shows ✅/已选 and its buttons disappear. Without this the
-                    // card stays frozen: a question-blocked prompt produces no
-                    // new parts, so the render poll never flushes.
-                    flush_inline_card(core, host, session_id).await;
+                    r.toast = Some(answer_recorded_toast(n - answered_count));
+                    // Build on a CLONE so a card-component-limit split can't
+                    // advance the live accumulator's `render_from` from inside
+                    // the click handler (flush_card owns that flow). Only take
+                    // the card when it fits without splitting; otherwise fall
+                    // back to the PATCH re-render, which finalizes the card and
+                    // sends the continuation card.
+                    let rebuilt = {
+                        let mut cards = core.cards.lock().await;
+                        cards.get_mut(host.as_deref().unwrap_or(session_id)).map(|c| {
+                            let mut probe = c.acc.clone();
+                            probe.build_card_with_split()
+                        })
+                    };
+                    match rebuilt {
+                        Some((card, false)) => r.card = Some(card),
+                        _ => {
+                            // Split needed, or no live accumulator (the turn
+                            // ended between the click and now): PATCH re-render.
+                            flush_inline_card(core, host, session_id).await;
+                        }
+                    }
                     Some(r)
                 } else {
                     // Still questions left: return an updated card that shows the
@@ -570,7 +616,7 @@ impl RequestKind for QuestionKind {
                         card: Some(card),
                         toast: None,
                     };
-                    r.toast = Some(format!("已记录答案，还有 {} 题未答", remaining));
+                    r.toast = Some(answer_recorded_toast(remaining));
                     Some(r)
                 }
             }
@@ -608,6 +654,7 @@ impl RequestKind for QuestionKind {
                     answers
                 );
                 flow.question_requests.lock().await.remove(req_id);
+                flow.question_dirs.lock().await.remove(req_id);
                 if inline
                     && let Some(acc) = core
                         .cards
@@ -657,6 +704,7 @@ impl RequestKind for QuestionKind {
                 }
                 tracing::info!("Question rejected: {}", req_id);
                 flow.question_requests.lock().await.remove(req_id);
+                flow.question_dirs.lock().await.remove(req_id);
                 flow.question_partial.lock().await.remove(req_id);
                 flow.sent_cards.lock().await.remove(req_id);
                 if inline
@@ -699,6 +747,10 @@ pub struct RequestFlow {
     /// request_id → pending question request (question kind only; the AI asks
     /// the user and cola posts the answer back from the question card).
     pub question_requests: Arc<Mutex<HashMap<String, opencode::client::QuestionRequest>>>,
+    /// request_id → owning directory (question kind only). Filled at poll time
+    /// (where `dir` is known) as the fallback for form-submit callbacks whose
+    /// card `name` no longer carries the directory (see question_elements).
+    pub question_dirs: Arc<Mutex<HashMap<String, String>>>,
     /// request_id → answers recorded so far (None = not answered yet; question
     /// kind only). A request is only submitted once EVERY question has an
     /// answer (or the user clicks "submit/skip"), because `reply_question`
@@ -713,6 +765,7 @@ impl RequestFlow {
             poll_interval_ms: std::sync::atomic::AtomicU64::new(3000),
             sent_cards: Arc::new(Mutex::new(HashMap::new())),
             question_requests: Arc::new(Mutex::new(HashMap::new())),
+            question_dirs: Arc::new(Mutex::new(HashMap::new())),
             question_partial: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -858,19 +911,26 @@ impl RequestFlow {
         value: &serde_json::Value,
     ) -> Option<CardActionResult> {
         let session_id = value.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+        let request_id = value.get("request_id").and_then(|v| v.as_str());
+        let req_id = request_id?;
         let directory = value
             .get("directory")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         let directory = match directory {
             Some(d) => Some(d),
-            None => core.sessions.lock().await.directory_for_session(session_id),
+            None => {
+                let from_store = core.sessions.lock().await.directory_for_session(session_id);
+                if from_store.is_some() {
+                    from_store
+                } else {
+                    self.question_dirs.lock().await.get(req_id).cloned()
+                }
+            }
         };
         let directory = directory.as_deref();
 
         let reply = value.get("reply").and_then(|v| v.as_str()).unwrap_or("reject");
-        let request_id = value.get("request_id").and_then(|v| v.as_str());
-        let req_id = request_id?;
         // Inline interaction: the session (or its sub-task parent chain) has a
         // live streaming card, so the result is NOT returned as a replacement
         // card — the streaming card re-renders itself on the next poll.
@@ -1050,6 +1110,44 @@ fn record_answer(
     (count, slot.clone())
 }
 
+/// Multi-select variant of `record_answer`: each click toggles the label in the
+/// question's answer set (add if absent, remove if present). Toggling the last
+/// label off reverts the slot to `None` (the question is open again). Used only
+/// for questions with `multiple: true`, which never auto-finalize on a click.
+fn record_toggle_answer(
+    partial: &mut HashMap<String, Vec<Option<Vec<String>>>>,
+    req_id: &str,
+    n: usize,
+    index: usize,
+    answer: &str,
+) -> (usize, Vec<Option<Vec<String>>>) {
+    let slot = partial.entry(req_id.to_string()).or_insert_with(|| vec![None; n]);
+    if index < n {
+        let current = slot[index].get_or_insert_with(Vec::new);
+        if let Some(pos) = current.iter().position(|l| l == answer) {
+            current.remove(pos);
+        } else {
+            current.push(answer.to_string());
+        }
+        if current.is_empty() {
+            slot[index] = None;
+        }
+    }
+    let count = slot.iter().filter(|a| a.is_some()).count();
+    (count, slot.clone())
+}
+
+/// Toast after recording an answer. `remaining == 0` only happens when every
+/// slot holds a selection but the request is NOT auto-submitting — i.e. a
+/// multi-select question is still awaiting an explicit submit click.
+fn answer_recorded_toast(remaining: usize) -> String {
+    if remaining == 0 {
+        "已记录答案，请点击提交".to_string()
+    } else {
+        format!("已记录答案，还有 {} 题未答", remaining)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1098,5 +1196,34 @@ mod tests {
         record_answer(&mut partial, "q1", 1, 0, "a");
         let (count, _) = record_answer(&mut partial, "q2", 1, 0, "b");
         assert_eq!(count, 1); // q2 has its own slots
+    }
+
+    #[test]
+    fn record_toggle_answer_adds_then_removes_labels() {
+        let mut partial = HashMap::new();
+        // First toggle adds the label.
+        let (count, slot) = record_toggle_answer(&mut partial, "q1", 1, 0, "a");
+        assert_eq!(count, 1);
+        assert_eq!(slot, vec![Some(vec!["a".to_string()])]);
+        // Second toggle accumulates a second label.
+        let (count, slot) = record_toggle_answer(&mut partial, "q1", 1, 0, "b");
+        assert_eq!(count, 1);
+        assert_eq!(slot, vec![Some(vec!["a".to_string(), "b".to_string()])]);
+        // Toggling one off keeps the other.
+        let (count, slot) = record_toggle_answer(&mut partial, "q1", 1, 0, "a");
+        assert_eq!(count, 1);
+        assert_eq!(slot, vec![Some(vec!["b".to_string()])]);
+        // Toggling the last off reverts the slot to None (question open again).
+        let (count, slot) = record_toggle_answer(&mut partial, "q1", 1, 0, "b");
+        assert_eq!(count, 0);
+        assert_eq!(slot, vec![None]);
+    }
+
+    #[test]
+    fn record_toggle_answer_out_of_range_index_is_ignored() {
+        let mut partial = HashMap::new();
+        let (count, slot) = record_toggle_answer(&mut partial, "q1", 2, 99, "x");
+        assert_eq!(count, 0);
+        assert_eq!(slot, vec![None, None]);
     }
 }

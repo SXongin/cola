@@ -618,20 +618,25 @@ fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Value> {
                     "chat_id": parts[1],
                     "thread_id": parts[2],
                 })
-            } else if parts.len() != 5 || parts[0] != "submit" {
+            } else if parts[0] != "submit" || !(parts.len() == 4 || parts.len() == 5) {
                 // Form submit callbacks don't always deliver the button `value`;
                 // the routing payload is encoded in the button `name`
-                // ("submit|<req>|<ses>|<qi>|<dir>") — rebuild the value from it.
+                // ("submit|<req>|<ses>|<qi>[|<dir>]") — rebuild the value from it.
+                // The trailing directory is legacy (dropped so the name stays
+                // under Feishu's 100-char limit); the handler re-resolves it.
                 return None;
             } else {
-                serde_json::json!({
+                let mut val = serde_json::json!({
                     "action": "question",
                     "reply": "answer",
                     "request_id": parts[1],
                     "session_id": parts[2],
                     "question_index": parts[3].parse::<u64>().ok()?,
-                    "directory": parts[4],
-                })
+                });
+                if let Some(dir) = parts.get(4) {
+                    val["directory"] = serde_json::Value::String(dir.to_string());
+                }
+                val
             }
         }
     };
@@ -662,11 +667,18 @@ fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Value> {
             val["keyword"] = serde_json::Value::String(s.to_string());
         }
     }
-    // The card's own message id (`card.action.trigger` carries it on the action
-    // object). `/topic --adopt`'s card button needs it to `reply_in_thread` off
+    // The card's own message id. In the schema 2.0 callback it lives on
+    // `event.context.open_message_id`; older shapes carried it on the action
+    // object. `/topic --adopt`'s card button needs it to `reply_in_thread` off
     // the card and create the topic (ADR-0016); without it there is no message
     // inside the new topic to anchor fallback cards on.
-    if let Some(open_message_id) = a.get("open_message_id").and_then(|m| m.as_str()) {
+    let open_message_id = v
+        .get("event")
+        .and_then(|e| e.get("context"))
+        .and_then(|c| c.get("open_message_id"))
+        .and_then(|m| m.as_str())
+        .or_else(|| a.get("open_message_id").and_then(|m| m.as_str()));
+    if let Some(open_message_id) = open_message_id {
         val["open_message_id"] = serde_json::Value::String(open_message_id.to_string());
     }
     Some(val)
@@ -1595,9 +1607,36 @@ mod tests {
     }
 
     /// Form submit callbacks may omit `action.value` entirely — the routing
-    /// payload is then rebuilt from the button `name`.
+    /// payload is then rebuilt from the button `name`. The directory is no
+    /// longer part of the name (Feishu caps `name` at 100 chars), so the rebuilt
+    /// value carries no `directory`; the handler re-resolves it.
     #[test]
     fn form_submit_without_value_rebuilds_routing_from_name() {
+        let payload = r#"{
+            "schema": "2.0",
+            "event": {
+                "action": {
+                    "tag": "button",
+                    "name": "submit|que_1|ses_1|0",
+                    "form_value": {
+                        "custom_0": "自定义答案"
+                    }
+                }
+            }
+        }"#;
+        let value = extract_card_action_value(payload.as_bytes()).expect("value extracted");
+        assert_eq!(value["answer"], "自定义答案");
+        assert_eq!(value["question_index"], 0);
+        assert_eq!(value["request_id"], "que_1");
+        assert_eq!(value["session_id"], "ses_1");
+        assert!(value.get("directory").is_none(), "directory dropped from name");
+        assert_eq!(value["reply"], "answer");
+    }
+
+    /// Legacy cards still carry the directory as a 5th name segment; keep
+    /// parsing them so in-flight cards from before the change keep working.
+    #[test]
+    fn form_submit_without_value_accepts_legacy_directory_segment() {
         let payload = r#"{
             "schema": "2.0",
             "event": {
@@ -1612,11 +1651,8 @@ mod tests {
         }"#;
         let value = extract_card_action_value(payload.as_bytes()).expect("value extracted");
         assert_eq!(value["answer"], "自定义答案");
-        assert_eq!(value["question_index"], 0);
-        assert_eq!(value["request_id"], "que_1");
-        assert_eq!(value["session_id"], "ses_1");
         assert_eq!(value["directory"], "/tmp/proj");
-        assert_eq!(value["reply"], "answer");
+        assert_eq!(value["session_id"], "ses_1");
     }
 
     /// A plain button click keeps its value untouched (no option/form_value).
@@ -1777,11 +1813,36 @@ fn process_frame_routes_card_actions() {
 }
 
 #[test]
-fn card_action_carries_open_message_id() {
+fn card_action_carries_open_message_id_from_context() {
     // `/topic --adopt`'s card button (ADR-0016) anchors the new topic on the
-    // card's own message id; it must survive extraction.
+    // card's own message id; the schema 2.0 callback carries it on
+    // `event.context.open_message_id`.
     let payload = br#"{
             "header": { "event_type": "card.action.trigger", "event_id": "e_card" },
+            "event": {
+                "action": {
+                    "tag": "button",
+                    "value": { "action": "switch", "op": "topic_adopt", "chat_id": "oc_1", "thread_id": "oc_1", "session_id": "ses_abc" }
+                },
+                "context": { "open_message_id": "om_switch_card", "open_chat_id": "oc_1" }
+            }
+        }"#;
+    let frame = event_frame(payload);
+    match process_frame(&frame, &mut DedupeSet::new(10)) {
+        FrameAction::CardAction(v) => {
+            assert_eq!(v["op"], "topic_adopt");
+            assert_eq!(v["open_message_id"], "om_switch_card");
+        }
+        other => panic!("expected CardAction, got {:?}", std::mem::discriminant(&other)),
+    }
+}
+
+#[test]
+fn card_action_falls_back_to_open_message_id_on_action() {
+    // Older callback shapes put the message id on the action object; the
+    // extraction still threads it through.
+    let payload = br#"{
+            "header": { "event_type": "card.action.trigger", "event_id": "e_card2" },
             "event": {
                 "action": {
                     "tag": "button",
@@ -1792,10 +1853,7 @@ fn card_action_carries_open_message_id() {
         }"#;
     let frame = event_frame(payload);
     match process_frame(&frame, &mut DedupeSet::new(10)) {
-        FrameAction::CardAction(v) => {
-            assert_eq!(v["op"], "topic_adopt");
-            assert_eq!(v["open_message_id"], "om_switch_card");
-        }
+        FrameAction::CardAction(v) => assert_eq!(v["open_message_id"], "om_switch_card"),
         other => panic!("expected CardAction, got {:?}", std::mem::discriminant(&other)),
     }
 }

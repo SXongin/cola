@@ -245,10 +245,24 @@ impl SingletonLock {
 
 /// Terminate the running cola instance (SIGTERM, escalating to SIGKILL on unix;
 /// `taskkill /F` on Windows) and wait for it to die. Only ever kills a PID
-/// verified to be a cola process — a stale lock file may hold a PID that reuse
-/// has handed to an unrelated program, which must never be killed.
+/// verified to be a live cola process — a stale lock file may hold a PID that
+/// reuse has handed to an unrelated program, which must never be killed.
+///
+/// An owner that is already dead or a zombie is NOT an error: a `/restart`
+/// parent exits via `std::process::exit` (no Drop) right after spawning its
+/// replacement, so its PID can tip from "alive" (as the lock check saw it) to
+/// zombie by the time we get here. A zombie has an unreadable `/proc/exe` and an
+/// empty cmdline, so `is_cola_process` reports false — refusing here would kill
+/// every restart with nothing left running. Nothing is alive to kill; the
+/// caller's re-acquire reclaims the now-stale lock (a zombie counts as dead in
+/// `stale_lock_owner`). Only an owner that is STILL ALIVE yet not a cola process
+/// is the PID-reuse danger this guard exists to refuse.
 fn replace_instance(pid: i32) -> anyhow::Result<()> {
     if !is_cola_process(pid) {
+        if !pid_alive(pid) {
+            tracing::warn!("lock owner PID {} is dead; nothing to replace", pid);
+            return Ok(());
+        }
         anyhow::bail!(
             "lock owner PID {} is not a cola process; refusing to kill it \
              (stale PID reused by another program?)",
@@ -588,6 +602,33 @@ mod tests {
         );
         assert!(pid_alive(pid), "the non-cola process must be left alive");
         let _ = child.wait();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn replace_instance_accepts_zombie_owner() {
+        // The /restart incident: the old cola exits via `std::process::exit`
+        // (no Drop, so the lock file survives) right after spawning its
+        // replacement, lingering as a zombie until the launching shell reaps it.
+        // The replacement's lock check can see the owner as "alive" a moment
+        // before it tips into zombie; `replace_instance` must then treat the
+        // owner as stale (nothing alive to kill) instead of refusing with
+        // "not a cola process" — a zombie has no readable /proc/exe or cmdline.
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn zombie owner");
+        let pid = child.id() as i32;
+        // Let the child exit; we must NOT wait() yet, so it stays a zombie.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!pid_alive(pid), "owner should be a zombie");
+        assert!(
+            !is_cola_process(pid),
+            "a zombie must not look like a cola process"
+        );
+        replace_instance(pid).expect("a dead/zombie owner is stale and replaceable");
+        let _ = child.wait(); // reap
     }
 
     #[test]

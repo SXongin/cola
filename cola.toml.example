@@ -5,6 +5,13 @@
 # The ONLY required values are the Feishu credentials below. Everything else
 # is optional.
 
+[feishu]
+# Your Feishu custom app's credentials. Create one at
+# https://open.feishu.cn/app, enable the "im:message" / "im:message:send_as_bot"
+# scopes, and grant the bot the needed permissions.
+app_id = "cli_xxxxxxxxxxxx"
+app_secret = "your-app-secret"
+
 [opencode]
 # Preferred/fallback port for the OpenCode server. cola discovers a running
 # server on the default store and attaches to it automatically; this value is
@@ -23,13 +30,6 @@
 # the OpenCode server uses ITS default model — so on most setups you can just
 # delete this line.
 # model = "opencode/deepseek-v4-flash"
-
-[feishu]
-# Your Feishu custom app's credentials. Create one at
-# https://open.feishu.cn/app, enable the "im:message" / "im:message:send_as_bot"
-# scopes, and grant the bot the needed permissions.
-app_id = "cli_xxxxxxxxxxxx"
-app_secret = "your-app-secret"
 
 [bridge]
 # Path to the session mapping file (chat thread <-> OpenCode session).
