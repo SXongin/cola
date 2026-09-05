@@ -65,8 +65,9 @@ pub trait Platform: Send + Sync {
     async fn get_message(&self, message_id: &str) -> Result<client::FeishuMessage>;
 
     /// Download an image embedded in a message (`GET /im/v1/messages/{id}/resources/{key}?type=image`),
-    /// used to attach Image Attachments to a prompt. Requires `im:resource`;
-    /// callers degrade to a `[图片]` placeholder on error.
+    /// used to attach Image Attachments to a prompt. Requires the `im:message`
+    /// permission (already held); callers degrade to a `[图片]` placeholder on
+    /// error.
     async fn download_image(&self, message_id: &str, image_key: &str) -> Result<client::ImageAttachment>;
 }
 

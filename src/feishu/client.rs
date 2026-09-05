@@ -618,7 +618,8 @@ impl Client {
 
     /// Download an image embedded in a message (`GET /im/v1/messages/{id}/resources/{key}?type=image`),
     /// returning its bytes and the server-declared content type. Requires the
-    /// `im:resource` permission; callers degrade to a `[图片]` placeholder on error.
+    /// `im:message` permission (already held); callers degrade to a `[图片]`
+    /// placeholder on error.
     pub async fn download_image(
         &self,
         message_id: &str,

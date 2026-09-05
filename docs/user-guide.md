@@ -37,6 +37,60 @@ Also make sure an `opencode` binary is on `PATH` — cola discovers and spawns i
 The autostart launcher snapshots your `PATH` at `cola autostart enable` time, so
 install both **before** enabling autostart.
 
+## Feishu app setup
+
+cola talks to Feishu as a custom app (企业自建应用). Setup is one-time, in the
+[developer console](https://open.feishu.cn/app); the [README Quick
+start](../README.md#quick-start) has the condensed checklist — this section is the
+full map.
+
+### 1. Enable the bot capability
+
+The app must have the **机器人** capability (应用能力 → 机器人). Without it the app
+cannot be added to chats, receive messages, or send as a bot — and it is a hard
+precondition for the message and resource APIs.
+
+### 2. Grant scopes
+
+| Scope | Feishu permission | What cola uses it for | If missing |
+| --- | --- | --- | --- |
+| `im:message` | 获取与发送单聊、群组消息 | send/reply to and update cards; read a message by id (quote context); download message images | cola cannot reply or update cards — unusable |
+| `im:message:send_as_bot` | 以应用的身份发消息 | send and reply to messages as the bot | card sending fails |
+| `im:message.p2p_msg:readonly` | 读取用户发给机器人的单聊消息 | receive DMs | DMs never reach cola |
+| `im:message.group_at_msg:readonly` | 接收群聊中@机器人消息事件 | receive group messages that @ the bot | group messages never reach cola |
+| `im:chat:readonly` | 获取群组信息 | chat display names (`/attach` rejection card, `/switch` cards) | raw chat ids instead of names |
+| `contact:contact.base:readonly` | 获取通讯录基本信息 | authorizes the contact API call | user names unavailable |
+| `contact:user.base:readonly` | 获取用户基本信息 | returns the user's `name` field | completion notices lose the @name |
+
+Notes:
+
+- `im:chat` (获取与更新群组信息) is a superset of `im:chat:readonly` — cola only
+  reads chat info, so the read-only scope is the minimum.
+- The contact API needs two scopes: one to authorize the call
+  (`contact:contact.base:readonly`) and one to reveal the `name` field
+  (`contact:user.base:readonly`).
+- Reading a message by id and downloading its images both work with `im:message`
+  alone — no extra scope is needed for media.
+
+### 3. Event subscription
+
+- **事件与回调 → 回调配置**: choose **使用长连接接收事件** (long-connection mode).
+  cola connects as a WebSocket client when it starts, so **run cola before saving
+  this setting** — Feishu only accepts the mode while a long-connection client is
+  connected.
+- Subscribe to the `im.message.receive_v1` event (接收消息). Card-button callbacks
+  (`card.action.trigger`) arrive over the same connection automatically — there is
+  no webhook URL to configure.
+- Long-connection mode only works for 企业自建应用 (not store apps), and each app
+  allows up to 50 connections — cola holds one.
+
+### 4. Publish
+
+Scope grants and event subscriptions only take effect after you **publish a new
+version** (版本管理与发布). Self-built apps can publish for themselves without a
+store review. You do not need to re-publish on every cola update — only when you
+change the app's scopes or events.
+
 ## Configuration
 
 Lookup order: `cola --config <path>` (used verbatim) → `./cola.toml` → `~/.cola/cola.toml`.
@@ -211,9 +265,21 @@ Notes:
 
 ## FAQ / troubleshooting
 
-**The bot never sees my group messages.** Feishu only pushes group messages that
-@-mention the bot — that is a server-side app setting, not fixable in cola. The
-bot can always be DM'd.
+**The bot never sees my group messages.** Two things gate this. First, Feishu only
+pushes group messages that @-mention the bot — a server-side app setting, not
+fixable in cola. Second, the app needs the `im:message.group_at_msg:readonly`
+scope, a subscription to `im.message.receive_v1`, a **published** version, and the
+bot must be a member of the group (see [Feishu app setup](#feishu-app-setup)). The
+bot can always be DM'd (`im:message.p2p_msg:readonly`).
+
+**DMs reach the bot but group messages never do.** The app is missing
+`im:message.group_at_msg:readonly`, or the group message did not @ the bot. Add the
+scope and re-publish.
+
+**Images show as `[图片]` in the prompt.** cola downloads images with `im:message`
+(already in the scope set). Downloading fails when the bot is not a member of the
+chat holding the image, or the message is marked confidential — cola degrades to a
+placeholder rather than erroring.
 
 **`另一个 cola 实例（PID x）正在运行`** — another instance holds the lock. Take
 over with `cola --replace`, or send the old instance `/restart` from Feishu.
