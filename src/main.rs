@@ -151,12 +151,11 @@ enum AcquireOutcome {
     HeldByInstance { pid: i32 },
 }
 
-/// Whether a PID refers to a live process whose executable is named cola.
-/// Guards the takeover path: never kill a PID that reuse has handed to an
-/// unrelated program (the lock file may carry a stale PID). Uses the
-/// executable name first (registered by the OS, not spoofable via argv), with
-/// the command-line argv as a fallback.
-fn is_cola_process(pid: i32) -> bool {
+/// A snapshot of one process's identity via sysinfo: its executable path and
+/// its argv[0] (None if the PID is not visible). Shared by the two identity
+/// checks below so the refresh shape — the sysinfo call that must run before
+/// `exe()`/`cmd()` are populated — lives in exactly one place.
+fn process_identity(pid: i32) -> Option<(Option<std::path::PathBuf>, Option<String>)> {
     let mut system = sysinfo::System::new();
     system.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid as u32)]),
@@ -165,19 +164,26 @@ fn is_cola_process(pid: i32) -> bool {
             .with_exe(sysinfo::UpdateKind::Always)
             .with_cmd(sysinfo::UpdateKind::Always),
     );
-    let Some(proc_) = system.process(sysinfo::Pid::from_u32(pid as u32)) else {
+    let proc_ = system.process(sysinfo::Pid::from_u32(pid as u32))?;
+    Some((
+        proc_.exe().map(|p| p.to_path_buf()),
+        proc_.cmd().first().map(|s| s.to_string_lossy().into_owned()),
+    ))
+}
+
+/// Whether a PID refers to a live process whose executable is named cola.
+/// Guards the takeover path: never kill a PID that reuse has handed to an
+/// unrelated program (the lock file may carry a stale PID). Uses the
+/// executable name first (registered by the OS, not spoofable via argv), with
+/// the command-line argv as a fallback.
+fn is_cola_process(pid: i32) -> bool {
+    let Some((exe, argv0)) = process_identity(pid) else {
         return false;
     };
-    if let Some(exe) = proc_.exe()
-        && exe.to_string_lossy().contains("cola")
-    {
+    if exe.as_ref().is_some_and(|e| e.to_string_lossy().contains("cola")) {
         return true;
     }
-    proc_
-        .cmd()
-        .first()
-        .map(|a| a.to_string_lossy().contains("cola"))
-        .unwrap_or(false)
+    argv0.is_some_and(|a| a.contains("cola"))
 }
 
 /// Whether a PID refers to a live process. A zombie ('Z') is treated as DEAD:
@@ -194,6 +200,29 @@ fn pid_alive(pid: i32) -> bool {
     bridge::discovery::process_alive(pid)
 }
 
+/// Whether a lock owner is still capable of processing events: a live
+/// (non-zombie) process whose identity is still readable. A process whose
+/// cmdline/exe have vanished has had its memory map torn down by the kernel
+/// (`exit_mm` inside `do_exit`) but is not yet marked a zombie — it is
+/// mid-exit and dying, so it must not block a `/restart` (the replacement
+/// would see "alive but not a cola process" and refuse to replace it, leaving
+/// nothing running — the exit-window bug, ADR-0021). "Alive" for the
+/// singleton means "can still answer a permission or post an event", which a
+/// dying process cannot.
+fn owner_functionally_alive(pid: i32) -> bool {
+    pid_alive(pid) && identity_readable(pid)
+}
+
+/// Whether a process's identity (`/proc/<pid>/exe` or cmdline) is still
+/// readable. Unreadable means the kernel has already torn down the process's
+/// memory map: it is inside `do_exit`, alive per its status but unable to do
+/// anything further.
+fn identity_readable(pid: i32) -> bool {
+    process_identity(pid)
+        .map(|(exe, argv0)| exe.is_some() || argv0.is_some())
+        .unwrap_or(false)
+}
+
 impl SingletonLock {
     fn acquire() -> anyhow::Result<AcquireOutcome> {
         Self::acquire_at(lock_file_path())
@@ -201,10 +230,11 @@ impl SingletonLock {
 
     /// Try to take the singleton lock at `path`. A lock file whose PID is no
     /// longer a live cola is a stale leftover from a crashed/killed process and
-    /// is reclaimed instead of failing forever. A zombie counts as dead (see
-    /// `pid_alive`), which is also what lets a `/restart` child start while the
-    /// old process lingers as a zombie. A LIVE owner is reported so the caller
-    /// can decide whether to replace it.
+    /// is reclaimed instead of failing forever. An owner that is dead, a
+    /// zombie, or mid-`exit()` counts as stale (see [`owner_functionally_alive`]),
+    /// which is what lets a `/restart` child start while the old process
+    /// lingers as a zombie or exits. A LIVE owner that can still process
+    /// events is reported so the caller can decide whether to replace it.
     fn acquire_at(path: std::path::PathBuf) -> anyhow::Result<AcquireOutcome> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -228,12 +258,13 @@ impl SingletonLock {
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     let owner = std::fs::read_to_string(&path).unwrap_or_default();
                     match owner.trim().parse::<i32>() {
-                        // A live owner is a genuine conflict.
-                        Ok(pid) if pid_alive(pid) => {
+                        // A live owner that can still process events is a
+                        // genuine conflict.
+                        Ok(pid) if owner_functionally_alive(pid) => {
                             return Ok(AcquireOutcome::HeldByInstance { pid });
                         }
-                        // Owner died between the stale check and the open; loop
-                        // to reclaim it and retry.
+                        // Owner died, turned zombie, or is mid-exit between the
+                        // stale check and the open; loop to reclaim it and retry.
                         _ => {}
                     }
                 }
@@ -248,21 +279,22 @@ impl SingletonLock {
 /// verified to be a live cola process — a stale lock file may hold a PID that
 /// reuse has handed to an unrelated program, which must never be killed.
 ///
-/// An owner that is already dead or a zombie is NOT an error: a `/restart`
-/// parent exits via `std::process::exit` (no Drop) right after spawning its
-/// replacement, so its PID can tip from "alive" (as the lock check saw it) to
-/// zombie by the time we get here. A zombie has an unreadable `/proc/exe` and an
-/// empty cmdline, so `is_cola_process` reports false — refusing here would kill
-/// every restart with nothing left running. Nothing is alive to kill; the
-/// caller's re-acquire reclaims the now-stale lock (a zombie counts as dead in
-/// `stale_lock_owner`). Only an owner that is STILL ALIVE yet not a cola process
-/// is the PID-reuse danger this guard exists to refuse.
+/// An owner that is already dead, a zombie, or mid-`exit()` is NOT an error: a
+/// `/restart` parent exits via `std::process::exit` (no Drop) right after
+/// spawning its replacement, so its PID can tip from "alive" (as the lock check
+/// saw it) to mid-exit to zombie by the time we get here. Mid-exit a process
+/// has no readable `/proc/exe` or cmdline, so `is_cola_process` reports false
+/// and refusing here would kill every restart with nothing left running.
+/// Nothing is alive to kill; the caller's re-acquire reclaims the now-stale
+/// lock (mid-exit and zombie both count as stale in `stale_lock_owner`). Only
+/// an owner that is STILL ALIVE and capable of processing yet not a cola
+/// process is the PID-reuse danger this guard exists to refuse.
 fn replace_instance(pid: i32) -> anyhow::Result<()> {
+    if !owner_functionally_alive(pid) {
+        tracing::warn!("lock owner PID {} is dead or exiting; nothing to replace", pid);
+        return Ok(());
+    }
     if !is_cola_process(pid) {
-        if !pid_alive(pid) {
-            tracing::warn!("lock owner PID {} is dead; nothing to replace", pid);
-            return Ok(());
-        }
         anyhow::bail!(
             "lock owner PID {} is not a cola process; refusing to kill it \
              (stale PID reused by another program?)",
@@ -308,13 +340,20 @@ fn parse_confirm(line: &str) -> bool {
     matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
-/// Whether the PID recorded in a lock file is stale (dead or a zombie) and the
-/// lock can be reclaimed. `None` means "not reclaimable" — either the file
-/// can't be read, the PID can't be parsed, or the owner is genuinely alive.
+/// Whether the PID recorded in a lock file is stale and the lock can be
+/// reclaimed. `None` means "not reclaimable" — either the file can't be read,
+/// the PID can't be parsed, or the owner is genuinely alive and capable of
+/// processing events (see [`owner_functionally_alive`]). An owner that is
+/// dead, a zombie, OR mid-`exit()` (alive per its status but identity already
+/// torn down) is stale: in each case it can no longer process events.
 fn stale_lock_owner(path: &std::path::Path) -> Option<i32> {
     let owner = std::fs::read_to_string(path).ok()?;
     let pid = owner.trim().parse::<i32>().ok()?;
-    if pid_alive(pid) { None } else { Some(pid) }
+    if owner_functionally_alive(pid) {
+        None
+    } else {
+        Some(pid)
+    }
 }
 
 /// The PID of a live cola daemon holding the singleton lock, if any. Used by
@@ -505,6 +544,80 @@ mod tests {
         assert_eq!(state, Some('Z'), "child should be a zombie: {stat}");
         assert!(!pid_alive(pid), "a zombie must not be considered alive");
         let _ = child.wait(); // reap
+    }
+
+    /// The exit-window variant of the restart bug (ADR-0021): between the
+    /// kernel's `exit_mm()` (memory map torn down) and the task being marked a
+    /// zombie (`TASK_DEAD`), `/proc/<pid>/status` still reads non-zombie while
+    /// `/proc/<pid>/cmdline` and `/proc/<pid>/exe` are already gone. The old
+    /// code saw that as "alive but not a cola process", refused to replace it,
+    /// and the `/restart` child died with nothing left running. A lock owned by
+    /// such a process must be reclaimable. Linux-only: relies on `/proc` and
+    /// the kernel exit sequence.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn lock_owner_in_exit_window_is_reclaimable() {
+        let home = tempfile::tempdir().unwrap();
+        let lock = home.path().join("cola.lock");
+        let mut caught = false;
+        for _ in 0..200 {
+            // Child writes its own PID to the lock, then allocates a large
+            // buffer (via dd) so exit_mm() takes long enough to observe, then
+            // exits. Parent must NOT wait() until the loop finishes so the
+            // child can't be reaped mid-observation.
+            let mut child = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "echo $$ > '{}'; dd if=/dev/zero of=/dev/null bs=16M count=1",
+                    lock.display()
+                ))
+                .spawn()
+                .expect("spawn exit-window child");
+            let pid = child.id() as i32;
+            for _ in 0..100_000 {
+                if !pid_alive(pid) {
+                    break; // died (or zombie) before the window was observed
+                }
+                if !identity_readable(pid) {
+                    // Mid-exit: alive per status, identity already gone. The
+                    // lock must be reclaimable and actually acquirable — the
+                    // old code bailed here instead.
+                    assert_eq!(
+                        stale_lock_owner(&lock),
+                        Some(pid),
+                        "a lock owned by a mid-exit process must be reclaimable"
+                    );
+                    match SingletonLock::acquire_at(lock.clone()).unwrap() {
+                        AcquireOutcome::Acquired(_held) => {}
+                        AcquireOutcome::HeldByInstance { .. } => {
+                            panic!("a lock owned by a mid-exit process must be acquired")
+                        }
+                    }
+                    caught = true;
+                    break;
+                }
+            }
+            let _ = child.wait(); // reap
+            if caught {
+                break;
+            }
+        }
+        assert!(
+            caught,
+            "never observed the kernel exit-window state (flaky environment?)"
+        );
+    }
+
+    #[test]
+    fn identity_readable_for_live_and_missing() {
+        assert!(identity_readable(std::process::id() as i32));
+        assert!(!identity_readable(i32::MAX - 1));
+    }
+
+    #[test]
+    fn owner_functionally_alive_live_and_dead() {
+        assert!(owner_functionally_alive(std::process::id() as i32));
+        assert!(!owner_functionally_alive(i32::MAX - 1));
     }
 
     #[test]

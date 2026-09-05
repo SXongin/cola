@@ -307,7 +307,7 @@ pub fn command_help(name: &str) -> Option<String> {
             "/autoaccept [on|off]\nShow or switch auto-allowing permission requests for this session (no permission cards).\nNo arg: show current state. `/autoaccept on` / `/autoaccept off` switch it.\nExample: `/autoaccept`"
         }
         "restart" => {
-            "/restart\nRestart cola itself, keeping startup args and the log redirect. The new process takes over the singleton lock (passes --replace). cola announces in this chat when it's back."
+            "/restart\nRestart cola itself, keeping startup args and the log redirect. The new process takes over the singleton lock (passes --replace). Under a systemd unit cola exits and lets `Restart=on-failure` bring it back; elsewhere it re-execs. cola announces in this chat when it's back."
         }
         "restart-opencode" => {
             "/restart-opencode\nRestart the OpenCode server. cola only restarts a server IT started; a server launched by another tool is left alone and needs a manual restart."
@@ -876,6 +876,13 @@ pub(crate) async fn handle_command(
             // Remember which chat to announce the restart in.
             let notify = serde_json::json!({ "chat_id": thread_key.chat_id });
             let _ = std::fs::write(restart_notify_path(), notify.to_string());
+            // Under a systemd unit, do NOT spawn a child: `KillMode=control-group`
+            // would kill it when the unit stops. Exit with the supervisor-restart
+            // code and let `Restart=on-failure` bring the unit back up from the
+            // same ExecStart (ADR-0015, ADR-0021 — same as `/update`).
+            if let Some(code) = crate::update::supervisor_restart_code() {
+                std::process::exit(code);
+            }
             match restart_process() {
                 Ok(()) => std::process::exit(0),
                 Err(e) => {

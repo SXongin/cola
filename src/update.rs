@@ -15,11 +15,24 @@ use anyhow::Context;
 use semver::Version;
 use sha2::{Digest, Sha256};
 
-/// Exit code used to hand a systemd unit back to `Restart=on-failure` after the
-/// binary has been replaced. Under systemd, spawning a child is wrong: the
-/// unit's default `KillMode=control-group` kills the whole cgroup — including a
-/// spawned replacement — when the main process exits.
-pub const EXIT_UPDATE_RESTART: i32 = 3;
+/// Exit code used to hand a systemd unit back to `Restart=on-failure` after a
+/// restart (`/restart`) or an in-band update (`/update`). Under systemd,
+/// spawning a child is wrong: the unit's default `KillMode=control-group` kills
+/// the whole cgroup — including a spawned replacement — when the main process
+/// exits (ADR-0015, ADR-0021).
+pub const EXIT_SUPERVISOR_RESTART: i32 = 3;
+
+/// The exit code to use when this process is supervised by a systemd unit
+/// (`INVOCATION_ID` is set): exit with it and let `Restart=on-failure` bring
+/// cola back up from the same ExecStart. `None` when no supervisor owns this
+/// process — callers fall back to the spawn-and-exit re-exec.
+pub fn supervisor_restart_code() -> Option<i32> {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("INVOCATION_ID").is_some() {
+        return Some(EXIT_SUPERVISOR_RESTART);
+    }
+    None
+}
 
 /// The current version of the running binary (from Cargo.toml).
 pub fn current_version() -> Version {
@@ -268,23 +281,22 @@ pub fn install(new_binary: &Path, current_exe: &Path) -> anyhow::Result<()> {
 
 /// Restart cola after a successful in-band install (never returns).
 ///
-/// Under a systemd unit (`INVOCATION_ID` is set) cola exits with
-/// `EXIT_UPDATE_RESTART` and lets the unit's `Restart=on-failure` bring up the
-/// new binary from the same ExecStart path. Everywhere else it re-execs via the
-/// existing `restart_process()` (spawn with the original args + `--replace`,
+/// Under a systemd unit (`INVOCATION_ID` is set) cola exits with the
+/// supervisor-restart code and lets the unit's `Restart=on-failure` bring up
+/// the new binary from the same ExecStart path. Everywhere else it re-execs via
+/// the existing `restart_process()` (spawn with the original args + `--replace`,
 /// then exit) — see ADR-0015. Only the in-band `/update` path calls this; the
 /// `cola update` CLI replaces the binary and restarts via its supervisor (or
 /// tells the operator — see [`restart_cli`]).
 pub fn restart() -> ! {
-    #[cfg(target_os = "linux")]
-    if std::env::var_os("INVOCATION_ID").is_some() {
-        std::process::exit(EXIT_UPDATE_RESTART);
+    if let Some(code) = supervisor_restart_code() {
+        std::process::exit(code);
     }
     match crate::bridge::command::restart_process() {
         Ok(()) => std::process::exit(0),
         Err(e) => {
             eprintln!("cola update: restart spawn failed: {e}");
-            std::process::exit(EXIT_UPDATE_RESTART);
+            std::process::exit(EXIT_SUPERVISOR_RESTART);
         }
     }
 }
