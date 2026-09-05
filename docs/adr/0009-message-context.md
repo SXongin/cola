@@ -21,9 +21,10 @@ non-text messages leaked raw JSON (`{"image_key":"..."}`) into the prompt.
   model.
 - **Placeholders**: non-text, non-card messages become `[图片]`/`[视频]`/`[语音]`/
   `[文件]`/`[表情]`/`[其他消息]` instead of leaking raw content JSON.
-- **New Feishu permissions** the bot must be granted: `im:message` (read a
-  message by id) and `im:resource` (download media). Missing permission
-  degrades the corresponding feature.
+- **Feishu permissions**: no new scopes beyond the message ones cola already
+  holds — reading a message by id and downloading its media both work with
+  `im:message` alone (per Feishu's docs for 获取消息中的资源文件). Missing
+  permission degrades the corresponding feature.
 
 ## Alternatives considered
 
