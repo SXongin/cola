@@ -24,12 +24,27 @@ starts and manages its own server, but the binary must be runnable.
 
 ### 2. Create a Feishu app
 
-1. Create a custom app at <https://open.feishu.cn/app>.
-2. Grant these scopes and **publish** the version so the bot is usable:
-   - `im:message`, `im:message:read`, `im:message:send_as_bot`
-   - `im:chat`
-   - `contact:user.base:readonly`
-3. Add the bot to a chat (or DM it) so it can receive messages.
+One-time setup at <https://open.feishu.cn/app> (create a custom app):
+
+1. Enable the **bot capability** (应用能力 → 机器人) — required before the app can
+   join chats or send anything.
+2. Grant these scopes (权限管理):
+   - `im:message`, `im:message:send_as_bot` — send, reply to and update cards,
+     read message content and download message images
+   - `im:message.p2p_msg:readonly` — receive DMs
+   - `im:message.group_at_msg:readonly` — receive group messages that @ the bot
+   - `im:chat:readonly` — read chat names
+   - `contact:contact.base:readonly`, `contact:user.base:readonly` — read user names
+3. Configure event subscription (事件与回调): use **long-connection mode** and
+   subscribe to the `im.message.receive_v1` event. Card-button callbacks
+   (`card.action.trigger`) arrive over the same connection automatically — no
+   webhook URL needed.
+4. **Publish** the version so the configuration takes effect and the bot is usable.
+5. Add the bot to a chat (or DM it) so it can receive messages.
+
+Missing scopes degrade features instead of crashing cola. The [user
+guide](docs/user-guide.md#feishu-app-setup) maps every scope to what it unlocks
+and what breaks without it.
 
 ### 3. Configure
 
