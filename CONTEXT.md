@@ -99,6 +99,14 @@ _Avoid_: Tail, footer bar, status line
 A git working tree that differs from HEAD — including untracked files — as measured by `git status --porcelain`. Shown as ⚠ on the Turn Footer. Captured at turn start, so it reflects the state the AI operated on, not the changes the AI itself made.
 _Avoid_: Uncommitted, modified
 
+**Singleton Lock**:
+The guarantee that at most one cola instance processes platform events at a time. A `/restart` hands it to its replacement before the old instance exits; a replacement may take it over from an owner that is no longer **Functionally Alive** — dead, a zombie, or mid-`exit()`.
+_Avoid_: pid file, lock file
+
+**Functionally Alive**:
+A cola instance that can still process events: running with its identity still readable. A process whose memory map the kernel has already torn down (mid-`exit()`) is NOT Functionally Alive even though the OS reports a live status — a `/restart` replacement reclaims its lock instead of waiting for it.
+_Avoid_: alive, running, process alive (all ambiguous — they include the mid-`exit()` state)
+
 ## Relationships
 
 - A **Bot** contains one **Platform** and one or more **Backend** adapters

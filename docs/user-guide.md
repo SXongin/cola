@@ -149,7 +149,13 @@ lock lives at `~/.cola/cola.lock`.
 - Starting interactively (a terminal): cola asks
   `旧实例 PID x 在运行，是否替换它并接管？[y/N]`.
 - `/restart` re-execs cola itself with `--replace` (keeping its startup args and
-  log redirect), so the new process always takes over the lock.
+  log redirect), so the new process always takes over the lock. The takeover is
+  robust to the old instance mid-`exit()`: an owner that is no longer
+  functionally alive (dead, a zombie, or tearing down) is reclaimed instead of
+  blocking the restart.
+- Under a systemd unit, `/restart` (like `/update`) does NOT spawn a child — it
+  exits with a restart code and lets the unit's `Restart=on-failure` bring cola
+  back up from the same ExecStart.
 
 ## Self-update
 
