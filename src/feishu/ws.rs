@@ -608,15 +608,16 @@ fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Value> {
         None => {
             let name = a.get("name").and_then(|n| n.as_str())?;
             let parts: Vec<&str> = name.split('|').collect();
-            if parts.len() == 3 && parts[0] == "switchsearch" {
+            if parts.len() >= 3 && parts[0] == "switchsearch" {
                 // `/switch` card search form: the button carries the routing
-                // ("switchsearch|<chat>|<thread>"), the typed keyword arrives
-                // as `form_value.search` below.
+                // ("switchsearch|<chat>|<thread>|<scope>"), the typed keyword
+                // arrives as `form_value.search` below.
                 serde_json::json!({
                     "action": "switch",
                     "op": "search",
                     "chat_id": parts[1],
                     "thread_id": parts[2],
+                    "scope": parts.get(3).copied().unwrap_or(""),
                 })
             } else if parts[0] != "submit" || !(parts.len() == 4 || parts.len() == 5) {
                 // Form submit callbacks don't always deliver the button `value`;

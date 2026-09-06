@@ -4759,7 +4759,8 @@ pub(crate) mod integration_tests {
             list_session("ses_beta02", "本地会话", "/work/cola", 300),
         ];
         let (app, platform) = build_app(cfg, backend).await;
-        // Our own lobby session, so /list marks it as active/本会话.
+        // Our own lobby session, so /list marks it active (ADR-0022: only the
+        // active session is marked; the 本会话 ownership marker is gone).
         {
             let mut store = app.sessions.lock().await;
             store.set_active(crate::config::SessionEntry {
@@ -4802,7 +4803,8 @@ pub(crate) mod integration_tests {
         let pos_ext = text.find("外部会话").unwrap();
         let pos_local = text.find("本地会话").unwrap();
         assert!(pos_local < pos_ext, "own (newer) session sorts first: {text}");
-        assert!(text.contains("(active)") || text.contains("本会话"));
+        assert!(text.contains("(active)"), "active session marked: {text}");
+        assert!(!text.contains("本会话"), "ownership marker dropped: {text}");
     }
 
     #[tokio::test]
@@ -5310,6 +5312,159 @@ pub(crate) mod integration_tests {
         assert!(text.contains("接管"), "adopt button: {text}");
         assert!(text.contains("＋ 新建会话"), "new button: {text}");
         assert!(text.contains("switch_search"), "search form: {text}");
+    }
+
+    /// `/switch` (no args) defaults to the current directory (ADR-0022): with
+    /// an active session in /work/cola, the card shows only that directory's
+    /// sessions, a header naming the directory, and a 全部 toggle to widen.
+    #[tokio::test]
+    async fn switch_card_defaults_to_current_directory_scope() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![
+            list_session("ses_alpha01", "重写登录", "/work/auth", 100),
+            list_session("ses_beta02", "修 bug", "/work/cola", 300),
+        ];
+        let (app, platform) = build_app(cfg, backend).await;
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+                session_id: "ses_beta02".into(),
+                directory: "/work/cola".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+                variant: None,
+            });
+        }
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Switch(SwitchAction::Card),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_switch_card",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let calls = platform.calls.lock().await.clone();
+        let card = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyCard { card, .. } => Some(card.clone()),
+                _ => None,
+            })
+            .next()
+            .expect("a switch card should be sent");
+        let text = card.to_string();
+        assert!(text.contains("cola 的会话"), "header names the directory: {text}");
+        assert!(text.contains("修 bug"), "own-directory session shown: {text}");
+        assert!(
+            !text.contains("重写登录"),
+            "other-directory session hidden: {text}"
+        );
+        assert!(text.contains("全部"), "scope-widen toggle present: {text}");
+        assert!(
+            text.contains("\"scope\":\"dir\""),
+            "search carries dir scope: {text}"
+        );
+    }
+
+    /// The 全部 toggle widens the switch card from the current directory to the
+    /// whole store, and the card then offers 本目录 to scope back down.
+    #[tokio::test]
+    async fn switch_card_scope_toggle_shows_whole_store() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![
+            list_session("ses_alpha01", "重写登录", "/work/auth", 100),
+            list_session("ses_beta02", "修 bug", "/work/cola", 300),
+        ];
+        let (app, _platform) = build_app(cfg, backend).await;
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+                session_id: "ses_beta02".into(),
+                directory: "/work/cola".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+                variant: None,
+            });
+        }
+
+        let value = serde_json::json!({
+            "action": "switch",
+            "op": "scope",
+            "scope": "all",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+        });
+        let result = app
+            .handle_card_action(value)
+            .await
+            .expect("scope toggle should return a card");
+        let card = result.card.expect("toggle rebuilds the card");
+        let text = card.to_string();
+        assert!(text.contains("最近会话"), "all-scope header: {text}");
+        assert!(text.contains("修 bug"), "own-directory session: {text}");
+        assert!(
+            text.contains("重写登录"),
+            "other-directory session now visible: {text}"
+        );
+        assert!(text.contains("本目录"), "scope-back toggle present: {text}");
+    }
+
+    /// Without an active session the switch card has no directory to scope to,
+    /// so it falls back to the whole store and omits the toggle.
+    #[tokio::test]
+    async fn switch_card_falls_back_to_global_without_active_session() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![
+            list_session("ses_alpha01", "重写登录", "/work/auth", 100),
+            list_session("ses_beta02", "修 bug", "/work/cola", 300),
+        ];
+        let (app, platform) = build_app(cfg, backend).await;
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Switch(SwitchAction::Card),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_switch_card",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let calls = platform.calls.lock().await.clone();
+        let card = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyCard { card, .. } => Some(card.clone()),
+                _ => None,
+            })
+            .next()
+            .expect("a switch card should be sent");
+        let text = card.to_string();
+        assert!(text.contains("最近会话"), "global fallback header: {text}");
+        assert!(text.contains("重写登录"), "all sessions shown: {text}");
+        assert!(text.contains("修 bug"), "all sessions shown: {text}");
+        assert!(
+            !text.contains("本目录"),
+            "no scope-back toggle without a directory: {text}"
+        );
     }
 
     /// A `/switch` card "adopt" action maps the session into the thread and

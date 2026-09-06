@@ -1006,6 +1006,7 @@ fn switch_card_row(
     btn_text: &str,
     thread_key: &crate::config::ThreadKey,
     session_id: &str,
+    scope: crate::bridge::command::SwitchScope,
 ) -> Vec<serde_json::Value> {
     let btn_column = |op: &str, content: &str| {
         json!({
@@ -1023,6 +1024,7 @@ fn switch_card_row(
                         "chat_id": thread_key.chat_id,
                         "thread_id": thread_key.thread_id,
                         "session_id": session_id,
+                        "scope": scope.as_str(),
                     },
                 }
             ],
@@ -1415,6 +1417,8 @@ pub fn build_switch_card(
     thread_key: &crate::config::ThreadKey,
     sessions: &[crate::opencode::client::SessionListInfo],
     keyword: &str,
+    scope: crate::bridge::command::SwitchScope,
+    current_dir: Option<&str>,
     active_id: Option<&str>,
     mapped_ids: &[String],
 ) -> serde_json::Value {
@@ -1440,37 +1444,85 @@ pub fn build_switch_card(
                 "text": { "tag": "plain_text", "content": "搜索" },
                 "type": "primary",
                 "form_action_type": "submit",
-                "name": format!("switchsearch|{}|{}", thread_key.chat_id, thread_key.thread_id),
+                "name": format!(
+                    "switchsearch|{}|{}|{}",
+                    thread_key.chat_id,
+                    thread_key.thread_id,
+                    scope.as_str()
+                ),
                 "value": {
                     "action": "switch",
                     "op": "search",
                     "chat_id": thread_key.chat_id,
                     "thread_id": thread_key.thread_id,
+                    "scope": scope.as_str(),
                 },
             },
         ],
     }));
 
+    // The scope toggle: in `Directory` view show 全部, in `All` view show
+    // 本目录 (ADR-0022). `All` from a fresh conversation has no directory, so
+    // the 本目录 button is hidden there. The keyword rides along so a scoped
+    // search survives the toggle.
+    let toggle_btn = match scope {
+        crate::bridge::command::SwitchScope::Directory => json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": "全部" },
+            "type": "default",
+            "value": {
+                "action": "switch",
+                "op": "scope",
+                "scope": "all",
+                "keyword": keyword,
+                "chat_id": thread_key.chat_id,
+                "thread_id": thread_key.thread_id,
+            },
+        }),
+        crate::bridge::command::SwitchScope::All => json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": "本目录" },
+            "type": "default",
+            "value": {
+                "action": "switch",
+                "op": "scope",
+                "scope": "dir",
+                "keyword": keyword,
+                "chat_id": thread_key.chat_id,
+                "thread_id": thread_key.thread_id,
+            },
+        }),
+    };
+    if scope == crate::bridge::command::SwitchScope::Directory || current_dir.is_some() {
+        elements.push(toggle_btn);
+    }
+
     if sessions.is_empty() {
         elements.push(json!({ "tag": "markdown", "content": "_(无匹配会话)_" }));
     } else {
         let header = if keyword.is_empty() {
-            "**最近会话**"
+            match scope {
+                crate::bridge::command::SwitchScope::Directory => {
+                    format!(
+                        "**{} 的会话**",
+                        current_dir
+                            .map(crate::bridge::command::dir_basename)
+                            .unwrap_or_default()
+                    )
+                }
+                crate::bridge::command::SwitchScope::All => "**最近会话**".to_string(),
+            }
         } else {
-            &format!("**匹配 `{keyword}` 的会话**")
+            format!("**匹配 `{keyword}` 的会话**")
         };
         elements.push(json!({ "tag": "markdown", "content": header }));
         for s in sessions.iter().take(MAX_SWITCH_ROWS) {
             let label = crate::bridge::command::title_or_id_tail(s);
+            // ADR-0022: only the active session is marked; the 本会话 ownership
+            // marker on mapped-but-not-active rows is dropped.
             let text = if active_id == Some(s.id.as_str()) {
                 format!(
                     "{label} · {} · {}\n_(active)_",
-                    s.directory,
-                    crate::bridge::command::id_tail(&s.id)
-                )
-            } else if mapped_ids.contains(&s.id) {
-                format!(
-                    "{label} · {} · {}\n_(本会话)_",
                     s.directory,
                     crate::bridge::command::id_tail(&s.id)
                 )
@@ -1488,7 +1540,7 @@ pub fn build_switch_card(
             } else {
                 "接管"
             };
-            elements.extend(switch_card_row(&text, btn, thread_key, &s.id));
+            elements.extend(switch_card_row(&text, btn, thread_key, &s.id, scope));
         }
     }
 
@@ -2643,7 +2695,15 @@ mod tests {
             model: None,
             time: None,
         }];
-        let card = build_switch_card(&key, &sessions, "", None, &[]);
+        let card = build_switch_card(
+            &key,
+            &sessions,
+            "",
+            crate::bridge::command::SwitchScope::Directory,
+            Some("/work/auth"),
+            None,
+            &[],
+        );
         let text = card.to_string();
         assert!(
             !text.contains("\"tag\":\"action\"") && !text.contains("\"tag\": \"action\""),
