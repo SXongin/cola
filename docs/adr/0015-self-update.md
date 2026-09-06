@@ -28,13 +28,15 @@ in-band `cola update` / `/update` that reuses the existing restart machinery.
   actually up; a dead bot gets a plain "start cola" note.
 - **Restart**: reuse the existing re-exec (`restart_process()` + `--replace` +
   singleton takeover + `restart-notify.json`) on every platform except one:
-  under a systemd unit (detected via `INVOCATION_ID`) cola does NOT spawn a
-  child — systemd's default `KillMode=control-group` would kill a spawned
-  child when the unit stops, so cola instead exits with a non-zero code and lets
-  the unit's `Restart=on-failure` bring up the new binary. macOS (launchd
-  `KeepAlive`) and Windows (no supervisor) keep the existing spawn-and-exit
-  behavior; the singleton lock resolves any race with launchd's KeepAlive
-  restart.
+  when a systemd unit owns the cola process itself (detected via
+  `INVOCATION_ID` + `SYSTEMD_EXEC_PID` == cola's own PID — see ADR-0021, the
+  detection refined after `INVOCATION_ID` alone leaked into unit-owned shells)
+  cola does NOT spawn a child — systemd's default `KillMode=control-group`
+  would kill a spawned child when the unit stops, so cola instead exits with a
+  non-zero code and lets the unit's `Restart=on-failure` bring up the new
+  binary. macOS (launchd `KeepAlive`) and Windows (no supervisor) keep the
+  existing spawn-and-exit behavior; the singleton lock resolves any race with
+  launchd's KeepAlive restart.
 - **No crates.io for now**: the `cola` crate name is taken on crates.io (a text
   CRDT library). Publishing is deferred until a name is chosen; self-update
   does not depend on it. `cargo-binstall`/`cargo install` remain future
