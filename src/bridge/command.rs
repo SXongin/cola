@@ -648,7 +648,7 @@ pub(crate) async fn handle_command(
             // Reuse the `/switch` session card, whose per-row button now also
             // offers "建话题接管" (ADR-0016). The card action handler creates
             // the topic via the card's own `open_message_id`.
-            send_switch_card(core, &thread_key, "", message_id).await?;
+            send_switch_card(core, &thread_key, "", SwitchScope::Directory, message_id).await?;
         }
         Command::Name(name) => {
             // `/name` PATCHes the server title (ADR-0007): the change is
@@ -723,7 +723,10 @@ pub(crate) async fn handle_command(
                 core.feishu.reply_text(message_id, "Compacting...").await?;
             } else {
                 core.feishu
-                    .reply_text(message_id, "当前对话还没有会话，无需压缩。")
+                    .reply_text(
+                        message_id,
+                        &format!("{}还没有会话，无需压缩。", feishu_side_label(&thread_key)),
+                    )
                     .await?;
             }
         }
@@ -744,7 +747,13 @@ pub(crate) async fn handle_command(
             };
             let Some(mut entry) = entry else {
                 core.feishu
-                    .reply_text(message_id, "⚠️ 当前对话还没有会话，先用 `/new` 或 `/dir` 创建。")
+                    .reply_text(
+                        message_id,
+                        &format!(
+                            "⚠️ {}还没有会话，先用 `/new` 或 `/dir` 创建。",
+                            feishu_side_label(&thread_key)
+                        ),
+                    )
                     .await?;
                 return Ok(());
             };
@@ -782,7 +791,13 @@ pub(crate) async fn handle_command(
             };
             let Some(mut entry) = core.sessions.lock().await.get_active(&thread_key).cloned() else {
                 core.feishu
-                    .reply_text(message_id, "⚠️ 当前对话还没有会话，先用 `/new` 或 `/dir` 创建。")
+                    .reply_text(
+                        message_id,
+                        &format!(
+                            "⚠️ {}还没有会话，先用 `/new` 或 `/dir` 创建。",
+                            feishu_side_label(&thread_key)
+                        ),
+                    )
                     .await?;
                 return Ok(());
             };
@@ -815,7 +830,13 @@ pub(crate) async fn handle_command(
             // `reset` clear the override (the server's default for the model).
             let Some(mut entry) = core.sessions.lock().await.get_active(&thread_key).cloned() else {
                 core.feishu
-                    .reply_text(message_id, "⚠️ 当前对话还没有会话，先用 `/new` 或 `/dir` 创建。")
+                    .reply_text(
+                        message_id,
+                        &format!(
+                            "⚠️ {}还没有会话，先用 `/new` 或 `/dir` 创建。",
+                            feishu_side_label(&thread_key)
+                        ),
+                    )
                     .await?;
                 return Ok(());
             };
@@ -966,7 +987,7 @@ async fn handle_switch_action(
 ) -> crate::error::Result<()> {
     match action {
         SwitchAction::Card => {
-            send_switch_card(core, thread_key, "", message_id).await?;
+            send_switch_card(core, thread_key, "", SwitchScope::Directory, message_id).await?;
             Ok(())
         }
         SwitchAction::Match(keyword) => handle_switch(core, thread_key, &keyword, message_id, kind).await,
@@ -984,7 +1005,10 @@ async fn handle_switch_action(
                 core.feishu
                     .reply_text(
                         message_id,
-                        "已解除本会话的映射（服务器会话仍保留，可用 `/switch list` 重新找到）。",
+                        &format!(
+                            "已解除{}的映射（服务器会话仍保留，可用 `/switch list` 重新找到）。",
+                            feishu_side_label(thread_key)
+                        ),
                     )
                     .await?;
             }
@@ -996,17 +1020,81 @@ async fn handle_switch_action(
     }
 }
 
+/// The `/switch` card's list scope (ADR-0022). `Directory` filters the list to
+/// the active session's directory (the card's default view); `All` shows the
+/// whole shared store. The scope round-trips through the card's button values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwitchScope {
+    Directory,
+    All,
+}
+
+impl SwitchScope {
+    /// The payload string (`"dir"` / `"all"`) carried on card buttons.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SwitchScope::Directory => "dir",
+            SwitchScope::All => "all",
+        }
+    }
+
+    /// Parse a payload string; anything other than `"dir"` reads as `All`.
+    pub fn parse(s: &str) -> SwitchScope {
+        if s == "dir" {
+            SwitchScope::Directory
+        } else {
+            SwitchScope::All
+        }
+    }
+}
+
+/// The Feishu-side label for the current conversation (ADR-0022): a topic is a
+/// 本话题, everything else is a 本聊天. Used where cola must name the Feishu
+/// side without overloading 会话 (which always means the OpenCode session).
+pub(crate) fn feishu_side_label(thread_key: &ThreadKey) -> &'static str {
+    if thread_key.thread_id.is_empty() {
+        "本聊天"
+    } else {
+        "本话题"
+    }
+}
+
 /// Fetch + shape the data the `/switch` card renders: the session list
 /// (children and archived excluded, filtered by `keyword`, sorted by last
-/// activity) plus the thread's active + mapped session ids. Shared by the text
-/// send path (`send_switch_card`) and the card ack refresh
-/// (`App::build_switch_card_for`) so both render from one source of truth.
+/// activity) plus the thread's active + mapped session ids. The list is scoped
+/// by `scope` (ADR-0022): `Directory` filters to the active session's
+/// directory, falling back to the whole store when the thread has no session;
+/// `All` shows everything. Returns the effective scope (the fallback may
+/// downgrade `Directory` to `All`) and the current directory, so the card can
+/// render the right header and toggle. Shared by the text send path
+/// (`send_switch_card`) and the card ack refresh (`App::build_switch_card_for`)
+/// so both render from one source of truth.
 pub(crate) async fn switch_card_data(
     core: &Arc<SharedCore>,
     thread_key: &ThreadKey,
     keyword: &str,
-) -> (Vec<crate::opencode::SessionListInfo>, Option<String>, Vec<String>) {
+    scope: SwitchScope,
+) -> (
+    Vec<crate::opencode::SessionListInfo>,
+    Option<String>,
+    Vec<String>,
+    SwitchScope,
+    Option<String>,
+) {
     let sessions = core.cached_session_list().await.unwrap_or_default();
+    let current_dir = core
+        .sessions
+        .lock()
+        .await
+        .get_active(thread_key)
+        .map(|e| e.directory.clone());
+    // Directory scope only holds when there IS a current directory; a fresh
+    // conversation (no active session) falls back to the whole store.
+    let scope = if scope == SwitchScope::Directory && current_dir.is_some() {
+        SwitchScope::Directory
+    } else {
+        SwitchScope::All
+    };
     let lower = keyword.to_lowercase();
     let mut shown: Vec<crate::opencode::SessionListInfo> = sessions
         .into_iter()
@@ -1018,6 +1106,7 @@ pub(crate) async fn switch_card_data(
                 } else {
                     matches_keyword(s, &lower)
                 }
+                && (scope != SwitchScope::Directory || current_dir.as_deref() == Some(s.directory.as_str()))
         })
         .collect();
     shown.sort_by(|a, b| {
@@ -1035,23 +1124,27 @@ pub(crate) async fn switch_card_data(
             .collect();
         (active, mapped)
     };
-    (shown, active_id, mapped_ids)
+    (shown, active_id, mapped_ids, scope, current_dir)
 }
 
-/// Build and send the interactive `/switch` session card (ADR-0012, issue 04).
-/// Renders the filtered session list (via `switch_card_data`) and replies with
-/// the card.
+/// Build and send the interactive `/switch` session card (ADR-0012, issue 04,
+/// ADR-0022). Renders the filtered session list (via `switch_card_data`) and
+/// replies with the card.
 async fn send_switch_card(
     core: &Arc<SharedCore>,
     thread_key: &ThreadKey,
     keyword: &str,
+    scope: SwitchScope,
     message_id: &str,
 ) -> crate::error::Result<()> {
-    let (shown, active_id, mapped_ids) = switch_card_data(core, thread_key, keyword).await;
+    let (shown, active_id, mapped_ids, scope, current_dir) =
+        switch_card_data(core, thread_key, keyword, scope).await;
     let card = crate::feishu::card::build_switch_card(
         thread_key,
         &shown,
         keyword,
+        scope,
+        current_dir.as_deref(),
         active_id.as_deref(),
         &mapped_ids,
     );
@@ -1149,7 +1242,10 @@ pub(crate) async fn think_card(
     let Some(entry) = core.sessions.lock().await.get_active(thread_key).cloned() else {
         return (
             None,
-            Some("当前对话还没有会话，先用 `/new` 或 `/dir` 创建。".to_string()),
+            Some(format!(
+                "{}还没有会话，先用 `/new` 或 `/dir` 创建。",
+                feishu_side_label(thread_key)
+            )),
         );
     };
     let Some((provider, model)) = core.effective_model(&entry.session_id).await else {
@@ -1271,7 +1367,13 @@ async fn handle_switch(
         return Ok(());
     }
     if thread_hits.len() > 1 {
-        let list = candidates_list("本会话匹配到多个，请用 `/switch <完整ID>` 指定：", &thread_hits);
+        let list = candidates_list(
+            &format!(
+                "{}匹配到多个，请用 `/switch <完整ID>` 指定：",
+                feishu_side_label(thread_key)
+            ),
+            &thread_hits,
+        );
         core.feishu.reply_text(message_id, &list).await?;
         return Ok(());
     }
@@ -1292,8 +1394,11 @@ async fn handle_switch(
         return Ok(());
     }
     // No match: send the interactive card pre-filtered by the keyword, so the
-    // user sees the empty result AND can adjust the search / start fresh.
-    send_switch_card(core, thread_key, keyword, message_id).await?;
+    // user sees the empty result AND can adjust the search / start fresh. The
+    // text `/switch <kw>` searches the whole store (ADR-0022), so the card
+    // opens in the `All` scope — a directory-scoped card would hide the
+    // candidates the user was just shown.
+    send_switch_card(core, thread_key, keyword, SwitchScope::All, message_id).await?;
     Ok(())
 }
 
@@ -1336,22 +1441,17 @@ async fn handle_list(
         return Ok(());
     }
 
-    let (active_id, mapped_ids) = {
+    let active_id = {
         let store = core.sessions.lock().await;
-        let active = store.get_active(thread_key).map(|e| e.session_id.clone());
-        let mapped: Vec<String> = store
-            .list_thread(thread_key)
-            .into_iter()
-            .map(|e| e.session_id.clone())
-            .collect();
-        (active, mapped)
+        store.get_active(thread_key).map(|e| e.session_id.clone())
     };
     let mut list = String::from("**Recent sessions:**\n");
     for s in &shown {
+        // ADR-0022: only the active session is marked; the confusing
+        // 「本会话」 ownership marker on mapped-but-not-active rows is dropped
+        // (the switch card carries the 切换/接管 distinction instead).
         let mark = if active_id.as_deref() == Some(&s.id) {
             " (active)"
-        } else if mapped_ids.contains(&s.id) {
-            " (本会话)"
         } else {
             ""
         };
@@ -1727,6 +1827,16 @@ async fn adopt_session(
 /// The last 7 characters of a session id (display suffix).
 pub(crate) fn id_tail(id: &str) -> String {
     id.strip_prefix("ses_").unwrap_or(id).chars().take(7).collect()
+}
+
+/// The basename of a working directory, for display (e.g. "cola" for
+/// "/root/workspace/dev/cola").
+pub(crate) fn dir_basename(dir: &str) -> String {
+    std::path::Path::new(dir)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| dir.to_string())
 }
 
 /// Normalize a user-supplied directory for `/dir` / `/topic` into an absolute

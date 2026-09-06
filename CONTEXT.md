@@ -39,16 +39,26 @@ _Avoid_: On-demand start, deferred start
 **Session**:
 A single conversation thread with an AI backend, identified by the server's session id and `title` (the server is the single source of truth for identity, ADR-0007). A session has a directory (project) and an optional agent selection. One session maps to at most one Feishu thread at a time.
 _Avoid_: Chat, conversation, room
+_UI label_: 会话 — the ONLY meaning of 「会话」 in cola's UI; the Feishu side is never called 会话 (see Chat/Topic UI labels). Resolves the old "why are so many sessions 本会话" ambiguity: cola marks only the Active Session and uses 聊天/话题 for the Feishu side.
 
-**Thread**:
-A Feishu topic, identified by `thread_id` (`omt_...`; called "话题/topic" in the Feishu UI). A message is a topic message IFF it carries `thread_id`. A thread holds exactly one session; the boundary that isolates one session from another (group or p2p).
+**Chat**:
+The Feishu top-level conversation (a group or p2p), identified by `chat_id` — the lobby of ADR-0007. A chat contains many Topics and may hold several Sessions directly (the lobby). Distinct from a Topic: a chat has no `thread_id`.
+_Avoid_: Conversation, room, group
+_UI label_: 聊天 (the Feishu-side container; a Feishu user's own term). Feishu's own UI calls the top-level thing a 会话, which is exactly the collision cola avoids — cola never uses 会话 for this.
 
-**Lobby**:
-A chat's top-level conversation: messages sent directly in a group (or p2p top-level), carrying no `thread_id`. Unlike a thread, a lobby may hold several sessions (switched via `/switch`).
-_Avoid_: Main channel, root session
+**Topic**:
+A Feishu thread inside a Chat, identified by `thread_id` (`omt_...`; called "话题" in the Feishu UI). A message is a topic message IFF it carries `thread_id`. A topic holds exactly one Session; the boundary that isolates one session from another.
+_UI label_: 话题.
+
+**Turn**:
+A single user→assistant exchange inside a Session (one prompt plus its streamed card response). cola's internal vocabulary is the English word "turn" (Turn Footer, ADR-0019); there is deliberately NO user-facing Chinese noun for it — the UI never labels individual turns. If one is ever needed, use 轮次/本轮.
+_Avoid_: 对话 as a user-facing term for this (overloads "conversation"); 消息 (a single message, not a full exchange).
+
+**Thread** (legacy name for Topic):
+A Feishu topic, identified by `thread_id` (`omt_...`). Retained in code as `ThreadKey { chat_id, thread_id }`; the glossary now calls the Feishu side Chat/Topic, and 话题 for topics in the UI. See Topic.
 
 **Active Session**:
-The single session of a thread that lobby messages route to and that external-message sync follows. Exactly one per thread at a time (the SessionStore's first entry for the thread); `/switch` and `/new` promote a session to active, and cola derives the conversation's current project from it.
+The single session of a chat/topic that messages route to and that external-message sync follows. Exactly one per ThreadKey at a time (the SessionStore's first entry); `/switch` and `/new` promote a session to active, and cola derives the conversation's current project from it.
 _Avoid_: Current session, latest session, selected session
 
 **Project**:
@@ -110,16 +120,16 @@ _Avoid_: alive, running, process alive (all ambiguous — they include the mid-`
 ## Relationships
 
 - A **Bot** contains one **Platform** and one or more **Backend** adapters
-- A **Thread** contains exactly one **Session** (topics only; a **Lobby** may hold several)
-- A **Session** has one **Project** and one optional **Agent**
+- A **Chat** contains many **Topics**; a **Chat** may hold several **Sessions** directly (lobby), while a **Topic** holds exactly one **Session**
+- A **Session** contains many **Turns** and has one **Project** and one optional **Agent**
 - A **Session** receives many **Permissions** and **Questions**
 - The **Bridge** receives **Events** from a **Backend** and renders them as **Card** updates on the **Platform**
 - A prompt's **Quoted Context** and **Image Attachment**s enrich the **Session** the reply belongs to
 
 ## Example dialogue
 
-> **Dev:** "If a user sends a message in a new thread, does the Bridge create a new Session?"
-> **Domain expert:** "Yes — the first message in a thread triggers session creation. If there's an existing thread, the message routes to that thread's session."
+> **Dev:** "If a user sends a message in a new topic, does the Bridge create a new Session?"
+> **Domain expert:** "Yes — the first message in a topic triggers session creation. If there's an existing topic, the message routes to that topic's session."
 >
 > **Dev:** "What happens when a Permission request arrives mid-stream?"
 > **Domain expert:** "The Bridge pauses the Card stream, renders a Permission card with action buttons, and waits for the user to reply. Once resolved, streaming resumes."
@@ -139,16 +149,16 @@ _Avoid_: Notification, message, signal
 ## Relationships
 
 - A **Bot** contains one **Platform** and one or more **Backend** adapters
-- A **Thread** contains exactly one **Session** (topics only; a **Lobby** may hold several)
-- A **Session** has one **Project** and one optional **Agent**
+- A **Chat** contains many **Topics**; a **Chat** may hold several **Sessions** directly (lobby), while a **Topic** holds exactly one **Session**
+- A **Session** contains many **Turns** and has one **Project** and one optional **Agent**
 - A **Session** receives many **Permissions** and **Questions**
 - The **Bridge** receives **Events** from a **Backend** and renders them as **Card** updates on the **Platform**
 - A **Command** is parsed by the **Bridge** from message text before routing to the **Backend**
 
 ## Example dialogue
 
-> **Dev:** "If a user sends a message in a new thread, does the Bridge create a new Session?"
-> **Domain expert:** "Yes — the first message in a thread triggers session creation. If there's an existing thread, the message routes to that thread's session."
+> **Dev:** "If a user sends a message in a new topic, does the Bridge create a new Session?"
+> **Domain expert:** "Yes — the first message in a topic triggers session creation. If there's an existing topic, the message routes to that topic's session."
 >
 > **Dev:** "What happens when a Permission request arrives mid-stream?"
 > **Domain expert:** "The Bridge pauses the Card stream, renders a Permission card with action buttons, and waits for the user to reply. Once resolved, streaming resumes."
@@ -158,4 +168,7 @@ _Avoid_: Notification, message, signal
 
 ## Flagged ambiguities
 
-- None yet.
+- None. Resolved: the 「会话」 overload (Feishu conversation vs OpenCode
+  session) and the "why are so many sessions 本会话" confusion were settled in
+  ADR-0022 — 会话 is the OpenCode Session only, the Feishu side is 聊天/话题,
+  a single exchange is a Turn (internal), and only the Active Session is marked.

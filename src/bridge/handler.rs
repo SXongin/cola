@@ -833,8 +833,24 @@ impl App {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let scope = crate::bridge::command::SwitchScope::parse(
+            value.get("scope").and_then(|v| v.as_str()).unwrap_or(""),
+        );
 
         match op {
+            "scope" => {
+                // The 全部/本目录 toggle (ADR-0022): the button carries the
+                // TARGET scope ("all"/"dir"); the outer `scope` above already
+                // parsed it. Rebuild the card in that scope, keeping the
+                // keyword so a scoped search survives the toggle.
+                Some(CardActionResult {
+                    card: Some(
+                        self.build_switch_card_for(core, &thread_key, &keyword, scope)
+                            .await,
+                    ),
+                    toast: None,
+                })
+            }
             "adopt" => {
                 // Adopt/switch the target session into this thread. Unlike the
                 // text `/switch <id>`, the card carries no `--force`: a session
@@ -851,7 +867,14 @@ impl App {
                 };
                 if already_active {
                     return Some(CardActionResult {
-                        card: Some(self.build_switch_card_for(core, &thread_key, &keyword).await),
+                        card: Some(
+                            self.build_switch_card_for(core, &thread_key, &keyword, scope)
+                                .await,
+                        ),
+                        // The target session is already this conversation's
+                        // active session — nothing changed. 会话 here names the
+                        // OpenCode session (ADR-0022 keeps it), not the Feishu
+                        // side.
                         toast: Some("已在当前会话".to_string()),
                     });
                 }
@@ -897,7 +920,10 @@ impl App {
                 core.invalidate_session_list_cache().await;
                 let toast = format!("已接管「{}」", crate::bridge::command::title_or_id_tail(&target));
                 Some(CardActionResult {
-                    card: Some(self.build_switch_card_for(core, &thread_key, &keyword).await),
+                    card: Some(
+                        self.build_switch_card_for(core, &thread_key, &keyword, scope)
+                            .await,
+                    ),
                     toast: Some(toast),
                 })
             }
@@ -929,7 +955,7 @@ impl App {
                         }
                         core.invalidate_session_list_cache().await;
                         Some(CardActionResult {
-                            card: Some(self.build_switch_card_for(core, &thread_key, "").await),
+                            card: Some(self.build_switch_card_for(core, &thread_key, "", scope).await),
                             toast: Some("已新建会话".to_string()),
                         })
                     }
@@ -944,7 +970,10 @@ impl App {
                 // cache so the re-filter sees newly created/adopted sessions.
                 core.invalidate_session_list_cache().await;
                 Some(CardActionResult {
-                    card: Some(self.build_switch_card_for(core, &thread_key, &keyword).await),
+                    card: Some(
+                        self.build_switch_card_for(core, &thread_key, &keyword, scope)
+                            .await,
+                    ),
                     toast: None,
                 })
             }
@@ -1024,7 +1053,10 @@ impl App {
                     thread_key.chat_id
                 );
                 Some(CardActionResult {
-                    card: Some(self.build_switch_card_for(core, &thread_key, &keyword).await),
+                    card: Some(
+                        self.build_switch_card_for(core, &thread_key, &keyword, scope)
+                            .await,
+                    ),
                     toast: Some("已建话题接管".to_string()),
                 })
             }
@@ -1032,16 +1064,26 @@ impl App {
         }
     }
 
-    /// Rebuild the `/switch` card for a thread with the given search keyword.
+    /// Rebuild the `/switch` card for a thread with the given search keyword
+    /// and list scope (ADR-0022).
     async fn build_switch_card_for(
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
         thread_key: &ThreadKey,
         keyword: &str,
+        scope: crate::bridge::command::SwitchScope,
     ) -> serde_json::Value {
-        let (shown, active_id, mapped_ids) =
-            crate::bridge::command::switch_card_data(core, thread_key, keyword).await;
-        crate::feishu::card::build_switch_card(thread_key, &shown, keyword, active_id.as_deref(), &mapped_ids)
+        let (shown, active_id, mapped_ids, scope, current_dir) =
+            crate::bridge::command::switch_card_data(core, thread_key, keyword, scope).await;
+        crate::feishu::card::build_switch_card(
+            thread_key,
+            &shown,
+            keyword,
+            scope,
+            current_dir.as_deref(),
+            active_id.as_deref(),
+            &mapped_ids,
+        )
     }
 
     /// Rebuild the `/dir` Recent Directories card for a thread.
@@ -1143,7 +1185,10 @@ impl App {
         let Some(mut entry) = core.sessions.lock().await.get_active(&thread_key).cloned() else {
             return Some(CardActionResult {
                 card: None,
-                toast: Some("当前对话还没有会话".to_string()),
+                toast: Some(format!(
+                    "{}还没有会话",
+                    crate::bridge::command::feishu_side_label(&thread_key)
+                )),
             });
         };
         entry.agent = Some(agent.clone());
@@ -1205,7 +1250,10 @@ impl App {
         let Some(mut entry) = core.sessions.lock().await.get_active(&thread_key).cloned() else {
             return Some(CardActionResult {
                 card: None,
-                toast: Some("当前对话还没有会话".to_string()),
+                toast: Some(format!(
+                    "{}还没有会话",
+                    crate::bridge::command::feishu_side_label(&thread_key)
+                )),
             });
         };
         entry.model = Some(picked.clone());
@@ -1249,7 +1297,10 @@ impl App {
         let Some(mut entry) = core.sessions.lock().await.get_active(&thread_key).cloned() else {
             return Some(CardActionResult {
                 card: None,
-                toast: Some("当前对话还没有会话".to_string()),
+                toast: Some(format!(
+                    "{}还没有会话",
+                    crate::bridge::command::feishu_side_label(&thread_key)
+                )),
             });
         };
         if !cleared
