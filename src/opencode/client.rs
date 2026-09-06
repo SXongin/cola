@@ -542,50 +542,7 @@ impl Client {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
             return Vec::new();
         };
-        let Some(all) = v.get("all").and_then(|a| a.as_array()) else {
-            return Vec::new();
-        };
-        let connected: Option<std::collections::HashSet<String>> = v
-            .get("connected")
-            .and_then(|c| c.as_array())
-            .map(|ids| ids.iter().filter_map(|i| i.as_str()).map(String::from).collect());
-        all.iter()
-            .filter(|prov| {
-                connected
-                    .as_ref()
-                    .is_none_or(|ids| ids.contains(prov.get("id").and_then(|i| i.as_str()).unwrap_or("")))
-            })
-            .filter_map(|prov| {
-                let id = prov.get("id").and_then(|i| i.as_str())?.to_string();
-                let models: Vec<ModelOption> = prov
-                    .get("models")
-                    .and_then(|m| m.as_object())
-                    .map(|m| {
-                        m.iter()
-                            .map(|(model_id, m_info)| ModelOption {
-                                id: model_id.clone(),
-                                variants: m_info
-                                    .get("variants")
-                                    .and_then(|v| v.as_array())
-                                    .map(|arr| {
-                                        arr.iter()
-                                            .filter_map(|v| {
-                                                v.get("id").and_then(|i| i.as_str()).map(String::from)
-                                            })
-                                            .collect()
-                                    })
-                                    .unwrap_or_default(),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if models.is_empty() {
-                    None
-                } else {
-                    Some(crate::opencode::client::ProviderModels { provider: id, models })
-                }
-            })
-            .collect()
+        parse_provider_models(&v)
     }
 
     /// Reject a question request (canonical: `POST /question/{id}/reject`).
@@ -623,6 +580,69 @@ impl Client {
             .error_for_status()?;
         Ok(())
     }
+}
+
+/// Parse a `GET /provider` response body into the provider → models map the
+/// `/model` and `/think` cards render. Only providers the server reports as
+/// `connected` are surfaced (see [`Client::list_models`]). Pure so it is
+/// unit-testable against a captured fixture.
+fn parse_provider_models(v: &serde_json::Value) -> Vec<crate::opencode::client::ProviderModels> {
+    let Some(all) = v.get("all").and_then(|a| a.as_array()) else {
+        return Vec::new();
+    };
+    let connected: Option<std::collections::HashSet<String>> = v
+        .get("connected")
+        .and_then(|c| c.as_array())
+        .map(|ids| ids.iter().filter_map(|i| i.as_str()).map(String::from).collect());
+    all.iter()
+        .filter(|prov| {
+            connected
+                .as_ref()
+                .is_none_or(|ids| ids.contains(prov.get("id").and_then(|i| i.as_str()).unwrap_or("")))
+        })
+        .filter_map(|prov| {
+            let id = prov.get("id").and_then(|i| i.as_str())?.to_string();
+            let models: Vec<ModelOption> = prov
+                .get("models")
+                .and_then(|m| m.as_object())
+                .map(|m| {
+                    m.iter()
+                        .map(|(model_id, m_info)| ModelOption {
+                            id: model_id.clone(),
+                            variants: declared_variants(m_info),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if models.is_empty() {
+                None
+            } else {
+                Some(crate::opencode::client::ProviderModels { provider: id, models })
+            }
+        })
+        .collect()
+}
+
+/// The variant names a model declares, per `GET /provider`. The server
+/// serializes `model.variants` as a Record keyed by variant id (`{"low": {...},
+/// "high": {...}, ...}`); very old servers sent an array of `{id, ...}` objects.
+/// Accept both so `/think` and the `/model` auto-clear resolve the same set
+/// either way.
+fn declared_variants(m_info: &serde_json::Value) -> Vec<String> {
+    let Some(variants) = m_info.get("variants") else {
+        return Vec::new();
+    };
+    if let Some(obj) = variants.as_object() {
+        return obj.keys().cloned().collect();
+    }
+    variants
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.get("id").and_then(|i| i.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Deserialize)]
@@ -686,9 +706,10 @@ pub struct ProviderModels {
 pub struct ModelOption {
     pub id: String,
     /// The model's declared variants (e.g. `["low", "medium", "high"]`),
-    /// empty when it declares none (`GET /provider` → `model.variants[].id`).
-    /// There is no universal scale — each model declares its own set
-    /// (ADR-0020).
+    /// empty when it declares none. `GET /provider` serializes each model's
+    /// variants as a Record keyed by variant id (`model.variants` →
+    /// `{"high": {...}}`); the names are its keys. There is no universal
+    /// scale — each model declares its own set (ADR-0020).
     pub variants: Vec<String>,
 }
 
@@ -1121,6 +1142,93 @@ mod tests {
         let mut body3 = serde_json::json!({ "parts": [] });
         inject_model(&mut body3, None, None, None);
         assert!(body3.get("variant").is_none());
+    }
+
+    #[test]
+    fn parses_provider_models_with_object_variants() {
+        // Real `GET /provider` shape (captured): `model.variants` is a Record
+        // keyed by variant id (`{"low": {...}, "high": {...}, "max": {...}}`),
+        // NOT an array of `{id}` objects. Only `connected` providers surface.
+        let json = serde_json::json!({
+            "all": [
+                {
+                    "id": "opencode-go",
+                    "name": "OpenCode Go",
+                    "models": {
+                        "deepseek-v4-flash": {
+                            "id": "deepseek-v4-flash",
+                            "providerID": "opencode-go",
+                            "name": "DeepSeek v4 Flash",
+                            "variants": {
+                                "low": { "reasoningEffort": "low" },
+                                "high": { "reasoningEffort": "high" },
+                                "max": { "reasoningEffort": "max" }
+                            }
+                        },
+                        "deepseek-v4-pro": {
+                            "id": "deepseek-v4-pro",
+                            "name": "DeepSeek v4 Pro"
+                        }
+                    }
+                },
+                {
+                    "id": "not-connected-provider",
+                    "models": { "x": { "id": "x", "name": "X" } }
+                }
+            ],
+            "connected": ["opencode-go"]
+        });
+        let models = parse_provider_models(&json);
+        assert_eq!(models.len(), 1, "only connected providers surface: {models:?}");
+        assert_eq!(models[0].provider, "opencode-go");
+        let flash = models[0]
+            .models
+            .iter()
+            .find(|m| m.id == "deepseek-v4-flash")
+            .unwrap();
+        assert_eq!(flash.variants, vec!["high", "low", "max"]);
+        let pro = models[0]
+            .models
+            .iter()
+            .find(|m| m.id == "deepseek-v4-pro")
+            .unwrap();
+        assert!(pro.variants.is_empty(), "a model with no variants stays empty");
+    }
+
+    #[test]
+    fn parses_provider_models_with_legacy_array_variants() {
+        // Very old servers sent `variants` as an array of `{id, ...}` objects;
+        // both shapes must resolve to the same variant names.
+        let json = serde_json::json!({
+            "all": [
+                {
+                    "id": "p",
+                    "models": {
+                        "m": {
+                            "id": "m",
+                            "name": "M",
+                            "variants": [ { "id": "high", "name": "High" }, { "id": "low", "name": "Low" } ]
+                        }
+                    }
+                }
+            ]
+        });
+        let models = parse_provider_models(&json);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].models[0].variants, vec!["high", "low"]);
+    }
+
+    #[test]
+    fn parses_provider_models_without_connected_keeps_all() {
+        // No `connected` field (older server): every provider is kept.
+        let json = serde_json::json!({
+            "all": [
+                { "id": "a", "models": { "m": { "id": "m", "name": "M" } } },
+                { "id": "b", "models": { "n": { "id": "n", "name": "N" } } }
+            ]
+        });
+        let models = parse_provider_models(&json);
+        assert_eq!(models.len(), 2);
     }
 
     #[test]
