@@ -22,13 +22,23 @@ use sha2::{Digest, Sha256};
 /// exits (ADR-0015, ADR-0021).
 pub const EXIT_SUPERVISOR_RESTART: i32 = 3;
 
-/// The exit code to use when this process is supervised by a systemd unit
-/// (`INVOCATION_ID` is set): exit with it and let `Restart=on-failure` bring
-/// cola back up from the same ExecStart. `None` when no supervisor owns this
-/// process — callers fall back to the spawn-and-exit re-exec.
+/// The exit code to use when this process is supervised by a systemd unit:
+/// exit with it and let `Restart=on-failure` bring cola back up from the same
+/// ExecStart. `None` when no supervisor owns this process — callers fall back
+/// to the spawn-and-exit re-exec.
+///
+/// Supervision is detected by systemd's `INVOCATION_ID` AND `SYSTEMD_EXEC_PID`
+/// pointing at THIS process. The two must be checked together: `INVOCATION_ID`
+/// alone leaks into every child of a unit — a terminal under a unit (e.g.
+/// OpenChamber's managed shell) hands it to the cola it runs as a foreground
+/// process, so a bare `INVOCATION_ID` check made `/restart` exit(3) expecting
+/// `Restart=on-failure` from a supervisor that does not own cola, leaving
+/// nothing running until a manual start.
 pub fn supervisor_restart_code() -> Option<i32> {
     #[cfg(target_os = "linux")]
-    if std::env::var_os("INVOCATION_ID").is_some() {
+    if std::env::var_os("INVOCATION_ID").is_some()
+        && std::env::var_os("SYSTEMD_EXEC_PID").is_some_and(|p| p == std::process::id().to_string().as_str())
+    {
         return Some(EXIT_SUPERVISOR_RESTART);
     }
     None
@@ -281,13 +291,13 @@ pub fn install(new_binary: &Path, current_exe: &Path) -> anyhow::Result<()> {
 
 /// Restart cola after a successful in-band install (never returns).
 ///
-/// Under a systemd unit (`INVOCATION_ID` is set) cola exits with the
-/// supervisor-restart code and lets the unit's `Restart=on-failure` bring up
-/// the new binary from the same ExecStart path. Everywhere else it re-execs via
-/// the existing `restart_process()` (spawn with the original args + `--replace`,
-/// then exit) — see ADR-0015. Only the in-band `/update` path calls this; the
-/// `cola update` CLI replaces the binary and restarts via its supervisor (or
-/// tells the operator — see [`restart_cli`]).
+/// When a systemd unit owns this process (see [`supervisor_restart_code`]),
+/// cola exits with the supervisor-restart code and lets the unit's
+/// `Restart=on-failure` bring up the new binary from the same ExecStart path.
+/// Everywhere else it re-execs via the existing `restart_process()` (spawn with
+/// the original args + `--replace`, then exit) — see ADR-0015. Only the in-band
+/// `/update` path calls this; the `cola update` CLI replaces the binary and
+/// restarts via its supervisor (or tells the operator — see [`restart_cli`]).
 pub fn restart() -> ! {
     if let Some(code) = supervisor_restart_code() {
         std::process::exit(code);
@@ -438,6 +448,63 @@ mod tests {
     #[test]
     fn current_version_is_semver() {
         assert!(Version::parse(env!("CARGO_PKG_VERSION")).is_ok());
+    }
+
+    /// Clean up the systemd env vars `supervisor_restart_code` reads so each
+    /// test starts from a neutral state (they are only set by systemd, so the
+    /// test runner never has them).
+    fn clear_supervisor_env() {
+        unsafe {
+            std::env::remove_var("INVOCATION_ID");
+            std::env::remove_var("SYSTEMD_EXEC_PID");
+        }
+    }
+
+    /// Serializes tests that mutate process-global env vars (`cargo test` runs
+    /// them on parallel threads; racing writes to the same vars would flake).
+    static SUPERVISOR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn supervisor_restart_code_requires_own_exec_pid() {
+        let _guard = SUPERVISOR_ENV_LOCK.lock().unwrap();
+        clear_supervisor_env();
+        // Unit main process: INVOCATION_ID + SYSTEMD_EXEC_PID == our own PID.
+        unsafe {
+            std::env::set_var("INVOCATION_ID", "test");
+            std::env::set_var("SYSTEMD_EXEC_PID", std::process::id().to_string());
+        }
+        assert_eq!(supervisor_restart_code(), Some(EXIT_SUPERVISOR_RESTART));
+        clear_supervisor_env();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn supervisor_restart_code_ignores_inherited_invocation_id() {
+        let _guard = SUPERVISOR_ENV_LOCK.lock().unwrap();
+        clear_supervisor_env();
+        // A terminal spawned under a unit inherits INVOCATION_ID but runs cola
+        // as a plain foreground process: SYSTEMD_EXEC_PID points at the unit's
+        // main process, not us, so there is NO supervisor to hand the restart
+        // to — the fix regression (restart exited 3 with nothing to restart it).
+        unsafe {
+            std::env::set_var("INVOCATION_ID", "inherited");
+            std::env::set_var("SYSTEMD_EXEC_PID", "99999");
+        }
+        assert_eq!(supervisor_restart_code(), None);
+        clear_supervisor_env();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn supervisor_restart_code_none_without_invocation_id() {
+        let _guard = SUPERVISOR_ENV_LOCK.lock().unwrap();
+        clear_supervisor_env();
+        unsafe {
+            std::env::set_var("SYSTEMD_EXEC_PID", std::process::id().to_string());
+        }
+        assert_eq!(supervisor_restart_code(), None);
+        clear_supervisor_env();
     }
 
     #[test]
