@@ -737,79 +737,90 @@ pub fn question_summary(questions: &[crate::opencode::client::QuestionInfo]) -> 
     s
 }
 
-/// Build the interactive question card (JSON 2.0). Options render as buttons
-/// when few, or collapse into a folding `overflow` group when many; a question
-/// that allows a custom answer (`custom`, default true) gets an input box in a
-/// form container. A multi-select question (`multiple`) renders its options as
-/// toggle buttons instead: each click adds/removes the label and the card shows
-/// the running selection ("已选"), finalized by an explicit submit. Already-
-/// answered single-select questions (`answered[i] == Some(labels)`) render as a
-/// static "已选" line instead of buttons, so answering one question never
-/// silently submits the others. A submit button appears when some (but not all)
-/// questions are answered, or when any multi-select question holds a selection;
-/// a reject button sits at the bottom. The card callback (`action: "question"`)
-/// posts the answer back to the session.
-/// The body elements of a question prompt: a markdown summary (with ✅ on
-/// answered questions), option buttons (or a folding `overflow` when many),
-/// a custom-answer input form, an optional "submit/skip" button, and a reject
-/// button. Shared by the standalone question card and the inline section on the
-/// streaming card.
+/// Build the interactive question card (JSON 2.0). Each question renders as its
+/// own block: a markdown heading (number, text, status) followed by its
+/// controls, with a divider between blocks so single- and multi-select options
+/// never mix. Controls are option buttons (or a folding `overflow` group when a
+/// single-select has many options) plus — when `custom` is allowed (default
+/// true) — an input form; a multi-select question (`multiple`) renders toggle
+/// buttons whose clicks add/remove labels in the running selection ("已选"),
+/// committed by a per-question "确定该题" button right under its own options.
+/// `done[i]` marks a finalized question (a single-select answered by a click, a
+/// multi-select confirmed) — it renders as a static "✅ … 已选" line instead of
+/// controls, so answering one question never silently submits the others.
+/// `answered[i]` is the DISPLAY selection: the locked answer for done questions,
+/// or the in-progress toggles of an open multi-select. A submit button appears
+/// when some (but not all) questions are answered (skip remaining); a reject
+/// button sits at the bottom. The card callback (`action: "question"`) posts
+/// the answer back to the session.
+/// The body elements of a question prompt. Shared by the standalone question
+/// card and the inline section on the streaming card.
 pub fn question_elements(
     request_id: &str,
     session_id: &str,
     questions: &[crate::opencode::client::QuestionInfo],
     directory: &str,
     answered: &[Option<Vec<String>>],
+    done: &[bool],
 ) -> Vec<serde_json::Value> {
     // A multi-select question (`multiple`) is NEVER finalized by clicking an
-    // option: clicks toggle labels in its answer set until the user submits.
-    // Single-select questions are finalized the moment an option is clicked.
+    // option: clicks toggle labels in its answer set until the user hits the
+    // per-question "确定该题" button. Single-select questions are finalized the
+    // moment an option is clicked.
     let is_multi = |i: usize| -> bool { questions.get(i).is_some_and(|q| q.multiple == Some(true)) };
-    let is_answered = |qi: usize| -> bool { answered.get(qi).and_then(|a| a.as_ref()).is_some() };
-    let mut markdown = String::new();
+    let is_done = |i: usize| -> bool { done.get(i).copied().unwrap_or(false) };
+    let mut elements: Vec<serde_json::Value> = Vec::new();
+
     for (i, q) in questions.iter().enumerate() {
-        if is_answered(i) && !is_multi(i) {
-            markdown.push_str(&format!("✅ **{}. {}**\n", i + 1, q.question));
+        let multi = is_multi(i);
+        let finalized = is_done(i);
+
+        // Per-question heading: number + text + status, option bullets while
+        // the question is still open (so the full option list reads together
+        // with the controls right below), and the running selection.
+        let mut heading = String::new();
+        if finalized {
+            heading.push_str(&format!("✅ **{}. {}**", i + 1, q.question));
         } else {
-            markdown.push_str(&format!(
-                "**{}. {}{}**\n",
-                i + 1,
-                q.question,
-                if is_multi(i) { "（可多选）" } else { "" }
-            ));
-        }
-        for opt in &q.options {
-            if opt.description.is_empty() {
-                markdown.push_str(&format!("- {}\n", opt.label));
+            let title = if q.header.is_empty() {
+                q.question.clone()
             } else {
-                markdown.push_str(&format!("- {} ({})\n", opt.label, opt.description));
+                q.header.clone()
+            };
+            heading.push_str(&format!(
+                "**{}. {}{}**",
+                i + 1,
+                title,
+                if multi { "（可多选）" } else { "" }
+            ));
+            if !q.header.is_empty() && q.header != q.question {
+                heading.push_str(&format!("\n{}", q.question));
+            }
+            for opt in &q.options {
+                if opt.description.is_empty() {
+                    heading.push_str(&format!("\n- {}", opt.label));
+                } else {
+                    heading.push_str(&format!("\n- {} ({})", opt.label, opt.description));
+                }
             }
         }
         if let Some(Some(labels)) = answered.get(i) {
-            markdown.push_str(&format!("  👉 已选：{}\n", labels.join("、")));
+            heading.push_str(&format!("\n👉 已选：{}", labels.join("、")));
         }
-        markdown.push('\n');
-    }
+        elements.push(json!({ "tag": "markdown", "content": heading }));
 
-    // Overflow (folding button group) delivers the chosen option as a STRING
-    // (`action.option`), so each option's value encodes the question index and
-    // the answer ("qi|label") and ws.rs decodes it back into the standard
-    // answer shape.
-    let mut elements: Vec<serde_json::Value> = vec![json!({ "tag": "markdown", "content": markdown })];
-    for (qi, q) in questions.iter().enumerate() {
-        if is_answered(qi) && !is_multi(qi) {
-            continue;
-        }
-        // Multi-select stays on buttons (clicks toggle); only single-select
-        // collapses into an `overflow` when there are many options.
-        if !is_multi(qi) && q.options.len() > MAX_VISIBLE_OPTIONS {
+        if finalized {
+            // Answered / confirmed: no controls, just the 已选 line above.
+        } else if !multi && q.options.len() > MAX_VISIBLE_OPTIONS {
+            // Single-select with many options collapses into an `overflow`
+            // group (the heading above keeps the full option list visible).
             let options: Vec<serde_json::Value> = q
                 .options
                 .iter()
                 .map(|opt| {
                     json!({
                         "text": { "tag": "plain_text", "content": opt.label },
-                        "value": format!("{}|{}", qi, opt.label),
+                        "value": format!("{}|{}", i, opt.label),
                     })
                 })
                 .collect();
@@ -829,9 +840,9 @@ pub fn question_elements(
             for opt in &q.options {
                 // Multi-select buttons show their selected state so the user
                 // can see what's already picked while still toggling.
-                let selected = is_multi(qi)
+                let selected = multi
                     && answered
-                        .get(qi)
+                        .get(i)
                         .and_then(|a| a.as_ref())
                         .is_some_and(|labels| labels.iter().any(|l| l == &opt.label));
                 elements.push(json!({
@@ -851,76 +862,99 @@ pub fn question_elements(
                         "request_id": request_id,
                         "session_id": session_id,
                         "directory": directory,
-                        "question_index": qi,
+                        "question_index": i,
                         "answer": opt.label,
+                    },
+                }));
+            }
+
+            // Free-text answer (OpenCode questions allow custom by default). The
+            // typed text arrives in `action.form_value`; ws.rs injects it into
+            // the button's `answer` field. Single-select submits a replacement
+            // (`reply: "answer"`); a multi-select ADDS the typed label to the
+            // toggled set (`reply: "custom"`), so the two never collide.
+            if q.custom.unwrap_or(true) {
+                let (reply, name_prefix) = if multi {
+                    ("custom", "submitm")
+                } else {
+                    ("answer", "submit")
+                };
+                let input_name = format!("custom_{}", i);
+                elements.push(json!({
+                    "tag": "form",
+                    "name": format!("form_{}", i),
+                    "elements": [
+                        {
+                            "tag": "input",
+                            "name": input_name,
+                            "placeholder": { "tag": "plain_text", "content": "✍️ 输入自定义答案" },
+                            "max_length": 500,
+                            "width": "fill",
+                        },
+                        {
+                            "tag": "button",
+                            "text": { "tag": "plain_text", "content": "✍️ 自定义" },
+                            "type": "default",
+                            "form_action_type": "submit",
+                            // Form submit callbacks don't always carry the button
+                            // `value`, so the routing payload is ALSO encoded in the
+                            // `name` ("submit|req|ses|qi", or "submitm|…" for a
+                            // multi-select custom addition) — ws.rs rebuilds the
+                            // value from it when `action.value` is absent. The
+                            // directory is deliberately NOT in the name: Feishu
+                            // caps `name` at 100 chars and `submit|req|ses|qi|dir`
+                            // overflows on deep paths, killing the whole card update
+                            // (ErrCode 11310 "name exceed the default maximum 100").
+                            // The handler re-resolves the directory from the store /
+                            // request flow when the fallback fires.
+                            "name": format!("{}|{}|{}|{}", name_prefix, request_id, session_id, i),
+                            "value": {
+                                "action": "question",
+                                "reply": reply,
+                                "request_id": request_id,
+                                "session_id": session_id,
+                                "directory": directory,
+                                "question_index": i,
+                            },
+                        },
+                    ],
+                }));
+            }
+
+            // Multi-select: the commit action sits right under its own options
+            // instead of a far-away bottom submit. Clicking locks the toggled
+            // set (empty allowed — "不选") and collapses the question to 已选.
+            if multi {
+                elements.push(json!({
+                    "tag": "button",
+                    "text": { "tag": "plain_text", "content": "✅ 确定该题" },
+                    "type": "primary",
+                    "value": {
+                        "action": "question",
+                        "reply": "confirm",
+                        "request_id": request_id,
+                        "session_id": session_id,
+                        "directory": directory,
+                        "question_index": i,
                     },
                 }));
             }
         }
 
-        // Free-text answer (OpenCode questions allow custom by default). The
-        // typed text arrives in `action.form_value`; ws.rs injects it into the
-        // button's `answer` field so the handler stays unchanged. Multi-select
-        // questions keep the button set (custom additions are an edge case).
-        if !is_multi(qi) && q.custom.unwrap_or(true) {
-            let input_name = format!("custom_{}", qi);
-            elements.push(json!({
-                "tag": "form",
-                "name": format!("form_{}", qi),
-                "elements": [
-                    {
-                        "tag": "input",
-                        "name": input_name,
-                        "placeholder": { "tag": "plain_text", "content": "✍️ 输入自定义答案" },
-                        "max_length": 500,
-                        "width": "fill",
-                    },
-                    {
-                        "tag": "button",
-                        "text": { "tag": "plain_text", "content": "✍️ 自定义" },
-                        "type": "default",
-                        "form_action_type": "submit",
-                        // Form submit callbacks don't always carry the button
-                        // `value`, so the routing payload is ALSO encoded in the
-                        // `name` ("submit|req|ses|qi") — ws.rs rebuilds the
-                        // value from it when `action.value` is absent. The
-                        // directory is deliberately NOT in the name: Feishu
-                        // caps `name` at 100 chars and `submit|req|ses|qi|dir`
-                        // overflows on deep paths, killing the whole card update
-                        // (ErrCode 11310 "name exceed the default maximum 100").
-                        // The handler re-resolves the directory from the store /
-                        // request flow when the fallback fires.
-                        "name": format!("submit|{}|{}|{}", request_id, session_id, qi),
-                        "value": {
-                            "action": "question",
-                            "reply": "answer",
-                            "request_id": request_id,
-                            "session_id": session_id,
-                            "directory": directory,
-                            "question_index": qi,
-                        },
-                    },
-                ],
-            }));
+        // A divider separates question blocks so options never mix visually.
+        if i + 1 < questions.len() {
+            elements.push(json!({ "tag": "hr" }));
         }
     }
-    let answered_count = answered.iter().filter(|a| a.is_some()).count();
-    let has_multi = questions.iter().any(|q| q.multiple == Some(true));
-    // Submit appears when something is picked while questions remain open
-    // (single-select "跳过剩余"), and ALWAYS for a request containing a
-    // multi-select question — so the user can explicitly submit an empty
-    // selection ("不选") as well as a full one. Without the multi-select case
-    // the button vanishes at zero selections and "none" is unexpressible.
-    let show_submit = (answered_count > 0 && answered_count < questions.len()) || has_multi;
-    if show_submit {
-        let label = if has_multi {
-            "✅ 提交"
-        } else {
-            "✅ 提交（跳过剩余）"
-        };
+
+    // Submit appears only when something is picked while questions remain open
+    // ("跳过剩余"). A multi-select question is finalized by its own 确定该题
+    // button, so there is no separate bottom submit for the multi-select case.
+    let answered_count = done.iter().filter(|d| **d).count();
+    if answered_count > 0 && answered_count < questions.len() {
         elements.push(json!({
             "tag": "button",
-            "text": { "tag": "plain_text", "content": label },
+            "text": { "tag": "plain_text", "content": "✅ 提交（跳过剩余）" },
             "type": "primary",
             "value": {
                 "action": "question",
@@ -955,8 +989,9 @@ pub fn build_question_card(
     questions: &[crate::opencode::client::QuestionInfo],
     directory: &str,
     answered: &[Option<Vec<String>>],
+    done: &[bool],
 ) -> serde_json::Value {
-    let elements = question_elements(request_id, session_id, questions, directory, answered);
+    let elements = question_elements(request_id, session_id, questions, directory, answered, done);
     json!({
         "schema": "2.0",
         "config": { "wide_screen_mode": true },
@@ -2080,7 +2115,7 @@ mod tests {
             multiple: None,
             custom: None,
         }];
-        let card = build_question_card("que_1", "ses_1", &questions, "/tmp/proj/lib", &[None]);
+        let card = build_question_card("que_1", "ses_1", &questions, "/tmp/proj/lib", &[None], &[false]);
         let text = card.to_string();
         assert!(
             text.contains("选择要在哪个目录继续"),
@@ -2124,7 +2159,7 @@ mod tests {
             multiple: None,
             custom: None,
         }];
-        let card = build_question_card("que_1", "ses_1", &questions, "/tmp/proj/lib", &[None]);
+        let card = build_question_card("que_1", "ses_1", &questions, "/tmp/proj/lib", &[None], &[false]);
         let elements = card["body"]["elements"].as_array().unwrap();
         let overflow = elements
             .iter()
@@ -2156,7 +2191,7 @@ mod tests {
             multiple: None,
             custom: None, // default: custom answers allowed
         }];
-        let card = build_question_card("que_1", "ses_1", &questions, "/tmp/proj/lib", &[None]);
+        let card = build_question_card("que_1", "ses_1", &questions, "/tmp/proj/lib", &[None], &[false]);
         let elements = card["body"]["elements"].as_array().unwrap();
         let form = elements
             .iter()
@@ -2179,11 +2214,156 @@ mod tests {
             multiple: None,
             custom: Some(false),
         }];
-        let card = build_question_card("que_1", "ses_1", &questions, "/tmp/proj/lib", &[None]);
+        let card = build_question_card("que_1", "ses_1", &questions, "/tmp/proj/lib", &[None], &[false]);
         let elements = card["body"]["elements"].as_array().unwrap();
         assert!(
             elements.iter().all(|e| e["tag"] != "form"),
             "custom-disabled question must not get an input form: {}",
+            card
+        );
+    }
+
+    #[test]
+    fn multi_select_question_gets_confirm_button_and_custom_form() {
+        let questions = vec![crate::opencode::client::QuestionInfo {
+            question: "选择水果".into(),
+            header: "水果".into(),
+            options: vec![crate::opencode::client::QuestionOption {
+                label: "苹果".into(),
+                description: String::new(),
+            }],
+            multiple: Some(true),
+            custom: None,
+        }];
+        let card = build_question_card("que_1", "ses_1", &questions, "/tmp/proj/lib", &[None], &[false]);
+        let elements = card["body"]["elements"].as_array().unwrap();
+        // The per-question 确定该题 button commits the toggled selection.
+        let confirm = elements
+            .iter()
+            .find(|e| e["tag"] == "button" && e["text"]["content"] == "✅ 确定该题")
+            .expect("multi-select must get a 确定该题 button");
+        assert_eq!(confirm["value"]["reply"], "confirm");
+        assert_eq!(confirm["value"]["question_index"], 0);
+        // A multi-select keeps its option toggle buttons.
+        let opt = elements
+            .iter()
+            .find(|e| e["tag"] == "button" && e["value"]["answer"] == "苹果")
+            .expect("option toggle button missing");
+        assert_eq!(opt["value"]["reply"], "answer");
+        // Multi-select now supports a custom answer too (reply "custom" adds it).
+        let form = elements
+            .iter()
+            .find(|e| e["tag"] == "form")
+            .expect("multi-select custom-allowed question gets an input form");
+        assert!(
+            form.to_string().contains("\"reply\":\"custom\""),
+            "multi-select custom form must reply with custom: {}",
+            form
+        );
+    }
+
+    #[test]
+    fn question_card_done_multi_select_collapses_to_selection_line() {
+        let questions = vec![crate::opencode::client::QuestionInfo {
+            question: "选择水果".into(),
+            header: "水果".into(),
+            options: vec![crate::opencode::client::QuestionOption {
+                label: "苹果".into(),
+                description: String::new(),
+            }],
+            multiple: Some(true),
+            custom: None,
+        }];
+        // Confirmed (done) multi-select: no option buttons, no confirm, no form.
+        let card = build_question_card(
+            "que_1",
+            "ses_1",
+            &questions,
+            "/tmp/proj/lib",
+            &[Some(vec!["苹果".to_string()])],
+            &[true],
+        );
+        let text = card.to_string();
+        assert!(text.contains("已选：苹果"), "selection missing: {}", text);
+        assert!(
+            !text.contains("确定该题"),
+            "done multi-select must not show the confirm button: {}",
+            text
+        );
+        assert!(
+            !text.contains("✍️ 自定义"),
+            "done multi-select must not show the custom form: {}",
+            text
+        );
+        assert!(
+            !text.contains("\"reply\":\"answer\""),
+            "done multi-select must not show option toggles: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn multi_question_card_groups_by_header_with_dividers() {
+        let mk = |q: &str, h: &str, multi: bool| crate::opencode::client::QuestionInfo {
+            question: q.into(),
+            header: h.into(),
+            options: vec![crate::opencode::client::QuestionOption {
+                label: "选项".into(),
+                description: String::new(),
+            }],
+            multiple: if multi { Some(true) } else { None },
+            custom: None,
+        };
+        let questions = vec![mk("选目录", "目录", false), mk("选水果", "水果", true)];
+        let card = build_question_card(
+            "que_1",
+            "ses_1",
+            &questions,
+            "/tmp/proj/lib",
+            &[None, None],
+            &[false, false],
+        );
+        let text = card.to_string();
+        // The header is used as the per-question title so blocks read distinctly.
+        assert!(text.contains("**1. 目录**"), "q1 title missing: {}", text);
+        assert!(text.contains("选目录"), "q1 question body missing: {}", text);
+        assert!(
+            text.contains("**2. 水果（可多选）**"),
+            "q2 title missing: {}",
+            text
+        );
+        assert!(text.contains("选水果"), "q2 question body missing: {}", text);
+        // A divider separates the two question blocks.
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let hr = elements.iter().filter(|e| e["tag"] == "hr").count();
+        assert_eq!(hr, 1, "one divider between two questions: {}", card);
+        // The multi-select's confirm button is grouped right under ITS own
+        // options (after Q1's option + custom form) and before the reject
+        // button — no separate bottom submit for a multi-select question.
+        let opt1 = elements
+            .iter()
+            .position(|e| {
+                e["tag"] == "button" && e["value"]["question_index"] == 1 && e["value"]["answer"] == "选项"
+            })
+            .expect("Q1 option toggle missing");
+        let confirm = elements
+            .iter()
+            .position(|e| e["tag"] == "button" && e["text"]["content"] == "✅ 确定该题")
+            .expect("confirm button missing");
+        let reject = elements
+            .iter()
+            .position(|e| e["tag"] == "button" && e["text"]["content"] == "🚫 无法回答")
+            .expect("reject button missing");
+        assert!(
+            opt1 < confirm && confirm < reject,
+            "multi-select confirm must sit with its options, before reject: {}",
+            card
+        );
+        assert!(
+            !elements
+                .iter()
+                .any(|e| e["tag"] == "button" && e["text"]["content"].to_string().contains("提交")),
+            "no bottom submit button when questions remain open: {}",
             card
         );
     }

@@ -30,7 +30,12 @@ pub struct PendingQuestion {
     pub session_id: String,
     pub questions: Vec<crate::opencode::client::QuestionInfo>,
     pub directory: String,
+    /// Display selection per question (locked answer, or live multi-select
+    /// toggles). Mirrors `question_elements`' `answered` slice.
     pub answers: Vec<Option<Vec<String>>>,
+    /// Whether each question is finalized (single-select answered, multi-select
+    /// confirmed) — its controls collapse to a static 已选 line.
+    pub done: Vec<bool>,
 }
 
 /// One live card per session: the streaming accumulator plus the card identity
@@ -448,7 +453,7 @@ impl StreamAccumulator {
                     builder = builder.with_element(btn);
                 }
             }
-            // Inline question requests (with their current partial answers).
+            // Inline question requests (with their current display answers).
             for q in &self.pending_questions {
                 for el in crate::feishu::card::question_elements(
                     &q.request_id,
@@ -456,6 +461,7 @@ impl StreamAccumulator {
                     &q.questions,
                     &q.directory,
                     &q.answers,
+                    &q.done,
                 ) {
                     builder = builder.with_element(el);
                 }
