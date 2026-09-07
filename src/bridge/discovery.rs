@@ -74,6 +74,23 @@ fn username_from_env(env: &[String]) -> String {
         .unwrap_or_else(|| DEFAULT_SERVER_USERNAME.to_string())
 }
 
+/// The sysinfo refresh shape for a server scan.
+///
+/// `ProcessRefreshKind::nothing()` defaults to `tasks: true`, which makes
+/// sysinfo enumerate every thread of a process as its own `Process` (keyed by
+/// TID, sharing the main thread's cmdline). An `opencode serve` process with N
+/// threads would then appear as N identical server candidates, polluting the
+/// reconcile's Coexistent detection and causing cola to kill its own Owned
+/// Server (yield) thinking a coexistent one appeared. `without_tasks()`
+/// keeps only real processes (one per Tgid). Kept as a named function so the
+/// shape is unit-testable (`.tasks()` must be false).
+fn server_scan_refresh() -> ProcessRefreshKind {
+    ProcessRefreshKind::nothing()
+        .without_tasks()
+        .with_cmd(UpdateKind::Always)
+        .with_environ(UpdateKind::Always)
+}
+
 /// Scan for running `opencode serve` processes. Thin I/O — the interesting
 /// decisions live in [`select_server`].
 ///
@@ -83,9 +100,7 @@ fn username_from_env(env: &[String]) -> String {
 pub fn scan_processes() -> Vec<ServerCandidate> {
     let default_store = default_data_home().to_string_lossy().into_owned();
     let mut system = System::new();
-    let refresh = ProcessRefreshKind::nothing()
-        .with_cmd(UpdateKind::Always)
-        .with_environ(UpdateKind::Always);
+    let refresh = server_scan_refresh();
     system.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
 
     system
@@ -492,6 +507,19 @@ mod tests {
             username: DEFAULT_SERVER_USERNAME.into(),
             uses_default_store,
         }
+    }
+
+    #[test]
+    fn server_scan_refresh_excludes_tasks() {
+        // Regression (see server_scan_refresh docs): sysinfo's default
+        // `tasks: true` turns each thread of an `opencode serve` process into
+        // its own candidate, which pollutes Coexistent detection and makes
+        // reconcile yield-kill cola's Owned Server. The scan refresh must not
+        // enumerate tasks.
+        assert!(
+            !server_scan_refresh().tasks(),
+            "server scan must not treat threads as separate server candidates"
+        );
     }
 
     #[test]
