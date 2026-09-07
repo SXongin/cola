@@ -4350,10 +4350,11 @@ pub(crate) mod integration_tests {
         assert_eq!(calls[0].1, vec![vec!["/a".to_string()], vec!["main".to_string()]]);
     }
 
-    /// A multi-select question (`multiple: true`) never finalizes on a click:
-    /// each option click toggles the label in the answer set, the returned card
-    /// shows the running selection (已选) and a submit button, and only an
-    /// explicit submit replies with the accumulated set.
+    /// A multi-select question (`multiple: true`) never finalizes on an option
+    /// click: each click toggles the label in the answer set, the returned card
+    /// shows the running selection (已选) and a per-question 确定该题 button, and
+    /// only that confirm commits — once it does and every question is answered,
+    /// the request auto-submits with the accumulated set.
     #[tokio::test]
     async fn multi_select_question_toggles_until_submit() {
         let _wd = test_work_dir();
@@ -4404,11 +4405,11 @@ pub(crate) mod integration_tests {
 
         // Click 苹果 → NOT submitted (multi-select toggles, never auto-submits).
         let r1 = app.handle_card_action(value("苹果")).await.expect("result");
-        assert_eq!(r1.toast.as_deref(), Some("已记录答案，请点击提交"));
+        assert_eq!(r1.toast.as_deref(), Some("已记录选项"));
         let c1 = r1.card.as_ref().expect("re-rendered card").to_string();
         assert!(c1.contains("已选：苹果"), "marker missing: {}", c1);
         assert!(c1.contains("可多选"), "multi hint missing: {}", c1);
-        assert!(c1.contains("✅ 提交"), "submit button missing: {}", c1);
+        assert!(c1.contains("✅ 确定该题"), "confirm button missing: {}", c1);
         // The selected button shows its ✅/checked state in the card JSON.
         assert!(
             c1.contains("\"content\":\"✅ 苹果\""),
@@ -4430,25 +4431,27 @@ pub(crate) mod integration_tests {
         assert!(!c3.contains("已选：苹果、香蕉"), "toggle off kept 苹果: {}", c3);
         assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
 
-        // Submit → replies with the accumulated set.
-        let submit = app
+        // 确定该题 → commits the toggled set; the single question is answered so
+        // the request auto-submits with the accumulated set.
+        let confirm = app
             .handle_card_action(serde_json::json!({
                 "action": "question",
-                "reply": "submit",
+                "reply": "confirm",
                 "request_id": "que_multi",
                 "session_id": "ses_1",
                 "directory": "/work",
+                "question_index": 0,
             }))
             .await
             .expect("result");
-        assert_eq!(submit.toast.as_deref(), Some("已提交"));
+        assert_eq!(confirm.toast.as_deref(), Some("已回答"));
         let calls = backend.reply_question_calls.lock().await.clone();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1, vec![vec!["香蕉".to_string()]]);
     }
 
-    /// A multi-select question can be submitted with an EMPTY selection ("不选"):
-    /// the submit button is always present for multi-select, and submitting with
+    /// A multi-select question can be confirmed with an EMPTY selection ("不选"):
+    /// the per-question 确定该题 button is always present, and confirming with
     /// nothing toggled replies with an empty answer set.
     #[tokio::test]
     async fn multi_select_can_submit_empty_selection() {
@@ -4499,28 +4502,236 @@ pub(crate) mod integration_tests {
             }))
             .await
             .expect("result");
-        // The re-rendered card has NO selection but STILL shows the submit
+        // The re-rendered card has NO selection but STILL shows the 确定该题
         // button, so "不选" is expressible.
         let c2 = r2.card.as_ref().expect("re-rendered card").to_string();
         assert!(!c2.contains("已选"), "selection must be cleared: {}", c2);
-        assert!(c2.contains("✅ 提交"), "submit must stay visible: {}", c2);
+        assert!(c2.contains("✅ 确定该题"), "confirm must stay visible: {}", c2);
         assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
 
-        // Submitting with nothing selected replies with an empty set.
-        let submit = app
+        // Confirming with nothing selected replies with an empty set.
+        let confirm = app
             .handle_card_action(serde_json::json!({
                 "action": "question",
-                "reply": "submit",
+                "reply": "confirm",
                 "request_id": "que_empty",
                 "session_id": "ses_1",
                 "directory": "/work",
+                "question_index": 0,
             }))
             .await
             .expect("result");
-        assert_eq!(submit.toast.as_deref(), Some("已提交"));
+        assert_eq!(confirm.toast.as_deref(), Some("已回答"));
         let calls = backend.reply_question_calls.lock().await.clone();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1, vec![Vec::<String>::new()]);
+    }
+
+    /// A stale card may re-confirm an already-confirmed multi-select question
+    /// (the re-render hasn't removed the button yet, while other questions stay
+    /// open). That second confirm must be a no-op — it must NOT wipe the locked
+    /// answer by overwriting it with the now-empty toggles slot.
+    #[tokio::test]
+    async fn stale_confirm_on_done_multi_select_is_a_no_op() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = Arc::new(MockBackend::new(realistic_parts()));
+        let app = Arc::new(App::new(cfg, backend.clone(), Arc::new(RecordingPlatform::new())).unwrap());
+
+        app.question.question_requests.lock().await.insert(
+            "que_stale".into(),
+            opencode::client::QuestionRequest {
+                id: "que_stale".into(),
+                session_id: "ses_1".into(),
+                questions: vec![
+                    opencode::client::QuestionInfo {
+                        question: "选择目录".into(),
+                        header: "目录".into(),
+                        options: vec![opencode::client::QuestionOption {
+                            label: "/a".into(),
+                            description: String::new(),
+                        }],
+                        multiple: None,
+                        custom: None,
+                    },
+                    opencode::client::QuestionInfo {
+                        question: "选择水果".into(),
+                        header: "水果".into(),
+                        options: vec![opencode::client::QuestionOption {
+                            label: "苹果".into(),
+                            description: String::new(),
+                        }],
+                        multiple: Some(true),
+                        custom: None,
+                    },
+                ],
+            },
+        );
+
+        let confirm = |index: u64| {
+            serde_json::json!({
+                "action": "question",
+                "reply": "confirm",
+                "request_id": "que_stale",
+                "session_id": "ses_1",
+                "directory": "/work",
+                "question_index": index,
+            })
+        };
+
+        // Toggle 苹果 on Q1 then confirm it → Q1 locked, Q0 still open.
+        app.handle_card_action(serde_json::json!({
+            "action": "question",
+            "reply": "answer",
+            "request_id": "que_stale",
+            "session_id": "ses_1",
+            "directory": "/work",
+            "question_index": 1,
+            "answer": "苹果",
+        }))
+        .await;
+        let r1 = app.handle_card_action(confirm(1)).await.expect("result");
+        assert_eq!(r1.toast.as_deref(), Some("已确定该题，还有 1 题未答"));
+        assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
+
+        // A stale second confirm on Q1 must NOT wipe 苹果 with an empty set.
+        let r2 = app.handle_card_action(confirm(1)).await.expect("result");
+        assert_eq!(r2.toast.as_deref(), Some("已确定该题，还有 1 题未答"));
+        let c2 = r2.card.as_ref().expect("re-rendered card").to_string();
+        assert!(
+            c2.contains("已选：苹果"),
+            "stale confirm wiped the answer: {}",
+            c2
+        );
+        assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
+
+        // Answer Q0 → both done → submits with 苹果 intact.
+        let ans = app
+            .handle_card_action(serde_json::json!({
+                "action": "question",
+                "reply": "answer",
+                "request_id": "que_stale",
+                "session_id": "ses_1",
+                "directory": "/work",
+                "question_index": 0,
+                "answer": "/a",
+            }))
+            .await
+            .expect("result");
+        assert_eq!(ans.toast.as_deref(), Some("已回答"));
+        let calls = backend.reply_question_calls.lock().await.clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, vec![vec!["/a".to_string()], vec!["苹果".to_string()]]);
+    }
+
+    /// A mixed request (one single-select + one multi-select) only submits once
+    /// EVERY question is finalized: toggling multi-select options or typing a
+    /// custom answer must never auto-submit, and confirming the multi-select
+    /// while the single-select is still open stays in-progress. Only when both
+    /// are done does the request reply.
+    #[tokio::test]
+    async fn mixed_single_and_multi_question_waits_for_all_confirmed() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = Arc::new(MockBackend::new(realistic_parts()));
+        let app = Arc::new(App::new(cfg, backend.clone(), Arc::new(RecordingPlatform::new())).unwrap());
+
+        app.question.question_requests.lock().await.insert(
+            "que_mix".into(),
+            opencode::client::QuestionRequest {
+                id: "que_mix".into(),
+                session_id: "ses_1".into(),
+                questions: vec![
+                    opencode::client::QuestionInfo {
+                        question: "选择目录".into(),
+                        header: "目录".into(),
+                        options: vec![opencode::client::QuestionOption {
+                            label: "/a".into(),
+                            description: String::new(),
+                        }],
+                        multiple: None,
+                        custom: None,
+                    },
+                    opencode::client::QuestionInfo {
+                        question: "选择水果".into(),
+                        header: "水果".into(),
+                        options: vec![opencode::client::QuestionOption {
+                            label: "苹果".into(),
+                            description: String::new(),
+                        }],
+                        multiple: Some(true),
+                        custom: None,
+                    },
+                ],
+            },
+        );
+
+        let answer = |index: u64, a: &str| {
+            serde_json::json!({
+                "action": "question",
+                "reply": "answer",
+                "request_id": "que_mix",
+                "session_id": "ses_1",
+                "directory": "/work",
+                "question_index": index,
+                "answer": a,
+            })
+        };
+
+        // Answer the single-select (Q0) → Q1 still open, NO auto-submit yet.
+        let r0 = app.handle_card_action(answer(0, "/a")).await.expect("result");
+        assert_eq!(r0.toast.as_deref(), Some("已记录答案，还有 1 题未答"));
+        assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
+
+        // Toggle a multi-select option (Q1) → still no submit (not confirmed).
+        let r1 = app.handle_card_action(answer(1, "苹果")).await.expect("result");
+        assert_eq!(r1.toast.as_deref(), Some("已记录选项"));
+        assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
+
+        // Type a custom answer into the multi-select (reply "custom") → the
+        // label is appended to the toggles, still no submit.
+        let r2 = app
+            .handle_card_action(serde_json::json!({
+                "action": "question",
+                "reply": "custom",
+                "request_id": "que_mix",
+                "session_id": "ses_1",
+                "directory": "/work",
+                "question_index": 1,
+                "answer": "自定义水果",
+            }))
+            .await
+            .expect("result");
+        assert_eq!(r2.toast.as_deref(), Some("已记录选项"));
+        // The displayed selection now holds the option + the custom label.
+        let c2 = r2.card.as_ref().expect("re-rendered card").to_string();
+        assert!(c2.contains("已选：苹果、自定义水果"), "append failed: {}", c2);
+        assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
+
+        // Confirm Q1 → both questions done → auto-submits with both answers.
+        let confirm = app
+            .handle_card_action(serde_json::json!({
+                "action": "question",
+                "reply": "confirm",
+                "request_id": "que_mix",
+                "session_id": "ses_1",
+                "directory": "/work",
+                "question_index": 1,
+            }))
+            .await
+            .expect("result");
+        assert_eq!(confirm.toast.as_deref(), Some("已回答"));
+        let calls = backend.reply_question_calls.lock().await.clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].1,
+            vec![
+                vec!["/a".to_string()],
+                vec!["苹果".to_string(), "自定义水果".to_string()]
+            ]
+        );
     }
 
     /// A question raised during an active turn is surfaced INLINE on the

@@ -37,7 +37,7 @@ impl PendingRequest {
 /// Partial answers recorded for a pending question request: `answers[i]` is
 /// `None` until the user answers question `i`. A request is only submitted once
 /// every slot is filled (or the user clicks "submit/skip").
-pub type QuestionPartial = HashMap<String, Vec<Option<Vec<String>>>>;
+type QuestionPartial = HashMap<String, Vec<Option<Vec<String>>>>;
 
 /// The deltas that make a permission request and a question request different.
 /// Everything else — the poll loop, the card delivery, the double-click guard
@@ -393,6 +393,7 @@ impl RequestKind for QuestionKind {
                 questions: q.questions.clone(),
                 directory: dir.to_string(),
                 answers: vec![None; q.questions.len()],
+                done: vec![false; q.questions.len()],
             });
         true
     }
@@ -407,6 +408,7 @@ impl RequestKind for QuestionKind {
             &q.questions,
             dir,
             &vec![None; q.questions.len()],
+            &vec![false; q.questions.len()],
         )
     }
 
@@ -434,14 +436,22 @@ impl RequestKind for QuestionKind {
         host: &Option<String>,
     ) -> Option<CardActionResult> {
         match reply {
-            "answer" => {
+            // "answer" = an option click (single-select replaces, multi-select
+            // toggles). "custom" = a typed custom answer from the form — a
+            // multi-select ADDS it to the toggled set (single-select custom
+            // answers flow through "answer" as before). "confirm" = the
+            // per-question 确定该题 button of a multi-select: locks the toggled
+            // set (empty allowed — "不选") into the final answer.
+            "answer" | "custom" | "confirm" => {
                 let index = value.get("question_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let answer = value
                     .get("answer")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                if answer.is_empty() {
+                // "confirm" carries no typed answer (the selection is already
+                // recorded); every other reply needs one.
+                if answer.is_empty() && reply != "confirm" {
                     return None;
                 }
                 // A request is submitted ONLY when every question has an answer
@@ -465,26 +475,60 @@ impl RequestKind for QuestionKind {
                 let Some(n) = n else {
                     return None; // stale card for an already-submitted request
                 };
-                // Multi-select questions toggle a label in the answer set on
-                // each click (never auto-finalize); single-select replaces the
-                // answer as before.
-                let (multi, has_multi) = {
+                let multi = {
                     let reqs = flow.question_requests.lock().await;
-                    let qs = &reqs.get(req_id).map(|r| r.questions.clone()).unwrap_or_default();
-                    let multi = qs.get(index).is_some_and(|q| q.multiple == Some(true));
-                    let has_multi = qs.iter().any(|q| q.multiple == Some(true));
-                    (multi, has_multi)
+                    reqs.get(req_id)
+                        .is_some_and(|r| r.questions.get(index).is_some_and(|q| q.multiple == Some(true)))
                 };
-                // Record this question's answer.
-                let (answered_count, slot) = {
+                // "custom"/"confirm" only exist on multi-select questions.
+                if (reply == "custom" || reply == "confirm") && !multi {
+                    return None;
+                }
+                // Multi-select answers compose in a SEPARATE toggles map; the
+                // partial map holds only FINAL answers (single-select clicks,
+                // confirmed multi-selects). The separation is what lets a
+                // multi-select stay open while the user keeps toggling, without
+                // ever auto-submitting mid-composition.
+                let (answered_count, display, done) = {
                     let mut partial = flow.question_partial.lock().await;
+                    let mut toggles = flow.question_toggles.lock().await;
                     if multi {
-                        record_toggle_answer(&mut partial, req_id, n, index, &answer)
+                        match reply {
+                            "custom" => record_append_answer(&mut toggles, req_id, n, index, &answer),
+                            "confirm" => {
+                                // A stale card may re-confirm an already-done
+                                // question (re-render hasn't removed the button
+                                // yet, and other questions remain open). A
+                                // second confirm must be a no-op, not overwrite
+                                // the locked answer with the (now-empty)
+                                // toggles slot.
+                                if index < n
+                                    && !partial
+                                        .get(req_id)
+                                        .and_then(|s| s.get(index))
+                                        .is_some_and(|slot| slot.is_some())
+                                {
+                                    // Lock the toggled set into the final answer.
+                                    let set = toggles
+                                        .get_mut(req_id)
+                                        .and_then(|s| s.get_mut(index))
+                                        .and_then(|slot| slot.take())
+                                        .unwrap_or_default();
+                                    let slot =
+                                        partial.entry(req_id.to_string()).or_insert_with(|| vec![None; n]);
+                                    slot[index] = Some(set);
+                                }
+                            }
+                            _ => {
+                                record_toggle_answer(&mut toggles, req_id, n, index, &answer);
+                            }
+                        }
                     } else {
-                        record_answer(&mut partial, req_id, n, index, &answer)
+                        record_answer(&mut partial, req_id, n, index, &answer);
                     }
+                    merge_question_state(&partial, &toggles, req_id, n)
                 };
-                // Keep the inline card's partial answers in sync.
+                // Keep the inline card's display answers and done flags in sync.
                 if inline
                     && let Some(pq) = core
                         .cards
@@ -498,9 +542,10 @@ impl RequestKind for QuestionKind {
                                 .find(|pq| pq.request_id == req_id)
                         })
                 {
-                    pq.answers = slot.clone();
+                    pq.answers = display.clone();
+                    pq.done = done.clone();
                 }
-                if answered_count == n && !has_multi {
+                if answered_count == n {
                     // All questions answered → submit the whole request.
                     flow.mark_answered(core, req_id).await;
                     let answers: Vec<Vec<String>> = flow
@@ -512,6 +557,7 @@ impl RequestKind for QuestionKind {
                         .into_iter()
                         .map(|a| a.unwrap_or_default())
                         .collect();
+                    flow.remove_question(req_id).await;
                     if let Err(e) = reply_question_scoped(core, req_id, Some(&answers), directory).await {
                         tracing::error!("question reply failed: {}", e);
                         return Some(failed_result_card(
@@ -526,8 +572,6 @@ impl RequestKind for QuestionKind {
                         value.get("session_id").and_then(|v| v.as_str()).unwrap_or(""),
                         answers
                     );
-                    flow.question_requests.lock().await.remove(req_id);
-                    flow.question_dirs.lock().await.remove(req_id);
                     flow.sent_cards.lock().await.remove(req_id);
                     if inline
                         && let Some(acc) = core
@@ -554,7 +598,7 @@ impl RequestKind for QuestionKind {
                     Some(r)
                 } else if inline {
                     // Inline: the streaming card re-renders with the updated
-                    // partial answers. Return the re-rendered card IN the
+                    // display state. Return the re-rendered card IN the
                     // callback response so Feishu updates the CLICKED card in
                     // place — the same mechanism standalone question cards use,
                     // and the only one that reliably refreshes the body after an
@@ -566,7 +610,7 @@ impl RequestKind for QuestionKind {
                         card: None,
                         toast: None,
                     };
-                    r.toast = Some(answer_recorded_toast(n - answered_count));
+                    r.toast = Some(action_toast(reply, multi, n - answered_count));
                     // Build on a CLONE so a card-component-limit split can't
                     // advance the live accumulator's `render_from` from inside
                     // the click handler (flush_card owns that flow). Only take
@@ -598,25 +642,19 @@ impl RequestKind for QuestionKind {
                         reqs.get(req_id).cloned()
                     };
                     let req = req?;
-                    let partial = flow
-                        .question_partial
-                        .lock()
-                        .await
-                        .get(req_id)
-                        .cloned()
-                        .unwrap_or_else(|| vec![None; n]);
                     let card = crate::feishu::card::build_question_card(
                         req_id,
                         &req.session_id,
                         &req.questions,
                         directory.unwrap_or(""),
-                        &partial,
+                        &display,
+                        &done,
                     );
                     let mut r = CardActionResult {
                         card: Some(card),
                         toast: None,
                     };
-                    r.toast = Some(answer_recorded_toast(remaining));
+                    r.toast = Some(action_toast(reply, multi, remaining));
                     Some(r)
                 }
             }
@@ -639,6 +677,7 @@ impl RequestKind for QuestionKind {
                     .into_iter()
                     .map(|a| a.unwrap_or_default())
                     .collect();
+                flow.remove_question(req_id).await;
                 if let Err(e) = reply_question_scoped(core, req_id, Some(&answers), directory).await {
                     tracing::error!("question reply failed: {}", e);
                     return Some(failed_result_card(
@@ -653,8 +692,6 @@ impl RequestKind for QuestionKind {
                     value.get("session_id").and_then(|v| v.as_str()).unwrap_or(""),
                     answers
                 );
-                flow.question_requests.lock().await.remove(req_id);
-                flow.question_dirs.lock().await.remove(req_id);
                 if inline
                     && let Some(acc) = core
                         .cards
@@ -703,9 +740,8 @@ impl RequestKind for QuestionKind {
                     ));
                 }
                 tracing::info!("Question rejected: {}", req_id);
-                flow.question_requests.lock().await.remove(req_id);
-                flow.question_dirs.lock().await.remove(req_id);
                 flow.question_partial.lock().await.remove(req_id);
+                flow.remove_question(req_id).await;
                 flow.sent_cards.lock().await.remove(req_id);
                 if inline
                     && let Some(acc) = core
@@ -751,11 +787,17 @@ pub struct RequestFlow {
     /// (where `dir` is known) as the fallback for form-submit callbacks whose
     /// card `name` no longer carries the directory (see question_elements).
     pub question_dirs: Arc<Mutex<HashMap<String, String>>>,
-    /// request_id → answers recorded so far (None = not answered yet; question
-    /// kind only). A request is only submitted once EVERY question has an
-    /// answer (or the user clicks "submit/skip"), because `reply_question`
-    /// expects answers for all of them.
+    /// request_id → FINAL answers (None = not answered yet; question kind
+    /// only). A request is only submitted once EVERY question has an answer (or
+    /// the user clicks "submit/skip"), because `reply_question` expects answers
+    /// for all of them.
     pub question_partial: Arc<Mutex<QuestionPartial>>,
+    /// request_id → LIVE multi-select toggles (question kind only). Kept
+    /// SEPARATE from `question_partial` so an in-progress multi-select (labels
+    /// toggled but not yet confirmed) never counts as answered — the request
+    /// can only auto-submit once every question is finalized (single-select
+    /// clicked, multi-select confirmed via its 确定该题 button).
+    pub question_toggles: Arc<Mutex<QuestionPartial>>,
 }
 
 impl RequestFlow {
@@ -767,6 +809,7 @@ impl RequestFlow {
             question_requests: Arc::new(Mutex::new(HashMap::new())),
             question_dirs: Arc::new(Mutex::new(HashMap::new())),
             question_partial: Arc::new(Mutex::new(HashMap::new())),
+            question_toggles: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -779,6 +822,17 @@ impl RequestFlow {
     /// The double-click guard primitive: record `req_id` as answered.
     pub(crate) async fn mark_answered(&self, core: &Arc<SharedCore>, req_id: &str) {
         core.answered_requests.lock().await.insert(req_id.to_string());
+    }
+
+    /// Drop a question request's in-flight state once it is finalized: the
+    /// remembered request, its owning directory, and any live multi-select
+    /// toggles. The final answers in `question_partial` are consumed separately
+    /// (to build the reply payload) and `sent_cards` is cleared only where the
+    /// request was actually delivered as its own card.
+    pub(crate) async fn remove_question(&self, req_id: &str) {
+        self.question_requests.lock().await.remove(req_id);
+        self.question_dirs.lock().await.remove(req_id);
+        self.question_toggles.lock().await.remove(req_id);
     }
 
     /// Independent poller: surfaces pending requests as cards (inline on a
@@ -1137,15 +1191,74 @@ fn record_toggle_answer(
     (count, slot.clone())
 }
 
-/// Toast after recording an answer. `remaining == 0` only happens when every
-/// slot holds a selection but the request is NOT auto-submitting — i.e. a
-/// multi-select question is still awaiting an explicit submit click.
-fn answer_recorded_toast(remaining: usize) -> String {
-    if remaining == 0 {
-        "已记录答案，请点击提交".to_string()
-    } else {
-        format!("已记录答案，还有 {} 题未答", remaining)
+/// Multi-select custom-answer variant of `record_toggle_answer`: ADDS the typed
+/// label to the question's toggled set (dedupe) but never removes it — a custom
+/// answer is a fresh choice, not something a re-click should toggle away.
+/// Writes into the LIVE toggles map (not the final answers), like option
+/// toggles, so the question still awaits its 确定该题 confirm.
+fn record_append_answer(
+    toggles: &mut HashMap<String, Vec<Option<Vec<String>>>>,
+    req_id: &str,
+    n: usize,
+    index: usize,
+    answer: &str,
+) {
+    let slot = toggles.entry(req_id.to_string()).or_insert_with(|| vec![None; n]);
+    if index < n {
+        let current = slot[index].get_or_insert_with(Vec::new);
+        if !current.iter().any(|l| l == answer) {
+            current.push(answer.to_string());
+        }
     }
+}
+
+/// Merge the final-answer map (`partial`) with the in-progress multi-select
+/// toggles into what the card should display: `display[i]` is the locked
+/// answer for done questions or the live toggles of an open multi-select;
+/// `done[i]` marks finalized questions. Returns `(count, display, done)` where
+/// `count` is the number of finalized (answered) questions — only the final
+/// answers drive auto-submit, never in-progress toggles.
+fn merge_question_state(
+    partial: &HashMap<String, Vec<Option<Vec<String>>>>,
+    toggles: &HashMap<String, Vec<Option<Vec<String>>>>,
+    req_id: &str,
+    n: usize,
+) -> (usize, Vec<Option<Vec<String>>>, Vec<bool>) {
+    let p = partial.get(req_id);
+    let t = toggles.get(req_id);
+    let mut display = vec![None; n];
+    let mut done = vec![false; n];
+    let mut count = 0;
+    for i in 0..n {
+        if let Some(Some(labels)) = p.and_then(|s| s.get(i)) {
+            display[i] = Some(labels.clone());
+            done[i] = true;
+            count += 1;
+        } else if let Some(Some(labels)) = t.and_then(|s| s.get(i)) {
+            display[i] = Some(labels.clone());
+        }
+    }
+    (count, display, done)
+}
+
+/// Toast after a question-card interaction, depending on the action:
+/// single-select clicks/customs report how many questions remain open,
+/// multi-select toggles/customs just acknowledge the recorded option, and a
+/// multi-select 确定该题 reports how many questions are still left.
+fn action_toast(reply: &str, multi: bool, remaining: usize) -> String {
+    if reply == "confirm" {
+        format!("已确定该题，还有 {} 题未答", remaining)
+    } else if multi {
+        "已记录选项".to_string()
+    } else {
+        answer_recorded_toast(remaining)
+    }
+}
+
+/// Toast after recording a single-select answer, with how many questions are
+/// still open.
+fn answer_recorded_toast(remaining: usize) -> String {
+    format!("已记录答案，还有 {} 题未答", remaining)
 }
 
 #[cfg(test)]
@@ -1225,5 +1338,62 @@ mod tests {
         let (count, slot) = record_toggle_answer(&mut partial, "q1", 2, 99, "x");
         assert_eq!(count, 0);
         assert_eq!(slot, vec![None, None]);
+    }
+
+    #[test]
+    fn record_append_answer_adds_but_never_toggles_away() {
+        let mut toggles = HashMap::new();
+        // First custom answer adds the label.
+        record_append_answer(&mut toggles, "q1", 1, 0, "自定");
+        assert_eq!(toggles["q1"], vec![Some(vec!["自定".to_string()])]);
+        // Re-adding the same custom label is a no-op (deduped).
+        record_append_answer(&mut toggles, "q1", 1, 0, "自定");
+        assert_eq!(toggles["q1"], vec![Some(vec!["自定".to_string()])]);
+        // A second custom label accumulates.
+        record_append_answer(&mut toggles, "q1", 1, 0, "另一个");
+        assert_eq!(
+            toggles["q1"],
+            vec![Some(vec!["自定".to_string(), "另一个".to_string()])]
+        );
+    }
+
+    #[test]
+    fn record_append_answer_out_of_range_index_is_ignored() {
+        let mut toggles = HashMap::new();
+        record_append_answer(&mut toggles, "q1", 2, 99, "x");
+        assert_eq!(toggles["q1"], vec![None, None]);
+    }
+
+    #[test]
+    fn merge_question_state_separates_done_from_in_progress_toggles() {
+        // Q0 answered (single-select), Q1 toggled (multi, in progress).
+        let mut partial = HashMap::new();
+        partial.insert("q1".into(), vec![Some(vec!["/a".to_string()]), None]);
+        let mut toggles = HashMap::new();
+        toggles.insert("q1".into(), vec![None, Some(vec!["苹果".to_string()])]);
+        let (count, display, done) = merge_question_state(&partial, &toggles, "q1", 2);
+        // Only the finalized question counts toward submit.
+        assert_eq!(count, 1);
+        assert_eq!(done, vec![true, false]);
+        // Display shows the locked answer AND the live toggles.
+        assert_eq!(
+            display,
+            vec![Some(vec!["/a".to_string()]), Some(vec!["苹果".to_string()])]
+        );
+    }
+
+    #[test]
+    fn merge_question_state_confirmed_multi_select_counts_as_done() {
+        // A confirmed multi-select lands in partial (moved out of toggles).
+        let mut partial = HashMap::new();
+        partial.insert(
+            "q1".into(),
+            vec![Some(vec!["苹果".to_string(), "香蕉".to_string()])],
+        );
+        let toggles = HashMap::new();
+        let (count, display, done) = merge_question_state(&partial, &toggles, "q1", 1);
+        assert_eq!(count, 1);
+        assert_eq!(done, vec![true]);
+        assert_eq!(display, vec![Some(vec!["苹果".to_string(), "香蕉".to_string()])]);
     }
 }

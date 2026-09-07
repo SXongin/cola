@@ -619,6 +619,22 @@ fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Value> {
                     "thread_id": parts[2],
                     "scope": parts.get(3).copied().unwrap_or(""),
                 })
+            } else if parts[0] == "submitm" && (parts.len() == 4 || parts.len() == 5) {
+                // A multi-select custom-answer form submit: the routing payload
+                // is encoded in the name ("submitm|<req>|<ses>|<qi>[|<dir>]")
+                // and `reply` is "custom" — the handler ADDS the typed label to
+                // the toggled set instead of treating it as an option toggle.
+                let mut val = serde_json::json!({
+                    "action": "question",
+                    "reply": "custom",
+                    "request_id": parts[1],
+                    "session_id": parts[2],
+                    "question_index": parts[3].parse::<u64>().ok()?,
+                });
+                if let Some(dir) = parts.get(4) {
+                    val["directory"] = serde_json::Value::String(dir.to_string());
+                }
+                val
             } else if parts[0] != "submit" || !(parts.len() == 4 || parts.len() == 5) {
                 // Form submit callbacks don't always deliver the button `value`;
                 // the routing payload is encoded in the button `name`
