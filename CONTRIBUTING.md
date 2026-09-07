@@ -16,17 +16,48 @@ assume it.
 
 ## Branch workflow
 
-**Never commit to `main` directly** — not even small fixes. Every change rides
-a feature branch to a PR:
+This is a **trunk-based (TBD)** repo with **rebase-linear** history. `main` is
+the only long-lived branch; it receives merges only. Every piece of work rides
+a short-lived branch pulled off `main` and merged back to `main` via PR.
 
-- Create a short descriptive branch off `main` (e.g. `fix/feishu-config-default`,
-  `docs/user-guide`). The branch name should say what it changes.
-- Do the work, commit in small Conventional Commits, push the branch, and open
-  a PR. `main` only receives merges.
-- One PR = one thing (see *Before you start*); keep the branch short-lived.
+The per-task loop is always:
 
-This rule applies to agents too — check `git branch --show-current` before
-touching code, and branch off `main` when you are on it.
+1. **Start on `main`** — `git switch main && git pull` (check
+   `git branch --show-current` first; never start from a stale checkout).
+2. **Branch off `main`** with a short descriptive name (`<type>/<slug>`, see
+   *Branch naming* below).
+3. **Do the work** on that branch, in small Conventional Commits.
+4. **Rebase-linear before merging**: `git switch main && git pull`, then
+   `git switch <branch> && git rebase main` so the branch sits on the latest
+   `main` (a rebase, not a merge — history stays linear).
+5. **Open a PR** with base `main`, pass the verification loop, and let `main`
+   receive the squash-merge. The branch is deleted once merged.
+6. **Return to `main`** for the next task — a fresh branch, never reusing one.
+
+Keep one PR to one thing (see *Before you start*) and the branch short-lived.
+
+This rule applies to agents too — run the full loop by default; do not stop at
+"branch off `main`" or ask which base to use. The base is always `main`.
+
+### Branch naming
+
+A branch name is `<type>/<slug>`:
+
+- **`type`** is the Conventional Commits type, matching the change's nature:
+  `feat/`, `fix/`, `docs/`, `refactor/`, `test/`, `chore/`, `ci/`, `build/`,
+  `perf/`, `revert/`. A branch that only touches docs (including `.scratch/`)
+  is `docs/`; a release cut is `release-<version>` (no slash).
+- **`slug`** is short, `kebab-case`, and says what the branch changes — the
+  noun of the change, not the whole sentence. One feature, one fix, one branch.
+
+Examples:
+
+```
+feat/bridge-dir-recent-card
+fix/switch-card-action-tag
+docs/feishu-permissions
+release-0.6.2
+```
 
 ## Commit conventions
 
