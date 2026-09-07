@@ -77,6 +77,17 @@ async fn wait_dead(pid: i32, timeout_ms: u64) -> bool {
     }
 }
 
+/// Whether a demand-time spawn is wanted for this reconcile pass.
+///
+/// `allow_spawn` is the message-path demand (Lazy Start). `heal_when_busy` is
+/// the poll-path heal: also spawn when a turn is in flight and the server is
+/// gone, so a mid-stream generation's next poll finds a live server instead of
+/// 502ing forever. `Never` policy is enforced separately by
+/// `ServerStartPolicy::spawns_when_needed`.
+fn want_to_spawn(allow_spawn: bool, heal_when_busy: bool, busy: bool) -> bool {
+    allow_spawn || (heal_when_busy && busy)
+}
+
 /// One pass of the server-ownership reconcile (ADR-0013): attach to the
 /// preferred default-store server (a Coexistent Server over cola's Owned),
 /// lazily spawn an Owned Server when `allow_spawn` and none exists, and reap a
@@ -85,19 +96,37 @@ async fn wait_dead(pid: i32, timeout_ms: u64) -> bool {
 /// runs it with `allow_spawn=true` at the moment a server is needed.
 ///
 /// Returns whether a server is attached (or was just started).
-async fn reconcile(core: &Arc<SharedCore>, allow_spawn: bool) -> crate::error::Result<bool> {
+///
+/// `heal_when_busy` lets a poll (not a new message) spawn an Owned Server when a
+/// turn is already in flight and the attached server died — the mid-stream
+/// generation's next poll should find a live server instead of 502ing forever.
+/// Spawns only if `allow_spawn` OR (`heal_when_busy` and a turn is busy), and
+/// only when the policy allows it (`Never` never spawns).
+async fn reconcile(
+    core: &Arc<SharedCore>,
+    allow_spawn: bool,
+    heal_when_busy: bool,
+) -> crate::error::Result<bool> {
     let candidates = discovery::scan_processes();
     let self_pid = discovery::self_spawned_pid();
     let Some(server) = discovery::pick_server(&candidates, core.preferred_port, self_pid) else {
         // No default-store server at all. Lazy Start: spawn an Owned Server on
         // demand; otherwise stay serverless (the caller replies that OpenCode
         // is unavailable).
-        if allow_spawn && core.server_start.spawns_when_needed() {
+        let want_spawn = want_to_spawn(allow_spawn, heal_when_busy, busy(core).await);
+        if want_spawn && core.server_start.spawns_when_needed() {
             let spawned = discovery::spawn_own_server(core.preferred_port)
                 .await
                 .map_err(|e| crate::error::BridgeError::OpenCode(format!("lazy start failed: {e}")))?;
             core.opencode.reconnect(&spawned.url, &spawned.password).await?;
-            tracing::info!("lazily started own OpenCode server at {}", spawned.url);
+            if allow_spawn {
+                tracing::info!("lazily started own OpenCode server at {}", spawned.url);
+            } else {
+                tracing::warn!(
+                    "attached server died mid-turn; started own OpenCode server at {}",
+                    spawned.url
+                );
+            }
             return Ok(true);
         }
         // The attached server, if any, is gone — go serverless so a later
@@ -139,13 +168,15 @@ async fn reconcile(core: &Arc<SharedCore>, allow_spawn: bool) -> crate::error::R
 /// another tool like OpenChamber, which can restart it (new pid/port/password)
 /// or raise a Coexistent Server after cola started its own. Reconcile every few
 /// seconds so cola re-attaches instead of 502ing against a dead port forever,
-/// and yields its Owned Server when a Coexistent one appears. Never spawns —
-/// Lazy Start is the demand path.
+/// and yields its Owned Server when a Coexistent one appears. Does not spawn
+/// for idle sessions — Lazy Start is the demand path — but heals a server that
+/// died while a turn was in flight (`heal_when_busy`), so a mid-stream
+/// generation's next poll finds a live server.
 pub(crate) async fn reconnect_poll_loop(core: &Arc<SharedCore>) -> crate::error::Result<()> {
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(RECONNECT_POLL_INTERVAL_SECS)).await;
         let _guard = core.server_lock.lock().await;
-        if let Err(e) = reconcile(core, false).await {
+        if let Err(e) = reconcile(core, false, true).await {
             tracing::warn!("server reconcile failed: {}", e);
         }
     }
@@ -172,7 +203,7 @@ pub(crate) async fn ensure_server(core: &Arc<SharedCore>) -> crate::error::Resul
         return Ok(true);
     }
     let _guard = core.server_lock.lock().await;
-    reconcile(core, true).await
+    reconcile(core, true, true).await
 }
 
 /// Where to deliver a permission/question card.
@@ -413,6 +444,25 @@ mod tests {
         assert!(!current_is_owned(&servers, Some(7), "http://localhost:4097"));
         assert!(!current_is_owned(&servers, Some(7), "http://mock"));
         assert!(!current_is_owned(&servers, Some(7), ""));
+    }
+
+    #[test]
+    fn want_to_spawn_message_path_always_spawns() {
+        // Lazy Start (allow_spawn) spawns regardless of busy state.
+        assert!(want_to_spawn(true, false, false));
+        assert!(want_to_spawn(true, false, true));
+        assert!(want_to_spawn(true, true, false));
+        assert!(want_to_spawn(true, true, true));
+    }
+
+    #[test]
+    fn want_to_spawn_poll_path_spawns_only_when_busy() {
+        // Poll path (allow_spawn=false) spawns to heal a dead server only when
+        // a turn is in flight; an idle poll stays serverless (no resource churn).
+        assert!(!want_to_spawn(false, true, false));
+        assert!(want_to_spawn(false, true, true));
+        assert!(!want_to_spawn(false, false, false));
+        assert!(!want_to_spawn(false, false, true));
     }
 
     /// A shared core whose `session_info` serves the given parent map, so the
