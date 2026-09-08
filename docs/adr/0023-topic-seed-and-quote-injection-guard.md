@@ -38,13 +38,23 @@ genuine quote of a real message.
   both `topic_root` and `topic_anchor`, so neither card's text is ever injected,
   and richness costs no tokens. Feishu card limits (30 KB, 200 elements) leave
   ample headroom.
-- **Title sync after the first turn**: OpenCode auto-generates a session title
-  after the first exchange (and `/name` changes it later). After each completed
-  turn cola compares the server title (`GET /session/{id}`) against the one
-  recorded in memory (`core.cover_titles`) and, when it changed, patches the
-  cover card in place via `update_message` — the chat-list topic entry follows.
-  The recorded title is in-memory only; after a restart the next completed turn
-  re-syncs once (same content, harmless).
+- **Title sync**: OpenCode auto-generates a session title after the first
+  exchange (and `/name` changes it later). The title agent races the turn and
+  can land mid-turn or just after it, so the cover card follows through three
+  sync points, all sharing `sync_topic_cover_title`:
+  1. **Mid-turn**: every render tick that refreshes the live card's subtitle
+     (`refresh_session_title`) patches the cover card the moment the server
+     title changes — the chat-list entry updates as early as the title agent
+     finishes, with no per-tick cost beyond the existing session-info GET.
+  2. **Turn end**: after each completed turn cola compares the server title
+     against the recorded one and patches when it changed.
+  3. **Post-turn retry ladder**: when the turn-end sync did not settle (the
+     auto-title had not landed yet), a detached task retries at 10/30/60/120 s
+     after the turn and stops at the first settled attempt — a short first
+     turn can otherwise leave the entry stale until the next message.
+  A default title (`New session - <ts>` or empty) is never patched over the
+  recorded creation title. The recorded title is in-memory only; after a
+  restart the next completed turn re-syncs once (same content, harmless).
 
 ## Why
 
