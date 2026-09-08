@@ -583,12 +583,8 @@ pub(crate) async fn handle_command(
             // in the topic (the create API rejects `thread_id` as a target).
             let cover_text =
                 topic_seed_brief("已创建会话", &display_name, &dir_str, &session.id, None, None).await;
-            let cover_id = send_topic_cover(core, &thread_key.chat_id, &cover_text).await;
-            let root_msg = cover_id.as_deref().unwrap_or(message_id);
-            let (anchor, thread_id) = core
-                .feishu
-                .reply_in_thread(root_msg, "请在本话题内回复，即可和这个会话对话。")
-                .await?;
+            let (anchor, thread_id, topic_root, cover_id) =
+                open_cover_topic(core, &thread_key.chat_id, message_id, &cover_text).await?;
             let Some(thread_id) = thread_id else {
                 tracing::warn!(
                     "topic: no thread_id returned for /topic in chat {}; not mapping session",
@@ -603,7 +599,6 @@ pub(crate) async fn handle_command(
                 return Ok(());
             };
             let topic_key = crate::config::ThreadKey::new(thread_key.chat_id.clone(), thread_id.clone());
-            let topic_root = cover_id.clone().unwrap_or_else(|| message_id.to_string());
             let entry = crate::config::SessionEntry {
                 thread_key: topic_key,
                 session_id: session.id.clone(),
@@ -619,18 +614,7 @@ pub(crate) async fn handle_command(
             store.set_active(entry);
             store.persist()?;
             drop(store);
-            // Only a cover-rooted topic is patchable later (Feishu updates only
-            // the app's own cards) — record the title shown so the post-turn
-            // hook can sync the auto-generated title onto the cover card.
-            if cover_id.is_some() {
-                core.cover_titles.lock().await.insert(
-                    session.id.clone(),
-                    crate::bridge::core::CoverTitle {
-                        title: display_name.clone(),
-                        model: None,
-                    },
-                );
-            }
+            record_cover_title(core, &session.id, &display_name, None, cover_id.is_some()).await;
             core.invalidate_session_list_cache().await;
             tracing::info!(
                 "topic: created topic {} for session {} in chat {}",
@@ -1698,12 +1682,8 @@ pub(crate) async fn create_topic_and_map_adopted(
     )
     .await;
     let model_line = model_display(info.model.as_ref());
-    let cover_id = send_topic_cover(core, &thread_key.chat_id, &cover_text).await;
-    let root_msg = cover_id.as_deref().unwrap_or(message_id);
-    let (anchor, thread_id) = core
-        .feishu
-        .reply_in_thread(root_msg, "请在本话题内回复，即可和这个会话对话。")
-        .await?;
+    let (anchor, thread_id, topic_root, cover_id) =
+        open_cover_topic(core, &thread_key.chat_id, message_id, &cover_text).await?;
     let Some(thread_id) = thread_id else {
         tracing::warn!(
             "topic-adopt: no thread_id returned in chat {}; not mapping session",
@@ -1712,7 +1692,6 @@ pub(crate) async fn create_topic_and_map_adopted(
         return Ok(None);
     };
     let topic_key = crate::config::ThreadKey::new(thread_key.chat_id.clone(), thread_id.clone());
-    let topic_root = cover_id.clone().unwrap_or_else(|| message_id.to_string());
     let entry = SessionEntry {
         thread_key: topic_key,
         session_id: info.id.clone(),
@@ -1729,15 +1708,7 @@ pub(crate) async fn create_topic_and_map_adopted(
         store.set_active(entry);
         store.persist()?;
     }
-    if cover_id.is_some() {
-        core.cover_titles.lock().await.insert(
-            info.id.clone(),
-            crate::bridge::core::CoverTitle {
-                title: info.title.clone(),
-                model: model_line,
-            },
-        );
-    }
+    record_cover_title(core, &info.id, &info.title, model_line, cover_id.is_some()).await;
     core.invalidate_session_list_cache().await;
     Ok(Some(thread_id))
 }
@@ -1931,6 +1902,54 @@ async fn send_topic_cover(core: &Arc<SharedCore>, chat_id: &str, text: &str) -> 
             tracing::warn!("topic cover card send failed: {e}; anchoring on the command message");
             None
         }
+    }
+}
+
+/// ADR-0023: open a topic whose root is the topic cover card — the session
+/// brief sent to the chat's top level, so the chat-list topic entry shows it
+/// permanently. Best-effort: when the cover send fails, the thread anchors on
+/// `fallback_root` (the user's command message) instead. Returns the created
+/// reply's message id (the in-topic anchor), the new thread_id, the root
+/// message id (`topic_root`), and the cover id (`None` on fallback). Shared by
+/// `/topic` and `/topic --adopt`.
+async fn open_cover_topic(
+    core: &Arc<SharedCore>,
+    chat_id: &str,
+    fallback_root: &str,
+    cover_text: &str,
+) -> crate::error::Result<(String, Option<String>, String, Option<String>)> {
+    let cover_id = send_topic_cover(core, chat_id, cover_text).await;
+    let root = cover_id.clone().unwrap_or_else(|| fallback_root.to_string());
+    let (anchor, thread_id) = core
+        .feishu
+        .reply_in_thread(&root, "请在本话题内回复，即可和这个会话对话。")
+        .await?;
+    Ok((anchor, thread_id, root, cover_id))
+}
+
+/// ADR-0023: record the title shown on a topic's cover card so the post-turn
+/// hook can sync the server title onto the card. Only cover-rooted topics are
+/// patchable (Feishu updates only the app's own cards) — when no cover card
+/// was sent, any stale entry is dropped so nothing is ever patched onto a
+/// user message.
+async fn record_cover_title(
+    core: &Arc<SharedCore>,
+    session_id: &str,
+    title: &str,
+    model: Option<String>,
+    cover_sent: bool,
+) {
+    let mut covers = core.cover_titles.lock().await;
+    if cover_sent {
+        covers.insert(
+            session_id.to_string(),
+            crate::bridge::core::CoverTitle {
+                title: title.to_string(),
+                model,
+            },
+        );
+    } else {
+        covers.remove(session_id);
     }
 }
 

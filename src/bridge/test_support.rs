@@ -3109,6 +3109,17 @@ pub(crate) mod integration_tests {
         let proj = tempfile::tempdir().unwrap();
         let proj_dir = proj.path().to_string_lossy().to_string();
 
+        // A stale cover-title entry may already exist (e.g. the session was
+        // previously adopted into a cover-rooted topic); the fallback must drop
+        // it so the post-turn hook never patches the user's command message.
+        app.core.cover_titles.lock().await.insert(
+            "ses_test".into(),
+            crate::bridge::core::CoverTitle {
+                title: "旧封面".into(),
+                model: None,
+            },
+        );
+
         crate::bridge::command::handle_command(
             &app.core,
             Command::Topic {
@@ -3141,7 +3152,7 @@ pub(crate) mod integration_tests {
         assert_eq!(entry.topic_root.as_deref(), Some("msg_topic"));
         assert!(
             app.core.cover_titles.lock().await.is_empty(),
-            "no cover title may be recorded without a cover card"
+            "no cover title may survive without a cover card"
         );
     }
 
@@ -4355,6 +4366,15 @@ pub(crate) mod integration_tests {
                 variant: None,
             });
         }
+        // The cover-title sync state belongs to the topic, not the session —
+        // it must move to the recreated session so the hook keeps patching.
+        app.core.cover_titles.lock().await.insert(
+            "ses_old".into(),
+            crate::bridge::core::CoverTitle {
+                title: "旧标题".into(),
+                model: None,
+            },
+        );
 
         // The first message 404s on the stale session; cola recreates and retries.
         app.handle_message(crate::bridge::IncomingMessage {
@@ -4380,6 +4400,10 @@ pub(crate) mod integration_tests {
         assert_eq!(entry.session_id, "ses_new");
         assert_eq!(entry.topic_anchor.as_deref(), Some("om_seed"));
         assert_eq!(entry.topic_root.as_deref(), Some("om_root_cmd"));
+        // The cover-title sync state moved to the recreated session id.
+        let covers = app.core.cover_titles.lock().await.clone();
+        assert!(!covers.contains_key("ses_old"), "stale cover title must move");
+        assert_eq!(covers.get("ses_new").map(|c| c.title.as_str()), Some("旧标题"));
 
         // A later plain reply pointing at the root must still skip injection.
         prompt_calls.lock().await.clear();

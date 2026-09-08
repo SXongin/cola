@@ -603,6 +603,15 @@ impl App {
                 inflight.remove(&session_id);
                 inflight.insert(fresh_id.clone());
             }
+            // The cover card belongs to the topic, not the dead session — move
+            // its recorded title to the fresh session so the title-sync hook
+            // keeps patching the card after the recreate (ADR-0023).
+            {
+                let mut covers = self.cover_titles.lock().await;
+                if let Some(cover) = covers.remove(&session_id) {
+                    covers.insert(fresh_id.clone(), cover);
+                }
+            }
             session_id = fresh_id;
             // The fresh session resets the per-session overrides, so the retry
             // is sent without a variant — re-capture what THIS prompt carries.
