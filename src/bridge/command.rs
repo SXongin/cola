@@ -655,9 +655,12 @@ pub(crate) async fn handle_command(
             // `/name` PATCHes the server title (ADR-0007): the change is
             // visible to every client sharing the store, and the `/list`
             // cache is invalidated so the new title shows immediately.
+            // For a cover-rooted topic, patch the cover card right away too —
+            // the chat-list topic entry is its content (ADR-0023).
             if let Some(id) = core.get_session_id(&thread_key).await {
                 core.opencode.update_session_title(&id, &name).await?;
                 core.invalidate_session_list_cache().await;
+                sync_topic_cover_title(core, &id).await;
             }
             core.feishu
                 .reply_text(message_id, &format!("Renamed to \"{}\".", name))
@@ -1900,6 +1903,67 @@ async fn open_cover_topic(
         .reply_in_thread(&root, "请在本话题内回复，即可和这个会话对话。")
         .await?;
     Ok((anchor, thread_id, root, cover_id))
+}
+
+/// ADR-0023: when the server's session title differs from the one shown on the
+/// topic cover card, rebuild the card in place. The cover card is the thread
+/// root, so this is what the chat-list topic entry displays — the patch keeps
+/// the entry current after the first auto-generated title (post-turn hook) or
+/// an immediate `/name`. The recorded title lives only in memory: after a
+/// restart the next completed turn re-syncs the card once (same content,
+/// harmless). Best effort; failures only log. Only cover-rooted topics are
+/// patched — command-rooted fallback topics record nothing, so they
+/// short-circuit.
+pub(crate) async fn sync_topic_cover_title(core: &Arc<SharedCore>, session_id: &str) {
+    let (root_id, directory, agent, recorded) = {
+        let store = core.sessions.lock().await;
+        match store.entry_for_session(session_id) {
+            Some(e) => {
+                let recorded = core.cover_titles.lock().await.get(session_id).cloned();
+                (
+                    e.topic_root.clone(),
+                    e.directory.clone(),
+                    e.agent.clone(),
+                    recorded,
+                )
+            }
+            None => return,
+        }
+    };
+    let (Some(root_id), Some(recorded)) = (root_id, recorded) else {
+        return;
+    };
+    let Ok(info) = core.opencode.session_info(session_id, Some(&directory)).await else {
+        return;
+    };
+    let Some(title) = info.title.filter(|t| !t.is_empty()) else {
+        return;
+    };
+    if title == recorded.title {
+        return;
+    }
+    let text = topic_cover_text(
+        &title,
+        &directory,
+        session_id,
+        agent.as_deref(),
+        recorded.model.as_deref(),
+    )
+    .await;
+    let card = crate::feishu::client::markdown_card(&text);
+    match core.feishu.update_message(&root_id, &card).await {
+        Ok(()) => {
+            tracing::info!("topic cover card updated for session {}: {}", session_id, title);
+            core.cover_titles.lock().await.insert(
+                session_id.to_string(),
+                crate::bridge::core::CoverTitle {
+                    title,
+                    model: recorded.model,
+                },
+            );
+        }
+        Err(e) => tracing::warn!("topic cover card update failed for session {}: {}", session_id, e),
+    }
 }
 
 /// ADR-0023: record the title shown on a topic's cover card so the post-turn
