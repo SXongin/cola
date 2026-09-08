@@ -47,8 +47,16 @@ _Avoid_: Conversation, room, group
 _UI label_: 聊天 (the Feishu-side container; a Feishu user's own term). Feishu's own UI calls the top-level thing a 会话, which is exactly the collision cola avoids — cola never uses 会话 for this.
 
 **Topic**:
-A Feishu thread inside a Chat, identified by `thread_id` (`omt_...`; called "话题" in the Feishu UI). A message is a topic message IFF it carries `thread_id`. A topic holds exactly one Session; the boundary that isolates one session from another.
+A Feishu thread inside a Chat, identified by `thread_id` (`omt_...`; called "话题" in the Feishu UI). A message is a topic message IFF it carries `thread_id`. A topic holds exactly one Session; the boundary that isolates one session from another. A topic is created around a message (its Topic Root) and is usually opened by cola with a seed card (Topic Anchor).
 _UI label_: 话题.
+
+**Topic Root**:
+The message a Feishu topic is created around. For a cola-created topic (`/topic`, `/topic --adopt`) this is the user's own command message — it stays in the main Chat while also anchoring the thread; for a manually-created topic it is the user's message the topic was made on. Persisted as `topic_root`. Distinct from Topic Anchor: the Root is the thread's first message (user-typed, outside/at the boundary of the topic), the Anchor is the first reply inside it (bot-typed).
+_Avoid_: Seed, anchor, topic message
+
+**Topic Anchor**:
+The bot's seed card inside a cola-created topic — the `/topic` confirmation message, the first reply inside the thread. Doubles as the reply target that keeps permission/question/external cards inside the topic (the create API rejects a `thread_id` as target). Persisted as `topic_anchor`. Distinct from Topic Root: the Anchor is inside the topic, the Root is the message the thread is built around. Never injected as prompt context (ADR-0023).
+_Avoid_: Root, seed message, confirmation card
 
 **Turn**:
 A single user→assistant exchange inside a Session (one prompt plus its streamed card response). cola's internal vocabulary is the English word "turn" (Turn Footer, ADR-0019); there is deliberately NO user-facing Chinese noun for it — the UI never labels individual turns. If one is ever needed, use 轮次/本轮.
@@ -94,7 +102,7 @@ A Feishu interactive message card. Evolves through states (loading → reasoning
 _Avoid_: Widget, component, bubble
 
 **Quoted Context**:
-The parent message's content (text + attached images) that a reply answers, fetched from the platform and prepended to the prompt. Makes the reply relationship explicit and covers parents missing from session history (lobby-switch, compaction). Distinct from the user's own message text, which is the prompt's primary content.
+The parent message's content (text + attached images) that a reply answers, fetched from the platform and prepended to the prompt. Makes the reply relationship explicit and covers parents missing from session history (lobby-switch, compaction). Distinct from the user's own message text, which is the prompt's primary content. Never applied to the topic's own Topic Root or Topic Anchor — they are creation boilerplate, not genuine quotes (ADR-0023).
 _Avoid_: Quote, reference, reply context
 
 **Image Attachment**:
@@ -121,6 +129,7 @@ _Avoid_: alive, running, process alive (all ambiguous — they include the mid-`
 
 - A **Bot** contains one **Platform** and one or more **Backend** adapters
 - A **Chat** contains many **Topics**; a **Chat** may hold several **Sessions** directly (lobby), while a **Topic** holds exactly one **Session**
+- A **Topic** is created around its **Topic Root** and, when cola opens it, is anchored on its **Topic Anchor**
 - A **Session** contains many **Turns** and has one **Project** and one optional **Agent**
 - A **Session** receives many **Permissions** and **Questions**
 - The **Bridge** receives **Events** from a **Backend** and renders them as **Card** updates on the **Platform**
@@ -150,6 +159,7 @@ _Avoid_: Notification, message, signal
 
 - A **Bot** contains one **Platform** and one or more **Backend** adapters
 - A **Chat** contains many **Topics**; a **Chat** may hold several **Sessions** directly (lobby), while a **Topic** holds exactly one **Session**
+- A **Topic** is created around its **Topic Root** and, when cola opens it, is anchored on its **Topic Anchor**
 - A **Session** contains many **Turns** and has one **Project** and one optional **Agent**
 - A **Session** receives many **Permissions** and **Questions**
 - The **Bridge** receives **Events** from a **Backend** and renders them as **Card** updates on the **Platform**
