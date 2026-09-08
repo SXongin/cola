@@ -6393,6 +6393,85 @@ pub(crate) mod integration_tests {
         );
     }
 
+    /// ADR-0023: `/name` inside a cover-rooted topic patches the cover card
+    /// IMMEDIATELY (no waiting for the next completed turn) — the chat-list
+    /// topic entry is the card's content.
+    #[tokio::test]
+    async fn name_patches_cover_card_in_cover_rooted_topic() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        // The server title after the PATCH (the mock records the call but the
+        // GET /session/{id} response comes from this map).
+        backend
+            .session_titles
+            .lock()
+            .unwrap()
+            .insert("ses_test".into(), "新名字".into());
+        let (app, platform) = build_app(cfg, backend).await;
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
+                session_id: "ses_test".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: Some("om_seed".into()),
+                topic_root: Some("om_cover".into()),
+                variant: None,
+            });
+        }
+        app.core.cover_titles.lock().await.insert(
+            "ses_test".into(),
+            crate::bridge::core::CoverTitle {
+                title: "旧标题".into(),
+                model: None,
+            },
+        );
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Name("新名字".into()),
+            crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
+            "msg_name",
+            crate::config::ConversationKind::Topic,
+        )
+        .await
+        .unwrap();
+
+        let calls = platform.calls.lock().await.clone();
+        let patched = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::UpdateMessage { message_id, card } if message_id == "om_cover" => {
+                    Some(card.to_string())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !patched.is_empty(),
+            "the cover card must be patched right away, got {calls:?}"
+        );
+        assert!(
+            patched.last().unwrap().contains("新名字"),
+            "cover card must show the new title: {:?}",
+            patched.last()
+        );
+        assert_eq!(
+            app.core
+                .cover_titles
+                .lock()
+                .await
+                .get("ses_test")
+                .map(|c| c.title.clone()),
+            Some("新名字".to_string())
+        );
+    }
+
     /// `/model <provider/model>` records a per-session override (the OpenCode
     /// server has no model-switch endpoint) and the NEXT prompt carries it.
     #[tokio::test]

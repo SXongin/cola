@@ -731,7 +731,7 @@ impl App {
         // `/name` — patch the cover card (the thread root) in place, so the
         // chat-list topic entry stays current. Best effort; failures only log.
         if prompt_err.is_none() {
-            self.maybe_update_topic_cover(&session_id).await;
+            crate::bridge::command::sync_topic_cover_title(&self.core, &session_id).await;
         }
 
         // Baseline for the external-message poller: the newest user message cola
@@ -849,66 +849,6 @@ impl App {
         store.persist()?;
         self.invalidate_session_list_cache().await;
         Ok(session.id)
-    }
-
-    /// ADR-0023: when the server's session title differs from the one shown on
-    /// the topic cover card, rebuild the card in place. The cover card is the
-    /// thread root, so this is what the chat-list topic entry displays — the
-    /// patch keeps the entry current after the first auto-generated title or a
-    /// `/name`. The recorded title lives only in memory: after a restart the
-    /// next completed turn re-syncs the card once (same content, harmless).
-    /// Best effort; failures only log. Only cover-rooted topics are patched —
-    /// command-rooted fallback topics record nothing, so they short-circuit.
-    async fn maybe_update_topic_cover(&self, session_id: &str) {
-        let (root_id, directory, agent, recorded) = {
-            let store = self.sessions.lock().await;
-            match store.entry_for_session(session_id) {
-                Some(e) => {
-                    let recorded = self.cover_titles.lock().await.get(session_id).cloned();
-                    (
-                        e.topic_root.clone(),
-                        e.directory.clone(),
-                        e.agent.clone(),
-                        recorded,
-                    )
-                }
-                None => return,
-            }
-        };
-        let (Some(root_id), Some(recorded)) = (root_id, recorded) else {
-            return;
-        };
-        let Ok(info) = self.opencode.session_info(session_id, Some(&directory)).await else {
-            return;
-        };
-        let Some(title) = info.title.filter(|t| !t.is_empty()) else {
-            return;
-        };
-        if title == recorded.title {
-            return;
-        }
-        let text = crate::bridge::command::topic_cover_text(
-            &title,
-            &directory,
-            session_id,
-            agent.as_deref(),
-            recorded.model.as_deref(),
-        )
-        .await;
-        let card = crate::feishu::client::markdown_card(&text);
-        match self.feishu.update_message(&root_id, &card).await {
-            Ok(()) => {
-                tracing::info!("topic cover card updated for session {}: {}", session_id, title);
-                self.cover_titles.lock().await.insert(
-                    session_id.to_string(),
-                    crate::bridge::core::CoverTitle {
-                        title,
-                        model: recorded.model,
-                    },
-                );
-            }
-            Err(e) => tracing::warn!("topic cover card update failed for session {}: {}", session_id, e),
-        }
     }
 
     /// Handle a card action (permission Allow/Deny, question answer/reject,
