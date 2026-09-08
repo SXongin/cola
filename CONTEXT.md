@@ -78,7 +78,7 @@ A working directory on the filesystem where OpenCode operates. A property of a s
 _Avoid_: Workspace, repo
 
 **Recent Directories** (「最近目录」):
-Directories of the most recently active sessions in the Shared Store, deduplicated by directory and sorted by last activity. A bare `/dir` (no argument) presents them as a picker card for one-tap re-rooting. The server's session list is the only source — cola records no folder history of its own.
+Directories of the most recently active sessions in the Shared Store, deduplicated by directory and sorted by last activity. A bare `/dir` (no argument) presents them as a picker card whose rows offer one-tap re-rooting into the current conversation or opening a new Topic for that directory (ADR-0025). The server's session list is the only source — cola records no folder history of its own.
 _Avoid_: Recently opened folders, folder history, recent projects
 
 **Variant**:
