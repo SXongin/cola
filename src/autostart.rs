@@ -57,12 +57,45 @@ pub(crate) fn supervisor_restart_command() -> Option<String> {
     }
 }
 
+/// The executable path a registered supervisor would start cola from — the
+/// systemd unit's `ExecStart` / the launchd agent's `ProgramArguments`.
+/// `None` when no supervisor is installed (or its binary cannot be parsed).
+/// The self-update flow compares this against the binary it just replaced so an
+/// ExecStart path mismatch surfaces as a warning instead of a silent stale
+/// daemon after the supervisor restart.
+pub(crate) fn supervisor_binary_path() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::supervisor_binary_path()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::supervisor_binary_path()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
 /// The absolute path of the running cola binary — what the launcher starts.
 fn exe_path() -> anyhow::Result<String> {
     let exe = std::env::current_exe().context("cannot resolve own executable path")?;
     let s = exe.to_string_lossy().into_owned();
     anyhow::ensure!(!s.trim().is_empty(), "empty executable path");
     Ok(s)
+}
+
+/// Read a supervisor config file and map its executable entry to a path
+/// (systemd `ExecStart=` / launchd `ProgramArguments`), shared by the
+/// platform-specific parsers.
+fn parse_supervisor_binary(
+    path: &std::path::Path,
+    parse: fn(&str) -> Option<String>,
+) -> Option<std::path::PathBuf> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| parse(&content).map(std::path::PathBuf::from))
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +220,72 @@ mod linux {
             .exists()
             .then(|| format!("systemctl --user restart {UNIT_NAME}"))
     }
+
+    /// Parse the executable from a systemd unit's `ExecStart=` line. The
+    /// generated unit quotes paths with spaces (`systemd_quote`); an unquoted
+    /// value may carry arguments, so only the first word is taken.
+    fn parse_exec_start(content: &str) -> Option<String> {
+        let line = content
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("ExecStart="))?;
+        let trimmed = line.trim();
+        if let Some(q) = trimmed.strip_prefix('"') {
+            q.strip_suffix('"').map(str::to_string)
+        } else {
+            Some(trimmed.split_whitespace().next()?.to_string())
+        }
+    }
+
+    /// The binary path the installed systemd unit would start.
+    pub(super) fn supervisor_binary_path() -> Option<std::path::PathBuf> {
+        parse_supervisor_binary(&unit_path(), parse_exec_start)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn sample_unit(exe: &str) -> String {
+            format!(
+                "[Unit]\n\
+                 Description=cola bridge bot (OpenCode to Feishu)\n\n\
+                 [Service]\n\
+                 Type=simple\n\
+                 ExecStart={}\n\
+                 Restart=on-failure\n",
+                exe
+            )
+        }
+
+        #[test]
+        fn parse_exec_start_plain_path() {
+            assert_eq!(
+                parse_exec_start(&sample_unit("/home/u/.local/bin/cola")).as_deref(),
+                Some("/home/u/.local/bin/cola")
+            );
+        }
+
+        #[test]
+        fn parse_exec_start_quoted_path_with_spaces() {
+            assert_eq!(
+                parse_exec_start(&sample_unit("\"/home/u/my apps/cola\"")).as_deref(),
+                Some("/home/u/my apps/cola")
+            );
+        }
+
+        #[test]
+        fn parse_exec_start_takes_first_word_of_args() {
+            assert_eq!(
+                parse_exec_start(&sample_unit("/usr/bin/cola --config /etc/cola.toml")).as_deref(),
+                Some("/usr/bin/cola")
+            );
+        }
+
+        #[test]
+        fn parse_exec_start_missing_line_is_none() {
+            assert_eq!(parse_exec_start("[Unit]\nDescription=no exec\n"), None);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -310,6 +409,54 @@ mod macos {
         plist_path()
             .exists()
             .then(|| format!("launchctl kickstart -k gui/{}/{}", uid(), LABEL))
+    }
+
+    /// Parse the first `ProgramArguments` string (the executable) from the
+    /// generated plist XML. The plist is machine-written by `plist_content`,
+    /// so a light scan for the block after the `<key>` is enough.
+    fn parse_program_arguments(content: &str) -> Option<String> {
+        let start = content.find("<key>ProgramArguments</key>")?;
+        let rest = &content[start..];
+        let open = rest.find("<string>")? + "<string>".len();
+        let close = rest[open..].find("</string>")? + open;
+        Some(rest[open..close].to_string())
+    }
+
+    /// The binary path the installed launchd agent would start.
+    pub(super) fn supervisor_binary_path() -> Option<std::path::PathBuf> {
+        parse_supervisor_binary(&plist_path(), parse_program_arguments)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parse_program_arguments_returns_executable() {
+            let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cola.bot</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/cola</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+"#;
+            assert_eq!(
+                parse_program_arguments(plist).as_deref(),
+                Some("/usr/local/bin/cola")
+            );
+        }
+
+        #[test]
+        fn parse_program_arguments_missing_key_is_none() {
+            assert_eq!(parse_program_arguments("<plist><dict></dict></plist>"), None);
+        }
     }
 }
 

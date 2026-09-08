@@ -358,8 +358,9 @@ fn stale_lock_owner(path: &std::path::Path) -> Option<i32> {
 
 /// The PID of a live cola daemon holding the singleton lock, if any. Used by
 /// `cola update` to decide whether to talk about "restart" (a daemon is
-/// running) or "start" (nothing is running) after replacing the binary.
-fn running_daemon_pid() -> Option<i32> {
+/// running) or "start" (nothing is running) after replacing the binary, and by
+/// `update::restart_cli` to verify a supervisor restart actually took effect.
+pub(crate) fn running_daemon_pid() -> Option<i32> {
     let raw = std::fs::read_to_string(lock_file_path()).ok()?;
     let pid = raw.trim().parse::<i32>().ok()?;
     (pid_alive(pid) && is_cola_process(pid)).then_some(pid)

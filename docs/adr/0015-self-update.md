@@ -12,7 +12,13 @@ in-band `cola update` / `/update` that reuses the existing restart machinery.
   downloads the asset matching the current platform triple, verifies it against
   the release's `SHA256SUMS`, extracts, and atomically replaces the running
   binary. Platforms with no prebuilt asset (e.g. Linux aarch64, macOS Intel)
-  get a clear "no binary for this platform" message.
+  get a clear "no binary for this platform" message. The latest-tag lookup uses
+  the **HTML `releases/latest` 302 redirect** (github.com, not `api.github.com`):
+  GET with redirects disabled, the tag is read from the `Location` header, and
+  the asset + `SHA256SUMS` URLs are constructed from the tag (`release.yml`
+  names them deterministically as `cola-<tag>-<triple>.tar.gz`/`.zip`). This
+  avoids the API endpoint's unauthenticated quota (60 req/hr/IP) entirely —
+  downloads are CDN-served and never count against it.
 - **Trigger**: manual only — a Feishu `/update` command (open to anyone, like
   `/restart`) and a `cola update [--check]` CLI subcommand. Startup does a
   silent check that logs when an update exists. No auto-apply, no periodic
@@ -25,7 +31,14 @@ in-band `cola update` / `/update` that reuses the existing restart machinery.
   and does not die with the CLI's terminal. When no supervisor restarts it, the
   CLI prints a hint that depends on whether a daemon is running (it checks the
   singleton lock): `/restart` in Feishu is only offered while a daemon is
-  actually up; a dead bot gets a plain "start cola" note.
+  actually up; a dead bot gets a plain "start cola" note. A supervisor restart
+  is only reported as successful **after verification**: the singleton lock
+  must move to a NEW daemon process running the freshly-installed binary
+  (guards against a manually-started instance still holding the lock — systemd
+  starts without `--replace` — or an ExecStart pointing at a different install
+  than the updated binary). The same ExecStart-vs-current-exe mismatch is
+  warned about before the binary is replaced, so an operator fixes the path
+  instead of discovering a silent stale daemon.
 - **Restart**: reuse the existing re-exec (`restart_process()` + `--replace` +
   singleton takeover + `restart-notify.json`) on every platform except one:
   when a systemd unit owns the cola process itself (detected via

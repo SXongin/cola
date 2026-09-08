@@ -96,39 +96,92 @@ pub struct UpdateInfo {
     pub sha256_url: String,
 }
 
-#[derive(serde::Deserialize)]
-struct Release {
-    tag_name: String,
-    assets: Vec<ReleaseAsset>,
+const REPO: &str = "SXongin/cola";
+const RELEASES_LATEST_URL: &str = "https://github.com/SXongin/cola/releases/latest";
+
+/// Extract the release tag from the `Location` header of the `releases/latest`
+/// redirect (e.g. `https://github.com/SXongin/cola/releases/tag/0.7.0` →
+/// `0.7.0`). Handles absolute and relative targets; a `v` prefix is left for
+/// the caller's semver parse (which tolerates it).
+fn latest_tag_from_location(location: &str) -> Option<String> {
+    if let Ok(url) = url::Url::parse(location) {
+        let last = url
+            .path_segments()
+            .and_then(|mut segs| segs.rfind(|s| !s.is_empty()));
+        if let Some(seg) = last {
+            return Some(seg.to_string());
+        }
+    }
+    // Relative `Location` (e.g. `/SXongin/cola/releases/tag/0.7.0`): the last
+    // path segment of the raw string. Must look like a path — a bare word is
+    // not a redirect target.
+    location
+        .strip_prefix('/')?
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
-#[derive(serde::Deserialize)]
-struct ReleaseAsset {
-    name: String,
-    browser_download_url: String,
+/// The release asset name for a platform triple, following `release.yml`'s
+/// packaging: `cola-<tag>-<triple>.tar.gz`, `.zip` on Windows.
+fn asset_name(tag: &str, triple: &str) -> String {
+    let ext = if triple.contains("windows") {
+        "zip"
+    } else {
+        "tar.gz"
+    };
+    format!("cola-{tag}-{triple}.{ext}")
 }
 
-const RELEASES_LATEST_URL: &str = "https://api.github.com/repos/SXongin/cola/releases/latest";
+/// The `releases/download` URL for an asset — github.com (redirecting to the
+/// asset CDN), not `api.github.com`, so downloads never touch the API quota.
+fn download_url(tag: &str, asset_name: &str) -> String {
+    format!("https://github.com/{REPO}/releases/download/{tag}/{asset_name}")
+}
 
 /// Query the latest GitHub release and decide whether an update is available.
+///
+/// Uses the HTML `releases/latest` redirect (github.com) instead of the
+/// `api.github.com` endpoint, whose unauthenticated quota is 60 req/hr/IP:
+/// GET with redirects disabled, read the tag from the `Location` header, and
+/// build the asset URLs from the tag (`release.yml` names them
+/// deterministically). Downloads are CDN-served and never count against the
+/// quota, so the whole update flow stays API-free.
 pub async fn check() -> anyhow::Result<UpdateCheck> {
     let current = current_version();
-    let client = reqwest::Client::new();
-    let release = client
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("build HTTP client")?;
+    let resp = client
         .get(RELEASES_LATEST_URL)
         .header(reqwest::header::USER_AGENT, "cola-self-update")
         .send()
         .await
-        .context("query GitHub releases/latest")?
+        .context("query GitHub releases/latest")?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!("GitHub 上没有已发布的版本（releases 为空）。");
+    }
+    let resp = resp
         .error_for_status()
-        .context("GitHub releases/latest returned an error")?
-        .json::<Release>()
-        .await
-        .context("parse GitHub releases/latest response")?;
-
+        .context("GitHub releases/latest returned an error")?;
+    anyhow::ensure!(
+        resp.status().is_redirection(),
+        "GitHub releases/latest returned {} (expected a redirect)",
+        resp.status()
+    );
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .context("GitHub releases/latest did not redirect (no Location header)")?;
+    let tag = latest_tag_from_location(location)
+        .with_context(|| format!("cannot parse release tag from redirect target `{location}`"))?;
     // Tags are strict semver without a v prefix (release.yml), but tolerate one.
-    let latest = Version::parse(release.tag_name.trim_start_matches('v'))
-        .with_context(|| format!("release tag `{}` is not semver", release.tag_name))?;
+    let latest = Version::parse(tag.trim_start_matches('v'))
+        .with_context(|| format!("release tag `{tag}` is not semver"))?;
     if latest <= current {
         return Ok(UpdateCheck::UpToDate);
     }
@@ -136,25 +189,14 @@ pub async fn check() -> anyhow::Result<UpdateCheck> {
     let Some(triple) = platform_triple() else {
         return Ok(UpdateCheck::NoAssetForPlatform { latest });
     };
-    let asset = select_asset(&release.assets, triple)
-        .with_context(|| format!("release {latest} has no asset for platform {triple}"))?;
-    let sha = release
-        .assets
-        .iter()
-        .find(|a| a.name == "SHA256SUMS")
-        .context("release has no SHA256SUMS")?;
+    let asset = asset_name(&tag, triple);
     Ok(UpdateCheck::Available(UpdateInfo {
         current,
         latest,
-        asset_name: asset.name.clone(),
-        asset_url: asset.browser_download_url.clone(),
-        sha256_url: sha.browser_download_url.clone(),
+        asset_name: asset.clone(),
+        asset_url: download_url(&tag, &asset),
+        sha256_url: download_url(&tag, "SHA256SUMS"),
     }))
-}
-
-/// The release asset whose name contains `triple` (e.g. `x86_64-unknown-linux-gnu`).
-fn select_asset<'a>(assets: &'a [ReleaseAsset], triple: &str) -> Option<&'a ReleaseAsset> {
-    assets.iter().find(|a| a.name.contains(triple))
 }
 
 /// The lower-case hex sha256 digest of a byte slice.
@@ -311,31 +353,105 @@ pub fn restart() -> ! {
     }
 }
 
+/// How long to wait for a supervisor restart to hand the singleton lock to a
+/// new daemon running the freshly-installed binary.
+const RESTART_VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Poll cadence while waiting for the restart to take effect.
+const RESTART_VERIFY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// The absolute path of the executable the given process is running (`None`
+/// when the process is not visible or reports no exe).
+fn process_exe_path(pid: i32) -> Option<std::path::PathBuf> {
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid as u32)]),
+        false,
+        sysinfo::ProcessRefreshKind::nothing().with_exe(sysinfo::UpdateKind::Always),
+    );
+    system
+        .process(sysinfo::Pid::from_u32(pid as u32))?
+        .exe()
+        .map(|p| p.to_path_buf())
+}
+
+/// Whether the given process is running the binary at `expected` (same resolved
+/// executable path). Confirms a supervisor restart brought up the freshly
+/// installed binary rather than a stale one from another install location (the
+/// ExecStart path-mismatch case).
+fn process_runs_binary(pid: i32, expected: &std::path::Path) -> bool {
+    let Some(exe) = process_exe_path(pid) else {
+        return false;
+    };
+    paths_equal(&exe, expected)
+}
+
+/// Whether two binary paths resolve to the same file (symlinks followed).
+fn paths_equal(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// Poll until the singleton lock is held by a DIFFERENT daemon process running
+/// `current_exe` — proof the supervisor restart brought up the new binary.
+/// Returns false when the deadline passes without that: the old daemon still
+/// holds the lock (manual instance outside the supervisor), or the unit's
+/// ExecStart points at a different binary than the one just updated.
+fn supervisor_restart_took_effect(old_pid: Option<i32>, current_exe: &std::path::Path) -> bool {
+    let deadline = std::time::Instant::now() + RESTART_VERIFY_TIMEOUT;
+    loop {
+        let new_pid = crate::running_daemon_pid();
+        if let Some(pid) = new_pid {
+            let different = old_pid.is_none_or(|old| pid != old);
+            if different && process_runs_binary(pid, current_exe) {
+                return true;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(RESTART_VERIFY_INTERVAL);
+    }
+}
+
 /// After the CLI has replaced the binary, restart a RUNNING daemon through its
 /// OS supervisor (systemd user unit / launchd agent) — a supervisor-mediated
 /// restart stays supervised and does not die with the CLI's terminal.
 ///
 /// Returns the message to print: `None` when the supervisor restarted the
-/// daemon, otherwise a hint tailored to whether a daemon is running. `/restart`
-/// in Feishu is only offered when `daemon_running` — a dead bot cannot answer.
+/// daemon **and verification confirmed the new process took the singleton lock
+/// running the freshly-installed binary**; otherwise a hint tailored to the
+/// situation. `/restart` in Feishu is only offered when `daemon_running` — a
+/// dead bot cannot answer.
+///
+/// The verification is what makes the CLI honest: `systemctl --user restart`
+/// reports success even when the new instance refuses to start (a manual daemon
+/// still holding the singleton lock — systemd starts without `--replace`) or
+/// when the unit's ExecStart points at a different binary path than the one the
+/// CLI just replaced. Both leave the old version running while the CLI would
+/// otherwise claim "restarted".
 pub fn restart_cli(daemon_running: bool) -> Option<String> {
-    let supervisor = crate::autostart::supervisor_restart_command();
-    if daemon_running {
-        if let Some(cmd) = supervisor.as_ref()
-            && matches!(
-                std::process::Command::new("sh").args(["-c", cmd]).status(),
-                Ok(s) if s.success()
-            )
-        {
-            return None;
-        }
-        let via = supervisor.map(|c| format!("，或 {c}")).unwrap_or_default();
-        Some(format!(
-            "运行中的 cola 仍是旧版本，重启生效：在飞书里发 /restart{via}。"
-        ))
-    } else {
-        Some("cola 尚未运行，更新已就绪。启动 cola 即生效。".to_string())
+    if !daemon_running {
+        return Some("cola 尚未运行，更新已就绪。启动 cola 即生效。".to_string());
     }
+    let Some(cmd) = crate::autostart::supervisor_restart_command() else {
+        return Some("运行中的 cola 仍是旧版本，重启生效：在飞书里发 /restart。".to_string());
+    };
+    let old_pid = crate::running_daemon_pid();
+    let restarted = matches!(
+        std::process::Command::new("sh").args(["-c", &cmd]).status(),
+        Ok(s) if s.success()
+    ) && std::env::current_exe()
+        .ok()
+        .map(|exe| supervisor_restart_took_effect(old_pid, &exe))
+        .unwrap_or(false);
+    if restarted {
+        return None;
+    }
+    Some(format!(
+        "⚠️ 监督者重启未确认生效：运行的 cola 仍是旧版本或未在运行（`{cmd}` 执行失败，或新进程未接管单例锁，或 ExecStart 与本次更新的路径不一致）。请检查，或在飞书里发 /restart。"
+    ))
 }
 
 /// How much of the update flow to run.
@@ -411,6 +527,22 @@ pub async fn run_update(reporter: &dyn UpdateReporter, mode: UpdateMode) -> Upda
                     return UpdateOutcome::Failed;
                 }
             };
+            // A supervisor registered earlier (systemd unit / launchd agent) has
+            // its ExecStart baked to the path it ran at registration time. If it
+            // points at a DIFFERENT binary than the one this update replaces,
+            // the supervisor restart would bring up the old version — warn now
+            // so the operator can fix the path instead of a silent stale daemon.
+            if let Some(supervisor_exe) = crate::autostart::supervisor_binary_path()
+                && !paths_equal(&supervisor_exe, &exe)
+            {
+                reporter
+                    .report(format!(
+                        "⚠️ 监督者（ExecStart）指向 {}，而本次更新的是 {}——监督者重启后仍会运行旧版本。请统一安装路径。",
+                        supervisor_exe.display(),
+                        exe.display()
+                    ))
+                    .await;
+            }
             let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
             // Extract in the same directory as the binary so the final rename
             // stays on one filesystem (an EXDEV rename would fail).
@@ -527,28 +659,91 @@ mod tests {
     }
 
     #[test]
-    fn select_asset_matches_by_triple() {
-        let assets = vec![
-            ReleaseAsset {
-                name: "cola-0.4.0-x86_64-unknown-linux-gnu.tar.gz".into(),
-                browser_download_url: "u1".into(),
-            },
-            ReleaseAsset {
-                name: "cola-0.4.0-aarch64-apple-darwin.tar.gz".into(),
-                browser_download_url: "u2".into(),
-            },
-            ReleaseAsset {
-                name: "SHA256SUMS".into(),
-                browser_download_url: "u3".into(),
-            },
-        ];
+    fn latest_tag_from_location_absolute_url() {
         assert_eq!(
-            select_asset(&assets, "x86_64-unknown-linux-gnu")
-                .unwrap()
-                .browser_download_url,
-            "u1"
+            latest_tag_from_location("https://github.com/SXongin/cola/releases/tag/0.7.0").as_deref(),
+            Some("0.7.0")
         );
-        assert!(select_asset(&assets, "aarch64-unknown-linux-gnu").is_none());
+    }
+
+    #[test]
+    fn latest_tag_from_location_relative_and_v_prefix() {
+        assert_eq!(
+            latest_tag_from_location("/SXongin/cola/releases/tag/v0.7.0").as_deref(),
+            Some("v0.7.0")
+        );
+    }
+
+    #[test]
+    fn latest_tag_from_location_trailing_slash() {
+        assert_eq!(
+            latest_tag_from_location("https://github.com/SXongin/cola/releases/tag/0.7.0/").as_deref(),
+            Some("0.7.0")
+        );
+    }
+
+    #[test]
+    fn latest_tag_from_location_rejects_garbage() {
+        assert_eq!(latest_tag_from_location("not-a-url"), None);
+        assert_eq!(latest_tag_from_location("https://github.com/"), None);
+    }
+
+    #[test]
+    fn asset_name_follows_release_yml_naming() {
+        assert_eq!(
+            asset_name("0.7.0", "x86_64-unknown-linux-gnu"),
+            "cola-0.7.0-x86_64-unknown-linux-gnu.tar.gz"
+        );
+        assert_eq!(
+            asset_name("0.7.0", "aarch64-apple-darwin"),
+            "cola-0.7.0-aarch64-apple-darwin.tar.gz"
+        );
+        assert_eq!(
+            asset_name("0.7.0", "x86_64-pc-windows-msvc"),
+            "cola-0.7.0-x86_64-pc-windows-msvc.zip"
+        );
+    }
+
+    #[test]
+    fn download_url_points_at_releases_download() {
+        assert_eq!(
+            download_url("0.7.0", "cola-0.7.0-x86_64-unknown-linux-gnu.tar.gz"),
+            "https://github.com/SXongin/cola/releases/download/0.7.0/cola-0.7.0-x86_64-unknown-linux-gnu.tar.gz"
+        );
+        assert_eq!(
+            download_url("0.7.0", "SHA256SUMS"),
+            "https://github.com/SXongin/cola/releases/download/0.7.0/SHA256SUMS"
+        );
+    }
+    #[test]
+    fn paths_equal_self_is_equal() {
+        let exe = std::env::current_exe().unwrap();
+        assert!(paths_equal(&exe, &exe));
+    }
+
+    #[test]
+    fn paths_equal_distinct_files_are_not_equal() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"y").unwrap();
+        assert!(!paths_equal(&a, &b));
+    }
+
+    #[test]
+    fn process_runs_binary_sees_own_binary() {
+        let exe = std::env::current_exe().unwrap();
+        assert!(process_runs_binary(std::process::id() as i32, &exe));
+    }
+
+    #[test]
+    fn process_runs_binary_rejects_other_binary() {
+        // A far-out PID is certainly not the test process.
+        assert!(!process_runs_binary(
+            i32::MAX - 1,
+            &std::env::current_exe().unwrap()
+        ));
     }
 
     #[cfg(not(target_os = "windows"))]
