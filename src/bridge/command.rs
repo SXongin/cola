@@ -1936,7 +1936,14 @@ pub(crate) async fn sync_topic_cover_title(core: &Arc<SharedCore>, session_id: &
     let Ok(info) = core.opencode.session_info(session_id, Some(&directory)).await else {
         return;
     };
-    let Some(title) = info.title.filter(|t| !t.is_empty()) else {
+    // Never patch a default title over the recorded one: the server's initial
+    // `New session - <ts>` (or empty) would otherwise replace the meaningful
+    // creation title (e.g. the directory name) the moment the auto-title has
+    // not (yet) been generated.
+    let Some(title) = info
+        .title
+        .filter(|t| !t.is_empty() && !crate::feishu::card::clean_session_label(t).is_empty())
+    else {
         return;
     };
     if title == recorded.title {

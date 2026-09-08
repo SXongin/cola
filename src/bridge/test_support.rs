@@ -1162,6 +1162,90 @@ pub(crate) mod integration_tests {
         assert!(!crate::bridge::render::refresh_session_title(&app.core, "ses_test").await);
     }
 
+    /// ADR-0023: when the server auto-titles a session MID-TURN, the render
+    /// tick that refreshes the live card's title must ALSO patch the topic
+    /// cover card — the chat-list entry updates as early as the title agent
+    /// finishes, not only when the turn completes.
+    #[tokio::test]
+    async fn refresh_session_title_syncs_cover_card_mid_turn() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mock = MockBackend::new(realistic_parts());
+        mock.session_titles
+            .lock()
+            .unwrap()
+            .insert("ses_test".into(), "修复登录鉴权问题".into());
+        let (app, platform) = build_app(cfg, mock).await;
+        let key = crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into());
+
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: key.clone(),
+                session_id: "ses_test".into(),
+                directory: "/tmp/x".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: Some("om_seed".into()),
+                topic_root: Some("om_cover".into()),
+                variant: None,
+            });
+        }
+        app.core.cover_titles.lock().await.insert(
+            "ses_test".into(),
+            crate::bridge::core::CoverTitle {
+                title: "cola".into(),
+                model: None,
+            },
+        );
+        // An in-flight turn whose card was captured with the OLD subtitle
+        // (before the server auto-titled the session).
+        let mut acc = crate::bridge::streaming::StreamAccumulator::new("test");
+        acc.reply_to_message_id = Some("msg_1".into());
+        acc.session_id = Some("ses_test".into());
+        {
+            let mut cards = app.cards.lock().await;
+            cards.insert(
+                "ses_test".into(),
+                crate::bridge::streaming::CardSession::new(acc, None),
+            );
+        }
+
+        let refreshed = crate::bridge::render::refresh_session_title(&app.core, "ses_test").await;
+        assert!(refreshed, "the mid-turn title change must refresh the card");
+
+        let calls = platform.calls.lock().await.clone();
+        let patched = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::UpdateMessage { message_id, card } if message_id == "om_cover" => {
+                    Some(card.to_string())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !patched.is_empty(),
+            "the cover card must be patched on the same tick, got {calls:?}"
+        );
+        assert!(
+            patched.last().unwrap().contains("修复登录鉴权问题"),
+            "cover card must show the auto-title: {:?}",
+            patched.last()
+        );
+        assert_eq!(
+            app.core
+                .cover_titles
+                .lock()
+                .await
+                .get("ses_test")
+                .map(|c| c.title.clone()),
+            Some("修复登录鉴权问题".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn long_answer_splits_across_cards_no_plain_text() {
         let _wd = test_work_dir();
@@ -6469,6 +6553,63 @@ pub(crate) mod integration_tests {
                 .get("ses_test")
                 .map(|c| c.title.clone()),
             Some("新名字".to_string())
+        );
+    }
+
+    /// ADR-0023: the server's default title (`New session - <ts>`) must never
+    /// be patched onto the cover card — it would replace the meaningful
+    /// creation title (the directory name) before the auto-title exists.
+    #[tokio::test]
+    async fn default_server_title_does_not_patch_cover_card() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        backend
+            .session_titles
+            .lock()
+            .unwrap()
+            .insert("ses_test".into(), "New session - 2024-12-14T05:33:00.000Z".into());
+        let (app, platform) = build_app(cfg, backend).await;
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
+                session_id: "ses_test".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: Some("om_seed".into()),
+                topic_root: Some("om_cover".into()),
+                variant: None,
+            });
+        }
+        app.core.cover_titles.lock().await.insert(
+            "ses_test".into(),
+            crate::bridge::core::CoverTitle {
+                title: "cola".into(),
+                model: None,
+            },
+        );
+
+        crate::bridge::command::sync_topic_cover_title(&app.core, "ses_test").await;
+
+        let calls = platform.calls.lock().await.clone();
+        assert!(
+            !calls.iter().any(
+                |c| matches!(c, PlatformCall::UpdateMessage { message_id, .. } if message_id == "om_cover")
+            ),
+            "the default title must not be patched onto the cover card: {calls:?}"
+        );
+        assert_eq!(
+            app.core
+                .cover_titles
+                .lock()
+                .await
+                .get("ses_test")
+                .map(|c| c.title.clone()),
+            Some("cola".to_string())
         );
     }
 
