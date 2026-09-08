@@ -3037,7 +3037,7 @@ pub(crate) mod integration_tests {
             })
             .expect("cover card JSON");
         assert!(
-            cover.contains("📌 `api-refactor`") && cover.contains("会话 `topic`"),
+            cover.contains("💬 `api-refactor`") && cover.contains("会话 `topic`"),
             "cover card should lead with the title and session, got: {cover}"
         );
         let seed = calls
