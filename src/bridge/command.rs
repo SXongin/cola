@@ -1853,7 +1853,7 @@ pub(crate) async fn topic_cover_text(
     model: Option<&str>,
 ) -> String {
     let git = crate::git::read_state(dir).await;
-    let mut s = format!("📌 `{title}`\n`{}`", dir_basename(dir));
+    let mut s = format!("💬 `{title}`\n`{}`", dir_basename(dir));
     if let Some(branch) = git.branch.as_deref() {
         s.push_str(&format!(" · `{branch}`{}", if git.dirty { " ⚠" } else { "" }));
     }
