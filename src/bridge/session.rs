@@ -124,6 +124,7 @@ mod tests {
             model: None,
             auto_accept: false,
             topic_anchor: None,
+            topic_root: None,
             variant: None,
         }
     }

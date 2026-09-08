@@ -469,6 +469,7 @@ pub(crate) async fn handle_command(
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             };
             let mut store = core.sessions.lock().await;
@@ -515,6 +516,7 @@ pub(crate) async fn handle_command(
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             };
             let mut store = core.sessions.lock().await;
@@ -576,14 +578,13 @@ pub(crate) async fn handle_command(
             // INSIDE the topic, so permission/question/external cards that
             // must be sent (no streaming card) can reply to it and stay in
             // the topic (the create API rejects `thread_id` as a target).
+            // The seed card is a session brief (ADR-0023): purely human-facing,
+            // never injected as prompt context.
             let (anchor, thread_id) = core
                 .feishu
                 .reply_in_thread(
                     message_id,
-                    &format!(
-                        "📌 已创建会话 `{}`（目录 `{}`）。\n请在本话题内回复，即可和这个会话对话。",
-                        display_name, dir_str
-                    ),
+                    &topic_seed_brief("已创建会话", &display_name, &dir_str, &session.id, None).await,
                 )
                 .await?;
             let Some(thread_id) = thread_id else {
@@ -608,6 +609,7 @@ pub(crate) async fn handle_command(
                 model: None,
                 auto_accept: false,
                 topic_anchor: Some(anchor),
+                topic_root: Some(message_id.to_string()),
                 variant: None,
             };
             let mut store = core.sessions.lock().await;
@@ -1674,10 +1676,14 @@ pub(crate) async fn create_topic_and_map_adopted(
         .feishu
         .reply_in_thread(
             message_id,
-            &format!(
-                "📌 已接管会话 `{}`（目录 `{}`）。\n请在本话题内回复，即可和这个会话对话。",
-                info.title, info.directory
-            ),
+            &topic_seed_brief(
+                "已接管会话",
+                &info.title,
+                &info.directory,
+                &info.id,
+                info.agent.as_deref(),
+            )
+            .await,
         )
         .await?;
     let Some(thread_id) = thread_id else {
@@ -1696,6 +1702,7 @@ pub(crate) async fn create_topic_and_map_adopted(
         model: None,
         auto_accept: false,
         topic_anchor: Some(anchor),
+        topic_root: Some(message_id.to_string()),
         variant: None,
     };
     {
@@ -1802,6 +1809,7 @@ async fn adopt_session(
         model: None,
         auto_accept: false,
         topic_anchor: anchor,
+        topic_root: None,
         variant: None,
     };
     {
@@ -1827,6 +1835,39 @@ async fn adopt_session(
 /// The last 7 characters of a session id (display suffix).
 pub(crate) fn id_tail(id: &str) -> String {
     id.strip_prefix("ses_").unwrap_or(id).chars().take(7).collect()
+}
+
+/// Build the seed card text for a cola-created topic (ADR-0023): a session
+/// brief — title, session-id tail, project, git state, agent — instead of the
+/// old one-line confirmation. Purely human-facing: the injection guard never
+/// feeds the topic's own root or anchor back into prompts, so richness costs
+/// no tokens. `verb` is the leading action phrase ("已创建会话"/"已接管会话").
+async fn topic_seed_brief(
+    verb: &str,
+    title: &str,
+    dir: &str,
+    session_id: &str,
+    agent: Option<&str>,
+) -> String {
+    let git = crate::git::read_state(dir).await;
+    let mut s = format!("📌 {verb} `{title}`\n");
+    s.push_str(&format!(
+        "会话 `{}` · 项目 `{}`",
+        id_tail(session_id),
+        dir_basename(dir)
+    ));
+    if let Some(branch) = git.branch.as_deref() {
+        s.push_str(&format!(
+            " · 分支 `{branch}`{}",
+            if git.dirty { " ⚠" } else { "" }
+        ));
+    }
+    s.push_str(&format!("\n目录 `{dir}`"));
+    if let Some(agent) = agent {
+        s.push_str(&format!(" · agent `{agent}`"));
+    }
+    s.push_str("\n\n请在本话题内回复，即可和这个会话对话。");
+    s
 }
 
 /// The basename of a working directory, for display (e.g. "cola" for
