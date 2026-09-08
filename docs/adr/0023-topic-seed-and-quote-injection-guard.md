@@ -80,5 +80,7 @@ genuine quote of a real message.
   longer exists and cola recreates it (`create_fresh_session`), the per-session
   overrides reset but `topic_root`/`topic_anchor` survive — they are Feishu
   message ids, not session state, so the guard keeps working after the recreate.
+  The recorded cover title moves to the recreated session id, so the title-sync
+  hook keeps patching the cover card too.
 - **The brief renders the model** as `providerID/modelID@variant` when the
   adopted session carries one (fresh `/topic` sessions have none and omit it).
