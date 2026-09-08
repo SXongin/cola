@@ -568,17 +568,27 @@ impl App {
             // Remove the dead mapping and create a FRESH session on the current
             // server — never fall through to another stale mapping for the
             // thread. Reuse the dead session's directory so the user keeps
-            // working in the same project.
-            let old_dir = {
+            // working in the same project, and keep its topic creation
+            // messages (ADR-0023) so the injection guard survives the recreate.
+            let old_entry = {
                 let mut store = self.sessions.lock().await;
-                let dir = store.remove(&session_id).map(|e| e.directory);
+                let entry = store.remove(&session_id);
                 store.persist()?;
-                dir
+                entry
             };
-            let directory = old_dir
-                .filter(|d| !d.is_empty())
+            let directory = old_entry
+                .as_ref()
+                .and_then(|e| (!e.directory.is_empty()).then_some(e.directory.clone()))
                 .unwrap_or_else(|| self.default_session_directory());
-            let fresh_id = self.create_fresh_session(&thread_key, &text, directory).await?;
+            let fresh_id = self
+                .create_fresh_session(
+                    &thread_key,
+                    &text,
+                    directory,
+                    old_entry.as_ref().and_then(|e| e.topic_anchor.clone()),
+                    old_entry.as_ref().and_then(|e| e.topic_root.clone()),
+                )
+                .await?;
             // Re-key the session's live card (accumulator + card identity in
             // one CardSession) from the dead session to the new one — a single
             // remap instead of three maps kept in lockstep.
@@ -782,17 +792,25 @@ impl App {
             return Ok((id, false));
         }
         let directory = self.default_session_directory();
-        let id = self.create_fresh_session(thread_key, text, directory).await?;
+        let id = self
+            .create_fresh_session(thread_key, text, directory, None, None)
+            .await?;
         Ok((id, true))
     }
 
     /// Create a brand-new session on the current server and make it the active
     /// one for the thread. Used when a mapped session no longer exists (404).
+    /// The per-session overrides (agent/model/variant/auto_accept) reset to
+    /// defaults, but the topic's creation messages (`topic_anchor`/`topic_root`,
+    /// ADR-0023) are Feishu message ids — not session state — and survive so the
+    /// quote-injection guard keeps working after the recreate.
     async fn create_fresh_session(
         &self,
         thread_key: &ThreadKey,
         _text: &str,
         directory: String,
+        topic_anchor: Option<String>,
+        topic_root: Option<String>,
     ) -> crate::error::Result<String> {
         let session = self
             .opencode
@@ -805,8 +823,8 @@ impl App {
             agent: None,
             model: None,
             auto_accept: false,
-            topic_anchor: None,
-            topic_root: None,
+            topic_anchor,
+            topic_root,
             variant: None,
         };
         let mut store = self.sessions.lock().await;
