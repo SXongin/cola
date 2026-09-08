@@ -11,7 +11,8 @@ Users could pick a model via `/model` but had no way to control how hard the mod
 
 ## Consequences
 
-- SessionStore entries gain a `variant: Option<String>`; `/think default|off|reset` clears it, and it is persisted across restarts like `/model`.
+- SessionStore entries gain a `variant: Option<String>`; `/think --reset` (or the card's dedicated `think_clear` button) clears it, and it is persisted across restarts like `/model`.
+- **Clearing is a mechanism, never a value word.** The "默认（清除）" card button carries its OWN `think_clear` action tag, and the text form reserves the `--reset` flag — so the *value* namespace holds only real variant names. A variant literally named `default`/`off`/`reset` stays selectable, and cola never depends on the server's internal `default` variant sentinel (`Session.Info.model.variant === "default"`) to mean "unset".
 - `list_models` (`GET /provider`) must carry each model's declared variants, used by both the `/think` card and the `/model` auto-clear check.
 - `inject_model` must now write `variant` (currently drops it); the turn footer renders `provider/model@variant` from the session store.
 - The `/think` card resolves the current model as session override → configured default → server-recorded session model (`GET /session/{id}`); with none of those it tells the user to `/model` first. A model with no declared variants gets a text prompt, not a card.

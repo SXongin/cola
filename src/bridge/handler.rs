@@ -869,9 +869,11 @@ impl App {
             "retry" => self.handle_retry_action(&value).await,
             "switch" => self.handle_switch_card_action(&self.core, &value).await,
             "dir" => self.handle_dir_card_action(&self.core, &value).await,
-            "agent" => self.handle_agent_card_action(&self.core, &value).await,
+            "agent" => self.handle_agent_card_action(&self.core, &value, false).await,
+            "agent_clear" => self.handle_agent_card_action(&self.core, &value, true).await,
             "model" => self.handle_model_card_action(&self.core, &value).await,
-            "think" => self.handle_think_card_action(&self.core, &value).await,
+            "think" => self.handle_think_card_action(&self.core, &value, false).await,
+            "think_clear" => self.handle_think_card_action(&self.core, &value, true).await,
             "autoaccept" => self.handle_autoaccept_card_action(&self.core, &value).await,
             _ => None,
         }
@@ -1233,13 +1235,18 @@ impl App {
     }
 
     /// Handle an `/agent` picker-card button: record the per-session override
-    /// and refresh the card.
+    /// (action `agent`), or clear it via the dedicated `agent_clear` button.
+    /// Clearing is carried by the ACTION tag, never a value word — an agent
+    /// literally named like a clear verb stays selectable (ADR-0020), so
+    /// `clear` is a dispatch flag, not a value predicate. Refreshes the card so
+    /// the current agent updates.
     async fn handle_agent_card_action(
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
         value: &serde_json::Value,
+        clear: bool,
     ) -> Option<CardActionResult> {
-        let agent = value
+        let picked = value
             .get("value")
             .and_then(|v| v.as_str())
             .unwrap_or("")
@@ -1254,7 +1261,7 @@ impl App {
                 )),
             });
         };
-        entry.agent = Some(agent.clone());
+        entry.agent = if clear { None } else { Some(picked.clone()) };
         {
             let mut store = core.sessions.lock().await;
             store.set_active(entry);
@@ -1262,10 +1269,14 @@ impl App {
                 tracing::warn!("agent card: persist failed: {}", e);
             }
         }
-        let agents = core.opencode.list_agents().await;
+        let (card, _error) = crate::bridge::command::agent_card(core, &thread_key).await;
         Some(CardActionResult {
-            card: Some(crate::feishu::card::build_agent_card(&thread_key, &agents)),
-            toast: Some(format!("Agent: {agent}（下一条消息开始生效）")),
+            card,
+            toast: Some(if clear {
+                "已清除 Agent（回到服务器默认）".to_string()
+            } else {
+                format!("Agent: {picked}（下一条消息开始生效）")
+            }),
         })
     }
 
@@ -1339,16 +1350,20 @@ impl App {
         })
     }
 
-    /// Handle a `/think` card button: record the chosen variant (or clear it
-    /// via "default") as the session's per-prompt override, then refresh the
-    /// card so the current selection updates. Best-effort validation: a pick is
-    /// rejected only when the effective model is resolvable AND positively
-    /// lacks the variant (ADR-0020); unknown models fall through to the
-    /// server's `VariantUnavailableError`.
+    /// Handle a `/think` card button: record the chosen variant (action
+    /// `think`), or clear it via the dedicated `think_clear` button. Clearing
+    /// is carried by the ACTION tag, never a value word — a variant literally
+    /// named like a clear verb stays selectable (ADR-0020), so `clear` is a
+    /// dispatch flag, not a value predicate. Refreshes the card so the current
+    /// selection updates. Best-effort validation: a pick is rejected only when
+    /// the effective model is resolvable AND positively lacks the variant
+    /// (ADR-0020); unknown models fall through to the server's
+    /// `VariantUnavailableError`.
     async fn handle_think_card_action(
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
         value: &serde_json::Value,
+        clear: bool,
     ) -> Option<CardActionResult> {
         let picked = value
             .get("value")
@@ -1356,7 +1371,6 @@ impl App {
             .unwrap_or("")
             .to_string();
         let thread_key = thread_key_from_value(value);
-        let cleared = crate::bridge::command::is_clear_variant(&picked);
         let Some(mut entry) = core.sessions.lock().await.get_active(&thread_key).cloned() else {
             return Some(CardActionResult {
                 card: None,
@@ -1366,7 +1380,7 @@ impl App {
                 )),
             });
         };
-        if !cleared
+        if !clear
             && let Some((provider, model)) = core.effective_model(&entry.session_id).await
             && let Some(variants) = core.model_variants(&provider, &model).await
             && !variants.iter().any(|v| v == &picked)
@@ -1376,7 +1390,7 @@ impl App {
                 toast: Some(format!("当前模型 `{provider}/{model}` 不支持思考等级 `{picked}`")),
             });
         }
-        entry.variant = if cleared { None } else { Some(picked.clone()) };
+        entry.variant = if clear { None } else { Some(picked.clone()) };
         {
             let mut store = core.sessions.lock().await;
             store.set_active(entry);
@@ -1387,7 +1401,7 @@ impl App {
         let (card, _error) = crate::bridge::command::think_card(core, &thread_key).await;
         Some(CardActionResult {
             card,
-            toast: Some(if cleared {
+            toast: Some(if clear {
                 "已清除思考等级（回到模型默认）".to_string()
             } else {
                 format!("Thinking: {}（下一条消息开始生效）", picked)

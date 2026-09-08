@@ -1086,7 +1086,7 @@ fn option_picker_card(
     action: &str,
     options: &[(String, String)],
 ) -> serde_json::Value {
-    picker_card(header, intro, thread_key, action, None, false, options)
+    picker_card(header, intro, thread_key, action, None, false, None, options)
 }
 
 /// The `/model` picker-card back button's value: clicking it returns from a
@@ -1117,7 +1117,12 @@ impl PickerLevel {
 /// A picker card whose buttons carry an optional `level` (two-step navigation
 /// for the `/model` provider → model flow) and an optional leading "back"
 /// button. Each button's callback payload is `{action, chat_id, thread_id,
-/// [level], value}`.
+/// [level], value}`. An optional leading clear button (`clear = Some((label,
+/// action))`) carries its OWN action tag: "clear/reset" never shares the value
+/// namespace with the options, so an option literally named like a clear verb
+/// stays selectable (ADR-0020's `--reset` decoupling — clearing is a mechanism,
+/// not a value).
+#[allow(clippy::too_many_arguments)] // picker builder: every knob is a first-class card axis
 fn picker_card(
     header: &str,
     intro: &str,
@@ -1125,6 +1130,7 @@ fn picker_card(
     action: &str,
     level: Option<PickerLevel>,
     back: bool,
+    clear: Option<(&str, &str)>,
     options: &[(String, String)],
 ) -> serde_json::Value {
     let mut elements: Vec<serde_json::Value> = vec![json!({ "tag": "markdown", "content": intro })];
@@ -1140,6 +1146,20 @@ fn picker_card(
                 "thread_id": thread_key.thread_id,
                 "level": PickerLevel::Provider.as_str(),
                 "value": PICKER_BACK_TO_PROVIDERS,
+            },
+        }));
+    }
+    if let Some((label, clear_action)) = clear {
+        elements.push(json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": label },
+            "type": "default",
+            "width": "fill",
+            "value": {
+                "action": clear_action,
+                "chat_id": thread_key.chat_id,
+                "thread_id": thread_key.thread_id,
+                "value": "",
             },
         }));
     }
@@ -1172,23 +1192,49 @@ fn picker_card(
     })
 }
 
-/// The `/agent` picker card: one button per available agent. Falls back to an
-/// empty intro when no agents are listed (the backend is unreachable).
+/// The `/agent` picker card: one button per available agent plus a separate
+/// "默认（清除）" button carrying its OWN `agent_clear` action tag — clearing is
+/// a mechanism, never a value word, so an agent literally named `default` stays
+/// selectable (ADR-0020). The intro shows the CURRENT agent: the per-session
+/// override (`override_agent`) when set, else the server's default agent name
+/// (`default_agent`, annotated 默认). Falls back to an empty intro when no
+/// agents are listed (the backend is unreachable).
 pub fn build_agent_card(
     thread_key: &crate::config::ThreadKey,
     agents: &[crate::opencode::client::AgentInfo],
+    override_agent: Option<&str>,
+    default_agent: Option<&str>,
 ) -> serde_json::Value {
     let intro = if agents.is_empty() {
-        "_(没有可用 agent)_"
+        "_(没有可用 agent)_".to_string()
     } else {
-        "**选择 agent**（下一条消息开始生效）："
+        let current = match (override_agent, default_agent) {
+            (Some(name), _) => format!("**当前 Agent**：`{name}`\n"),
+            (None, Some(name)) => format!("**当前 Agent**：`{name}`（默认）\n"),
+            (None, None) => String::new(),
+        };
+        format!("{current}**选择 agent**（下一条消息开始生效）：")
     };
     let options: Vec<(String, String)> = agents
         .iter()
         .filter(|a| a.hidden != Some(true))
         .map(|a| (a.name.clone(), a.name.clone()))
         .collect();
-    option_picker_card("🤖 选择 Agent", intro, thread_key, "agent", &options)
+    let empty = agents.is_empty();
+    picker_card(
+        "🤖 选择 Agent",
+        &intro,
+        thread_key,
+        "agent",
+        None,
+        false,
+        if empty {
+            None
+        } else {
+            Some(("默认（清除）", "agent_clear"))
+        },
+        &options,
+    )
 }
 
 /// The `/model` picker, step 1: one card page per set of `provider` buttons.
@@ -1219,6 +1265,7 @@ pub fn build_model_provider_cards(
             "model",
             Some(PickerLevel::Provider),
             false,
+            None,
             &[],
         )];
     }
@@ -1229,6 +1276,7 @@ pub fn build_model_provider_cards(
         "model",
         Some(PickerLevel::Provider),
         false,
+        None,
         &options,
     )
 }
@@ -1257,6 +1305,7 @@ pub fn build_model_picker_cards(
             "model",
             Some(PickerLevel::Model),
             true,
+            None,
             &[],
         )];
     }
@@ -1267,6 +1316,7 @@ pub fn build_model_picker_cards(
         "model",
         Some(PickerLevel::Model),
         true,
+        None,
         &options,
     )
 }
@@ -1281,6 +1331,7 @@ pub const MAX_PICKER_BUTTONS_PER_CARD: usize = 80;
 /// Build picker cards from `options`, chunking so each card stays under
 /// Feishu's component and JSON-size ceilings. Each card beyond the first
 /// carries a page hint so the user knows there is more.
+#[allow(clippy::too_many_arguments)] // picker builder: every knob is a first-class card axis
 fn chunk_picker_cards(
     header: &str,
     intro: &str,
@@ -1288,6 +1339,7 @@ fn chunk_picker_cards(
     action: &str,
     level: Option<PickerLevel>,
     back: bool,
+    clear: Option<(&str, &str)>,
     options: &[(String, String)],
 ) -> Vec<serde_json::Value> {
     let mut pages: Vec<&[(String, String)]> = Vec::new();
@@ -1326,6 +1378,7 @@ fn chunk_picker_cards(
             action,
             level,
             back,
+            clear,
             page,
         ));
     }
@@ -1346,8 +1399,11 @@ pub fn build_autoaccept_card(thread_key: &crate::config::ThreadKey, current_on: 
 }
 
 /// The `/think` picker card (ADR-0020): the current model, its declared
-/// variants (each model's own set — no universal scale), and a "默认（清除）"
-/// button. `current` is the session's active variant (None = server default).
+/// variants (each model's own set — no universal scale), and a separate
+/// "默认（清除）" button carrying its OWN `think_clear` action tag. Clearing is
+/// a mechanism, never a value word: a variant literally named `default`/`off`/
+/// `reset` stays selectable, and nothing depends on the server's `default`
+/// sentinel. `current` is the session's active variant (None = server default).
 /// Only built when `variants` is non-empty — the caller replies a text message
 /// for models that declare none.
 pub fn build_think_card(
@@ -1363,11 +1419,17 @@ pub fn build_think_card(
         .unwrap_or_else(|| "默认".to_string());
     let intro =
         format!("**当前模型**：`{label}`\n**当前思考等级**：{current_label}\n选择后下一条消息开始生效：");
-    let mut options = vec![("默认（清除）".to_string(), "default".to_string())];
-    for v in variants {
-        options.push((v.clone(), v.clone()));
-    }
-    option_picker_card("🧠 思考等级", &intro, thread_key, "think", &options)
+    let options: Vec<(String, String)> = variants.iter().map(|v| (v.clone(), v.clone())).collect();
+    picker_card(
+        "🧠 思考等级",
+        &intro,
+        thread_key,
+        "think",
+        None,
+        false,
+        Some(("默认（清除）", "think_clear")),
+        &options,
+    )
 }
 
 /// The `/help` reference card: a pure command manual grouped by 会话 / 操作 /
@@ -1835,8 +1897,9 @@ mod tests {
     }
 
     /// The `/think` card lists the current model, its declared variants, and a
-    /// "默认（清除）" button; each button carries the `think` action and the
-    /// routing payload.
+    /// "默认（清除）" button carrying its OWN `think_clear` action tag — the
+    /// value namespace holds only real variants, so a variant literally named
+    /// like a clear verb stays selectable (ADR-0020 `--reset` decoupling).
     #[test]
     fn think_card_lists_model_and_variants() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
@@ -1852,8 +1915,79 @@ mod tests {
         assert!(text.contains("opencode-go/deepseek-v4-flash"), "model: {text}");
         assert!(text.contains("当前思考等级"), "current label: {text}");
         assert!(text.contains("默认（清除）"), "default option: {text}");
+        assert!(
+            text.contains("\"action\":\"think_clear\""),
+            "clear action tag: {text}"
+        );
+        assert!(
+            !text.contains("\"value\":\"default\""),
+            "clear must not overload a value: {text}"
+        );
         assert!(text.contains("\"value\":\"high\""), "variant button: {text}");
-        assert!(text.contains("\"action\":\"think\""), "action tag: {text}");
+        assert!(
+            text.contains("\"action\":\"think\""),
+            "variant action tag: {text}"
+        );
+    }
+
+    /// The `/agent` card shows the CURRENT agent (override, or the derived
+    /// server default annotated 默认), lists agents as buttons under the `agent`
+    /// action, and carries a separate "默认（清除）" button under its OWN
+    /// `agent_clear` action — an agent literally named `default` stays a
+    /// selectable value (ADR-0020). The empty degrade carries no clear button.
+    #[test]
+    fn agent_card_lists_current_and_clear_button() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let agents = vec![
+            crate::opencode::client::AgentInfo {
+                name: "default".into(),
+                description: None,
+                mode: Some("primary".into()),
+                hidden: Some(false),
+            },
+            crate::opencode::client::AgentInfo {
+                name: "build".into(),
+                description: None,
+                mode: Some("primary".into()),
+                hidden: Some(true),
+            },
+        ];
+        // No override → the server default `default` is the current agent.
+        let card = build_agent_card(&key, &agents, None, Some("default"));
+        let text = card.to_string();
+        assert!(text.contains("当前 Agent"), "current label: {text}");
+        assert!(text.contains("`default`（默认）"), "default current: {text}");
+        assert!(
+            text.contains("\"action\":\"agent_clear\""),
+            "clear action tag: {text}"
+        );
+        assert!(
+            text.contains("\"value\":\"default\""),
+            "agent named `default` is selectable: {text}"
+        );
+        assert!(
+            !text.contains("\"value\":\"build\""),
+            "hidden agent must not be listed: {text}"
+        );
+        assert!(text.contains("\"action\":\"agent\""), "agent action tag: {text}");
+
+        // Override set → shown without the 默认 annotation.
+        let card = build_agent_card(&key, &agents, Some("default"), Some("build"));
+        let text = card.to_string();
+        assert!(text.contains("`default`"), "override shown: {text}");
+        assert!(
+            !text.contains("`default`（默认）"),
+            "override is not the default annotation: {text}"
+        );
+
+        // Empty agents → degrade intro, no clear button.
+        let card = build_agent_card(&key, &[], None, None);
+        let text = card.to_string();
+        assert!(text.contains("没有可用 agent"), "degrade intro: {text}");
+        assert!(
+            !text.contains("agent_clear"),
+            "no clear button when empty: {text}"
+        );
     }
 
     #[test]

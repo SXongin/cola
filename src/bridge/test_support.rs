@@ -6317,20 +6317,37 @@ pub(crate) mod integration_tests {
         );
     }
 
-    /// `/agent` (no args) sends the agent-picker card; a button records the
-    /// per-session override.
+    /// `/agent` (no args) sends the agent-picker card: it shows the CURRENT
+    /// agent (the server's default when no override is set — derived as the
+    /// first primary non-hidden agent, skipping subagents), records an override
+    /// from a button, treats an agent literally named `default` as a normal
+    /// pick, and clears via the dedicated `agent_clear` action.
     #[tokio::test]
     async fn agent_card_picker_and_button() {
         let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
         let mut backend = MockBackend::new(realistic_parts());
-        backend.agents = vec![crate::opencode::client::AgentInfo {
-            name: "build".into(),
-            description: Some("build agent".into()),
-            mode: Some("primary".into()),
-            hidden: Some(false),
-        }];
+        backend.agents = vec![
+            crate::opencode::client::AgentInfo {
+                name: "sec-agent".into(),
+                description: Some("a subagent".into()),
+                mode: Some("subagent".into()),
+                hidden: Some(false),
+            },
+            crate::opencode::client::AgentInfo {
+                name: "build".into(),
+                description: Some("build agent".into()),
+                mode: Some("primary".into()),
+                hidden: Some(false),
+            },
+            crate::opencode::client::AgentInfo {
+                name: "default".into(),
+                description: Some("an agent literally named default".into()),
+                mode: Some("primary".into()),
+                hidden: Some(false),
+            },
+        ];
         let (app, platform) = build_app(cfg, backend).await;
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
         {
@@ -6366,8 +6383,36 @@ pub(crate) mod integration_tests {
             })
             .next()
             .expect("an agent card should be sent");
-        assert!(card.to_string().contains("build"), "agent button: {card}");
+        let text = card.to_string();
+        assert!(text.contains("当前 Agent"), "current label: {text}");
+        // The subagent sorts first in the fixture but is skipped: `build` is
+        // the derived server default.
+        assert!(text.contains("`build`（默认）"), "default agent: {text}");
+        assert!(
+            text.contains("\"action\":\"agent_clear\""),
+            "clear action: {text}"
+        );
+        assert!(
+            text.contains("\"value\":\"default\""),
+            "an agent named `default` is a selectable value: {text}"
+        );
 
+        // An agent literally named `default` is a normal pick, never a clear.
+        let literal_default = serde_json::json!({
+            "action": "agent",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "value": "default",
+        });
+        let result = app
+            .handle_card_action(literal_default)
+            .await
+            .expect("agent literal-default action");
+        assert!(result.card.is_some(), "refreshed card returned");
+        let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
+        assert_eq!(entry.agent.as_deref(), Some("default"));
+
+        // A real pick records the override.
         let value = serde_json::json!({
             "action": "agent",
             "chat_id": "chat_1",
@@ -6378,6 +6423,102 @@ pub(crate) mod integration_tests {
         assert!(result.card.is_some(), "refreshed card returned");
         let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
         assert_eq!(entry.agent.as_deref(), Some("build"));
+
+        // The dedicated `agent_clear` action clears it (mechanism, not value).
+        let clear = serde_json::json!({
+            "action": "agent_clear",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "value": "",
+        });
+        app.handle_card_action(clear).await.expect("agent clear action");
+        assert!(
+            app.sessions
+                .lock()
+                .await
+                .get_active(&key)
+                .and_then(|e| e.agent.clone())
+                .is_none(),
+            "agent_clear must clear the override"
+        );
+    }
+
+    /// `/agent --reset` (text) clears the per-session override; a bare agent
+    /// name never clears — it is always a pick.
+    #[tokio::test]
+    async fn agent_text_reset_flag_clears_override() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: key.clone(),
+                session_id: "ses_test".into(),
+                directory: "/tmp/aa".into(),
+                agent: Some("build".into()),
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+                topic_root: None,
+                variant: None,
+            });
+        }
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Agent("--reset".into()),
+            key.clone(),
+            "msg_agent_reset",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+        assert!(
+            app.sessions
+                .lock()
+                .await
+                .entry_for_session("ses_test")
+                .and_then(|e| e.agent.clone())
+                .is_none(),
+            "--reset must clear the agent override"
+        );
+        let text = platform
+            .calls
+            .lock()
+            .await
+            .clone()
+            .into_iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyText { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("已清除 Agent"), "clear reply: {text}");
+
+        // A bare name never clears — it records the override.
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Agent("build".into()),
+            key.clone(),
+            "msg_agent_set",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            app.sessions
+                .lock()
+                .await
+                .entry_for_session("ses_test")
+                .and_then(|e| e.agent.clone())
+                .as_deref(),
+            Some("build"),
+            "a bare agent name must be recorded, not clear"
+        );
     }
 
     /// `/autoaccept` (no args) sends the toggle card; a button flips the flag.
@@ -6873,9 +7014,10 @@ pub(crate) mod integration_tests {
         );
     }
 
-    /// `/think default` (and `off`/`reset`) clears the override.
+    /// `/think --reset` clears the override; the bare words `default`/`off`/`reset`
+    /// are ordinary variant picks now (never clear words — ADR-0020).
     #[tokio::test]
-    async fn think_command_clears_variant_with_default() {
+    async fn think_reset_flag_clears_variant() {
         let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
@@ -6898,7 +7040,7 @@ pub(crate) mod integration_tests {
 
         crate::bridge::command::handle_command(
             &app.core,
-            Command::Think("default".into()),
+            Command::Think("--reset".into()),
             key.clone(),
             "msg_think",
             crate::config::ConversationKind::P2p,
@@ -6913,7 +7055,108 @@ pub(crate) mod integration_tests {
                 .entry_for_session("ses_test")
                 .and_then(|e| e.variant.clone())
                 .is_none(),
-            "default must clear the variant"
+            "--reset must clear the variant"
+        );
+    }
+
+    /// A variant literally named `default` is a normal pick, never a clear
+    /// word: when the effective model doesn't declare it, `/think default` is
+    /// rejected (ADR-0020 decoupling).
+    #[tokio::test]
+    async fn think_bare_default_undeclared_is_rejected() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.provider_models = vec![crate::opencode::client::ProviderModels {
+            provider: "opencode-go".into(),
+            models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
+        }];
+        let (app, _platform) = build_app(cfg, backend).await;
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: key.clone(),
+                session_id: "ses_test".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                model: Some("opencode-go/deepseek-v4-flash".into()),
+                auto_accept: false,
+                topic_anchor: None,
+                topic_root: None,
+                variant: Some("high".into()),
+            });
+        }
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Think("default".into()),
+            key.clone(),
+            "msg_think",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+        assert!(
+            app.sessions
+                .lock()
+                .await
+                .entry_for_session("ses_test")
+                .and_then(|e| e.variant.clone())
+                .is_some(),
+            "an undeclared bare word must not clear the variant"
+        );
+    }
+
+    /// A variant literally named `default` that the model DOES declare is
+    /// stored as the override — the value namespace is never overloaded by the
+    /// clear mechanism (ADR-0020).
+    #[tokio::test]
+    async fn think_bare_default_declared_is_stored() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.provider_models = vec![crate::opencode::client::ProviderModels {
+            provider: "opencode-go".into(),
+            models: vec![model_option("deepseek-v4-flash", &["low", "default"])],
+        }];
+        let (app, _platform) = build_app(cfg, backend).await;
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: key.clone(),
+                session_id: "ses_test".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                model: Some("opencode-go/deepseek-v4-flash".into()),
+                auto_accept: false,
+                topic_anchor: None,
+                topic_root: None,
+                variant: None,
+            });
+        }
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Think("default".into()),
+            key.clone(),
+            "msg_think",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            app.sessions
+                .lock()
+                .await
+                .entry_for_session("ses_test")
+                .and_then(|e| e.variant.clone())
+                .as_deref(),
+            Some("default"),
+            "a declared `default` variant must be stored"
         );
     }
 
@@ -6975,7 +7218,9 @@ pub(crate) mod integration_tests {
     }
 
     /// A `/think` card button records the chosen variant and refreshes the
-    /// card; "default" clears it.
+    /// card; the dedicated `think_clear` action clears it, and a card button
+    /// whose value is literally `default` is rejected (not a clear — the value
+    /// namespace is never overloaded, ADR-0020).
     #[tokio::test]
     async fn think_card_button_records_variant() {
         let _wd = test_work_dir();
@@ -7014,12 +7259,35 @@ pub(crate) mod integration_tests {
         let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
         assert_eq!(entry.variant.as_deref(), Some("high"));
 
-        // "default" clears it.
-        let clear = serde_json::json!({
+        // A `think` action whose value is literally `default` is NOT a clear
+        // and NOT a pick (the declared set lacks it): the current `high`
+        // override must survive untouched.
+        let literal_default = serde_json::json!({
             "action": "think",
             "chat_id": "chat_1",
             "thread_id": "chat_1",
             "value": "default",
+        });
+        app.handle_card_action(literal_default)
+            .await
+            .expect("think literal-default action");
+        assert_eq!(
+            app.sessions
+                .lock()
+                .await
+                .get_active(&key)
+                .and_then(|e| e.variant.clone())
+                .as_deref(),
+            Some("high"),
+            "a literal `default` value must neither clear nor replace the variant"
+        );
+
+        // The dedicated `think_clear` action clears it (mechanism, not value).
+        let clear = serde_json::json!({
+            "action": "think_clear",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "value": "",
         });
         app.handle_card_action(clear).await.expect("think clear action");
         assert!(
@@ -7029,7 +7297,7 @@ pub(crate) mod integration_tests {
                 .get_active(&key)
                 .and_then(|e| e.variant.clone())
                 .is_none(),
-            "default must clear the variant"
+            "think_clear must clear the variant"
         );
     }
 

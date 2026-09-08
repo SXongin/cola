@@ -31,7 +31,9 @@ pub enum Command {
     Stop,
     /// Compact the current session context
     Compact,
-    /// Switch agent in the current session
+    /// Switch agent in the current session: an available agent name, or
+    /// `--reset` to clear the per-session override (back to the server's
+    /// default agent).
     Agent(String),
     /// `/agent` (no args) — interactive agent-picker card.
     AgentCard,
@@ -40,7 +42,7 @@ pub enum Command {
     /// `/model` (no args) — interactive model-picker card.
     ModelCard,
     /// Set the thinking level (model-declared variant) in the current session:
-    /// a concrete variant name, or `default`/`off`/`reset` to clear it.
+    /// a concrete variant name, or `--reset` to clear it.
     Think(String),
     /// `/think` (no args) — interactive variant-picker card.
     ThinkCard,
@@ -295,13 +297,13 @@ pub fn command_help(name: &str) -> Option<String> {
             "/compact\nCompact the current session's context: summarize older messages to free context window."
         }
         "agent" => {
-            "/agent <name>\nSwitch the agent for the current session — a per-session override sent on the NEXT message (the OpenCode server has no agent-switch endpoint; the session's own/default agent otherwise). Persisted across restarts. Unknown agent names surface as an error on the next prompt.\nExample: `/agent build`"
+            "/agent <name>\nSwitch the agent for the current session — a per-session override sent on the NEXT message (the OpenCode server has no agent-switch endpoint). Without an override the server's default agent applies; the card (`/agent` alone) shows the current one. `--reset` clears the override back to the server default. Persisted across restarts. Unknown agent names surface as an error on the next prompt.\nExample: `/agent build`"
         }
         "model" => {
             "/model <provider/model>\nSwitch the model for the current session — a per-session override sent on the NEXT message (the server has no model-switch endpoint; unset = the configured default / server default). Persisted across restarts.\nExample: `/model opencode-go/deepseek-v4-flash`"
         }
         "think" => {
-            "/think [等级]\nSet or clear the thinking level for the current session — a per-session override sent as `variant` on the NEXT message. Each model declares its own levels (e.g. `low`/`high`/`minimal`), so there is no universal scale: the card (`/think` alone) lists what the current model supports, and switching to a model that doesn't declare the current level clears it. `default`/`off`/`reset` clear the override (= the server's default for the model). Persisted across restarts.\nExample: `/think high`"
+            "/think [等级]\nSet or clear the thinking level for the current session — a per-session override sent as `variant` on the NEXT message. Each model declares its own levels (e.g. `low`/`high`/`minimal`), so there is no universal scale: the card (`/think` alone) lists what the current model supports, and switching to a model that doesn't declare the current level clears it. `--reset` clears the override (= the server's default for the model). Persisted across restarts.\nExample: `/think high`"
         }
         "autoaccept" => {
             "/autoaccept [on|off]\nShow or switch auto-allowing permission requests for this session (no permission cards).\nNo arg: show current state. `/autoaccept on` / `/autoaccept off` switch it.\nExample: `/autoaccept`"
@@ -391,12 +393,13 @@ impl<'a> crate::update::UpdateReporter for FeishuUpdateReporter<'a> {
     }
 }
 
-/// Whether a `/think` value means "clear the override" (ADR-0020). The card's
-/// "默认（清除）" button sends `default`; the text form also accepts `off` and
-/// `reset` as aliases. Defined once so the card handler and text handler can't
-/// drift apart on which values clear.
-pub(crate) fn is_clear_variant(value: &str) -> bool {
-    matches!(value, "default" | "off" | "reset")
+/// Whether a `/think` or `/agent` argument means "clear the override" — only
+/// the `--reset` flag. Clearing is a syntax mechanism, never a bare word: a
+/// variant or agent literally named `default`/`off`/`reset` stays selectable,
+/// and nothing depends on the server's own `default` sentinel (ADR-0020).
+/// Defined once so the text handlers and their tests can't drift apart.
+pub(crate) fn is_reset_flag(name: &str) -> bool {
+    name == "--reset"
 }
 
 /// Execute a parsed slash command against the shared core. Unrecognized
@@ -744,7 +747,9 @@ pub(crate) async fn handle_command(
             // in the SessionEntry so it survives a restart — and cola sends it as
             // a per-prompt agent on the next message (the server honors
             // `PromptInput.agent`). Unknown agent names surface as a clear error
-            // on the next prompt's card.
+            // on the next prompt's card. `--reset` clears the override (the
+            // server's default agent applies); an agent literally named
+            // `default`/`off`/`reset` is a normal pick, never a clear word.
             let entry = {
                 let store = core.sessions.lock().await;
                 store.get_active(&thread_key).cloned()
@@ -761,15 +766,19 @@ pub(crate) async fn handle_command(
                     .await?;
                 return Ok(());
             };
-            entry.agent = Some(name.clone());
+            let cleared = is_reset_flag(&name);
+            entry.agent = if cleared { None } else { Some(name.clone()) };
             {
                 let mut store = core.sessions.lock().await;
                 store.set_active(entry);
                 store.persist()?;
             }
-            core.feishu
-                .reply_text(message_id, &format!("Agent: {}（下一条消息开始生效）", name))
-                .await?;
+            let msg = if cleared {
+                "已清除 Agent（回到服务器默认）。".to_string()
+            } else {
+                format!("Agent: {}（下一条消息开始生效）", name)
+            };
+            core.feishu.reply_text(message_id, &msg).await?;
         }
         Command::ModelCard => {
             send_model_card(core, &thread_key, message_id).await?;
@@ -830,8 +839,10 @@ pub(crate) async fn handle_command(
         Command::Think(name) => {
             // The OpenCode server has no thinking-level endpoint either —
             // `/think` records a per-session variant override and cola sends it
-            // as a per-prompt `variant` on the next message. `default`/`off`/
-            // `reset` clear the override (the server's default for the model).
+            // as a per-prompt `variant` on the next message. `--reset` clears
+            // the override (the server's default for the model); a variant
+            // literally named `default`/`off`/`reset` is a normal pick, never
+            // a clear word.
             let Some(mut entry) = core.sessions.lock().await.get_active(&thread_key).cloned() else {
                 core.feishu
                     .reply_text(
@@ -844,7 +855,7 @@ pub(crate) async fn handle_command(
                     .await?;
                 return Ok(());
             };
-            let cleared = is_clear_variant(&name);
+            let cleared = is_reset_flag(&name);
             if !cleared
                 && let Some((provider, model)) = core.effective_model(&entry.session_id).await
                 && let Some(variants) = core.model_variants(&provider, &model).await
@@ -859,7 +870,7 @@ pub(crate) async fn handle_command(
                     .reply_text(
                         message_id,
                         &format!(
-                            "⚠️ 当前模型 `{provider}/{model}` 不支持思考等级 `{name}`。可用：{available}。"
+                            "⚠️ 当前模型 `{provider}/{model}` 不支持思考等级 `{name}`。可用：{available}。（清除请用 `/think --reset`）"
                         ),
                     )
                     .await?;
@@ -1204,15 +1215,62 @@ async fn send_dir_card(
     Ok(())
 }
 
-/// Send the `/agent` picker card (ADR-0012, issue 05): one button per agent.
+/// The first agent in `GET /agent` order that the server would actually run as
+/// its default: primary (not subagent) and visible (not hidden). Parity with
+/// opencode's `Agent.Service` `defaultInfo` fallback — `agent.list()` already
+/// sorts the configured default (or `build`) first, so the first primary
+/// visible agent in that order IS the server default; no `/config` round trip
+/// needed. Mirrors `defaultInfo`'s "first primary non-hidden agent".
+pub(crate) fn server_default_agent(agents: &[crate::opencode::client::AgentInfo]) -> Option<String> {
+    agents
+        .iter()
+        .find(|a| a.mode.as_deref() != Some("subagent") && a.hidden != Some(true))
+        .map(|a| a.name.clone())
+}
+
+/// Resolve what the `/agent` card should show for a thread's active session:
+/// the per-session override if set, else the server's default agent, plus the
+/// agent list. Shared by the text send path and the card-ack refresh so both
+/// render the current agent from one source of truth.
+pub(crate) async fn agent_card(
+    core: &Arc<SharedCore>,
+    thread_key: &ThreadKey,
+) -> (Option<serde_json::Value>, Option<String>) {
+    let Some(entry) = core.sessions.lock().await.get_active(thread_key).cloned() else {
+        return (
+            None,
+            Some(format!(
+                "{}还没有会话，先用 `/new` 或 `/dir` 创建。",
+                feishu_side_label(thread_key)
+            )),
+        );
+    };
+    let agents = core.opencode.list_agents().await;
+    let default = server_default_agent(&agents);
+    let card = crate::feishu::card::build_agent_card(
+        thread_key,
+        &agents,
+        entry.agent.as_deref(),
+        default.as_deref(),
+    );
+    (Some(card), None)
+}
+
+/// Send the `/agent` picker card, or a text explanation when there is no
+/// active session.
 async fn send_agent_card(
     core: &Arc<SharedCore>,
     thread_key: &ThreadKey,
     message_id: &str,
 ) -> crate::error::Result<()> {
-    let agents = core.opencode.list_agents().await;
-    let card = crate::feishu::card::build_agent_card(thread_key, &agents);
-    core.feishu.reply_card(message_id, &card).await?;
+    let (card, error) = agent_card(core, thread_key).await;
+    if let Some(c) = card {
+        core.feishu.reply_card(message_id, &c).await?;
+    } else {
+        core.feishu
+            .reply_text(message_id, &error.unwrap_or_default())
+            .await?;
+    }
     Ok(())
 }
 
@@ -2247,6 +2305,10 @@ mod tests {
         assert_eq!(
             parse_command("/think default"),
             Some(Command::Think("default".into()))
+        );
+        assert_eq!(
+            parse_command("/think --reset"),
+            Some(Command::Think("--reset".into()))
         );
     }
 
