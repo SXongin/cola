@@ -732,6 +732,10 @@ impl App {
         // chat-list topic entry stays current. Best effort; failures only log.
         if prompt_err.is_none() {
             crate::bridge::command::sync_topic_cover_title(&self.core, &session_id).await;
+            // The auto-title can still be in flight when a short turn ends
+            // (the title agent races the turn); retry with backoff so the
+            // cover follows even if the user stops here (ADR-0023).
+            crate::bridge::command::spawn_cover_title_retry(&self.core, &session_id);
         }
 
         // Baseline for the external-message poller: the newest user message cola
