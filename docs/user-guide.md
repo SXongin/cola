@@ -243,7 +243,7 @@ detailed help for any of these.
 | `/name <name>` | Rename current session (server-side, visible to all clients) |
 | `/stop` | Interrupt execution |
 | `/compact` | Compact context |
-| `/agent <name>` | Switch agent (takes effect next message; persisted) |
+| `/agent <name>` | Switch agent (takes effect next message; persisted; `--reset` clears to the server default) |
 | `/model <p/m>` | Switch model (takes effect next message; persisted) |
 | `/think [level]` | Set/clear thinking level, per model (takes effect next message) |
 | `/autoaccept [on\|off]` | Show/switch auto-allowing tool-permission requests for this session |
