@@ -51,8 +51,12 @@ A Feishu thread inside a Chat, identified by `thread_id` (`omt_...`; called "话
 _UI label_: 话题.
 
 **Topic Root**:
-The message a Feishu topic is created around. For a cola-created topic (`/topic`, `/topic --adopt`) this is the user's own command message — it stays in the main Chat while also anchoring the thread; for a manually-created topic it is the user's message the topic was made on. Persisted as `topic_root`. Distinct from Topic Anchor: the Root is the thread's first message (user-typed, outside/at the boundary of the topic), the Anchor is the first reply inside it (bot-typed).
+The message a Feishu topic is created around. For a cola-created topic (`/topic`, `/topic --adopt`) this is the bot's Topic Cover Card, sent to the main Chat at creation and then replied-in-thread; for a manually-created topic it is the user's message the topic was made on. Persisted as `topic_root`. Distinct from Topic Anchor: the Root is the thread's first message (outside/at the boundary of the topic), the Anchor is the first reply inside it (bot-typed). Never injected as prompt context (ADR-0023).
 _Avoid_: Seed, anchor, topic message
+
+**Topic Cover Card**:
+The bot's card that is the Topic Root of a cola-created topic. Sent to the main Chat at creation so the chat-list topic entry shows the session brief (title, session id, project, branch, directory, agent, model) permanently, then replied-in-thread to open the topic. Being an interactive card, cola patches it in place when the session title changes — auto-generated after the first exchange, or set by `/name` (ADR-0023). When the card cannot be sent, the topic falls back to anchoring on the user's `/topic` command message instead.
+_Avoid_: Cover message, topic stub, seed card
 
 **Topic Anchor**:
 The bot's confirmation card inside a topic, placed by `/topic` / `/topic --adopt` (the seed card) or by `/switch` / `/attach` inside an existing topic. Doubles as the reply target that keeps permission/question/external cards inside the topic (the create API rejects a `thread_id` as target). Persisted as `topic_anchor`. Distinct from Topic Root: the Anchor is inside the topic, the Root is the message the thread is built around. Never injected as prompt context (ADR-0023).
@@ -141,7 +145,7 @@ _Avoid_: Notification, message, signal
 
 - A **Bot** contains one **Platform** and one or more **Backend** adapters
 - A **Chat** contains many **Topics**; a **Chat** may hold several **Sessions** directly (lobby), while a **Topic** holds exactly one **Session**
-- A **Topic** is created around its **Topic Root** and, when cola opens it, is anchored on its **Topic Anchor**
+- A **Topic** is created around its **Topic Root** and, when cola opens it, is anchored on its **Topic Anchor**; a cola-created **Topic Root** is a **Topic Cover Card**
 - A **Session** contains many **Turns** and has one **Project** and one optional **Agent**
 - A **Session** receives many **Permissions** and **Questions**
 - The **Bridge** receives **Events** from a **Backend** and renders them as **Card** updates on the **Platform**

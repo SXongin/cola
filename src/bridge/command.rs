@@ -573,19 +573,21 @@ pub(crate) async fn handle_command(
                     .unwrap_or(&dir_str)
                     .to_string()
             });
-            // Create a real topic anchored on the user's command message.
-            // `anchor` is the created reply's own message_id — a message
-            // INSIDE the topic, so permission/question/external cards that
-            // must be sent (no streaming card) can reply to it and stay in
-            // the topic (the create API rejects `thread_id` as a target).
-            // The seed card is a session brief (ADR-0023): purely human-facing,
-            // never injected as prompt context.
+            // Create a real topic whose root is the topic cover card (ADR-0023): a
+            // session brief sent to the chat's top level, so the chat-list
+            // topic entry shows it permanently. The cover send is best-effort —
+            // on failure the thread anchors on the user's command message
+            // instead. `anchor` is the created reply's own message_id — a
+            // message INSIDE the topic, so permission/question/external cards
+            // that must be sent (no streaming card) can reply to it and stay
+            // in the topic (the create API rejects `thread_id` as a target).
+            let cover_text =
+                topic_seed_brief("已创建会话", &display_name, &dir_str, &session.id, None, None).await;
+            let cover_id = send_topic_cover(core, &thread_key.chat_id, &cover_text).await;
+            let root_msg = cover_id.as_deref().unwrap_or(message_id);
             let (anchor, thread_id) = core
                 .feishu
-                .reply_in_thread(
-                    message_id,
-                    &topic_seed_brief("已创建会话", &display_name, &dir_str, &session.id, None, None).await,
-                )
+                .reply_in_thread(root_msg, "请在本话题内回复，即可和这个会话对话。")
                 .await?;
             let Some(thread_id) = thread_id else {
                 tracing::warn!(
@@ -601,6 +603,7 @@ pub(crate) async fn handle_command(
                 return Ok(());
             };
             let topic_key = crate::config::ThreadKey::new(thread_key.chat_id.clone(), thread_id.clone());
+            let topic_root = cover_id.clone().unwrap_or_else(|| message_id.to_string());
             let entry = crate::config::SessionEntry {
                 thread_key: topic_key,
                 session_id: session.id.clone(),
@@ -609,12 +612,25 @@ pub(crate) async fn handle_command(
                 model: None,
                 auto_accept: false,
                 topic_anchor: Some(anchor),
-                topic_root: Some(message_id.to_string()),
+                topic_root: Some(topic_root),
                 variant: None,
             };
             let mut store = core.sessions.lock().await;
             store.set_active(entry);
             store.persist()?;
+            drop(store);
+            // Only a cover-rooted topic is patchable later (Feishu updates only
+            // the app's own cards) — record the title shown so the post-turn
+            // hook can sync the auto-generated title onto the cover card.
+            if cover_id.is_some() {
+                core.cover_titles.lock().await.insert(
+                    session.id.clone(),
+                    crate::bridge::core::CoverTitle {
+                        title: display_name.clone(),
+                        model: None,
+                    },
+                );
+            }
             core.invalidate_session_list_cache().await;
             tracing::info!(
                 "topic: created topic {} for session {} in chat {}",
@@ -1672,20 +1688,21 @@ pub(crate) async fn create_topic_and_map_adopted(
     info: &crate::opencode::SessionListInfo,
     message_id: &str,
 ) -> crate::error::Result<Option<String>> {
+    let cover_text = topic_seed_brief(
+        "已接管会话",
+        &info.title,
+        &info.directory,
+        &info.id,
+        info.agent.as_deref(),
+        model_display(info.model.as_ref()).as_deref(),
+    )
+    .await;
+    let model_line = model_display(info.model.as_ref());
+    let cover_id = send_topic_cover(core, &thread_key.chat_id, &cover_text).await;
+    let root_msg = cover_id.as_deref().unwrap_or(message_id);
     let (anchor, thread_id) = core
         .feishu
-        .reply_in_thread(
-            message_id,
-            &topic_seed_brief(
-                "已接管会话",
-                &info.title,
-                &info.directory,
-                &info.id,
-                info.agent.as_deref(),
-                model_display(info.model.as_ref()).as_deref(),
-            )
-            .await,
-        )
+        .reply_in_thread(root_msg, "请在本话题内回复，即可和这个会话对话。")
         .await?;
     let Some(thread_id) = thread_id else {
         tracing::warn!(
@@ -1695,6 +1712,7 @@ pub(crate) async fn create_topic_and_map_adopted(
         return Ok(None);
     };
     let topic_key = crate::config::ThreadKey::new(thread_key.chat_id.clone(), thread_id.clone());
+    let topic_root = cover_id.clone().unwrap_or_else(|| message_id.to_string());
     let entry = SessionEntry {
         thread_key: topic_key,
         session_id: info.id.clone(),
@@ -1703,13 +1721,22 @@ pub(crate) async fn create_topic_and_map_adopted(
         model: None,
         auto_accept: false,
         topic_anchor: Some(anchor),
-        topic_root: Some(message_id.to_string()),
+        topic_root: Some(topic_root),
         variant: None,
     };
     {
         let mut store = core.sessions.lock().await;
         store.set_active(entry);
         store.persist()?;
+    }
+    if cover_id.is_some() {
+        core.cover_titles.lock().await.insert(
+            info.id.clone(),
+            crate::bridge::core::CoverTitle {
+                title: info.title.clone(),
+                model: model_line,
+            },
+        );
     }
     core.invalidate_session_list_cache().await;
     Ok(Some(thread_id))
@@ -1851,13 +1878,30 @@ async fn topic_seed_brief(
     agent: Option<&str>,
     model: Option<&str>,
 ) -> String {
+    let body = seed_brief_body(dir, session_id, agent, model).await;
+    format!("📌 {verb} `{title}`\n{body}\n\n请在本话题内回复，即可和这个会话对话。")
+}
+
+/// Rebuild the topic cover card's text after a title change (ADR-0023): the
+/// creation verb is transient, so the title itself becomes the header. The
+/// cover card is the thread root, so this text is what the chat-list topic
+/// entry shows — patching it in place keeps the entry current.
+pub(crate) async fn topic_cover_title_text(
+    title: &str,
+    dir: &str,
+    session_id: &str,
+    agent: Option<&str>,
+    model: Option<&str>,
+) -> String {
+    let body = seed_brief_body(dir, session_id, agent, model).await;
+    format!("`{title}`\n{body}\n\n请在本话题内回复，即可和这个会话对话。")
+}
+
+/// The body lines shared by the topic seed / cover card (ADR-0023): session
+/// tail, project, git state, directory, agent, model. No header, no footer.
+async fn seed_brief_body(dir: &str, session_id: &str, agent: Option<&str>, model: Option<&str>) -> String {
     let git = crate::git::read_state(dir).await;
-    let mut s = format!("📌 {verb} `{title}`\n");
-    s.push_str(&format!(
-        "会话 `{}` · 项目 `{}`",
-        id_tail(session_id),
-        dir_basename(dir)
-    ));
+    let mut s = format!("会话 `{}` · 项目 `{}`", id_tail(session_id), dir_basename(dir));
     if let Some(branch) = git.branch.as_deref() {
         s.push_str(&format!(
             " · 分支 `{branch}`{}",
@@ -1871,8 +1915,23 @@ async fn topic_seed_brief(
     if let Some(model) = model {
         s.push_str(&format!(" · 模型 `{model}`"));
     }
-    s.push_str("\n\n请在本话题内回复，即可和这个会话对话。");
     s
+}
+
+/// Send the topic cover card to the chat's top level, then anchor the new
+/// thread on it — the card becomes the thread root, so the chat-list topic
+/// entry shows the session brief permanently (ADR-0023). Returns the cover
+/// message id, or `None` when sending fails (the caller then anchors the
+/// thread on the user's command message instead).
+async fn send_topic_cover(core: &Arc<SharedCore>, chat_id: &str, text: &str) -> Option<String> {
+    let card = crate::feishu::client::markdown_card(text);
+    match core.feishu.send_card("chat_id", chat_id, &card).await {
+        Ok(id) => Some(id),
+        Err(e) => {
+            tracing::warn!("topic cover card send failed: {e}; anchoring on the command message");
+            None
+        }
+    }
 }
 
 /// The display identity of a session's model from the list payload
