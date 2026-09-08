@@ -267,7 +267,7 @@ pub fn help_text() -> String {
 pub fn command_help(name: &str) -> Option<String> {
     let text = match name.to_lowercase().as_str() {
         "dir" => {
-            "/dir <path> [name]\nSwitch to a project: open a NEW session rooted at <path> (create a session rooted at that directory).\n- `/dir` (no arg) — Recent Directories card: pick a recently-used folder and switch there\nExample: `/dir /root/proj/lib`"
+            "/dir <path> [name]\nSwitch to a project: open a NEW session rooted at <path> (create a session rooted at that directory).\n- `/dir` (no arg) — Recent Directories card: pick a recently-used folder and switch there, or open it as a fresh topic (each row's 建话题 = `/topic <dir>` without typing; only from the main conversation)\nExample: `/dir /root/proj/lib`"
         }
         "switch" => {
             "/switch [action]\nSession management card and text forms.\n- `/switch` (no arg) — interactive session card (browse / search / adopt / new)\n- `/switch <keyword>` — switch by title/directory/id; the current chat's sessions win, otherwise a unique global match is adopted. Ambiguous keywords list candidates.\n- `/switch list [keyword] [--all]` — list recent sessions across the store (up to 15)\n- `/switch <id|title> [--force]` — take over a session (exact id → id-prefix → title; reject if owned by another chat unless `--force`)\n- `/switch forget` — un-map this chat's session (server session stays)\nExamples: `/switch backend`, `/switch list cola`, `/switch ses_abc --force`"
@@ -576,54 +576,38 @@ pub(crate) async fn handle_command(
                     .unwrap_or(&dir_str)
                     .to_string()
             });
-            // Create a real topic whose root is the topic cover card (ADR-0023): a
-            // session brief sent to the chat's top level, so the chat-list
-            // topic entry shows it permanently. The cover send is best-effort —
-            // on failure the thread anchors on the user's command message
-            // instead. `anchor` is the created reply's own message_id — a
-            // message INSIDE the topic, so permission/question/external cards
-            // that must be sent (no streaming card) can reply to it and stay
-            // in the topic (the create API rejects `thread_id` as a target).
-            let cover_text = topic_cover_text(&display_name, &dir_str, &session.id, None, None).await;
-            let (anchor, thread_id, topic_root, cover_id) =
-                open_cover_topic(core, &thread_key.chat_id, message_id, &cover_text).await?;
-            let Some(thread_id) = thread_id else {
-                tracing::warn!(
-                    "topic: no thread_id returned for /topic in chat {}; not mapping session",
-                    thread_key.chat_id
-                );
-                core.feishu
+            // Create a real topic whose root is the topic cover card (ADR-0023),
+            // map the new session to it and record the cover title — shared with
+            // `/topic --adopt` and the `/dir` card's 建话题 op (ADR-0025).
+            match open_topic_for_session(
+                core,
+                &thread_key.chat_id,
+                message_id,
+                &session.id,
+                dir_str,
+                display_name,
+                None,
+                None,
+            )
+            .await?
+            {
+                Some(thread_id) => {
+                    tracing::info!(
+                        "topic: created topic {} for session {} in chat {}",
+                        thread_id,
+                        session.id,
+                        thread_key.chat_id
+                    );
+                }
+                None => {
+                    core.feishu
                         .reply_text(
                             message_id,
                             "⚠️ 当前会话不支持创建话题（未返回 thread_id）。请改用 `/dir <目录>` 或在飞书里手动创建话题。",
                         )
                         .await?;
-                return Ok(());
-            };
-            let topic_key = crate::config::ThreadKey::new(thread_key.chat_id.clone(), thread_id.clone());
-            let entry = crate::config::SessionEntry {
-                thread_key: topic_key,
-                session_id: session.id.clone(),
-                directory: dir_str,
-                agent: None,
-                model: None,
-                auto_accept: false,
-                topic_anchor: Some(anchor),
-                topic_root: Some(topic_root),
-                variant: None,
-            };
-            let mut store = core.sessions.lock().await;
-            store.set_active(entry);
-            store.persist()?;
-            drop(store);
-            record_cover_title(core, &session.id, &display_name, None, cover_id.is_some()).await;
-            core.invalidate_session_list_cache().await;
-            tracing::info!(
-                "topic: created topic {} for session {} in chat {}",
-                thread_id,
-                session.id,
-                thread_key.chat_id
-            );
+                }
+            }
         }
         Command::TopicAdopt { keyword, force } => {
             // Opening a topic from inside another topic would nest
@@ -1720,6 +1704,72 @@ async fn handle_topic_adopt(
     }
 }
 
+/// Wrap an ALREADY-CREATED session in a brand-new Feishu topic: send the cover
+/// card to the chat's top level and anchor the thread on it (ADR-0023), then
+/// map the session to the new topic's `ThreadKey` with the in-topic
+/// confirmation as the fallback-card anchor (ADR-0006), and record the cover
+/// title. `display_title` is what the cover shows until the server
+/// auto-generates a real title (ADR-0007: `/new`-style sessions are unnamed at
+/// creation, so callers pass the directory basename or the user-given name).
+/// Returns the new topic's `thread_id`, or `None` when the platform returns no
+/// thread_id (the caller reports that to the user). Shared by the text
+/// `/topic` form, `/topic --adopt` (via [`create_topic_and_map_adopted`]) and
+/// the `/dir` card's "建话题" op (ADR-0025), so the cover/anchor/mapping
+/// behavior cannot drift between the topic-creation surfaces.
+// `too-many-arguments` accepted like `picker_card`: every knob is a first-class
+// topic-creation axis, and the callers are the three topic surfaces this
+// helper exists to keep in lockstep.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn open_topic_for_session(
+    core: &Arc<SharedCore>,
+    chat_id: &str,
+    fallback_root: &str,
+    session_id: &str,
+    directory: String,
+    display_title: String,
+    agent: Option<String>,
+    model: Option<String>,
+) -> crate::error::Result<Option<String>> {
+    let cover_text = topic_cover_text(
+        &display_title,
+        &directory,
+        session_id,
+        agent.as_deref(),
+        model.as_deref(),
+    )
+    .await;
+    let (anchor, thread_id, topic_root, cover_id) =
+        open_cover_topic(core, chat_id, fallback_root, &cover_text).await?;
+    let Some(thread_id) = thread_id else {
+        tracing::warn!(
+            "topic: no thread_id returned in chat {} for session {}; not mapping session",
+            chat_id,
+            session_id
+        );
+        return Ok(None);
+    };
+    let topic_key = crate::config::ThreadKey::new(chat_id.to_string(), thread_id.clone());
+    let entry = SessionEntry {
+        thread_key: topic_key,
+        session_id: session_id.to_string(),
+        directory,
+        agent,
+        model: None,
+        auto_accept: false,
+        topic_anchor: Some(anchor),
+        topic_root: Some(topic_root),
+        variant: None,
+    };
+    {
+        let mut store = core.sessions.lock().await;
+        store.set_active(entry);
+        store.persist()?;
+    }
+    record_cover_title(core, session_id, &display_title, model, cover_id.is_some()).await;
+    core.invalidate_session_list_cache().await;
+    Ok(Some(thread_id))
+}
+
 /// Create a real Feishu topic anchored on `message_id` via `reply_in_thread`
 /// (ADR-0006), then map the adopted `info` session to the NEW topic's
 /// `ThreadKey` with the in-topic confirmation as the fallback-card anchor.
@@ -1732,44 +1782,17 @@ pub(crate) async fn create_topic_and_map_adopted(
     info: &crate::opencode::SessionListInfo,
     message_id: &str,
 ) -> crate::error::Result<Option<String>> {
-    let cover_text = topic_cover_text(
-        &info.title,
-        &info.directory,
+    open_topic_for_session(
+        core,
+        &thread_key.chat_id,
+        message_id,
         &info.id,
-        info.agent.as_deref(),
-        model_display(info.model.as_ref()).as_deref(),
+        info.directory.clone(),
+        info.title.clone(),
+        info.agent.clone(),
+        model_display(info.model.as_ref()),
     )
-    .await;
-    let model_line = model_display(info.model.as_ref());
-    let (anchor, thread_id, topic_root, cover_id) =
-        open_cover_topic(core, &thread_key.chat_id, message_id, &cover_text).await?;
-    let Some(thread_id) = thread_id else {
-        tracing::warn!(
-            "topic-adopt: no thread_id returned in chat {}; not mapping session",
-            thread_key.chat_id
-        );
-        return Ok(None);
-    };
-    let topic_key = crate::config::ThreadKey::new(thread_key.chat_id.clone(), thread_id.clone());
-    let entry = SessionEntry {
-        thread_key: topic_key,
-        session_id: info.id.clone(),
-        directory: info.directory.clone(),
-        agent: info.agent.clone(),
-        model: None,
-        auto_accept: false,
-        topic_anchor: Some(anchor),
-        topic_root: Some(topic_root),
-        variant: None,
-    };
-    {
-        let mut store = core.sessions.lock().await;
-        store.set_active(entry);
-        store.persist()?;
-    }
-    record_cover_title(core, &info.id, &info.title, model_line, cover_id.is_some()).await;
-    core.invalidate_session_list_cache().await;
-    Ok(Some(thread_id))
+    .await
 }
 
 /// Adopt a server session as the current thread's session, honoring the

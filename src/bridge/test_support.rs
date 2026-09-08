@@ -50,6 +50,10 @@ pub struct RecordingPlatform {
     pub chat_names: std::collections::HashMap<String, String>,
     /// When true, `send_card` fails (tests the topic-cover fallback path).
     pub fail_send_card: bool,
+    /// The thread_id `reply_in_thread` returns; `None` simulates a chat
+    /// without topic support (the create-topic surfaces degrade with a
+    /// message instead of mapping).
+    pub reply_in_thread_thread_id: Option<String>,
     /// message_id → quoted-parent content served by `get_message` (absent =
     /// the default text parent). Lets tests script quote-injection cases.
     pub quoted_messages:
@@ -63,6 +67,7 @@ impl RecordingPlatform {
             user_names: std::collections::HashMap::new(),
             chat_names: std::collections::HashMap::new(),
             fail_send_card: false,
+            reply_in_thread_thread_id: Some("omt_created_topic".into()),
             quoted_messages: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -121,13 +126,14 @@ impl feishu::Platform for RecordingPlatform {
         message_id: &str,
         text: &str,
     ) -> crate::error::Result<(String, Option<String>)> {
+        let thread_id = self.reply_in_thread_thread_id.clone();
         self.calls.lock().await.push(PlatformCall::ReplyInThread {
             message_id: message_id.into(),
             text: text.into(),
-            thread_id: Some("omt_created_topic".into()),
+            thread_id: thread_id.clone(),
         });
         // The mock's created topic-reply message id becomes the anchor.
-        Ok(("msg_topic_reply".into(), Some("omt_created_topic".into())))
+        Ok(("msg_topic_reply".into(), thread_id))
     }
 
     async fn reply_completion_notice(
@@ -4057,6 +4063,347 @@ pub(crate) mod integration_tests {
         assert!(
             text.contains("回主对话操作"),
             "DirCard must be rejected in a bound topic: {text}"
+        );
+    }
+
+    /// The `/dir` Recent Directories card's "建话题" op (ADR-0025) wraps a NEW
+    /// session in a brand-new topic — the card equivalent of `/topic <dir>`:
+    /// cover card at the chat's top level, thread anchored on it, the new
+    /// session mapped to the new topic key, the lobby untouched.
+    #[tokio::test]
+    async fn dir_card_topic_creates_topic_with_new_session() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_id = "ses_dir".into();
+        backend.session_list = vec![list_session("ses_b", "项目B", "/work/b", 200)];
+        let (app, platform) = build_app(cfg, backend).await;
+
+        let value = serde_json::json!({
+            "action": "dir",
+            "op": "topic",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "directory": "/work/b",
+            "open_message_id": "om_dir_card",
+        });
+        let result = app
+            .handle_card_action(value)
+            .await
+            .expect("dir topic should return a result");
+        assert!(result.card.is_some(), "dir topic refreshes the card");
+        let toast = result.toast.clone().unwrap_or_default();
+        assert!(
+            toast.contains("已建话题") && toast.contains("b"),
+            "dir topic toasts the created topic: {toast:?}"
+        );
+        assert!(
+            result.card.unwrap().to_string().contains("建话题"),
+            "refreshed card keeps the 建话题 rows"
+        );
+
+        // The topic pipeline is /topic's (ADR-0023): a cover card leading with
+        // the directory basename as the display title goes to the chat's top
+        // level, then reply_in_thread on THAT card seeds the topic.
+        let calls = platform.calls.lock().await.clone();
+        let cover = calls
+            .iter()
+            .find_map(|c| match c {
+                PlatformCall::SendCard { receive_id, card } if receive_id == "chat_1" => {
+                    Some(card.to_string())
+                }
+                _ => None,
+            })
+            .expect("cover card sent to the chat");
+        assert!(
+            cover.contains("💬 `b`") && cover.contains("`/work/b`"),
+            "cover leads with the directory basename, got: {cover}"
+        );
+        assert!(
+            calls.iter().any(
+                |c| matches!(c, PlatformCall::ReplyInThread { message_id, .. } if message_id == "msg_sent")
+            ),
+            "reply_in_thread anchors on the cover card, got {calls:?}"
+        );
+
+        // The new topic owns the NEW session; the lobby stays untouched.
+        let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
+        let entry = app
+            .sessions
+            .lock()
+            .await
+            .get_active(&topic_key)
+            .cloned()
+            .expect("dir topic maps the new session to the new topic");
+        assert_eq!(entry.session_id, "ses_dir");
+        assert_eq!(entry.directory, "/work/b");
+        assert_eq!(entry.topic_anchor.as_deref(), Some("msg_topic_reply"));
+        assert_eq!(entry.topic_root.as_deref(), Some("msg_sent"));
+        assert_eq!(
+            app.core.cover_titles.lock().await.get("ses_dir").cloned(),
+            Some(crate::bridge::core::CoverTitle {
+                title: "b".into(),
+                model: None
+            })
+        );
+        let lobby_key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        assert!(
+            app.sessions.lock().await.get_active(&lobby_key).is_none(),
+            "lobby must not gain a session from 建话题"
+        );
+    }
+
+    /// 建话题 on the CURRENT directory's row is allowed — it equals bare
+    /// `/topic` in the current project (mirroring the switch card, whose ✅ 当前
+    /// row still carries 建话题接管). Only `pick` is a no-op on the current row.
+    #[tokio::test]
+    async fn dir_card_topic_on_current_directory_opens_topic() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        let (app, _platform) = build_app(cfg, backend).await;
+        let lobby_key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: lobby_key.clone(),
+                session_id: "ses_a".into(),
+                directory: "/work/a".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+                topic_root: None,
+                variant: None,
+            });
+        }
+
+        let value = serde_json::json!({
+            "action": "dir",
+            "op": "topic",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "directory": "/work/a",
+            "open_message_id": "om_dir_card",
+        });
+        let result = app
+            .handle_card_action(value)
+            .await
+            .expect("dir topic should return a result");
+        assert!(
+            result.toast.clone().unwrap_or_default().contains("已建话题"),
+            "current-dir 建话题 opens the topic: {:?}",
+            result.toast
+        );
+        let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
+        assert!(
+            app.sessions.lock().await.get_active(&topic_key).is_some(),
+            "current-dir 建话题 must map the fresh topic"
+        );
+        // The lobby's own session is unchanged (no re-rooting happened).
+        assert_eq!(
+            app.sessions
+                .lock()
+                .await
+                .get_active(&lobby_key)
+                .map(|e| e.session_id.clone()),
+            Some("ses_a".into())
+        );
+    }
+
+    /// A topic cannot be created from inside a topic (ADR-0006, ADR-0025): a
+    /// `/dir` card opened in a never-bound topic — which may legally bind its
+    /// session via `pick` — must not nest another topic via 建话题.
+    #[tokio::test]
+    async fn dir_card_topic_rejects_inside_topic() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        let (app, _platform) = build_app(cfg, backend).await;
+
+        let value = serde_json::json!({
+            "action": "dir",
+            "op": "topic",
+            "chat_id": "chat_1",
+            "thread_id": "omt_t_1",
+            "directory": "/work/b",
+            "open_message_id": "om_dir_card",
+        });
+        let result = app
+            .handle_card_action(value)
+            .await
+            .expect("dir topic should return a result");
+        assert_eq!(result.card, None, "no card refresh on rejection");
+        assert!(
+            result.toast.clone().unwrap_or_default().contains("回主对话操作"),
+            "nested topic creation is rejected with a Toast: {:?}",
+            result.toast
+        );
+        assert!(app.sessions.lock().await.all_entries().is_empty());
+    }
+
+    /// The dir card's 建话题 op fails gracefully when the card action carries
+    /// no `open_message_id` (the anchor needed to create the topic).
+    #[tokio::test]
+    async fn dir_card_topic_missing_open_message_id() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        let (app, _platform) = build_app(cfg, backend).await;
+
+        let value = serde_json::json!({
+            "action": "dir",
+            "op": "topic",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "directory": "/work/b",
+        });
+        let result = app
+            .handle_card_action(value)
+            .await
+            .expect("dir topic should return a result");
+        assert_eq!(result.card, None);
+        assert!(
+            result
+                .toast
+                .clone()
+                .unwrap_or_default()
+                .contains("缺少卡片消息引用"),
+            "missing open_message_id surfaces a hint: {:?}",
+            result.toast
+        );
+        assert!(app.sessions.lock().await.all_entries().is_empty());
+    }
+
+    /// A chat without topic support returns no thread_id: 建话题 degrades with
+    /// a toast pointing at `/dir` or a manual topic — nothing is mapped.
+    #[tokio::test]
+    async fn dir_card_topic_no_thread_id_degrades_with_guidance() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        let mut platform = RecordingPlatform::new();
+        platform.reply_in_thread_thread_id = None;
+        let platform = Arc::new(platform);
+        let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
+
+        let value = serde_json::json!({
+            "action": "dir",
+            "op": "topic",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "directory": "/work/b",
+            "open_message_id": "om_dir_card",
+        });
+        let result = app
+            .handle_card_action(value)
+            .await
+            .expect("dir topic should return a result");
+        assert_eq!(result.card, None);
+        assert!(
+            result
+                .toast
+                .clone()
+                .unwrap_or_default()
+                .contains("不支持创建话题"),
+            "no-thread_id chat surfaces guidance: {:?}",
+            result.toast
+        );
+        assert!(app.sessions.lock().await.all_entries().is_empty());
+    }
+
+    /// The location-based guard also covers a topic that bound its session via
+    /// the row's left button on THIS same card: after `pick` binds the
+    /// never-bound topic, clicking 建话题 on the refreshed card must still
+    /// reject — the topic now has a session, so it cannot open another topic.
+    #[tokio::test]
+    async fn dir_card_topic_rejects_after_topic_bound_via_pick() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        let (app, _platform) = build_app(cfg, backend).await;
+        let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into());
+
+        // Step 1: the never-bound topic binds its single session via `pick`.
+        let pick_value = serde_json::json!({
+            "action": "dir",
+            "op": "pick",
+            "chat_id": "chat_1",
+            "thread_id": "omt_t_1",
+            "directory": "/work/a",
+        });
+        app.handle_card_action(pick_value)
+            .await
+            .expect("pick should bind the topic");
+        assert!(
+            app.sessions.lock().await.get_active(&topic_key).is_some(),
+            "pick binds the never-bound topic's session"
+        );
+
+        // Step 2: 建话题 on the same thread is rejected — the guard is
+        // location-based (thread_id != chat_id), independent of session state.
+        let topic_value = serde_json::json!({
+            "action": "dir",
+            "op": "topic",
+            "chat_id": "chat_1",
+            "thread_id": "omt_t_1",
+            "directory": "/work/b",
+            "open_message_id": "om_dir_card",
+        });
+        let result = app
+            .handle_card_action(topic_value)
+            .await
+            .expect("dir topic should return a result");
+        assert_eq!(result.card, None, "no card refresh on rejection");
+        assert!(
+            result.toast.clone().unwrap_or_default().contains("回主对话操作"),
+            "bound topic still rejects nesting: {:?}",
+            result.toast
+        );
+        // Only the original binding remains — no second topic was created.
+        assert_eq!(app.sessions.lock().await.all_entries().len(), 1);
+    }
+
+    /// The switch card's "建话题接管" op is rejected inside a topic thread too
+    /// (ADR-0025 retrofit): the session card may legally open in a never-bound
+    /// topic, but its topic op must not nest — same rule as the text forms.
+    #[tokio::test]
+    async fn switch_card_topic_adopt_rejects_inside_topic() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session("ses_alpha01", "重写登录", "/work/auth", 100)];
+        let (app, _platform) = build_app(cfg, backend).await;
+
+        let value = serde_json::json!({
+            "action": "switch",
+            "op": "topic_adopt",
+            "chat_id": "chat_1",
+            "thread_id": "omt_t_1",
+            "session_id": "ses_alpha01",
+            "open_message_id": "om_switch_card",
+        });
+        let result = app
+            .handle_card_action(value)
+            .await
+            .expect("topic_adopt should return a result");
+        assert_eq!(result.card, None, "no card refresh on rejection");
+        assert!(
+            result.toast.clone().unwrap_or_default().contains("回主对话操作"),
+            "nested topic_adopt is rejected with a Toast: {:?}",
+            result.toast
+        );
+        let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
+        assert!(
+            app.sessions.lock().await.get_active(&topic_key).is_none(),
+            "no new topic mapping inside a topic"
         );
     }
 

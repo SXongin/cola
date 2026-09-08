@@ -128,6 +128,21 @@ fn thread_key_from_value(value: &serde_json::Value) -> crate::config::ThreadKey 
     )
 }
 
+/// Nested-topic rejection (ADR-0006, ADR-0025): a topic can only be created
+/// from a non-topic message. A card whose `thread_id != chat_id` lives inside
+/// a topic — a never-bound topic may open the `/dir`/`/switch` cards to bind
+/// its single session, but the topic-creating ops must not nest. The one
+/// guard + message shared by both card ops keeps their copies from drifting
+/// (the text forms carry the same rule with their own reply text).
+const NESTED_TOPIC_REJECTION: &str = "话题里不能开话题，请回主对话操作。";
+
+fn reject_nested_topic(thread_key: &ThreadKey) -> Option<CardActionResult> {
+    (thread_key.thread_id != thread_key.chat_id).then(|| CardActionResult {
+        card: None,
+        toast: Some(NESTED_TOPIC_REJECTION.to_string()),
+    })
+}
+
 impl App {
     pub fn new(
         cfg: Config,
@@ -1048,6 +1063,14 @@ impl App {
                 // threaded through by `extract_card_action_value`), so fallback
                 // cards can reply inside it. No `--force` from the card: a
                 // session owned by another thread is rejected with a Toast.
+                // A topic can only be created from a non-topic message
+                // (ADR-0006, ADR-0025): the session card may legally open in a
+                // never-bound topic, but its topic op must not nest there —
+                // same guard as the `/dir` card's "建话题" op and the text
+                // `/topic --adopt` forms.
+                if let Some(rejection) = reject_nested_topic(&thread_key) {
+                    return Some(rejection);
+                }
                 let Some(open_message_id) = value.get("open_message_id").and_then(|v| v.as_str()) else {
                     return Some(CardActionResult {
                         card: None,
@@ -1160,11 +1183,13 @@ impl App {
         crate::feishu::card::build_dir_card(thread_key, &dirs, current_dir.as_deref())
     }
 
-    /// Handle a `/dir` Recent Directories card button (`op: "pick"`): re-root
-    /// the thread into the picked directory by creating a NEW session there
-    /// (matching the text `/dir <path>` form). Clicking the current directory
-    /// is a no-op that just toasts. Refreshes the card in place so the new
-    /// directory shows as `当前`.
+    /// Handle a `/dir` Recent Directories card button (ADR-0025): `op:
+    /// "pick"` re-roots the thread into the picked directory by creating a
+    /// NEW session there (matching the text `/dir <path>` form); `op:
+    /// "topic"` wraps a NEW session in a brand-new Feishu topic instead — the
+    /// card equivalent of `/topic <dir>`. Clicking the current directory's
+    /// `pick` is a no-op that just toasts. Refreshes the card in place so the
+    /// new directory shows as `当前`.
     async fn handle_dir_card_action(
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
@@ -1177,61 +1202,139 @@ impl App {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        if op != "pick" || directory.is_empty() {
+        if directory.is_empty() {
             return Some(CardActionResult {
                 card: None,
                 toast: Some("无效操作".to_string()),
             });
         }
-        let current_dir = core
-            .sessions
-            .lock()
-            .await
-            .get_active(&thread_key)
-            .map(|e| e.directory.clone());
-        if current_dir.as_deref() == Some(directory.as_str()) {
-            return Some(CardActionResult {
-                card: Some(self.build_dir_card_for(core, &thread_key).await),
-                toast: Some("已在当前目录".to_string()),
-            });
-        }
-        let session = match core
-            .opencode
-            .create_session(&core.opencode.new_session_input(Some(&directory)))
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("dir card pick session failed: {}", e);
-                return Some(CardActionResult {
-                    card: None,
-                    toast: Some(format!("创建会话失败：{e}")),
-                });
+        match op {
+            "pick" => {
+                let current_dir = core
+                    .sessions
+                    .lock()
+                    .await
+                    .get_active(&thread_key)
+                    .map(|e| e.directory.clone());
+                if current_dir.as_deref() == Some(directory.as_str()) {
+                    return Some(CardActionResult {
+                        card: Some(self.build_dir_card_for(core, &thread_key).await),
+                        toast: Some("已在当前目录".to_string()),
+                    });
+                }
+                let session = match core
+                    .opencode
+                    .create_session(&core.opencode.new_session_input(Some(&directory)))
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("dir card pick session failed: {}", e);
+                        return Some(CardActionResult {
+                            card: None,
+                            toast: Some(format!("创建会话失败：{e}")),
+                        });
+                    }
+                };
+                let entry = crate::config::SessionEntry {
+                    thread_key: thread_key.clone(),
+                    session_id: session.id.clone(),
+                    directory: directory.clone(),
+                    agent: None,
+                    model: None,
+                    auto_accept: false,
+                    topic_anchor: None,
+                    topic_root: None,
+                    variant: None,
+                };
+                {
+                    let mut store = core.sessions.lock().await;
+                    store.set_active(entry);
+                    if let Err(e) = store.persist() {
+                        tracing::warn!("dir card pick: persist failed: {}", e);
+                    }
+                }
+                core.invalidate_session_list_cache().await;
+                Some(CardActionResult {
+                    card: Some(self.build_dir_card_for(core, &thread_key).await),
+                    toast: Some(format!("已切换目录并新建会话（`{directory}`）")),
+                })
             }
-        };
-        let entry = crate::config::SessionEntry {
-            thread_key: thread_key.clone(),
-            session_id: session.id.clone(),
-            directory: directory.clone(),
-            agent: None,
-            model: None,
-            auto_accept: false,
-            topic_anchor: None,
-            topic_root: None,
-            variant: None,
-        };
-        {
-            let mut store = core.sessions.lock().await;
-            store.set_active(entry);
-            if let Err(e) = store.persist() {
-                tracing::warn!("dir card pick: persist failed: {}", e);
+            "topic" => {
+                // A topic can only be created from a non-topic message
+                // (ADR-0006, ADR-0025): a `/dir` card opened inside a
+                // never-bound topic — which may legally bind its single
+                // session via `pick` — must not nest another topic. The guard
+                // is location-based, so it also covers a topic that bound
+                // itself via the row's left button on this same card.
+                if let Some(rejection) = reject_nested_topic(&thread_key) {
+                    return Some(rejection);
+                }
+                // The topic anchors on the card's own message (`open_message_id`,
+                // threaded by `extract_card_action_value`), so fallback cards
+                // can reply inside it — same contract as the switch card's
+                // topic op (ADR-0016).
+                let Some(open_message_id) = value.get("open_message_id").and_then(|v| v.as_str()) else {
+                    return Some(CardActionResult {
+                        card: None,
+                        toast: Some("无法创建话题（缺少卡片消息引用）".to_string()),
+                    });
+                };
+                let session = match core
+                    .opencode
+                    .create_session(&core.opencode.new_session_input(Some(&directory)))
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("dir card topic: create session failed: {}", e);
+                        return Some(CardActionResult {
+                            card: None,
+                            toast: Some(format!("创建会话失败：{e}")),
+                        });
+                    }
+                };
+                // Creation title policy (ADR-0007): unnamed, like `/topic
+                // <dir>`; the cover shows the directory basename until the
+                // server auto-generates a title after the first exchange.
+                let display = crate::bridge::command::dir_basename(&directory);
+                match crate::bridge::command::open_topic_for_session(
+                    core,
+                    &thread_key.chat_id,
+                    open_message_id,
+                    &session.id,
+                    directory.clone(),
+                    display.clone(),
+                    None,
+                    None,
+                )
+                .await
+                {
+                    Ok(Some(_thread_id)) => Some(CardActionResult {
+                        card: Some(self.build_dir_card_for(core, &thread_key).await),
+                        toast: Some(format!("已建话题并新建会话（{display}）")),
+                    }),
+                    Ok(None) => Some(CardActionResult {
+                        card: None,
+                        toast: Some(
+                            "当前会话不支持创建话题（未返回 thread_id）。请改用 `/dir <目录>` 或在飞书里手动创建话题。"
+                                .to_string(),
+                        ),
+                    }),
+                    Err(e) => {
+                        tracing::warn!("dir card topic: create topic failed: {}", e);
+                        Some(CardActionResult {
+                            card: None,
+                            toast: Some("创建话题失败".to_string()),
+                        })
+                    }
+                }
             }
+            _ => Some(CardActionResult {
+                card: None,
+                toast: Some("无效操作".to_string()),
+            }),
         }
-        core.invalidate_session_list_cache().await;
-        Some(CardActionResult {
-            card: Some(self.build_dir_card_for(core, &thread_key).await),
-            toast: Some(format!("已切换目录并新建会话（`{directory}`）")),
-        })
     }
 
     /// Handle an `/agent` picker-card button: record the per-session override
