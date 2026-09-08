@@ -1668,10 +1668,12 @@ pub fn build_switch_card(
 /// The `/dir` Recent Directories card (no-arg form): one directory per entry,
 /// capped at [`MAX_SWITCH_ROWS`]. Each entry is two rows — a full-width text
 /// row (directory path, marked `当前` when it is the thread's active session
-/// directory) and a button row beneath it, mirroring the `/switch` card
-/// layout. The pick button carries the routing payload (action, op,
-/// thread_key, directory), so the ack re-roots the thread into that directory.
-/// Schema-2.0 safe: no v1 `action` container (see `switch_card_row`).
+/// directory) and a two-button row beneath it, mirroring the `/switch` card
+/// layout (ADR-0025): 切换到这里 / ✅ 当前 re-roots the thread into that
+/// directory (`op: "pick"`), 建话题 wraps a NEW session in a fresh topic
+/// there (`op: "topic"`). Each button carries the routing payload (action,
+/// op, thread_key, directory), so the ack routes the choice back to the right
+/// thread. Schema-2.0 safe: no v1 `action` container (see `switch_card_row`).
 pub fn build_dir_card(
     thread_key: &crate::config::ThreadKey,
     dirs: &[String],
@@ -1725,10 +1727,14 @@ pub fn build_dir_card(
     })
 }
 
-/// One `/dir` card entry: a full-width text row plus a single-button row that
-/// re-roots the thread into the directory (`op: "pick"`). Mirrors the
-/// `/switch` card's two-row-per-entry layout (schema-2.0 safe, no `action`
-/// container).
+/// One `/dir` card entry: a full-width text row plus a two-button row beneath
+/// it, mirroring the `/switch` card's row layout (ADR-0025): the left button
+/// re-roots the thread into the directory (`op: "pick"`), the right "建话题"
+/// button wraps a NEW session in a fresh topic there (`op: "topic"` — the card
+/// equivalent of `/topic <dir>`; nested topic creation is rejected by the
+/// action handler). Each button carries the routing payload (action, op,
+/// thread_key, directory), so the ack routes back to the right thread.
+/// Schema-2.0 safe: no v1 `action` container (see `switch_card_row`).
 fn dir_card_row(
     text: &str,
     btn_text: &str,
@@ -1736,30 +1742,34 @@ fn dir_card_row(
     directory: &str,
 ) -> Vec<serde_json::Value> {
     let text_row = card_text_row(text);
+    let btn_column = |op: &str, content: &str, btn_type: &str| {
+        json!({
+            "tag": "column",
+            "width": "auto",
+            "vertical_align": "center",
+            "elements": [
+                {
+                    "tag": "button",
+                    "text": { "tag": "plain_text", "content": content },
+                    "type": btn_type,
+                    "value": {
+                        "action": "dir",
+                        "op": op,
+                        "chat_id": thread_key.chat_id,
+                        "thread_id": thread_key.thread_id,
+                        "directory": directory,
+                    },
+                }
+            ],
+        })
+    };
     let btn_row = json!({
         "tag": "column_set",
-        "flex_mode": "none",
+        "flex_mode": "bisect",
         "horizontal_spacing": "default",
         "columns": [
-            {
-                "tag": "column",
-                "width": "auto",
-                "vertical_align": "center",
-                "elements": [
-                    {
-                        "tag": "button",
-                        "text": { "tag": "plain_text", "content": btn_text },
-                        "type": "primary",
-                        "value": {
-                            "action": "dir",
-                            "op": "pick",
-                            "chat_id": thread_key.chat_id,
-                            "thread_id": thread_key.thread_id,
-                            "directory": directory,
-                        },
-                    }
-                ]
-            }
+            btn_column("pick", btn_text, "default"),
+            btn_column("topic", "建话题", "default"),
         ]
     });
     vec![text_row, btn_row]
@@ -1783,6 +1793,24 @@ mod tests {
         let header = &card["header"]["title"]["content"];
         assert!(header.as_str().unwrap().contains("思考中"));
         assert_eq!(card["schema"].as_str().unwrap(), "2.0");
+    }
+
+    /// ADR-0025: every Recent Directories row carries both gestures — the
+    /// re-root pick and the 建话题 topic opener (each with the routing payload
+    /// and the directory).
+    #[test]
+    fn dir_card_rows_carry_pick_and_topic_buttons() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let card = build_dir_card(&key, &["/work/a".to_string()], None);
+        let s = card.to_string();
+        assert!(s.contains("切换到这里"), "left button re-roots: {s}");
+        assert!(s.contains("建话题"), "right button opens a topic: {s}");
+        assert!(s.contains("\"op\":\"pick\""), "pick op present: {s}");
+        assert!(s.contains("\"op\":\"topic\""), "topic op present: {s}");
+        assert!(
+            s.contains("\"directory\":\"/work/a\""),
+            "directory rides along: {s}"
+        );
     }
 
     #[test]
