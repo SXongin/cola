@@ -23,6 +23,15 @@ impl SessionListCache {
     }
 }
 
+/// The title shown on a topic's cover card, plus the model line it carries —
+/// the post-turn hook compares the server title against this and patches the
+/// card in place when it changed (ADR-0023).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoverTitle {
+    pub title: String,
+    pub model: Option<String>,
+}
+
 /// State shared across every flow: the session map, the per-session live cards
 /// ([`CardSession`] — accumulator + card identity in one place), the
 /// double-click guard, prompt serialization, and the two adapters. Owned by the
@@ -40,6 +49,12 @@ pub struct SharedCore {
     /// Session ids with a prompt currently in flight (serializes prompts per
     /// session so concurrent messages don't clobber each other's cards).
     pub inflight: Arc<Mutex<HashSet<String>>>,
+    /// session_id → the cover card's current title for topics created with a
+    /// bot cover card as their root (ADR-0023). In-memory only: the post-turn
+    /// hook compares the server title and patches the cover card in place when
+    /// it changed; after a restart the next completed turn re-syncs the card
+    /// once (same content, harmless).
+    pub cover_titles: Arc<Mutex<HashMap<String, CoverTitle>>>,
     /// Default directory for new sessions (from `[bridge] work_dir`).
     pub work_dir: Option<String>,
     /// Whether to send the group completion notice (from `[bridge] group_completion_notice`).
@@ -73,6 +88,7 @@ impl SharedCore {
             cards: Arc::new(Mutex::new(HashMap::new())),
             answered_requests: Arc::new(Mutex::new(HashSet::new())),
             inflight: Arc::new(Mutex::new(HashSet::new())),
+            cover_titles: Arc::new(Mutex::new(HashMap::new())),
             work_dir: cfg
                 .bridge
                 .work_dir

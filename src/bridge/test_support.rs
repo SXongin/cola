@@ -48,6 +48,8 @@ pub struct RecordingPlatform {
     pub user_names: std::collections::HashMap<String, String>,
     /// chat_id → display name served by `chat_name` (absent = None).
     pub chat_names: std::collections::HashMap<String, String>,
+    /// When true, `send_card` fails (tests the topic-cover fallback path).
+    pub fail_send_card: bool,
     /// message_id → quoted-parent content served by `get_message` (absent =
     /// the default text parent). Lets tests script quote-injection cases.
     pub quoted_messages:
@@ -60,6 +62,7 @@ impl RecordingPlatform {
             calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             user_names: std::collections::HashMap::new(),
             chat_names: std::collections::HashMap::new(),
+            fail_send_card: false,
             quoted_messages: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -85,6 +88,11 @@ impl feishu::Platform for RecordingPlatform {
         receive_id: &str,
         card: &serde_json::Value,
     ) -> crate::error::Result<String> {
+        if self.fail_send_card {
+            return Err(crate::error::BridgeError::Feishu(
+                "simulated send_card failure".into(),
+            ));
+        }
         self.calls.lock().await.push(PlatformCall::SendCard {
             receive_id: receive_id.into(),
             card: card.clone(),
@@ -3002,16 +3010,36 @@ pub(crate) mod integration_tests {
         .await
         .unwrap();
 
-        // The topic is created via reply_in_thread on the command message.
+        // The topic is created via a cover card sent to the chat's top level,
+        // then reply_in_thread on THAT card: the cover becomes the thread root,
+        // so the chat-list topic entry shows the session brief permanently
+        // (ADR-0023). On the mock the cover send returns "msg_sent".
         let calls = platform.calls.lock().await.clone();
         assert!(
-            calls.iter().any(
-                |c| matches!(c, PlatformCall::ReplyInThread { message_id, .. } if message_id == "msg_topic")
-            ),
-            "expected a reply_in_thread on the command message, got {calls:?}"
+            calls
+                .iter()
+                .any(|c| matches!(c, PlatformCall::SendCard { receive_id, .. } if receive_id == "chat_1")),
+            "expected a cover card sent to the chat, got {calls:?}"
         );
-        // The seed card is a session brief (ADR-0023): it names the session
-        // id tail and the project — not just a one-line confirmation.
+        assert!(
+            calls.iter().any(
+                |c| matches!(c, PlatformCall::ReplyInThread { message_id, .. } if message_id == "msg_sent")
+            ),
+            "expected reply_in_thread on the cover card, got {calls:?}"
+        );
+        // The cover card carries the session brief; the in-topic seed is only a
+        // short hint (the brief lives on the root card at the top of the thread).
+        let cover = calls
+            .iter()
+            .find_map(|c| match c {
+                PlatformCall::SendCard { card, .. } => Some(card.to_string()),
+                _ => None,
+            })
+            .expect("cover card JSON");
+        assert!(
+            cover.contains("已创建会话") && cover.contains("会话 `topic`") && cover.contains("项目"),
+            "cover card should be a session brief, got: {cover}"
+        );
         let seed = calls
             .iter()
             .find_map(|c| match c {
@@ -3019,10 +3047,7 @@ pub(crate) mod integration_tests {
                 _ => None,
             })
             .expect("reply_in_thread seed text");
-        assert!(
-            seed.contains("已创建会话") && seed.contains("会话 `topic`") && seed.contains("项目"),
-            "seed card should be a session brief, got: {seed}"
-        );
+        assert_eq!(seed, "请在本话题内回复，即可和这个会话对话。");
 
         // The created topic's thread_id is mapped to the new session.
         let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
@@ -3049,14 +3074,155 @@ pub(crate) mod integration_tests {
         // The topic anchor is the confirmation message INSIDE the topic; future
         // sent cards reply to it so they stay in the topic.
         assert_eq!(entry.topic_anchor.as_deref(), Some("msg_topic_reply"));
-        // The thread root is the command message the topic was created around
-        // (ADR-0023): the injection guard excludes it from Quoted Context.
-        assert_eq!(entry.topic_root.as_deref(), Some("msg_topic"));
+        // The thread root is the cover card (ADR-0023): the injection guard
+        // excludes it from Quoted Context, and the post-turn hook patches it
+        // when the server auto-generates a title.
+        assert_eq!(entry.topic_root.as_deref(), Some("msg_sent"));
+        // The cover title is recorded so the post-turn hook can sync it.
+        assert_eq!(
+            app.core.cover_titles.lock().await.get("ses_topic").cloned(),
+            Some(crate::bridge::core::CoverTitle {
+                title: "api-refactor".to_string(),
+                model: None
+            })
+        );
 
         // The lobby conversation still maps to nothing new (no session was
         // created for the lobby itself).
         let lobby_key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
         assert!(app.sessions.lock().await.get_active(&lobby_key).is_none());
+    }
+
+    /// ADR-0023: when the cover card cannot be sent, the thread anchors on the
+    /// user's command message instead — the old behavior — and no cover title
+    /// is recorded (so the post-turn hook never tries to patch the user's
+    /// message, which Feishu would reject).
+    #[tokio::test]
+    async fn topic_cover_send_failure_falls_back_to_command_root() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        let mut platform = Arc::new(RecordingPlatform::new());
+        Arc::get_mut(&mut platform).unwrap().fail_send_card = true;
+        let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
+        let proj = tempfile::tempdir().unwrap();
+        let proj_dir = proj.path().to_string_lossy().to_string();
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Topic {
+                directory: Some(proj_dir.clone()),
+                name: None,
+            },
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_topic",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let calls = platform.calls.lock().await.clone();
+        assert!(
+            calls.iter().any(
+                |c| matches!(c, PlatformCall::ReplyInThread { message_id, .. } if message_id == "msg_topic")
+            ),
+            "expected reply_in_thread on the command message after cover failure, got {calls:?}"
+        );
+
+        let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
+        let entry = app
+            .sessions
+            .lock()
+            .await
+            .get_active(&topic_key)
+            .cloned()
+            .expect("topic thread_id should map to the new session");
+        assert_eq!(entry.topic_root.as_deref(), Some("msg_topic"));
+        assert!(
+            app.core.cover_titles.lock().await.is_empty(),
+            "no cover title may be recorded without a cover card"
+        );
+    }
+
+    /// ADR-0023: after a completed turn, when the server holds a different
+    /// title for the session (auto-generated after the first exchange), cola
+    /// patches the cover card in place — the thread root — so the chat-list
+    /// topic entry shows the real title.
+    #[tokio::test]
+    async fn topic_cover_card_updated_with_auto_title_after_turn() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        backend
+            .session_titles
+            .lock()
+            .unwrap()
+            .insert("ses_t1".into(), "修复登录 bug".into());
+        let (app, platform) = build_app(cfg, backend).await;
+
+        let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into());
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: topic_key.clone(),
+                session_id: "ses_t1".into(),
+                directory: "/work/t".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: Some("om_seed".into()),
+                topic_root: Some("om_cover".into()),
+                variant: None,
+            });
+        }
+        app.core.cover_titles.lock().await.insert(
+            "ses_t1".into(),
+            crate::bridge::core::CoverTitle {
+                title: "旧标题".into(),
+                model: None,
+            },
+        );
+
+        app.handle_message(crate::bridge::IncomingMessage {
+            message_id: "msg_1".into(),
+            chat_id: "chat_1".into(),
+            chat_type: "group".into(),
+            thread_id: Some("omt_t_1".into()),
+            parent_id: None,
+            text: "继续".into(),
+            images: vec![],
+            requester_open_id: None,
+        })
+        .await;
+
+        let calls = platform.calls.lock().await.clone();
+        let patched = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::UpdateMessage { message_id, card } if message_id == "om_cover" => {
+                    Some(card.to_string())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !patched.is_empty(),
+            "the cover card must be patched in place, got {calls:?}"
+        );
+        assert!(
+            patched.last().unwrap().contains("修复登录 bug"),
+            "cover card must show the server title: {:?}",
+            patched.last()
+        );
+        assert_eq!(
+            app.core.cover_titles.lock().await.get("ses_t1").cloned(),
+            Some(crate::bridge::core::CoverTitle {
+                title: "修复登录 bug".to_string(),
+                model: None
+            })
+        );
     }
 
     /// Bare `/topic` (no args) creates the topic session in the conversation's
@@ -3101,13 +3267,14 @@ pub(crate) mod integration_tests {
         .await
         .unwrap();
 
-        // The topic is created on the command message, like the explicit form.
+        // The topic is created on the cover card sent to the chat, like the
+        // explicit form (ADR-0023); the mock cover send returns "msg_sent".
         let calls = platform.calls.lock().await.clone();
         assert!(
             calls.iter().any(
-                |c| matches!(c, PlatformCall::ReplyInThread { message_id, .. } if message_id == "msg_topic")
+                |c| matches!(c, PlatformCall::ReplyInThread { message_id, .. } if message_id == "msg_sent")
             ),
-            "expected a reply_in_thread on the command message, got {calls:?}"
+            "expected a reply_in_thread on the cover card, got {calls:?}"
         );
 
         // The topic session lives in the inherited project directory.
@@ -3247,11 +3414,14 @@ pub(crate) mod integration_tests {
         .await
         .unwrap();
 
-        // The topic is created via reply_in_thread on the command message.
+        // The topic is created via a cover card sent to the chat, then
+        // reply_in_thread on that card (ADR-0023); the mock cover returns "msg_sent".
         let calls = platform.calls.lock().await.clone();
         assert!(
-            calls.iter().any(|c| matches!(c, PlatformCall::ReplyInThread { message_id, .. } if message_id == "msg_topic_adopt")),
-            "expected reply_in_thread on the command message, got {calls:?}"
+            calls.iter().any(
+                |c| matches!(c, PlatformCall::ReplyInThread { message_id, .. } if message_id == "msg_sent")
+            ),
+            "expected reply_in_thread on the cover card, got {calls:?}"
         );
 
         // The new topic's thread_id maps to the ADOPTED session (not a new one),

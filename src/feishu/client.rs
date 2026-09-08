@@ -337,13 +337,7 @@ impl Client {
         let body = serde_json::json!({
             "msg_type": "interactive",
             "reply_in_thread": true,
-            "content": serde_json::json!({
-                "config": { "wide_screen_mode": true },
-                "elements": [{
-                    "tag": "markdown",
-                    "content": text
-                }]
-            }).to_string()
+            "content": markdown_card(text).to_string()
         });
 
         let resp: MessageResponse = self
@@ -656,6 +650,15 @@ impl Client {
             data: bytes.to_vec(),
         })
     }
+}
+
+/// A minimal interactive card carrying one markdown element — the shape
+/// `reply_in_thread` and the topic cover card use (ADR-0023).
+pub(crate) fn markdown_card(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "config": { "wide_screen_mode": true },
+        "elements": [{ "tag": "markdown", "content": text }]
+    })
 }
 
 #[derive(Debug, Deserialize)]

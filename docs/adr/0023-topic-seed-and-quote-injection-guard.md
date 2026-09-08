@@ -1,35 +1,50 @@
-# Topic seed card & quote-injection guard
+# Topic cover card & quote-injection guard
 
-Creating a topic with `/topic` or `/topic --adopt` leaves two messages that are
-thin by nature: the **thread root** — the user's `/topic ...` command message the
-Feishu thread is built around (it stays in the main Chat) — and the **seed
-card** — cola's one-line `📌 已创建会话...` confirmation that is the first
-message *inside* the topic. Because Feishu reports a topic reply's `parent_id`
-pointing at the thread root, cola's Quoted Context (ADR-0009) fetched and
-prepended that thin command text to **every** prompt in the topic — noise the
-model could not tell apart from a genuine quote of a real message.
+Creating a topic with `/topic` or `/topic --adopt` leaves the topic's identity
+thin in two places: the **thread root** — the message the Feishu thread is built
+around, which is what the chat-list topic entry shows as its title — and the
+**seed card** — cola's confirmation that is the first message *inside* the
+topic. Because Feishu reports a topic reply's `parent_id` pointing at the thread
+root, cola's Quoted Context (ADR-0009) fetched and prepended that text to
+**every** prompt in the topic — noise the model could not tell apart from a
+genuine quote of a real message.
 
 ## Decision
 
+- **The thread root is the Topic Cover Card**: `/topic` and `/topic --adopt`
+  first send the session brief to the main Chat as an interactive card, then
+  `reply_in_thread` on **that card** — so the card is the thread root and the
+  chat-list topic entry shows it permanently. The old root (the user's `/topic`
+  command message) was the least informative message in the topic and is not
+  editable; a bot card is. If the cover send fails, the thread falls back to
+  anchoring on the command message (the pre-change behavior) and no cover title
+  is recorded, so nothing is ever patched onto a user message.
 - **Persist the thread root as `topic_root`** on `SessionEntry` for cola-created
-  topics (`/topic`, `/topic --adopt`): the `message_id` of the command message
-  the topic was anchored on, alongside the existing `topic_anchor` (the seed
-  card inside the topic).
+  topics (`/topic`, `/topic --adopt`): the cover card's `message_id` (or the
+  command message's on fallback), alongside the existing `topic_anchor` (the
+  seed card inside the topic).
 - **Injection guard**: in the Quoted Context path (`handle_prompt`), skip
   fetching/injecting the parent when `parent_id` equals the active session's
   `topic_anchor` **or** `topic_root` — i.e. the messages cola itself placed in
-  the topic: the `/topic` / `/topic --adopt` seed card, the `/switch` /
-  `/attach` adopt card inside an existing topic (`adopt_session`), and the
-  user's `/topic` command message that is the thread root. A manually-created
-  topic that never received a cola card keeps both `None`, so the guard is
-  silent there and the user's own subject message still injects — that is
-  valuable context, not noise.
-- **Enrich the seed card**: the `/topic` / `/topic --adopt` confirmation card
-  becomes a session brief — title, directory, agent, model, session-id tail, git
-  branch — instead of one thin line. Purely human-facing: because the guard
-  suppresses both `topic_root` and `topic_anchor`, the enriched card's text is
-  never injected, so richness costs no tokens. Feishu card limits (30 KB, 200
-  elements) leave ample headroom.
+  the topic: the seed card, the `/switch` / `/attach` adopt card inside an
+  existing topic (`adopt_session`), and the cover card (or command message on
+  fallback) that is the thread root. A manually-created topic that never
+  received a cola card keeps both `None`, so the guard is silent there and the
+  user's own subject message still injects — that is valuable context, not
+  noise.
+- **Enrich the seed card**: the seed card (first message inside the topic) is a
+  short hint — "请在本话题内回复" — because the full session brief lives on the
+  cover card at the top of the thread. Purely human-facing: the guard suppresses
+  both `topic_root` and `topic_anchor`, so neither card's text is ever injected,
+  and richness costs no tokens. Feishu card limits (30 KB, 200 elements) leave
+  ample headroom.
+- **Title sync after the first turn**: OpenCode auto-generates a session title
+  after the first exchange (and `/name` changes it later). After each completed
+  turn cola compares the server title (`GET /session/{id}`) against the one
+  recorded in memory (`core.cover_titles`) and, when it changed, patches the
+  cover card in place via `update_message` — the chat-list topic entry follows.
+  The recorded title is in-memory only; after a restart the next completed turn
+  re-syncs once (same content, harmless).
 
 ## Why
 
@@ -37,6 +52,10 @@ model could not tell apart from a genuine quote of a real message.
   level (both may carry `parent_id`); cola's only reliable signal is *what* the
   parent is. `topic_root` and `topic_anchor` are cola's own topic-creation
   boilerplate, so suppressing exactly those two drops no user content.
+- The chat-list topic entry shows the thread root as its title, so making the
+  root a bot card is the only lever that survives replies: the latest-message
+  preview changes every turn, but the title stays the cover card's content —
+  and an interactive card can be patched in place later.
 - The `parent_id == root_id` discriminator was rejected: it also fires in
   manually-created topics, where the root is the user's subject message and
   injecting it is desirable.
