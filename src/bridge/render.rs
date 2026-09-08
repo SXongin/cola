@@ -89,6 +89,11 @@ pub(crate) async fn refresh_session_title(core: &Arc<SharedCore>, session_id: &s
     card.acc.title = fresh;
     drop(cards);
     flush_card(core, session_id).await;
+    // The topic cover card is the chat-list topic entry — sync it the MOMENT
+    // the server title changes mid-turn (not only at turn end), so the list
+    // entry updates as early as the title agent finishes (ADR-0023). Only
+    // fires on this change tick; the per-tick cost is unchanged.
+    crate::bridge::command::sync_topic_cover_title(core, session_id).await;
     true
 }
 
