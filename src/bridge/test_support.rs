@@ -1004,6 +1004,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -1045,6 +1046,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -1079,6 +1081,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -1118,6 +1121,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -1495,6 +1499,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: true,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
             store.persist().unwrap();
@@ -1564,6 +1569,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
             store.persist().unwrap();
@@ -1628,6 +1634,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
             store.persist().unwrap();
@@ -1715,6 +1722,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
             store.persist().unwrap();
@@ -1782,6 +1790,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
             store.set_active(crate::config::SessionEntry {
@@ -1792,6 +1801,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
             store.persist().unwrap();
@@ -1876,6 +1886,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
             store.set_active(crate::config::SessionEntry {
@@ -1886,6 +1897,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
             store.persist().unwrap();
@@ -1968,6 +1980,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
             store.persist().unwrap();
@@ -2042,6 +2055,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
             store.persist().unwrap();
@@ -2232,6 +2246,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
             store.persist().unwrap();
@@ -2440,6 +2455,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
             store.persist().unwrap();
@@ -2521,6 +2537,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: Some("msg_in_topic_anchor".into()),
+                topic_root: None,
                 variant: None,
             });
             store.persist().unwrap();
@@ -2993,6 +3010,19 @@ pub(crate) mod integration_tests {
             ),
             "expected a reply_in_thread on the command message, got {calls:?}"
         );
+        // The seed card is a session brief (ADR-0023): it names the session
+        // id tail and the project — not just a one-line confirmation.
+        let seed = calls
+            .iter()
+            .find_map(|c| match c {
+                PlatformCall::ReplyInThread { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("reply_in_thread seed text");
+        assert!(
+            seed.contains("已创建会话") && seed.contains("会话 `topic`") && seed.contains("项目"),
+            "seed card should be a session brief, got: {seed}"
+        );
 
         // The created topic's thread_id is mapped to the new session.
         let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
@@ -3019,6 +3049,9 @@ pub(crate) mod integration_tests {
         // The topic anchor is the confirmation message INSIDE the topic; future
         // sent cards reply to it so they stay in the topic.
         assert_eq!(entry.topic_anchor.as_deref(), Some("msg_topic_reply"));
+        // The thread root is the command message the topic was created around
+        // (ADR-0023): the injection guard excludes it from Quoted Context.
+        assert_eq!(entry.topic_root.as_deref(), Some("msg_topic"));
 
         // The lobby conversation still maps to nothing new (no session was
         // created for the lobby itself).
@@ -3309,6 +3342,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -3368,6 +3402,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -3514,6 +3549,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -3682,6 +3718,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -3729,6 +3766,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -3894,6 +3932,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
             store.set_active(crate::config::SessionEntry {
@@ -3904,6 +3943,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
             store.persist().unwrap();
@@ -3984,6 +4024,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
             store.set_active(crate::config::SessionEntry {
@@ -3994,6 +4035,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
             store.persist().unwrap();
@@ -4062,6 +4104,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
             store.set_active(crate::config::SessionEntry {
@@ -4072,6 +4115,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
             store.persist().unwrap();
@@ -4156,6 +4200,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -4900,6 +4945,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
             store.persist().unwrap();
@@ -4982,6 +5028,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -5132,6 +5179,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -5251,6 +5299,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -5307,6 +5356,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -5350,6 +5400,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -5451,6 +5502,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
             store.set_active(crate::config::SessionEntry {
@@ -5461,6 +5513,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -5549,6 +5602,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -5609,6 +5663,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -5737,6 +5792,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -5831,6 +5887,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -5932,6 +5989,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -5986,6 +6044,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -6043,6 +6102,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -6083,6 +6143,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -6144,6 +6205,7 @@ pub(crate) mod integration_tests {
                 model: Some("opencode-go/deepseek-v4-flash".into()),
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -6206,6 +6268,7 @@ pub(crate) mod integration_tests {
                 model: Some("opencode-go/deepseek-v4-flash".into()),
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -6259,6 +6322,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: Some("high".into()),
             });
         }
@@ -6308,6 +6372,7 @@ pub(crate) mod integration_tests {
                 model: Some("opencode-go/deepseek-v4-flash".into()),
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: Some("high".into()),
             });
         }
@@ -6364,6 +6429,7 @@ pub(crate) mod integration_tests {
                 model: Some("opencode-go/deepseek-v4-flash".into()),
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -6429,6 +6495,7 @@ pub(crate) mod integration_tests {
                 model: Some("opencode-go/deepseek-v4-flash".into()),
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: Some("high".into()),
             });
         }
@@ -6500,6 +6567,7 @@ pub(crate) mod integration_tests {
                 model: Some("opencode-go/deepseek-v4-flash".into()),
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: Some("high".into()),
             });
         }
@@ -6543,6 +6611,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -6599,6 +6668,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
             store.persist().unwrap();
@@ -6654,6 +6724,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -6714,6 +6785,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
             store.persist().unwrap();
@@ -6758,6 +6830,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: None,
+                topic_root: None,
                 variant: None,
             });
         }
@@ -6885,6 +6958,7 @@ pub(crate) mod integration_tests {
                 model: None,
                 auto_accept: false,
                 topic_anchor: Some("msg_anchor".into()),
+                topic_root: None,
                 variant: None,
             });
         }
@@ -7015,6 +7089,168 @@ pub(crate) mod integration_tests {
         );
         // The text parent carries no images.
         assert_eq!(*prompt_images.lock().await, vec![0]);
+    }
+
+    /// ADR-0023: a plain message in a cola-created topic carries `parent_id`
+    /// pointing at the topic's own creation messages — the thread root (the
+    /// user's `/topic` command) or the seed card (`topic_anchor`). Neither must
+    /// be injected as Quoted Context: both are boilerplate, and injecting them
+    /// pollutes every prompt in the topic.
+    #[tokio::test]
+    async fn topic_plain_reply_skips_own_root_and_seed_injection() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        let prompt_calls = backend.prompt_calls.clone();
+        let platform = RecordingPlatform::new();
+        for (id, text) in [
+            ("om_root_cmd", "📌 已创建会话 `api-refactor`"),
+            ("om_seed", "📌 已创建会话 `api-refactor`\n请在本话题内回复"),
+        ] {
+            platform.quoted_messages.lock().unwrap().insert(
+                id.into(),
+                crate::feishu::client::FeishuMessage {
+                    msg_type: "text".into(),
+                    content: format!(r#"{{"text":"{text}"}}"#),
+                    mentions: vec![],
+                },
+            );
+        }
+        let app = Arc::new(App::new(cfg, Arc::new(backend), Arc::new(platform)).unwrap());
+        // The cola-created topic already owns a session; its creation messages
+        // are the thread root (the `/topic` command) and the seed card.
+        app.sessions.lock().await.set_active(crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
+            session_id: "ses_topic".into(),
+            directory: "/work/topic".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: Some("om_seed".into()),
+            topic_root: Some("om_root_cmd".into()),
+            variant: None,
+        });
+
+        for pid in ["om_root_cmd", "om_seed"] {
+            prompt_calls.lock().await.clear();
+            app.handle_message(crate::bridge::IncomingMessage {
+                message_id: format!("msg_{pid}"),
+                chat_id: "chat_1".into(),
+                chat_type: "group".into(),
+                thread_id: Some("omt_t_1".into()),
+                parent_id: Some(pid.into()),
+                text: "普通回复".into(),
+                images: vec![],
+                requester_open_id: None,
+            })
+            .await;
+            assert_eq!(
+                *prompt_calls.lock().await,
+                vec!["普通回复".to_string()],
+                "parent {pid} is the topic's own creation message — must not be injected"
+            );
+        }
+    }
+
+    /// ADR-0023: a genuine quote of a real message inside a topic still injects
+    /// — only the topic's own creation messages are excluded.
+    #[tokio::test]
+    async fn topic_explicit_quote_of_real_message_still_injects() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        let prompt_calls = backend.prompt_calls.clone();
+        let platform = RecordingPlatform::new();
+        platform.quoted_messages.lock().unwrap().insert(
+            "om_real_quote".into(),
+            crate::feishu::client::FeishuMessage {
+                msg_type: "text".into(),
+                content: r#"{"text":"真正的上下文"}"#.into(),
+                mentions: vec![],
+            },
+        );
+        let app = Arc::new(App::new(cfg, Arc::new(backend), Arc::new(platform)).unwrap());
+        app.sessions.lock().await.set_active(crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
+            session_id: "ses_topic".into(),
+            directory: "/work/topic".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: Some("om_seed".into()),
+            topic_root: Some("om_root_cmd".into()),
+            variant: None,
+        });
+
+        app.handle_message(crate::bridge::IncomingMessage {
+            message_id: "msg_q".into(),
+            chat_id: "chat_1".into(),
+            chat_type: "group".into(),
+            thread_id: Some("omt_t_1".into()),
+            parent_id: Some("om_real_quote".into()),
+            text: "继续".into(),
+            images: vec![],
+            requester_open_id: None,
+        })
+        .await;
+
+        assert_eq!(
+            *prompt_calls.lock().await,
+            vec!["[引用消息]:\n真正的上下文\n\n继续".to_string()]
+        );
+    }
+
+    /// ADR-0023: a manually-created topic has neither `topic_root` nor
+    /// `topic_anchor`, so the guard is silent and the user's own subject
+    /// message (the topic's root) still injects — it is context, not
+    /// boilerplate.
+    #[tokio::test]
+    async fn manual_topic_plain_reply_injects_user_root() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        let prompt_calls = backend.prompt_calls.clone();
+        let platform = RecordingPlatform::new();
+        platform.quoted_messages.lock().unwrap().insert(
+            "om_user_root".into(),
+            crate::feishu::client::FeishuMessage {
+                msg_type: "text".into(),
+                content: r#"{"text":"用户的主题消息"}"#.into(),
+                mentions: vec![],
+            },
+        );
+        let app = Arc::new(App::new(cfg, Arc::new(backend), Arc::new(platform)).unwrap());
+        app.sessions.lock().await.set_active(crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
+            session_id: "ses_topic".into(),
+            directory: "/work/topic".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        });
+
+        app.handle_message(crate::bridge::IncomingMessage {
+            message_id: "msg_manual".into(),
+            chat_id: "chat_1".into(),
+            chat_type: "group".into(),
+            thread_id: Some("omt_t_1".into()),
+            parent_id: Some("om_user_root".into()),
+            text: "继续".into(),
+            images: vec![],
+            requester_open_id: None,
+        })
+        .await;
+
+        assert_eq!(
+            *prompt_calls.lock().await,
+            vec!["[引用消息]:\n用户的主题消息\n\n继续".to_string()]
+        );
     }
 
     /// A reply to an IMAGE message downloads the quoted image and attaches it as

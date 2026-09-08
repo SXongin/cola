@@ -344,7 +344,25 @@ impl App {
         // including parents missing from session history (lobby-session switch,
         // compaction). Depth-1 with a short timeout; any failure degrades to
         // text-only (the pre-change behavior).
-        if let Some(pid) = parent_id.as_deref() {
+        //
+        // ADR-0023: never inject the topic's own creation messages — the
+        // thread root (the user's `/topic` command, `topic_root`) and the seed
+        // card (`topic_anchor`). Feishu reports a plain topic reply's parent_id
+        // pointing at the root, so without this guard every prompt in a
+        // cola-created topic would carry boilerplate. Manually-created topics
+        // leave both `None`, so their user-typed root still injects.
+        let parent_is_topic_creation = match parent_id.as_deref() {
+            Some(pid) => self
+                .sessions
+                .lock()
+                .await
+                .get_active(&thread_key)
+                .is_some_and(|e| {
+                    e.topic_root.as_deref() == Some(pid) || e.topic_anchor.as_deref() == Some(pid)
+                }),
+            None => false,
+        };
+        if let Some(pid) = parent_id.as_deref().filter(|_| !parent_is_topic_creation) {
             let fetch = feishu::ws::quoted_context(&self.feishu, pid);
             let fetch = tokio::time::timeout(std::time::Duration::from_millis(1500), fetch);
             match fetch.await {
@@ -788,6 +806,7 @@ impl App {
             model: None,
             auto_accept: false,
             topic_anchor: None,
+            topic_root: None,
             variant: None,
         };
         let mut store = self.sessions.lock().await;
@@ -908,6 +927,7 @@ impl App {
                     model: None,
                     auto_accept: false,
                     topic_anchor: None,
+                    topic_root: None,
                     variant: None,
                 };
                 {
@@ -944,6 +964,7 @@ impl App {
                             model: None,
                             auto_accept: false,
                             topic_anchor: None,
+                            topic_root: None,
                             variant: None,
                         };
                         {
@@ -1153,6 +1174,7 @@ impl App {
             model: None,
             auto_accept: false,
             topic_anchor: None,
+            topic_root: None,
             variant: None,
         };
         {

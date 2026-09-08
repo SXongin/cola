@@ -262,6 +262,13 @@ pub struct SessionEntry {
     /// create API rejects `receive_id_type=thread_id`.
     #[serde(default)]
     pub topic_anchor: Option<String>,
+    /// For cola-created topics (`/topic`, `/topic --adopt`): the `message_id`
+    /// of the command message the Feishu topic was created around — the thread
+    /// root (ADR-0023). Together with `topic_anchor` it identifies the topic's
+    /// own creation messages, which are never injected as Quoted Context.
+    /// Manually-created topics leave it `None`.
+    #[serde(default)]
+    pub topic_root: Option<String>,
 }
 
 #[cfg(test)]
