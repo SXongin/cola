@@ -55,7 +55,7 @@ The message a Feishu topic is created around. For a cola-created topic (`/topic`
 _Avoid_: Seed, anchor, topic message
 
 **Topic Anchor**:
-The bot's seed card inside a cola-created topic — the `/topic` confirmation message, the first reply inside the thread. Doubles as the reply target that keeps permission/question/external cards inside the topic (the create API rejects a `thread_id` as target). Persisted as `topic_anchor`. Distinct from Topic Root: the Anchor is inside the topic, the Root is the message the thread is built around. Never injected as prompt context (ADR-0023).
+The bot's confirmation card inside a topic, placed by `/topic` / `/topic --adopt` (the seed card) or by `/switch` / `/attach` inside an existing topic. Doubles as the reply target that keeps permission/question/external cards inside the topic (the create API rejects a `thread_id` as target). Persisted as `topic_anchor`. Distinct from Topic Root: the Anchor is inside the topic, the Root is the message the thread is built around. Never injected as prompt context (ADR-0023).
 _Avoid_: Root, seed message, confirmation card
 
 **Turn**:
@@ -125,24 +125,6 @@ _Avoid_: pid file, lock file
 A cola instance that can still process events: running with its identity still readable. A process whose memory map the kernel has already torn down (mid-`exit()`) is NOT Functionally Alive even though the OS reports a live status — a `/restart` replacement reclaims its lock instead of waiting for it.
 _Avoid_: alive, running, process alive (all ambiguous — they include the mid-`exit()` state)
 
-## Relationships
-
-- A **Bot** contains one **Platform** and one or more **Backend** adapters
-- A **Chat** contains many **Topics**; a **Chat** may hold several **Sessions** directly (lobby), while a **Topic** holds exactly one **Session**
-- A **Topic** is created around its **Topic Root** and, when cola opens it, is anchored on its **Topic Anchor**
-- A **Session** contains many **Turns** and has one **Project** and one optional **Agent**
-- A **Session** receives many **Permissions** and **Questions**
-- The **Bridge** receives **Events** from a **Backend** and renders them as **Card** updates on the **Platform**
-- A prompt's **Quoted Context** and **Image Attachment**s enrich the **Session** the reply belongs to
-
-## Example dialogue
-
-> **Dev:** "If a user sends a message in a new topic, does the Bridge create a new Session?"
-> **Domain expert:** "Yes — the first message in a topic triggers session creation. If there's an existing topic, the message routes to that topic's session."
->
-> **Dev:** "What happens when a Permission request arrives mid-stream?"
-> **Domain expert:** "The Bridge pauses the Card stream, renders a Permission card with action buttons, and waits for the user to reply. Once resolved, streaming resumes."
-
 **Command**:
 A slash-prefixed instruction (e.g. `/new`, `/dir`, `/switch`, `/compact`). Every command supports two forms: a text-direct form (an argument that completes the action in one step) and a card form (no argument pops a card — an **Interactive Card** for strong-interaction commands like `/switch`, `/dir`, `/model`, `/agent`, `/autoaccept`, or a **Reference Card** for `/help`). cola parses its own commands locally and forwards unrecognized ones to the Backend as prompt text.
 _Avoid_: Slash command, action, operation
@@ -163,6 +145,7 @@ _Avoid_: Notification, message, signal
 - A **Session** contains many **Turns** and has one **Project** and one optional **Agent**
 - A **Session** receives many **Permissions** and **Questions**
 - The **Bridge** receives **Events** from a **Backend** and renders them as **Card** updates on the **Platform**
+- A prompt's **Quoted Context** and **Image Attachment**s enrich the **Session** the reply belongs to
 - A **Command** is parsed by the **Bridge** from message text before routing to the **Backend**
 
 ## Example dialogue

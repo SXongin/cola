@@ -17,9 +17,13 @@ model could not tell apart from a genuine quote of a real message.
   card inside the topic).
 - **Injection guard**: in the Quoted Context path (`handle_prompt`), skip
   fetching/injecting the parent when `parent_id` equals the active session's
-  `topic_anchor` **or** `topic_root`. Manually-created Feishu topics leave both
-  `None`, so the guard is silent there and the user's own subject message still
-  injects — that is valuable context, not noise.
+  `topic_anchor` **or** `topic_root` — i.e. the messages cola itself placed in
+  the topic: the `/topic` / `/topic --adopt` seed card, the `/switch` /
+  `/attach` adopt card inside an existing topic (`adopt_session`), and the
+  user's `/topic` command message that is the thread root. A manually-created
+  topic that never received a cola card keeps both `None`, so the guard is
+  silent there and the user's own subject message still injects — that is
+  valuable context, not noise.
 - **Enrich the seed card**: the `/topic` / `/topic --adopt` confirmation card
   becomes a session brief — title, directory, agent, model, session-id tail, git
   branch — instead of one thin line. Purely human-facing: because the guard
