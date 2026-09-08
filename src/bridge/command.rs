@@ -584,7 +584,7 @@ pub(crate) async fn handle_command(
                 .feishu
                 .reply_in_thread(
                     message_id,
-                    &topic_seed_brief("已创建会话", &display_name, &dir_str, &session.id, None).await,
+                    &topic_seed_brief("已创建会话", &display_name, &dir_str, &session.id, None, None).await,
                 )
                 .await?;
             let Some(thread_id) = thread_id else {
@@ -1682,6 +1682,7 @@ pub(crate) async fn create_topic_and_map_adopted(
                 &info.directory,
                 &info.id,
                 info.agent.as_deref(),
+                model_display(info.model.as_ref()).as_deref(),
             )
             .await,
         )
@@ -1838,16 +1839,17 @@ pub(crate) fn id_tail(id: &str) -> String {
 }
 
 /// Build the seed card text for a cola-created topic (ADR-0023): a session
-/// brief — title, session-id tail, project, git state, agent — instead of the
-/// old one-line confirmation. Purely human-facing: the injection guard never
-/// feeds the topic's own root or anchor back into prompts, so richness costs
-/// no tokens. `verb` is the leading action phrase ("已创建会话"/"已接管会话").
+/// brief — title, session-id tail, project, git state, agent, model — instead
+/// of the old one-line confirmation. Purely human-facing: the injection guard
+/// never feeds the topic's own root or anchor back into prompts, so richness
+/// costs no tokens. `verb` is the leading action phrase ("已创建会话"/"已接管会话").
 async fn topic_seed_brief(
     verb: &str,
     title: &str,
     dir: &str,
     session_id: &str,
     agent: Option<&str>,
+    model: Option<&str>,
 ) -> String {
     let git = crate::git::read_state(dir).await;
     let mut s = format!("📌 {verb} `{title}`\n");
@@ -1866,8 +1868,31 @@ async fn topic_seed_brief(
     if let Some(agent) = agent {
         s.push_str(&format!(" · agent `{agent}`"));
     }
+    if let Some(model) = model {
+        s.push_str(&format!(" · 模型 `{model}`"));
+    }
     s.push_str("\n\n请在本话题内回复，即可和这个会话对话。");
     s
+}
+
+/// The display identity of a session's model from the list payload
+/// (`providerID/modelID@variant`), matching how cola renders model identity
+/// elsewhere. Returns None when the payload carries no model.
+fn model_display(model: Option<&serde_json::Value>) -> Option<String> {
+    let v = model?;
+    let id = match v {
+        serde_json::Value::String(s) => return Some(s.clone()),
+        _ => v.get("id").and_then(|x| x.as_str())?,
+    };
+    let mut s = match v.get("providerID").and_then(|x| x.as_str()) {
+        Some(p) => format!("{p}/{id}"),
+        None => id.to_string(),
+    };
+    if let Some(variant) = v.get("variant").and_then(|x| x.as_str()) {
+        s.push('@');
+        s.push_str(variant);
+    }
+    Some(s)
 }
 
 /// The basename of a working directory, for display (e.g. "cola" for
@@ -1985,6 +2010,36 @@ mod tests {
     fn plain_text_is_not_command() {
         assert_eq!(parse_command("hello world"), None);
         assert_eq!(parse_command("fix the bug"), None);
+    }
+
+    #[test]
+    fn model_display_formats_provider_model_and_variant() {
+        use serde_json::json;
+        // Full identity: providerID/modelID@variant (ADR-0019 model identity).
+        assert_eq!(
+            model_display(Some(
+                &json!({"id": "deepseek-v4-flash", "providerID": "opencode-go", "variant": "low"})
+            ))
+            .as_deref(),
+            Some("opencode-go/deepseek-v4-flash@low")
+        );
+        // No variant.
+        assert_eq!(
+            model_display(Some(&json!({"id": "gpt-4o", "providerID": "openai"}))).as_deref(),
+            Some("openai/gpt-4o")
+        );
+        // No provider: bare id.
+        assert_eq!(
+            model_display(Some(&json!({"id": "claude"}))).as_deref(),
+            Some("claude")
+        );
+        // A bare string payload passes through.
+        assert_eq!(
+            model_display(Some(&json!("openai/gpt-4o"))).as_deref(),
+            Some("openai/gpt-4o")
+        );
+        // No model at all.
+        assert_eq!(model_display(None), None);
     }
 
     #[test]

@@ -53,3 +53,9 @@ model could not tell apart from a genuine quote of a real message.
   fall back to the `topic_anchor`-only guard until the topic is recreated.
   `topic_root` could be recovered by listing the thread and taking its earliest
   message if the noise shows up in practice.
+- **Session 404-recreate keeps the topic identity**: when a mapped session no
+  longer exists and cola recreates it (`create_fresh_session`), the per-session
+  overrides reset but `topic_root`/`topic_anchor` survive — they are Feishu
+  message ids, not session state, so the guard keeps working after the recreate.
+- **The brief renders the model** as `providerID/modelID@variant` when the
+  adopted session carries one (fresh `/topic` sessions have none and omit it).
