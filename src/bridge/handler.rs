@@ -887,7 +887,7 @@ impl App {
         if title == recorded.title {
             return;
         }
-        let text = crate::bridge::command::topic_cover_title_text(
+        let text = crate::bridge::command::topic_cover_text(
             &title,
             &directory,
             session_id,

@@ -581,8 +581,7 @@ pub(crate) async fn handle_command(
             // message INSIDE the topic, so permission/question/external cards
             // that must be sent (no streaming card) can reply to it and stay
             // in the topic (the create API rejects `thread_id` as a target).
-            let cover_text =
-                topic_seed_brief("已创建会话", &display_name, &dir_str, &session.id, None, None).await;
+            let cover_text = topic_cover_text(&display_name, &dir_str, &session.id, None, None).await;
             let (anchor, thread_id, topic_root, cover_id) =
                 open_cover_topic(core, &thread_key.chat_id, message_id, &cover_text).await?;
             let Some(thread_id) = thread_id else {
@@ -1672,8 +1671,7 @@ pub(crate) async fn create_topic_and_map_adopted(
     info: &crate::opencode::SessionListInfo,
     message_id: &str,
 ) -> crate::error::Result<Option<String>> {
-    let cover_text = topic_seed_brief(
-        "已接管会话",
+    let cover_text = topic_cover_text(
         &info.title,
         &info.directory,
         &info.id,
@@ -1836,50 +1834,27 @@ pub(crate) fn id_tail(id: &str) -> String {
     id.strip_prefix("ses_").unwrap_or(id).chars().take(7).collect()
 }
 
-/// Build the seed card text for a cola-created topic (ADR-0023): a session
-/// brief — title, session-id tail, project, git state, agent, model — instead
-/// of the old one-line confirmation. Purely human-facing: the injection guard
-/// never feeds the topic's own root or anchor back into prompts, so richness
-/// costs no tokens. `verb` is the leading action phrase ("已创建会话"/"已接管会话").
-async fn topic_seed_brief(
-    verb: &str,
+/// Build the topic cover card's text (ADR-0023): a session brief laid out for
+/// the chat-list entry — the list shows the card's first ~3 lines, so line 1
+/// is the title, line 2 the project + git state, line 3 the session + dir.
+/// No creation verb and no footer: the reply hint lives only on the first
+/// message inside the topic, where the user actually sees it. Used both at
+/// creation and by the title-sync hook (patching the card keeps the list
+/// entry current). Purely human-facing: the injection guard never feeds the
+/// topic's own root or anchor back into prompts, so richness costs no tokens.
+pub(crate) async fn topic_cover_text(
     title: &str,
     dir: &str,
     session_id: &str,
     agent: Option<&str>,
     model: Option<&str>,
 ) -> String {
-    let body = seed_brief_body(dir, session_id, agent, model).await;
-    format!("📌 {verb} `{title}`\n{body}\n\n请在本话题内回复，即可和这个会话对话。")
-}
-
-/// Rebuild the topic cover card's text after a title change (ADR-0023): the
-/// creation verb is transient, so the title itself becomes the header. The
-/// cover card is the thread root, so this text is what the chat-list topic
-/// entry shows — patching it in place keeps the entry current.
-pub(crate) async fn topic_cover_title_text(
-    title: &str,
-    dir: &str,
-    session_id: &str,
-    agent: Option<&str>,
-    model: Option<&str>,
-) -> String {
-    let body = seed_brief_body(dir, session_id, agent, model).await;
-    format!("`{title}`\n{body}\n\n请在本话题内回复，即可和这个会话对话。")
-}
-
-/// The body lines shared by the topic seed / cover card (ADR-0023): session
-/// tail, project, git state, directory, agent, model. No header, no footer.
-async fn seed_brief_body(dir: &str, session_id: &str, agent: Option<&str>, model: Option<&str>) -> String {
     let git = crate::git::read_state(dir).await;
-    let mut s = format!("会话 `{}` · 项目 `{}`", id_tail(session_id), dir_basename(dir));
+    let mut s = format!("📌 `{title}`\n`{}`", dir_basename(dir));
     if let Some(branch) = git.branch.as_deref() {
-        s.push_str(&format!(
-            " · 分支 `{branch}`{}",
-            if git.dirty { " ⚠" } else { "" }
-        ));
+        s.push_str(&format!(" · `{branch}`{}", if git.dirty { " ⚠" } else { "" }));
     }
-    s.push_str(&format!("\n目录 `{dir}`"));
+    s.push_str(&format!("\n会话 `{}` · `{dir}`", id_tail(session_id)));
     if let Some(agent) = agent {
         s.push_str(&format!(" · agent `{agent}`"));
     }
