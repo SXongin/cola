@@ -1914,7 +1914,12 @@ async fn open_cover_topic(
 /// harmless). Best effort; failures only log. Only cover-rooted topics are
 /// patched — command-rooted fallback topics record nothing, so they
 /// short-circuit.
-pub(crate) async fn sync_topic_cover_title(core: &Arc<SharedCore>, session_id: &str) {
+///
+/// Returns `true` when the card is settled (nothing more to do: no cover
+/// topic, already synced, or patched) and `false` when the server title is
+/// not (yet) available or the patch failed — callers like the post-turn retry
+/// ladder use this to decide whether to try again later.
+pub(crate) async fn sync_topic_cover_title(core: &Arc<SharedCore>, session_id: &str) -> bool {
     let (root_id, directory, agent, recorded) = {
         let store = core.sessions.lock().await;
         match store.entry_for_session(session_id) {
@@ -1927,14 +1932,14 @@ pub(crate) async fn sync_topic_cover_title(core: &Arc<SharedCore>, session_id: &
                     recorded,
                 )
             }
-            None => return,
+            None => return true,
         }
     };
     let (Some(root_id), Some(recorded)) = (root_id, recorded) else {
-        return;
+        return true;
     };
     let Ok(info) = core.opencode.session_info(session_id, Some(&directory)).await else {
-        return;
+        return false;
     };
     // Never patch a default title over the recorded one: the server's initial
     // `New session - <ts>` (or empty) would otherwise replace the meaningful
@@ -1944,10 +1949,10 @@ pub(crate) async fn sync_topic_cover_title(core: &Arc<SharedCore>, session_id: &
         .title
         .filter(|t| !t.is_empty() && !crate::feishu::card::clean_session_label(t).is_empty())
     else {
-        return;
+        return false;
     };
     if title == recorded.title {
-        return;
+        return true;
     }
     let text = topic_cover_text(
         &title,
@@ -1968,9 +1973,54 @@ pub(crate) async fn sync_topic_cover_title(core: &Arc<SharedCore>, session_id: &
                     model: recorded.model,
                 },
             );
+            true
         }
-        Err(e) => tracing::warn!("topic cover card update failed for session {}: {}", session_id, e),
+        Err(e) => {
+            tracing::warn!("topic cover card update failed for session {}: {}", session_id, e);
+            false
+        }
     }
+}
+
+/// ADR-0023: after a completed turn the auto-title may still be in flight —
+/// the title agent races the turn, and on short turns it lands AFTER the turn
+/// ends. Retry the cover sync a few times with backoff so the chat-list topic
+/// entry follows even if the user stops here. Each attempt is one cheap
+/// `session_info` GET and stops as soon as the title is settled (patched,
+/// already equal, or no cover topic); the ladder gives up after ~4 minutes,
+/// leaving later turns' hooks to catch up. Detached task: holds no locks
+/// across sleeps.
+pub(crate) fn spawn_cover_title_retry(core: &Arc<SharedCore>, session_id: &str) {
+    spawn_cover_title_retry_at(
+        core,
+        session_id,
+        &[
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(120),
+        ],
+    );
+}
+
+/// The delay-injectable form of [`spawn_cover_title_retry`] (tests use
+/// millisecond delays).
+pub(crate) fn spawn_cover_title_retry_at(
+    core: &Arc<SharedCore>,
+    session_id: &str,
+    delays: &[std::time::Duration],
+) {
+    let core = Arc::clone(core);
+    let sid = session_id.to_string();
+    let delays = delays.to_vec();
+    tokio::spawn(async move {
+        for delay in delays {
+            tokio::time::sleep(delay).await;
+            if sync_topic_cover_title(&core, &sid).await {
+                return;
+            }
+        }
+    });
 }
 
 /// ADR-0023: record the title shown on a topic's cover card so the post-turn

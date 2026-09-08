@@ -234,7 +234,7 @@ pub struct MockBackend {
     /// session_id → server title (simulates OpenChamber's session title).
     /// `std::sync::Mutex` for interior mutability: `update_session_title`
     /// writes it through `&self` (the trait requires `&self`).
-    pub session_titles: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    pub session_titles: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
     /// Pending questions served by `list_questions`.
     pub questions: Vec<opencode::client::QuestionRequest>,
     /// Records `reply_question` calls: (request_id, answers).
@@ -302,7 +302,7 @@ impl MockBackend {
             external_reply_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             external_user_created: Arc::new(std::sync::Mutex::new(None)),
             reply_permission_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            session_titles: std::sync::Mutex::new(std::collections::HashMap::new()),
+            session_titles: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             questions: Vec::new(),
             reply_question_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_error: None,
@@ -6593,7 +6593,7 @@ pub(crate) mod integration_tests {
             },
         );
 
-        crate::bridge::command::sync_topic_cover_title(&app.core, "ses_test").await;
+        let settled = crate::bridge::command::sync_topic_cover_title(&app.core, "ses_test").await;
 
         let calls = platform.calls.lock().await.clone();
         assert!(
@@ -6610,6 +6610,85 @@ pub(crate) mod integration_tests {
                 .get("ses_test")
                 .map(|c| c.title.clone()),
             Some("cola".to_string())
+        );
+        assert!(
+            !settled,
+            "a default title must signal 'retry later', not 'settled'"
+        );
+    }
+
+    /// ADR-0023: when the auto-title lands shortly AFTER a short turn ends,
+    /// the retry ladder (backoff) patches the cover card anyway — the title
+    /// agent races the turn, so the cover must not depend on the user sending
+    /// another message.
+    #[tokio::test]
+    async fn cover_title_retry_ladder_catches_late_auto_title() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        let titles = backend.session_titles.clone();
+        let (app, platform) = build_app(cfg, backend).await;
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
+                session_id: "ses_test".into(),
+                directory: "/tmp/aa".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: Some("om_seed".into()),
+                topic_root: Some("om_cover".into()),
+                variant: None,
+            });
+        }
+        app.core.cover_titles.lock().await.insert(
+            "ses_test".into(),
+            crate::bridge::core::CoverTitle {
+                title: "cola".into(),
+                model: None,
+            },
+        );
+
+        // The title is NOT on the server when the turn ends; the ladder starts
+        // and the title lands a moment later.
+        crate::bridge::command::spawn_cover_title_retry_at(
+            &app.core,
+            "ses_test",
+            &[
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_millis(200),
+            ],
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        titles
+            .lock()
+            .unwrap()
+            .insert("ses_test".into(), "迟到标题".into());
+
+        // Wait past the ladder window; the 100ms attempt must catch it.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        let calls = platform.calls.lock().await.clone();
+        let patched = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::UpdateMessage { message_id, card } if message_id == "om_cover" => {
+                    Some(card.to_string())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !patched.is_empty(),
+            "the retry ladder must patch the cover card once the title lands: {calls:?}"
+        );
+        assert!(
+            patched.last().unwrap().contains("迟到标题"),
+            "cover card must show the late title: {:?}",
+            patched.last()
         );
     }
 
