@@ -55,7 +55,7 @@ The message a Feishu topic is created around. For a cola-created topic (`/topic`
 _Avoid_: Seed, anchor, topic message
 
 **Topic Cover Card**:
-The bot's card that is the Topic Root of a cola-created topic. Sent to the main Chat at creation so the chat-list topic entry shows the session brief (title, session id, project, branch, directory, agent, model) permanently, then replied-in-thread to open the topic. Being an interactive card, cola patches it in place when the session title changes — auto-generated after the first exchange, or set by `/name` (ADR-0023). When the card cannot be sent, the topic falls back to anchoring on the user's `/topic` command message instead.
+The bot's card that is the Topic Root of a cola-created topic. Sent to the main Chat at creation so the chat-list topic entry shows the session brief (title, session id, project, branch, directory, agent, model) permanently, then replied-in-thread to open the topic. Being an interactive card, cola patches it in place when the session title changes — auto-generated after the first exchange (mid-turn, with a post-turn retry ladder) or set by `/name` (ADR-0023). When the card cannot be sent, the topic falls back to anchoring on the user's `/topic` command message instead.
 _Avoid_: Cover message, topic stub, seed card
 
 **Topic Anchor**:

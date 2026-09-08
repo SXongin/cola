@@ -1984,12 +1984,13 @@ pub(crate) async fn sync_topic_cover_title(core: &Arc<SharedCore>, session_id: &
 
 /// ADR-0023: after a completed turn the auto-title may still be in flight —
 /// the title agent races the turn, and on short turns it lands AFTER the turn
-/// ends. Retry the cover sync a few times with backoff so the chat-list topic
-/// entry follows even if the user stops here. Each attempt is one cheap
-/// `session_info` GET and stops as soon as the title is settled (patched,
-/// already equal, or no cover topic); the ladder gives up after ~4 minutes,
-/// leaving later turns' hooks to catch up. Detached task: holds no locks
-/// across sleeps.
+/// ends. Retry the cover sync at 10/30/60/120 s after the turn so the
+/// chat-list topic entry follows even if the user stops here. Each attempt is
+/// one cheap `session_info` GET and stops as soon as the title is settled
+/// (patched, already equal, or no cover topic); the ladder gives up after two
+/// minutes, leaving later turns' hooks to catch up. Detached task: holds no
+/// locks across sleeps. Only meaningful when the initial sync did not settle —
+/// callers gate on its return value.
 pub(crate) fn spawn_cover_title_retry(core: &Arc<SharedCore>, session_id: &str) {
     spawn_cover_title_retry_at(
         core,
@@ -2004,7 +2005,8 @@ pub(crate) fn spawn_cover_title_retry(core: &Arc<SharedCore>, session_id: &str) 
 }
 
 /// The delay-injectable form of [`spawn_cover_title_retry`] (tests use
-/// millisecond delays).
+/// millisecond delays). `delays` are ABSOLUTE offsets from the call: attempts
+/// happen at each listed time after spawn, not after the previous attempt.
 pub(crate) fn spawn_cover_title_retry_at(
     core: &Arc<SharedCore>,
     session_id: &str,
@@ -2014,8 +2016,12 @@ pub(crate) fn spawn_cover_title_retry_at(
     let sid = session_id.to_string();
     let delays = delays.to_vec();
     tokio::spawn(async move {
+        let start = std::time::Instant::now();
         for delay in delays {
-            tokio::time::sleep(delay).await;
+            let elapsed = start.elapsed();
+            if delay > elapsed {
+                tokio::time::sleep(delay - elapsed).await;
+            }
             if sync_topic_cover_title(&core, &sid).await {
                 return;
             }
