@@ -4155,6 +4155,82 @@ pub(crate) mod integration_tests {
         assert_eq!(sid.as_deref(), Some("ses_new"));
     }
 
+    /// ADR-0023: when a cola-created topic's session 404s and is recreated, the
+    /// topic's creation messages (`topic_anchor`/`topic_root`) survive the
+    /// recreate — they are Feishu message ids, not session state — so the
+    /// quote-injection guard keeps working for later replies in the topic.
+    #[tokio::test]
+    async fn stale_topic_recreate_preserves_creation_messages() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_id = "ses_new".into();
+        backend.stale_session_404 = true;
+        let prompt_calls = backend.prompt_calls.clone();
+        let (app, _platform) = build_app(cfg, backend).await;
+
+        let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into());
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: topic_key.clone(),
+                session_id: "ses_old".into(),
+                directory: "/work/topic".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: Some("om_seed".into()),
+                topic_root: Some("om_root_cmd".into()),
+                variant: None,
+            });
+        }
+
+        // The first message 404s on the stale session; cola recreates and retries.
+        app.handle_message(crate::bridge::IncomingMessage {
+            message_id: "msg_1".into(),
+            chat_id: "chat_1".into(),
+            chat_type: "group".into(),
+            thread_id: Some("omt_t_1".into()),
+            parent_id: Some("om_root_cmd".into()),
+            text: "第一条".into(),
+            images: vec![],
+            requester_open_id: None,
+        })
+        .await;
+
+        // The recreated entry keeps the topic's creation messages (ADR-0023).
+        let entry = app
+            .sessions
+            .lock()
+            .await
+            .get_active(&topic_key)
+            .cloned()
+            .expect("recreated session mapped to the topic");
+        assert_eq!(entry.session_id, "ses_new");
+        assert_eq!(entry.topic_anchor.as_deref(), Some("om_seed"));
+        assert_eq!(entry.topic_root.as_deref(), Some("om_root_cmd"));
+
+        // A later plain reply pointing at the root must still skip injection.
+        prompt_calls.lock().await.clear();
+        app.handle_message(crate::bridge::IncomingMessage {
+            message_id: "msg_2".into(),
+            chat_id: "chat_1".into(),
+            chat_type: "group".into(),
+            thread_id: Some("omt_t_1".into()),
+            parent_id: Some("om_root_cmd".into()),
+            text: "第二条".into(),
+            images: vec![],
+            requester_open_id: None,
+        })
+        .await;
+        assert_eq!(
+            *prompt_calls.lock().await,
+            vec!["第二条".to_string()],
+            "the recreated entry must still exclude the topic root from Quoted Context"
+        );
+    }
+
     #[tokio::test]
     async fn question_card_action_posts_answer_back() {
         let _wd = test_work_dir();
