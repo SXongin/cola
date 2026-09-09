@@ -113,6 +113,10 @@ _Avoid_: Auto-authorize button, approve-all switch
 A structured multi-choice prompt from the AI backend, distinct from permissions. User selects options to reply.
 _Avoid_: Poll, survey, prompt
 
+**Session Snapshot** (会话快照):
+The one read-only card a Chat/Topic receives when it activates a Session it was not already following — a first adoption, `/attach`, `/topic --adopt`, or the re-activation of a mapped Session — replacing the bare adoption confirmation. It answers what the operator cannot know at takeover: whether the last Turn ended (status line 等待你的确认 / 运行中 / 需要重试 / 空闲), what is blocked on the user (adopt-time Permissions and Questions, actionable inline), and what was recently said (最近对话 tail). Purely a read: it never prompts the Backend, writes to the Session, or disturbs a running Turn. Suppressed when re-activating a Session whose recent life is already fully visible in this Chat/Topic (the switch then confirms in one text line). An adopted-busy Session's in-flight external Turn is followed into the card until completion; every other snapshot is one-shot.
+_Avoid_: Briefing, takeover summary, handoff card
+
 **Card**:
 A Feishu interactive message card. Evolves through states (loading → reasoning → running → streaming → done), uses collapsible panels for secondary content, and shows progress in its header (phase timer, silence, reasoning length) so a slow turn is distinguishable from a dead one — including a "等待你的授权/回答" state while a permission or question is pending.
 _Avoid_: Widget, component, bubble
@@ -168,6 +172,7 @@ _Avoid_: Notification, message, signal
 - A **Topic** is created around its **Topic Root** and, when cola opens it, is anchored on its **Topic Anchor**; a cola-created **Topic Root** is a **Topic Cover Card**
 - A **Session** contains many **Turns** and has one **Project** and one optional **Agent**
 - A **Session** receives many **Permissions** and **Questions**
+- A **Session Snapshot** reports the state of one **Session** (its last **Turn**'s completion, pending **Permissions**/**Questions**, recent messages) to the **Chat**/**Topic** that activated it
 - The **Bridge** receives **Events** from a **Backend** and renders them as **Card** updates on the **Platform**
 - A prompt's **Quoted Context** and **Image Attachment**s enrich the **Session** the reply belongs to
 - A **Command** is parsed by the **Bridge** from message text before routing to the **Backend**
