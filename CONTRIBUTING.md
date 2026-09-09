@@ -31,7 +31,9 @@ The per-task loop is always:
    `git switch <branch> && git rebase main` so the branch sits on the latest
    `main` (a rebase, not a merge — history stays linear).
 5. **Open a PR** with base `main`, pass the verification loop, and let `main`
-   receive the squash-merge. The branch is deleted once merged.
+   receive a rebase-merge (the repo's PR merge setting: rebase merges keep
+   the branch's commits verbatim on `main`; squash is disabled in settings).
+   The branch is deleted once merged.
 6. **Return to `main`** for the next task — a fresh branch, never reusing one.
 
 Keep one PR to one thing (see *Before you start*) and the branch short-lived.
@@ -97,7 +99,9 @@ Note: CI's Format job is `cargo fmt --all -- --check` — clippy and rustc do
 
 ## Pull request rules
 
-1. **Title** is a Conventional Commits subject (used as the squash-merge title).
+1. **Title** is a Conventional Commits subject (kept verbatim by the rebase
+   merge — it lands on `main` as the commit message's subject, so make it
+   accurate and complete).
 2. **Description** answers: what changed, why, and how it was verified.
 3. Reference the originating issue/spec when one exists (`.scratch/<feature>/`
    files or a GitHub issue number).
