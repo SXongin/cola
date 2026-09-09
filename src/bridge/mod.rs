@@ -7,6 +7,7 @@ pub mod pollers;
 pub mod render;
 pub mod request;
 pub mod session;
+pub mod snapshot;
 pub mod streaming;
 
 #[cfg(test)]

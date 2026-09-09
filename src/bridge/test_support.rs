@@ -310,6 +310,14 @@ pub struct MockBackend {
     /// The server-recorded session model served by `session_info` (the third
     /// rung of the `/think` effective-model resolution).
     pub session_model: Option<opencode::client::SessionModel>,
+    /// Per-session server status served by `session_status` (session_id →
+    /// status). A missing key means idle (matches the server: a finished run is
+    /// removed from the status map). `Some(None)` inside simulates a session
+    /// present but with an unrecognised status type (unknown).
+    pub session_statuses: std::collections::HashMap<String, Option<opencode::client::SessionStatus>>,
+    /// When set, `session_status` fails with this message (simulates a read
+    /// failure — the caller must not guess a status).
+    pub session_status_error: Option<String>,
 }
 
 impl MockBackend {
@@ -352,6 +360,8 @@ impl MockBackend {
             provider_models: Vec::new(),
             default_model: None,
             session_model: None,
+            session_statuses: std::collections::HashMap::new(),
+            session_status_error: None,
         }
     }
 }
@@ -664,6 +674,22 @@ impl opencode::Backend for MockBackend {
             parent_id: self.session_parents.get(session_id).cloned(),
             title: self.session_titles.lock().unwrap().get(session_id).cloned(),
             model: self.session_model.clone(),
+        })
+    }
+
+    async fn session_status(
+        &self,
+        session_id: &str,
+        _d: Option<&str>,
+    ) -> crate::error::Result<Option<opencode::client::SessionStatus>> {
+        if let Some(err) = &self.session_status_error {
+            return Err(crate::error::BridgeError::OpenCode(err.clone()));
+        }
+        // A scripted entry is served verbatim (`Some(None)` → unknown); a
+        // missing key means idle (the server removes finished runs).
+        Ok(match self.session_statuses.get(session_id) {
+            Some(status) => *status,
+            None => Some(opencode::client::SessionStatus::Idle),
         })
     }
 
