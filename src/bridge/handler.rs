@@ -70,9 +70,6 @@ pub struct App {
     /// the app alive — no reference cycle; `OnceLock` because it is written
     /// exactly once, before any event can arrive.
     self_weak: std::sync::OnceLock<std::sync::Weak<App>>,
-    /// External-message flow: owns `last_user_msg_epoch`, notifies Feishu when
-    /// another shared-store client posts while cola is idle.
-    pub external: super::external::ExternalFlow,
 }
 
 impl Deref for App {
@@ -150,7 +147,6 @@ impl App {
         let core = Arc::new(SharedCore::new(&cfg, opencode, feishu)?);
         Ok(Self {
             self_weak: std::sync::OnceLock::new(),
-            external: super::external::ExternalFlow::new(),
             core,
         })
     }
@@ -1067,7 +1063,7 @@ impl App {
                 }
                 core.invalidate_session_list_cache().await;
                 if let (Some(message_id), Some(data)) = (&open_message_id, &claim_data) {
-                    crate::bridge::request::claim_snapshot_pendings(
+                    crate::bridge::external::settle_snapshot_after_send(
                         core,
                         message_id,
                         verb,

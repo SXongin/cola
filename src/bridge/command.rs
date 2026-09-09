@@ -1442,7 +1442,8 @@ async fn handle_switch(
                 let data = crate::bridge::request::claimable_pendings(core, data).await;
                 let card = crate::feishu::snapshot_card::build_snapshot_card("切换", &hit.title, &data);
                 let mid = core.feishu.reply_card(message_id, &card).await?;
-                crate::bridge::request::claim_snapshot_pendings(core, &mid, "切换", &hit.title, &data).await;
+                crate::bridge::external::settle_snapshot_after_send(core, &mid, "切换", &hit.title, &data)
+                    .await;
             }
             crate::bridge::snapshot::SnapshotEmit::Suppressed => {
                 core.feishu
@@ -1890,7 +1891,7 @@ pub(crate) async fn create_topic_and_map_adopted(
     // never duplicates them. Not claimed when the topic could not be opened
     // (no thread_id) — the poller keeps today's standalone flow for them.
     if thread_id.is_some() {
-        crate::bridge::request::claim_snapshot_pendings(core, &anchor, "接管", &info.title, &data).await;
+        crate::bridge::external::settle_snapshot_after_send(core, &anchor, "接管", &info.title, &data).await;
     }
     Ok(thread_id)
 }
@@ -2026,9 +2027,9 @@ async fn adopt_session(
     // above); don't reply twice.
     if kind != ConversationKind::Topic {
         let mid = core.feishu.reply_card(message_id, &card).await?;
-        crate::bridge::request::claim_snapshot_pendings(core, &mid, "接管", &info.title, &data).await;
+        crate::bridge::external::settle_snapshot_after_send(core, &mid, "接管", &info.title, &data).await;
     } else if let Some(anchor) = &anchor {
-        crate::bridge::request::claim_snapshot_pendings(core, anchor, "接管", &info.title, &data).await;
+        crate::bridge::external::settle_snapshot_after_send(core, anchor, "接管", &info.title, &data).await;
     }
     Ok(())
 }

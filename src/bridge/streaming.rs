@@ -42,6 +42,7 @@ pub struct PendingQuestion {
 /// chain — the current live card's message id, updated in place by
 /// `flush_card` (including continuation cards). Replaces the two per-session
 /// maps kept in lockstep; owned by [`SharedCore::cards`].
+#[derive(Clone)]
 pub struct CardSession {
     pub acc: StreamAccumulator,
     pub card_message_id: Option<String>,
@@ -61,6 +62,14 @@ impl CardSession {
             card_message_id,
             last_header_sig: String::new(),
         }
+    }
+
+    /// Re-point the live card identity at a new message (ADR-0028: a re-adopt
+    /// mid-turn sends a fresh snapshot; the follow renderer keeps updating the
+    /// new card instead of the old one). The accumulator content is untouched.
+    pub fn repoint(&mut self, message_id: &str) {
+        self.card_message_id = Some(message_id.to_string());
+        self.acc.reply_to_message_id = Some(message_id.to_string());
     }
 }
 

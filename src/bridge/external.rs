@@ -278,6 +278,201 @@ impl ExternalFlow {
             external_render_loop(&core, sid, epoch_ms, poll_ms, timeout_ms).await;
         });
     }
+
+    /// ADR-0028 busy-adopt follow: the adopted session's in-flight EXTERNAL
+    /// turn streams into the snapshot card instead of freezing a static
+    /// "运行中" line. The snapshot card is the host (`CardSession` in
+    /// `core.cards`, like `start_reply_render`): its message id is the live
+    /// card, the static 已接管 prefix + tail ride as acc text (the same
+    /// representation choice as the 👤 preview), and the adopt-time pending
+    /// blocks are pre-seeded as inline sections so a permission approved from
+    /// the snapshot resumes the run inside the SAME card. The renderer exits
+    /// when a cola prompt or a newer external message replaces the accumulator
+    /// (the existing `external_render_loop` guards).
+    pub(crate) async fn start_snapshot_follow(
+        &self,
+        core: &Arc<SharedCore>,
+        session_id: &str,
+        card_id: &str,
+        verb: &str,
+        title: &str,
+        data: &crate::bridge::snapshot::SnapshotData,
+    ) -> bool {
+        // Race (ADR-0028): busy at gather but idle by now → the turn already
+        // finished; keep the static snapshot and never arm a renderer.
+        let busy_now = matches!(
+            core.opencode
+                .session_status(session_id, Some(&data.directory))
+                .await,
+            Ok(Some(crate::opencode::SessionStatus::Busy))
+        );
+        if !busy_now {
+            tracing::info!(
+                "snapshot follow: session {} no longer busy; keeping static snapshot",
+                session_id
+            );
+            return false;
+        }
+        let Some(epoch_ms) = data.newest_user_epoch else {
+            tracing::warn!(
+                "snapshot follow: session {} busy but has no user message to follow",
+                session_id
+            );
+            return false;
+        };
+        // The follow is scoped to EXTERNAL turns (ADR-0028): the busy run
+        // answers the newest user message, so a cola-authored newest means the
+        // in-flight turn is cola's OWN (this thread, another thread, or a
+        // re-/switch mid-answer) — keep the static snapshot and never touch
+        // cola's live accumulator.
+        if data.newest_user_is_cola_authored {
+            tracing::info!(
+                "snapshot follow: session {} busy on a cola-authored turn; keeping static snapshot",
+                session_id
+            );
+            return false;
+        }
+        // Guard: a renderer for THIS turn is already armed (the accumulator
+        // still carries its epoch). Re-point it at the new card — a re-adopt
+        // sent a fresh snapshot mid-turn — so one renderer keeps one live
+        // card, and never double-render.
+        let already_rendering = {
+            let cards = core.cards.lock().await;
+            cards
+                .get(session_id)
+                .map(|c| c.acc.submit_epoch_ms == Some(epoch_ms))
+                .unwrap_or(false)
+        };
+        if already_rendering {
+            let mut cards = core.cards.lock().await;
+            if let Some(card) = cards.get_mut(session_id) {
+                card.repoint(card_id);
+            }
+            tracing::info!(
+                "snapshot follow: re-pointing existing renderer at card {}",
+                card_id
+            );
+            return true;
+        }
+        let session_dir = {
+            let store = core.sessions.lock().await;
+            store
+                .entry_for_session(session_id)
+                .map(|e| e.directory.clone())
+                .unwrap_or_default()
+        };
+        let mut acc = StreamAccumulator::new("");
+        acc.submit_epoch_ms = Some(epoch_ms);
+        acc.session_id = Some(session_id.to_string());
+        acc.reply_to_message_id = Some(card_id.to_string());
+        acc.attach_work_context(&session_dir).await;
+        acc.variant = core
+            .sessions
+            .lock()
+            .await
+            .entry_for_session(session_id)
+            .and_then(|e| e.variant.clone());
+        // The snapshot's identity rides as static text (same choice as the
+        // 👤 preview in `start_reply_render`): the header verb 已接管 stays
+        // visible while the turn streams, and the 最近对话 tail keeps the
+        // context that the static layout showed.
+        let mut static_text = format!(
+            "已{verb} {}（正在继续该会话的回合，有新进展会自动更新）",
+            crate::feishu::snapshot_card::display_title(title, session_id)
+        );
+        if !data.tail.is_empty() {
+            static_text.push_str("\n\n**最近对话**");
+            for entry in &data.tail {
+                let (role, preview) = crate::feishu::snapshot_card::tail_preview(entry);
+                static_text.push_str(&format!("\n{role} {preview}"));
+            }
+        }
+        acc.push_text(&static_text);
+        // The adopt-time pending blocks ride as inline sections: the poll's
+        // inline dedupe (push_inline sees them already present) prevents a
+        // duplicate, and clicking one takes the normal inline path — resolved
+        // sections are stripped and the run resumes into the same card.
+        for req in &data.pending {
+            match req {
+                crate::bridge::request::PendingRequest::Permission(p) => {
+                    acc.pending_permissions
+                        .push(crate::bridge::streaming::PendingPermission {
+                            session_id: session_id.to_string(),
+                            request_id: p.request_id.clone(),
+                            body: crate::bridge::request::describe_permission(p),
+                            directory: data.directory.clone(),
+                        });
+                }
+                crate::bridge::request::PendingRequest::Question(q) => {
+                    acc.pending_questions
+                        .push(crate::bridge::streaming::PendingQuestion {
+                            request_id: q.id.clone(),
+                            session_id: q.session_id.clone(),
+                            questions: q.questions.clone(),
+                            directory: data.directory.clone(),
+                            answers: vec![None; q.questions.len()],
+                            done: vec![false; q.questions.len()],
+                        });
+                    // Remember the full question request (like the static
+                    // claim path): the poll loop never sees follow-hosted
+                    // requests, so `prepare()` never runs for them and the
+                    // block's buttons would resolve to nothing.
+                    core.question
+                        .question_requests
+                        .lock()
+                        .await
+                        .insert(q.id.clone(), q.clone());
+                    core.question
+                        .question_dirs
+                        .lock()
+                        .await
+                        .insert(q.id.clone(), data.directory.clone());
+                }
+            }
+        }
+        {
+            let mut cards = core.cards.lock().await;
+            cards.insert(
+                session_id.to_string(),
+                crate::bridge::streaming::CardSession::new(acc, Some(card_id.to_string())),
+            );
+        }
+        tracing::info!("snapshot follow armed for session {}", session_id);
+
+        let core = Arc::clone(core);
+        let sid = session_id.to_string();
+        let poll_ms = self.render_poll_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let timeout_ms = self.render_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
+        tokio::spawn(async move {
+            external_render_loop(&core, sid, epoch_ms, poll_ms, timeout_ms).await;
+        });
+        true
+    }
+}
+
+/// ADR-0028: settle a snapshot card right after it was sent — arm the
+/// busy-adopt follow when the adopted session is mid-turn (the in-flight
+/// external run streams into the snapshot), otherwise keep the static
+/// snapshot and claim its embedded pendings. A follow that declines to arm
+/// (the busy→idle race: the turn already finished) falls back to the static
+/// claim path, so the embedded pendings are never left unclaimed. Shared by
+/// every adoption surface so the busy/static decision cannot drift between
+/// them.
+pub(crate) async fn settle_snapshot_after_send(
+    core: &Arc<SharedCore>,
+    snapshot_message_id: &str,
+    verb: &str,
+    title: &str,
+    data: &crate::bridge::snapshot::SnapshotData,
+) {
+    let followed = data.status == Some(crate::opencode::SessionStatus::Busy)
+        && core
+            .external
+            .start_snapshot_follow(core, &data.session_id, snapshot_message_id, verb, title, data)
+            .await;
+    if !followed {
+        crate::bridge::request::claim_snapshot_pendings(core, snapshot_message_id, verb, title, data).await;
+    }
 }
 
 /// Incremental renderer for an external message's reply: poll the session,

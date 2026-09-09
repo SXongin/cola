@@ -24,6 +24,10 @@ pub struct SnapshotData {
     /// The 最近对话 tail: the last text-bearing user/assistant messages,
     /// newest last, verbatim `text` parts only.
     pub tail: Vec<TailEntry>,
+    /// The created time of the newest user message (ANY user message, text or
+    /// not — the epoch the busy-adopt follow renders from, ticket 06). `None`
+    /// when the session has no user message: nothing to follow.
+    pub newest_user_epoch: Option<i64>,
     /// Whether the newest user message is a Cola-Authored Message (`msg_cola_`
     /// id, ADR-0026) — one input to the suppression predicate.
     pub newest_user_is_cola_authored: bool,
@@ -155,7 +159,10 @@ pub(crate) async fn gather_snapshot(
             Vec::new()
         }
     };
-    let newest_user_is_cola_authored = newest_user_is_cola_authored(&messages);
+    let newest_user_epoch = newest_user_message(&messages).map(|(created, _)| created);
+    let newest_user_is_cola_authored = newest_user_message(&messages)
+        .map(|(_, id)| opencode::client::is_cola_message_id(id))
+        .unwrap_or(false);
     let tail = transcript_tail(&messages);
 
     SnapshotData {
@@ -164,21 +171,20 @@ pub(crate) async fn gather_snapshot(
         status,
         pending,
         tail,
+        newest_user_epoch,
         newest_user_is_cola_authored,
     }
 }
 
-/// Whether the newest user message (by created time) carries a cola-authored
-/// id (ADR-0026). A session with no user message is treated as NOT
-/// cola-authored — the conservative answer for suppression.
-pub(crate) fn newest_user_is_cola_authored(messages: &[opencode::client::SessionMessage]) -> bool {
+/// The newest user message (by created time), if any — `(created, id)`. A
+/// session with no user message has no newest; the caller decides the meaning
+/// (cola authorship for suppression, an epoch for the busy-adopt follow).
+fn newest_user_message(messages: &[opencode::client::SessionMessage]) -> Option<(i64, &str)> {
     messages
         .iter()
         .filter(|m| m.info.role.as_deref() == Some("user"))
         .filter_map(|m| m.info.time.as_ref().map(|t| (t.created, m.info.id.as_str())))
         .max_by_key(|(created, _)| *created)
-        .map(|(_, id)| opencode::client::is_cola_message_id(id))
-        .unwrap_or(false)
 }
 
 /// The 最近对话 tail: the last (at most `limit`) text-bearing user/assistant
@@ -359,23 +365,27 @@ mod tests {
             msg("msg_cola_x", "user", 2000, text("我发的")),
             msg("assist", "assistant", 3000, text("回答")),
         ];
-        assert!(newest_user_is_cola_authored(&messages));
+        let (created, id) = newest_user_message(&messages).unwrap();
+        assert_eq!(created, 2000);
+        assert!(opencode::client::is_cola_message_id(id));
 
         // An external user message newer than cola's is NOT cola-authored.
         let messages = vec![
             msg("msg_cola_x", "user", 1000, text("我发的")),
             msg("msg_other", "user", 2000, text("外部问题")),
         ];
-        assert!(!newest_user_is_cola_authored(&messages));
+        let (created, id) = newest_user_message(&messages).unwrap();
+        assert_eq!(created, 2000);
+        assert!(!opencode::client::is_cola_message_id(id));
 
-        // No user messages → false (conservative: snapshot shows).
+        // No user messages → None (no newest, no epoch).
         let messages = vec![msg("a", "assistant", 1000, text("回答"))];
-        assert!(!newest_user_is_cola_authored(&messages));
+        assert!(newest_user_message(&messages).is_none());
 
-        // No time on any user message → false.
+        // No time on any user message → None.
         let mut no_time = cola_user(1000, "hi");
         no_time.info.time = None;
-        assert!(!newest_user_is_cola_authored(&[no_time]));
+        assert!(newest_user_message(&[no_time]).is_none());
     }
 
     #[tokio::test]
