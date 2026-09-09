@@ -966,6 +966,16 @@ pub fn question_elements(
                         {
                             "tag": "input",
                             "name": input_name,
+                            // Multiline box instead of the default single line:
+                            // the single-line input is a cramped one-row strip
+                            // that types poorly on both PC and mobile. Rows give
+                            // it room up front; auto_resize grows it with the
+                            // text (PC only, per Feishu's schema). Callbacks
+                            // arrive unchanged via `action.form_value`.
+                            "input_type": "multiline_text",
+                            "rows": 3,
+                            "auto_resize": true,
+                            "max_rows": 8,
                             "placeholder": { "tag": "plain_text", "content": "✍️ 输入自定义答案" },
                             "max_length": 500,
                             "width": "fill",
@@ -1610,8 +1620,22 @@ pub fn build_switch_card(
             {
                 "tag": "input",
                 "name": "search",
+                // Multiline like the question card's custom-answer box: the
+                // single-line input types poorly on PC and mobile alike. rows:2
+                // keeps it compact for a keyword; the submitted text is trimmed
+                // before filtering (see handler.rs) so stray newlines don't
+                // break the match.
+                "input_type": "multiline_text",
+                "rows": 2,
+                "auto_resize": true,
+                "max_rows": 4,
                 "placeholder": { "tag": "plain_text", "content": "🔍 搜索标题 / 目录 / ID" },
-                "value": { "tag": "plain_text", "content": keyword },
+                // `default_value` (NOT `value`) is what prefills the box, so a
+                // search that comes back empty keeps the keyword and the user can
+                // tweak it instead of retyping. `value` is the passback-data
+                // field and is never displayed — echoing keyword there left the
+                // input blank on every re-render.
+                "default_value": keyword,
                 "max_length": 100,
                 "width": "fill",
             },
@@ -2444,6 +2468,12 @@ mod tests {
         assert_eq!(form["name"], "form_0");
         assert!(form.to_string().contains("input"), "form needs an input");
         assert!(form.to_string().contains("form_action_type"));
+        // The custom-answer box is a multiline textarea (better typing on both
+        // PC and mobile than the default single-line input).
+        let input = form["elements"].as_array().unwrap()[0].clone();
+        assert_eq!(input["tag"], "input");
+        assert_eq!(input["input_type"], "multiline_text");
+        assert!(input["rows"].as_u64().unwrap() >= 2);
     }
 
     #[test]
@@ -3296,6 +3326,40 @@ Index: /a/lua.lua
         assert_eq!(btn_columns.len(), 2, "both buttons side by side: {text}");
         assert_eq!(btn_columns[0]["elements"][0]["tag"], "button");
         assert_eq!(btn_columns[1]["elements"][0]["tag"], "button");
+    }
+
+    /// A re-rendered `/switch` card after a search must keep the keyword in the
+    /// box (`default_value`), so an empty result is tweakable instead of a
+    /// retype. The prefill must live in `default_value` — `value` is the
+    /// passback field and is never displayed.
+    #[test]
+    fn switch_card_search_input_echoes_keyword_in_default_value() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let card = build_switch_card(
+            &key,
+            &[],
+            "重写登录\n任务",
+            crate::bridge::command::SwitchScope::Directory,
+            Some("/work/auth"),
+            None,
+            &[],
+        );
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let form = elements
+            .iter()
+            .find(|e| e["tag"] == "form" && e["name"] == "switch_search")
+            .expect("switch card has a search form");
+        let input = form["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["tag"] == "input")
+            .expect("search form has an input");
+        assert_eq!(input["default_value"], "重写登录\n任务");
+        assert!(
+            input.get("value").is_none(),
+            "echo must not use the passback `value` field"
+        );
     }
 
     /// The `/dir` Recent Directories card must be schema-V2-compatible (no v1

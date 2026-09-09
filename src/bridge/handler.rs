@@ -929,6 +929,7 @@ impl App {
             .get("keyword")
             .and_then(|v| v.as_str())
             .unwrap_or("")
+            .trim()
             .to_string();
         let scope = crate::bridge::command::SwitchScope::parse(
             value.get("scope").and_then(|v| v.as_str()).unwrap_or(""),

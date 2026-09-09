@@ -2235,11 +2235,23 @@ async fn resolve_directory_or_reply(
 }
 
 /// Case-insensitive keyword match on a session's title, directory or id
-/// (shared by `/list`, `/switch`, `/attach` and the `/switch` card).
+/// (used by `/switch <keyword>`, `/list`/`/switch list`, and the `/switch`
+/// card's filtered list). `/attach` and `/topic --adopt` do NOT use this —
+/// they resolve via `resolve_session` (exact id → id-prefix → whole-title
+/// substring) so adoption stays unambiguous.
+///
+/// `lower` is split on whitespace (spaces AND newlines) and every token must
+/// hit somewhere in the session's title/dir/id — an AND over tokens. This makes
+/// the multiline `/switch` search box usable: pasted/typed multi-line input is
+/// searched as its words, not as one literal string (which could never match).
 pub(crate) fn matches_keyword(s: &crate::opencode::SessionListInfo, lower: &str) -> bool {
-    s.title.to_lowercase().contains(lower)
-        || s.directory.to_lowercase().contains(lower)
-        || s.id.to_lowercase().contains(lower)
+    let haystack = format!(
+        "{} {} {}",
+        s.title.to_lowercase(),
+        s.directory.to_lowercase(),
+        s.id.to_lowercase()
+    );
+    lower.split_whitespace().all(|tok| haystack.contains(tok))
 }
 
 /// The "ambiguous match" candidate list shown when a keyword or id resolves to
