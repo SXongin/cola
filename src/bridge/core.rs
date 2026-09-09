@@ -33,14 +33,29 @@ pub struct CoverTitle {
 }
 
 /// State shared across every flow: the session map, the per-session live cards
-/// ([`CardSession`] — accumulator + card identity in one place), the
-/// double-click guard, prompt serialization, and the two adapters. Owned by the
-/// bridge coordinator ([`super::App`]) and passed by handle to the flow modules
-/// that need it.
+/// ([`CardSession`] — accumulator + card identity in one place), the two
+/// request flows (permission/question pollers + card actions, on the core so
+/// snapshot claims and question remembering are reachable from the command
+/// layer, ADR-0028), the double-click guard, prompt serialization, and the two
+/// adapters. Owned by the bridge coordinator ([`super::App`]) and passed by
+/// handle to the flow modules that need it.
 pub struct SharedCore {
     pub sessions: Arc<Mutex<SessionStore>>,
     /// session_id → the session's one live card (accumulator + card id chain).
     pub cards: Arc<Mutex<HashMap<String, crate::bridge::streaming::CardSession>>>,
+    /// Permission flow: owns `sent_cards`, polls pending requests, auto-accepts
+    /// for `/autoaccept` sessions, and handles the "perm" card action.
+    pub permission: crate::bridge::request::RequestFlow,
+    /// Question flow: owns `sent_cards` + the question kind's request/partial
+    /// state, polls pending questions, and handles the "question" card action.
+    pub question: crate::bridge::request::RequestFlow,
+    /// ADR-0028 snapshot claim registry: which snapshot card hosts which
+    /// adopt-time pending block, what each snapshot was built from, and the
+    /// tombstones for late second clicks. One Mutex keeps claim/host/tombstone
+    /// mutations atomic (they always change together). The poll loop treats a
+    /// claimed id as already-surfaced (no standalone card, no re-inline); a
+    /// claimed id leaving the pending list drops its block.
+    pub snapshot_claims: Arc<Mutex<crate::bridge::request::SnapshotClaimRegistry>>,
     /// request ids already answered on the permission/question cards. Guards
     /// against double-click races (two card callbacks before the result card
     /// replaces the buttons): a second click on the same request is ignored
@@ -86,6 +101,15 @@ impl SharedCore {
         Ok(Self {
             sessions: Arc::new(Mutex::new(session_store)),
             cards: Arc::new(Mutex::new(HashMap::new())),
+            permission: crate::bridge::request::RequestFlow::new(Box::new(
+                crate::bridge::request::PermissionKind,
+            )),
+            question: crate::bridge::request::RequestFlow::new(Box::new(
+                crate::bridge::request::QuestionKind,
+            )),
+            snapshot_claims: Arc::new(Mutex::new(
+                crate::bridge::request::SnapshotClaimRegistry::default(),
+            )),
             answered_requests: Arc::new(Mutex::new(HashSet::new())),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             cover_titles: Arc::new(Mutex::new(HashMap::new())),

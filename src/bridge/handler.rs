@@ -70,13 +70,6 @@ pub struct App {
     /// the app alive — no reference cycle; `OnceLock` because it is written
     /// exactly once, before any event can arrive.
     self_weak: std::sync::OnceLock<std::sync::Weak<App>>,
-    /// Permission flow: owns `sent_cards`, polls pending requests, auto-accepts
-    /// for `/autoaccept` sessions, and handles the "perm" card action.
-    pub permission: super::request::RequestFlow,
-    /// Question flow: owns `sent_cards` + the question kind's request/partial
-    /// state, polls pending questions, and handles the "question" card action
-    /// (answer / submit / reject).
-    pub question: super::request::RequestFlow,
     /// External-message flow: owns `last_user_msg_epoch`, notifies Feishu when
     /// another shared-store client posts while cola is idle.
     pub external: super::external::ExternalFlow,
@@ -157,8 +150,6 @@ impl App {
         let core = Arc::new(SharedCore::new(&cfg, opencode, feishu)?);
         Ok(Self {
             self_weak: std::sync::OnceLock::new(),
-            permission: super::request::RequestFlow::new(Box::new(super::request::PermissionKind)),
-            question: super::request::RequestFlow::new(Box::new(super::request::QuestionKind)),
             external: super::external::ExternalFlow::new(),
             core,
         })
@@ -1008,9 +999,16 @@ impl App {
                 // to a compact 已切换 state card instead of a full snapshot).
                 // After the early returns above, `owner` is either `None`
                 // (unmapped → first adopt) or this thread itself (→ 切换).
+                let open_message_id = value
+                    .get("open_message_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 let mapped_to_this_thread = owner.is_some();
                 let verb = if mapped_to_this_thread { "切换" } else { "接管" };
-                let card = if mapped_to_this_thread {
+                // `claim_data` is the snapshot's claimable pendings: claimed
+                // against the patched card once the ack result is assembled,
+                // so the poll loop never duplicates the embedded blocks.
+                let (card, claim_data) = if mapped_to_this_thread {
                     let data = crate::bridge::snapshot::gather_snapshot(
                         &core.opencode,
                         &target.id,
@@ -1019,28 +1017,33 @@ impl App {
                     .await;
                     match crate::bridge::snapshot::re_switch_emit(&data) {
                         crate::bridge::snapshot::SnapshotEmit::Full => {
-                            crate::feishu::snapshot_card::build_snapshot_card("切换", &target.title, &data)
+                            let data = crate::bridge::request::claimable_pendings(core, data).await;
+                            let card = crate::feishu::snapshot_card::build_snapshot_card(
+                                "切换",
+                                &target.title,
+                                &data,
+                            );
+                            (card, Some(data))
                         }
-                        crate::bridge::snapshot::SnapshotEmit::Suppressed => {
+                        crate::bridge::snapshot::SnapshotEmit::Suppressed => (
                             crate::feishu::snapshot_card::build_switched_state_card(
                                 &target.title,
                                 &target.id,
                                 &target.directory,
-                            )
-                        }
+                            ),
+                            None,
+                        ),
                     }
                 } else {
-                    crate::bridge::command::snapshot_card_for(core, "接管", &target).await
+                    let (card, data) = crate::bridge::command::snapshot_card_for(core, "接管", &target).await;
+                    (card, Some(data))
                 };
                 // In a topic the patched card lives INSIDE it, so persist its
                 // own message id as the fallback-card anchor (same anchor
                 // semantics as the text in-topic adopt, ADR-0028): later
                 // permission/question cards reply to it and stay in the topic.
                 let topic_anchor = if thread_key.thread_id != thread_key.chat_id {
-                    value
-                        .get("open_message_id")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
+                    open_message_id.clone()
                 } else {
                     None
                 };
@@ -1063,6 +1066,16 @@ impl App {
                     }
                 }
                 core.invalidate_session_list_cache().await;
+                if let (Some(message_id), Some(data)) = (&open_message_id, &claim_data) {
+                    crate::bridge::request::claim_snapshot_pendings(
+                        core,
+                        message_id,
+                        verb,
+                        &target.title,
+                        data,
+                    )
+                    .await;
+                }
                 let toast = format!(
                     "已{verb}「{}」",
                     crate::bridge::command::title_or_id_tail(&target)
