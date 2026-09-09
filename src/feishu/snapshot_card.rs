@@ -96,12 +96,7 @@ fn tail_panels(tail: &[TailEntry]) -> Vec<serde_json::Value> {
     }
     panels.push(json!({ "tag": "markdown", "content": "**最近对话**" }));
     for entry in tail {
-        let role = match entry.role.as_str() {
-            "user" => "👤",
-            "assistant" => "🤖",
-            _ => "💬",
-        };
-        let preview: String = entry.text.chars().take(40).collect::<String>().trim().to_string();
+        let (role, preview) = tail_preview(entry);
         let title = if preview.is_empty() {
             format!("{role} （空消息）")
         } else {
@@ -119,10 +114,24 @@ fn tail_panels(tail: &[TailEntry]) -> Vec<serde_json::Value> {
     panels
 }
 
+/// One tail entry's role marker + short preview, shared by the static
+/// snapshot's collapsible panels and the busy-adopt follow's static text
+/// (ADR-0028).
+pub(crate) fn tail_preview(entry: &TailEntry) -> (&'static str, String) {
+    let role = match entry.role.as_str() {
+        "user" => "👤",
+        "assistant" => "🤖",
+        _ => "💬",
+    };
+    let preview: String = entry.text.chars().take(40).collect::<String>().trim().to_string();
+    (role, preview)
+}
+
 /// The snapshot's display title: the cleaned session label, falling back to
-/// the id tail when the label is empty (shared by the full snapshot and the
-/// compact suppressed-切换 state card).
-fn display_title(title: &str, session_id: &str) -> String {
+/// the id tail when the label is empty (shared by the full snapshot, the
+/// compact suppressed-切换 state card, and the busy-adopt follow's static
+/// prefix).
+pub(crate) fn display_title(title: &str, session_id: &str) -> String {
     let label = crate::feishu::card::clean_session_label(title);
     if label.is_empty() {
         crate::bridge::command::id_tail(session_id)
@@ -262,6 +271,7 @@ mod tests {
             status,
             pending,
             tail,
+            newest_user_epoch: None,
             newest_user_is_cola_authored: false,
         }
     }

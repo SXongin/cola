@@ -352,6 +352,9 @@ pub struct MockBackend {
     /// When set, `session_status` fails with this message (simulates a read
     /// failure — the caller must not guess a status).
     pub session_status_error: Option<String>,
+    /// Scripts the ADR-0028 busy→idle race: the first `session_status` read
+    /// returns Busy (and clears the flag), later reads serve the map.
+    pub status_busy_once: std::sync::atomic::AtomicBool,
 }
 
 impl MockBackend {
@@ -399,6 +402,7 @@ impl MockBackend {
             session_model: None,
             session_statuses: std::collections::HashMap::new(),
             session_status_error: None,
+            status_busy_once: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -742,6 +746,15 @@ impl opencode::Backend for MockBackend {
     ) -> crate::error::Result<Option<opencode::client::SessionStatus>> {
         if let Some(err) = &self.session_status_error {
             return Err(crate::error::BridgeError::OpenCode(err.clone()));
+        }
+        // Scripts the ADR-0028 busy→idle race: the FIRST read reports Busy
+        // (the snapshot gather sees a mid-flight turn), later reads serve the
+        // map (the follow's arm-time check sees the turn already finished).
+        if self
+            .status_busy_once
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(Some(opencode::client::SessionStatus::Busy));
         }
         // A scripted entry is served verbatim (`Some(None)` → unknown); a
         // missing key means idle (the server removes finished runs).
@@ -7857,6 +7870,491 @@ pub(crate) mod integration_tests {
         assert!(
             !app.core.snapshot_claims.lock().await.contains("q_1"),
             "claim dropped after submit"
+        );
+    }
+
+    // ===== ADR-0028 busy-adopt follow (ticket 06) =====
+
+    /// Adopting a BUSY foreign session arms the snapshot as the host of the
+    /// external-reply renderer: the running turn's reasoning/text streams
+    /// INTO the snapshot card (patched in place) and it finalizes Done when
+    /// the turn completes.
+    #[tokio::test]
+    async fn busy_adopt_streams_turn_into_snapshot() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
+        backend
+            .session_statuses
+            .insert("ses_alpha01".into(), Some(opencode::client::SessionStatus::Busy));
+        backend
+            .external_user_messages
+            .insert("ses_alpha01".into(), "帮我重构这个模块".into());
+        backend.external_reply_parts = Some(realistic_parts());
+        let backend = Arc::new(backend);
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+        app.core
+            .external
+            .render_poll_ms
+            .store(50, std::sync::atomic::Ordering::Relaxed);
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Switch(SwitchAction::Match("唯一外部标题".into())),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_switch",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        // The follow armed: the snapshot card hosts a live accumulator for the
+        // external turn (epoch = the newest user message's created time).
+        let acc = app
+            .core
+            .cards
+            .lock()
+            .await
+            .get("ses_alpha01")
+            .cloned()
+            .expect("follow armed a host accumulator");
+        assert_eq!(acc.card_message_id.as_deref(), Some("msg_reply"));
+        assert!(acc.acc.submit_epoch_ms.is_some(), "turn epoch set");
+        assert!(
+            app.core.snapshot_claims.lock().await.claims.is_empty(),
+            "busy follow hosts its blocks inline, not claimed"
+        );
+
+        // The model answers: flip the reply ready → the parts stream into the
+        // SAME snapshot message and finalize Done.
+        backend
+            .external_reply_ready
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let calls = platform.calls.lock().await.clone();
+        let updates: Vec<String> = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::UpdateMessage { message_id, card } if message_id == "msg_reply" => {
+                    Some(card.to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !updates.is_empty(),
+            "the snapshot card was re-rendered: {calls:?}"
+        );
+        let final_card = updates.last().unwrap();
+        assert!(
+            final_card.contains("已接管 唯一外部标题"),
+            "the 已接管 identity stays visible: {final_card}"
+        );
+        assert!(
+            final_card.contains("当前目录有 src/ 和 Cargo.toml。"),
+            "the turn's text streamed into the snapshot: {final_card}"
+        );
+        assert!(
+            final_card.contains("✅ 完成"),
+            "the follow finalizes Done: {final_card}"
+        );
+    }
+
+    /// An external run BLOCKED on a permission resumes from the snapshot: the
+    /// adopt-time block rides as an inline section on the follow card, the
+    /// approval takes the normal inline path, and the turn completes inside
+    /// the SAME card — no standalone permission card, no second snapshot.
+    #[tokio::test]
+    async fn busy_follow_permission_approved_resumes() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
+        backend
+            .session_statuses
+            .insert("ses_alpha01".into(), Some(opencode::client::SessionStatus::Busy));
+        backend
+            .external_user_messages
+            .insert("ses_alpha01".into(), "帮我重构这个模块".into());
+        backend.permissions = vec![perm_request("per_1", "ses_alpha01", "ls -la")];
+        backend.external_reply_parts = Some(realistic_parts());
+        let backend = Arc::new(backend);
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+        app.core
+            .external
+            .render_poll_ms
+            .store(50, std::sync::atomic::Ordering::Relaxed);
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Switch(SwitchAction::Match("唯一外部标题".into())),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_switch",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        // The adopt-time pending block is pre-seeded as the host's inline
+        // section (not claimed — the inline dedupe prevents duplicates).
+        let acc = app
+            .core
+            .cards
+            .lock()
+            .await
+            .get("ses_alpha01")
+            .cloned()
+            .expect("follow armed");
+        assert_eq!(acc.acc.pending_permissions.len(), 1);
+        assert!(app.core.snapshot_claims.lock().await.claims.is_empty());
+
+        // Approve the block from the snapshot: the normal inline path replies
+        // and strips the section — no standalone card, no replacement card.
+        let value = serde_json::json!({
+            "action": "perm",
+            "reply": "once",
+            "session_id": "ses_alpha01",
+            "request_id": "per_1",
+            "directory": "/work/ext",
+            "perm_label": "✅ 已允许一次",
+            "perm_color": "green",
+            "perm_body": "bash",
+        });
+        let result = app
+            .handle_card_action(value)
+            .await
+            .expect("permission click returns a result");
+        assert!(
+            result.card.is_none(),
+            "inline answer must not replace the follow card"
+        );
+        assert_eq!(result.toast.as_deref(), Some("已允许本次执行"));
+        assert!(
+            app.core
+                .cards
+                .lock()
+                .await
+                .get("ses_alpha01")
+                .unwrap()
+                .acc
+                .pending_permissions
+                .is_empty(),
+            "the approved section is stripped from the follow card"
+        );
+
+        // The resumed turn streams into the SAME snapshot message and finishes.
+        backend
+            .external_reply_ready
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let calls = platform.calls.lock().await.clone();
+        let updates: Vec<String> = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::UpdateMessage { message_id, card } if message_id == "msg_reply" => {
+                    Some(card.to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        let final_card = updates.last().expect("the follow card streams the resume");
+        assert!(
+            final_card.contains("✅ 完成") && final_card.contains("已接管"),
+            "the run completed inside the snapshot card: {final_card}"
+        );
+    }
+
+    /// Adopting an IDLE session stays a static one-shot snapshot: no renderer
+    /// armed, pendings claimed as usual.
+    #[tokio::test]
+    async fn idle_adopt_does_not_arm_follow() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
+        backend.permissions = vec![perm_request("per_1", "ses_alpha01", "ls -la")];
+        let (app, _platform) = build_app(cfg, backend).await;
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Switch(SwitchAction::Match("唯一外部标题".into())),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_switch",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !app.core.cards.lock().await.contains_key("ses_alpha01"),
+            "no renderer armed for an idle session"
+        );
+        assert!(
+            app.core.snapshot_claims.lock().await.contains("per_1"),
+            "the static snapshot claims its pendings as usual"
+        );
+    }
+
+    /// The busy→idle race: busy at gather, idle by arm time → the snapshot
+    /// stays static, NO renderer is armed, and the embedded pendings are
+    /// still claimed (never left to be duplicated by the poller).
+    #[tokio::test]
+    async fn busy_then_idle_race_stays_static() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
+        backend
+            .external_user_messages
+            .insert("ses_alpha01".into(), "帮我重构这个模块".into());
+        backend.permissions = vec![perm_request("per_1", "ses_alpha01", "ls -la")];
+        backend
+            .status_busy_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (app, platform) = build_app(cfg, backend).await;
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Switch(SwitchAction::Match("唯一外部标题".into())),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_switch",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !app.core.cards.lock().await.contains_key("ses_alpha01"),
+            "no renderer armed for a turn that already finished"
+        );
+        assert!(
+            app.core.snapshot_claims.lock().await.contains("per_1"),
+            "the static fallback still claims the embedded pendings"
+        );
+        // The snapshot card itself was sent with the busy chip (gather saw
+        // busy) and no renderer ever touches it.
+        let calls = platform.calls.lock().await.clone();
+        assert!(
+            calls
+                .iter()
+                .all(|c| !matches!(c, PlatformCall::UpdateMessage { .. })),
+            "no re-render of the static snapshot: {calls:?}"
+        );
+    }
+
+    /// The follow is scoped to EXTERNAL turns: a busy session whose newest user
+    /// message is cola-authored (cola itself is answering it) keeps the static
+    /// snapshot — cola's live accumulator is never re-pointed or overwritten.
+    #[tokio::test]
+    async fn busy_follow_skips_cola_authored_turn() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
+        backend
+            .session_statuses
+            .insert("ses_alpha01".into(), Some(opencode::client::SessionStatus::Busy));
+        // The newest user message is cola's OWN (a cola prompt mid-turn).
+        backend
+            .cola_user_messages
+            .insert("ses_alpha01".into(), "我在问的问题".into());
+        backend.permissions = vec![perm_request("per_1", "ses_alpha01", "ls -la")];
+        let (app, _platform) = build_app(cfg, backend).await;
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Switch(SwitchAction::Match("唯一外部标题".into())),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_switch",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !app.core.cards.lock().await.contains_key("ses_alpha01"),
+            "cola's own turn is never followed"
+        );
+        assert!(
+            app.core.snapshot_claims.lock().await.contains("per_1"),
+            "the static fallback claims the pendings"
+        );
+    }
+
+    /// A QUESTION block on a busy-follow card works: the follow remembers the
+    /// full request (the poll never saw it), so clicking an option records the
+    /// answer through the normal inline path.
+    #[tokio::test]
+    async fn busy_follow_question_block_resolves() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
+        backend
+            .session_statuses
+            .insert("ses_alpha01".into(), Some(opencode::client::SessionStatus::Busy));
+        backend
+            .external_user_messages
+            .insert("ses_alpha01".into(), "帮我重构这个模块".into());
+        backend.questions = vec![opencode::client::QuestionRequest {
+            id: "q_1".into(),
+            session_id: "ses_alpha01".into(),
+            questions: vec![opencode::client::QuestionInfo {
+                question: "选择语言".into(),
+                header: "language".into(),
+                options: vec![opencode::client::QuestionOption {
+                    label: "rust".into(),
+                    description: String::new(),
+                }],
+                multiple: Some(false),
+                custom: Some(false),
+            }],
+        }];
+        let (app, _platform) = build_app(cfg, backend).await;
+        app.core
+            .external
+            .render_poll_ms
+            .store(50, std::sync::atomic::Ordering::Relaxed);
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Switch(SwitchAction::Match("唯一外部标题".into())),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_switch",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        // The follow pre-seeded the inline section AND remembered the request.
+        let acc = app
+            .core
+            .cards
+            .lock()
+            .await
+            .get("ses_alpha01")
+            .cloned()
+            .expect("follow armed");
+        assert_eq!(acc.acc.pending_questions.len(), 1);
+        assert!(
+            app.core
+                .question
+                .question_requests
+                .lock()
+                .await
+                .contains_key("q_1")
+        );
+
+        // Click an option: the single question is answered → the request
+        // submits and the section is stripped from the follow card.
+        let value = serde_json::json!({
+            "action": "question",
+            "reply": "answer",
+            "session_id": "ses_alpha01",
+            "request_id": "q_1",
+            "directory": "/work/ext",
+            "question_index": 0,
+            "answer": "rust",
+        });
+        let result = app
+            .handle_card_action(value)
+            .await
+            .expect("question click returns a result");
+        assert_eq!(result.toast.as_deref(), Some("已回答"));
+        assert!(
+            app.core
+                .cards
+                .lock()
+                .await
+                .get("ses_alpha01")
+                .unwrap()
+                .acc
+                .pending_questions
+                .is_empty(),
+            "the answered question block is stripped from the follow card"
+        );
+    }
+
+    /// A cola prompt during the follow takes over: `run_prompt` replaces the
+    /// accumulator, the follow renderer exits, and the user's own turn
+    /// renders into its own card — the snapshot is never touched again.
+    #[tokio::test]
+    async fn user_prompt_during_follow_takes_over() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
+        backend
+            .session_statuses
+            .insert("ses_alpha01".into(), Some(opencode::client::SessionStatus::Busy));
+        backend
+            .external_user_messages
+            .insert("ses_alpha01".into(), "帮我重构这个模块".into());
+        let (app, platform) = build_app(cfg, backend).await;
+        app.core
+            .external
+            .render_poll_ms
+            .store(50, std::sync::atomic::Ordering::Relaxed);
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Switch(SwitchAction::Match("唯一外部标题".into())),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_switch",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+        let follow_epoch = app
+            .core
+            .cards
+            .lock()
+            .await
+            .get("ses_alpha01")
+            .cloned()
+            .expect("follow armed")
+            .acc
+            .submit_epoch_ms;
+
+        // The user prompts cola in the thread.
+        app.handle_message(incoming(
+            "msg_prompt".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "继续".into(),
+            None,
+        ))
+        .await;
+
+        let new_epoch = app
+            .core
+            .cards
+            .lock()
+            .await
+            .get("ses_alpha01")
+            .cloned()
+            .expect("the prompt inserted its own accumulator")
+            .acc
+            .submit_epoch_ms;
+        assert_ne!(new_epoch, follow_epoch, "the follow accumulator was replaced");
+        let calls = platform.calls.lock().await.clone();
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, PlatformCall::ReplyCard { reply_to, .. } if reply_to == "msg_prompt")),
+            "the user's own turn rendered into its own card: {calls:?}"
         );
     }
 

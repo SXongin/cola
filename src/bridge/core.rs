@@ -49,6 +49,10 @@ pub struct SharedCore {
     /// Question flow: owns `sent_cards` + the question kind's request/partial
     /// state, polls pending questions, and handles the "question" card action.
     pub question: crate::bridge::request::RequestFlow,
+    /// External-message flow: owns `last_user_msg_epoch`, notifies Feishu when
+    /// another shared-store client posts while cola is idle, and arms the
+    /// external-reply renderers (including the busy-adopt follow, ADR-0028).
+    pub external: crate::bridge::external::ExternalFlow,
     /// ADR-0028 snapshot claim registry: which snapshot card hosts which
     /// adopt-time pending block, what each snapshot was built from, and the
     /// tombstones for late second clicks. One Mutex keeps claim/host/tombstone
@@ -107,6 +111,7 @@ impl SharedCore {
             question: crate::bridge::request::RequestFlow::new(Box::new(
                 crate::bridge::request::QuestionKind,
             )),
+            external: crate::bridge::external::ExternalFlow::new(),
             snapshot_claims: Arc::new(Mutex::new(
                 crate::bridge::request::SnapshotClaimRegistry::default(),
             )),
