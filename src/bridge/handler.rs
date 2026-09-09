@@ -211,11 +211,21 @@ impl App {
             tokio::spawn(async move {
                 match crate::update::check().await {
                     Ok(crate::update::UpdateCheck::Available(info)) => {
-                        tracing::info!(
-                            "新版本 {} 可用（当前 {}）—— 发送 /update 更新。",
-                            info.latest,
-                            info.current
-                        );
+                        if crate::version::is_dev_build() {
+                            // A dev build is typically ahead of the last release
+                            // (ADR-0027): warn instead of implying an upgrade.
+                            tracing::warn!(
+                                "本地 dev 构建（{}）发现新版本 {} —— 自更新会替换为发布版，可能比本地代码旧。",
+                                crate::version::display_version(),
+                                info.latest
+                            );
+                        } else {
+                            tracing::info!(
+                                "新版本 {} 可用（当前 {}）—— 发送 /update 更新。",
+                                info.latest,
+                                info.current
+                            );
+                        }
                     }
                     Ok(_) => {}
                     Err(e) => tracing::debug!("update check failed: {e}"),

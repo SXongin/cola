@@ -7,6 +7,7 @@ mod git;
 mod logging;
 mod opencode;
 mod update;
+mod version;
 
 use clap::Parser;
 use std::io::IsTerminal;
@@ -31,6 +32,11 @@ struct Cli {
     /// itself via `/restart`.
     #[arg(long)]
     replace: bool,
+
+    /// Print cola's version and build provenance (release or dev build) and
+    /// exit — before config, logging, or the singleton lock (ADR-0027).
+    #[arg(short = 'V', long)]
+    version: bool,
 
     #[command(subcommand)]
     subcommand: Option<Subcommand>,
@@ -376,6 +382,13 @@ impl Drop for SingletonLock {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // Print the version before any config/log/lock machinery (ADR-0027): a
+    // version query must work even for a bot whose config is broken.
+    if cli.version {
+        println!("{}", version::display_version());
+        return Ok(());
+    }
+
     // Autostart registration doesn't need a config, a log file, or the
     // singleton lock — handle it before any of that machinery.
     if let Some(Subcommand::Autostart { action }) = cli.subcommand {
@@ -412,6 +425,9 @@ async fn main() -> anyhow::Result<()> {
         .with(stdout_layer)
         .init();
     tracing::info!("logging to {}", log_path.display());
+    // Every boot records the exact build in the log so a report can be traced
+    // back to a release or a dev build (ADR-0027).
+    tracing::info!("{}", version::display_version());
 
     // Grab the singleton lock BEFORE touching the network or the store — a
     // duplicate cola must die before it can double-connect to the Feishu WS. A

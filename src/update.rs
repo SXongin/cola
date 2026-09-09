@@ -483,6 +483,17 @@ pub enum UpdateOutcome {
 /// Run the whole self-update flow against `reporter`. Returns whether an
 /// update was applied; the caller decides whether to call [`restart`].
 pub async fn run_update(reporter: &dyn UpdateReporter, mode: UpdateMode) -> UpdateOutcome {
+    // A dev build has no release-tag guarantee (ADR-0027): warn before the
+    // check so `/update` on a local build never silently downgrades the
+    // developer to the last release.
+    if crate::version::is_dev_build() {
+        reporter
+            .report(
+                "⚠️ 当前是本地 dev 构建 —— 自更新会把二进制替换为最新发布版（可能比本地代码旧）。仅在发布版上建议执行更新。"
+                    .into(),
+            )
+            .await;
+    }
     reporter.report("🔍 正在检查更新…".into()).await;
     match check().await {
         Err(e) => {

@@ -133,6 +133,14 @@ _Avoid_: Tail, footer bar, status line
 A git working tree that differs from HEAD — including untracked files — as measured by `git status --porcelain`. Shown as ⚠ on the Turn Footer. Captured at turn start, so it reflects the state the AI operated on, not the changes the AI itself made.
 _Avoid_: Uncommitted, modified
 
+**Release Version**:
+The semver in `Cargo.toml` that the running cola binary was built from — the ONLY value self-update ever compares against the release tag (ADR-0015, ADR-0027). It must equal the tag a release is cut on; dev/provenance detail never enters the comparison, or a dev build ahead of the last release would report "update available" forever.
+_Avoid_: Version, build number (unqualified — they blur the comparison source with the display string)
+
+**Build Provenance**:
+The git-derived identity baked into a cola binary at build time describing the exact source tree it came from. Only an exact, clean release-tag checkout carries none (the binary then shows the bare **Release Version**); any other build — a branch, a dirty tree, or a source tree with no git — is a dev build and shows `-dev` plus the branch/short-sha it was built from, with ⚠ when that tree was Dirty. Determines whether a binary is a release or a dev build (ADR-0027).
+_Avoid_: Version, build info, source marker
+
 **Singleton Lock**:
 The guarantee that at most one cola instance processes platform events at a time. A `/restart` hands it to its replacement before the old instance exits; a replacement may take it over from an owner that is no longer **Functionally Alive** — dead, a zombie, or mid-`exit()`.
 _Avoid_: pid file, lock file
