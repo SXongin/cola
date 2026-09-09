@@ -9,3 +9,5 @@ cola-test.toml
 SURVEY.md
 # Live run logs (contain transient command echoes)
 test.log
+# CodeGraph local index (regenerable via `codegraph init`)
+.codegraph/
