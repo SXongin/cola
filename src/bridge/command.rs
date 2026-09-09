@@ -56,6 +56,9 @@ pub enum Command {
     /// Self-update from GitHub Releases (ADR-0015): check, download, verify,
     /// replace the running binary, and restart.
     Update,
+    /// Show the running cola version and build provenance (release or dev
+    /// build) — ADR-0027. Never talks to the network.
+    Version,
     /// Show available commands, or help for one command (`/help <cmd>`).
     Help(Option<String>),
     /// Forward unrecognized slash command to OpenCode as prompt text
@@ -227,6 +230,7 @@ pub fn parse_command(text: &str) -> Option<Command> {
         "/restart" => Some(Command::Restart),
         "/restart-opencode" => Some(Command::RestartOpenCode),
         "/update" => Some(Command::Update),
+        "/version" => Some(Command::Version),
         "/help" => Some(Command::Help(arg.map(|s| s.to_lowercase()))),
         // `/init`, `/review`, or any unknown /command — forward to OpenCode
         _ => Some(Command::Forward(trimmed.to_string())),
@@ -256,6 +260,7 @@ pub fn help_text() -> String {
 `/restart` · Restart cola (keeps startup args + log redirect)
 `/restart-opencode` · Restart the OpenCode server (only when cola started it)
 `/update` · Check for and apply a cola self-update from GitHub Releases
+`/version` · Show cola version & build provenance (release or dev build)
 `/help <command>` · Show help for one command (e.g. `/help model`)
 
 话题规则：已绑定会话的话题里，`/switch`、`/new`、`/dir` 被拒绝，请回主对话操作。从未绑定过会话的话题可以用它们来绑定该话题的唯一会话。
@@ -316,6 +321,9 @@ pub fn command_help(name: &str) -> Option<String> {
         }
         "update" => {
             "/update\nCheck GitHub Releases for a newer cola; if one exists, download, verify (SHA256SUMS), replace the running binary and restart. When running as a systemd unit, the restart hands back to `Restart=on-failure`; otherwise the new process re-execs with --replace. If already on the latest version, it reports that and does nothing."
+        }
+        "version" => {
+            "/version\nShow the running cola's version and build provenance (no network).\n- Release build (built at a clean release tag): `cola 0.7.0`\n- Dev build (local or untagged): `cola 0.7.0-dev <branch>@<sha> ⚠` — ⚠ means the source tree had uncommitted changes at build time\nSelf-update compares only the release version, so a dev build is never reported outdated by its dev marker.\nCLI equivalent: `cola --version`."
         }
         "help" => {
             "/help [command]\nList all commands, or show detailed help for one.\nExample: `/help model`"
@@ -965,6 +973,13 @@ pub(crate) async fn handle_command(
                 let _ = std::fs::write(restart_notify_path(), notify.to_string());
                 crate::update::restart();
             }
+        }
+        Command::Version => {
+            // Version identity (ADR-0027): a local text reply, never a network
+            // call — it must work on any instance at any time.
+            core.feishu
+                .reply_text(message_id, &crate::version::feishu_reply())
+                .await?;
         }
         Command::Forward(_) => {
             // Unreachable: the message coordinator intercepts `Command::Forward`
@@ -2426,6 +2441,8 @@ mod tests {
         assert_eq!(parse_command("/restart now"), Some(Command::Restart));
         assert_eq!(parse_command("/update"), Some(Command::Update));
         assert_eq!(parse_command("/update now"), Some(Command::Update));
+        assert_eq!(parse_command("/version"), Some(Command::Version));
+        assert_eq!(parse_command("/version x"), Some(Command::Version));
     }
 
     #[test]
@@ -2574,6 +2591,7 @@ mod tests {
         assert!(command_help("model").unwrap().contains("/model"));
         assert!(command_help("think").unwrap().contains("/think"));
         assert!(command_help("dir").unwrap().contains("NEW session"));
+        assert!(command_help("version").unwrap().contains("/version"));
         assert_eq!(command_help("nonexistent"), None);
     }
 
