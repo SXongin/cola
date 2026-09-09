@@ -3,7 +3,7 @@ pub mod types;
 
 pub use client::{
     Client, CreateSessionInput, ModelInfo, PermissionRequest, PromptResponse, QuestionRequest, Session,
-    SessionInfo, SessionListInfo, SessionMessage,
+    SessionInfo, SessionListInfo, SessionMessage, SessionStatus,
 };
 
 use std::sync::Arc;
@@ -29,6 +29,12 @@ pub trait DirectoryBackend: Send + Sync {
     async fn reject_question(&self, request_id: &str) -> Result<()>;
 
     async fn session_info(&self, session_id: &str) -> Result<SessionInfo>;
+
+    /// The server's live run state for one session (`GET /session/status`;
+    /// ADR-0028). A successful read always yields a status (absent = idle);
+    /// `Ok(None)` is an unrecognised status type, an error a failed read.
+    #[allow(dead_code)] // ticket 01 ships the read; 02/03 consume it
+    async fn session_status(&self, session_id: &str) -> Result<Option<SessionStatus>>;
 }
 
 /// The single concrete [`DirectoryBackend`]: wraps any [`Backend`] and forwards
@@ -76,6 +82,12 @@ impl DirectoryBackend for BackendDirectory {
 
     async fn session_info(&self, session_id: &str) -> Result<SessionInfo> {
         self.backend.session_info(session_id, Some(&self.directory)).await
+    }
+
+    async fn session_status(&self, session_id: &str) -> Result<Option<SessionStatus>> {
+        self.backend
+            .session_status(session_id, Some(&self.directory))
+            .await
     }
 }
 
@@ -155,6 +167,17 @@ pub trait Backend: Send + Sync {
     async fn reject_question(&self, request_id: &str, directory: Option<&str>) -> Result<()>;
 
     async fn messages(&self, session_id: &str) -> Result<Vec<SessionMessage>>;
+
+    /// The server's live run state for one session (`GET /session/status`).
+    /// `directory` selects the instance (ADR-0010). A successful read always
+    /// yields a status (absent = idle); `Ok(None)` is an unrecognised status
+    /// type (never guessed), an `Err` a failed read.
+    #[allow(dead_code)] // ticket 01 ships the read; 02/03 consume it
+    async fn session_status(
+        &self,
+        session_id: &str,
+        directory: Option<&str>,
+    ) -> Result<Option<SessionStatus>>;
 
     /// The model's context-window size (tokens), from `GET /provider`. Used to
     /// compute the context-usage ratio for the card footer. Best-effort: None
@@ -276,6 +299,14 @@ impl Backend for Client {
 
     async fn messages(&self, session_id: &str) -> Result<Vec<SessionMessage>> {
         Client::messages(self, session_id).await
+    }
+
+    async fn session_status(
+        &self,
+        session_id: &str,
+        directory: Option<&str>,
+    ) -> Result<Option<SessionStatus>> {
+        Client::session_status(self, session_id, directory).await
     }
 
     async fn model_context_window(&self, provider: &str, model: &str) -> Result<Option<i64>> {

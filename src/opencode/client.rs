@@ -444,6 +444,55 @@ impl Client {
         Ok(resp.json().await?)
     }
 
+    /// The server's per-session run state for ONE session (canonical:
+    /// `GET /session/status`, which returns `Record<sessionID, SessionStatus>`).
+    ///
+    /// Semantics mirror the server's own status service: a session the server
+    /// has no record for is idle (a finished run is removed from the map; the
+    /// server's `get` returns `{type:"idle"}` for an absent session). So a
+    /// successful read always yields a status — `Idle` for an absent session —
+    /// and `Ok(None)` is reserved for a session that IS present but whose
+    /// status `type` this client does not recognise (unknown → never guessed).
+    ///
+    /// `directory` selects the server instance (ADR-0010); without it only the
+    /// cwd instance is checked.
+    pub async fn session_status(
+        &self,
+        session_id: &str,
+        directory: Option<&str>,
+    ) -> crate::error::Result<Option<SessionStatus>> {
+        let mut url = reqwest::Url::parse(&self.url("/session/status"))?;
+        if let Some(d) = directory {
+            url.query_pairs_mut().append_pair("directory", d);
+        }
+        let resp = self.http().get(url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                "GET /session/status failed: {} — body: {}",
+                status,
+                &text[..text.len().min(500)]
+            );
+            return Err(crate::error::BridgeError::OpenCode(format!(
+                "session status failed: {}",
+                status
+            )));
+        }
+        let text = resp.text().await?;
+        let map: std::collections::HashMap<String, serde_json::Value> =
+            serde_json::from_str(&text).map_err(|e| {
+                crate::error::BridgeError::OpenCode(format!(
+                    "session status parse: {e} — body: {}",
+                    &text[..text.len().min(300)]
+                ))
+            })?;
+        Ok(match map.get(session_id) {
+            None => Some(SessionStatus::Idle),
+            Some(entry) => parse_session_status_entry(entry),
+        })
+    }
+
     /// List pending question requests for an instance (canonical: `GET /question`).
     pub async fn list_questions(
         &self,
@@ -996,6 +1045,32 @@ pub struct PermissionListResponse {
     pub data: Vec<PermissionRequest>,
 }
 
+/// A session's run state as reported by the server (`GET /session/status`).
+/// cola consumes the server's own status service (ADR-0028): idle/busy/retry
+/// per session. A read this client cannot interpret is never guessed — it
+/// becomes `None` and the caller omits whatever depends on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStatus {
+    /// The server has no running turn for the session (`{type:"idle"}`, or the
+    /// session is absent from the status map — a finished run is removed).
+    Idle,
+    /// A turn is actively running (`{type:"busy"}`).
+    Busy,
+    /// The last turn failed and is scheduled for retry (`{type:"retry", …}`).
+    Retry,
+}
+
+/// Parse one `GET /session/status` map entry (e.g. `{"type":"busy"}`) into a
+/// [`SessionStatus`]. `None` for an unrecognised/absent `type` — never guess.
+fn parse_session_status_entry(entry: &serde_json::Value) -> Option<SessionStatus> {
+    match entry.get("type").and_then(|t| t.as_str()) {
+        Some("idle") => Some(SessionStatus::Idle),
+        Some("busy") => Some(SessionStatus::Busy),
+        Some("retry") => Some(SessionStatus::Retry),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PermissionRequest {
     #[serde(rename = "id")]
@@ -1276,6 +1351,34 @@ mod tests {
         // Degenerate: neither present.
         let tokens: MessageTokens = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(tokens.context_used(), 0);
+    }
+
+    #[test]
+    fn parses_session_status_entry_types() {
+        assert_eq!(
+            parse_session_status_entry(&serde_json::json!({"type": "idle"})),
+            Some(SessionStatus::Idle)
+        );
+        assert_eq!(
+            parse_session_status_entry(&serde_json::json!({"type": "busy"})),
+            Some(SessionStatus::Busy)
+        );
+        // The retry entry carries extra fields; cola reads only `type`.
+        assert_eq!(
+            parse_session_status_entry(&serde_json::json!({
+                "type": "retry", "attempt": 1, "message": "boom", "next": 5000
+            })),
+            Some(SessionStatus::Retry)
+        );
+        // Unknown/absent type is never guessed.
+        assert_eq!(
+            parse_session_status_entry(&serde_json::json!({"type": "zombie"})),
+            None
+        );
+        assert_eq!(
+            parse_session_status_entry(&serde_json::json!({"no": "type"})),
+            None
+        );
     }
 
     #[test]
