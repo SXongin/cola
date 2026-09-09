@@ -7088,7 +7088,9 @@ pub(crate) mod integration_tests {
     }
 
     /// A `/switch` card "adopt" action maps the session into the thread and
-    /// returns a refreshed card + toast in the ack.
+    /// patches the list card IN PLACE to the Session Snapshot (ADR-0028): the
+    /// returned card is the snapshot — the list is no longer visible and no
+    /// second message is sent.
     #[tokio::test]
     async fn switch_card_adopt_action_maps_session() {
         let _wd = test_work_dir();
@@ -7109,10 +7111,19 @@ pub(crate) mod integration_tests {
             .handle_card_action(value)
             .await
             .expect("switch adopt should return a result");
+        let card = result.card.clone().expect("adopt returns the patched card");
+        let card_str = card.to_string();
         assert!(
-            result.card.is_some(),
-            "adopt returns a refreshed card: {:?}",
-            result.card
+            card_str.contains("已接管 重写登录"),
+            "patched card is the snapshot: {card_str}"
+        );
+        assert!(
+            !card_str.contains("会话管理"),
+            "the list is gone from the patched card: {card_str}"
+        );
+        assert!(
+            !card_str.contains("switch_search"),
+            "the search form is gone from the patched card: {card_str}"
         );
         assert!(
             result.toast.clone().unwrap_or_default().contains("接管"),
@@ -7123,6 +7134,201 @@ pub(crate) mod integration_tests {
         assert_eq!(
             app.sessions.lock().await.get_active(&key).unwrap().session_id,
             "ses_alpha01"
+        );
+    }
+
+    /// ADR-0028: a 切换 on a row of a session already mapped to this thread
+    /// patches the card to a snapshot with the 已切换 verb — a mapped re-switch
+    /// is an activation and reports content (external newness here).
+    #[tokio::test]
+    async fn switch_card_switch_on_mapped_session_patches_to_snapshot() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)];
+        // External newness → content to report → full snapshot, not suppressed.
+        backend
+            .external_user_messages
+            .insert("ses_own1".into(), "OpenChamber 里的问题".into());
+        let (app, _platform) = build_app(cfg, backend).await;
+        // The session is mapped to this thread but NOT active (a stacked
+        // session) — the row shows 切换.
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+                session_id: "ses_own1".into(),
+                directory: "/work/cola".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+                topic_root: None,
+                variant: None,
+            });
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+                session_id: "ses_active".into(),
+                directory: "/work/active".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+                topic_root: None,
+                variant: None,
+            });
+        }
+
+        let value = serde_json::json!({
+            "action": "switch",
+            "op": "adopt",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "session_id": "ses_own1",
+        });
+        let result = app
+            .handle_card_action(value)
+            .await
+            .expect("switch on a mapped row should return a result");
+        let card = result.card.expect("mapped re-switch patches the card");
+        let card_str = card.to_string();
+        assert!(
+            card_str.contains("已切换 本项目会话"),
+            "re-switch verb: {card_str}"
+        );
+        assert!(
+            card_str.contains("OpenChamber 里的问题"),
+            "external message surfaces in the tail: {card_str}"
+        );
+        assert!(
+            result.toast.clone().unwrap_or_default().contains("已切换"),
+            "re-switch toasts the verb: {:?}",
+            result.toast
+        );
+        // The mapped session is now the thread's ACTIVE one.
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        assert_eq!(
+            app.sessions.lock().await.get_active(&key).unwrap().session_id,
+            "ses_own1"
+        );
+    }
+
+    /// ADR-0028: a 切换 on a fully-visible mapped session (idle, no pending,
+    /// newest user message cola-authored) patches to the COMPACT 「已切换」 state
+    /// card instead of a full snapshot — mirroring the text form's one-line
+    /// ack under suppression.
+    #[tokio::test]
+    async fn switch_card_switch_suppressed_patches_to_compact_state() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)];
+        backend
+            .cola_user_messages
+            .insert("ses_own1".into(), "上次的问题".into());
+        let (app, _platform) = build_app(cfg, backend).await;
+        // ses_own1 is mapped to this thread but NOT active (a stacked
+        // session) — the row shows 切换, and this is a re-activation, not the
+        // already-active ✅ row.
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+                session_id: "ses_own1".into(),
+                directory: "/work/cola".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+                topic_root: None,
+                variant: None,
+            });
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+                session_id: "ses_active".into(),
+                directory: "/work/active".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+                topic_root: None,
+                variant: None,
+            });
+        }
+
+        let value = serde_json::json!({
+            "action": "switch",
+            "op": "adopt",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "session_id": "ses_own1",
+        });
+        let result = app
+            .handle_card_action(value)
+            .await
+            .expect("suppressed switch should return a result");
+        let card = result.card.expect("suppressed 切换 still patches the card");
+        let card_str = card.to_string();
+        assert!(
+            card_str.contains("已切换 本项目会话"),
+            "compact state header: {card_str}"
+        );
+        assert!(
+            !card_str.contains("最近对话"),
+            "no full snapshot tail on a suppressed 切换: {card_str}"
+        );
+        assert!(
+            !card_str.contains("已接管"),
+            "suppressed re-switch is 已切换, never 已接管: {card_str}"
+        );
+    }
+
+    /// ADR-0028: when the switch card lives inside a topic (a never-bound
+    /// topic adopting its single session), the patched card is the in-topic
+    /// confirmation — its own message id (`open_message_id`) is persisted as
+    /// the fallback-card anchor, so later permission/question cards keep
+    /// routing inside the topic.
+    #[tokio::test]
+    async fn switch_card_adopt_in_topic_persists_anchor() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session("ses_alpha01", "重写登录", "/work/auth", 100)];
+        let (app, _platform) = build_app(cfg, backend).await;
+
+        let value = serde_json::json!({
+            "action": "switch",
+            "op": "adopt",
+            "chat_id": "chat_1",
+            "thread_id": "omt_fresh",
+            "session_id": "ses_alpha01",
+            "open_message_id": "om_switch_card",
+        });
+        let result = app
+            .handle_card_action(value)
+            .await
+            .expect("topic adopt should return a result");
+        let card = result.card.expect("adopt patches the card in place");
+        assert!(
+            card.to_string().contains("已接管"),
+            "snapshot in the topic: {card}"
+        );
+        let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_fresh".into());
+        let entry = app
+            .sessions
+            .lock()
+            .await
+            .get_active(&topic_key)
+            .cloned()
+            .expect("the topic maps to the adopted session");
+        assert_eq!(entry.session_id, "ses_alpha01");
+        assert_eq!(
+            entry.topic_anchor.as_deref(),
+            Some("om_switch_card"),
+            "the patched card is the in-topic fallback anchor"
         );
     }
 

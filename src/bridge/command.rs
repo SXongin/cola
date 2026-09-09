@@ -1434,18 +1434,16 @@ async fn handle_switch(
         // `already_mapped` input is true by construction: the hit came from
         // this thread's mapped-session list.
         let data = crate::bridge::snapshot::gather_snapshot(&core.opencode, &hit.id, &hit.directory).await;
-        if crate::bridge::snapshot::should_emit_snapshot(
-            true,
-            data.status,
-            data.has_pending(),
-            data.newest_user_is_cola_authored,
-        ) {
-            let card = snapshot_card_for(core, "切换", hit).await;
-            core.feishu.reply_card(message_id, &card).await?;
-        } else {
-            core.feishu
-                .reply_text(message_id, &format!("Switched to \"{}\".", hit.title))
-                .await?;
+        match crate::bridge::snapshot::re_switch_emit(&data) {
+            crate::bridge::snapshot::SnapshotEmit::Full => {
+                let card = snapshot_card_for(core, "切换", hit).await;
+                core.feishu.reply_card(message_id, &card).await?;
+            }
+            crate::bridge::snapshot::SnapshotEmit::Suppressed => {
+                core.feishu
+                    .reply_text(message_id, &format!("Switched to \"{}\".", hit.title))
+                    .await?;
+            }
         }
         return Ok(());
     }
@@ -1885,7 +1883,7 @@ pub(crate) async fn create_topic_and_map_adopted(
 /// pendings, transcript tail) from server reads and build its card with the
 /// given takeover verb (接管/切换). Shared by every adoption surface so the
 /// gather-before-mapping sequence cannot drift between them.
-async fn snapshot_card_for(
+pub(crate) async fn snapshot_card_for(
     core: &Arc<SharedCore>,
     verb: &str,
     info: &crate::opencode::SessionListInfo,
