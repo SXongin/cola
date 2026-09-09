@@ -30,6 +30,44 @@ impl SnapshotData {
     pub fn has_pending(&self) -> bool {
         !self.pending.is_empty()
     }
+
+    /// ADR-0028 suppression predicate, reading this snapshot's gathered state.
+    /// `already_mapped_to_this_thread` marks a re-activation (the only case
+    /// where suppression can fire); first-time adoption always emits.
+    pub fn should_emit(&self, already_mapped_to_this_thread: bool) -> bool {
+        should_emit_snapshot(
+            already_mapped_to_this_thread,
+            self.status,
+            self.has_pending(),
+            self.newest_user_is_cola_authored,
+        )
+    }
+}
+
+/// The emit decision for RE-activating a session already mapped to this
+/// thread (ADR-0028 suppression). First-time adoptions always emit the full
+/// snapshot and never consult this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotEmit {
+    /// Content to report (busy/retry, a pending request, or an external
+    /// newest message) → the full snapshot card.
+    Full,
+    /// Nothing to report (idle, no pending, newest user cola-authored — the
+    /// session's recent life is already visible in this thread) → a compact
+    /// state instead of the full snapshot.
+    Suppressed,
+}
+
+/// ADR-0028: decide whether a re-switch to a session already mapped to this
+/// thread reports the full snapshot. Shared by the text `/switch` mapped-hit
+/// branch and the switch card's 切换 op so the predicate cannot drift between
+/// the two surfaces.
+pub(crate) fn re_switch_emit(data: &SnapshotData) -> SnapshotEmit {
+    if data.should_emit(true) {
+        SnapshotEmit::Full
+    } else {
+        SnapshotEmit::Suppressed
+    }
 }
 
 /// One 最近对话 tail entry: a text-bearing user/assistant message's role, its

@@ -915,8 +915,11 @@ impl App {
     }
 
     /// Handle a `/switch` card button (ADR-0012, issue 04): adopt a session,
-    /// create a new one, or re-search. Returns the refreshed card so the ack
-    /// patches the card in place, plus a Toast for instant feedback.
+    /// create a new one, or re-search. The 接管/切换 ops return the Session
+    /// Snapshot (or the compact suppressed-切换 state, ADR-0028) as the card
+    /// so the ack patches the switch card in place — one message per
+    /// activation; scope/search/new return a refreshed list card. Plus a
+    /// Toast for instant feedback.
     async fn handle_switch_card_action(
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
@@ -981,8 +984,8 @@ impl App {
                     let store = core.sessions.lock().await;
                     store.thread_for_session(&target.id)
                 };
-                if let Some(owner_key) = owner
-                    && owner_key != thread_key
+                if let Some(ref owner_key) = owner
+                    && owner_key != &thread_key
                 {
                     let chat_name = core
                         .feishu
@@ -998,6 +1001,49 @@ impl App {
                         )),
                     });
                 }
+                // ADR-0028 one-card rule: the switch card's OWN message becomes
+                // the confirmation — the ack patches the list card in place to
+                // the snapshot (接管 for a first adopt, 切换 for a mapped
+                // re-switch; a mapped re-switch with nothing to report patches
+                // to a compact 已切换 state card instead of a full snapshot).
+                // After the early returns above, `owner` is either `None`
+                // (unmapped → first adopt) or this thread itself (→ 切换).
+                let mapped_to_this_thread = owner.is_some();
+                let verb = if mapped_to_this_thread { "切换" } else { "接管" };
+                let card = if mapped_to_this_thread {
+                    let data = crate::bridge::snapshot::gather_snapshot(
+                        &core.opencode,
+                        &target.id,
+                        &target.directory,
+                    )
+                    .await;
+                    match crate::bridge::snapshot::re_switch_emit(&data) {
+                        crate::bridge::snapshot::SnapshotEmit::Full => {
+                            crate::feishu::snapshot_card::build_snapshot_card("切换", &target.title, &data)
+                        }
+                        crate::bridge::snapshot::SnapshotEmit::Suppressed => {
+                            crate::feishu::snapshot_card::build_switched_state_card(
+                                &target.title,
+                                &target.id,
+                                &target.directory,
+                            )
+                        }
+                    }
+                } else {
+                    crate::bridge::command::snapshot_card_for(core, "接管", &target).await
+                };
+                // In a topic the patched card lives INSIDE it, so persist its
+                // own message id as the fallback-card anchor (same anchor
+                // semantics as the text in-topic adopt, ADR-0028): later
+                // permission/question cards reply to it and stay in the topic.
+                let topic_anchor = if thread_key.thread_id != thread_key.chat_id {
+                    value
+                        .get("open_message_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                };
                 let entry = crate::config::SessionEntry {
                     thread_key: thread_key.clone(),
                     session_id: target.id.clone(),
@@ -1005,7 +1051,7 @@ impl App {
                     agent: target.agent.clone(),
                     model: None,
                     auto_accept: false,
-                    topic_anchor: None,
+                    topic_anchor,
                     topic_root: None,
                     variant: None,
                 };
@@ -1017,12 +1063,12 @@ impl App {
                     }
                 }
                 core.invalidate_session_list_cache().await;
-                let toast = format!("已接管「{}」", crate::bridge::command::title_or_id_tail(&target));
+                let toast = format!(
+                    "已{verb}「{}」",
+                    crate::bridge::command::title_or_id_tail(&target)
+                );
                 Some(CardActionResult {
-                    card: Some(
-                        self.build_switch_card_for(core, &thread_key, &keyword, scope)
-                            .await,
-                    ),
+                    card: Some(card),
                     toast: Some(toast),
                 })
             }

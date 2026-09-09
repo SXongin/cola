@@ -94,6 +94,18 @@ fn tail_panels(tail: &[TailEntry]) -> Vec<serde_json::Value> {
     panels
 }
 
+/// The snapshot's display title: the cleaned session label, falling back to
+/// the id tail when the label is empty (shared by the full snapshot and the
+/// compact suppressed-切换 state card).
+fn display_title(title: &str, session_id: &str) -> String {
+    let label = crate::feishu::card::clean_session_label(title);
+    if label.is_empty() {
+        crate::bridge::command::id_tail(session_id)
+    } else {
+        label
+    }
+}
+
 /// Build the one-shot Session Snapshot card (ADR-0028) for an adopted session.
 /// `verb` is the takeover verb (接管/切换 — 已 is prefixed for the header) and
 /// `title` the session's display title; the body comes entirely from the
@@ -102,12 +114,7 @@ fn tail_panels(tail: &[TailEntry]) -> Vec<serde_json::Value> {
 /// (05) or stream a busy follow (06) into the same card.
 pub fn build_snapshot_card(verb: &str, title: &str, data: &SnapshotData) -> serde_json::Value {
     let verb = verb.strip_prefix("已").unwrap_or(verb);
-    let label = crate::feishu::card::clean_session_label(title);
-    let title = if label.is_empty() {
-        crate::bridge::command::id_tail(&data.session_id)
-    } else {
-        label
-    };
+    let title = display_title(title, &data.session_id);
 
     // Only the adopted session's OWN pendings belong on the snapshot — never a
     // sibling session's block (defensive; the gather already filtered). The
@@ -142,6 +149,27 @@ pub fn build_snapshot_card(verb: &str, title: &str, data: &SnapshotData) -> serd
             "template": "blue"
         },
         "body": { "elements": elements }
+    })
+}
+
+/// Build the compact suppressed-切换 state card (ADR-0028): when a re-switch
+/// to a session already mapped to this thread has nothing to report (idle, no
+/// pending, newest user message cola-authored), the switch card patches to
+/// this small confirmation instead of a full snapshot — the card-form mirror
+/// of the text form's one-line ack. No status chip, no tail, no pending
+/// blocks: there is deliberately nothing to report.
+pub fn build_switched_state_card(title: &str, session_id: &str, directory: &str) -> serde_json::Value {
+    let title = display_title(title, session_id);
+    json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true },
+        "header": {
+            "title": { "tag": "plain_text", "content": format!("已切换 {title}") },
+            "template": "blue"
+        },
+        "body": { "elements": [
+            { "tag": "markdown", "content": format!("已切换到该会话（目录 `{directory}`）。") }
+        ] }
     })
 }
 
