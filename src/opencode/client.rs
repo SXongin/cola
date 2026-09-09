@@ -4,6 +4,29 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+/// The id prefix cola assigns to every user message it submits (ADR-0026).
+/// cola picks the message's id (`PromptInput.messageID`) at send time and the
+/// server persists it, so the `msg_cola_` prefix self-identifies a message as
+/// cola-authored — the external-message sync uses it instead of a timestamp
+/// baseline that goes stale when the server dies mid-turn.
+const COLA_MESSAGE_ID_PREFIX: &str = "msg_cola_";
+
+/// Generate a fresh self-identifying user-message id for a prompt cola is about
+/// to send (ADR-0026). The server validates ids by `msg` prefix and persists
+/// the supplied id, and re-posting the same id is idempotent — so a retry that
+/// reuses the id never duplicates the user message.
+pub fn cola_message_id() -> String {
+    format!("{}{}", COLA_MESSAGE_ID_PREFIX, uuid::Uuid::new_v4().simple())
+}
+
+/// Whether a stored user message was authored by cola (ADR-0026). Any user
+/// message whose id carries the `msg_cola_` prefix was submitted by cola on
+/// behalf of Feishu; everything else in a cola-mapped session is a candidate
+/// for the external-message sync.
+pub fn is_cola_message_id(id: &str) -> bool {
+    id.starts_with(COLA_MESSAGE_ID_PREFIX)
+}
+
 /// Lightweight HTTP client for the OpenCode Server REST API.
 ///
 /// The server cola talks to can be restarted/replaced at runtime (another tool
@@ -200,6 +223,12 @@ impl Client {
     /// applies that model-declared variant (e.g. "high") to whatever model runs
     /// this turn. Independent of `model` — a variant can be set even when no
     /// model override exists (the server default model then carries it).
+    ///
+    /// `message_id` is the id cola chose for the user message this prompt will
+    /// create (ADR-0026). The server persists it, and a retry that reuses it is
+    /// idempotent — never a duplicate user message. None falls back to a
+    /// server-generated id (used only by tests/other clients).
+    #[allow(clippy::too_many_arguments)] // prompt axes: session/text/images + model/variant/agent/message-id
     pub async fn prompt(
         &self,
         session_id: &str,
@@ -208,10 +237,12 @@ impl Client {
         model: Option<&ModelInfo>,
         variant: Option<&str>,
         agent: Option<&str>,
+        message_id: Option<&str>,
     ) -> crate::error::Result<PromptResponse> {
         let mut body = serde_json::json!({
             "parts": build_parts(text, images),
         });
+        inject_message_id(&mut body, message_id);
         inject_model(&mut body, model, self.model.as_ref(), variant);
         inject_agent(&mut body, agent);
         let resp = self
@@ -276,36 +307,20 @@ impl Client {
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(crate::error::BridgeError::SessionNotFound(session_id.to_string()));
         }
+        let status = resp.status();
 
-        // Fallback: older servers expose `/api/session/{id}/prompt` with `prompt` payload.
-        tracing::warn!(
-            "canonical /session/{}/message failed ({}), falling back to /api/session/{}/prompt",
-            session_id,
-            resp.status(),
-            session_id
-        );
-        let body = serde_json::json!({
-            "prompt": {
-                "text": text,
-            },
-            "delivery": "steer",
-        });
-        let resp = self
-            .http()
-            .post(self.url(&format!("/api/session/{}/prompt", session_id)))
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?;
+        // Any other failure (5xx, network drop) surfaces as a prompt error —
+        // the error card's retry re-submits with the SAME message_id, which the
+        // server deduplicates. There is deliberately NO legacy `/api/.../prompt`
+        // fallback: it cannot carry `message_id`, appends a fresh user message,
+        // and re-runs the model, so retrying through it would duplicate the
+        // message + double-run (ADR-0026).
         let text_body = resp.text().await?;
-        tracing::info!("prompt response: {}", &text_body[..text_body.len().min(300)]);
-        let body: PromptOutput = serde_json::from_str(&text_body).map_err(|e| {
-            crate::error::BridgeError::OpenCode(format!(
-                "prompt decode: {e} — body: {}",
-                &text_body[..text_body.len().min(300)]
-            ))
-        })?;
-        Ok(body.data)
+        Err(crate::error::BridgeError::OpenCode(format!(
+            "prompt {session_id} failed: HTTP {} — {}",
+            status,
+            &text_body[..text_body.len().min(300)]
+        )))
     }
 
     /// Fire-and-forget prompt: `POST /session/{id}/prompt_async`. OpenCode
@@ -315,6 +330,7 @@ impl Client {
     /// send the new message here so it lands in the DB and the running loop
     /// picks it up at the next tool boundary (merged into the current turn),
     /// without a second synchronous prompt blocking the WS read loop.
+    #[allow(clippy::too_many_arguments)] // same prompt axes as `prompt`
     pub async fn prompt_async(
         &self,
         session_id: &str,
@@ -323,10 +339,12 @@ impl Client {
         model: Option<&ModelInfo>,
         variant: Option<&str>,
         agent: Option<&str>,
+        message_id: Option<&str>,
     ) -> crate::error::Result<()> {
         let mut body = serde_json::json!({
             "parts": build_parts(text, images),
         });
+        inject_message_id(&mut body, message_id);
         inject_model(&mut body, model, self.model.as_ref(), variant);
         inject_agent(&mut body, agent);
         let resp = self
@@ -1052,6 +1070,15 @@ fn inject_agent(body: &mut serde_json::Value, agent: Option<&str>) {
     }
 }
 
+/// Attach the cola-chosen user-message id to a prompt body (`msg_cola_…`,
+/// ADR-0026). When set the server persists that id (idempotent on retries);
+/// when None it generates one. Shared by `prompt` and `prompt_async`.
+fn inject_message_id(body: &mut serde_json::Value, message_id: Option<&str>) {
+    if let Some(mid) = message_id {
+        body["messageID"] = serde_json::json!(mid);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1249,5 +1276,16 @@ mod tests {
         // Degenerate: neither present.
         let tokens: MessageTokens = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(tokens.context_used(), 0);
+    }
+
+    #[test]
+    fn cola_message_id_self_identifies_and_is_unique() {
+        let a = cola_message_id();
+        let b = cola_message_id();
+        assert!(a.starts_with("msg_cola_"), "prefix missing: {a}");
+        assert_ne!(a, b, "ids must be unique");
+        assert!(is_cola_message_id(&a));
+        assert!(!is_cola_message_id("msg_serverside"));
+        assert!(!is_cola_message_id("msg_cola")); // no trailing separator
     }
 }

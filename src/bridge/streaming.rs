@@ -129,6 +129,9 @@ pub struct StreamAccumulator {
     /// The full original prompt text of this turn, kept so the error-card
     /// "retry" button can re-submit it without the user retyping.
     pub prompt: Option<String>,
+    /// The id this turn's user message carries (`msg_cola_…`, ADR-0026), so a
+    /// later error-card retry reuses it and the server deduplicates by id.
+    pub cola_message_id: Option<String>,
     /// Who sent the prompt (Feishu open_id), so the group completion notice can
     /// be replied to them / @-mention them.
     pub requester_open_id: Option<String>,

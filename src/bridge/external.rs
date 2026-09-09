@@ -8,10 +8,14 @@ use crate::bridge::streaming::StreamAccumulator;
 
 /// The external-message flow: watches for user messages that were NOT sent by
 /// cola (someone posted from OpenChamber or another client on the shared store)
-/// and notifies the Feishu side with a small card. cola's own prompts are
-/// excluded via the per-session baseline set at the end of each prompt.
+/// and notifies the Feishu side with a small card. cola's own messages are
+/// excluded by their self-identifying `msg_cola_` id (ADR-0026), never by a
+/// timestamp baseline — authorship lives on the message, so a server crash
+/// mid-turn cannot make cola's own round look external afterwards.
 pub struct ExternalFlow {
-    /// session_id → created time of the last user message cola knows about.
+    /// session_id → Sync Watermark: the created time of the newest user message
+    /// the poller has already accounted for (cola-authored or external). Owned
+    /// by the poller alone — the prompt path no longer records it (ADR-0026).
     pub last_user_msg_epoch: Arc<Mutex<HashMap<String, i64>>>,
     /// External poll cadence (ms). Defaults to today's 8 s; tests store a small
     /// value so every loop branch runs without sleeping real seconds.
@@ -35,19 +39,18 @@ impl ExternalFlow {
         }
     }
 
-    /// Record the user-message baseline after cola's own prompt completes, so
-    /// the external poller treats anything newer as posted by another client.
-    /// Owns `last_user_msg_epoch` — the prompt path calls this method instead
-    /// of poking the map directly.
-    pub(crate) async fn record_prompt_baseline(&self, session_id: &str, baseline: i64) {
-        self.last_user_msg_epoch
-            .lock()
-            .await
-            .insert(session_id.to_string(), baseline);
-    }
-
     /// Independent poller: detects user messages not sent by cola and notifies
     /// the Feishu side. Started once at App startup.
+    ///
+    /// The Sync Watermark is advanced on every poll that reads the session:
+    /// over cola-authored messages (which never notify) and over external
+    /// messages (which notify once, at the moment they first exceed the
+    /// watermark). Authorship is authoritative (ADR-0026): a user message whose
+    /// id starts with `msg_cola_` was submitted by cola. cola chooses that id
+    /// at send time and the server persists it, so even when a server dies
+    /// mid-turn and cola never reads back the message's created time, the
+    /// poller still recognises it as cola's own on the first poll after a heal
+    /// — it can never be mistaken for an external message.
     pub(crate) async fn poll_loop(&self, core: &Arc<SharedCore>) -> crate::error::Result<()> {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_millis(
@@ -63,9 +66,9 @@ impl ExternalFlow {
             // (p2p/group) can stack several sessions via /new and /switch, and
             // notifying for a historical one would interleave its cards with the
             // current conversation's. Historical sessions are skipped AND their
-            // baseline cleared, so switching back to one re-baselines silently
-            // (external messages received while it was inactive are marked read,
-            // not replayed).
+            // Sync Watermark cleared, so switching back to one re-syncs its
+            // watermark silently (external messages received while it was
+            // inactive are marked read, not replayed).
             //
             // `active` and `sessions` are derived from ONE store snapshot so a
             // session activated mid-poll can't slip through as active-but-unchecked.
@@ -91,7 +94,8 @@ impl ExternalFlow {
             for (sid, thread_key, directory) in sessions {
                 if !active.contains(&sid) {
                     // Historical (non-active) session: stop syncing it and drop
-                    // its baseline so a later /switch back re-baselines silently.
+                    // its Sync Watermark so a later /switch back re-syncs it
+                    // silently (first observation, no replay).
                     self.last_user_msg_epoch.lock().await.remove(&sid);
                     continue;
                 }
@@ -102,60 +106,79 @@ impl ExternalFlow {
                 let Ok(msgs) = core.opencode.messages(&sid).await else {
                     continue;
                 };
-                let latest_user = msgs
+                // The newest user message overall decides this poll. Its author
+                // is authoritative (ADR-0026): a `msg_cola_` id means cola sent
+                // it — advance the watermark, never notify. Only a message
+                // written by another shared-store client and newer than the
+                // watermark is an External Message.
+                let newest = msgs
                     .iter()
                     .filter(|m| m.info.role.as_deref() == Some("user"))
-                    .filter_map(|m| m.info.time.as_ref().map(|t| t.created))
-                    .max();
-                let Some(latest) = latest_user else {
+                    .filter_map(|m| {
+                        let id = m.info.id.as_str();
+                        m.info.time.as_ref().map(|t| (t.created, id))
+                    })
+                    .max_by_key(|(created, _)| *created);
+                let Some((latest, latest_id)) = newest else {
                     continue;
                 };
+                let cola_authored = crate::opencode::client::is_cola_message_id(latest_id);
                 let mut map = self.last_user_msg_epoch.lock().await;
-                match map.get(&sid).copied() {
-                    // First observation: just establish the baseline, don't notify.
-                    None => {
+                let watermark = map.get(&sid).copied();
+                if cola_authored {
+                    // cola's own message: never notify; just make sure the
+                    // watermark covers it so later external messages compare
+                    // against it.
+                    if watermark.is_none_or(|w| latest > w) {
                         map.insert(sid.clone(), latest);
                     }
-                    Some(prev) if latest > prev => {
-                        map.insert(sid.clone(), latest);
-                        let preview = user_message_preview(&msgs, latest);
-                        drop(map);
-                        tracing::info!("External message on session {}: {}", sid, preview);
-                        // The card title is the server's session title (ADR-0007)
-                        // — fetched on demand, never a cola-side name.
-                        let title = core
-                            .opencode
-                            .clone()
-                            .for_directory(&directory)
-                            .session_info(&sid)
-                            .await
-                            .ok()
-                            .and_then(|i| i.title)
-                            .unwrap_or_default();
-                        let card = crate::feishu::card::build_external_message_card(&title, &preview);
-                        // A topic session must be reached by replying to a
-                        // message INSIDE the topic (the create API rejects
-                        // `receive_id_type=thread_id`). Resolve an in-topic
-                        // anchor — the persisted `/topic` confirmation card, or
-                        // the newest bot message in the thread. Non-topic
-                        // sessions fall back to the chat top level.
-                        let anchor = crate::bridge::pollers::resolve_topic_anchor(core, &thread_key).await;
-                        let sent = match anchor {
-                            Some(anchor) => core.feishu.reply_card(&anchor, &card).await,
-                            None => core.feishu.send_card("chat_id", &thread_key.chat_id, &card).await,
-                        };
-                        match sent {
-                            Ok(card_id) => {
-                                // Now render the model's reply INTO that card, so
-                                // the Feishu side sees the answer, not just the
-                                // notification.
-                                self.start_reply_render(core, &sid, latest, &card_id, &preview)
-                                    .await;
-                            }
-                            Err(e) => tracing::warn!("external message notify: {}", e),
+                    continue;
+                }
+                // First observation: establish the watermark, don't notify.
+                // External messages received before cola ever polled are marked
+                // read, not replayed (ADR-0017).
+                let Some(prev) = watermark else {
+                    map.insert(sid.clone(), latest);
+                    continue;
+                };
+                if latest > prev {
+                    map.insert(sid.clone(), latest);
+                    let preview = user_message_preview(&msgs, latest);
+                    drop(map);
+                    tracing::info!("External message on session {}: {}", sid, preview);
+                    // The card title is the server's session title (ADR-0007)
+                    // — fetched on demand, never a cola-side name.
+                    let title = core
+                        .opencode
+                        .clone()
+                        .for_directory(&directory)
+                        .session_info(&sid)
+                        .await
+                        .ok()
+                        .and_then(|i| i.title)
+                        .unwrap_or_default();
+                    let card = crate::feishu::card::build_external_message_card(&title, &preview);
+                    // A topic session must be reached by replying to a
+                    // message INSIDE the topic (the create API rejects
+                    // `receive_id_type=thread_id`). Resolve an in-topic
+                    // anchor — the persisted `/topic` confirmation card, or
+                    // the newest bot message in the thread. Non-topic
+                    // sessions fall back to the chat top level.
+                    let anchor = crate::bridge::pollers::resolve_topic_anchor(core, &thread_key).await;
+                    let sent = match anchor {
+                        Some(anchor) => core.feishu.reply_card(&anchor, &card).await,
+                        None => core.feishu.send_card("chat_id", &thread_key.chat_id, &card).await,
+                    };
+                    match sent {
+                        Ok(card_id) => {
+                            // Now render the model's reply INTO that card, so
+                            // the Feishu side sees the answer, not just the
+                            // notification.
+                            self.start_reply_render(core, &sid, latest, &card_id, &preview)
+                                .await;
                         }
+                        Err(e) => tracing::warn!("external message notify: {}", e),
                     }
-                    _ => {}
                 }
             }
         }
