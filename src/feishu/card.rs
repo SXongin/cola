@@ -890,68 +890,74 @@ pub fn question_elements(
 
         if finalized {
             // Answered / confirmed: no controls, just the 已选 line above.
-        } else if !multi && q.options.len() > MAX_VISIBLE_OPTIONS {
-            // Single-select with many options collapses into an `overflow`
-            // group (the heading above keeps the full option list visible).
-            let options: Vec<serde_json::Value> = q
-                .options
-                .iter()
-                .map(|opt| {
-                    json!({
-                        "text": { "tag": "plain_text", "content": opt.label },
-                        "value": format!("{}|{}", i, opt.label),
-                    })
-                })
-                .collect();
-            elements.push(json!({
-                "tag": "overflow",
-                "width": "fill",
-                "options": options,
-                "value": {
-                    "action": "question",
-                    "reply": "answer",
-                    "request_id": request_id,
-                    "session_id": session_id,
-                    "directory": directory,
-                },
-            }));
         } else {
-            for opt in &q.options {
-                // Multi-select buttons show their selected state so the user
-                // can see what's already picked while still toggling.
-                let selected = multi
-                    && answered
-                        .get(i)
-                        .and_then(|a| a.as_ref())
-                        .is_some_and(|labels| labels.iter().any(|l| l == &opt.label));
+            // Option picker: raw buttons when the set is small; a single-select
+            // with many options collapses into an `overflow` group (the heading
+            // above keeps the full option list visible). Multi-select always
+            // stays on buttons so clicks toggle the running set.
+            if !multi && q.options.len() > MAX_VISIBLE_OPTIONS {
+                let options: Vec<serde_json::Value> = q
+                    .options
+                    .iter()
+                    .map(|opt| {
+                        json!({
+                            "text": { "tag": "plain_text", "content": opt.label },
+                            "value": format!("{}|{}", i, opt.label),
+                        })
+                    })
+                    .collect();
                 elements.push(json!({
-                    "tag": "button",
-                    "text": {
-                        "tag": "plain_text",
-                        "content": if selected {
-                            format!("✅ {}", opt.label)
-                        } else {
-                            opt.label.clone()
-                        },
-                    },
-                    "type": if selected { "primary" } else { "default" },
+                    "tag": "overflow",
+                    "width": "fill",
+                    "options": options,
                     "value": {
                         "action": "question",
                         "reply": "answer",
                         "request_id": request_id,
                         "session_id": session_id,
                         "directory": directory,
-                        "question_index": i,
-                        "answer": opt.label,
                     },
                 }));
+            } else {
+                for opt in &q.options {
+                    // Multi-select buttons show their selected state so the user
+                    // can see what's already picked while still toggling.
+                    let selected = multi
+                        && answered
+                            .get(i)
+                            .and_then(|a| a.as_ref())
+                            .is_some_and(|labels| labels.iter().any(|l| l == &opt.label));
+                    elements.push(json!({
+                        "tag": "button",
+                        "text": {
+                            "tag": "plain_text",
+                            "content": if selected {
+                                format!("✅ {}", opt.label)
+                            } else {
+                                opt.label.clone()
+                            },
+                        },
+                        "type": if selected { "primary" } else { "default" },
+                        "value": {
+                            "action": "question",
+                            "reply": "answer",
+                            "request_id": request_id,
+                            "session_id": session_id,
+                            "directory": directory,
+                            "question_index": i,
+                            "answer": opt.label,
+                        },
+                    }));
+                }
             }
 
             // Free-text answer (OpenCode questions allow custom by default). The
             // typed text arrives in `action.form_value`; ws.rs injects it into
-            // the button's `answer` field. Single-select submits a replacement
+            // the answer payload. Single-select submits a replacement
             // (`reply: "answer"`); a multi-select ADDS the typed label to the
-            // toggled set (`reply: "custom"`), so the two never collide.
+            // toggled set (`reply: "custom"`), so the two never collide. Rendered
+            // for the overflow path too: a many-option single-select still needs
+            // a way to type an answer outside the listed set.
             if q.custom.unwrap_or(true) {
                 let (reply, name_prefix) = if multi {
                     ("custom", "submitm")
@@ -2411,23 +2417,34 @@ mod tests {
         assert_eq!(reject["value"]["request_id"], "que_1");
     }
 
-    #[test]
-    fn question_card_many_options_collapse_into_overflow() {
-        let mut options = Vec::new();
-        for i in 0..5 {
-            options.push(crate::opencode::client::QuestionOption {
+    /// A single-select question with 5 options — past `MAX_VISIBLE_OPTIONS`,
+    /// so its controls take the `overflow` path rather than raw buttons.
+    fn many_option_question() -> crate::opencode::client::QuestionInfo {
+        let options = (0..5)
+            .map(|i| crate::opencode::client::QuestionOption {
                 label: format!("/a{}", i),
                 description: String::new(),
-            });
-        }
-        let questions = vec![crate::opencode::client::QuestionInfo {
+            })
+            .collect();
+        crate::opencode::client::QuestionInfo {
             question: "选一个目录".into(),
             header: "目录".into(),
             options,
             multiple: None,
             custom: None,
-        }];
-        let card = build_question_card("que_1", "ses_1", &questions, "/tmp/proj/lib", &[None], &[false]);
+        }
+    }
+
+    #[test]
+    fn question_card_many_options_collapse_into_overflow() {
+        let card = build_question_card(
+            "que_1",
+            "ses_1",
+            &[many_option_question()],
+            "/tmp/proj/lib",
+            &[None],
+            &[false],
+        );
         let elements = card["body"]["elements"].as_array().unwrap();
         let overflow = elements
             .iter()
@@ -2441,10 +2458,47 @@ mod tests {
         // The overflow carries the routing payload for the reply.
         assert_eq!(overflow["value"]["request_id"], "que_1");
         assert_eq!(overflow["value"]["reply"], "answer");
-        // No raw option buttons for the collapsed question.
+        // No raw option buttons for the collapsed question (the form's submit
+        // button is nested inside the form element, not a top-level button).
         let buttons: Vec<_> = elements.iter().filter(|e| e["tag"] == "button").collect();
         assert_eq!(buttons.len(), 1, "only the reject button remains");
         assert_eq!(buttons[0]["value"]["reply"], "reject");
+    }
+
+    #[test]
+    fn question_card_overflow_path_keeps_custom_answer_form() {
+        let card = build_question_card(
+            "que_1",
+            "ses_1",
+            &[many_option_question()],
+            "/tmp/proj/lib",
+            &[None],
+            &[false],
+        );
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let form = elements
+            .iter()
+            .find(|e| e["tag"] == "form")
+            .expect("overflow question still gets a custom-answer form");
+        assert_eq!(form["name"], "form_0");
+        assert!(form.to_string().contains("form_action_type"));
+    }
+
+    #[test]
+    fn question_card_overflow_custom_disabled_has_no_form() {
+        let mut q = many_option_question();
+        q.custom = Some(false);
+        let card = build_question_card("que_1", "ses_1", &[q], "/tmp/proj/lib", &[None], &[false]);
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert!(
+            elements.iter().any(|e| e["tag"] == "overflow"),
+            "overflow picker still rendered"
+        );
+        assert!(
+            elements.iter().all(|e| e["tag"] != "form"),
+            "custom-disabled overflow question must not get an input form: {}",
+            card
+        );
     }
 
     #[test]
