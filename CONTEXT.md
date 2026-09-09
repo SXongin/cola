@@ -73,6 +73,18 @@ A Feishu topic, identified by `thread_id` (`omt_...`). Retained in code as `Thre
 The single session of a chat/topic that messages route to and that external-message sync follows. Exactly one per ThreadKey at a time (the SessionStore's first entry); `/switch` and `/new` promote a session to active, and cola derives the conversation's current project from it.
 _Avoid_: Current session, latest session, selected session
 
+**Cola-Authored Message**:
+A user message cola itself submitted to the Backend on behalf of a Feishu Chat/Topic, as opposed to an External Message. Self-identifying: cola chooses the message's id (`msg_cola_…`) at send time and the Backend persists that id, so authorship survives a server crash/replacement and even a cola restart without any cola-side ledger. Recognised by the `msg_cola_` id prefix.
+_Avoid_: Outbound message, own prompt (a prompt is the send action, not the stored message)
+
+**External Message**:
+A user message in a Session that cola did NOT author — someone posted it from another Shared Store client (OpenChamber, the CLI). Surfaced to Feishu by the external-message sync, which follows only the Active Session (ADR-0017). The opposite of a Cola-Authored Message.
+_Avoid_: Foreign message, out-of-band message
+
+**Sync Watermark**:
+The external-message poller's per-session record of the newest user message it has already accounted for: anything newer that is not a Cola-Authored Message is an External Message and triggers a notification. Advances past both cola-authored and external messages; cleared when a session stops being the Active Session so a later `/switch` back re-baselines silently. Owned by the poller alone — the prompt path no longer records it (formerly called the "baseline").
+_Avoid_: Baseline (the old name; it implied the prompt path owned it)
+
 **Project**:
 A working directory on the filesystem where OpenCode operates. A property of a session, not of the bot. A conversation's current project is the directory of its active session (derived, never stored separately); `/new` and the bare `/topic` form inherit it and fall back to the default directory only when the conversation has no session. Sessions created outside a conversation still carry their own directory.
 _Avoid_: Workspace, repo
@@ -151,6 +163,7 @@ _Avoid_: Notification, message, signal
 - The **Bridge** receives **Events** from a **Backend** and renders them as **Card** updates on the **Platform**
 - A prompt's **Quoted Context** and **Image Attachment**s enrich the **Session** the reply belongs to
 - A **Command** is parsed by the **Bridge** from message text before routing to the **Backend**
+- Every **Cola-Authored Message** carries a `msg_cola_` id chosen by the **Bridge**; external-message sync treats only user messages newer than the **Sync Watermark** that are NOT **Cola-Authored Message**s as **External Message**s
 
 ## Example dialogue
 

@@ -221,6 +221,15 @@ pub struct MockBackend {
     /// a session has an entry, so tests can script an external message on a
     /// historical (non-active) session while the active one has none.
     pub external_user_messages: std::collections::HashMap<String, String>,
+    /// Per-session cola-authored user messages: simulates cola's OWN prompt
+    /// persisting on the store with a `msg_cola_` id (ADR-0026) — e.g. after a
+    /// server died mid-turn and healed, so the poller sees it as newer than the
+    /// stale watermark. Returned with the newest user-message slot taken, so a
+    /// test can assert cola's own round is never notified as external.
+    pub cola_user_messages: std::collections::HashMap<String, String>,
+    /// Created time of each cola-authored message, captured on first read so it
+    /// stays stable across polls.
+    pub cola_user_created: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
     /// When set, `messages` returns this as the assistant reply to the
     /// external user message (simulates OpenCode answering it), replacing the
     /// default assistant turn. Returned only once `external_reply_ready`
@@ -231,7 +240,7 @@ pub struct MockBackend {
     /// notification card is sent, to simulate the model answering later.
     pub external_reply_ready: Arc<std::sync::atomic::AtomicBool>,
     /// Created time of the external user message, captured on first read so
-    /// it stays stable across polls (the poller's baseline logic must not
+    /// it stays stable across polls (the poller's watermark logic must not
     /// see the same message as "new" every call). A test may bump it via
     /// the `Arc` handle to simulate a SECOND external message arriving.
     pub external_user_created: Arc<std::sync::Mutex<Option<i64>>>,
@@ -259,6 +268,9 @@ pub struct MockBackend {
     pub prompt_variants: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
     /// Records the agent passed to each `prompt` call.
     pub prompt_agents: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
+    /// Records the message_id passed to each `prompt` call (asserts every cola
+    /// prompt carries a `msg_cola_` id and retries reuse it, ADR-0026).
+    pub prompt_message_ids: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
     /// Records every `prompt_async` call's text (asserts supplement path).
     pub prompt_async_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// Records the number of images attached to each `prompt_async` call.
@@ -269,6 +281,9 @@ pub struct MockBackend {
     pub prompt_async_variants: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
     /// Records the agent passed to each `prompt_async` call.
     pub prompt_async_agents: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
+    /// Records the message_id passed to each `prompt_async` call (asserts the
+    /// supplement path carries a `msg_cola_` id, ADR-0026).
+    pub prompt_async_message_ids: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
     /// The session id `create_session` returns.
     pub session_id: String,
     /// When true, `prompt` 404s for any session id other than `session_id`
@@ -304,6 +319,8 @@ impl MockBackend {
             permissions: Vec::new(),
             external_user_message: None,
             external_user_messages: std::collections::HashMap::new(),
+            cola_user_messages: std::collections::HashMap::new(),
+            cola_user_created: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             external_reply_parts: None,
             external_reply_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             external_user_created: Arc::new(std::sync::Mutex::new(None)),
@@ -318,11 +335,13 @@ impl MockBackend {
             prompt_models: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_variants: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_agents: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            prompt_message_ids: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_async_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_async_images: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_async_models: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_async_variants: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_async_agents: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            prompt_async_message_ids: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             session_id: "ses_test".into(),
             stale_session_404: false,
             session_parents: std::collections::HashMap::new(),
@@ -395,9 +414,14 @@ impl opencode::Backend for MockBackend {
         _model: Option<&opencode::client::ModelInfo>,
         variant: Option<&str>,
         agent: Option<&str>,
+        message_id: Option<&str>,
     ) -> crate::error::Result<opencode::client::PromptResponse> {
         self.prompt_calls.lock().await.push(text.to_string());
         self.prompt_images.lock().await.push(images.len());
+        self.prompt_message_ids
+            .lock()
+            .await
+            .push(message_id.map(|s| s.to_string()));
         self.prompt_models
             .lock()
             .await
@@ -438,12 +462,17 @@ impl opencode::Backend for MockBackend {
         _model: Option<&opencode::client::ModelInfo>,
         variant: Option<&str>,
         agent: Option<&str>,
+        message_id: Option<&str>,
     ) -> crate::error::Result<()> {
         self.prompt_async_calls
             .lock()
             .await
             .push(format!("{}:{}", session_id, text));
         self.prompt_async_images.lock().await.push(images.len());
+        self.prompt_async_message_ids
+            .lock()
+            .await
+            .push(message_id.map(|s| s.to_string()));
         self.prompt_async_models
             .lock()
             .await
@@ -464,6 +493,30 @@ impl opencode::Backend for MockBackend {
         _session_id: &str,
     ) -> crate::error::Result<Vec<opencode::client::SessionMessage>> {
         let now = chrono::Utc::now().timestamp_millis();
+        let mut msgs: Vec<opencode::client::SessionMessage> = Vec::new();
+        // cola's OWN user message persisting on the store (ADR-0026): id starts
+        // with `msg_cola_`, created time stable across polls. Simulates a prompt
+        // cola sent that the poller must recognise as cola-authored even when it
+        // surfaces AFTER a stale watermark (server died mid-turn then healed).
+        if let Some(cola_text) = self.cola_user_messages.get(_session_id) {
+            let created = {
+                let mut map = self.cola_user_created.lock().unwrap();
+                *map.entry(_session_id.to_string())
+                    .or_insert_with(|| chrono::Utc::now().timestamp_millis())
+            };
+            msgs.push(opencode::client::SessionMessage {
+                info: opencode::client::MessageInfo {
+                    id: "msg_cola_mock_user".into(),
+                    role: Some("user".into()),
+                    parent_id: None,
+                    time: Some(opencode::client::MessageTime { created }),
+                    model_id: None,
+                    provider_id: None,
+                    tokens: None,
+                },
+                parts: serde_json::json!([{ "type": "text", "text": cola_text }]),
+            });
+        }
         // When set, simulate a user message posted by ANOTHER client (e.g.
         // OpenChamber), for the external-message poller tests. If an AI
         // reply is also set (and `external_reply_ready` has flipped), return
@@ -481,7 +534,15 @@ impl opencode::Backend for MockBackend {
                 let mut slot = self.external_user_created.lock().unwrap();
                 *slot.get_or_insert_with(|| chrono::Utc::now().timestamp_millis())
             };
-            let mut msgs = vec![opencode::client::SessionMessage {
+            // If cola's own message is also present, guarantee the external one
+            // is NEWEST — it was posted after cola's (the heal scenario).
+            let created = {
+                let map = self.cola_user_created.lock().unwrap();
+                map.get(_session_id)
+                    .map(|c| created.max(c + 1000))
+                    .unwrap_or(created)
+            };
+            msgs.push(opencode::client::SessionMessage {
                 info: opencode::client::MessageInfo {
                     id: "msg_ext_user".into(),
                     role: Some("user".into()),
@@ -492,7 +553,7 @@ impl opencode::Backend for MockBackend {
                     tokens: None,
                 },
                 parts: serde_json::json!([{ "type": "text", "text": text }]),
-            }];
+            });
             if self
                 .external_reply_ready
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -513,6 +574,11 @@ impl opencode::Backend for MockBackend {
                     parts: parts.clone(),
                 });
             }
+            return Ok(msgs);
+        }
+        // No cola-authored or external user message modeled: return only the
+        // assistant side of cola's own turn (the default rendering path).
+        if !msgs.is_empty() {
             return Ok(msgs);
         }
         Ok(vec![opencode::client::SessionMessage {
@@ -806,6 +872,7 @@ pub(crate) mod integration_tests {
         mock.fail_prompt_count
             .store(1, std::sync::atomic::Ordering::SeqCst);
         let prompt_calls = mock.prompt_calls.clone();
+        let prompt_ids = mock.prompt_message_ids.clone();
         let backend = Arc::new(mock);
         let platform = Arc::new(RecordingPlatform::new());
         let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
@@ -879,6 +946,22 @@ pub(crate) mod integration_tests {
 
         let backend_calls = prompt_calls.lock().await.clone();
         assert_eq!(backend_calls, vec!["hi".to_string(), "hi".to_string()]);
+        // Both attempts are the SAME logical user message: a fresh `msg_cola_`
+        // id on the first send, REUSED by the retry (ADR-0026) so the server
+        // deduplicates instead of appending a second user message.
+        let message_ids = prompt_ids.lock().await.clone();
+        assert_eq!(message_ids.len(), 2, "two prompt attempts expected");
+        let first = message_ids[0].clone().expect("prompt must carry a message id");
+        assert!(
+            first.starts_with("msg_cola_"),
+            "cola prompt must self-identify: {}",
+            first
+        );
+        assert_eq!(
+            message_ids[1].as_deref(),
+            Some(first.as_str()),
+            "retry must reuse the failed attempt's message id"
+        );
     }
 
     #[tokio::test]
@@ -1826,12 +1909,12 @@ pub(crate) mod integration_tests {
             store.persist().unwrap();
         }
         // Baseline: a minute ago, so the fresh user message is "new".
-        let baseline = chrono::Utc::now().timestamp_millis() - 60_000;
+        let watermark = chrono::Utc::now().timestamp_millis() - 60_000;
         app.external
             .last_user_msg_epoch
             .lock()
             .await
-            .insert("ses_ext".into(), baseline);
+            .insert("ses_ext".into(), watermark);
 
         app.external
             .poll_interval_ms
@@ -1859,9 +1942,151 @@ pub(crate) mod integration_tests {
         );
     }
 
+    /// ADR-0026 regression (observed 2026-09-09): when a server dies mid-turn and
+    /// cola heals by starting its own server on the same store, cola's OWN
+    /// persisted user message (`msg_cola_` id) surfaces as newer than the stale
+    /// Sync Watermark. It must NOT be re-notified into Feishu as an external
+    /// message — authorship is carried by the id prefix, not by the watermark.
+    #[tokio::test]
+    async fn cola_own_message_after_heal_is_never_notified_external() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut mock = MockBackend::new(realistic_parts());
+        // cola's own prompt persisted on the store before the crash (a
+        // `msg_cola_` id, exactly what the real server echoes back).
+        mock.cola_user_messages.insert(
+            "ses_ext".into(),
+            "可以把我本地的 openchamber serve 杀掉吗？".to_string(),
+        );
+        let (app, platform) = build_app(cfg, mock).await;
+
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
+                session_id: "ses_ext".into(),
+                directory: "/tmp/ext".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+                topic_root: None,
+                variant: None,
+            });
+            store.persist().unwrap();
+        }
+        // Stale watermark: the old run_prompt-era epoch predates the message the
+        // dying server actually persisted — the exact state that caused the bug.
+        let stale = chrono::Utc::now().timestamp_millis() - 60_000;
+        app.external
+            .last_user_msg_epoch
+            .lock()
+            .await
+            .insert("ses_ext".into(), stale);
+
+        app.external
+            .poll_interval_ms
+            .store(50, std::sync::atomic::Ordering::Relaxed);
+        tokio::spawn({
+            let app = app.clone();
+            async move {
+                let _ = app.external.poll_loop(&app.core).await;
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // No external-message card: cola's own round is recognised, not echoed.
+        let calls = platform.calls.lock().await.clone();
+        assert!(
+            !calls.iter().any(|c| match c {
+                PlatformCall::SendCard { card, .. } | PlatformCall::ReplyCard { card, .. } => {
+                    card.to_string().contains("有新消息")
+                }
+                _ => false,
+            }),
+            "cola's own message must never be notified as external: {calls:?}"
+        );
+        // The watermark advanced PAST cola's message (so a later genuine
+        // external message is still detected).
+        let watermark = app
+            .external
+            .last_user_msg_epoch
+            .lock()
+            .await
+            .get("ses_ext")
+            .copied();
+        assert!(
+            watermark.is_some_and(|w| w > stale),
+            "watermark should advance over cola's own message: {watermark:?}"
+        );
+    }
+
+    /// ADR-0026: a GENUINE external message posted AFTER cola's own (the heal
+    /// scenario) is still notified — recognising cola's authorship must not
+    /// swallow real OpenChamber traffic.
+    #[tokio::test]
+    async fn newer_external_message_after_cola_own_still_notifies() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut mock = MockBackend::new(realistic_parts());
+        mock.cola_user_messages
+            .insert("ses_ext".into(), "cola 自己的一轮".to_string());
+        mock.external_user_message = Some("OpenChamber 后来发的消息".to_string());
+        let (app, platform) = build_app(cfg, mock).await;
+
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
+                session_id: "ses_ext".into(),
+                directory: "/tmp/ext".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+                topic_root: None,
+                variant: None,
+            });
+            store.persist().unwrap();
+        }
+        let stale = chrono::Utc::now().timestamp_millis() - 60_000;
+        app.external
+            .last_user_msg_epoch
+            .lock()
+            .await
+            .insert("ses_ext".into(), stale);
+
+        app.external
+            .poll_interval_ms
+            .store(50, std::sync::atomic::Ordering::Relaxed);
+        tokio::spawn({
+            let app = app.clone();
+            async move {
+                let _ = app.external.poll_loop(&app.core).await;
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let calls = platform.calls.lock().await.clone();
+        let notify = calls.iter().find_map(|c| match c {
+            PlatformCall::SendCard { card, .. } if card.to_string().contains("有新消息") => {
+                Some(card.clone())
+            }
+            _ => None,
+        });
+        let notify = notify.expect("the genuine external message should be notified");
+        assert!(
+            notify.to_string().contains("OpenChamber 后来发的消息"),
+            "notification should preview the external message: {}",
+            notify
+        );
+    }
+
     /// ADR-0017: an external message on a HISTORICAL (non-active) lobby session
     /// must NOT be notified into the chat — only the thread's active session is
-    /// synced. Its baseline is also cleared so a later /switch back re-baselines.
+    /// synced. Its watermark is also cleared so a later /switch back re-syncs.
     #[tokio::test]
     async fn external_message_to_historical_session_is_not_notified() {
         let _wd = test_work_dir();
@@ -1909,18 +2134,18 @@ pub(crate) mod integration_tests {
             app.sessions.lock().await.get_active(&key).unwrap().session_id,
             "ses_active"
         );
-        // Both sessions have a baseline from before the external message.
-        let baseline = chrono::Utc::now().timestamp_millis() - 60_000;
+        // Both sessions have a watermark from before the external message.
+        let watermark = chrono::Utc::now().timestamp_millis() - 60_000;
         app.external
             .last_user_msg_epoch
             .lock()
             .await
-            .insert("ses_active".into(), baseline);
+            .insert("ses_active".into(), watermark);
         app.external
             .last_user_msg_epoch
             .lock()
             .await
-            .insert("ses_historical".into(), baseline);
+            .insert("ses_historical".into(), watermark);
 
         app.external
             .poll_interval_ms
@@ -1945,7 +2170,7 @@ pub(crate) mod integration_tests {
             }),
             "historical session external message must NOT be notified: {calls:?}"
         );
-        // The historical session's baseline was cleared (ready to re-baseline
+        // The historical session's watermark was cleared (ready to re-sync
         // silently when it becomes active again).
         assert!(
             !app.external
@@ -1953,15 +2178,15 @@ pub(crate) mod integration_tests {
                 .lock()
                 .await
                 .contains_key("ses_historical"),
-            "historical session baseline should be cleared"
+            "historical session watermark should be cleared"
         );
     }
 
     /// ADR-0017: switching back to a historical session makes it the active one
-    /// and re-baselines SILENTLY — external messages received while it was
+    /// and re-syncs SILENTLY — external messages received while it was
     /// inactive are marked read, not replayed as a stale notification.
     #[tokio::test]
-    async fn reactivated_session_rebaselines_silently() {
+    async fn reactivated_session_resyncs_silently() {
         let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
@@ -2005,16 +2230,16 @@ pub(crate) mod integration_tests {
             app.sessions.lock().await.get_active(&key).unwrap().session_id,
             "ses_old"
         );
-        // While ses_old was historical, the poller cleared its baseline (see the
+        // While ses_old was historical, the poller cleared its watermark (see the
         // test above). So on the first poll after reactivation the map has NO
-        // entry for it → first-observation path → silent re-baseline, no notify.
+        // entry for it → first-observation path → silent re-sync, no notify.
         assert!(
             !app.external
                 .last_user_msg_epoch
                 .lock()
                 .await
                 .contains_key("ses_old"),
-            "precondition: baseline was cleared while inactive"
+            "precondition: watermark was cleared while inactive"
         );
 
         app.external
@@ -2029,7 +2254,7 @@ pub(crate) mod integration_tests {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         // No notification: the external message was marked read on first
-        // observation (silent re-baseline), not replayed as stale.
+        // observation (silent re-sync), not replayed as stale.
         let calls = platform.calls.lock().await.clone();
         assert!(
             !calls.iter().any(|c| match c {
@@ -2038,16 +2263,16 @@ pub(crate) mod integration_tests {
                 }
                 _ => false,
             }),
-            "reactivated session must re-baseline silently, no notification: {calls:?}"
+            "reactivated session must re-sync silently, no notification: {calls:?}"
         );
-        // The baseline is now recorded for the reactivated session.
+        // The watermark is now recorded for the reactivated session.
         assert!(
             app.external
                 .last_user_msg_epoch
                 .lock()
                 .await
                 .contains_key("ses_old"),
-            "reactivated session should have a recorded baseline"
+            "reactivated session should have a recorded watermark"
         );
     }
 
@@ -2083,12 +2308,12 @@ pub(crate) mod integration_tests {
             });
             store.persist().unwrap();
         }
-        let baseline = chrono::Utc::now().timestamp_millis() - 60_000;
+        let watermark = chrono::Utc::now().timestamp_millis() - 60_000;
         app.external
             .last_user_msg_epoch
             .lock()
             .await
-            .insert("ses_ext".into(), baseline);
+            .insert("ses_ext".into(), watermark);
         app.external
             .poll_interval_ms
             .store(50, std::sync::atomic::Ordering::Relaxed);
@@ -2158,7 +2383,7 @@ pub(crate) mod integration_tests {
             });
             store.persist().unwrap();
         }
-        let baseline = chrono::Utc::now().timestamp_millis() - 60_000;
+        let watermark = chrono::Utc::now().timestamp_millis() - 60_000;
         app.external
             .poll_interval_ms
             .store(50, std::sync::atomic::Ordering::Relaxed);
@@ -2166,7 +2391,7 @@ pub(crate) mod integration_tests {
             .last_user_msg_epoch
             .lock()
             .await
-            .insert("ses_ext".into(), baseline);
+            .insert("ses_ext".into(), watermark);
 
         tokio::spawn({
             let app = app.clone();
@@ -2359,12 +2584,12 @@ pub(crate) mod integration_tests {
         app.external
             .render_timeout_ms
             .store(20, std::sync::atomic::Ordering::Relaxed);
-        let baseline = chrono::Utc::now().timestamp_millis() - 60_000;
+        let watermark = chrono::Utc::now().timestamp_millis() - 60_000;
         app.external
             .last_user_msg_epoch
             .lock()
             .await
-            .insert("ses_ext".into(), baseline);
+            .insert("ses_ext".into(), watermark);
 
         // The poll loop detects the external message, sends the notification,
         // arms the renderer with the REAL message epoch, and the renderer
@@ -5635,6 +5860,7 @@ pub(crate) mod integration_tests {
         let cfg = test_config(&dir.path().join("sessions.json"));
         let backend = MockBackend::new(realistic_parts());
         let sup_calls = backend.prompt_async_calls.clone();
+        let sup_ids = backend.prompt_async_message_ids.clone();
         let (app, platform) = build_app(cfg, backend).await;
         {
             let mut store = app.sessions.lock().await;
@@ -5669,6 +5895,15 @@ pub(crate) mod integration_tests {
             calls.iter().any(|c| c.contains("补充一下，改用方案 B")),
             "supplement text must be sent via prompt_async: {:?}",
             calls
+        );
+        // The supplement is a cola-authored message: fresh `msg_cola_` id
+        // (ADR-0026).
+        let ids = sup_ids.lock().await.clone();
+        assert!(
+            ids.iter()
+                .all(|id| id.as_deref().is_some_and(|i| i.starts_with("msg_cola_"))),
+            "every supplement must self-identify as cola-authored: {:?}",
+            ids
         );
 
         // NO Loading card / run_prompt was started for the supplement message.

@@ -49,6 +49,11 @@ struct PromptContext {
     existing_card_id: Option<String>,
     requester_open_id: Option<String>,
     is_group: bool,
+    /// The id cola assigned to this turn's user message (`msg_cola_…`,
+    /// ADR-0026). Set when this run re-submits a previous attempt (error-card
+    /// retry) so the server deduplicates by id; None means a fresh message,
+    /// and run_prompt generates a new id.
+    cola_message_id: Option<String>,
     /// Downloaded images attached to this turn (Image Attachments).
     images: Vec<crate::feishu::client::ImageAttachment>,
 }
@@ -416,6 +421,9 @@ impl App {
             let busy = self.inflight.lock().await.contains(&session_id);
             if busy {
                 let image_inputs = image_inputs(&images);
+                // Each supplement is its own logical user message: fresh
+                // cola-authored id (ADR-0026), never reused.
+                let cola_msg_id = crate::opencode::client::cola_message_id();
                 match self
                     .opencode
                     .prompt_async(
@@ -425,6 +433,7 @@ impl App {
                         self.session_model_override(&session_id).await.as_ref(),
                         self.session_variant_override(&session_id).await.as_deref(),
                         self.session_agent_override(&session_id).await.as_deref(),
+                        Some(&cola_msg_id),
                     )
                     .await
                 {
@@ -464,6 +473,7 @@ impl App {
             existing_card_id: None,
             requester_open_id,
             is_group,
+            cola_message_id: None,
             images,
         })
         .await
@@ -483,8 +493,13 @@ impl App {
             existing_card_id,
             requester_open_id,
             is_group,
+            cola_message_id,
             images,
         } = ctx;
+        // This logical user message keeps ONE id across every attempt of this
+        // turn (ADR-0026): a retry carries the previous attempt's id so the
+        // server deduplicates; a fresh message generates a new one.
+        let cola_message_id = cola_message_id.unwrap_or_else(crate::opencode::client::cola_message_id);
         // Serialize prompts per session: if one is already in flight, don't let
         // a second message overwrite its accumulator (the two would race on the
         // same card). Reply with a notice only when we own a fresh message.
@@ -533,6 +548,9 @@ impl App {
             acc.reply_to_message_id = Some(message_id);
             acc.session_id = Some(session_id.clone());
             acc.submit_epoch_ms = Some(epoch_ms);
+            // The id this turn's user message carries, so a later retry reuses
+            // it (ADR-0026) — the server deduplicates by id.
+            acc.cola_message_id = Some(cola_message_id.clone());
             // Full original prompt, so the error-card "retry" can re-submit it.
             acc.prompt = Some(text.clone());
             acc.requester_open_id = requester_open_id;
@@ -569,6 +587,7 @@ impl App {
                 self.session_model_override(&session_id).await.as_ref(),
                 turn_variant.as_deref(),
                 self.session_agent_override(&session_id).await.as_deref(),
+                Some(&cola_message_id),
             )
             .await;
 
@@ -648,6 +667,7 @@ impl App {
                     self.session_model_override(&session_id).await.as_ref(),
                     self.session_variant_override(&session_id).await.as_deref(),
                     self.session_agent_override(&session_id).await.as_deref(),
+                    Some(&cola_message_id),
                 )
                 .await;
             done2.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -755,21 +775,11 @@ impl App {
             }
         }
 
-        // Baseline for the external-message poller: the newest user message cola
-        // itself created (or the submit epoch). Anything newer than this later
-        // is from another shared-store client (e.g. OpenChamber).
-        let baseline = final_msgs
-            .as_ref()
-            .map(|msgs| {
-                msgs.iter()
-                    .filter(|m| m.info.role.as_deref() == Some("user"))
-                    .filter_map(|m| m.info.time.as_ref().map(|t| t.created))
-                    .max()
-                    .unwrap_or(epoch_ms)
-            })
-            .unwrap_or(epoch_ms)
-            .max(epoch_ms);
-        self.external.record_prompt_baseline(&session_id, baseline).await;
+        // No external-sync baseline is recorded here (ADR-0026): authorship is
+        // carried by this turn's `msg_cola_` message id, and the external-message
+        // poller alone owns the Sync Watermark, so a failed/errored turn can no
+        // longer leave a stale watermark that makes cola's own message look
+        // external after a server heal.
 
         // Group completion notice: the streaming card is patched in place, which
         // pushes no new notification — so reply to the requester's message so
@@ -1598,6 +1608,7 @@ impl App {
                     c.acc.title.clone(),
                     c.acc.requester_open_id.clone(),
                     c.acc.is_group,
+                    c.acc.cola_message_id.clone(),
                 )
             })
         };
@@ -1607,7 +1618,7 @@ impl App {
         };
         let thread_key = self.sessions.lock().await.thread_for_session(&sid);
         if !inflight
-            && let Some((text, reply_to, subtitle, requester, is_group)) = ctx
+            && let Some((text, reply_to, subtitle, requester, is_group, cola_message_id)) = ctx
             && !text.is_empty()
             && let Some(card_id) = card_id
             && let Some(thread_key) = thread_key
@@ -1624,6 +1635,10 @@ impl App {
                         existing_card_id: Some(card_id),
                         requester_open_id: requester,
                         is_group,
+                        // Reuse the failed attempt's id so the server
+                        // deduplicates — the retry is the same logical user
+                        // message (ADR-0026).
+                        cola_message_id,
                         images: Vec::new(),
                     })
                     .await
