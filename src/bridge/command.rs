@@ -1383,7 +1383,9 @@ async fn send_help_card(core: &Arc<SharedCore>, message_id: &str) -> crate::erro
 /// `/switch <keyword>` — switch within the thread first, then adopt a unique
 /// global match (ADR-0008). Resolution order:
 /// 1. Current thread's mapped sessions (matched by title/directory/id);
-///    a unique hit switches without changing the mapping.
+///    a unique hit switches without changing the mapping. The re-switch ack
+///    is a Session Snapshot card (已切换) unless the suppression predicate
+///    says there is nothing to report (ADR-0028).
 /// 2. Global store search (sub-task children excluded); a unique hit adopts
 ///    into the current thread and becomes active.
 /// 3. Multiple hits: list up to 8 candidates and point at `/attach`.
@@ -1412,19 +1414,39 @@ async fn handle_switch(
         .collect();
     if thread_hits.len() == 1 {
         let hit = thread_hits[0];
-        let mut store = core.sessions.lock().await;
-        if let Some(entry) = store
-            .list_thread(thread_key)
-            .into_iter()
-            .find(|e| e.session_id == hit.id)
-            .cloned()
         {
-            store.set_active(entry);
-            store.persist()?;
+            let mut store = core.sessions.lock().await;
+            if let Some(entry) = store
+                .list_thread(thread_key)
+                .into_iter()
+                .find(|e| e.session_id == hit.id)
+                .cloned()
+            {
+                store.set_active(entry);
+                store.persist()?;
+            }
         }
-        core.feishu
-            .reply_text(message_id, &format!("Switched to \"{}\".", hit.title))
-            .await?;
+        // ADR-0028 suppression: re-activating a session already mapped to
+        // this thread reports a snapshot only when there is content to show —
+        // busy/retry, a pending request, or an external newest message. An
+        // idle, pending-free, cola-authored session keeps today's one-line
+        // text ack (its recent life is already visible in this thread). The
+        // `already_mapped` input is true by construction: the hit came from
+        // this thread's mapped-session list.
+        let data = crate::bridge::snapshot::gather_snapshot(&core.opencode, &hit.id, &hit.directory).await;
+        if crate::bridge::snapshot::should_emit_snapshot(
+            true,
+            data.status,
+            data.has_pending(),
+            data.newest_user_is_cola_authored,
+        ) {
+            let card = snapshot_card_for(core, "切换", hit).await;
+            core.feishu.reply_card(message_id, &card).await?;
+        } else {
+            core.feishu
+                .reply_text(message_id, &format!("Switched to \"{}\".", hit.title))
+                .await?;
+        }
         return Ok(());
     }
     if thread_hits.len() > 1 {
@@ -1719,18 +1741,34 @@ async fn handle_topic_adopt(
     }
 }
 
+/// The reply hint seeded as a fresh topic's first in-topic message
+/// (ADR-0023): it tells the user where to reply. Fresh-session topics
+/// (`/topic`, the `/dir` card's 建话题 op) seed with this text; adopted
+/// sessions seed with their Session Snapshot card instead (ADR-0028).
+const TOPIC_REPLY_HINT: &str = "请在本话题内回复，即可和这个会话对话。";
+
+/// What a newly created topic's FIRST in-topic message carries. That message
+/// is also the persisted `topic_anchor` (fallback-card routing, ADR-0006).
+enum TopicSeed {
+    /// The reply hint text — fresh sessions created around a new session.
+    ReplyHint,
+    /// The adopted session's Session Snapshot card (ADR-0028) — `/topic
+    /// --adopt` and the switch card's 建话题接管 op.
+    Snapshot(serde_json::Value),
+}
+
 /// Wrap an ALREADY-CREATED session in a brand-new Feishu topic: send the cover
 /// card to the chat's top level and anchor the thread on it (ADR-0023), then
-/// map the session to the new topic's `ThreadKey` with the in-topic
-/// confirmation as the fallback-card anchor (ADR-0006), and record the cover
-/// title. `display_title` is what the cover shows until the server
-/// auto-generates a real title (ADR-0007: `/new`-style sessions are unnamed at
-/// creation, so callers pass the directory basename or the user-given name).
-/// Returns the new topic's `thread_id`, or `None` when the platform returns no
-/// thread_id (the caller reports that to the user). Shared by the text
-/// `/topic` form, `/topic --adopt` (via [`create_topic_and_map_adopted`]) and
-/// the `/dir` card's "建话题" op (ADR-0025), so the cover/anchor/mapping
-/// behavior cannot drift between the topic-creation surfaces.
+/// map the session to the new topic's `ThreadKey` with the seed message as the
+/// in-topic anchor (ADR-0006/ADR-0028), and record the cover title.
+/// `display_title` is what the cover shows until the server auto-generates a
+/// real title (ADR-0007: `/new`-style sessions are unnamed at creation, so
+/// callers pass the directory basename or the user-given name). Returns the
+/// new topic's `thread_id`, or `None` when the platform returns no thread_id
+/// (the caller reports that to the user). Shared by the text `/topic` form,
+/// `/topic --adopt` (via [`create_topic_and_map_adopted`]) and the `/dir`
+/// card's "建话题" op (ADR-0025), so the cover/anchor/mapping behavior cannot
+/// drift between the topic-creation surfaces.
 // `too-many-arguments` accepted like `picker_card`: every knob is a first-class
 // topic-creation axis, and the callers are the three topic surfaces this
 // helper exists to keep in lockstep.
@@ -1745,6 +1783,34 @@ pub(crate) async fn open_topic_for_session(
     agent: Option<String>,
     model: Option<String>,
 ) -> crate::error::Result<Option<String>> {
+    open_topic_seeded(
+        core,
+        chat_id,
+        fallback_root,
+        session_id,
+        directory,
+        display_title,
+        agent,
+        model,
+        TopicSeed::ReplyHint,
+    )
+    .await
+}
+
+/// The shared body of [`open_topic_for_session`], parameterised by what the
+/// new topic's first in-topic message (its anchor) carries.
+#[allow(clippy::too_many_arguments)]
+async fn open_topic_seeded(
+    core: &Arc<SharedCore>,
+    chat_id: &str,
+    fallback_root: &str,
+    session_id: &str,
+    directory: String,
+    display_title: String,
+    agent: Option<String>,
+    model: Option<String>,
+    seed: TopicSeed,
+) -> crate::error::Result<Option<String>> {
     let cover_text = topic_cover_text(
         &display_title,
         &directory,
@@ -1754,7 +1820,7 @@ pub(crate) async fn open_topic_for_session(
     )
     .await;
     let (anchor, thread_id, topic_root, cover_id) =
-        open_cover_topic(core, chat_id, fallback_root, &cover_text).await?;
+        open_cover_topic(core, chat_id, fallback_root, &cover_text, seed).await?;
     let Some(thread_id) = thread_id else {
         tracing::warn!(
             "topic: no thread_id returned in chat {} for session {}; not mapping session",
@@ -1785,19 +1851,23 @@ pub(crate) async fn open_topic_for_session(
     Ok(Some(thread_id))
 }
 
-/// Create a real Feishu topic anchored on `message_id` via `reply_in_thread`
-/// (ADR-0006), then map the adopted `info` session to the NEW topic's
-/// `ThreadKey` with the in-topic confirmation as the fallback-card anchor.
-/// Returns the new topic's `thread_id`, or `None` when the platform returns no
-/// thread_id (the caller decides the message). Shared by the text `/topic
-/// --adopt` form and the switch card's "建话题接管" op (ADR-0016).
+/// Create a real Feishu topic around an ADOPTED session: the Topic Cover Card
+/// stays the root in the main chat; the session's Session Snapshot card
+/// (ADR-0028) is the first bot message INSIDE the new topic and the persisted
+/// anchor — replacing the reply-hint seed of fresh-session topics. The
+/// snapshot is gathered BEFORE the topic mapping is written, so it reflects
+/// the session's pre-adoption state. Returns the new topic's `thread_id`, or
+/// `None` when the platform returns no thread_id (the caller decides the
+/// message). Shared by the text `/topic --adopt` form and the switch card's
+/// "建话题接管" op (ADR-0016).
 pub(crate) async fn create_topic_and_map_adopted(
     core: &Arc<SharedCore>,
     thread_key: &ThreadKey,
     info: &crate::opencode::SessionListInfo,
     message_id: &str,
 ) -> crate::error::Result<Option<String>> {
-    open_topic_for_session(
+    let card = snapshot_card_for(core, "接管", info).await;
+    open_topic_seeded(
         core,
         &thread_key.chat_id,
         message_id,
@@ -1806,8 +1876,22 @@ pub(crate) async fn create_topic_and_map_adopted(
         info.title.clone(),
         info.agent.clone(),
         model_display(info.model.as_ref()),
+        TopicSeed::Snapshot(card),
     )
     .await
+}
+
+/// ADR-0028: gather an adopted session's snapshot data (status, adopt-time
+/// pendings, transcript tail) from server reads and build its card with the
+/// given takeover verb (接管/切换). Shared by every adoption surface so the
+/// gather-before-mapping sequence cannot drift between them.
+async fn snapshot_card_for(
+    core: &Arc<SharedCore>,
+    verb: &str,
+    info: &crate::opencode::SessionListInfo,
+) -> serde_json::Value {
+    let data = crate::bridge::snapshot::gather_snapshot(&core.opencode, &info.id, &info.directory).await;
+    crate::feishu::snapshot_card::build_snapshot_card(verb, &info.title, &data)
 }
 
 /// Adopt a server session as the current thread's session, honoring the
@@ -1815,8 +1899,10 @@ pub(crate) async fn create_topic_and_map_adopted(
 /// → idempotent no-op. Mapped to another thread → rejected with an
 /// actionable card unless `--force` (which steals the mapping). Copies
 /// `directory` + `agent` from the server; `auto_accept` resets to false.
-/// In a never-had-a-session topic, the fallback-card anchor is the
-/// command's own reply inside the topic (`reply_in_thread`, ADR-0006).
+/// The adoption confirmation is the Session Snapshot card (ADR-0028): in a
+/// never-had-a-session topic it is sent inside the topic and doubles as the
+/// fallback-card anchor (`reply_card_in_thread`, ADR-0006); in the lobby it
+/// is the reply replacing the old 「已接管…」 text.
 async fn adopt_session(
     core: &Arc<SharedCore>,
     thread_key: &ThreadKey,
@@ -1879,18 +1965,21 @@ async fn adopt_session(
         store.persist()?;
     }
 
+    // ADR-0028: every adoption ends in exactly ONE Session Snapshot card
+    // (replacing the old 「已接管…」 texts) — never a card plus a text, never
+    // nothing. Gathered BEFORE the mapping write below, so the card reflects
+    // the session's pre-adoption state; each field is best-effort, so a read
+    // failure degrades that field rather than blocking the adoption.
+    let card = snapshot_card_for(core, "接管", info).await;
+
     let anchor = if kind == ConversationKind::Topic {
-        match core
-            .feishu
-            .reply_in_thread(
-                message_id,
-                &format!("📎 已接管会话 `{}`（目录 `{}`）。", info.title, info.directory),
-            )
-            .await
-        {
+        // The snapshot is sent inside the topic and doubles as the fallback-card
+        // anchor (ADR-0023): permission/question cards reply to it and land
+        // inside the topic. Its message id is persisted as `topic_anchor`.
+        match core.feishu.reply_card_in_thread(message_id, &card).await {
             Ok((anchor, _)) => Some(anchor),
             Err(e) => {
-                tracing::warn!("attach: reply_in_thread failed: {}", e);
+                tracing::warn!("attach: snapshot in-thread send failed: {}", e);
                 None
             }
         }
@@ -1914,16 +2003,10 @@ async fn adopt_session(
         store.persist()?;
     }
     core.invalidate_session_list_cache().await;
-    // In a topic the confirmation was already sent inside it (the
-    // `reply_in_thread` above doubles as the fallback-card anchor); don't
-    // reply twice.
+    // In a topic the snapshot was already sent inside it (the in-thread send
+    // above); don't reply twice.
     if kind != ConversationKind::Topic {
-        core.feishu
-            .reply_text(
-                message_id,
-                &format!("已接管会话 `{}`（目录 `{}`）。", info.title, info.directory),
-            )
-            .await?;
+        core.feishu.reply_card(message_id, &card).await?;
     }
     Ok(())
 }
@@ -1982,22 +2065,25 @@ async fn send_topic_cover(core: &Arc<SharedCore>, chat_id: &str, text: &str) -> 
 /// ADR-0023: open a topic whose root is the topic cover card — the session
 /// brief sent to the chat's top level, so the chat-list topic entry shows it
 /// permanently. Best-effort: when the cover send fails, the thread anchors on
-/// `fallback_root` (the user's command message) instead. Returns the created
-/// reply's message id (the in-topic anchor), the new thread_id, the root
-/// message id (`topic_root`), and the cover id (`None` on fallback). Shared by
-/// `/topic` and `/topic --adopt`.
+/// `fallback_root` (the user's command message) instead. The topic's FIRST
+/// in-topic message is `seed` (the reply hint for fresh sessions, the Session
+/// Snapshot card for adopted ones, ADR-0028) and becomes the in-topic anchor.
+/// Returns the created reply's message id (the anchor), the new thread_id, the
+/// root message id (`topic_root`), and the cover id (`None` on fallback).
+/// Shared by `/topic` and `/topic --adopt`.
 async fn open_cover_topic(
     core: &Arc<SharedCore>,
     chat_id: &str,
     fallback_root: &str,
     cover_text: &str,
+    seed: TopicSeed,
 ) -> crate::error::Result<(String, Option<String>, String, Option<String>)> {
     let cover_id = send_topic_cover(core, chat_id, cover_text).await;
     let root = cover_id.clone().unwrap_or_else(|| fallback_root.to_string());
-    let (anchor, thread_id) = core
-        .feishu
-        .reply_in_thread(&root, "请在本话题内回复，即可和这个会话对话。")
-        .await?;
+    let (anchor, thread_id) = match seed {
+        TopicSeed::ReplyHint => core.feishu.reply_in_thread(&root, TOPIC_REPLY_HINT).await?,
+        TopicSeed::Snapshot(card) => core.feishu.reply_card_in_thread(&root, &card).await?,
+    };
     Ok((anchor, thread_id, root, cover_id))
 }
 

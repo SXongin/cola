@@ -33,6 +33,11 @@ pub enum PlatformCall {
         text: String,
         thread_id: Option<String>,
     },
+    ReplyCardInThread {
+        message_id: String,
+        card: serde_json::Value,
+        thread_id: Option<String>,
+    },
     CompletionNotice {
         reply_to: String,
         open_id: String,
@@ -133,6 +138,23 @@ impl feishu::Platform for RecordingPlatform {
             thread_id: thread_id.clone(),
         });
         // The mock's created topic-reply message id becomes the anchor.
+        Ok(("msg_topic_reply".into(), thread_id))
+    }
+
+    async fn reply_card_in_thread(
+        &self,
+        message_id: &str,
+        card: &serde_json::Value,
+    ) -> crate::error::Result<(String, Option<String>)> {
+        let thread_id = self.reply_in_thread_thread_id.clone();
+        self.calls.lock().await.push(PlatformCall::ReplyCardInThread {
+            message_id: message_id.into(),
+            card: card.clone(),
+            thread_id: thread_id.clone(),
+        });
+        // The mock's created topic-reply message id becomes the anchor (same
+        // id as the text reply_in_thread, so topic-adopt tests asserting the
+        // anchor id pass for both seed kinds).
         Ok(("msg_topic_reply".into(), thread_id))
     }
 
@@ -3766,18 +3788,35 @@ pub(crate) mod integration_tests {
         .await
         .unwrap();
 
-        // The topic is created via a cover card sent to the chat, then
-        // reply_in_thread on that card (ADR-0023); the mock cover returns "msg_sent".
+        // The topic is created via a cover card sent to the chat, then the
+        // Session Snapshot card replied in-thread on that card (ADR-0023 +
+        // ADR-0028): the cover stays the chat-list root, the snapshot is the
+        // topic's first in-topic message and its anchor. The mock cover
+        // returns "msg_sent".
         let calls = platform.calls.lock().await.clone();
+        let seed_card = calls
+            .iter()
+            .find_map(|c| match c {
+                PlatformCall::ReplyCardInThread { message_id, card, .. } if message_id == "msg_sent" => {
+                    Some(card.to_string())
+                }
+                _ => None,
+            })
+            .expect("expected the snapshot card replied in-thread on the cover card, got {calls:?}");
         assert!(
-            calls.iter().any(
-                |c| matches!(c, PlatformCall::ReplyInThread { message_id, .. } if message_id == "msg_sent")
-            ),
-            "expected reply_in_thread on the cover card, got {calls:?}"
+            seed_card.contains("已接管 重写登录模块"),
+            "snapshot seed carries the adopt verb and title: {seed_card}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, PlatformCall::ReplyInThread { .. })),
+            "an adopted topic seeds with the snapshot card, not the reply hint: {calls:?}"
         );
 
         // The new topic's thread_id maps to the ADOPTED session (not a new one),
-        // with the in-topic confirmation as the fallback-card anchor.
+        // with the snapshot card (the topic's first in-topic message) as the
+        // fallback-card anchor.
         let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
         let entry = app
             .sessions
@@ -6518,6 +6557,247 @@ pub(crate) mod integration_tests {
         assert_eq!(entry.directory, "/work/ext");
     }
 
+    /// ADR-0028: a lobby text adopt ends in EXACTLY ONE Session Snapshot card
+    /// — never a card plus the old 「已接管…」 text, and never nothing for a
+    /// first adopt, even when the session is idle and empty. The snapshot is
+    /// the confirmation.
+    #[tokio::test]
+    async fn switch_lobby_adopt_ends_in_one_snapshot_card() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
+        let (app, platform) = build_app(cfg, backend).await;
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Switch(SwitchAction::Match("唯一外部标题".into())),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_switch",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let calls = platform.calls.lock().await.clone();
+        let cards: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyCard { card, .. } => Some(card.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cards.len(), 1, "exactly one confirmation card: {calls:?}");
+        assert!(
+            cards[0].contains("已接管 唯一外部标题"),
+            "snapshot header carries the adopt verb + title: {}",
+            cards[0]
+        );
+        assert!(
+            !cards[0].contains("已接管会话"),
+            "the old text confirmation is gone: {}",
+            cards[0]
+        );
+        let texts: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().all(|t| !t.contains("已接管")),
+            "no text confirmation alongside the snapshot: {texts:?}"
+        );
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
+        assert_eq!(entry.session_id, "ses_alpha01");
+        assert_eq!(entry.topic_anchor, None, "lobby adopts carry no topic anchor");
+    }
+
+    /// ADR-0028 re-switch scenario: `ses_own1`（本项目会话, /work/cola）is both
+    /// the thread's mapped active session and the shared store's only session,
+    /// so `/switch 本项目` takes the mapped-hit branch of `handle_switch`. The
+    /// backend arrives pre-scripted with the cell under test (cola/external
+    /// newest message, status, pendings).
+    async fn build_reeswitch_app(
+        backend: MockBackend,
+    ) -> (Arc<App>, Arc<RecordingPlatform>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = backend;
+        backend.session_list = vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)];
+        let (app, platform) = build_app(cfg, backend).await;
+        app.sessions.lock().await.set_active(crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            session_id: "ses_own1".into(),
+            directory: "/work/cola".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        });
+        (app, platform, dir)
+    }
+
+    /// ADR-0028: the re-`/switch` mapped-hit branch applies the suppression
+    /// predicate. An idle, pending-free session whose newest user message is
+    /// cola-authored (its recent life is already visible in this thread) keeps
+    /// today's one-line text ack and sends NO card.
+    #[tokio::test]
+    async fn switch_reeswitch_suppressed_when_nothing_to_report() {
+        let _wd = test_work_dir();
+        let mut backend = MockBackend::new(realistic_parts());
+        // Newest user message is cola-authored; status defaults to idle; no
+        // pending requests — the one suppressed cell of the matrix.
+        backend
+            .cola_user_messages
+            .insert("ses_own1".into(), "上次的问题".into());
+        let (app, platform, _dir) = build_reeswitch_app(backend).await;
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Switch(SwitchAction::Match("本项目".into())),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_switch",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let calls = platform.calls.lock().await.clone();
+        let text = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Switched to"), "one-line ack kept: {text}");
+        assert!(
+            calls.iter().all(|c| !matches!(c, PlatformCall::ReplyCard { .. })),
+            "suppressed: no snapshot card: {calls:?}"
+        );
+    }
+
+    /// ADR-0028: the same re-switch reports a snapshot when the newest user
+    /// message is EXTERNAL (invisible while the session was inactive, ADR-0017)
+    /// — the tail is the one vehicle that surfaces it.
+    #[tokio::test]
+    async fn switch_reeswitch_snapshots_on_external_newest_message() {
+        let _wd = test_work_dir();
+        let mut backend = MockBackend::new(realistic_parts());
+        backend
+            .external_user_messages
+            .insert("ses_own1".into(), "OpenChamber 里的问题".into());
+        let (app, platform, _dir) = build_reeswitch_app(backend).await;
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Switch(SwitchAction::Match("本项目".into())),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_switch",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let calls = platform.calls.lock().await.clone();
+        let card = calls
+            .iter()
+            .find_map(|c| match c {
+                PlatformCall::ReplyCard { card, .. } => Some(card.to_string()),
+                _ => None,
+            })
+            .expect("external newness reports a snapshot: {calls:?}");
+        assert!(card.contains("已切换 本项目会话"), "re-switch verb: {card}");
+        assert!(
+            card.contains("OpenChamber 里的问题"),
+            "the external message surfaces in the tail: {card}"
+        );
+    }
+
+    /// ADR-0028: a busy re-switch reports a snapshot (运行中) — the in-flight
+    /// external turn is invisible until the snapshot surfaces it.
+    #[tokio::test]
+    async fn switch_reeswitch_snapshots_on_busy_status() {
+        let _wd = test_work_dir();
+        let mut backend = MockBackend::new(realistic_parts());
+        backend
+            .session_statuses
+            .insert("ses_own1".into(), Some(opencode::client::SessionStatus::Busy));
+        // Cola-authored newest alone is NOT enough to suppress a busy session.
+        backend
+            .cola_user_messages
+            .insert("ses_own1".into(), "上次的问题".into());
+        let (app, platform, _dir) = build_reeswitch_app(backend).await;
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Switch(SwitchAction::Match("本项目".into())),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_switch",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let calls = platform.calls.lock().await.clone();
+        let card = calls
+            .iter()
+            .find_map(|c| match c {
+                PlatformCall::ReplyCard { card, .. } => Some(card.to_string()),
+                _ => None,
+            })
+            .expect("busy reports a snapshot: {calls:?}");
+        assert!(card.contains("运行中"), "busy chip: {card}");
+    }
+
+    /// ADR-0028: an adopt-time pending request on a re-switch reports a
+    /// snapshot with the 等待你的确认 chip — the request is blocked on the
+    /// operator, so the snapshot must surface it.
+    #[tokio::test]
+    async fn switch_reeswitch_snapshots_on_pending_permission() {
+        let _wd = test_work_dir();
+        let mut backend = MockBackend::new(realistic_parts());
+        backend
+            .cola_user_messages
+            .insert("ses_own1".into(), "上次的问题".into());
+        backend.permissions = vec![opencode::client::PermissionRequest {
+            request_id: "req_own".into(),
+            session_id: Some("ses_own1".into()),
+            permission: Some("bash".into()),
+            patterns: vec!["ls".into()],
+            metadata: None,
+            always: vec![],
+        }];
+        let (app, platform, _dir) = build_reeswitch_app(backend).await;
+
+        crate::bridge::command::handle_command(
+            &app.core,
+            Command::Switch(SwitchAction::Match("本项目".into())),
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_switch",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+
+        let calls = platform.calls.lock().await.clone();
+        let card = calls
+            .iter()
+            .find_map(|c| match c {
+                PlatformCall::ReplyCard { card, .. } => Some(card.to_string()),
+                _ => None,
+            })
+            .expect("a pending request reports a snapshot: {calls:?}");
+        assert!(card.contains("等待你的确认"), "waiting chip: {card}");
+    }
+
     #[tokio::test]
     async fn switch_ambiguous_global_match_lists_candidates() {
         let _wd = test_work_dir();
@@ -8578,7 +8858,7 @@ pub(crate) mod integration_tests {
         let cfg = test_config(&dir.path().join("sessions.json"));
         let mut backend = MockBackend::new(realistic_parts());
         backend.session_list = vec![list_session("ses_foreign123abc", "外部会话", "/work/ext", 100)];
-        let (app, _platform) = build_app(cfg, backend).await;
+        let (app, platform) = build_app(cfg, backend).await;
         let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_fresh".into());
 
         crate::bridge::command::handle_command(
@@ -8594,7 +8874,28 @@ pub(crate) mod integration_tests {
         .await
         .unwrap();
 
-        // Adopted as the topic's single session, anchored to a reply inside it.
+        // ADR-0028: the in-topic adoption confirmation is the Session Snapshot
+        // card, sent inside the topic — no 「📎 已接管…」 text anchor anymore.
+        let calls = platform.calls.lock().await.clone();
+        let seed = calls
+            .iter()
+            .find_map(|c| match c {
+                PlatformCall::ReplyCardInThread { message_id, card, .. } if message_id == "msg_topic_cmd" => {
+                    Some(card.to_string())
+                }
+                _ => None,
+            })
+            .expect("snapshot replied in-thread on the command: {calls:?}");
+        assert!(seed.contains("已接管 外部会话"), "snapshot header: {seed}");
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, PlatformCall::ReplyInThread { .. })),
+            "no text anchor alongside the snapshot: {calls:?}"
+        );
+
+        // Adopted as the topic's single session, anchored to the snapshot card
+        // (the mock's created topic-reply message id).
         let entry = app.sessions.lock().await.get_active(&topic_key).cloned().unwrap();
         assert_eq!(entry.session_id, "ses_foreign123abc");
         assert_eq!(entry.topic_anchor.as_deref(), Some("msg_topic_reply"));
