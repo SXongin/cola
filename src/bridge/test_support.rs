@@ -5159,6 +5159,118 @@ pub(crate) mod integration_tests {
     }
 
     #[tokio::test]
+    async fn completing_last_question_replaces_card_with_full_qa_summary() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = Arc::new(MockBackend::new(realistic_parts()));
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
+
+        app.question.question_requests.lock().await.insert(
+            "que_1".into(),
+            opencode::client::QuestionRequest {
+                id: "que_1".into(),
+                session_id: "ses_1".into(),
+                questions: vec![
+                    opencode::client::QuestionInfo {
+                        question: "问题甲".into(),
+                        header: String::new(),
+                        options: vec![
+                            opencode::client::QuestionOption {
+                                label: "/a1".into(),
+                                description: String::new(),
+                            },
+                            opencode::client::QuestionOption {
+                                label: "/a2".into(),
+                                description: String::new(),
+                            },
+                        ],
+                        multiple: None,
+                        custom: None,
+                    },
+                    opencode::client::QuestionInfo {
+                        question: "问题乙".into(),
+                        header: String::new(),
+                        options: vec![
+                            opencode::client::QuestionOption {
+                                label: "/b1".into(),
+                                description: String::new(),
+                            },
+                            opencode::client::QuestionOption {
+                                label: "/b2".into(),
+                                description: String::new(),
+                            },
+                        ],
+                        multiple: None,
+                        custom: None,
+                    },
+                ],
+            },
+        );
+        {
+            let thread = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: thread,
+                session_id: "ses_1".into(),
+                directory: "/work".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+                topic_root: None,
+                variant: None,
+            });
+        }
+
+        let value_for = |index: usize, answer: &str| {
+            serde_json::json!({
+                "action": "question",
+                "reply": "answer",
+                "request_id": "que_1",
+                "session_id": "ses_1",
+                "question_index": index,
+                "answer": answer,
+            })
+        };
+
+        // Answering only the first question returns the card with the first
+        // question collapsed (已选) and the second still open.
+        let first = app.handle_card_action(value_for(0, "/a1")).await.unwrap();
+        let first_card = first.card.unwrap().to_string();
+        assert!(
+            first_card.contains("问题乙"),
+            "second question still open: {first_card}"
+        );
+
+        // Answering the LAST question submits once and replaces the card with a
+        // summary of EVERY question and answer — not a card that only echoes
+        // the last answer under a bogus "AI 的问题是" label.
+        let done = app.handle_card_action(value_for(1, "/b1")).await.unwrap();
+        let done_card = done.card.unwrap().to_string();
+        assert!(
+            done_card.contains("问题甲"),
+            "first question missing: {done_card}"
+        );
+        assert!(done_card.contains("/a1"), "first answer missing: {done_card}");
+        assert!(
+            done_card.contains("问题乙"),
+            "second question missing: {done_card}"
+        );
+        assert!(done_card.contains("/b1"), "second answer missing: {done_card}");
+        assert!(
+            !done_card.contains("AI 的问题是"),
+            "bogus question label: {done_card}"
+        );
+
+        let calls = backend.reply_question_calls.lock().await.clone();
+        assert_eq!(calls.len(), 1, "expected one reply_question call");
+        assert_eq!(calls[0].0, "que_1");
+        assert_eq!(calls[0].1, vec![vec!["/a1".to_string()], vec!["/b1".to_string()]]);
+    }
+
+    #[tokio::test]
     async fn question_card_action_rejects() {
         let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();

@@ -458,11 +458,7 @@ impl RequestKind for QuestionKind {
                 // (`reply_question` expects all of them).
                 if flow.is_answered(core, req_id).await {
                     // finalized before (double-click): replay the result.
-                    let mut r = result_card(
-                        &format!("✅ 已回答：{}", answer),
-                        "green",
-                        &format!("AI 的问题是：\n{}", answer),
-                    );
+                    let mut r = result_card("✅ 已回答", "green", "已提交 AI 的问题答案。");
                     if inline {
                         r.card = None;
                     }
@@ -548,6 +544,9 @@ impl RequestKind for QuestionKind {
                 if answered_count == n {
                     // All questions answered → submit the whole request.
                     flow.mark_answered(core, req_id).await;
+                    // The questions are needed for the completion card, so
+                    // capture them before `remove_question` drops the request.
+                    let questions = flow.questions_of(req_id).await;
                     let answers: Vec<Vec<String>> = flow
                         .question_partial
                         .lock()
@@ -583,11 +582,7 @@ impl RequestKind for QuestionKind {
                     {
                         acc.pending_questions.retain(|pq| pq.request_id != req_id);
                     }
-                    let mut r = result_card(
-                        &format!("✅ 已回答：{}", answer),
-                        "green",
-                        &format!("AI 的问题是：\n{}", answer),
-                    );
+                    let mut r = result_card("✅ 已回答", "green", &qa_completion_body(&questions, &answers));
                     if inline {
                         r.card = None;
                     }
@@ -668,6 +663,9 @@ impl RequestKind for QuestionKind {
                     return Some(r);
                 }
                 flow.mark_answered(core, req_id).await;
+                // The questions are needed for the completion card, so capture
+                // them before `remove_question` drops the request.
+                let questions = flow.questions_of(req_id).await;
                 let answers: Vec<Vec<String>> = flow
                     .question_partial
                     .lock()
@@ -702,17 +700,7 @@ impl RequestKind for QuestionKind {
                 {
                     acc.pending_questions.retain(|pq| pq.request_id != req_id);
                 }
-                let labels: Vec<&str> = answers.iter().flatten().map(|s| s.as_str()).collect();
-                let summary = if labels.is_empty() {
-                    "已提交".to_string()
-                } else {
-                    labels.join("、")
-                };
-                let mut r = result_card(
-                    &format!("✅ 已回答：{}", summary),
-                    "green",
-                    &format!("AI 的问题是：\n{}", summary),
-                );
+                let mut r = result_card("✅ 已回答", "green", &qa_completion_body(&questions, &answers));
                 if inline {
                     r.card = None;
                 }
@@ -833,6 +821,18 @@ impl RequestFlow {
         self.question_requests.lock().await.remove(req_id);
         self.question_dirs.lock().await.remove(req_id);
         self.question_toggles.lock().await.remove(req_id);
+    }
+
+    /// The pending request's questions (empty once the request was dropped).
+    /// Completion cards render the full Q&A from them, so callers capture the
+    /// list before `remove_question` discards the request.
+    pub(crate) async fn questions_of(&self, req_id: &str) -> Vec<opencode::client::QuestionInfo> {
+        self.question_requests
+            .lock()
+            .await
+            .get(req_id)
+            .map(|r| r.questions.clone())
+            .unwrap_or_default()
     }
 
     /// Independent poller: surfaces pending requests as cards (inline on a
@@ -1012,6 +1012,31 @@ fn failed_result_card(inline: bool, body: &str, toast: &str) -> CardActionResult
     }
     r.toast = Some(toast.to_string());
     r
+}
+
+/// Body of the completion card for a standalone question request: EVERY
+/// question with the answer(s) the user gave, so the finished card keeps the
+/// full Q&A instead of echoing only the last clicked answer (which used to be
+/// mislabeled "AI 的问题是：<answer>"). Empty answer slots (skipped via
+/// submit/skip) render as 未作答.
+fn qa_completion_body(
+    questions: &[crate::opencode::client::QuestionInfo],
+    answers: &[Vec<String>],
+) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for (i, (q, a)) in questions.iter().zip(answers).enumerate() {
+        lines.push(format!("**{}. {}**", i + 1, q.question));
+        lines.push(if a.is_empty() {
+            "（未作答）".to_string()
+        } else {
+            format!("👉 {}", a.join("、"))
+        });
+    }
+    if lines.is_empty() {
+        "已提交 AI 的问题答案。".to_string()
+    } else {
+        lines.join("\n")
+    }
 }
 
 /// Drop surfaced cards for a set of answered request ids: remove the ids from
