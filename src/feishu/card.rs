@@ -681,6 +681,14 @@ pub(crate) fn header_title_and_template(
 
 /// Build a collapsible panel (v2), folded by default.
 fn collapsible_panel(title: &str, content: &str) -> serde_json::Value {
+    collapsible_panel_chunks(title, &[content.to_string()])
+}
+
+/// Build a collapsible panel (v2) holding several markdown chunks, folded by
+/// default. Used when one logical section (e.g. a snapshot tail entry's full
+/// text) needs splitting across multiple markdown elements to stay within the
+/// per-element character cap — a single `content` string would silently truncate.
+pub(crate) fn collapsible_panel_chunks(title: &str, chunks: &[String]) -> serde_json::Value {
     json!({
         "tag": "collapsible_panel",
         "expanded": false,
@@ -689,9 +697,10 @@ fn collapsible_panel(title: &str, content: &str) -> serde_json::Value {
             "icon": { "tag": "standard_icon", "token": "down-small-ccm_outlined" },
             "icon_position": "right"
         },
-        "elements": [
-            { "tag": "markdown", "content": content }
-        ]
+        "elements": chunks
+            .iter()
+            .map(|c| json!({ "tag": "markdown", "content": c }))
+            .collect::<Vec<_>>(),
     })
 }
 

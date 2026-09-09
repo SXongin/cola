@@ -1132,8 +1132,9 @@ fn truncate(s: &str, max: usize) -> String {
 const PERMISSION_DIFF_MAX_CHARS: usize = 1200;
 
 /// A friendly description of what a permission request asks to do, shown on the
-/// permission card.
-fn describe_permission(p: &opencode::client::PermissionRequest) -> String {
+/// permission card (and reused verbatim by the snapshot card's pending block,
+/// ADR-0028 — the adopt-time block must look and behave like today's cards).
+pub(crate) fn describe_permission(p: &opencode::client::PermissionRequest) -> String {
     let action = p.permission.as_deref().unwrap_or("?");
     let (emoji, label) = describe_action(action);
     let mut s = format!("{} **{}**\n", emoji, label);
