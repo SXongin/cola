@@ -1090,13 +1090,21 @@ fn describe_action(action: &str) -> (&'static str, &'static str) {
     }
 }
 
+/// Clip `s` to at most `max` characters, appending a "…" marker when it was
+/// cut. Character-counted (not bytes) so CJK paths/values truncate at the same
+/// visual length as ASCII — mirrors `card::truncate_md`.
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}...", s.chars().take(max).collect::<String>())
+        format!("{}…", s.chars().take(max).collect::<String>())
     }
 }
+
+/// Cap for an edit diff shown on a permission card. The request body is one
+/// card element with no further chunking on the standalone card, so a huge
+/// diff must be clipped here to stay under Feishu's card size limit.
+const PERMISSION_DIFF_MAX_CHARS: usize = 1200;
 
 /// A friendly description of what a permission request asks to do, shown on the
 /// permission card.
@@ -1112,8 +1120,43 @@ fn describe_permission(p: &opencode::client::PermissionRequest) -> String {
         }
     }
 
-    // Metadata often carries richer context (e.g. bash command, tool input)
-    if let Some(meta) = &p.metadata {
+    // An edit/patch/apply_patch permission carries its unified diff (metadata
+    // `{filepath, diff}` from OpenCode's edit tool) — that IS the request, so
+    // show the actual changed lines instead of dumping raw metadata JSON (which
+    // used to make the card show a wall of escaped diff text).
+    let diff = p
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("diff"))
+        .and_then(|v| v.as_str())
+        .filter(|d| !d.is_empty());
+    if matches!(action, "edit" | "patch" | "apply_patch")
+        && let Some(diff) = diff
+    {
+        let parsed = crate::feishu::card::parse_edit_diff(diff);
+        let path = p
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("filepath"))
+            .and_then(|v| v.as_str())
+            .or_else(|| parsed.as_ref().and_then(|d| d.path.as_deref()))
+            .or_else(|| p.patterns.first().map(String::as_str))
+            .unwrap_or("?");
+        match parsed.as_ref() {
+            Some(d) => s.push_str(&format!(
+                "**改动**: 📄 `{}` (+{} −{})\n",
+                truncate(path, 200),
+                d.additions,
+                d.deletions
+            )),
+            None => s.push_str(&format!("**改动**: 📄 `{}`\n", truncate(path, 200))),
+        }
+        let body = parsed.map(|d| d.body).unwrap_or_else(|| diff.to_string());
+        let body = crate::feishu::card::truncate_md(&body, PERMISSION_DIFF_MAX_CHARS);
+        s.push_str(&crate::feishu::card::fenced_code(&body, None));
+        s.push('\n');
+    } else if let Some(meta) = &p.metadata {
+        // Metadata often carries richer context (e.g. bash command, tool input)
         let mut shown = 0;
         for (key, label) in [
             ("command", "命令"),
@@ -1309,6 +1352,66 @@ mod tests {
         record_answer(&mut partial, "q1", 1, 0, "a");
         let (count, _) = record_answer(&mut partial, "q2", 1, 0, "b");
         assert_eq!(count, 1); // q2 has its own slots
+    }
+
+    fn perm(action: &str, metadata: serde_json::Value) -> crate::opencode::client::PermissionRequest {
+        crate::opencode::client::PermissionRequest {
+            request_id: "per_1".into(),
+            session_id: Some("ses_1".into()),
+            permission: Some(action.into()),
+            patterns: vec!["/proj/src/main.rs".into()],
+            metadata: Some(metadata),
+            always: vec![],
+        }
+    }
+
+    #[test]
+    fn describe_edit_permission_shows_diff_not_raw_metadata() {
+        let diff = "\
+Index: /proj/src/main.rs
+===================================================================
+--- /proj/src/main.rs
++++ /proj/src/main.rs
+@@ -1 +1 @@
+-old line
++new line";
+        let p = perm(
+            "edit",
+            serde_json::json!({ "filepath": "/proj/src/main.rs", "diff": diff }),
+        );
+        let s = describe_permission(&p);
+        assert!(
+            s.contains("**改动**: 📄 `/proj/src/main.rs` (+1 −1)"),
+            "count line: {}",
+            s
+        );
+        assert!(s.contains("@@ -1 +1 @@"), "hunk header: {}", s);
+        assert!(s.contains("-old line"), "removed line: {}", s);
+        assert!(s.contains("+new line"), "added line: {}", s);
+        assert!(s.contains("```"), "diff fenced: {}", s);
+        assert!(s.contains("是否允许"), "closing prompt: {}", s);
+        // The diff must not leak as escaped raw JSON metadata.
+        assert!(!s.contains("\\n"), "no escaped JSON: {}", s);
+    }
+
+    #[test]
+    fn describe_edit_permission_without_parseable_diff_shows_raw_diff() {
+        let p = perm(
+            "edit",
+            serde_json::json!({ "filepath": "x.rs", "diff": "not a unified diff" }),
+        );
+        let s = describe_permission(&p);
+        assert!(s.contains("not a unified diff"), "raw diff kept: {}", s);
+        assert!(s.contains("是否允许"));
+    }
+
+    #[test]
+    fn describe_bash_permission_stays_generic() {
+        let p = perm("bash", serde_json::json!({ "command": "cargo test" }));
+        let s = describe_permission(&p);
+        assert!(s.contains("cargo test"), "command shown: {}", s);
+        assert!(!s.contains("```"), "no diff fence for bash: {}", s);
+        assert!(s.contains("是否允许"));
     }
 
     #[test]
