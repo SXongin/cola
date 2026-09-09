@@ -1436,8 +1436,13 @@ async fn handle_switch(
         let data = crate::bridge::snapshot::gather_snapshot(&core.opencode, &hit.id, &hit.directory).await;
         match crate::bridge::snapshot::re_switch_emit(&data) {
             crate::bridge::snapshot::SnapshotEmit::Full => {
-                let card = snapshot_card_for(core, "切换", hit).await;
-                core.feishu.reply_card(message_id, &card).await?;
+                // Restrict to the claimable pendings (an already-surfaced one
+                // stays authoritative) and claim the rest against the sent
+                // snapshot so the poll loop never duplicates them.
+                let data = crate::bridge::request::claimable_pendings(core, data).await;
+                let card = crate::feishu::snapshot_card::build_snapshot_card("切换", &hit.title, &data);
+                let mid = core.feishu.reply_card(message_id, &card).await?;
+                crate::bridge::request::claim_snapshot_pendings(core, &mid, "切换", &hit.title, &data).await;
             }
             crate::bridge::snapshot::SnapshotEmit::Suppressed => {
                 core.feishu
@@ -1793,10 +1798,13 @@ pub(crate) async fn open_topic_for_session(
         TopicSeed::ReplyHint,
     )
     .await
+    .map(|(thread_id, _)| thread_id)
 }
 
 /// The shared body of [`open_topic_for_session`], parameterised by what the
-/// new topic's first in-topic message (its anchor) carries.
+/// new topic's first in-topic message (its anchor) carries. Returns the new
+/// topic's `thread_id` and the in-topic anchor message id (the first message
+/// inside the topic — the adopt path claims its pendings against it).
 #[allow(clippy::too_many_arguments)]
 async fn open_topic_seeded(
     core: &Arc<SharedCore>,
@@ -1808,7 +1816,7 @@ async fn open_topic_seeded(
     agent: Option<String>,
     model: Option<String>,
     seed: TopicSeed,
-) -> crate::error::Result<Option<String>> {
+) -> crate::error::Result<(Option<String>, String)> {
     let cover_text = topic_cover_text(
         &display_title,
         &directory,
@@ -1825,7 +1833,7 @@ async fn open_topic_seeded(
             chat_id,
             session_id
         );
-        return Ok(None);
+        return Ok((None, anchor));
     };
     let topic_key = crate::config::ThreadKey::new(chat_id.to_string(), thread_id.clone());
     let entry = SessionEntry {
@@ -1835,7 +1843,7 @@ async fn open_topic_seeded(
         agent,
         model: None,
         auto_accept: false,
-        topic_anchor: Some(anchor),
+        topic_anchor: Some(anchor.clone()),
         topic_root: Some(topic_root),
         variant: None,
     };
@@ -1846,7 +1854,7 @@ async fn open_topic_seeded(
     }
     record_cover_title(core, session_id, &display_title, model, cover_id.is_some()).await;
     core.invalidate_session_list_cache().await;
-    Ok(Some(thread_id))
+    Ok((Some(thread_id), anchor))
 }
 
 /// Create a real Feishu topic around an ADOPTED session: the Topic Cover Card
@@ -1864,8 +1872,8 @@ pub(crate) async fn create_topic_and_map_adopted(
     info: &crate::opencode::SessionListInfo,
     message_id: &str,
 ) -> crate::error::Result<Option<String>> {
-    let card = snapshot_card_for(core, "接管", info).await;
-    open_topic_seeded(
+    let (card, data) = snapshot_card_for(core, "接管", info).await;
+    let (thread_id, anchor) = open_topic_seeded(
         core,
         &thread_key.chat_id,
         message_id,
@@ -1876,20 +1884,33 @@ pub(crate) async fn create_topic_and_map_adopted(
         model_display(info.model.as_ref()),
         TopicSeed::Snapshot(card),
     )
-    .await
+    .await?;
+    // ADR-0028: claim the snapshot's embedded pendings against the in-topic
+    // snapshot message (the topic's first message + anchor) so the poll loop
+    // never duplicates them. Not claimed when the topic could not be opened
+    // (no thread_id) — the poller keeps today's standalone flow for them.
+    if thread_id.is_some() {
+        crate::bridge::request::claim_snapshot_pendings(core, &anchor, "接管", &info.title, &data).await;
+    }
+    Ok(thread_id)
 }
 
 /// ADR-0028: gather an adopted session's snapshot data (status, adopt-time
-/// pendings, transcript tail) from server reads and build its card with the
-/// given takeover verb (接管/切换). Shared by every adoption surface so the
-/// gather-before-mapping sequence cannot drift between them.
+/// pendings, transcript tail) from server reads, restrict the pendings to the
+/// claimable ones (the session's own, not already surfaced elsewhere), and
+/// build its card with the given takeover verb (接管/切换). Shared by every
+/// adoption surface so the gather-before-mapping sequence cannot drift between
+/// them. Returns the card together with the filtered data — the caller sends
+/// the card and then claims the pendings with its message id.
 pub(crate) async fn snapshot_card_for(
     core: &Arc<SharedCore>,
     verb: &str,
     info: &crate::opencode::SessionListInfo,
-) -> serde_json::Value {
+) -> (serde_json::Value, crate::bridge::snapshot::SnapshotData) {
     let data = crate::bridge::snapshot::gather_snapshot(&core.opencode, &info.id, &info.directory).await;
-    crate::feishu::snapshot_card::build_snapshot_card(verb, &info.title, &data)
+    let data = crate::bridge::request::claimable_pendings(core, data).await;
+    let card = crate::feishu::snapshot_card::build_snapshot_card(verb, &info.title, &data);
+    (card, data)
 }
 
 /// Adopt a server session as the current thread's session, honoring the
@@ -1968,7 +1989,7 @@ async fn adopt_session(
     // nothing. Gathered BEFORE the mapping write below, so the card reflects
     // the session's pre-adoption state; each field is best-effort, so a read
     // failure degrades that field rather than blocking the adoption.
-    let card = snapshot_card_for(core, "接管", info).await;
+    let (card, data) = snapshot_card_for(core, "接管", info).await;
 
     let anchor = if kind == ConversationKind::Topic {
         // The snapshot is sent inside the topic and doubles as the fallback-card
@@ -1991,7 +2012,7 @@ async fn adopt_session(
         agent: info.agent.clone(),
         model: None,
         auto_accept: false,
-        topic_anchor: anchor,
+        topic_anchor: anchor.clone(),
         topic_root: None,
         variant: None,
     };
@@ -2004,7 +2025,10 @@ async fn adopt_session(
     // In a topic the snapshot was already sent inside it (the in-thread send
     // above); don't reply twice.
     if kind != ConversationKind::Topic {
-        core.feishu.reply_card(message_id, &card).await?;
+        let mid = core.feishu.reply_card(message_id, &card).await?;
+        crate::bridge::request::claim_snapshot_pendings(core, &mid, "接管", &info.title, &data).await;
+    } else if let Some(anchor) = &anchor {
+        crate::bridge::request::claim_snapshot_pendings(core, anchor, "接管", &info.title, &data).await;
     }
     Ok(())
 }

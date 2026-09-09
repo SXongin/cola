@@ -6,7 +6,10 @@ use crate::opencode;
 /// server reads at the moment a Chat/Topic activates a session — never from a
 /// prompt, a session write, or a guess. Each source is best-effort: a read
 /// failure degrades that field (status → `None`, lists → empty) and is logged,
-/// so an adoption can never be blocked by the snapshot gather.
+/// so an adoption can never be blocked by the snapshot gather. Clone: the
+/// claim registry keeps a copy of the adopt-time state to re-render the card
+/// when a claimed request resolves.
+#[derive(Clone)]
 pub struct SnapshotData {
     pub session_id: String,
     pub directory: String,
@@ -72,6 +75,7 @@ pub(crate) fn re_switch_emit(data: &SnapshotData) -> SnapshotEmit {
 
 /// One 最近对话 tail entry: a text-bearing user/assistant message's role, its
 /// created time (for display/ordering) and its verbatim text-part content.
+#[derive(Clone)]
 pub struct TailEntry {
     pub role: String,
     pub created_ms: i64,

@@ -36,6 +36,21 @@ fn status_chip_element(
 ) -> Option<serde_json::Value> {
     status_chip(has_pending, status).map(|content| json!({ "tag": "markdown", "content": content }))
 }
+/// The live answer state of one claimed question block on the snapshot
+/// (ADR-0028): request_id → state. Rebuilds after a button interaction pass
+/// the flow's current state so the block mirrors the standalone question
+/// card's 已选/✅ markers; the initial adopt-time snapshot passes nothing (all
+/// questions open).
+#[derive(Default, Clone)]
+pub struct QuestionBlockState {
+    /// The displayed answers per question slot (locked answers + live
+    /// multi-select toggles).
+    pub display: Vec<Option<Vec<String>>>,
+    /// Whether each question slot is finalized (answered).
+    pub done: Vec<bool>,
+}
+
+pub type SnapshotQuestionState = std::collections::HashMap<String, QuestionBlockState>;
 
 /// The body elements for one adopt-time pending request, embedded on the
 /// snapshot so it looks and behaves like today's inline card sections
@@ -43,6 +58,7 @@ fn status_chip_element(
 fn pending_block_elements(
     req: &crate::bridge::request::PendingRequest,
     directory: &str,
+    question_state: &SnapshotQuestionState,
 ) -> Vec<serde_json::Value> {
     match req {
         crate::bridge::request::PendingRequest::Permission(p) => {
@@ -54,9 +70,18 @@ fn pending_block_elements(
         }
         crate::bridge::request::PendingRequest::Question(q) => {
             let n = q.questions.len();
-            let answered = vec![None; n];
-            let done = vec![false; n];
-            question_elements(&q.id, &q.session_id, &q.questions, directory, &answered, &done)
+            let state = question_state.get(&q.id).cloned().unwrap_or(QuestionBlockState {
+                display: vec![None; n],
+                done: vec![false; n],
+            });
+            question_elements(
+                &q.id,
+                &q.session_id,
+                &q.questions,
+                directory,
+                &state.display,
+                &state.done,
+            )
         }
     }
 }
@@ -113,6 +138,18 @@ fn display_title(title: &str, session_id: &str) -> String {
 /// constructible builders so a later ticket can drop a resolved claim
 /// (05) or stream a busy follow (06) into the same card.
 pub fn build_snapshot_card(verb: &str, title: &str, data: &SnapshotData) -> serde_json::Value {
+    build_snapshot_card_with_state(verb, title, data, &SnapshotQuestionState::new())
+}
+
+/// [`build_snapshot_card`] with live question state: after an interaction on a
+/// claimed question block, the rebuild passes the flow's current answers/done
+/// flags so the embedded block mirrors the standalone question card.
+pub fn build_snapshot_card_with_state(
+    verb: &str,
+    title: &str,
+    data: &SnapshotData,
+    question_state: &SnapshotQuestionState,
+) -> serde_json::Value {
     let verb = verb.strip_prefix("已").unwrap_or(verb);
     let title = display_title(title, &data.session_id);
 
@@ -134,7 +171,7 @@ pub fn build_snapshot_card(verb: &str, title: &str, data: &SnapshotData) -> serd
         if i > 0 {
             elements.push(json!({ "tag": "hr" }));
         }
-        elements.extend(pending_block_elements(req, &data.directory));
+        elements.extend(pending_block_elements(req, &data.directory, question_state));
     }
     if !pending.is_empty() && !data.tail.is_empty() {
         elements.push(json!({ "tag": "hr" }));
