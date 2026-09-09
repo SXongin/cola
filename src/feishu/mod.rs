@@ -25,6 +25,14 @@ pub trait Platform: Send + Sync {
 
     async fn reply_text(&self, message_id: &str, text: &str) -> Result<String>;
 
+    /// Reply to a message in thread form (`reply_in_thread: true`) with an
+    /// interactive card, creating a topic around a non-topic seed message.
+    /// Returns the created reply's `message_id` (an anchor inside the topic)
+    /// and the topic's `thread_id` (or `None` if the chat does not support
+    /// topic replies). Used by `/topic --adopt` to place the Session Snapshot
+    /// card as the topic's first message and anchor (ADR-0028).
+    async fn reply_card_in_thread(&self, message_id: &str, card: &Value) -> Result<(String, Option<String>)>;
+
     /// Reply to a message in thread form (`reply_in_thread: true`), creating a
     /// topic. Returns the created reply's `message_id` (an anchor inside the
     /// topic) and the topic's `thread_id` (or `None` if the chat does not
@@ -92,6 +100,10 @@ impl Platform for Client {
 
     async fn reply_text(&self, message_id: &str, text: &str) -> Result<String> {
         Client::reply_text(self, message_id, text).await
+    }
+
+    async fn reply_card_in_thread(&self, message_id: &str, card: &Value) -> Result<(String, Option<String>)> {
+        Client::reply_card_in_thread(self, message_id, card).await
     }
 
     async fn reply_in_thread(&self, message_id: &str, text: &str) -> Result<(String, Option<String>)> {

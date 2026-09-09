@@ -1,8 +1,3 @@
-// ticket 01 ships the snapshot's read side; the card renderer (02), adoption
-// wiring (03), pending claim (05) and busy-follow (06) consume it. Until then
-// the surface is only reachable from tests, so dead_code is allowed here.
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use crate::opencode;

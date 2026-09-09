@@ -319,25 +319,28 @@ impl Client {
         }
     }
 
-    /// Reply to a message **in thread form** (`reply_in_thread: true`), which
-    /// creates a topic around the seed message. Returns `(message_id,
-    /// thread_id)`: the id of the created reply (which lives INSIDE the topic,
-    /// usable as an anchor to reply into it later) and the new topic's
-    /// `thread_id`. Used by `/topic` to open a real, UI-separated conversation.
+    /// Reply to a message **in thread form** (`reply_in_thread: true`) with an
+    /// interactive card, which creates a topic around the seed message when it
+    /// is not already inside one. Returns `(message_id, thread_id)`: the id of
+    /// the created reply (which lives INSIDE the topic, usable as an anchor to
+    /// reply into it later) and the topic's `thread_id`. Used by `/topic` to
+    /// open a real, UI-separated conversation and by `/topic --adopt` to place
+    /// the Session Snapshot card as the topic's first message and anchor
+    /// (ADR-0028).
     ///
     /// `thread_id` is `None` when the response carries no topic (the chat does
     /// not support topic replies) — the caller must not persist a broken
     /// mapping in that case.
-    pub async fn reply_in_thread(
+    pub async fn reply_card_in_thread(
         &self,
         message_id: &str,
-        text: &str,
+        card: &serde_json::Value,
     ) -> crate::error::Result<(String, Option<String>)> {
         let token = self.get_access_token().await?;
         let body = serde_json::json!({
             "msg_type": "interactive",
             "reply_in_thread": true,
-            "content": markdown_card(text).to_string()
+            "content": card.to_string()
         });
 
         let resp: MessageResponse = self
@@ -355,12 +358,30 @@ impl Client {
 
         if resp.code != 0 {
             Err(crate::error::BridgeError::Feishu(format!(
-                "reply in thread error {}: {}",
+                "reply card in thread error {}: {}",
                 resp.code, resp.msg
             )))
         } else {
             Ok((resp.data.message_id, resp.data.thread_id))
         }
+    }
+
+    /// Reply to a message **in thread form** (`reply_in_thread: true`) with a
+    /// markdown card, which creates a topic around the seed message. Returns
+    /// `(message_id, thread_id)`: the id of the created reply (which lives
+    /// INSIDE the topic, usable as an anchor to reply into it later) and the
+    /// new topic's `thread_id`. Used by `/topic` to open a real, UI-separated
+    /// conversation.
+    ///
+    /// `thread_id` is `None` when the response carries no topic (the chat does
+    /// not support topic replies) — the caller must not persist a broken
+    /// mapping in that case.
+    pub async fn reply_in_thread(
+        &self,
+        message_id: &str,
+        text: &str,
+    ) -> crate::error::Result<(String, Option<String>)> {
+        self.reply_card_in_thread(message_id, &markdown_card(text)).await
     }
 
     /// Reply to a message with a completion notice: a short text message. When

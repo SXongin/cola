@@ -1,8 +1,3 @@
-// ticket 02 ships the snapshot card renderer; the adoption wiring (03), switch
-// card patch (04), pending claim (05) and busy-follow (06) consume it. Until
-// then the builder is only reachable from tests, so dead_code is allowed here.
-#![allow(dead_code)]
-
 use crate::bridge::request::describe_permission;
 use crate::bridge::snapshot::{SnapshotData, TailEntry};
 use crate::feishu::card::{permission_buttons, question_elements};
