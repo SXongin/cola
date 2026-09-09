@@ -152,6 +152,35 @@ fn extract_tool_output(part: &serde_json::Value, status: &str) -> Option<String>
     }
 }
 
+/// For an `edit` tool, prefer the REAL diff recorded in `state.metadata.diff`
+/// (OpenCode computes it with `createTwoFilesPatch`) over the tool's plain
+/// text output ("Edit applied successfully."), which tells the reader nothing
+/// about what changed. `extract_tool_output` only reads
+/// `state.output/content/result`, so without this the diff — the actual
+/// interesting content of every file edit — was silently dropped and the card
+/// just repeated the file name. Failures keep their extracted error text.
+fn edit_tool_output(part: &serde_json::Value, status: &str) -> Option<String> {
+    let orig = extract_tool_output(part, status);
+    if status == "error" {
+        return orig;
+    }
+    let diff = part
+        .pointer("/state/metadata/diff")
+        .and_then(|v| v.as_str())
+        .filter(|d| !d.is_empty())?;
+    // The success sentence is noise once the diff is shown; anything beyond it
+    // (e.g. an "LSP errors detected" note) is kept as a tail after the diff.
+    let tail = orig
+        .as_deref()
+        .and_then(|o| o.strip_prefix("Edit applied successfully."))
+        .map(|s| s.trim_start_matches('\n'))
+        .filter(|s| !s.is_empty());
+    Some(match tail {
+        Some(t) => format!("{diff}\n\n{t}"),
+        None => diff.to_string(),
+    })
+}
+
 /// Render canonical message parts (from `POST /session/{id}/message` response)
 /// into the accumulator so the card shows the assistant's final result.
 fn render_part(acc: &mut StreamAccumulator, part: &serde_json::Value) {
@@ -184,8 +213,14 @@ fn render_part(acc: &mut StreamAccumulator, part: &serde_json::Value) {
             // OpenCode stores tool output as `state.content` (array of
             // {type:"text",text}) plus an optional `result`, and failures put
             // the reason in `state.error.message`. There is NO `state.output`
-            // field on tool parts — reading it silently lost every result.
-            let output = extract_tool_output(part, status);
+            // field on tool parts — reading it silently lost every result. An
+            // `edit` call additionally records its unified diff in
+            // `state.metadata.diff`, which is what the panel should show.
+            let output = if name == "edit" {
+                edit_tool_output(part, status)
+            } else {
+                extract_tool_output(part, status)
+            };
             acc.push_tool(
                 &call_id,
                 crate::feishu::card::ToolPanel {
@@ -264,7 +299,16 @@ fn render_part_once(acc: &mut StreamAccumulator, part: &serde_json::Value) -> bo
             .and_then(|v| v.as_str())
             .map(|s| s.len())
             .unwrap_or(0);
-        let sig = format!("{}|{}", status, output_len);
+        // An edit's meaningful content is its unified diff (`metadata.diff`),
+        // not `state.output` ("Edit applied successfully.") — fold its length
+        // into the signature so a diff appearing under a stable status still
+        // triggers a re-render.
+        let diff_len = part
+            .pointer("/state/metadata/diff")
+            .and_then(|v| v.as_str())
+            .map(|s| s.len())
+            .unwrap_or(0);
+        let sig = format!("{status}|{output_len}|{diff_len}");
         if acc.rendered_tool_states.get(call_id) == Some(&sig) {
             return false;
         }
@@ -868,6 +912,96 @@ mod tests {
         );
         assert!(!out.is_empty(), "output must not be empty for a string error");
     }
+    /// A completed `edit` records its real unified diff in
+    /// `state.metadata.diff` (not in `state.output`, which only says "Edit
+    /// applied successfully."). The panel output must carry the diff so the card
+    /// shows what actually changed instead of the file name + the tool's
+    /// success sentence. Failures keep their extracted error text.
+    #[test]
+    fn edit_part_uses_metadata_diff_as_output() {
+        use crate::opencode::client::{MessageInfo, MessageTime, SessionMessage};
+
+        let epoch = 0;
+        let mut acc = StreamAccumulator::new("test");
+        acc.submit_epoch_ms = Some(epoch);
+
+        let msgs = |status: &str, output: &str| {
+            vec![SessionMessage {
+                info: MessageInfo {
+                    id: "a1".into(),
+                    role: Some("assistant".into()),
+                    parent_id: None,
+                    time: Some(MessageTime { created: 100 }),
+                    model_id: None,
+                    provider_id: None,
+                    tokens: None,
+                },
+                parts: serde_json::json!([{
+                    "type": "tool", "tool": "edit", "callID": "call_edit",
+                    "state": {
+                        "status": status,
+                        "input": { "filePath": "src/main.rs", "oldString": "a", "newString": "b" },
+                        "output": output,
+                        "metadata": {
+                            "diagnostics": {},
+                            "diff": "Index: src/main.rs\n======\n--- src/main.rs\n+++ src/main.rs\n@@ -1 +1 @@\n-a\n+b\n",
+                            "filediff": { "file": "src/main.rs", "additions": 1, "deletions": 1 }
+                        }
+                    }
+                }]),
+            }]
+        };
+
+        // Completed: the diff replaces the generic success sentence.
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &msgs("completed", "Edit applied successfully."),
+            epoch
+        ));
+        let out = acc.tools["call_edit"].output.clone().unwrap_or_default();
+        assert!(out.contains("@@ -1 +1 @@"), "diff must be shown: {}", out);
+        assert!(
+            !out.contains("Edit applied successfully."),
+            "noise dropped: {}",
+            out
+        );
+
+        // Re-rendering the same completed part is deduped (output unchanged).
+        assert!(!render_new_turn_parts(
+            &mut acc,
+            &msgs("completed", "Edit applied successfully."),
+            epoch
+        ));
+
+        // A failure keeps its error text, not a diff.
+        let mut acc = StreamAccumulator::new("test");
+        acc.submit_epoch_ms = Some(epoch);
+        let err_msgs = vec![SessionMessage {
+            info: MessageInfo {
+                id: "a1".into(),
+                role: Some("assistant".into()),
+                parent_id: None,
+                time: Some(MessageTime { created: 100 }),
+                model_id: None,
+                provider_id: None,
+                tokens: None,
+            },
+            parts: serde_json::json!([{
+                "type": "tool", "tool": "edit", "callID": "call_edit",
+                "state": {
+                    "status": "error",
+                    "input": { "filePath": "src/main.rs", "oldString": "a", "newString": "b" },
+                    "error": { "type": "unknown", "message": "no such file" },
+                    "metadata": { "diff": "Index: src/main.rs\n@@ -1 +1 @@\n-a\n+b\n" }
+                }
+            }]),
+        }];
+        assert!(render_new_turn_parts(&mut acc, &err_msgs, epoch));
+        let out = acc.tools["call_edit"].output.clone().unwrap_or_default();
+        assert!(out.contains("no such file"), "error text must be shown: {}", out);
+        assert!(!out.contains("@@"), "no diff on a failed edit: {}", out);
+    }
+
     /// Regression: the final reconcile falls back to `render_parts(resp.parts)`
     /// when the incremental poll already rendered everything (`render_new_turn_parts`
     /// returns false). `render_parts` used to append unconditionally, doubling the

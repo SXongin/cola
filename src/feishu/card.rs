@@ -185,10 +185,11 @@ fn tool_panel_element(tool: &ToolPanel) -> serde_json::Value {
             content.push_str(&format!("{}\n\n", h));
         }
         let body = truncate_md(&body, TOOL_OUTPUT_MAX_CHARS);
-        // File content (read) and anything with long lines render as a fenced
-        // code block: Feishu markdown wraps plain text but not code blocks, so
-        // long file/command output stays on one visual line instead of folding.
-        if tool.name == "read" || needs_code_block(&body) {
+        // File content (read) and edit hunks render as a fenced code block, as
+        // does anything with long lines: Feishu markdown wraps plain text but
+        // not code blocks, so long file/command output stays on one visual line
+        // instead of folding.
+        if tool.name == "read" || tool.name == "edit" || needs_code_block(&body) {
             content.push_str(&fenced_code(&body, lang));
         } else {
             content.push_str(&body);
@@ -200,14 +201,97 @@ fn tool_panel_element(tool: &ToolPanel) -> serde_json::Value {
     collapsible_panel(&format!("{} {}", tool.status_icon(), tool.name), &content)
 }
 
+/// The meaningful parts of an `edit` tool's unified diff (recorded by OpenCode
+/// in `state.metadata.diff` / an edit permission request's `diff`): the target
+/// path and the hunk lines (`@@`, `-`, `+`) plus the counted change. The
+/// `Index:`, `===`, `---`, `+++` header noise and unchanged context lines
+/// (starting with a space) are dropped — oldString/newString are often
+/// near-identical full-block snapshots whose context would otherwise render as
+/// walls of repeated text around a few changed lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EditDiff {
+    pub path: Option<String>,
+    pub additions: usize,
+    pub deletions: usize,
+    pub body: String,
+}
+
+/// Parse a unified diff produced by OpenCode's `edit` tool into its hunks.
+/// Returns `None` when `diff` isn't a recognizable edit diff (plain text
+/// output, an error message), so callers fall back to showing it unchanged.
+pub(crate) fn parse_edit_diff(diff: &str) -> Option<EditDiff> {
+    let mut path = None;
+    let mut additions = 0usize;
+    let mut deletions = 0usize;
+    let mut body = String::new();
+    let mut changed = false;
+    // The `--- path` / `+++ path` file headers only appear BEFORE the first
+    // `@@` hunk. Past that point any `-`/`+` line is real content — a removed
+    // line whose text starts with `-- ` (Lua/YAML `--` comments) renders as
+    // `--- …` and must stay a removal, not be mistaken for a header.
+    let mut in_hunk = false;
+    for line in diff.lines() {
+        let l = line.trim_end();
+        if let Some(p) = l.strip_prefix("Index: ") {
+            path = Some(p.to_string());
+        } else if !in_hunk && l.starts_with("diff --git ") {
+            // `a/old b/new` — the explicit Index/filepath carries the target.
+        } else if !in_hunk
+            && (l.starts_with("--- ")
+                || l.starts_with("+++ ")
+                || l == "---"
+                || l == "+++"
+                || l.starts_with("==="))
+        {
+            // The old/new file headers of a unified diff (`--- path` / `+++ path`)
+            // plus the `====` separator.
+        } else if l.starts_with("@@") {
+            in_hunk = true;
+            changed = true;
+            body.push_str(l);
+            body.push('\n');
+        } else if l.starts_with('+') {
+            additions += 1;
+            changed = true;
+            body.push_str(l);
+            body.push('\n');
+        } else if l.starts_with('-') {
+            deletions += 1;
+            changed = true;
+            body.push_str(l);
+            body.push('\n');
+        }
+        // Anything else (context lines, "\ No newline…") is dropped.
+    }
+    if !changed {
+        return None;
+    }
+    Some(EditDiff {
+        path,
+        additions,
+        deletions,
+        body,
+    })
+}
+
 /// Render a tool's raw output string human-friendly. OpenCode's `read` tool
 /// wraps its output in XML tags (`<path>…</path>`, `<type>…</type>`,
 /// `<content>…</content>`); strip them so the card shows just the file path and
-/// the numbered lines instead of raw markup. Other tools pass through unchanged.
+/// the numbered lines instead of raw markup. An `edit` tool's output is its
+/// unified diff (substituted by the renderer) — keep only the hunks and report
+/// the change count. Other tools pass through unchanged.
 ///
 /// Returns `(header, language hint, body)`: the header (the file-path line) is
 /// markdown; the body is shown as a code block so long lines don't wrap.
 fn format_tool_output(name: &str, output: &str) -> (Option<String>, Option<&'static str>, String) {
+    if name == "edit" {
+        // The panel input already shows the target file, so the header is just
+        // the change count; the hunks render as a code block.
+        return match parse_edit_diff(output) {
+            Some(d) => (Some(format!("+{} −{}", d.additions, d.deletions)), None, d.body),
+            None => (None, None, output.to_string()),
+        };
+    }
     if name != "read" || !output.contains("<path>") {
         return (None, None, output.to_string());
     }
@@ -280,7 +364,7 @@ fn needs_code_block(text: &str) -> bool {
 /// Wrap `text` in a fenced code block so long lines render without wrapping.
 /// The fence is sized longer than any backtick run in the content, so an
 /// embedded ``` can't break out of the block.
-fn fenced_code(text: &str, lang: Option<&str>) -> String {
+pub(crate) fn fenced_code(text: &str, lang: Option<&str>) -> String {
     let max_run = text
         .chars()
         .fold((0usize, 0usize), |(best, run), c| {
@@ -302,8 +386,8 @@ fn fenced_code(text: &str, lang: Option<&str>) -> String {
 
 /// Render a tool's input JSON as human-readable markdown, keyed on the tool
 /// name. Recognized tools get tailored one-liners (bash → the command, read →
-/// the file path, edit → file + a change summary); anything else falls back to
-/// a generic key-value list.
+/// the file path, edit → the file; the edit's actual change comes from its diff
+/// output); anything else falls back to a generic key-value list.
 fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
     // Non-object inputs (a bare path string, a number) just display as-is.
     let obj = match input.as_object() {
@@ -326,17 +410,12 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
             if s.is_empty() { input.to_string() } else { s }
         }
         "edit" => {
-            let file = get("filePath").unwrap_or("?");
-            let old = get("oldString").unwrap_or("");
-            let new = get("newString").unwrap_or("");
-            let mut s = format!("📄 `{}`", file);
-            if !old.is_empty() {
-                s.push_str(&format!("\n- {}", first_chunk(old, 120)));
-            }
-            if !new.is_empty() {
-                s.push_str(&format!("\n+ {}", first_chunk(new, 120)));
-            }
-            s
+            // Only the target file. oldString/newString are near-identical
+            // full-block snapshots (the change is usually a few lines deep in
+            // them), so showing their -/+ first lines reads as duplicated
+            // content and hides the real change — which now comes from the
+            // tool's unified diff (see `parse_edit_diff`).
+            format!("📄 `{}`", get("filePath").unwrap_or("?"))
         }
         "read" | "write" | "glob" | "grep" => {
             let mut parts = Vec::new();
@@ -1775,11 +1854,14 @@ fn dir_card_row(
     vec![text_row, btn_row]
 }
 
-fn truncate_md(text: &str, max_len: usize) -> String {
-    if text.len() <= max_len {
+/// Clip `text` to at most `max_len` characters, appending a "…" marker when it
+/// was cut. Character-counted so CJK content (3 bytes/char) is truncated at the
+/// same visual length as ASCII instead of at a byte budget.
+pub(crate) fn truncate_md(text: &str, max_len: usize) -> String {
+    if text.chars().count() <= max_len {
         text.to_string()
     } else {
-        format!("{}...", text.chars().take(max_len).collect::<String>())
+        format!("{}…", text.chars().take(max_len).collect::<String>())
     }
 }
 
@@ -2607,6 +2689,136 @@ mod tests {
     }
 
     #[test]
+    fn edit_tool_output_reduces_diff_to_hunks() {
+        // A real OpenCode edit diff (from state.metadata.diff). The card should
+        // keep the @@ / + / - lines with the change count and drop the header
+        // noise plus the unchanged context, so a small edit in a large block
+        // doesn't read as two walls of repeated file content.
+        let diff = "\
+Index: /x/src/main.rs
+===================================================================
+--- /x/src/main.rs
++++ /x/src/main.rs
+@@ -10,3 +10,3 @@
+ let a = 1;
+-let b = 2;
++let b = 3;
+ let c = 4;
+\\ No newline at end of file";
+        let (header, lang, body) = format_tool_output("edit", diff);
+        assert_eq!(header.as_deref(), Some("+1 −1"), "count header: {:?}", header);
+        assert_eq!(lang, None, "edit hunks have no language hint");
+        assert!(body.contains("@@ -10,3 +10,3 @@"), "hunk header kept: {}", body);
+        assert!(body.contains("-let b = 2;"), "removed line kept: {}", body);
+        assert!(body.contains("+let b = 3;"), "added line kept: {}", body);
+        assert!(!body.contains("let a = 1;"), "context line dropped: {}", body);
+        assert!(!body.contains("let c = 4;"), "context line dropped: {}", body);
+        assert!(!body.contains("Index:"), "header noise dropped: {}", body);
+        assert!(!body.contains("+++"), "header noise dropped: {}", body);
+    }
+
+    #[test]
+    fn edit_tool_plain_output_passes_through() {
+        // An edit without a parseable diff (running / error text) stays as-is.
+        let raw = "❌ Could not find oldString in the file.";
+        let (header, lang, body) = format_tool_output("edit", raw);
+        assert_eq!(header, None);
+        assert_eq!(lang, None);
+        assert_eq!(body, raw);
+        assert_eq!(parse_edit_diff(raw), None);
+    }
+
+    #[test]
+    fn edit_tool_output_renders_diff_in_panel() {
+        let tool = ToolPanel {
+            name: "edit".into(),
+            status: "completed".into(),
+            input: Some(json!({"filePath": "src/main.rs"})),
+            output: Some(
+                "\
+Index: src/main.rs
+===================================================================
+--- src/main.rs
++++ src/main.rs
+@@ -1,4 +1,4 @@
+ use std::fs;
+-fn main() {}
++fn main() { println!(\"hi\"); }
+"
+                .into(),
+            ),
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        let md = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .expect("panel markdown content");
+        assert!(
+            md.contains("**Input**\n📄 `src/main.rs`"),
+            "file in input: {}",
+            md
+        );
+        assert!(md.contains("**Output**\n+1 −1"), "count header: {}", md);
+        // Hunks render inside a fenced code block (monospace, no wrapping).
+        assert!(md.contains("```\n@@ -1,4 +1,4 @@"), "fenced hunk: {}", md);
+        assert!(md.contains("-fn main() {}"), "removed line: {}", md);
+        assert!(md.contains("+fn main() { println"), "added line: {}", md);
+        assert!(!md.contains("use std::fs;"), "context line dropped: {}", md);
+        assert!(md.contains("\n```"), "closing fence: {}", md);
+    }
+
+    #[test]
+    fn parse_edit_diff_counts_and_tracks_path() {
+        let diff = "\
+Index: /a/b.rs
+===================================================================
+--- /a/b.rs
++++ /a/b.rs
+@@ -1 +1 @@
+-x
++y
+@@ -5,0 +6,2 @@
++z1
++z2";
+        let d = parse_edit_diff(diff).expect("diff parsed");
+        assert_eq!(d.path.as_deref(), Some("/a/b.rs"));
+        assert_eq!(d.additions, 3, "one +y plus two added z lines");
+        assert_eq!(d.deletions, 1);
+        assert_eq!(
+            d.body.lines().filter(|l| l.starts_with("@@")).count(),
+            2,
+            "two hunk header lines: {}",
+            d.body
+        );
+        assert!(!d.body.contains("b.rs"), "header lines not in body");
+    }
+
+    /// A removed line whose own content starts with `--` renders as `--- …` in
+    /// the diff — it must stay a removal (not be dropped as a file header) once
+    /// the parser is past the first `@@` hunk.
+    #[test]
+    fn parse_edit_diff_keeps_dash_prefixed_removed_lines() {
+        let diff = "\
+Index: /a/lua.lua
+===================================================================
+--- /a/lua.lua
++++ /a/lua.lua
+@@ -1,3 +1,3 @@
+--- old comment
++-- new comment
+ return 1
+";
+        let d = parse_edit_diff(diff).expect("diff parsed");
+        assert_eq!(d.additions, 1);
+        assert_eq!(d.deletions, 1);
+        assert!(d.body.contains("--- old comment"), "removal kept: {}", d.body);
+        assert!(d.body.contains("+-- new comment"), "addition kept: {}", d.body);
+        assert!(!d.body.contains("return 1"), "context dropped: {}", d.body);
+    }
+
+    #[test]
     fn read_tool_output_renders_in_panel() {
         let raw = "\
 <path>/x/y.rs</path>
@@ -2794,7 +3006,11 @@ mod tests {
     }
 
     #[test]
-    fn tool_input_edit_shows_file_and_diff() {
+    fn tool_input_edit_shows_only_the_file() {
+        // The oldString/newString preview (the first line of each, both marked
+        // -/+) read as duplicated content and hid the real change, which now
+        // comes from the tool's diff output. The input shows the target file
+        // and nothing else.
         let tool = ToolPanel {
             name: "edit".into(),
             status: "completed".into(),
@@ -2811,8 +3027,18 @@ mod tests {
             .build();
         let text = card.to_string();
         assert!(text.contains("src/main.rs"), "file missing: {}", text);
-        assert!(text.contains("- let a = 1;"), "old line missing: {}", text);
-        assert!(text.contains("+ let a = 2;"), "new line missing: {}", text);
+        assert!(
+            !text.contains("- let a = 1;"),
+            "old preview must not show: {}",
+            text
+        );
+        assert!(
+            !text.contains("+ let a = 2;"),
+            "new preview must not show: {}",
+            text
+        );
+        assert!(!text.contains("oldString"), "raw key leaked: {}", text);
+        assert!(!text.contains("newString"), "raw key leaked: {}", text);
         assert!(!text.contains("filePath"), "raw key leaked: {}", text);
     }
 
@@ -2882,22 +3108,20 @@ mod tests {
         );
     }
 
-    /// Regression: a tool whose input renders as markdown LIST lines (edit's
-    /// `- old`/`+ new`, skill's `- name: ...`) must NOT swallow the Output
-    /// marker as a lazy continuation of the last list line — Feishu then glues
-    /// `**Output**` to the end of the input. A blank line between the sections
-    /// keeps them on separate visual lines.
+    /// Regression: a tool whose input renders as markdown LIST lines (the
+    /// generic fallback `- name: ...`, a skill's metadata list) must NOT swallow
+    /// the Output marker as a lazy continuation of the last list line — Feishu
+    /// then glues `**Output**` to the end of the input. A blank line between
+    /// the sections keeps them on separate visual lines.
     #[test]
     fn tool_panel_input_and_output_separated_by_blank_line() {
         let tool = ToolPanel {
-            name: "edit".into(),
+            name: "skill_apply".into(),
             status: "completed".into(),
             input: Some(json!({
-                "filePath": "src/main.rs",
-                "oldString": "let a = 1;",
-                "newString": "let a = 2;"
+                "skill": "m15",
             })),
-            output: Some("Edited file successfully: src/main.rs".into()),
+            output: Some("applied".into()),
         };
         let card = CardBuilder::new()
             .with_state(CardState::Done)
@@ -2908,14 +3132,14 @@ mod tests {
             .expect("panel markdown content");
         // The last input list line and the Output marker must not be adjacent —
         // a single newline would make `**Output**` a lazy continuation of the
-        // `+ let a = 2;` list item and Feishu would render them on one line.
+        // `- skill: m15` list item and Feishu would render them on one line.
         assert!(
-            md.contains("+ let a = 2;\n\n**Output**\n"),
+            md.contains("- skill: m15\n\n**Output**\n"),
             "Input and Output sections must be separated by a blank line: {:?}",
             md
         );
         assert!(
-            !md.contains("+ let a = 2;\n**Output**"),
+            !md.contains("- skill: m15\n**Output**"),
             "no glued marker: {:?}",
             md
         );
