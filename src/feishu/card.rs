@@ -983,14 +983,13 @@ pub fn question_elements(
                             "name": input_name,
                             // Multiline box instead of the default single line:
                             // the single-line input is a cramped one-row strip
-                            // that types poorly on both PC and mobile. rows:2
-                            // keeps the empty box compact while leaving room
-                            // for a longer typed answer on mobile (where
-                            // auto_resize doesn't apply); auto_resize grows it
-                            // with the text on PC. Callbacks arrive unchanged
+                            // that types poorly on both PC and mobile. rows:1
+                            // starts it at one line; auto_resize grows it with
+                            // the text (Feishu's docs say PC-only, but mobile
+                            // grows too in practice). Callbacks arrive unchanged
                             // via `action.form_value`.
                             "input_type": "multiline_text",
-                            "rows": 2,
+                            "rows": 1,
                             "auto_resize": true,
                             "max_rows": 8,
                             "placeholder": { "tag": "plain_text", "content": "✍️ 输入自定义答案" },
@@ -2621,13 +2620,12 @@ mod tests {
         assert!(form.to_string().contains("input"), "form needs an input");
         assert!(form.to_string().contains("form_action_type"));
         // The custom-answer box is a multiline textarea (better typing on both
-        // PC and mobile than the default single-line input). rows:2 keeps the
-        // empty box compact yet roomier for longer answers on mobile, where
-        // auto_resize doesn't apply.
+        // PC and mobile than the default single-line input). rows:1 starts it
+        // compact; auto_resize grows it with the text.
         let input = form["elements"].as_array().unwrap()[0].clone();
         assert_eq!(input["tag"], "input");
         assert_eq!(input["input_type"], "multiline_text");
-        assert_eq!(input["rows"], 2);
+        assert_eq!(input["rows"], 1);
         assert_eq!(input["auto_resize"], true);
     }
 
