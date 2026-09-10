@@ -983,12 +983,14 @@ pub fn question_elements(
                             "name": input_name,
                             // Multiline box instead of the default single line:
                             // the single-line input is a cramped one-row strip
-                            // that types poorly on both PC and mobile. Rows give
-                            // it room up front; auto_resize grows it with the
-                            // text (PC only, per Feishu's schema). Callbacks
-                            // arrive unchanged via `action.form_value`.
+                            // that types poorly on both PC and mobile. rows:2
+                            // keeps the empty box compact while leaving room
+                            // for a longer typed answer on mobile (where
+                            // auto_resize doesn't apply); auto_resize grows it
+                            // with the text on PC. Callbacks arrive unchanged
+                            // via `action.form_value`.
                             "input_type": "multiline_text",
-                            "rows": 3,
+                            "rows": 2,
                             "auto_resize": true,
                             "max_rows": 8,
                             "placeholder": { "tag": "plain_text", "content": "✍️ 输入自定义答案" },
@@ -1636,12 +1638,13 @@ pub fn build_switch_card(
                 "tag": "input",
                 "name": "search",
                 // Multiline like the question card's custom-answer box: the
-                // single-line input types poorly on PC and mobile alike. rows:2
-                // keeps it compact for a keyword; the submitted text is trimmed
-                // before filtering (see handler.rs) so stray newlines don't
-                // break the match.
+                // single-line input types poorly on PC and mobile alike. rows:1
+                // starts it at one line for a keyword; auto_resize grows it as
+                // the user types. The submitted text is trimmed before
+                // filtering (see handler.rs) so stray newlines don't break the
+                // match.
                 "input_type": "multiline_text",
-                "rows": 2,
+                "rows": 1,
                 "auto_resize": true,
                 "max_rows": 4,
                 "placeholder": { "tag": "plain_text", "content": "🔍 搜索标题 / 目录 / ID" },
@@ -2618,11 +2621,14 @@ mod tests {
         assert!(form.to_string().contains("input"), "form needs an input");
         assert!(form.to_string().contains("form_action_type"));
         // The custom-answer box is a multiline textarea (better typing on both
-        // PC and mobile than the default single-line input).
+        // PC and mobile than the default single-line input). rows:2 keeps the
+        // empty box compact yet roomier for longer answers on mobile, where
+        // auto_resize doesn't apply.
         let input = form["elements"].as_array().unwrap()[0].clone();
         assert_eq!(input["tag"], "input");
         assert_eq!(input["input_type"], "multiline_text");
-        assert!(input["rows"].as_u64().unwrap() >= 2);
+        assert_eq!(input["rows"], 2);
+        assert_eq!(input["auto_resize"], true);
     }
 
     #[test]
