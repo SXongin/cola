@@ -275,13 +275,13 @@ pub fn command_help(name: &str) -> Option<String> {
             "/dir <path> [name]\nSwitch to a project: open a NEW session rooted at <path> (create a session rooted at that directory).\n- `/dir` (no arg) — Recent Directories card: pick a recently-used folder and switch there, or open it as a fresh topic (each row's 建话题 = `/topic <dir>` without typing; only from the main conversation)\nExample: `/dir /root/proj/lib`"
         }
         "switch" => {
-            "/switch [action]\nSession management card and text forms.\n- `/switch` (no arg) — interactive session card (browse / search / adopt / new)\n- `/switch <keyword>` — switch by title/directory/id; the current chat's sessions win, otherwise a unique global match is adopted. Ambiguous keywords list candidates.\n- `/switch list [keyword] [--all]` — list recent sessions across the store (up to 15)\n- `/switch <id|title> [--force]` — take over a session (exact id → id-prefix → title; reject if owned by another chat unless `--force`)\n- `/switch forget` — un-map this chat's session (server session stays)\nExamples: `/switch backend`, `/switch list cola`, `/switch ses_abc --force`"
+            "/switch [action]\nSession management card and text forms.\n- `/switch` (no arg) — interactive session card (browse / search / adopt / new)\n- `/switch <keyword>` — switch by title/directory/id; the current chat's sessions win, otherwise a unique global match is adopted. Ambiguous keywords list candidates.\n- `/switch list [keyword] [--all]` — list recent sessions across the store (up to 15)\n- `/switch <id|title> [--force]` — take over a session (exact id → id-prefix → title; the card's short hash works too; reject if owned by another chat unless `--force`, or use the card's 强制接管 button)\n- `/switch forget` — un-map this chat's session (server session stays)\nExamples: `/switch backend`, `/switch list cola`, `/switch ses_abc --force`"
         }
         "list" => {
             "/switch list [keyword] [--all]\nList recently-active sessions across the shared store (up to 15): title, directory, id and last activity. A keyword filters by title/directory/id; `--all` also shows sub-task child sessions.\nExample: `/switch list cola`"
         }
         "attach" => {
-            "/switch <id|title> [--force]\nTake over a session created outside Feishu into this chat. Resolution: exact id → unique id-prefix → unique title substring. If the session already belongs to another chat, show its owner and reject unless `--force`.\nExample: `/switch ses_abc123`"
+            "/switch <id|title> [--force]\nTake over a session created outside Feishu into this chat. Resolution: exact id → unique id-prefix (the short hash shown on the card works too) → unique title substring. If the session already belongs to another chat, show its owner and reject unless `--force`.\nExample: `/switch ses_abc123`"
         }
         "forget" => {
             "/switch forget\nUn-map this chat's session. The server session stays untouched and can be adopted again.\nExample: `/switch forget`"
@@ -290,7 +290,7 @@ pub fn command_help(name: &str) -> Option<String> {
             "/new [name]\nCreate a fresh session in the current project (the active session's directory); with no active session, the default directory (`work_dir` or cwd). Optionally named (the name is PATCHed server-side); without a name the server generates one after the first message.\nExample: `/new api-refactor`"
         }
         "topic" => {
-            "/topic [dir] [name]\nCreate a real Feishu topic backed by a new session. The topic is UI-separated from the current conversation, so you can switch between topics in the Feishu client. Reply inside the created topic to talk to that session.\n- `/topic` (no args) — new session in the CURRENT PROJECT (the active session's directory, like `/new`; falls back to the default directory when the conversation has no session)\n- `/topic <dir>` — new session rooted at <dir>\n- `/topic <dir> <name>` — also name the session\nExample: `/topic /root/proj/lib api-refactor`\n\n/topic --adopt <keyword> [--force]\nOpen a topic around an EXISTING session instead of creating a new one. Resolution: exact id → unique id-prefix → unique title substring (the whole remaining arg is the keyword, so multi-word titles match). Child (sub-task) sessions are rejected. If the session belongs to another chat, reject unless `--force` (which steals the mapping). No argument pops the session card — each row's 建话题接管 button does the same.\nExample: `/topic --adopt 重写登录模块`"
+            "/topic [dir] [name]\nCreate a real Feishu topic backed by a new session. The topic is UI-separated from the current conversation, so you can switch between topics in the Feishu client. Reply inside the created topic to talk to that session.\n- `/topic` (no args) — new session in the CURRENT PROJECT (the active session's directory, like `/new`; falls back to the default directory when the conversation has no session)\n- `/topic <dir>` — new session rooted at <dir>\n- `/topic <dir> <name>` — also name the session\nExample: `/topic /root/proj/lib api-refactor`\n\n/topic --adopt <keyword> [--force]\nOpen a topic around an EXISTING session instead of creating a new one. Resolution: exact id → unique id-prefix (the short hash shown on the card works too) → unique title substring (the whole remaining arg is the keyword, so multi-word titles match). Child (sub-task) sessions are rejected. If the session belongs to another chat, reject unless `--force` (which steals the mapping). No argument pops the session card — each row's 建话题接管 button does the same, and an occupied session offers a 强制建话题接管 confirmation.\nExample: `/topic --adopt 重写登录模块`"
         }
         "name" => {
             "/name <name>\nRename the current session server-side (visible to every client sharing the store).\nExample: `/name frontend`"
@@ -1564,7 +1564,7 @@ async fn handle_list(
 }
 
 /// Resolution outcome for a session keyword, shared by `/attach` and
-/// `/topic --adopt` (ADR-0016). Exact id wins, then unique id-prefix, then
+/// `/topic --adopt` (ADR-0016). Exact id wins, then unique id match, then
 /// unique title substring — the same order both commands documented.
 enum SessionResolution<'a> {
     /// Exactly one session matched.
@@ -1575,10 +1575,15 @@ enum SessionResolution<'a> {
     None,
 }
 
-/// Resolve a session keyword against the shared store: exact id → unique
-/// id-prefix → unique title substring (shared by `/attach` and
-/// `/topic --adopt`). Child sessions are NOT excluded here — exclusion is a
-/// per-command policy (ADR-0008, ADR-0016).
+/// Resolve a session keyword against the shared store: exact id → unique id
+/// match → unique title substring (shared by `/attach` and `/topic --adopt`).
+/// The id match is tiered, highest precedence first: the full id prefix
+/// (`ses_...`), the bare hash prefix the cards display (`id_tail` strips the
+/// `ses_` prefix, so a copy-pasted card hash has no prefix), then a suffix of
+/// the id's tail. A tier that matches decides before the next is tried, so a
+/// prefix hit is never shadowed by a coincidental suffix hit. Child sessions
+/// are NOT excluded here — exclusion is a per-command policy (ADR-0008,
+/// ADR-0016).
 fn resolve_session<'a>(
     sessions: &'a [crate::opencode::SessionListInfo],
     query: &str,
@@ -1587,15 +1592,32 @@ fn resolve_session<'a>(
     if let Some(s) = sessions.iter().find(|s| s.id == query) {
         return SessionResolution::Hit(s);
     }
-    let prefix: Vec<&crate::opencode::SessionListInfo> = sessions
+    let full_prefix: Vec<&crate::opencode::SessionListInfo> = sessions
         .iter()
         .filter(|s| s.id.to_lowercase().starts_with(&lower))
         .collect();
-    if prefix.len() == 1 {
-        return SessionResolution::Hit(prefix[0]);
+    if let Some(r) = decide_id_hits(full_prefix) {
+        return r;
     }
-    if prefix.len() > 1 {
-        return SessionResolution::Ambiguous(prefix);
+    let bare_prefix: Vec<&crate::opencode::SessionListInfo> = sessions
+        .iter()
+        .filter(|s| {
+            let id = s.id.to_lowercase();
+            id.strip_prefix("ses_").unwrap_or(&id).starts_with(&lower)
+        })
+        .collect();
+    if let Some(r) = decide_id_hits(bare_prefix) {
+        return r;
+    }
+    let suffix: Vec<&crate::opencode::SessionListInfo> = sessions
+        .iter()
+        .filter(|s| {
+            let id = s.id.to_lowercase();
+            id.strip_prefix("ses_").unwrap_or(&id).ends_with(&lower)
+        })
+        .collect();
+    if let Some(r) = decide_id_hits(suffix) {
+        return r;
     }
     let titles: Vec<&crate::opencode::SessionListInfo> = sessions
         .iter()
@@ -1608,6 +1630,16 @@ fn resolve_session<'a>(
         return SessionResolution::Ambiguous(titles);
     }
     SessionResolution::None
+}
+
+/// Turn one id-match tier into a resolution, or `None` when the tier is empty
+/// (so the caller falls through to the next, lower-precedence tier).
+fn decide_id_hits<'a>(hits: Vec<&'a crate::opencode::SessionListInfo>) -> Option<SessionResolution<'a>> {
+    match hits.len() {
+        0 => None,
+        1 => Some(SessionResolution::Hit(hits[0])),
+        _ => Some(SessionResolution::Ambiguous(hits)),
+    }
 }
 
 /// `/attach <id|title> [--force]` — take over an arbitrary server session
@@ -2047,7 +2079,9 @@ async fn adopt_session(
     Ok(())
 }
 
-/// The last 7 characters of a session id (display suffix).
+/// The first 7 characters of a session id with its `ses_` prefix stripped —
+/// the compact display hash on cards. `resolve_session` accepts this bare hash
+/// as a query, so a copy-pasted card hash resolves without the `ses_` prefix.
 pub(crate) fn id_tail(id: &str) -> String {
     id.strip_prefix("ses_").unwrap_or(id).chars().take(7).collect()
 }
@@ -2420,6 +2454,73 @@ mod tests {
     fn plain_text_is_not_command() {
         assert_eq!(parse_command("hello world"), None);
         assert_eq!(parse_command("fix the bug"), None);
+    }
+
+    fn session(id: &str, title: &str) -> crate::opencode::client::SessionListInfo {
+        crate::opencode::client::SessionListInfo {
+            id: id.into(),
+            title: title.into(),
+            directory: "/work/x".into(),
+            parent_id: None,
+            agent: None,
+            model: None,
+            time: None,
+        }
+    }
+
+    /// The hash the cards display (`id_tail`) is the id without its `ses_`
+    /// prefix, so a copy-pasted card hash must resolve — not just a full-id
+    /// prefix. This is the `/switch <hash> --force` path (issue: the toast
+    /// pointed at a command whose ID the user could not obtain).
+    #[test]
+    fn resolve_session_accepts_the_bare_card_hash() {
+        let sessions = vec![
+            session("ses_1a2b3c4d5e6f7g8h9i0j", "A"),
+            session("ses_9z8y7x6w5v4u3t2s1r0q", "B"),
+        ];
+        let shown = id_tail(&sessions[0].id);
+        assert_eq!(shown, "1a2b3c4");
+        match resolve_session(&sessions, &shown) {
+            SessionResolution::Hit(s) => assert_eq!(s.id, sessions[0].id),
+            _ => panic!("the displayed hash must resolve"),
+        }
+    }
+
+    /// Full-id prefix and id-tail suffix both resolve (users quote either end).
+    #[test]
+    fn resolve_session_accepts_prefix_and_suffix() {
+        let sessions = vec![session("ses_1a2b3c4d5e6f7g8h9i0j", "A")];
+        for q in ["ses_1a2b", "1a2b3c4", "h9i0j"] {
+            match resolve_session(&sessions, q) {
+                SessionResolution::Hit(s) => assert_eq!(s.id, sessions[0].id, "query {q}"),
+                _ => panic!("query {q} must resolve"),
+            }
+        }
+    }
+
+    /// Two sessions sharing the displayed hash (a time-prefix collision) list
+    /// candidates instead of silently picking one.
+    #[test]
+    fn resolve_session_reports_ambiguous_hashes() {
+        let sessions = vec![session("ses_1a2b3c4aaaa", "A"), session("ses_1a2b3c4bbbb", "B")];
+        assert!(matches!(
+            resolve_session(&sessions, "1a2b3c4"),
+            SessionResolution::Ambiguous(_)
+        ));
+    }
+
+    /// A prefix hit outranks a coincidental suffix hit: the id-match tiers
+    /// decide in order, so the lower tier never makes the higher one ambiguous.
+    #[test]
+    fn resolve_session_prefers_prefix_over_suffix() {
+        let sessions = vec![
+            session("ses_1a2bXxxxx", "prefix"),
+            session("ses_zzzz1a2b", "suffix"),
+        ];
+        match resolve_session(&sessions, "1a2b") {
+            SessionResolution::Hit(s) => assert_eq!(s.id, "ses_1a2bXxxxx"),
+            _ => panic!("the prefix hit must win"),
+        }
     }
 
     #[test]
