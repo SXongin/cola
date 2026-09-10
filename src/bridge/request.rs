@@ -838,6 +838,12 @@ pub struct RequestFlow {
     /// to today's 3 s cadence; tests store a small value so every branch is
     /// exercisable without sleeping real seconds.
     pub poll_interval_ms: std::sync::atomic::AtomicU64,
+    /// How long (milliseconds) one pending-request list call may take before
+    /// the poll loop gives up on it and retries next tick. Bounds a request
+    /// stuck on a half-open connection (e.g. across a server restart) so one
+    /// hung call cannot freeze the poller forever. Defaults to 30 s; tests
+    /// store a small value so the timeout branch runs without sleeping.
+    pub list_timeout_ms: std::sync::atomic::AtomicU64,
     /// request_id → (card message_id, description) of the card cola sent (used
     /// to mark a card stale when the request is resolved by ANOTHER client).
     pub sent_cards: Arc<Mutex<HashMap<String, (String, String)>>>,
@@ -866,6 +872,7 @@ impl RequestFlow {
         Self {
             kind,
             poll_interval_ms: std::sync::atomic::AtomicU64::new(3000),
+            list_timeout_ms: std::sync::atomic::AtomicU64::new(30_000),
             sent_cards: Arc::new(Mutex::new(HashMap::new())),
             question_requests: Arc::new(Mutex::new(HashMap::new())),
             question_dirs: Arc::new(Mutex::new(HashMap::new())),
@@ -932,7 +939,21 @@ impl RequestFlow {
             let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
             for dir in &directories {
                 let backend = core.opencode.clone().for_directory(dir);
-                match self.kind.list(&backend).await {
+                // Bound the list call: a server restart can leave an in-flight
+                // request on a half-open connection, and without a timeout the
+                // poller would sit on it forever (no cards, no auto-accept).
+                // On timeout the call is cancelled and the next tick retries.
+                let listed = match crate::bridge::bounded_call(
+                    &format!("poll {} ({}) list", self.kind.label(), dir),
+                    self.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
+                    self.kind.list(&backend),
+                )
+                .await
+                {
+                    Some(listed) => listed,
+                    None => continue,
+                };
+                match listed {
                     Ok(requests) => {
                         for req in &requests {
                             pending.insert(req.id().to_string());

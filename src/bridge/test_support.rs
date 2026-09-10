@@ -235,6 +235,16 @@ impl feishu::Platform for RecordingPlatform {
 pub struct MockBackend {
     pub parts: serde_json::Value,
     pub permissions: Vec<opencode::client::PermissionRequest>,
+    /// Number of initial `list_permissions` calls to hang forever — simulates
+    /// an in-flight request stuck on a half-open connection while the server
+    /// restarts. Each hung call decrements the counter; once it reaches zero
+    /// the call serves normally, so a bounded poller recovers on a later poll.
+    pub hang_list_permissions: Arc<std::sync::atomic::AtomicUsize>,
+    /// Same as `hang_list_permissions`, for `list_questions`.
+    pub hang_list_questions: Arc<std::sync::atomic::AtomicUsize>,
+    /// Same as `hang_list_permissions`, for `messages` (the external poller's
+    /// per-session read).
+    pub hang_messages: Arc<std::sync::atomic::AtomicUsize>,
     /// When set, `messages` returns this as a fresh user message (simulates
     /// a message posted from OpenChamber).
     pub external_user_message: Option<String>,
@@ -362,6 +372,9 @@ impl MockBackend {
         Self {
             parts,
             permissions: Vec::new(),
+            hang_list_permissions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hang_list_questions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hang_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             external_user_message: None,
             external_user_messages: std::collections::HashMap::new(),
             cola_user_messages: std::collections::HashMap::new(),
@@ -404,6 +417,17 @@ impl MockBackend {
             session_status_error: None,
             status_busy_once: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+}
+
+/// Test scaffolding: while `counter` is positive, hang this call forever.
+/// Decrements once per hung call, so a later poll (after a caller-side timeout
+/// cancelled the first) serves normally. A future awaiting forever is exactly
+/// the half-open-connection failure mode: only a caller-side timeout can end it.
+async fn hang_if_scripted(counter: &std::sync::atomic::AtomicUsize) {
+    if counter.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        std::future::pending::<()>().await;
     }
 }
 
@@ -543,6 +567,7 @@ impl opencode::Backend for MockBackend {
         &self,
         _session_id: &str,
     ) -> crate::error::Result<Vec<opencode::client::SessionMessage>> {
+        hang_if_scripted(&self.hang_messages).await;
         let now = chrono::Utc::now().timestamp_millis();
         let mut msgs: Vec<opencode::client::SessionMessage> = Vec::new();
         // cola's OWN user message persisting on the store (ADR-0026): id starts
@@ -650,6 +675,7 @@ impl opencode::Backend for MockBackend {
         &self,
         _d: Option<&str>,
     ) -> crate::error::Result<Vec<opencode::client::PermissionRequest>> {
+        hang_if_scripted(&self.hang_list_permissions).await;
         let replied = self.replied_permissions.lock().await;
         let mut out: Vec<_> = self
             .permissions
@@ -667,6 +693,7 @@ impl opencode::Backend for MockBackend {
         &self,
         _d: Option<&str>,
     ) -> crate::error::Result<Vec<opencode::client::QuestionRequest>> {
+        hang_if_scripted(&self.hang_list_questions).await;
         let replied = self.replied_questions.lock().await;
         Ok(self
             .questions
@@ -1615,6 +1642,157 @@ pub(crate) mod integration_tests {
         );
     }
 
+    /// A poll that hangs on the backend list call (a half-open connection left
+    /// by a server restart) must not freeze the poller forever: the list call
+    /// is bounded, so a later poll still surfaces pending requests.
+    #[tokio::test]
+    async fn permission_poller_recovers_when_a_list_call_hangs() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.permissions = vec![opencode::client::PermissionRequest {
+            request_id: "per_hung".into(),
+            session_id: Some("ses_test".into()),
+            permission: Some("bash".into()),
+            patterns: vec!["ls -la".into()],
+            metadata: None,
+            always: Vec::new(),
+        }];
+        // The first list call hangs forever, like a request in flight when the
+        // server was SIGTERM'd; later calls serve normally.
+        backend
+            .hang_list_permissions
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let (app, _platform) = build_app(cfg, backend).await;
+
+        // Seed a session + accumulator so the poller has a reply target.
+        app.handle_message(incoming(
+            "msg_1".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "hi".into(),
+            None,
+        ))
+        .await;
+
+        tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.permission
+                    .poll_interval_ms
+                    .store(20, std::sync::atomic::Ordering::Relaxed);
+                app.permission
+                    .list_timeout_ms
+                    .store(50, std::sync::atomic::Ordering::Relaxed);
+                let _ = app.permission.poll_loop(&app.core).await;
+            }
+        });
+
+        // Without a bound on the list call the poller sits on the first hung
+        // call forever and the permission never surfaces.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let surfaced = app
+                .cards
+                .lock()
+                .await
+                .get("ses_test")
+                .map(|c| {
+                    c.acc
+                        .pending_permissions
+                        .iter()
+                        .any(|p| p.request_id == "per_hung")
+                })
+                .unwrap_or(false);
+            if surfaced {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "poller never recovered from the hung list call"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The question kind rides the same poll loop, so the recovery guarantee
+    /// must hold for it too: a hung `list_questions` (half-open connection
+    /// after a server restart) cannot freeze the question poller.
+    #[tokio::test]
+    async fn question_poller_recovers_when_a_list_call_hangs() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.questions = vec![opencode::client::QuestionRequest {
+            id: "que_hung".into(),
+            session_id: "ses_test".into(),
+            questions: vec![opencode::client::QuestionInfo {
+                question: "继续吗？".into(),
+                header: "下一步".into(),
+                options: vec![opencode::client::QuestionOption {
+                    label: "继续".into(),
+                    description: String::new(),
+                }],
+                multiple: None,
+                custom: None,
+            }],
+        }];
+        // The first list call hangs forever, like a request in flight when the
+        // server was SIGTERM'd; later calls serve normally.
+        backend
+            .hang_list_questions
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let (app, _platform) = build_app(cfg, backend).await;
+
+        // Seed a session + accumulator so the poller has a reply target.
+        app.handle_message(incoming(
+            "msg_1".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "hi".into(),
+            None,
+        ))
+        .await;
+
+        tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.question
+                    .poll_interval_ms
+                    .store(20, std::sync::atomic::Ordering::Relaxed);
+                app.question
+                    .list_timeout_ms
+                    .store(50, std::sync::atomic::Ordering::Relaxed);
+                let _ = app.question.poll_loop(&app.core).await;
+            }
+        });
+
+        // Without a bound on the list call the poller sits on the first hung
+        // call forever and the question never surfaces.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let surfaced = app
+                .cards
+                .lock()
+                .await
+                .get("ses_test")
+                .map(|c| c.acc.pending_questions.iter().any(|q| q.request_id == "que_hung"))
+                .unwrap_or(false);
+            if surfaced {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "question poller never recovered from the hung list call"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// Clicking "开启自动授权" on a permission card turns on the session's
     /// Auto-Accept (cola-side `/autoaccept`) AND approves the current pending
     /// permission — all without posting a new message. The backend sees the
@@ -2037,6 +2215,79 @@ pub(crate) mod integration_tests {
             "notification should preview the message: {}",
             notify
         );
+    }
+
+    /// A hung `messages` read (a half-open connection left by a server
+    /// restart) must not freeze the external poller forever: the read is
+    /// bounded, so a later poll still notifies about the external message.
+    #[tokio::test]
+    async fn external_poller_recovers_when_messages_hangs() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut mock = MockBackend::new(realistic_parts());
+        mock.external_user_message = Some("OpenChamber 里发的消息".to_string());
+        // The first `messages` call hangs forever, like a request in flight
+        // when the server was SIGTERM'd; later calls serve normally.
+        mock.hang_messages.store(1, std::sync::atomic::Ordering::SeqCst);
+        let (app, platform) = build_app(cfg, mock).await;
+
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
+                session_id: "ses_ext".into(),
+                directory: "/tmp/ext".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+                topic_root: None,
+                variant: None,
+            });
+            store.persist().unwrap();
+        }
+        // Baseline: a minute ago, so the fresh user message is "new".
+        let watermark = chrono::Utc::now().timestamp_millis() - 60_000;
+        app.external
+            .last_user_msg_epoch
+            .lock()
+            .await
+            .insert("ses_ext".into(), watermark);
+
+        app.external
+            .poll_interval_ms
+            .store(20, std::sync::atomic::Ordering::Relaxed);
+        app.external
+            .request_timeout_ms
+            .store(50, std::sync::atomic::Ordering::Relaxed);
+        tokio::spawn({
+            let app = app.clone();
+            async move {
+                let _ = app.external.poll_loop(&app.core).await;
+            }
+        });
+
+        // Without a bound on `messages` the poller sits on the first hung call
+        // forever and the notification never arrives.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let notified = platform.calls.lock().await.iter().any(|c| {
+                matches!(
+                    c,
+                    PlatformCall::SendCard { card, .. }
+                        if card.to_string().contains("有新消息")
+                )
+            });
+            if notified {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "external poller never recovered from the hung messages call"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     /// ADR-0026 regression (observed 2026-09-09): when a server dies mid-turn and

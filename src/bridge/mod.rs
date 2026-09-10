@@ -18,6 +18,26 @@ pub use handler::App;
 use crate::feishu::client::ImageAttachment;
 use async_trait::async_trait;
 
+/// Bound one backend call by a timeout. `None` means the call timed out
+/// (already logged): the caller moves on and retries on its next tick.
+/// Background pollers use this so a single request stuck on a half-open
+/// connection (e.g. across a server restart) cannot freeze the loop forever.
+/// Total-timeout-free by design — a prompt POST legitimately runs for many
+/// minutes, so only the calls that can afford to give up are bounded.
+pub(crate) async fn bounded_call<T>(
+    what: &str,
+    timeout_ms: u64,
+    fut: impl std::future::Future<Output = crate::error::Result<T>>,
+) -> Option<crate::error::Result<T>> {
+    match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), fut).await {
+        Ok(result) => Some(result),
+        Err(_) => {
+            tracing::warn!("{} timed out after {}ms — retrying next tick", what, timeout_ms);
+            None
+        }
+    }
+}
+
 /// A Feishu message as delivered into the bridge, already parsed by the
 /// platform layer into its prompt-relevant parts. Carries the reply linkage
 /// (`parent_id`) and any downloaded images so the bridge can build Quoted
