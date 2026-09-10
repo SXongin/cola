@@ -5,9 +5,22 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
+    groups:
+      # Semver-compatible patch/minor bumps land as one PR. Major bumps stay
+      # separate, since they may need code migration.
+      cargo-patch-minor:
+        update-types:
+          - patch
+          - minor
 
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
+    groups:
+      # Actions are pinned to major tags (v4, v2, ...), so group them all into
+      # a single PR rather than one PR per action.
+      github-actions:
+        patterns:
+          - "*"
