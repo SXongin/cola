@@ -55,7 +55,13 @@ fn build_http_client(username: &Option<String>, password: &Option<String>) -> re
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(reqwest::header::CONTENT_TYPE, "application/json".parse().unwrap());
 
-    let mut builder = reqwest::Client::builder().default_headers(headers);
+    let mut builder = reqwest::Client::builder()
+        .default_headers(headers)
+        // Bound TCP connect only — NOT a total request timeout. A prompt POST
+        // legitimately runs for many minutes, and a total timeout would abort
+        // real turns. Long waits on an established connection are bounded by
+        // the callers that can afford to give up (e.g. the request poller).
+        .connect_timeout(std::time::Duration::from_secs(10));
 
     if let (Some(user), Some(pass)) = (username, password) {
         let auth = format!("{}:{}", user, pass);
