@@ -138,6 +138,24 @@ fn reject_nested_topic(thread_key: &ThreadKey) -> Option<CardActionResult> {
     })
 }
 
+/// A display label for the Chat/Topic that owns a session, for the force-confirm
+/// card: the chat's display name (falling back to its id), with `（话题）` when
+/// the owner is a Topic rather than the Chat lobby. Vocabulary per CONTEXT.md —
+/// the Feishu side is a Chat/Topic, never a "conversation".
+async fn owner_label(core: &Arc<SharedCore>, owner_key: &ThreadKey) -> String {
+    let chat_name = core
+        .feishu
+        .chat_name(&owner_key.chat_id)
+        .await
+        .unwrap_or(None)
+        .unwrap_or_else(|| owner_key.chat_id.clone());
+    if owner_key.thread_id != owner_key.chat_id {
+        format!("{chat_name}（话题）")
+    } else {
+        chat_name
+    }
+}
+
 impl App {
     pub fn new(
         cfg: Config,
@@ -939,11 +957,13 @@ impl App {
                     toast: None,
                 })
             }
-            "adopt" => {
-                // Adopt/switch the target session into this thread. Unlike the
-                // text `/switch <id>`, the card carries no `--force`: a session
-                // owned by another thread is rejected with a Toast (the owner
-                // chat is shown for the user to resolve).
+            "adopt" | "force_adopt" => {
+                // Adopt/switch the target session into this thread. The plain
+                // `adopt` op carries no `--force`: an occupied session patches
+                // the card to the force-confirm card, whose `force_adopt`
+                // button re-enters here. `force_adopt` skips the owner check and
+                // lets the adoption's `set_active` steal the mapping.
+                let force = op == "force_adopt";
                 let sessions = core.cached_session_list().await.ok()?;
                 let target = sessions.iter().find(|s| s.id == session_id)?.clone();
                 let already_active = {
@@ -966,122 +986,47 @@ impl App {
                         toast: Some("已在当前会话".to_string()),
                     });
                 }
-                // Mapped to another thread → reject (no --force from the card).
-                let owner = {
-                    let store = core.sessions.lock().await;
-                    store.thread_for_session(&target.id)
-                };
-                if let Some(ref owner_key) = owner
-                    && owner_key != &thread_key
-                {
-                    let chat_name = core
-                        .feishu
-                        .chat_name(&owner_key.chat_id)
-                        .await
-                        .unwrap_or(None)
-                        .unwrap_or_else(|| owner_key.chat_id.clone());
-                    return Some(CardActionResult {
-                        card: None,
-                        toast: Some(format!(
-                            "该会话被 {} 占用，请先请对方解除，或用 `/switch <ID> --force`",
-                            chat_name
-                        )),
-                    });
+                if !force {
+                    let owner = {
+                        let store = core.sessions.lock().await;
+                        store.thread_for_session(&target.id)
+                    };
+                    if let Some(owner_key) = owner
+                        && owner_key != thread_key
+                    {
+                        let owner_label = owner_label(core, &owner_key).await;
+                        return Some(CardActionResult {
+                            card: Some(crate::feishu::card::build_force_confirm_card(
+                                &thread_key,
+                                &target,
+                                &owner_label,
+                                "force_adopt",
+                                "强制接管",
+                                scope,
+                            )),
+                            toast: Some(format!("该会话被 {} 占用，请确认是否强制接管", owner_label)),
+                        });
+                    }
                 }
                 // ADR-0028 one-card rule: the switch card's OWN message becomes
                 // the confirmation — the ack patches the list card in place to
-                // the snapshot (接管 for a first adopt, 切换 for a mapped
-                // re-switch; a mapped re-switch with nothing to report patches
-                // to a compact 已切换 state card instead of a full snapshot).
-                // After the early returns above, `owner` is either `None`
-                // (unmapped → first adopt) or this thread itself (→ 切换).
+                // the snapshot.
                 let open_message_id = value
                     .get("open_message_id")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                let mapped_to_this_thread = owner.is_some();
-                let verb = if mapped_to_this_thread { "切换" } else { "接管" };
-                // `claim_data` is the snapshot's claimable pendings: claimed
-                // against the patched card once the ack result is assembled,
-                // so the poll loop never duplicates the embedded blocks.
-                let (card, claim_data) = if mapped_to_this_thread {
-                    let data = crate::bridge::snapshot::gather_snapshot(
-                        &core.opencode,
-                        &target.id,
-                        &target.directory,
-                    )
-                    .await;
-                    match crate::bridge::snapshot::re_switch_emit(&data) {
-                        crate::bridge::snapshot::SnapshotEmit::Full => {
-                            let (card, data) = crate::bridge::command::snapshot_card_from_data(
-                                core,
-                                "切换",
-                                &target.title,
-                                data,
-                            )
-                            .await;
-                            (card, Some(data))
-                        }
-                        crate::bridge::snapshot::SnapshotEmit::Suppressed => (
-                            crate::feishu::snapshot_card::build_switched_state_card(
-                                &target.title,
-                                &target.id,
-                                &target.directory,
-                            ),
-                            None,
-                        ),
-                    }
-                } else {
-                    let (card, data) = crate::bridge::command::snapshot_card_for(core, "接管", &target).await;
-                    (card, Some(data))
-                };
-                // In a topic the patched card lives INSIDE it, so persist its
-                // own message id as the fallback-card anchor (same anchor
-                // semantics as the text in-topic adopt, ADR-0028): later
-                // permission/question cards reply to it and stay in the topic.
-                let topic_anchor = if thread_key.thread_id != thread_key.chat_id {
-                    open_message_id.clone()
-                } else {
-                    None
-                };
-                let entry = crate::config::SessionEntry {
-                    thread_key: thread_key.clone(),
-                    session_id: target.id.clone(),
-                    directory: target.directory.clone(),
-                    agent: target.agent.clone(),
-                    model: None,
-                    auto_accept: false,
-                    topic_anchor,
-                    topic_root: None,
-                    variant: None,
-                };
-                {
-                    let mut store = core.sessions.lock().await;
-                    store.set_active(entry);
-                    if let Err(e) = store.persist() {
-                        tracing::warn!("switch card adopt: persist failed: {}", e);
-                    }
-                }
-                core.invalidate_session_list_cache().await;
-                if let (Some(message_id), Some(data)) = (&open_message_id, &claim_data) {
-                    crate::bridge::external::settle_snapshot_after_send(
-                        core,
-                        message_id,
-                        verb,
-                        &target.title,
-                        data,
-                    )
-                    .await;
-                }
-                let toast = format!(
-                    "已{verb}「{}」",
-                    crate::bridge::command::title_or_id_tail(&target)
-                );
-                Some(CardActionResult {
-                    card: Some(card),
-                    toast: Some(toast),
-                })
+                Some(
+                    self.apply_card_adoption(core, &thread_key, &target, open_message_id)
+                        .await,
+                )
             }
+            "back" => Some(CardActionResult {
+                card: Some(
+                    self.build_switch_card_for(core, &thread_key, &keyword, scope)
+                        .await,
+                ),
+                toast: None,
+            }),
             "new" => {
                 // Fresh session in the current project (equivalent to `/new`).
                 let directory = core.current_project_directory(&thread_key).await;
@@ -1133,18 +1078,21 @@ impl App {
                     toast: None,
                 })
             }
-            "topic_adopt" => {
+            "topic_adopt" | "force_topic_adopt" => {
                 // "建话题接管" (ADR-0016): open a NEW Feishu topic around an
                 // existing session, in one gesture from the session card. The
                 // topic anchors on the card's own message (`open_message_id`,
                 // threaded through by `extract_card_action_value`), so fallback
-                // cards can reply inside it. No `--force` from the card: a
-                // session owned by another thread is rejected with a Toast.
+                // cards can reply inside it. The plain `topic_adopt` op patches
+                // an occupied session to the force-confirm card (强制建话题接管),
+                // whose `force_topic_adopt` button re-enters here and skips the
+                // owner check.
                 // A topic can only be created from a non-topic message
                 // (ADR-0006, ADR-0025): the session card may legally open in a
                 // never-bound topic, but its topic op must not nest there —
                 // same guard as the `/dir` card's "建话题" op and the text
                 // `/topic --adopt` forms.
+                let force = op == "force_topic_adopt";
                 if let Some(rejection) = reject_nested_topic(&thread_key) {
                     return Some(rejection);
                 }
@@ -1163,66 +1111,32 @@ impl App {
                         toast: Some("子任务会话不支持接管".to_string()),
                     });
                 }
-                let owner = {
-                    let store = core.sessions.lock().await;
-                    store.thread_for_session(&target.id)
-                };
-                if let Some(owner_key) = owner
-                    && owner_key != thread_key
-                {
-                    let chat_name = core
-                        .feishu
-                        .chat_name(&owner_key.chat_id)
-                        .await
-                        .unwrap_or(None)
-                        .unwrap_or_else(|| owner_key.chat_id.clone());
-                    return Some(CardActionResult {
-                        card: None,
-                        toast: Some(format!(
-                            "会话被 {} 占用，请用 `/topic --adopt <ID> --force`",
-                            chat_name
-                        )),
-                    });
+                if !force {
+                    let owner = {
+                        let store = core.sessions.lock().await;
+                        store.thread_for_session(&target.id)
+                    };
+                    if let Some(owner_key) = owner
+                        && owner_key != thread_key
+                    {
+                        let owner_label = owner_label(core, &owner_key).await;
+                        return Some(CardActionResult {
+                            card: Some(crate::feishu::card::build_force_confirm_card(
+                                &thread_key,
+                                &target,
+                                &owner_label,
+                                "force_topic_adopt",
+                                "强制建话题接管",
+                                scope,
+                            )),
+                            toast: Some(format!("会话被 {} 占用，请确认是否强制接管", owner_label)),
+                        });
+                    }
                 }
-                // Create a topic anchored on the card message and map the
-                // adopted session to the new topic's ThreadKey (shared with the
-                // text `/topic --adopt` form, ADR-0016).
-                let new_thread_id = match crate::bridge::command::create_topic_and_map_adopted(
-                    core,
-                    &thread_key,
-                    &target,
-                    &open_message_id,
+                Some(
+                    self.topic_adopt_target(core, &thread_key, &target, &open_message_id, &keyword, scope)
+                        .await,
                 )
-                .await
-                {
-                    Ok(Some(id)) => id,
-                    Ok(None) => {
-                        return Some(CardActionResult {
-                            card: None,
-                            toast: Some("创建话题失败（未返回 thread_id）".to_string()),
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!("switch card topic_adopt: create topic failed: {}", e);
-                        return Some(CardActionResult {
-                            card: None,
-                            toast: Some("创建话题失败".to_string()),
-                        });
-                    }
-                };
-                tracing::info!(
-                    "switch card topic_adopt: created topic {} for session {} in chat {}",
-                    new_thread_id,
-                    target.id,
-                    thread_key.chat_id
-                );
-                Some(CardActionResult {
-                    card: Some(
-                        self.build_switch_card_for(core, &thread_key, &keyword, scope)
-                            .await,
-                    ),
-                    toast: Some("已建话题接管".to_string()),
-                })
             }
             _ => None,
         }
@@ -1248,6 +1162,143 @@ impl App {
             active_id.as_deref(),
             &mapped_ids,
         )
+    }
+
+    /// The adoption tail shared by the card's 接管/切换 and 强制接管 ops: build
+    /// the Session Snapshot (or the compact suppressed-切换 state card,
+    /// ADR-0028), persist the new active entry, and settle the snapshot's
+    /// claimed pendings. The returned card patches the clicked card in place
+    /// (ADR-0028 one-card rule), so no second message is sent.
+    ///
+    /// The steal is `set_active`'s: it removes any existing entry with this
+    /// session id, so a `force_adopt` from another thread leaves that owner
+    /// sessionless there. No pre-remove — if the snapshot work failed, the old
+    /// mapping would otherwise be lost for nothing.
+    async fn apply_card_adoption(
+        &self,
+        core: &Arc<SharedCore>,
+        thread_key: &ThreadKey,
+        target: &crate::opencode::SessionListInfo,
+        open_message_id: Option<String>,
+    ) -> CardActionResult {
+        let mapped_to_this_thread = {
+            let store = core.sessions.lock().await;
+            store.thread_for_session(&target.id).as_ref() == Some(thread_key)
+        };
+        let verb = if mapped_to_this_thread { "切换" } else { "接管" };
+        // `claim_data` is the snapshot's claimable pendings: claimed against
+        // the patched card once the ack result is assembled, so the poll loop
+        // never duplicates the embedded blocks.
+        let (card, claim_data) = if mapped_to_this_thread {
+            let data =
+                crate::bridge::snapshot::gather_snapshot(&core.opencode, &target.id, &target.directory).await;
+            match crate::bridge::snapshot::re_switch_emit(&data) {
+                crate::bridge::snapshot::SnapshotEmit::Full => {
+                    let (card, data) =
+                        crate::bridge::command::snapshot_card_from_data(core, "切换", &target.title, data)
+                            .await;
+                    (card, Some(data))
+                }
+                crate::bridge::snapshot::SnapshotEmit::Suppressed => (
+                    crate::feishu::snapshot_card::build_switched_state_card(
+                        &target.title,
+                        &target.id,
+                        &target.directory,
+                    ),
+                    None,
+                ),
+            }
+        } else {
+            let (card, data) = crate::bridge::command::snapshot_card_for(core, "接管", target).await;
+            (card, Some(data))
+        };
+        // In a topic the patched card lives INSIDE it, so persist its own
+        // message id as the fallback-card anchor (same anchor semantics as the
+        // text in-topic adopt, ADR-0028): later permission/question cards reply
+        // to it and stay in the topic.
+        let topic_anchor = if thread_key.thread_id != thread_key.chat_id {
+            open_message_id.clone()
+        } else {
+            None
+        };
+        let entry = crate::config::SessionEntry {
+            thread_key: thread_key.clone(),
+            session_id: target.id.clone(),
+            directory: target.directory.clone(),
+            agent: target.agent.clone(),
+            model: None,
+            auto_accept: false,
+            topic_anchor,
+            topic_root: None,
+            variant: None,
+        };
+        {
+            let mut store = core.sessions.lock().await;
+            store.set_active(entry);
+            if let Err(e) = store.persist() {
+                tracing::warn!("switch card adopt: persist failed: {}", e);
+            }
+        }
+        core.invalidate_session_list_cache().await;
+        if let (Some(message_id), Some(data)) = (&open_message_id, &claim_data) {
+            crate::bridge::external::settle_snapshot_after_send(core, message_id, verb, &target.title, data)
+                .await;
+        }
+        CardActionResult {
+            card: Some(card),
+            toast: Some(format!(
+                "已{verb}「{}」",
+                crate::bridge::command::title_or_id_tail(target)
+            )),
+        }
+    }
+
+    /// The topic-creation tail shared by the card's 建话题接管 and
+    /// 强制建话题接管 ops: open a topic anchored on the card message and map
+    /// the adopted session to the new topic's `ThreadKey` (shared with the text
+    /// `/topic --adopt` form, ADR-0016), then refresh the list card in place.
+    async fn topic_adopt_target(
+        self: &Arc<Self>,
+        core: &Arc<SharedCore>,
+        thread_key: &ThreadKey,
+        target: &crate::opencode::SessionListInfo,
+        open_message_id: &str,
+        keyword: &str,
+        scope: crate::bridge::command::SwitchScope,
+    ) -> CardActionResult {
+        let new_thread_id = match crate::bridge::command::create_topic_and_map_adopted(
+            core,
+            thread_key,
+            target,
+            open_message_id,
+        )
+        .await
+        {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                return CardActionResult {
+                    card: None,
+                    toast: Some("创建话题失败（未返回 thread_id）".to_string()),
+                };
+            }
+            Err(e) => {
+                tracing::warn!("switch card topic_adopt: create topic failed: {}", e);
+                return CardActionResult {
+                    card: None,
+                    toast: Some("创建话题失败".to_string()),
+                };
+            }
+        };
+        tracing::info!(
+            "switch card topic_adopt: created topic {} for session {} in chat {}",
+            new_thread_id,
+            target.id,
+            thread_key.chat_id
+        );
+        CardActionResult {
+            card: Some(self.build_switch_card_for(core, thread_key, keyword, scope).await),
+            toast: Some("已建话题接管".to_string()),
+        }
     }
 
     /// Rebuild the `/dir` Recent Directories card for a thread.

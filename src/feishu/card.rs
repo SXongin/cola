@@ -1783,6 +1783,92 @@ pub fn build_switch_card(
     })
 }
 
+/// The confirmation card shown when a `/switch` card op targets a session owned
+/// by ANOTHER chat. The row buttons deliberately carry no `--force` (ADR-0016),
+/// so the occupied case used to dead-end in a Toast pointing at a text command
+/// whose ID the card never displays. This card turns it into one more click:
+/// `force_op` re-enters the handler with the full session id and steals the
+/// mapping; `back` rebuilds the session list. `force_label` is the op-specific
+/// verb (强制接管 / 强制建话题接管).
+pub fn build_force_confirm_card(
+    thread_key: &crate::config::ThreadKey,
+    target: &crate::opencode::client::SessionListInfo,
+    owner_name: &str,
+    force_op: &str,
+    force_label: &str,
+    scope: crate::bridge::command::SwitchScope,
+) -> serde_json::Value {
+    let label = crate::bridge::command::title_or_id_tail(target);
+    let back_btn = json!({
+        "tag": "button",
+        "text": { "tag": "plain_text", "content": "返回列表" },
+        "type": "default",
+        "value": {
+            "action": "switch",
+            "op": "back",
+            "chat_id": thread_key.chat_id,
+            "thread_id": thread_key.thread_id,
+            "scope": scope.as_str(),
+        },
+    });
+    let force_btn = json!({
+        "tag": "button",
+        "text": { "tag": "plain_text", "content": force_label },
+        "type": "danger",
+        "value": {
+            "action": "switch",
+            "op": force_op,
+            "chat_id": thread_key.chat_id,
+            "thread_id": thread_key.thread_id,
+            "session_id": target.id,
+            "scope": scope.as_str(),
+        },
+    });
+    json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true },
+        "header": {
+            "title": { "tag": "plain_text", "content": "⚠️ 会话已被占用" },
+            "template": "orange"
+        },
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": format!(
+                        "**{label}** 正被 **{owner_name}** 使用。\n`{}` · `{}`",
+                        target.directory,
+                        crate::bridge::command::id_tail(&target.id)
+                    )
+                },
+                {
+                    "tag": "markdown",
+                    "content": "强制接管后，原来的聊天/话题会失去这个会话（需要重新选择）。"
+                },
+                {
+                    "tag": "column_set",
+                    "flex_mode": "bisect",
+                    "horizontal_spacing": "default",
+                    "columns": [
+                        {
+                            "tag": "column",
+                            "width": "auto",
+                            "vertical_align": "center",
+                            "elements": [ force_btn ]
+                        },
+                        {
+                            "tag": "column",
+                            "width": "auto",
+                            "vertical_align": "center",
+                            "elements": [ back_btn ]
+                        }
+                    ]
+                }
+            ]
+        }
+    })
+}
+
 /// The `/dir` Recent Directories card (no-arg form): one directory per entry,
 /// capped at [`MAX_SWITCH_ROWS`]. Each entry is two rows — a full-width text
 /// row (directory path, marked `当前` when it is the thread's active session
