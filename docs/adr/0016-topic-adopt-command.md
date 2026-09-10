@@ -32,9 +32,10 @@ Extend `/topic` with an adopt mode:
   `/switch` card) with a per-row "建话题接管" button.
 - **`--force`** — a standalone token, symmetric with `/switch <id> --force`.
   The text form honors it (steals a session mapped to another thread, the other
-  thread becomes sessionless); the card form does not (occupied sessions are
-  rejected with a Toast pointing at the text form). Users learn about `--force`
-  on first rejection, exactly as with `/switch` today.
+  thread becomes sessionless); the card form was originally reject-only
+  (occupied sessions Toast at the text form). **Superseded by ADR-0029**: the
+  card's 建话题接管 now patches to a 强制建话题接管 confirm card that steals on
+  a second click.
 - **Child sessions** are always rejected (`parentID` set), matching OpenChamber
   which does not allow driving sub-task sessions. The server technically allows
   `POST /session/{id}/message` on a child, but it is a task-derived temporary

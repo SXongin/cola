@@ -35,8 +35,9 @@ backing session is an **existing** server session, in one gesture.
     `event.action.open_message_id` through into the value.
   - `handle_switch_card_action` (src/bridge/handler.rs): handle the new op by
     `reply_in_thread` off the card's `open_message_id`, then map to the new
-    topic key. No `--force` from the card — occupied sessions Toast and point at
-    the text form.
+    topic key. Originally no `--force` from the card — occupied sessions Toast
+    and point at the text form; **superseded by ADR-0029** (the card patches to
+    a 强制建话题接管 confirm card).
 - Stealing an actively-driven session with `--force` needs no extra check.
 - Update `/help` topic entry, the README Commands list, and the card footer if
   it advertises the topic form.
