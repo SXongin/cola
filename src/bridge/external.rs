@@ -20,6 +20,12 @@ pub struct ExternalFlow {
     /// External poll cadence (ms). Defaults to today's 8 s; tests store a small
     /// value so every loop branch runs without sleeping real seconds.
     pub poll_interval_ms: std::sync::atomic::AtomicU64,
+    /// How long (ms) one backend call in the poll loop may take before it is
+    /// abandoned and retried on the next tick. Bounds a request stuck on a
+    /// half-open connection (e.g. across a server restart) so one hung call
+    /// cannot freeze the poller forever. Defaults to 30 s; tests store a small
+    /// value so the timeout branch runs without sleeping.
+    pub request_timeout_ms: std::sync::atomic::AtomicU64,
     /// External-reply render poll cadence (ms).
     pub render_poll_ms: std::sync::atomic::AtomicU64,
     /// How long the external-reply renderer waits for a reply before giving up
@@ -34,6 +40,7 @@ impl ExternalFlow {
         Self {
             last_user_msg_epoch: Arc::new(Mutex::new(HashMap::new())),
             poll_interval_ms: std::sync::atomic::AtomicU64::new(8_000),
+            request_timeout_ms: std::sync::atomic::AtomicU64::new(30_000),
             render_poll_ms: std::sync::atomic::AtomicU64::new(1_500),
             render_timeout_ms: std::sync::atomic::AtomicU64::new(600_000),
         }
@@ -103,7 +110,13 @@ impl ExternalFlow {
                 if core.inflight.lock().await.contains(&sid) {
                     continue;
                 }
-                let Ok(msgs) = core.opencode.messages(&sid).await else {
+                let Some(Ok(msgs)) = crate::bridge::bounded_call(
+                    "external poll messages",
+                    self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
+                    core.opencode.messages(&sid),
+                )
+                .await
+                else {
                     continue;
                 };
                 // The newest user message overall decides this poll. Its author
@@ -147,16 +160,18 @@ impl ExternalFlow {
                     drop(map);
                     tracing::info!("External message on session {}: {}", sid, preview);
                     // The card title is the server's session title (ADR-0007)
-                    // — fetched on demand, never a cola-side name.
-                    let title = core
-                        .opencode
-                        .clone()
-                        .for_directory(&directory)
-                        .session_info(&sid)
-                        .await
-                        .ok()
-                        .and_then(|i| i.title)
-                        .unwrap_or_default();
+                    // — fetched on demand, never a cola-side name. Bounded like
+                    // the poll's other calls so a hung read cannot freeze the
+                    // notify path either.
+                    let title = crate::bridge::bounded_call(
+                        "external poll session_info",
+                        self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
+                        core.opencode.clone().for_directory(&directory).session_info(&sid),
+                    )
+                    .await
+                    .and_then(|r| r.ok())
+                    .and_then(|i| i.title)
+                    .unwrap_or_default();
                     let card = crate::feishu::card::build_external_message_card(&title, &preview);
                     // A topic session must be reached by replying to a
                     // message INSIDE the topic (the create API rejects
@@ -219,15 +234,18 @@ impl ExternalFlow {
                 .unwrap_or_default()
         };
         // Card subtitle: the server's live title (ADR-0007), or the id-tail.
-        let title = core
-            .opencode
-            .clone()
-            .for_directory(session_dir.as_str())
-            .session_info(session_id)
-            .await
-            .ok()
-            .and_then(|i| i.title)
-            .unwrap_or_default();
+        let title = crate::bridge::bounded_call(
+            "external render session_info",
+            self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
+            core.opencode
+                .clone()
+                .for_directory(session_dir.as_str())
+                .session_info(session_id),
+        )
+        .await
+        .and_then(|r| r.ok())
+        .and_then(|i| i.title)
+        .unwrap_or_default();
         let clean = crate::feishu::card::clean_session_label(&title);
         let id_tail: String = session_id
             .strip_prefix("ses_")
