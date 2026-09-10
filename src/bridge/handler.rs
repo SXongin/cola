@@ -1013,12 +1013,13 @@ impl App {
                     .await;
                     match crate::bridge::snapshot::re_switch_emit(&data) {
                         crate::bridge::snapshot::SnapshotEmit::Full => {
-                            let data = crate::bridge::request::claimable_pendings(core, data).await;
-                            let card = crate::feishu::snapshot_card::build_snapshot_card(
+                            let (card, data) = crate::bridge::command::snapshot_card_from_data(
+                                core,
                                 "切换",
                                 &target.title,
-                                &data,
-                            );
+                                data,
+                            )
+                            .await;
                             (card, Some(data))
                         }
                         crate::bridge::snapshot::SnapshotEmit::Suppressed => (
