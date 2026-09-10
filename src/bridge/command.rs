@@ -1909,8 +1909,21 @@ pub(crate) async fn snapshot_card_for(
     info: &crate::opencode::SessionListInfo,
 ) -> (serde_json::Value, crate::bridge::snapshot::SnapshotData) {
     let data = crate::bridge::snapshot::gather_snapshot(&core.opencode, &info.id, &info.directory).await;
+    snapshot_card_from_data(core, verb, &info.title, data).await
+}
+
+/// ADR-0028: the filter+build half of [`snapshot_card_for`] — restrict the
+/// gathered data to the claimable pendings and build the card. Shared by the
+/// switch-card 切换 op, which gathers first (the suppression decision needs
+/// the raw data) and then filters, so the two surfaces cannot drift.
+pub(crate) async fn snapshot_card_from_data(
+    core: &Arc<SharedCore>,
+    verb: &str,
+    title: &str,
+    data: crate::bridge::snapshot::SnapshotData,
+) -> (serde_json::Value, crate::bridge::snapshot::SnapshotData) {
     let data = crate::bridge::request::claimable_pendings(core, data).await;
-    let card = crate::feishu::snapshot_card::build_snapshot_card(verb, &info.title, &data);
+    let card = crate::feishu::snapshot_card::build_snapshot_card(verb, title, &data);
     (card, data)
 }
 

@@ -375,7 +375,9 @@ impl ExternalFlow {
         // The snapshot's identity rides as static text (same choice as the
         // 👤 preview in `start_reply_render`): the header verb 已接管 stays
         // visible while the turn streams, and the 最近对话 tail keeps the
-        // context that the static layout showed.
+        // verbatim context the static layout showed (spec: tail verbatim).
+        // `push_text` chunks long text, and the card splitter breaks overflow
+        // into continuation cards, so no truncation happens here.
         let mut static_text = format!(
             "已{verb} {}（正在继续该会话的回合，有新进展会自动更新）",
             crate::feishu::snapshot_card::display_title(title, session_id)
@@ -383,8 +385,17 @@ impl ExternalFlow {
         if !data.tail.is_empty() {
             static_text.push_str("\n\n**最近对话**");
             for entry in &data.tail {
-                let (role, preview) = crate::feishu::snapshot_card::tail_preview(entry);
-                static_text.push_str(&format!("\n{role} {preview}"));
+                let role = match entry.role.as_str() {
+                    "user" => "👤",
+                    "assistant" => "🤖",
+                    _ => "💬",
+                };
+                let text = if entry.text.trim().is_empty() {
+                    "（空消息）".to_string()
+                } else {
+                    entry.text.clone()
+                };
+                static_text.push_str(&format!("\n{role} {text}"));
             }
         }
         acc.push_text(&static_text);
