@@ -31,7 +31,7 @@ async-trait = "0.1"
 indexmap = "2"
 sysinfo = "0.39"
 semver = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 tempfile = "3"
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]

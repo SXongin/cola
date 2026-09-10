@@ -203,7 +203,7 @@ pub async fn check() -> anyhow::Result<UpdateCheck> {
 fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    format!("{:x}", hasher.finalize())
+    hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 /// The expected sha256 hex for `asset_name` in a `sha256sum`-format file
