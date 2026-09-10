@@ -12,12 +12,26 @@ tap-to-answer cards.
 
 ### 1. Install
 
-Download the prebuilt binary from the [latest GitHub
-release](https://github.com/SXongin/cola/releases/latest) and put it on your
-`PATH` — **in a user-writable directory** (`~/.local/bin` is ideal). cola's
-self-update replaces its own binary in place, which a root-owned path like
-`/usr/local/bin` would block. Or build from source (Rust toolchain, edition
-2024): `cargo build --release`.
+Download the archive for your platform from the [latest GitHub
+release](https://github.com/SXongin/cola/releases/latest) and put the binary on
+your `PATH` — **in a user-writable directory**. cola's self-update replaces its
+own binary in place, which a root-owned path like `/usr/local/bin` would block:
+
+| Platform | Release asset | Install to |
+| --- | --- | --- |
+| Linux x86_64 | `cola-<version>-x86_64-unknown-linux-gnu.tar.gz` | `~/.local/bin` |
+| macOS (Apple Silicon) | `cola-<version>-aarch64-apple-darwin.tar.gz` | `~/.local/bin` |
+| Windows x86_64 | `cola-<version>-x86_64-pc-windows-msvc.zip` | `%LOCALAPPDATA%\Programs\cola` |
+
+- **macOS**: the binary is unsigned — clear the quarantine flag after
+  extracting (`xattr -d com.apple.quarantine ~/.local/bin/cola`). There is no
+  Intel build; Intel users must build from source.
+- **Windows**: extract `cola.exe`, add the install directory to your user
+  `PATH` (via the Environment Variables dialog), then reopen the terminal.
+  `AppData\Local` is user-writable and not roamed, unlike `AppData\Roaming`.
+
+Or build from source (Rust toolchain, edition 2024): `cargo build --release`.
+The [user guide](docs/user-guide.md#install) explains each choice in detail.
 
 You also need an `opencode` binary on `PATH` (see <https://opencode.ai>); cola
 starts and manages its own server, but the binary must be runnable.
@@ -65,6 +79,9 @@ guide](docs/user-guide.md#configuration).
 ```bash
 nohup cola >/dev/null 2>&1 &
 ```
+
+On Windows there is no `nohup` — run `start /b cola`, or use
+`cola autostart enable` to keep it running.
 
 cola attaches to an already-running `opencode serve` on the shared store
 (so sessions stay shared with OpenChamber / the CLI), and lazily starts its own
