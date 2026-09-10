@@ -20,18 +20,41 @@ resolves everything from `~/.cola` regardless of the working directory.
 
 ## Install
 
-Download the prebuilt binary from the [latest GitHub
-release](https://github.com/SXongin/cola/releases/latest) and put it on your
-`PATH`.
+Download the archive for your platform from the [latest GitHub
+release](https://github.com/SXongin/cola/releases/latest) and put the binary on
+your `PATH`, in a user-writable directory:
 
-**Install into a user-writable directory — `~/.local/bin` is the sweet spot.**
-cola's self-update replaces its own binary in place (`/update`, `cola update`),
-which requires write permission on the binary's directory. In a root-owned
-location like `/usr/local/bin` cola runs fine but **cannot update itself** (you
-would have to replace it manually each release).
+| Platform | Release asset | Install to |
+| --- | --- | --- |
+| Linux x86_64 | `cola-<version>-x86_64-unknown-linux-gnu.tar.gz` | `~/.local/bin` |
+| macOS (Apple Silicon) | `cola-<version>-aarch64-apple-darwin.tar.gz` | `~/.local/bin` |
+| Windows x86_64 | `cola-<version>-x86_64-pc-windows-msvc.zip` | `%LOCALAPPDATA%\Programs\cola` |
 
-If you build from source (`cargo build --release`), `cargo install --path .`
-also places it in a user-writable directory.
+**Why a user-writable directory?** cola's self-update replaces its own binary
+in place (`/update`, `cola update`), which requires write permission on the
+binary's directory. In a root-owned location like `/usr/local/bin` (or
+`C:\Program Files`) cola runs fine but **cannot update itself** — you would
+have to replace it manually each release.
+
+**macOS.** The release build is Apple Silicon (`aarch64`) only: every Mac sold
+since late 2020 is ARM, and macOS 26 Tahoe is the last macOS release supporting
+Intel Macs. An `aarch64` binary cannot run on an Intel Mac (Rosetta translates
+x86→ARM, not the reverse) — Intel users can build from source. The downloaded
+binary is unsigned, so clear Gatekeeper's quarantine flag after extracting:
+
+    xattr -d com.apple.quarantine ~/.local/bin/cola
+
+**Windows.** Prefer `%LOCALAPPDATA%\Programs\cola` over `%USERPROFILE%\bin`:
+`AppData\Local` is user-writable and **not roamed**, unlike `AppData\Roaming`
+(which would sync a binary through a domain roaming profile), and `Programs\`
+is the convention per-user apps use. Extract `cola.exe`, add the directory to
+your user `PATH` (Settings → System → About → Advanced system settings →
+Environment Variables), and reopen the terminal.
+
+**Other platforms.** There is no prebuilt asset for Linux aarch64 or Intel
+macOS; self-update reports "no asset for this platform" instead of failing.
+Build from source (Rust toolchain, edition 2024): `cargo build --release`;
+`cargo install --path .` also places the binary in a user-writable directory.
 
 Also make sure an `opencode` binary is on `PATH` — cola discovers and spawns it.
 The autostart launcher snapshots your `PATH` at `cola autostart enable` time, so
