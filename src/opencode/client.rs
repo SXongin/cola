@@ -75,6 +75,23 @@ fn build_http_client(username: &Option<String>, password: &Option<String>) -> re
     builder.build().expect("failed to build reqwest client")
 }
 
+/// Apply the shared policy for a request-reply endpoint's response: a 404
+/// means the request was already resolved elsewhere — benign and expected (a
+/// double-click, another client, or a click replayed after a cola restart) —
+/// so it maps to `BridgeError::NotFound`, which the bridge renders as a
+/// neutral "already handled" card rather than a failure. Any other error
+/// status stays a real failure. Shared by the permission and question reply
+/// endpoints so their behaviour cannot drift apart.
+fn check_reply_status(resp: reqwest::Response, what: &str, request_id: &str) -> crate::error::Result<()> {
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(crate::error::BridgeError::NotFound(format!(
+            "{what} {request_id}"
+        )));
+    }
+    resp.error_for_status()?;
+    Ok(())
+}
+
 impl Clone for Client {
     fn clone(&self) -> Self {
         Self {
@@ -401,12 +418,8 @@ impl Client {
         if let Some(d) = directory {
             url.query_pairs_mut().append_pair("directory", d);
         }
-        self.http()
-            .post(url)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?;
+        let resp = self.http().post(url).json(&body).send().await?;
+        check_reply_status(resp, "permission", request_id)?;
         Ok(())
     }
 
@@ -573,12 +586,8 @@ impl Client {
         if let Some(d) = directory {
             url.query_pairs_mut().append_pair("directory", d);
         }
-        self.http()
-            .post(url)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?;
+        let resp = self.http().post(url).json(&body).send().await?;
+        check_reply_status(resp, "question", request_id)?;
         Ok(())
     }
 
@@ -628,7 +637,8 @@ impl Client {
         if let Some(d) = directory {
             url.query_pairs_mut().append_pair("directory", d);
         }
-        self.http().post(url).send().await?.error_for_status()?;
+        let resp = self.http().post(url).send().await?;
+        check_reply_status(resp, "question", request_id)?;
         Ok(())
     }
 

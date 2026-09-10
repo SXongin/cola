@@ -12,6 +12,13 @@ pub enum BridgeError {
     #[error("session not found: {0}")]
     SessionNotFound(String),
 
+    /// The addressed request/resource no longer exists on the backend (a
+    /// request-reply endpoint returned 404). Distinct from `SessionNotFound`:
+    /// this is the benign "already resolved elsewhere" case, not a stale
+    /// session mapping.
+    #[error("not found: {0}")]
+    NotFound(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -35,6 +42,18 @@ impl BridgeError {
     pub fn is_session_not_found(&self) -> bool {
         match self {
             BridgeError::SessionNotFound(_) => true,
+            BridgeError::Http(e) => e.status() == Some(reqwest::StatusCode::NOT_FOUND),
+            _ => false,
+        }
+    }
+
+    /// True when the backend reported the addressed request/resource no longer
+    /// exists — a 404, or the dedicated `NotFound` variant a request-reply
+    /// endpoint maps one to. A resolved-elsewhere permission/question is a
+    /// benign outcome, not a failure.
+    pub fn is_not_found(&self) -> bool {
+        match self {
+            BridgeError::NotFound(_) => true,
             BridgeError::Http(e) => e.status() == Some(reqwest::StatusCode::NOT_FOUND),
             _ => false,
         }

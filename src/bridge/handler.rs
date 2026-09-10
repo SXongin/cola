@@ -100,6 +100,7 @@ impl crate::bridge::EventSink for App {
 /// 200830) and an optional client Toast for instant feedback. `card: None` means
 /// "keep the current card" — used when an interaction was answered inline inside
 /// the streaming card, which re-renders itself on the next poll.
+#[derive(Clone)]
 pub struct CardActionResult {
     pub card: Option<serde_json::Value>,
     pub toast: Option<String>,

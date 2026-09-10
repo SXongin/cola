@@ -251,8 +251,7 @@ impl RequestKind for PermissionKind {
                     .directory_for_session(session_id)
                     .unwrap_or_default(),
             };
-            if !flow.is_answered(core, req_id).await {
-                flow.mark_answered(core, req_id).await;
+            if flow.try_mark_answered(core, req_id).await {
                 let approved = core.set_auto_accept(session_id, &dir, true).await;
                 // Drop every inline section the toggle just approved (not just
                 // the clicked one) so the streaming card re-renders without
@@ -270,42 +269,60 @@ impl RequestKind for PermissionKind {
                 r.card = None;
             }
             r.toast = Some("已开启自动授权".to_string());
+            // Re-served verbatim to a losing double-click.
+            flow.remember_answered_result(req_id, &r).await;
             return Some(r);
         }
 
-        // Double-click guard: once answered, a second click only re-serves the
-        // result.
-        if !flow.is_answered(core, req_id).await {
-            flow.mark_answered(core, req_id).await;
-            // Route the reply to the instance owning the session. The card
-            // carries the owning directory (ADR-0010); without it the reply
-            // can't be routed, so surface the failure instead of guessing at
-            // the server cwd instance.
-            let reply_result = match directory {
-                Some(dir) => {
-                    core.opencode
-                        .clone()
-                        .for_directory(dir)
-                        .reply_permission(req_id, reply)
-                        .await
-                }
-                None => Err(crate::error::BridgeError::OpenCode(
-                    "permission card carries no directory".into(),
-                )),
-            };
-            if let Err(e) = reply_result {
-                // The request is probably already resolved by another client (e.g.
-                // OpenChamber) — show feedback instead of leaving the user with a
-                // dead card and no response.
+        // Double-click guard: the atomic claim decides who replies. A click
+        // that loses the race re-serves the winning click's result; only the
+        // winner may reach the backend.
+        if !flow.try_mark_answered(core, req_id).await {
+            return flow.answered_result(req_id).await;
+        }
+        // Route the reply to the instance owning the session. The card
+        // carries the owning directory (ADR-0010); without it the reply
+        // can't be routed, so surface the failure instead of guessing at
+        // the server cwd instance.
+        let reply_result = match directory {
+            Some(dir) => {
+                core.opencode
+                    .clone()
+                    .for_directory(dir)
+                    .reply_permission(req_id, reply)
+                    .await
+            }
+            None => Err(crate::error::BridgeError::OpenCode(
+                "permission card carries no directory".into(),
+            )),
+        };
+        match reply_result {
+            Ok(()) => {
+                tracing::info!("Permission reply sent: {} session={}", reply, req_id);
+                drop_surfaced(flow, core, host, &[req_id.to_string()]).await;
+            }
+            // 404: the permission is already resolved — by another client,
+            // or by a click replayed after a restart cleared the in-memory
+            // guard. Benign: keep the claim, drop its surfaced section, and
+            // show the neutral handled card.
+            Err(e) if e.is_not_found() => {
+                tracing::info!("Permission already resolved: {}", e);
+                drop_surfaced(flow, core, host, &[req_id.to_string()]).await;
+                let r = already_handled_result(self.label(), inline, "该权限已处理");
+                flow.remember_answered_result(req_id, &r).await;
+                return Some(r);
+            }
+            // Genuine failure (network, routing): roll the claim back so a
+            // retry can reply again.
+            Err(e) => {
                 tracing::error!("perm reply failed: {}", e);
+                flow.unmark_answered(core, req_id).await;
                 return Some(failed_result_card(
                     inline,
-                    "该权限请求可能已在其他端处理。",
-                    "可能已在其他端处理",
+                    "该权限请求处理失败，请重试。",
+                    "处理失败，请重试",
                 ));
             }
-            tracing::info!("Permission reply sent: {} session={}", reply, req_id);
-            drop_surfaced(flow, core, host, &[req_id.to_string()]).await;
         }
         // Result card: shows the decision, no buttons.
         let label = if !perm_label.is_empty() { perm_label } else { reply };
@@ -324,6 +341,7 @@ impl RequestKind for PermissionKind {
             r.card = None;
         }
         r.toast = Some(toast);
+        flow.remember_answered_result(req_id, &r).await;
         Some(r)
     }
 }
@@ -477,12 +495,14 @@ impl RequestKind for QuestionKind {
                 // A request is submitted ONLY when every question has an answer
                 // (`reply_question` expects all of them).
                 if flow.is_answered(core, req_id).await {
-                    // finalized before (double-click): replay the result.
-                    let mut r = result_card("✅ 已回答", "green", "已提交 AI 的问题答案。");
-                    if inline {
-                        r.card = None;
-                    }
-                    return Some(r);
+                    // Finalized before (double-click): re-serve the winning
+                    // click's result, falling back to the generic ack while it
+                    // is still in flight.
+                    return Some(
+                        flow.answered_result(req_id)
+                            .await
+                            .unwrap_or_else(|| question_replay_card(inline)),
+                    );
                 }
                 let n = {
                     let reqs = flow.question_requests.lock().await;
@@ -562,28 +582,28 @@ impl RequestKind for QuestionKind {
                     pq.done = done.clone();
                 }
                 if answered_count == n {
-                    // All questions answered → submit the whole request.
-                    flow.mark_answered(core, req_id).await;
-                    // The questions are needed for the completion card, so
-                    // capture them before `remove_question` drops the request.
-                    let questions = flow.questions_of(req_id).await;
-                    let answers: Vec<Vec<String>> = flow
-                        .question_partial
-                        .lock()
-                        .await
-                        .remove(req_id)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|a| a.unwrap_or_default())
-                        .collect();
-                    flow.remove_question(req_id).await;
-                    if let Err(e) = reply_question_scoped(core, req_id, Some(&answers), directory).await {
-                        tracing::error!("question reply failed: {}", e);
-                        return Some(failed_result_card(
-                            inline,
-                            "该问题可能已在其他端回答。",
-                            "可能已在其他端回答",
-                        ));
+                    // All questions answered → claim the request and submit.
+                    // The claim is atomic: a click that loses the race re-serves
+                    // the winning result instead of replying again.
+                    if !flow.try_mark_answered(core, req_id).await {
+                        return Some(
+                            flow.answered_result(req_id)
+                                .await
+                                .unwrap_or_else(|| question_replay_card(inline)),
+                        );
+                    }
+                    let (questions, answers) = question_snapshot(flow, req_id).await;
+                    if let Some(r) = settle_question_reply(
+                        flow,
+                        core,
+                        req_id,
+                        self.label(),
+                        reply_question_scoped(core, req_id, Some(&answers), directory).await,
+                        inline,
+                    )
+                    .await
+                    {
+                        return Some(r);
                     }
                     tracing::info!(
                         "Question answered: {} session={} -> {:?}",
@@ -591,7 +611,6 @@ impl RequestKind for QuestionKind {
                         value.get("session_id").and_then(|v| v.as_str()).unwrap_or(""),
                         answers
                     );
-                    flow.sent_cards.lock().await.remove(req_id);
                     if inline
                         && let Some(acc) = core
                             .cards
@@ -610,6 +629,8 @@ impl RequestKind for QuestionKind {
                     if inline {
                         flush_inline_card(core, host, session_id).await;
                     }
+                    // Re-served verbatim to a losing double-click.
+                    flow.remember_answered_result(req_id, &r).await;
                     Some(r)
                 } else if inline {
                     // Inline: the streaming card re-renders with the updated
@@ -675,34 +696,27 @@ impl RequestKind for QuestionKind {
             }
             "submit" => {
                 // Finalize with whatever was answered (empty for the rest).
-                if flow.is_answered(core, req_id).await {
-                    let mut r = result_card("✅ 已回答", "green", "已提交 AI 的问题答案。");
-                    if inline {
-                        r.card = None;
-                    }
-                    return Some(r);
+                // Atomic claim: a click that loses the race re-serves the
+                // winning result.
+                if !flow.try_mark_answered(core, req_id).await {
+                    return Some(
+                        flow.answered_result(req_id)
+                            .await
+                            .unwrap_or_else(|| question_replay_card(inline)),
+                    );
                 }
-                flow.mark_answered(core, req_id).await;
-                // The questions are needed for the completion card, so capture
-                // them before `remove_question` drops the request.
-                let questions = flow.questions_of(req_id).await;
-                let answers: Vec<Vec<String>> = flow
-                    .question_partial
-                    .lock()
-                    .await
-                    .remove(req_id)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|a| a.unwrap_or_default())
-                    .collect();
-                flow.remove_question(req_id).await;
-                if let Err(e) = reply_question_scoped(core, req_id, Some(&answers), directory).await {
-                    tracing::error!("question reply failed: {}", e);
-                    return Some(failed_result_card(
-                        inline,
-                        "该问题可能已在其他端回答。",
-                        "可能已在其他端回答",
-                    ));
+                let (questions, answers) = question_snapshot(flow, req_id).await;
+                if let Some(r) = settle_question_reply(
+                    flow,
+                    core,
+                    req_id,
+                    self.label(),
+                    reply_question_scoped(core, req_id, Some(&answers), directory).await,
+                    inline,
+                )
+                .await
+                {
+                    return Some(r);
                 }
                 tracing::info!(
                     "Question submitted: {} session={} -> {:?}",
@@ -728,29 +742,35 @@ impl RequestKind for QuestionKind {
                 if inline {
                     flush_inline_card(core, host, session_id).await;
                 }
+                // Re-served verbatim to a losing double-click.
+                flow.remember_answered_result(req_id, &r).await;
                 Some(r)
             }
             "reject" => {
-                if flow.is_answered(core, req_id).await {
-                    let mut r = result_card("🚫 已拒绝回答", "red", "已拒绝回答 AI 的问题。");
-                    if inline {
-                        r.card = None;
-                    }
+                // Atomic claim: a click that loses the race re-serves the
+                // winning result.
+                if !flow.try_mark_answered(core, req_id).await {
+                    return Some(flow.answered_result(req_id).await.unwrap_or_else(|| {
+                        let mut r = result_card("🚫 已拒绝回答", "red", "已拒绝回答 AI 的问题。");
+                        if inline {
+                            r.card = None;
+                        }
+                        r
+                    }));
+                }
+                if let Some(r) = settle_question_reply(
+                    flow,
+                    core,
+                    req_id,
+                    self.label(),
+                    reply_question_scoped(core, req_id, None, directory).await,
+                    inline,
+                )
+                .await
+                {
                     return Some(r);
                 }
-                flow.mark_answered(core, req_id).await;
-                if let Err(e) = reply_question_scoped(core, req_id, None, directory).await {
-                    tracing::error!("question reject failed: {}", e);
-                    return Some(failed_result_card(
-                        inline,
-                        "该问题可能已在其他端回答。",
-                        "可能已在其他端回答",
-                    ));
-                }
                 tracing::info!("Question rejected: {}", req_id);
-                flow.question_partial.lock().await.remove(req_id);
-                flow.remove_question(req_id).await;
-                flow.sent_cards.lock().await.remove(req_id);
                 if inline
                     && let Some(acc) = core
                         .cards
@@ -769,6 +789,8 @@ impl RequestKind for QuestionKind {
                 if inline {
                     flush_inline_card(core, host, session_id).await;
                 }
+                // Re-served verbatim to a losing double-click.
+                flow.remember_answered_result(req_id, &r).await;
                 Some(r)
             }
             _ => None,
@@ -865,6 +887,12 @@ pub struct RequestFlow {
     /// can only auto-submit once every question is finalized (single-select
     /// clicked, multi-select confirmed via its 确定该题 button).
     pub question_toggles: Arc<Mutex<QuestionPartial>>,
+    /// request_id → the WINNING click's result. A losing click re-serves this
+    /// instead of rendering its own decision — otherwise a rapid second click
+    /// on a different button (允许一次 vs 总是允许) would flip the card to a
+    /// decision the backend never received. In-memory like the claim set on
+    /// `core.answered_requests`, and one card per answered request.
+    answered_results: Arc<Mutex<HashMap<String, CardActionResult>>>,
 }
 
 impl RequestFlow {
@@ -878,18 +906,48 @@ impl RequestFlow {
             question_dirs: Arc::new(Mutex::new(HashMap::new())),
             question_partial: Arc::new(Mutex::new(HashMap::new())),
             question_toggles: Arc::new(Mutex::new(HashMap::new())),
+            answered_results: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// The double-click guard primitive: whether `req_id` was already answered
-    /// (the shared `answered_requests` set).
+    /// The double-click guard's read-only check: whether `req_id` was already
+    /// answered. Used to re-serve a result to a late click; the atomic
+    /// [`Self::try_mark_answered`] is what decides who may reply.
     pub(crate) async fn is_answered(&self, core: &Arc<SharedCore>, req_id: &str) -> bool {
         core.answered_requests.lock().await.contains(req_id)
     }
 
-    /// The double-click guard primitive: record `req_id` as answered.
-    pub(crate) async fn mark_answered(&self, core: &Arc<SharedCore>, req_id: &str) {
-        core.answered_requests.lock().await.insert(req_id.to_string());
+    /// Atomically claim `req_id` for this click: `true` when it was not yet
+    /// answered (this click may reply), `false` when another click already
+    /// claimed it (re-serve the first result, never reply again). The
+    /// check-and-insert happens under ONE lock, so two near-simultaneous clicks
+    /// cannot both win the way the old `is_answered` + `mark_answered` pair
+    /// could.
+    pub(crate) async fn try_mark_answered(&self, core: &Arc<SharedCore>, req_id: &str) -> bool {
+        core.answered_requests.lock().await.insert(req_id.to_string())
+    }
+
+    /// Roll back a claim made by [`Self::try_mark_answered`] after a GENUINE
+    /// reply failure, so the user can retry. A benign 404 ("already resolved")
+    /// keeps the claim — the request really is gone.
+    pub(crate) async fn unmark_answered(&self, core: &Arc<SharedCore>, req_id: &str) {
+        core.answered_requests.lock().await.remove(req_id);
+    }
+
+    /// Record the winning click's result so a click that loses the guard race
+    /// re-serves the SAME result instead of rendering its own decision (which
+    /// could disagree with what actually reached the backend).
+    pub(crate) async fn remember_answered_result(&self, req_id: &str, result: &CardActionResult) {
+        self.answered_results
+            .lock()
+            .await
+            .insert(req_id.to_string(), result.clone());
+    }
+
+    /// The winning click's result, if it has settled. `None` while the winner
+    /// is still in flight — the losing click then renders a generic replay.
+    pub(crate) async fn answered_result(&self, req_id: &str) -> Option<CardActionResult> {
+        self.answered_results.lock().await.get(req_id).cloned()
     }
 
     /// Drop a question request's in-flight state once it is finalized: the
@@ -1185,6 +1243,97 @@ fn failed_result_card(inline: bool, body: &str, toast: &str) -> CardActionResult
     r
 }
 
+/// The neutral result for a request the backend no longer has (404): it was
+/// already resolved — by another client, or by a click replayed after a cola
+/// restart cleared the in-memory guard. NOT a failure, so it must never render
+/// the red failure card. Reuses the stale-card body so both "resolved
+/// elsewhere" paths look identical.
+fn already_handled_result(kind: &str, inline: bool, toast: &str) -> CardActionResult {
+    let mut r = CardActionResult {
+        card: Some(crate::feishu::card::build_resolved_elsewhere_card(kind, "")),
+        toast: Some(toast.to_string()),
+    };
+    if inline {
+        r.card = None;
+    }
+    r
+}
+
+/// The generic "already answered" replay a losing question click gets when the
+/// winning click's result is not recorded yet (it is still in flight).
+fn question_replay_card(inline: bool) -> CardActionResult {
+    let mut r = result_card("✅ 已回答", "green", "已提交 AI 的问题答案。");
+    if inline {
+        r.card = None;
+    }
+    r
+}
+
+/// Capture a question request's questions and its current answers for the
+/// completion card and the reply payload. The answers are CLONED, not
+/// consumed: a genuine reply failure rolls the guard claim back and the state
+/// must stay intact so the click can be retried.
+async fn question_snapshot(
+    flow: &RequestFlow,
+    req_id: &str,
+) -> (Vec<opencode::client::QuestionInfo>, Vec<Vec<String>>) {
+    let questions = flow.questions_of(req_id).await;
+    let answers = flow
+        .question_partial
+        .lock()
+        .await
+        .get(req_id)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| a.unwrap_or_default())
+        .collect();
+    (questions, answers)
+}
+
+/// Apply a question reply's outcome to the guard and the in-flight state:
+/// - `Ok`: the reply landed — drop the request's partial/remembered/card
+///   state and return `None` (the caller renders its completion card).
+/// - 404: resolved elsewhere — drop the state, remember the neutral card (so a
+///   losing click re-serves it) and return it.
+/// - other: genuine failure — keep the state, roll the claim back for a retry,
+///   and return the failure card.
+async fn settle_question_reply(
+    flow: &RequestFlow,
+    core: &Arc<SharedCore>,
+    req_id: &str,
+    kind: &str,
+    result: crate::error::Result<()>,
+    inline: bool,
+) -> Option<CardActionResult> {
+    match result {
+        Ok(()) => {
+            flow.question_partial.lock().await.remove(req_id);
+            flow.remove_question(req_id).await;
+            flow.sent_cards.lock().await.remove(req_id);
+            None
+        }
+        Err(e) if e.is_not_found() => {
+            tracing::info!("Question already resolved: {}", e);
+            flow.question_partial.lock().await.remove(req_id);
+            flow.remove_question(req_id).await;
+            flow.sent_cards.lock().await.remove(req_id);
+            let r = already_handled_result(kind, inline, "该问题已处理");
+            flow.remember_answered_result(req_id, &r).await;
+            Some(r)
+        }
+        Err(e) => {
+            tracing::error!("question reply failed: {}", e);
+            flow.unmark_answered(core, req_id).await;
+            Some(failed_result_card(
+                inline,
+                "该问题处理失败，请重试。",
+                "处理失败，请重试",
+            ))
+        }
+    }
+}
+
 /// Body of the completion card for a standalone question request: EVERY
 /// question with the answer(s) the user gave, so the finished card keeps the
 /// full Q&A instead of echoing only the last clicked answer (which used to be
@@ -1215,6 +1364,12 @@ fn qa_completion_body(
 /// and strip their sections from the host streaming card's inline accumulator.
 /// A single request passes one id; the Auto-Accept toggle passes every id it
 /// approved so all inline sections re-render away at once.
+///
+/// When an inline section was actually stripped, the host card is re-rendered
+/// immediately: a permission-blocked prompt produces no new parts, so the
+/// render poll would otherwise leave the resolved section (and its still-live
+/// buttons) on the Feishu card until the AI resumes — or forever, if the turn
+/// was stopped. Same reason the question paths flush explicitly.
 async fn drop_surfaced(flow: &RequestFlow, core: &Arc<SharedCore>, host: &Option<String>, ids: &[String]) {
     {
         let mut sent = flow.sent_cards.lock().await;
@@ -1222,10 +1377,17 @@ async fn drop_surfaced(flow: &RequestFlow, core: &Arc<SharedCore>, host: &Option
             sent.remove(id);
         }
     }
+    let mut dropped_inline = false;
     if let Some(host) = host
         && let Some(acc) = core.cards.lock().await.get_mut(host).map(|c| &mut c.acc)
     {
+        let before = acc.pending_permissions.len();
         acc.pending_permissions.retain(|p| !ids.contains(&p.request_id));
+        dropped_inline = acc.pending_permissions.len() != before;
+    }
+    if dropped_inline {
+        // `dropped_inline` implies `host` is Some; the fallback is unused.
+        flush_inline_card(core, host, host.as_deref().unwrap_or_default()).await;
     }
 }
 

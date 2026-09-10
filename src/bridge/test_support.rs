@@ -282,6 +282,16 @@ pub struct MockBackend {
     /// `list_permissions` like the real server drops a replied request. A test
     /// simulating resolution by ANOTHER client inserts the id here directly.
     pub replied_permissions: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    /// When true, `reply_permission` reports the request as already gone (404):
+    /// simulates a click replayed after the request was resolved elsewhere (or
+    /// after a cola restart cleared the in-memory guard).
+    pub reply_permission_not_found: bool,
+    /// Number of initial `reply_permission` calls to fail with a genuine
+    /// (non-404) error — tests the guard rollback that lets the user retry.
+    pub fail_reply_permission_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// When true, `reply_question`/`reject_question` report the request as
+    /// already gone (404), like a question resolved elsewhere.
+    pub reply_question_not_found: bool,
     /// Requests a test adds AFTER the app is built (simulating a request that
     /// arrives after the snapshot was sent, ADR-0028).
     pub extra_permissions: Arc<tokio::sync::Mutex<Vec<opencode::client::PermissionRequest>>>,
@@ -384,6 +394,9 @@ impl MockBackend {
             external_user_created: Arc::new(std::sync::Mutex::new(None)),
             reply_permission_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             replied_permissions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            reply_permission_not_found: false,
+            fail_reply_permission_count: std::sync::atomic::AtomicUsize::new(0).into(),
+            reply_question_not_found: false,
             extra_permissions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             session_titles: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             questions: Vec::new(),
@@ -417,6 +430,27 @@ impl MockBackend {
             session_status_error: None,
             status_busy_once: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Shared recording/error policy for the question reply endpoints: record
+    /// the call, honor a scripted 404, then mark the request replied (like the
+    /// real server drops a replied request from the pending list).
+    async fn record_question_reply(
+        &self,
+        request_id: &str,
+        answers: Vec<Vec<String>>,
+    ) -> crate::error::Result<()> {
+        self.reply_question_calls
+            .lock()
+            .await
+            .push((request_id.to_string(), answers));
+        if self.reply_question_not_found {
+            return Err(crate::error::BridgeError::NotFound(format!(
+                "question {request_id}"
+            )));
+        }
+        self.replied_questions.lock().await.insert(request_id.to_string());
+        Ok(())
     }
 }
 
@@ -725,22 +759,12 @@ impl opencode::Backend for MockBackend {
         answers: &[Vec<String>],
         _d: Option<&str>,
     ) -> crate::error::Result<()> {
-        self.reply_question_calls
-            .lock()
-            .await
-            .push((request_id.to_string(), answers.to_vec()));
-        // Like the real server, a replied request leaves the pending list.
-        self.replied_questions.lock().await.insert(request_id.to_string());
-        Ok(())
+        self.record_question_reply(request_id, answers.to_vec()).await
     }
 
     async fn reject_question(&self, request_id: &str, _d: Option<&str>) -> crate::error::Result<()> {
-        self.reply_question_calls
-            .lock()
+        self.record_question_reply(request_id, vec![vec!["__reject__".to_string()]])
             .await
-            .push((request_id.to_string(), vec![vec!["__reject__".to_string()]]));
-        self.replied_questions.lock().await.insert(request_id.to_string());
-        Ok(())
     }
 
     async fn reply_permission(&self, r: &str, reply: &str, _d: Option<&str>) -> crate::error::Result<()> {
@@ -748,6 +772,20 @@ impl opencode::Backend for MockBackend {
             .lock()
             .await
             .push((r.to_string(), reply.to_string()));
+        if self.reply_permission_not_found {
+            return Err(crate::error::BridgeError::NotFound(format!("permission {r}")));
+        }
+        if self
+            .fail_reply_permission_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            self.fail_reply_permission_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(crate::error::BridgeError::OpenCode(
+                "simulated permission reply failure".into(),
+            ));
+        }
         // Like the real server, a replied request leaves the pending list.
         self.replied_permissions.lock().await.insert(r.to_string());
         Ok(())
@@ -904,6 +942,25 @@ pub(crate) mod integration_tests {
         let dir = tempfile::tempdir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
         dir
+    }
+
+    /// Map a session to a directory in the SessionStore, so a card action's
+    /// reply routes to the owning instance (the permission/question cards do
+    /// this via their payload; tests that seed state directly need the store).
+    async fn seed_session(app: &Arc<App>, session_id: &str, directory: &str) {
+        let thread = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let mut store = app.sessions.lock().await;
+        store.set_active(crate::config::SessionEntry {
+            thread_key: thread,
+            session_id: session_id.into(),
+            directory: directory.into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        });
     }
 
     #[tokio::test]
@@ -1640,6 +1697,281 @@ pub(crate) mod integration_tests {
                 .pending_permissions
                 .is_empty()
         );
+    }
+
+    /// Resolving an INLINE permission must re-render the host streaming card
+    /// right away. A permission-blocked prompt produces no new parts, so
+    /// without an explicit flush the render poll leaves the resolved section —
+    /// and its live buttons — on the Feishu card until the AI resumes, or
+    /// forever if the turn was stopped (the "card stuck" report). The question
+    /// path already flushes; this covers permissions.
+    #[tokio::test]
+    async fn inline_permission_click_flushes_the_card_immediately() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.permissions = vec![opencode::client::PermissionRequest {
+            request_id: "per_1".into(),
+            session_id: Some("ses_test".into()),
+            permission: Some("bash".into()),
+            patterns: vec!["ls -la".into()],
+            metadata: None,
+            always: Vec::new(),
+        }];
+        let (app, platform) = build_app(cfg, backend).await;
+
+        app.handle_message(incoming(
+            "msg_1".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "hi".into(),
+            None,
+        ))
+        .await;
+
+        tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.permission
+                    .poll_interval_ms
+                    .store(50, std::sync::atomic::Ordering::Relaxed);
+                let _ = app.permission.poll_loop(&app.core).await;
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !app.cards
+                .lock()
+                .await
+                .get("ses_test")
+                .unwrap()
+                .acc
+                .pending_permissions
+                .is_empty(),
+            "permission should be inlined on the streaming card"
+        );
+
+        let updates_before = platform
+            .calls
+            .lock()
+            .await
+            .iter()
+            .filter(|c| matches!(c, PlatformCall::UpdateMessage { .. }))
+            .count();
+
+        let result = app
+            .handle_card_action(serde_json::json!({
+                "action": "perm",
+                "reply": "once",
+                "session_id": "ses_test",
+                "request_id": "per_1",
+                "perm_label": "✅ 已允许一次",
+                "perm_color": "green",
+                "perm_body": "bash",
+            }))
+            .await;
+        assert!(result.is_some());
+
+        let calls = platform.calls.lock().await.clone();
+        let new_updates: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::UpdateMessage { card, .. } => Some(card.clone()),
+                _ => None,
+            })
+            .skip(updates_before)
+            .collect();
+        assert!(
+            !new_updates.is_empty(),
+            "resolving an inline permission must flush the card immediately"
+        );
+        let last = new_updates.last().unwrap().to_string();
+        assert!(
+            !last.contains("权限请求") && !last.contains("允许一次"),
+            "the resolved inline section must be gone from the re-rendered card: {}",
+            last
+        );
+    }
+
+    /// Two near-simultaneous clicks on the same permission card must reach the
+    /// backend exactly once. The test holds the answered-set lock so both
+    /// clicks queue on the guard and are released together — reproducing the
+    /// check-then-act window the atomic guard closes.
+    #[tokio::test]
+    async fn concurrent_permission_clicks_reply_once() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = Arc::new(MockBackend::new(realistic_parts()));
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
+        seed_session(&app, "ses_1", "/work").await;
+
+        let value = serde_json::json!({
+            "action": "perm",
+            "reply": "once",
+            "session_id": "ses_1",
+            "request_id": "per_1",
+            "perm_label": "✅ 已允许一次",
+            "perm_color": "green",
+            "perm_body": "bash",
+        });
+
+        // Hold the guard lock, start both clicks, let them queue on it, then
+        // release: with the old check-then-act pair both pass the check before
+        // either records, so both reply.
+        let guard = app.answered_requests.lock().await;
+        let a = {
+            let app = app.clone();
+            let value = value.clone();
+            tokio::spawn(async move { app.handle_card_action(value).await })
+        };
+        let b = {
+            let app = app.clone();
+            tokio::spawn(async move { app.handle_card_action(value).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(guard);
+        let (ra, rb) = tokio::join!(a, b);
+        assert!(ra.is_ok() && rb.is_ok(), "both clicks must be handled");
+
+        let calls = backend.reply_permission_calls.lock().await.clone();
+        assert_eq!(calls.len(), 1, "two clicks must reply exactly once: {:?}", calls);
+    }
+
+    /// A 404 from the backend means the permission was already resolved (by
+    /// another client, or by a click replayed after a cola restart cleared the
+    /// in-memory guard). That is a benign outcome: a neutral "已处理" card, not
+    /// the red failure card.
+    #[tokio::test]
+    async fn permission_reply_404_renders_neutral_already_handled() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.reply_permission_not_found = true;
+        let backend = Arc::new(backend);
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
+        seed_session(&app, "ses_1", "/work").await;
+
+        let value = serde_json::json!({
+            "action": "perm",
+            "reply": "once",
+            "session_id": "ses_1",
+            "request_id": "per_1",
+            "perm_label": "✅ 已允许一次",
+            "perm_color": "green",
+            "perm_body": "bash",
+        });
+        let result = app.handle_card_action(value).await.expect("a result card");
+        let card = result.card.expect("standalone card").to_string();
+        assert!(card.contains("已处理"), "neutral card expected: {}", card);
+        assert!(
+            !card.contains("处理失败"),
+            "a 404 must not render as a failure: {}",
+            card
+        );
+        assert_eq!(result.toast.as_deref(), Some("该权限已处理"));
+        // The request did reach the backend once (it was this click that got
+        // the 404) — the point is only that the outcome is neutral.
+        assert_eq!(backend.reply_permission_calls.lock().await.len(), 1);
+    }
+
+    /// A genuine (non-404) failure must roll the answered mark back, so a
+    /// retry click replies to the backend again instead of replaying a
+    /// decision that never reached it.
+    #[tokio::test]
+    async fn permission_reply_failure_rolls_back_so_retry_replies() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        backend
+            .fail_reply_permission_count
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let backend = Arc::new(backend);
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
+        seed_session(&app, "ses_1", "/work").await;
+
+        let value = serde_json::json!({
+            "action": "perm",
+            "reply": "once",
+            "session_id": "ses_1",
+            "request_id": "per_1",
+            "perm_label": "✅ 已允许一次",
+            "perm_color": "green",
+            "perm_body": "bash",
+        });
+        let first = app
+            .handle_card_action(value.clone())
+            .await
+            .expect("a result card");
+        let first_card = first.card.expect("standalone card").to_string();
+        assert!(
+            first_card.contains("处理失败"),
+            "genuine failure still shows the failure card: {}",
+            first_card
+        );
+
+        let second = app.handle_card_action(value).await.expect("a result card");
+        assert!(
+            second.card.is_some(),
+            "retry must be handled, not silently dropped"
+        );
+        let calls = backend.reply_permission_calls.lock().await.clone();
+        assert_eq!(
+            calls.len(),
+            2,
+            "retry after a failure must reply again: {:?}",
+            calls
+        );
+    }
+
+    /// A second click on a DIFFERENT permission button must re-serve the first
+    /// click's result, not its own. Otherwise the card would show a decision
+    /// the backend never received (the winner sent "once", the loser picked
+    /// "always") — the "card state flips to the last click" bug.
+    #[tokio::test]
+    async fn second_permission_click_reserves_the_first_result() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = Arc::new(MockBackend::new(realistic_parts()));
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
+        seed_session(&app, "ses_1", "/work").await;
+
+        let value_for = |reply: &str, label: &str| {
+            serde_json::json!({
+                "action": "perm",
+                "reply": reply,
+                "session_id": "ses_1",
+                "request_id": "per_1",
+                "perm_label": label,
+                "perm_color": "green",
+                "perm_body": "bash",
+            })
+        };
+        let first = app
+            .handle_card_action(value_for("once", "✅ 已允许一次"))
+            .await
+            .expect("a result card");
+        let second = app
+            .handle_card_action(value_for("always", "✅ 已允许（总是）"))
+            .await
+            .expect("a result card");
+
+        assert_eq!(
+            first.card, second.card,
+            "the losing click must re-serve the winning result card"
+        );
+        assert_eq!(first.toast, second.toast);
+        let calls = backend.reply_permission_calls.lock().await.clone();
+        assert_eq!(calls, vec![("per_1".to_string(), "once".to_string())]);
     }
 
     /// A poll that hangs on the backend list call (a half-open connection left
@@ -5843,14 +6175,72 @@ pub(crate) mod integration_tests {
         });
 
         // First click replies; second (a fast re-click before the result card
-        // replaces the buttons) must NOT re-reply — same request, one answer.
+        // replaces the buttons) must NOT re-reply — same request, one answer —
+        // and must re-serve the first click's completion card, not a generic
+        // ack.
         let first = app.handle_card_action(value.clone()).await;
         assert!(first.is_some());
+        let first = first.unwrap();
         let second = app.handle_card_action(value).await;
         assert!(second.is_some(), "second click still gets the result card");
+        assert_eq!(
+            first.card,
+            second.unwrap().card,
+            "second click re-serves the first result"
+        );
 
         let calls = backend.reply_question_calls.lock().await.clone();
         assert_eq!(calls.len(), 1, "double click must not double-reply: {:?}", calls);
+    }
+
+    /// A 404 on a question reply means the question was already answered (or
+    /// rejected) elsewhere — a neutral "已处理" card, not the red failure card.
+    #[tokio::test]
+    async fn question_reply_404_renders_neutral_already_handled() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.reply_question_not_found = true;
+        let backend = Arc::new(backend);
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
+
+        app.question.question_requests.lock().await.insert(
+            "que_1".into(),
+            opencode::client::QuestionRequest {
+                id: "que_1".into(),
+                session_id: "ses_1".into(),
+                questions: vec![opencode::client::QuestionInfo {
+                    question: "选择目录".into(),
+                    header: "目录".into(),
+                    options: vec![opencode::client::QuestionOption {
+                        label: "/a".into(),
+                        description: String::new(),
+                    }],
+                    multiple: None,
+                    custom: None,
+                }],
+            },
+        );
+
+        let value = serde_json::json!({
+            "action": "question",
+            "reply": "answer",
+            "request_id": "que_1",
+            "session_id": "ses_1",
+            "directory": "/work",
+            "question_index": 0,
+            "answer": "/a",
+        });
+        let result = app.handle_card_action(value).await.expect("a result card");
+        let card = result.card.expect("standalone card").to_string();
+        assert!(card.contains("已处理"), "neutral card expected: {}", card);
+        assert!(
+            !card.contains("处理失败"),
+            "a 404 must not render as a failure: {}",
+            card
+        );
     }
 
     #[tokio::test]
