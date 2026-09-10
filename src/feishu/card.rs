@@ -3515,6 +3515,11 @@ Index: /a/lua.lua
             input.get("value").is_none(),
             "echo must not use the passback `value` field"
         );
+        // Same compact-start contract as the question card's custom-answer
+        // box: multiline, one row at rest, growing with the text.
+        assert_eq!(input["input_type"], "multiline_text");
+        assert_eq!(input["rows"], 1);
+        assert_eq!(input["auto_resize"], true);
     }
 
     /// The `/dir` Recent Directories card must be schema-V2-compatible (no v1
