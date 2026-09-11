@@ -331,6 +331,11 @@ pub struct MockBackend {
     /// Records the message_id passed to each `prompt` call (asserts every cola
     /// prompt carries a `msg_cola_` id and retries reuse it, ADR-0026).
     pub prompt_message_ids: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
+    /// A callback run inside `prompt` just before it succeeds — lets a test
+    /// mutate the session's working tree mid-turn (e.g. switch branches or
+    /// leave an uncommitted file) to exercise the Turn Footer's turn-end
+    /// refresh (ADR-0019).
+    pub on_prompt: Option<Box<dyn Fn() + Send + Sync>>,
     /// Records every `prompt_async` call's text (asserts supplement path).
     pub prompt_async_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// Records the number of images attached to each `prompt_async` call.
@@ -418,6 +423,7 @@ impl MockBackend {
             prompt_variants: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_agents: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_message_ids: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            on_prompt: None,
             prompt_async_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_async_images: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_async_models: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -561,6 +567,9 @@ impl opencode::Backend for MockBackend {
         }
         if let Some(err) = &self.prompt_error {
             return Err(crate::error::BridgeError::OpenCode(err.clone()));
+        }
+        if let Some(hook) = &self.on_prompt {
+            hook();
         }
         Ok(opencode::client::PromptResponse {
             id: "msg_assist".into(),
@@ -954,6 +963,36 @@ pub(crate) mod integration_tests {
         dir
     }
 
+    /// Run a git command in `dir`, panicking on failure (test setup helper).
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(["-C"])
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A temp git repo on branch `main` with one commit — a real work context
+    /// for the Turn Footer tests (ADR-0019). The returned TempDir must stay
+    /// alive for the test's duration.
+    fn git_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        git_in(dir.path(), &["config", "user.email", "test@example.com"]);
+        git_in(dir.path(), &["config", "user.name", "test"]);
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        git_in(dir.path(), &["add", "a.txt"]);
+        git_in(dir.path(), &["commit", "-m", "init"]);
+        dir
+    }
+
     /// Map a session to a directory in the SessionStore, so a card action's
     /// reply routes to the owning instance (the permission/question cards do
     /// this via their payload; tests that seed state directly need the store).
@@ -1014,6 +1053,103 @@ pub(crate) mod integration_tests {
             text
         );
         assert!(text.contains("ls -la"), "tool input missing: {}", text);
+    }
+
+    /// ADR-0019: the Turn Footer's work context is captured at turn start AND
+    /// refreshed at turn end — the final card shows the branch the AI landed on
+    /// (here one it created and committed to), not the one it started from.
+    #[tokio::test]
+    async fn turn_footer_shows_the_branch_the_ai_landed_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git_repo();
+        let repo_path = repo.path().to_path_buf();
+        let mut cfg = test_config(&dir.path().join("sessions.json"));
+        cfg.bridge.work_dir = Some(repo_path.clone());
+
+        let mut mock = MockBackend::new(realistic_parts());
+        mock.on_prompt = Some(Box::new(move || {
+            // The AI's work: branch off and commit — the tree ends clean.
+            git_in(&repo_path, &["switch", "-c", "feat/ai-work"]);
+            std::fs::write(repo_path.join("b.txt"), "done").unwrap();
+            git_in(&repo_path, &["add", "b.txt"]);
+            git_in(&repo_path, &["commit", "-m", "ai work"]);
+        }));
+        let (app, platform) = build_app(cfg, mock).await;
+
+        app.handle_message(incoming(
+            "msg_1".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "干个活".into(),
+            None,
+        ))
+        .await;
+
+        let calls = platform.calls.lock().await.clone();
+        let final_card = calls
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                PlatformCall::UpdateMessage { card, .. } => Some(card.clone()),
+                _ => None,
+            })
+            .expect("the final card must be updated in place");
+        let text = final_card.to_string();
+        assert!(
+            text.contains("· feat/ai-work"),
+            "final footer must show the end branch: {text}"
+        );
+        assert!(
+            !text.contains("· main"),
+            "the start branch must be gone from the final card: {text}"
+        );
+        assert!(
+            !text.contains("⚠"),
+            "a committed tree must not show the dirty marker: {text}"
+        );
+    }
+
+    /// ADR-0019: a turn that ends with uncommitted changes lights the ⚠ on the
+    /// final card even though the tree was clean when the turn started.
+    #[tokio::test]
+    async fn turn_footer_shows_dirty_left_by_the_ai() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git_repo();
+        let repo_path = repo.path().to_path_buf();
+        let mut cfg = test_config(&dir.path().join("sessions.json"));
+        cfg.bridge.work_dir = Some(repo_path.clone());
+
+        let mut mock = MockBackend::new(realistic_parts());
+        mock.on_prompt = Some(Box::new(move || {
+            std::fs::write(repo_path.join("uncommitted.txt"), "left behind").unwrap();
+        }));
+        let (app, platform) = build_app(cfg, mock).await;
+
+        app.handle_message(incoming(
+            "msg_1".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "改点东西".into(),
+            None,
+        ))
+        .await;
+
+        let calls = platform.calls.lock().await.clone();
+        let final_card = calls
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                PlatformCall::UpdateMessage { card, .. } => Some(card.clone()),
+                _ => None,
+            })
+            .expect("the final card must be updated in place");
+        let text = final_card.to_string();
+        assert!(
+            text.contains("· main ⚠"),
+            "final footer must show the AI's uncommitted changes: {text}"
+        );
     }
 
     #[tokio::test]
@@ -3115,6 +3251,7 @@ pub(crate) mod integration_tests {
     async fn external_message_reply_renders_into_notification_card() {
         let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
+        let repo = git_repo();
         let cfg = test_config(&dir.path().join("sessions.json"));
         let mut mock = MockBackend::new(realistic_parts());
         mock.external_user_message = Some("OpenChamber 里发的消息".to_string());
@@ -3136,7 +3273,7 @@ pub(crate) mod integration_tests {
             store.set_active(crate::config::SessionEntry {
                 thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
                 session_id: "ses_ext".into(),
-                directory: "/tmp/ext".into(),
+                directory: repo.path().to_string_lossy().to_string(),
                 agent: None,
                 model: None,
                 auto_accept: false,
@@ -3182,6 +3319,9 @@ pub(crate) mod integration_tests {
             "notification card should be sent: {calls_before:?}"
         );
 
+        // The turn's work: the AI switched branches before its reply landed —
+        // the final card must show where it landed (ADR-0019 end refresh).
+        git_in(repo.path(), &["switch", "-c", "feat/ext"]);
         // Now the model replies; the renderer picks it up on the next poll.
         reply_ready.store(true, std::sync::atomic::Ordering::SeqCst);
         tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
@@ -3194,7 +3334,9 @@ pub(crate) mod integration_tests {
         let sent_card = sent_card.expect("notification card should be sent");
         // The reply rendered IN PLACE on the SAME card (msg_sent): it shows the
         // external user's message and the AI's reasoning/tool/text, finalized Done.
-        let final_card = calls.iter().find_map(|c| match c {
+        // The LAST update is the finalized card (earlier flushes streamed while
+        // the model was still working).
+        let final_card = calls.iter().rev().find_map(|c| match c {
             PlatformCall::UpdateMessage { message_id, card } if message_id == "msg_sent" => {
                 Some(card.clone())
             }
@@ -3211,6 +3353,11 @@ pub(crate) mod integration_tests {
         assert!(text.contains("我来看看目录"), "reasoning missing: {}", text);
         assert!(text.contains("bash"), "tool panel missing: {}", text);
         assert!(text.contains("目录里有 src。"), "reply text missing: {}", text);
+        assert!(
+            text.contains("· feat/ext"),
+            "final footer must show the end branch: {}",
+            text
+        );
 
         // No SECOND card was sent — the reply lives entirely on the notification.
         let second_cards = calls
