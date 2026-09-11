@@ -3,11 +3,20 @@ members = [".", "xtask"]
 resolver = "3"
 
 [package]
-name = "cola"
+name = "colark"
 version = "0.8.0"
 edition = "2024"
 description = "A bridge bot that brings the OpenCode AI coding experience into Feishu"
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/SXongin/cola"
+homepage = "https://github.com/SXongin/cola"
+keywords = ["feishu", "lark", "opencode", "bot", "bridge"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "cola"
+path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
