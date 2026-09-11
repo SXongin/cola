@@ -130,7 +130,7 @@ A platform image (a standalone image message, an image inside a rich-text messag
 _Avoid_: Picture, media, attachment file
 
 **Turn Footer**:
-The Card footer line summarizing what a turn ran on: working directory (project basename), git branch and dirty state, the answering model, and context-window usage. The model line renders the full identity `provider/model@variant` (provider is part of model identity, not decoration). The directory/branch half is captured when the turn starts (so a wrong-branch run is visible from the first card) and refreshed when the turn ends (so the completed card shows where the turn landed); the model and context usage appear only when the turn completes.
+The Card footer line summarizing what a turn ran on: working directory (project basename), git branch and dirty state, the answering model, and context-window usage. The model line renders the full identity `provider/model@variant` (provider is part of model identity, not decoration). The directory/branch half is captured when the turn starts (so a wrong-branch run is visible from the first card) and refreshed when the turn ends (so the completed card shows where the turn landed); the model line appears on every card — including a split "部分完成" one — as soon as the assistant message carries it, while context-window usage appears only when the turn completes.
 _Avoid_: Tail, footer bar, status line
 
 **Dirty**:

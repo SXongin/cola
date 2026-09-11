@@ -29,3 +29,13 @@ clean, and a read-only turn does not touch it. End refresh does not replace the
 start capture — the start value is the state the AI builds on, the end value is
 where it left the tree — so the footer now does both. Source:
 `.scratch/turn-footer-end-refresh/issues/01-end-of-turn-refresh.md`.
+
+## Amendment (2026-09-12): the model line renders on every card
+
+The model is not an end-of-turn fact like the context ratio: it is captured from
+the assistant message while the turn streams (`render_new_turn_parts`), so the 🤖
+line now renders on every card. A split "部分完成，继续中…" card — the middle of a
+continuation chain — must still say which model is answering; previously it
+dropped the line, which read as data loss. The 📊 context-window ratio stays
+final-card-only, because it is genuinely computed only at turn end. Source:
+reported split-card footer missing the model.

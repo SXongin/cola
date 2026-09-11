@@ -411,8 +411,8 @@ impl StreamAccumulator {
 
     /// Assemble the card JSON for `timeline[start..end]`. `include_tail` adds
     /// the non-timeline sections (inline permission/question, error, retry
-    /// button, token footer) — only the turn's final card should carry them.
-    /// `state_override` forces the header state (e.g. "部分完成" on split cards).
+    /// button, context-ratio footer) — only the turn's final card should carry
+    /// them. `state_override` forces the header state (e.g. "部分完成" on split cards).
     fn build_card_inner(
         &self,
         start: usize,
@@ -522,9 +522,11 @@ impl StreamAccumulator {
         // branch · dirty) is captured at turn start — so a wrong-branch run is
         // visible before it completes — and refreshed at turn end, so the final
         // card shows where the turn landed (a branch the AI created or switched
-        // to, and whether it left uncommitted work); the model and
-        // context-window ratio are end-of-turn facts, so they append only on the
-        // final card (include_tail).
+        // to, and whether it left uncommitted work). The 🤖 model is captured
+        // from the assistant message while the turn streams, so it renders on
+        // EVERY card (a split "部分完成" card must still say which model is
+        // answering); the context-window ratio is computed at turn end, so it
+        // appends only on the final card (include_tail).
         let mut footer_parts: Vec<String> = Vec::new();
         if let Some(dir) = &self.directory {
             let name = self.project_name.as_deref().unwrap_or(dir);
@@ -539,24 +541,22 @@ impl StreamAccumulator {
             }
             footer_parts.push(segment);
         }
-        if include_tail {
-            if let Some(model) = &self.model_id {
-                let label = match self.provider_id.as_deref() {
-                    Some(p) => format!("{}/{}", p, model),
-                    None => model.clone(),
-                };
-                // The variant appends as `provider/model@variant` — provider is
-                // part of model identity, and the variant is what cola sent
-                // this turn (ADR-0020).
-                let label = match &self.variant {
-                    Some(v) => format!("{}@{}", label, v),
-                    None => label,
-                };
-                footer_parts.push(format!("🤖 {}", label));
-            }
-            if let Some(ratio) = self.context_ratio {
-                footer_parts.push(format!("📊 上下文 {:.0}%", ratio * 100.0));
-            }
+        if let Some(model) = &self.model_id {
+            let label = match self.provider_id.as_deref() {
+                Some(p) => format!("{}/{}", p, model),
+                None => model.clone(),
+            };
+            // The variant appends as `provider/model@variant` — provider is
+            // part of model identity, and the variant is what cola sent
+            // this turn (ADR-0020).
+            let label = match &self.variant {
+                Some(v) => format!("{}@{}", label, v),
+                None => label,
+            };
+            footer_parts.push(format!("🤖 {}", label));
+        }
+        if include_tail && let Some(ratio) = self.context_ratio {
+            footer_parts.push(format!("📊 上下文 {:.0}%", ratio * 100.0));
         }
         if !footer_parts.is_empty() {
             builder = builder.with_footer(&footer_parts.join(" · "));
@@ -723,10 +723,11 @@ mod tests {
         assert!(!acc.dirty);
     }
 
-    /// ADR-0019: the 📁 segment renders on every card (include_tail=false),
-    /// while model/context only append on the final card.
+    /// ADR-0019: the 📁 segment and the 🤖 model line render on every card
+    /// (the model is known while streaming), while the context ratio only
+    /// appends on the final card.
     #[test]
-    fn work_context_shows_before_final_card_but_model_does_not() {
+    fn work_context_and_model_show_before_final_card_but_ratio_does_not() {
         let mut acc = StreamAccumulator::new("test");
         acc.card_state = CardState::Streaming;
         acc.directory = Some("/root/workspace/dev/cola".into());
@@ -742,7 +743,11 @@ mod tests {
             .build_card_inner(0, acc.timeline.len(), false, None)
             .to_string();
         assert!(mid.contains("📁 cola · feat/x ⚠"), "mid missing: {}", mid);
-        assert!(!mid.contains("🤖"), "model must not show mid-turn: {}", mid);
+        assert!(
+            mid.contains("🤖 opencode-go/deepseek-v4-flash"),
+            "model must show mid-turn: {}",
+            mid
+        );
         assert!(!mid.contains("📊"), "ratio must not show mid-turn: {}", mid);
 
         acc.card_state = CardState::Done;
