@@ -55,6 +55,8 @@ pub struct RecordingPlatform {
     pub chat_names: std::collections::HashMap<String, String>,
     /// When true, `send_card` fails (tests the topic-cover fallback path).
     pub fail_send_card: bool,
+    /// When true, `reply_card` fails (tests the restart-announce fallback).
+    pub fail_reply_card: bool,
     /// The thread_id `reply_in_thread` returns; `None` simulates a chat
     /// without topic support (the create-topic surfaces degrade with a
     /// message instead of mapping).
@@ -72,6 +74,7 @@ impl RecordingPlatform {
             user_names: std::collections::HashMap::new(),
             chat_names: std::collections::HashMap::new(),
             fail_send_card: false,
+            fail_reply_card: false,
             reply_in_thread_thread_id: Some("omt_created_topic".into()),
             quoted_messages: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
@@ -85,6 +88,11 @@ impl feishu::Platform for RecordingPlatform {
     }
 
     async fn reply_card(&self, reply_to: &str, card: &serde_json::Value) -> crate::error::Result<String> {
+        if self.fail_reply_card {
+            return Err(crate::error::BridgeError::Feishu(
+                "simulated reply_card failure".into(),
+            ));
+        }
         self.calls.lock().await.push(PlatformCall::ReplyCard {
             reply_to: reply_to.into(),
             card: card.clone(),
@@ -914,7 +922,7 @@ pub fn long_answer_parts() -> serde_json::Value {
 
 pub(crate) mod integration_tests {
     use super::*;
-    use crate::bridge::command::{Command, SwitchAction};
+    use crate::bridge::command::{Command, RestartKind, RestartNotify, SwitchAction};
 
     /// Build a `ModelOption` with the given id and declared variants.
     fn model_option(id: &str, variants: &[&str]) -> crate::opencode::client::ModelOption {
@@ -11620,5 +11628,101 @@ pub(crate) mod integration_tests {
 
         let calls = prompt_calls.lock().await.clone();
         assert_eq!(calls, vec!["hi".to_string()]);
+    }
+
+    /// A `/restart` (or `/update`) issued inside a Topic is announced back
+    /// INSIDE that topic by replying to the command message; the chat lobby
+    /// must not receive the card.
+    #[tokio::test]
+    async fn restart_announce_replies_inside_the_topic() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+        app.announce_restart(&RestartNotify {
+            chat_id: "oc_1".into(),
+            thread_id: Some("omt_1".into()),
+            message_id: Some("om_cmd".into()),
+            kind: RestartKind::Update,
+            version: Some("0.9.0".into()),
+        })
+        .await;
+
+        let calls = platform.calls.lock().await.clone();
+        assert_eq!(calls.len(), 1, "expected exactly one card: {calls:?}");
+        match &calls[0] {
+            PlatformCall::ReplyCard { reply_to, card } => {
+                assert_eq!(reply_to, "om_cmd");
+                let text = card.to_string();
+                assert!(text.contains("已更新到 0.9.0 并重启完成"), "got {text}");
+            }
+            other => panic!("expected a reply inside the topic, got {other:?}"),
+        }
+    }
+
+    /// A lobby `/restart` keeps the standalone chat card (no topic to reply in).
+    #[tokio::test]
+    async fn restart_announce_lobby_sends_to_the_chat() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+        app.announce_restart(&RestartNotify {
+            chat_id: "oc_1".into(),
+            thread_id: Some("oc_1".into()),
+            message_id: Some("om_cmd".into()),
+            kind: RestartKind::Restart,
+            version: None,
+        })
+        .await;
+
+        let calls = platform.calls.lock().await.clone();
+        assert_eq!(calls.len(), 1, "expected exactly one card: {calls:?}");
+        match &calls[0] {
+            PlatformCall::SendCard { receive_id, card } => {
+                assert_eq!(receive_id, "oc_1");
+                assert!(card.to_string().contains("已重启完成"));
+            }
+            other => panic!("expected a chat card, got {other:?}"),
+        }
+    }
+
+    /// A topic reply that fails degrades to the chat card — the announcement is
+    /// never silently lost.
+    #[tokio::test]
+    async fn restart_announce_topic_failure_falls_back_to_chat() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let platform = Arc::new(RecordingPlatform {
+            fail_reply_card: true,
+            ..RecordingPlatform::new()
+        });
+        let app = Arc::new(
+            App::new(
+                cfg,
+                Arc::new(MockBackend::new(realistic_parts())),
+                platform.clone(),
+            )
+            .unwrap(),
+        );
+
+        app.announce_restart(&RestartNotify {
+            chat_id: "oc_1".into(),
+            thread_id: Some("omt_1".into()),
+            message_id: Some("om_cmd".into()),
+            kind: RestartKind::Restart,
+            version: None,
+        })
+        .await;
+
+        let calls = platform.calls.lock().await.clone();
+        assert_eq!(calls.len(), 1, "expected the fallback card: {calls:?}");
+        match &calls[0] {
+            PlatformCall::SendCard { receive_id, .. } => assert_eq!(receive_id, "oc_1"),
+            other => panic!("expected the chat fallback, got {other:?}"),
+        }
     }
 }

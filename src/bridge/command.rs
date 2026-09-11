@@ -389,6 +389,58 @@ pub(crate) fn restart_notify_path() -> std::path::PathBuf {
         .join("restart-notify.json")
 }
 
+/// The announcement `/restart` and `/update` leave for the successor process
+/// at [`restart_notify_path`]: which chat to announce in, plus the command
+/// message and its thread. A command issued inside a Topic announces back
+/// INSIDE that topic (the handler replies to `message_id`, which lives in the
+/// topic), not in the chat lobby.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RestartNotify {
+    pub(crate) chat_id: String,
+    /// The command message; `None` in payloads written before topic support.
+    #[serde(default)]
+    pub(crate) message_id: Option<String>,
+    /// The command's thread id — equal to `chat_id` for the lobby.
+    #[serde(default)]
+    pub(crate) thread_id: Option<String>,
+    /// `update` after `/update`; `restart` for a bare `/restart` (including
+    /// payloads from older versions that predate the field).
+    #[serde(default)]
+    pub(crate) kind: RestartKind,
+    /// The new version, present only after `/update`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) version: Option<String>,
+}
+
+impl RestartNotify {
+    fn new(thread_key: &ThreadKey, message_id: &str) -> Self {
+        Self {
+            chat_id: thread_key.chat_id.clone(),
+            message_id: Some(message_id.to_string()),
+            thread_id: Some(thread_key.thread_id.clone()),
+            kind: RestartKind::Restart,
+            version: None,
+        }
+    }
+}
+
+/// Which restart flow wrote a [`RestartNotify`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum RestartKind {
+    #[default]
+    Restart,
+    Update,
+}
+
+/// Persist the announcement for the successor process. Best effort: a failed
+/// write only means the restart isn't announced.
+fn write_restart_notify(notify: &RestartNotify) {
+    if let Ok(raw) = serde_json::to_string(notify) {
+        let _ = std::fs::write(restart_notify_path(), raw);
+    }
+}
+
 /// Report self-update progress as Feishu text replies (ADR-0015).
 struct FeishuUpdateReporter<'a> {
     feishu: &'a Arc<dyn crate::feishu::Platform>,
@@ -902,9 +954,10 @@ pub(crate) async fn handle_command(
             // startup args and inherited stdio (so the log redirect to
             // test.log keeps working in the new process).
             core.feishu.reply_text(message_id, "♻️ 正在重启，稍候…").await?;
-            // Remember which chat to announce the restart in.
-            let notify = serde_json::json!({ "chat_id": thread_key.chat_id });
-            let _ = std::fs::write(restart_notify_path(), notify.to_string());
+            // Remember where to announce the restart: the chat, plus the
+            // command message/thread so an in-Topic command announces back
+            // inside its topic.
+            write_restart_notify(&RestartNotify::new(&thread_key, message_id));
             // Under a systemd unit, do NOT spawn a child: `KillMode=control-group`
             // would kill it when the unit stops. Exit with the supervisor-restart
             // code and let `Restart=on-failure` bring the unit back up from the
@@ -966,12 +1019,10 @@ pub(crate) async fn handle_command(
                 crate::update::run_update(&reporter, crate::update::UpdateMode::Apply).await
             {
                 core.feishu.reply_text(message_id, "正在重启…").await?;
-                let notify = serde_json::json!({
-                    "chat_id": thread_key.chat_id,
-                    "kind": "update",
-                    "version": new_version.to_string(),
-                });
-                let _ = std::fs::write(restart_notify_path(), notify.to_string());
+                let mut notify = RestartNotify::new(&thread_key, message_id);
+                notify.kind = RestartKind::Update;
+                notify.version = Some(new_version.to_string());
+                write_restart_notify(&notify);
                 crate::update::restart();
             }
         }
@@ -2679,6 +2730,32 @@ mod tests {
         assert_eq!(parse_command("/update now"), Some(Command::Update));
         assert_eq!(parse_command("/version"), Some(Command::Version));
         assert_eq!(parse_command("/version x"), Some(Command::Version));
+    }
+
+    /// The restart announce payload carries the command message and thread so
+    /// an in-Topic `/restart` can be announced back inside its topic.
+    #[test]
+    fn restart_notify_payload_carries_topic_reply_target() {
+        let topic = ThreadKey::new("oc_1".into(), "omt_1".into());
+        let notify = RestartNotify::new(&topic, "om_cmd");
+        assert_eq!(notify.chat_id, "oc_1");
+        assert_eq!(notify.thread_id.as_deref(), Some("omt_1"));
+        assert_eq!(notify.message_id.as_deref(), Some("om_cmd"));
+        assert_eq!(notify.kind, RestartKind::Restart);
+        assert_eq!(notify.version, None);
+    }
+
+    /// A payload written by an older cola carries only `chat_id`: it must still
+    /// deserialize and announce in the chat lobby (no in-topic reply target).
+    #[test]
+    fn old_restart_notify_payload_deserializes() {
+        let notify: RestartNotify =
+            serde_json::from_str(r#"{"chat_id":"oc_1"}"#).expect("old payload parses");
+        assert_eq!(notify.chat_id, "oc_1");
+        assert_eq!(notify.message_id, None);
+        assert_eq!(notify.thread_id, None);
+        assert_eq!(notify.kind, RestartKind::Restart);
+        assert_eq!(notify.version, None);
     }
 
     #[test]
