@@ -16,7 +16,7 @@ Non-git directories degrade to just `📁 project`; a detached HEAD falls back t
 ## Consequences
 
 - Two places create the turn accumulator (handler.rs and external.rs); both capture branch/dirty before the prompt is sent, and both terminal paths (handler.rs finalize, external.rs `finalize_done`) refresh them before the final flush. The refresh read runs outside the cards lock; the lock only wraps the field swap.
-- The halves never regress: only a resolved branch overwrites them, so a failed or empty end read keeps the start capture rather than dropping `branch ⚠` from the footer.
+- The halves never regress: a failed or empty end read keeps the start capture rather than dropping `branch ⚠` from the footer. That includes a PARTIAL read — the branch resolves but `git status --porcelain` fails (e.g. index-lock contention): `read_state` reports no state at all, since a failed status read must never be mistaken for a clean tree, and the refresh then leaves the fields untouched.
 - The footer builder splits into an always-visible part (directory/branch/dirty) and a final-card-only part (model/context ratio); the token-cost fallback path becomes unreachable and is removed.
 - Two git subprocess pairs per turn (`rev-parse` + `status`, at start and at end), strictly best-effort: any failure silently omits — or, at turn end, keeps — the branch/dirty halves.
 

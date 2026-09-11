@@ -72,3 +72,21 @@ done.
   --all-targets -- -D warnings`, `cargo test --workspace --locked` (490
   passed), `cargo build --release --locked`, `cargo xtask audit` all green.
 
+### 2026-09-12 review fixes
+
+`/code-review` (Standards + Spec over `main...HEAD`) found one real Spec gap and
+one test-duplication judgement call; both fixed:
+
+- **A partial end read no longer clears the start capture.** A failed
+  `git status --porcelain` was indistinguishable from a clean tree, so a read
+  that resolved the branch but failed `status` could wipe the start ⚠.
+  `read_state` now reports no state at all on a failed status read
+  (`git::status_dirty` distinguishes clean-empty from command failure), so the
+  refresh leaves the fields untouched. Tests:
+  `git::failed_status_read_yields_no_state` and
+  `turn_footer_keeps_start_capture_when_the_end_status_read_fails` (breaks the
+  index mid-turn, asserts the final card keeps `main ⚠`).
+- **Test duplication**: the Turn Footer integration tests share a
+  `final_card(platform)` helper.
+- Re-verified: fmt / clippy / 492 tests / release build / audit green.
+
