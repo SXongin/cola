@@ -32,8 +32,9 @@ own binary in place, which a root-owned path like `/usr/local/bin` would block:
 
 Or install from [crates.io](https://crates.io/crates/colark) (any platform with a
 Rust toolchain, edition 2024): `cargo install colark`. The binary is still named
-`cola`, and self-update still targets the GitHub release channel, so a
-`cargo install`-ed binary can move itself onto it via `/update`.
+`cola`. Updates follow the install channel: a `cargo install` (or
+`cargo binstall colark`) binary is updated with cargo, while an archive install
+uses cola's own updater (`/update`, `cola update`).
 
 Or build from source (Rust toolchain, edition 2024): `cargo build --release`.
 The [user guide](docs/user-guide.md#install) explains each choice in detail.

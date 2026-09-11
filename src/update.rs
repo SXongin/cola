@@ -1,13 +1,16 @@
-//! Self-update (ADR-0015): check GitHub Releases for a newer cola, download the
-//! asset for the current platform, verify it against the release's `SHA256SUMS`,
-//! atomically replace the running binary, and restart.
+//! Updates (ADR-0015, ADR-0030): check the channel the running binary was
+//! installed through, then either apply the update or hand it to cargo.
 //!
-//! The update channel is GitHub Releases only — the same binaries `release.yml`
-//! builds. crates.io publishing is deferred (the `cola` name is taken); `cargo
-//! install`/`cargo-binstall` remain future conveniences and do not change this
-//! module. The binary's embedded version must equal the release tag
-//! (guarded in `release.yml`), or the semver compare reports "update available"
-//! forever.
+//! - GitHub Releases installs self-update: check `releases/latest`, download the
+//!   asset for the current platform, verify it against the release's
+//!   `SHA256SUMS`, atomically replace the running binary, and restart.
+//! - A cargo-tracked install (`cargo install colark` / `cargo binstall colark`,
+//!   detected from cargo's install receipt) is never replaced: availability is
+//!   checked on the crates.io sparse index and the user is given the cargo
+//!   command instead.
+//!
+//! The binary's embedded version must equal the release tag (guarded in
+//! `release.yml`), or the semver compare reports "update available" forever.
 
 use std::path::{Path, PathBuf};
 
@@ -42,6 +45,73 @@ pub fn supervisor_restart_code() -> Option<i32> {
         return Some(EXIT_SUPERVISOR_RESTART);
     }
     None
+}
+
+/// Which install channel a binary was installed through (ADR-0030). Decides
+/// how updates are applied: self-update for GitHub Releases installs, the
+/// cargo command for cargo-tracked installs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallChannel {
+    /// GitHub Releases archive or a source build: self-update applies.
+    GitHub,
+    /// Tracked by cargo's install receipt (`cargo install` / `cargo binstall`):
+    /// the cargo command updates it.
+    Cargo,
+}
+
+/// Detect the install channel of `exe` from cargo's install receipt (ADR-0030):
+/// a binary in `<install root>/bin` whose install root carries a
+/// `.crates2.json` entry listing that binary name. Best effort — no receipt (a
+/// GitHub archive, a source build, `--no-track`, or binstall's local
+/// `--install-path`) means the GitHub channel.
+pub fn detect_install_channel(exe: &Path) -> InstallChannel {
+    let Ok(exe) = exe.canonicalize() else {
+        return InstallChannel::GitHub;
+    };
+    let Some(bin_dir) = exe.parent() else {
+        return InstallChannel::GitHub;
+    };
+    // cargo always installs into `<root>/bin`; requiring it rules out a stray
+    // receipt file elsewhere from classifying an arbitrary binary.
+    if bin_dir.file_name().and_then(|n| n.to_str()) != Some("bin") {
+        return InstallChannel::GitHub;
+    }
+    let Some(root) = bin_dir.parent() else {
+        return InstallChannel::GitHub;
+    };
+    // On Windows the receipt lists `cola` while the binary is `cola.exe`, so
+    // both the full file name and the stem are checked.
+    let names = [exe.file_name(), exe.file_stem()].map(|n| n.and_then(|s| s.to_str()));
+    if names.iter().flatten().any(|bin| receipt_has_binary(root, bin)) {
+        InstallChannel::Cargo
+    } else {
+        InstallChannel::GitHub
+    }
+}
+
+/// Whether `<install root>/.crates2.json` lists `bin` among the binaries cargo
+/// installed. Every cargo new enough to build cola (edition 2024 ⇒ 1.85+)
+/// writes this file — older cargo wrote only the legacy `.crates.toml`, which
+/// cannot install cola anyway.
+fn receipt_has_binary(install_root: &Path, bin: &str) -> bool {
+    std::fs::read_to_string(install_root.join(".crates2.json"))
+        .is_ok_and(|data| crates2_has_binary(&data, bin))
+}
+
+/// `.crates2.json` is `{"installs": {<pkg id>: {"bins": [<bin>...], ...}}}`.
+fn crates2_has_binary(data: &str, bin: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+        return false;
+    };
+    v.get("installs")
+        .and_then(|i| i.as_object())
+        .is_some_and(|installs| {
+            installs.values().any(|info| {
+                info.get("bins")
+                    .and_then(|b| b.as_array())
+                    .is_some_and(|bins| bins.iter().any(|b| b.as_str() == Some(bin)))
+            })
+        })
 }
 
 /// The current version of the running binary (from Cargo.toml).
@@ -197,6 +267,48 @@ pub async fn check() -> anyhow::Result<UpdateCheck> {
         asset_url: download_url(&tag, &asset),
         sha256_url: download_url(&tag, "SHA256SUMS"),
     }))
+}
+
+/// The crates.io sparse index is a static CDN (no API quota) serving one JSON
+/// line per published version of the crate (ADR-0030).
+const CRATES_IO_INDEX_URL: &str = "https://index.crates.io/co/la/colark";
+
+/// One sparse-index line: the fields cola needs from it.
+#[derive(serde::Deserialize)]
+struct IndexEntry {
+    vers: String,
+    #[serde(default)]
+    yanked: bool,
+}
+
+/// The newest crates.io version that is a valid update for `current`: not
+/// yanked, newer, and not a prerelease unless `current` itself is one.
+fn latest_from_index(body: &str, current: &Version) -> Option<Version> {
+    body.lines()
+        .filter_map(|line| serde_json::from_str::<IndexEntry>(line).ok())
+        .filter(|e| !e.yanked)
+        .filter_map(|e| Version::parse(&e.vers).ok())
+        // A stable install is never offered a prerelease; a prerelease channel
+        // may advance to newer prereleases or the stable release.
+        .filter(|v| !current.pre.is_empty() || v.pre.is_empty())
+        .filter(|v| v > current)
+        .max()
+}
+
+/// Ask crates.io for the latest update available to a cargo-tracked binary.
+async fn crates_io_latest(current: &Version) -> anyhow::Result<Option<Version>> {
+    let body = reqwest::Client::new()
+        .get(CRATES_IO_INDEX_URL)
+        .header(reqwest::header::USER_AGENT, "cola-self-update")
+        .send()
+        .await
+        .context("query crates.io sparse index")?
+        .error_for_status()
+        .context("crates.io sparse index returned an error")?
+        .text()
+        .await
+        .context("read crates.io sparse index body")?;
+    Ok(latest_from_index(&body, current))
 }
 
 /// The lower-case hex sha256 digest of a byte slice.
@@ -475,18 +587,65 @@ pub enum UpdateOutcome {
     UpToDate,
     NoAssetForPlatform,
     Available,
+    /// A cargo-tracked install has a newer version on crates.io; nothing was
+    /// downloaded or replaced — the user updates with the cargo command
+    /// (ADR-0030).
+    CargoUpdateAvailable,
     /// Applied; carries the new version.
     Updated(Version),
     Failed,
 }
 
+/// The message a cargo-tracked install gets when crates.io has a newer
+/// version: the exact commands, including the escape hatch for stale install
+/// bookkeeping (`--force`).
+fn cargo_update_message(latest: &Version, current: &Version) -> String {
+    format!(
+        "发现新版本 {latest}（当前 {current}）。\n\
+         当前 cola 由 cargo 安装，请用 cargo 更新：\n\
+         - `cargo install colark`\n\
+         - 若当初用 cargo-binstall 安装：`cargo binstall colark`\n\
+         - 若 cargo 提示 already installed，加 `--force`"
+    )
+}
+
+/// The cargo-channel flow (ADR-0030): report crates.io availability and the
+/// command that applies it. Never downloads, installs, or restarts — a
+/// cargo-tracked binary belongs to cargo.
+async fn run_cargo_update(reporter: &dyn UpdateReporter) -> UpdateOutcome {
+    let current = current_version();
+    match crates_io_latest(&current).await {
+        Err(e) => {
+            tracing::warn!("crates.io update check failed: {e}");
+            reporter.report(format!("❌ 检查 crates.io 更新失败：{e}")).await;
+            UpdateOutcome::Failed
+        }
+        Ok(None) => {
+            reporter
+                .report(format!("✅ 已是最新版本（{current}，crates.io）。"))
+                .await;
+            UpdateOutcome::UpToDate
+        }
+        Ok(Some(latest)) => {
+            reporter.report(cargo_update_message(&latest, &current)).await;
+            UpdateOutcome::CargoUpdateAvailable
+        }
+    }
+}
+
 /// Run the whole self-update flow against `reporter`. Returns whether an
 /// update was applied; the caller decides whether to call [`restart`].
 pub async fn run_update(reporter: &dyn UpdateReporter, mode: UpdateMode) -> UpdateOutcome {
+    // A cargo-tracked binary is updated through cargo, never by replacing it
+    // with a GitHub asset (ADR-0030).
+    let cargo_tracked =
+        std::env::current_exe().is_ok_and(|exe| detect_install_channel(&exe) == InstallChannel::Cargo);
+
     // A dev build has no release-tag guarantee (ADR-0027): warn before the
     // check so `/update` on a local build never silently downgrades the
-    // developer to the last release.
-    if crate::version::is_dev_build() {
+    // developer to the last release. Only the GitHub channel replaces a
+    // binary, so a cargo-tracked dev install gets no replacement warning.
+    if !cargo_tracked && crate::version::is_dev_build() {
         reporter
             .report(
                 "⚠️ 当前是本地 dev 构建 —— 自更新会把二进制替换为最新发布版（可能比本地代码旧）。仅在发布版上建议执行更新。"
@@ -495,6 +654,11 @@ pub async fn run_update(reporter: &dyn UpdateReporter, mode: UpdateMode) -> Upda
             .await;
     }
     reporter.report("🔍 正在检查更新…".into()).await;
+
+    if cargo_tracked {
+        return run_cargo_update(reporter).await;
+    }
+
     match check().await {
         Err(e) => {
             tracing::warn!("update check failed: {e}");
@@ -510,7 +674,7 @@ pub async fn run_update(reporter: &dyn UpdateReporter, mode: UpdateMode) -> Upda
         Ok(UpdateCheck::NoAssetForPlatform { latest }) => {
             reporter
                 .report(format!(
-                    "发现新版本 {latest}，但当前平台没有预编译二进制，请手动更新。"
+                    "发现新版本 {latest}，但当前平台没有预编译二进制，请手动更新（例如 `cargo install colark`）。"
                 ))
                 .await;
             UpdateOutcome::NoAssetForPlatform
@@ -726,6 +890,132 @@ mod tests {
             "https://github.com/SXongin/cola/releases/download/0.7.0/SHA256SUMS"
         );
     }
+    #[test]
+    fn detect_channel_reads_crates2_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("cola"), b"x").unwrap();
+        std::fs::write(
+            root.join(".crates2.json"),
+            r#"{"installs":{"colark 0.8.1 (registry+https://github.com/rust-lang/crates.io-index)":{"bins":["cola"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_install_channel(&bin_dir.join("cola")),
+            InstallChannel::Cargo
+        );
+    }
+
+    #[test]
+    fn detect_channel_without_receipt_is_github() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("cola"), b"x").unwrap();
+        assert_eq!(
+            detect_install_channel(&bin_dir.join("cola")),
+            InstallChannel::GitHub
+        );
+    }
+
+    #[test]
+    fn detect_channel_ignores_receipt_for_another_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("cola"), b"x").unwrap();
+        std::fs::write(
+            root.join(".crates2.json"),
+            r#"{"installs":{"other 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)":{"bins":["other"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_install_channel(&bin_dir.join("cola")),
+            InstallChannel::GitHub
+        );
+    }
+
+    #[test]
+    fn detect_channel_accepts_windows_stem_in_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("cola.exe"), b"x").unwrap();
+        std::fs::write(
+            root.join(".crates2.json"),
+            r#"{"installs":{"colark 0.8.1 (registry+https://github.com/rust-lang/crates.io-index)":{"bins":["cola"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_install_channel(&bin_dir.join("cola.exe")),
+            InstallChannel::Cargo
+        );
+    }
+
+    #[test]
+    fn detect_channel_requires_bin_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join("cola"), b"x").unwrap();
+        std::fs::write(
+            root.join(".crates2.json"),
+            r#"{"installs":{"colark 0.8.1 (registry+https://github.com/rust-lang/crates.io-index)":{"bins":["cola"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_install_channel(&root.join("cola")), InstallChannel::GitHub);
+    }
+
+    #[test]
+    fn index_picks_newest_stable_and_skips_yanked() {
+        let body = r#"{"name":"colark","vers":"0.7.0","yanked":false}
+{"name":"colark","vers":"0.8.2","yanked":false}
+{"name":"colark","vers":"0.9.0-rc.1","yanked":false}
+{"name":"colark","vers":"1.0.0","yanked":true}"#;
+        let current = Version::parse("0.8.1").unwrap();
+        assert_eq!(
+            latest_from_index(body, &current),
+            Some(Version::parse("0.8.2").unwrap())
+        );
+    }
+
+    #[test]
+    fn index_allows_prerelease_when_current_is_prerelease() {
+        let body = r#"{"name":"colark","vers":"0.9.0-rc.1","yanked":false}
+{"name":"colark","vers":"0.9.0-rc.2","yanked":false}"#;
+        let current = Version::parse("0.9.0-rc.1").unwrap();
+        assert_eq!(
+            latest_from_index(body, &current),
+            Some(Version::parse("0.9.0-rc.2").unwrap())
+        );
+    }
+
+    #[test]
+    fn index_none_when_nothing_newer() {
+        let body = r#"{"name":"colark","vers":"0.8.1","yanked":false}
+not json at all
+{"name":"colark","vers":"0.8.0","yanked":false}"#;
+        let current = Version::parse("0.8.1").unwrap();
+        assert_eq!(latest_from_index(body, &current), None);
+    }
+
+    #[test]
+    fn cargo_update_message_names_commands_and_force() {
+        let msg = cargo_update_message(
+            &Version::parse("0.9.0").unwrap(),
+            &Version::parse("0.8.1").unwrap(),
+        );
+        assert!(msg.contains("0.9.0"), "{msg}");
+        assert!(msg.contains("0.8.1"), "{msg}");
+        assert!(msg.contains("cargo install colark"), "{msg}");
+        assert!(msg.contains("cargo binstall colark"), "{msg}");
+        assert!(msg.contains("--force"), "{msg}");
+    }
+
     #[test]
     fn paths_equal_self_is_equal() {
         let exe = std::env::current_exe().unwrap();

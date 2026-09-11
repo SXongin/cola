@@ -53,8 +53,9 @@ pub enum Command {
     /// Restart the OpenCode server — but only when cola started it. A server
     /// another tool launched is never touched.
     RestartOpenCode,
-    /// Self-update from GitHub Releases (ADR-0015): check, download, verify,
-    /// replace the running binary, and restart.
+    /// Update cola (ADR-0015, ADR-0030): check the install channel. A GitHub
+    /// Releases install downloads, verifies, replaces the running binary, and
+    /// restarts; a cargo-tracked install is told which cargo command updates it.
     Update,
     /// Show the running cola version and build provenance (release or dev
     /// build) — ADR-0027. Never talks to the network.
@@ -259,8 +260,8 @@ pub fn help_text() -> String {
 `/autoaccept` · Show auto-approve status; `/autoaccept on|off` switches
 `/restart` · Restart cola (keeps startup args + log redirect)
 `/restart-opencode` · Restart the OpenCode server (only when cola started it)
-`/update` · Check for and apply a cola self-update from GitHub Releases
-`/version` · Show cola version & build provenance (release or dev build)
+`/update` · Update cola (GitHub Releases self-update; cargo installs get the cargo command)
+`/version` · Show cola version & build provenance (release / crates.io / dev build)
 `/help <command>` · Show help for one command (e.g. `/help model`)
 
 话题规则：已绑定会话的话题里，`/switch`、`/new`、`/dir` 被拒绝，请回主对话操作。从未绑定过会话的话题可以用它们来绑定该话题的唯一会话。
@@ -320,10 +321,10 @@ pub fn command_help(name: &str) -> Option<String> {
             "/restart-opencode\nRestart the OpenCode server. cola only restarts a server IT started; a server launched by another tool is left alone and needs a manual restart."
         }
         "update" => {
-            "/update\nCheck GitHub Releases for a newer cola; if one exists, download, verify (SHA256SUMS), replace the running binary and restart. When running as a systemd unit, the restart hands back to `Restart=on-failure`; otherwise the new process re-execs with --replace. If already on the latest version, it reports that and does nothing."
+            "/update\nUpdate cola to the latest version (ADR-0030).\n- GitHub Releases install: check GitHub Releases; if newer, download, verify (SHA256SUMS), replace the running binary and restart. When running as a systemd unit, the restart hands back to `Restart=on-failure`; otherwise the new process re-execs with --replace.\n- cargo install (`cargo install colark` / `cargo binstall colark`, detected from cargo's install receipt): nothing is replaced; cola reports the crates.io version and the command to run (`cargo install colark`; binstall users `cargo binstall colark`; add `--force` if cargo says already installed).\nCLI equivalent: `cola update [--check]`."
         }
         "version" => {
-            "/version\nShow the running cola's version and build provenance (no network).\n- Release build (built at a clean release tag): `cola 0.7.0`\n- Dev build (local or untagged): `cola 0.7.0-dev <branch>@<sha> ⚠` — ⚠ means the source tree had uncommitted changes at build time\nSelf-update compares only the release version, so a dev build is never reported outdated by its dev marker.\nCLI equivalent: `cola --version`."
+            "/version\nShow the running cola's version and build provenance (no network).\n- Release build (built at a clean release tag): `cola 0.7.0`\n- crates.io install (`cargo install colark`): `cola 0.8.1 (crates.io)`\n- Dev build (local or untagged): `cola 0.7.0-dev <branch>@<sha> ⚠` — ⚠ means the source tree had uncommitted changes at build time\nUpdate checks compare only the release version, so a dev build is never reported outdated by its dev marker.\nCLI equivalent: `cola --version`."
         }
         "help" => {
             "/help [command]\nList all commands, or show detailed help for one.\nExample: `/help model`"
