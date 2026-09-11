@@ -130,11 +130,11 @@ A platform image (a standalone image message, an image inside a rich-text messag
 _Avoid_: Picture, media, attachment file
 
 **Turn Footer**:
-The Card footer line summarizing what a turn ran on: working directory (project basename), git branch and dirty state, the answering model, and context-window usage. The model line renders the full identity `provider/model@variant` (provider is part of model identity, not decoration). The directory/branch half is captured when the turn starts and shows from the first card; the model and context usage appear only when the turn completes.
+The Card footer line summarizing what a turn ran on: working directory (project basename), git branch and dirty state, the answering model, and context-window usage. The model line renders the full identity `provider/model@variant` (provider is part of model identity, not decoration). The directory/branch half is captured when the turn starts (so a wrong-branch run is visible from the first card) and refreshed when the turn ends (so the completed card shows where the turn landed); the model and context usage appear only when the turn completes.
 _Avoid_: Tail, footer bar, status line
 
 **Dirty**:
-A git working tree that differs from HEAD — including untracked files — as measured by `git status --porcelain`. Shown as ⚠ on the Turn Footer. Captured at turn start, so it reflects the state the AI operated on, not the changes the AI itself made.
+A git working tree that differs from HEAD — including untracked files — as measured by `git status --porcelain`. Shown as ⚠ on the Turn Footer. Captured at turn start (the state the AI operated on) and refreshed at turn end (whether the AI left uncommitted work behind).
 _Avoid_: Uncommitted, modified
 
 **Release Version**:
