@@ -88,6 +88,10 @@ body`). The working mechanism is the anchor:
   anchor** instead of sending, so they land inside the topic. Without an anchor
   (non-topic sessions, or topic sessions that predate this field) they fall back
   to `send_card("chat_id", ...)` as before.
+- The restart/update announcement (ADR-0015) is the same kind of card: the dying
+  process persists the command's `message_id` and `thread_id` in
+  `restart-notify.json`, and the successor replies to that in-topic message, so
+  an in-topic `/restart` announces inside its topic rather than the chat lobby.
 
 ## Why
 
