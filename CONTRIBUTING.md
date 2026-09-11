@@ -144,4 +144,13 @@ git tag 1.2.3 && git push origin 1.2.3
 ```
 
 `.github/workflows/release.yml` builds all three platforms and attaches the
-binaries + `SHA256SUMS` to a GitHub release.
+binaries + `SHA256SUMS` to a GitHub release, then publishes the crate to
+crates.io as `colark`. The GitHub release runs first on purpose (ADR-0030): its
+assets are the self-update channel and must appear atomically, and a crates.io
+release cannot be revoked. Two operational rules follow:
+
+- If the crates-io job fails after a release, rerun it (or cut a patch
+  version) — a GitHub release with no crates.io version means cargo installs
+  cannot reach that version.
+- If a version must be yanked on crates.io, remove the matching GitHub Release
+  too, or GitHub-channel installs keep receiving it.

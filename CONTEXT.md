@@ -138,12 +138,24 @@ A git working tree that differs from HEAD — including untracked files — as m
 _Avoid_: Uncommitted, modified
 
 **Release Version**:
-The semver in `Cargo.toml` that the running cola binary was built from — the ONLY value self-update ever compares against the release tag (ADR-0015, ADR-0027). It must equal the tag a release is cut on; dev/provenance detail never enters the comparison, or a dev build ahead of the last release would report "update available" forever.
+The semver in `Cargo.toml` that the running cola binary was built from — the ONLY value an update check ever compares: against the GitHub release tag (ADR-0015) or, on the cargo channel, the crates.io version (ADR-0030). It must equal the tag a release is cut on; dev/provenance detail never enters the comparison, or a dev build ahead of the last release would report "update available" forever.
 _Avoid_: Version, build number (unqualified — they blur the comparison source with the display string)
 
 **Build Provenance**:
-The git-derived identity baked into a cola binary at build time describing the exact source tree it came from. Only an exact, clean release-tag checkout carries none (the binary then shows the bare **Release Version**); any other build — a branch, a dirty tree, or a source tree with no git — is a dev build and shows `-dev` plus the branch/short-sha it was built from, with ⚠ when that tree was Dirty. Determines whether a binary is a release or a dev build (ADR-0027).
+The identity baked into a cola binary at build time describing where it came from. An exact, clean release-tag checkout shows the bare **Release Version**; a crates.io package build (no `.git`, but `.cargo_vcs_info.json`) is also a release identity, marked `(crates.io)` (ADR-0030); every other build — a branch, a dirty tree, or a source tree with no git — is a dev build and shows `-dev` plus the branch/short-sha it was built from, with ⚠ when that tree was Dirty. Determines whether a binary is a release or a dev build (ADR-0027).
 _Avoid_: Version, build info, source marker
+
+**Install Channel**:
+How a cola binary got onto the machine: a GitHub Release archive, crates.io (`cargo install`/`cargo binstall`), or a source build. Decides the **Update Channel** (ADR-0030).
+_Avoid_: Install method, distribution channel (that is the publishing side)
+
+**Update Channel**:
+Where a running binary takes its updates from: GitHub Releases self-update for binaries cargo does not track; crates.io (via the cargo commands) for a binary with a **Cargo Receipt**. Set by the **Install Channel**, never mixed (ADR-0030).
+_Avoid_: Channel (unqualified), update source
+
+**Cargo Receipt**:
+cargo's install bookkeeping in the install root — `.crates2.json`, mapping each installed package to the binary names it placed in `<root>/bin`. Its presence for the running binary is what makes cola route updates through cargo instead of self-update; a `--no-track` install leaves none and is treated as a GitHub-channel install (ADR-0030).
+_Avoid_: Lock file, metadata file (both ambiguous)
 
 **Singleton Lock**:
 The guarantee that at most one cola instance processes platform events at a time. A `/restart` hands it to its replacement before the old instance exits; a replacement may take it over from an owner that is no longer **Functionally Alive** — dead, a zombie, or mid-`exit()`.
@@ -177,6 +189,7 @@ _Avoid_: Notification, message, signal
 - A prompt's **Quoted Context** and **Image Attachment**s enrich the **Session** the reply belongs to
 - A **Command** is parsed by the **Bridge** from message text before routing to the **Backend**
 - Every **Cola-Authored Message** carries a `msg_cola_` id chosen by the **Bridge**; external-message sync treats only user messages newer than the **Sync Watermark** that are NOT **Cola-Authored Message**s as **External Message**s
+- A **Cargo Receipt** for the running binary flips its **Update Channel** from GitHub Releases to crates.io; the **Install Channel** decides, never the other way around (ADR-0030)
 
 ## Example dialogue
 
