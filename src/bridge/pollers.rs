@@ -6,6 +6,7 @@ use crate::bridge::core::SharedCore;
 use crate::bridge::discovery::{self, ServerCandidate};
 use crate::bridge::handler::CardActionResult;
 use crate::config::ServerStartPolicy;
+use crate::opencode;
 
 /// How often the server-reconcile loop rescans for a changed or newly-appeared
 /// server (the same cadence the old reconnect loop used).
@@ -88,6 +89,36 @@ fn want_to_spawn(allow_spawn: bool, heal_when_busy: bool, busy: bool) -> bool {
     allow_spawn || (heal_when_busy && busy)
 }
 
+/// Wait until the freshly spawned server actually serves requests, within
+/// `timeout`. `opencode serve` accepts TCP before its HTTP dispatch is fully
+/// wired up; requests landing in that startup window (~1s) are swallowed
+/// silently and hang forever — the Lazy Start flow's first request
+/// (session_subtitle) always landed there, hanging the turn silently (the
+/// Lazy Start silent-hang incident). Each probe is short-bounded so a wedged
+/// attempt is abandoned and retried on a fresh connection. ANY HTTP response
+/// — success or error — counts as ready: the failure mode being dodged is a
+/// swallowed request (no response at all), and a responding server is past
+/// the window even when it answers with an error.
+pub(crate) async fn wait_for_server_ready(
+    backend: &Arc<dyn opencode::Backend>,
+    timeout: std::time::Duration,
+) -> crate::error::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_millis(1500), backend.list_sessions()).await {
+            Ok(Ok(_)) | Ok(Err(_)) => return Ok(()),
+            Err(_) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(crate::error::BridgeError::OpenCode(
+                        "own OpenCode server accepted connections but never served a request".into(),
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    }
+}
+
 /// One pass of the server-ownership reconcile (ADR-0013): attach to the
 /// preferred default-store server (a Coexistent Server over cola's Owned),
 /// lazily spawn an Owned Server when `allow_spawn` and none exists, and reap a
@@ -119,6 +150,29 @@ async fn reconcile(
                 .await
                 .map_err(|e| crate::error::BridgeError::OpenCode(format!("lazy start failed: {e}")))?;
             core.opencode.reconnect(&spawned.url, &spawned.password).await?;
+            // The spawned server only serves requests after a short startup
+            // window (requests landing in it are swallowed forever). Wait until
+            // it actually responds, so the message flow's first request lands
+            // on a live server instead of hanging the turn silently.
+            if let Err(e) = wait_for_server_ready(&core.opencode, std::time::Duration::from_secs(20)).await {
+                tracing::warn!("own OpenCode server never served a request: {}", e);
+                // Reap the wedged server and go serverless, so the NEXT message
+                // re-runs this reconcile and spawns a fresh one — leaving the
+                // record in place would re-attach a scan-found wedged server
+                // (its requests are swallowed, hanging the turn again).
+                if let Some(pid) = discovery::self_spawned_pid() {
+                    if discovery::terminate_process(pid).is_ok() && wait_dead(pid, 5000).await {
+                        discovery::clear_self_spawned();
+                    } else {
+                        let _ = discovery::force_kill(pid);
+                        if wait_dead(pid, 5000).await {
+                            discovery::clear_self_spawned();
+                        }
+                    }
+                }
+                let _ = core.opencode.reconnect("", "").await;
+                return Err(e);
+            }
             if allow_spawn {
                 tracing::info!("lazily started own OpenCode server at {}", spawned.url);
             } else {
