@@ -9,6 +9,10 @@ release built from the `0.7.0` tag, so "what build is running?" had no answer.
 We decided to make every binary identify itself, and to make release vs dev a
 property of the build's git provenance rather than of the human who built it.
 
+> **Amended by ADR-0030**: a crates.io package build (no `.git`, but
+> `.cargo_vcs_info.json`) is a release identity marked `(crates.io)`, not a
+> dev build. The release/dev split below describes git-tree builds.
+
 ## Decision
 
 1. **`build.rs` stamps the binary's Build Provenance from the git tree it was

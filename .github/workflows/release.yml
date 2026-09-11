@@ -119,6 +119,11 @@ jobs:
             dist/*.zip
             dist/SHA256SUMS
 
+  # Deliberately runs AFTER the GitHub Release (ADR-0030): the release assets
+  # are the self-update channel and must appear atomically, while a crates.io
+  # publish cannot be revoked. If this job fails, rerun it (or cut a patch
+  # version) — GitHub-channel users already have the release. If a version is
+  # yanked on crates.io, remove the matching GitHub Release too.
   crates-io:
     name: Publish to crates.io
     needs: publish

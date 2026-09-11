@@ -5,6 +5,10 @@ Feishu. We decided: the update channel is GitHub Releases only — the release
 binaries already built by `release.yml` — and the update is applied by an
 in-band `cola update` / `/update` that reuses the existing restart machinery.
 
+> **Amended by ADR-0030**: cola is published on crates.io as `colark`.
+> GitHub Releases remains the self-update channel for binaries cargo does not
+> track; a cargo-tracked binary is updated with cargo instead of this flow.
+
 ## Decision
 
 - **Channel**: GitHub Releases (`releases/latest`). The update checks
@@ -50,10 +54,14 @@ in-band `cola update` / `/update` that reuses the existing restart machinery.
   binary. macOS (launchd `KeepAlive`) and Windows (no supervisor) keep the
   existing spawn-and-exit behavior; the singleton lock resolves any race with
   launchd's KeepAlive restart.
-- **No crates.io for now**: the `cola` crate name is taken on crates.io (a text
-  CRDT library). Publishing is deferred until a name is chosen; self-update
-  does not depend on it. `cargo-binstall`/`cargo install` remain future
-  conveniences.
+- **crates.io is a distribution channel, not a second self-update channel
+  (ADR-0030)**: cola is published as `colark` (binary still `cola`), so
+  `cargo install colark` / `cargo binstall colark` are supported installs.
+  A binary tracked by cargo's install receipt is updated through cargo —
+  `/update` detects this and reports the command (`cargo install colark`,
+  `--force` when cargo answers "already installed") instead of replacing the
+  binary; its availability check reads the crates.io sparse index. The GitHub
+  Releases flow above applies to every binary cargo does not track.
 - **Release invariant**: the binary's embedded version must equal the release
   tag, otherwise self-update reports "update available" forever. `release.yml`
   gains a step enforcing `Cargo.toml` `package.version == tag`.
