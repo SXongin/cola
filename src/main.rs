@@ -493,11 +493,13 @@ impl update::UpdateReporter for CliReporter {
     }
 }
 
-/// `cola update [--check]`: report the update situation; on an available
-/// update, download, verify and replace the binary. The daemon is then
-/// restarted through its OS supervisor when one is registered; otherwise the
-/// user gets a hint that depends on whether a daemon is actually running —
-/// `/restart` in Feishu only makes sense when one is (ADR-0015).
+/// `cola update [--check]`: report the update situation per install channel
+/// (ADR-0030). A GitHub Releases install downloads, verifies and replaces the
+/// binary, then restarts the daemon through its OS supervisor when one is
+/// registered; otherwise the user gets a hint that depends on whether a daemon
+/// is actually running — `/restart` in Feishu only makes sense when one is
+/// (ADR-0015). A cargo-tracked install downloads nothing: it prints the cargo
+/// command that applies the update.
 async fn update_cli(check_only: bool) -> anyhow::Result<()> {
     let mode = if check_only {
         update::UpdateMode::Check

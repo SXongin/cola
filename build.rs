@@ -39,6 +39,10 @@ fn main() {
 /// tree is clean; every other build (a branch, a dirty tree, or no git at all)
 /// is a dev build and gets its branch/short-sha/dirty state stamped for display.
 ///
+/// A crates.io package build is the one non-git release identity (ADR-0030):
+/// the package is extracted without `.git` but carries `.cargo_vcs_info.json`,
+/// and its Cargo.toml version is the published release version.
+///
 /// Best effort: any git failure (no git, a tarball checkout) leaves the
 /// release var unset, which the runtime reads as "dev build, no provenance".
 fn stamp_build_identity() {
@@ -66,6 +70,14 @@ fn stamp_build_identity() {
     let release = clean && tag.as_deref() == Some(cargo_version.as_str());
     if release {
         println!("cargo:rustc-env=COLA_RELEASE=1");
+        return;
+    }
+
+    // A crates.io package build (ADR-0030): no `.git`, but the package carries
+    // `.cargo_vcs_info.json`. This is a release identity at the published
+    // version, not a dev build.
+    if !git_dir.exists() && Path::new(&manifest_dir).join(".cargo_vcs_info.json").exists() {
+        println!("cargo:rustc-env=COLA_BUILD_CHANNEL=crates.io");
         return;
     }
 

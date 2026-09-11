@@ -34,7 +34,8 @@ your `PATH`, in a user-writable directory:
 in place (`/update`, `cola update`), which requires write permission on the
 binary's directory. In a root-owned location like `/usr/local/bin` (or
 `C:\Program Files`) cola runs fine but **cannot update itself** — you would
-have to replace it manually each release.
+have to replace it manually each release. (cargo installs are unaffected: they
+are updated through cargo.)
 
 **macOS.** The release build is Apple Silicon (`aarch64`) only: every Mac sold
 since late 2020 is ARM, and macOS 26 Tahoe is the last macOS release supporting
@@ -51,10 +52,17 @@ is the convention per-user apps use. Extract `cola.exe`, add the directory to
 your user `PATH` (Settings → System → About → Advanced system settings →
 Environment Variables), and reopen the terminal.
 
+**crates.io.** With a Rust toolchain you can install from
+[crates.io](https://crates.io/crates/colark): `cargo install colark` (the
+binary is named `cola`). A cargo-installed binary is updated with cargo, not by
+cola's self-update — see [Self-update](#self-update).
+
 **Other platforms.** There is no prebuilt asset for Linux aarch64 or Intel
-macOS; self-update reports "no asset for this platform" instead of failing.
-Build from source (Rust toolchain, edition 2024): `cargo build --release`;
-`cargo install --path .` also places the binary in a user-writable directory.
+macOS; a GitHub-channel self-update reports "no asset for this platform"
+instead of failing (cargo installs are unaffected — they update through
+crates.io). Build from source (Rust toolchain, edition 2024):
+`cargo build --release`; `cargo install --path .` also places the binary in a
+user-writable directory.
 
 Also make sure an `opencode` binary is on `PATH` — cola discovers and spawns it.
 The autostart launcher snapshots your `PATH` at `cola autostart enable` time, so
@@ -236,13 +244,20 @@ lock lives at `~/.cola/cola.lock`.
 
 ## Self-update
 
-`/update` (Feishu) or `cola update [--check]` checks GitHub Releases for a newer
-cola. If one exists, it downloads the binary for your platform, verifies it
-against the release's `SHA256SUMS`, replaces the running binary and restarts.
+`/update` (Feishu) or `cola update [--check]` updates whichever channel cola
+was installed through.
 
-- The binary's directory must be **user-writable** (see [Install](#install)).
-- Under a systemd unit the restart hands back to `Restart=on-failure`; elsewhere
-  cola re-execs itself.
+- **GitHub Releases installs**: checks GitHub Releases, downloads the binary for
+  your platform, verifies it against the release's `SHA256SUMS`, replaces the
+  running binary and restarts. The binary's directory must be
+  **user-writable** (see [Install](#install)). Under a systemd unit the restart
+  hands back to `Restart=on-failure`; elsewhere cola re-execs itself.
+- **cargo installs** (`cargo install colark` / `cargo binstall colark`): cola
+  detects cargo's install receipt and replaces nothing. It checks the crates.io
+  version and replies with the command to run: `cargo install colark`, or
+  `cargo binstall colark` for a binstall install; add `--force` if cargo
+  answers "already installed". Updating through cargo keeps its install
+  bookkeeping (`cargo install --list`, cargo-update) truthful.
 - Platforms without a prebuilt binary (e.g. Linux aarch64) report that instead
   of failing.
 
@@ -272,7 +287,8 @@ detailed help for any of these.
 | `/autoaccept [on\|off]` | Show/switch auto-allowing tool-permission requests for this session |
 | `/restart` | Restart cola (keeps startup args + log redirect) |
 | `/restart-opencode` | Restart the OpenCode server (only one cola itself started) |
-| `/update` | Check for and apply a cola self-update from GitHub Releases |
+| `/update` | Update cola via its install channel (GitHub Releases self-update, or the cargo command for `cargo install`/`cargo binstall` installs) |
+| `/version` | Show cola version and build provenance (release / crates.io / dev build) |
 | `/help [command]` | List commands, or show detailed help for one |
 
 Notes:
