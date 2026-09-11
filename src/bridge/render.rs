@@ -10,6 +10,12 @@ use crate::bridge::streaming::StreamAccumulator;
 /// still has the default `New session - ...` title (or the title is empty),
 /// the id-tail alone identifies the session; the current prompt is never
 /// echoed (the reply context already shows it).
+/// Bound on the server-side session-title fetch. A freshly spawned Owned
+/// Server (Lazy Start) can swallow the first requests in its startup window,
+/// and a hung session_info must degrade the subtitle — not hang the whole
+/// turn (the Lazy Start silent-hang incident).
+const SESSION_INFO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 pub(crate) async fn session_subtitle(
     core: &SharedCore,
     thread_key: &crate::config::ThreadKey,
@@ -25,12 +31,14 @@ pub(crate) async fn session_subtitle(
     };
     let session_id = entry.session_id.clone();
     let mut name = String::new();
-    if let Ok(info) = core
-        .opencode
-        .clone()
-        .for_directory(&entry.directory)
-        .session_info(&session_id)
-        .await
+    if let Ok(Ok(info)) = tokio::time::timeout(
+        SESSION_INFO_TIMEOUT,
+        core.opencode
+            .clone()
+            .for_directory(&entry.directory)
+            .session_info(&session_id),
+    )
+    .await
         && let Some(t) = info.title.filter(|t| !t.is_empty())
     {
         name = crate::feishu::card::clean_session_label(&t);

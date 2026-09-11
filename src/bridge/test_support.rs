@@ -245,6 +245,12 @@ pub struct MockBackend {
     /// Same as `hang_list_permissions`, for `messages` (the external poller's
     /// per-session read).
     pub hang_messages: Arc<std::sync::atomic::AtomicUsize>,
+    /// Same as `hang_list_permissions`, for `session_info` (the session
+    /// subtitle fetch — a wedged first request on a freshly spawned server).
+    pub hang_session_info: Arc<std::sync::atomic::AtomicUsize>,
+    /// Same as `hang_list_permissions`, for `list_sessions` (the Lazy Start
+    /// readiness probe).
+    pub hang_list_sessions: Arc<std::sync::atomic::AtomicUsize>,
     /// When set, `messages` returns this as a fresh user message (simulates
     /// a message posted from OpenChamber).
     pub external_user_message: Option<String>,
@@ -385,6 +391,8 @@ impl MockBackend {
             hang_list_permissions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             hang_list_questions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             hang_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hang_session_info: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hang_list_sessions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             external_user_message: None,
             external_user_messages: std::collections::HashMap::new(),
             cola_user_messages: std::collections::HashMap::new(),
@@ -498,6 +506,7 @@ impl opencode::Backend for MockBackend {
     }
 
     async fn list_sessions(&self) -> crate::error::Result<Vec<opencode::client::SessionListInfo>> {
+        hang_if_scripted(&self.hang_list_sessions).await;
         self.list_sessions_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(self.session_list.clone())
@@ -796,6 +805,7 @@ impl opencode::Backend for MockBackend {
         session_id: &str,
         _d: Option<&str>,
     ) -> crate::error::Result<opencode::client::SessionInfo> {
+        hang_if_scripted(&self.hang_session_info).await;
         Ok(opencode::client::SessionInfo {
             id: session_id.to_string(),
             parent_id: self.session_parents.get(session_id).cloned(),
@@ -1296,6 +1306,79 @@ pub(crate) mod integration_tests {
         assert_eq!(
             crate::bridge::render::session_subtitle(&app.core, &key, "你好").await,
             "01ba0ed"
+        );
+    }
+
+    /// The session-title fetch must degrade, not hang the turn, when the
+    /// server swallows the request — a freshly spawned Owned Server's startup
+    /// window is exactly this: the first request is read but never dispatched
+    /// (the Lazy Start silent-hang incident).
+    #[tokio::test]
+    async fn subtitle_degrades_when_session_info_hangs() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mock = MockBackend::new(realistic_parts());
+        mock.hang_session_info
+            .store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
+        let (app, _) = build_app(cfg, mock).await;
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        {
+            let mut store = app.sessions.lock().await;
+            store.set_active(crate::config::SessionEntry {
+                thread_key: key.clone(),
+                session_id: "ses_01ba0ed03ffeRvYNWua6mg8d9c".into(),
+                directory: "/tmp/x".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+                topic_root: None,
+                variant: None,
+            });
+        }
+        // The fetch hangs forever; the subtitle must still return (id-tail
+        // only) within the bound instead of hanging the prompt flow.
+        let subtitle = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            crate::bridge::render::session_subtitle(&app.core, &key, "问题"),
+        )
+        .await
+        .expect("session_subtitle must not hang when session_info never returns");
+        assert_eq!(subtitle, "01ba0ed");
+    }
+
+    /// The Lazy Start readiness probe must keep retrying through wedged
+    /// attempts (the spawned server's startup window) and only return once
+    /// the server actually serves a request.
+    #[tokio::test]
+    async fn readiness_wait_recovers_after_wedged_attempts() {
+        let mock = MockBackend::new(realistic_parts());
+        mock.hang_list_sessions
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        let backend: Arc<dyn crate::opencode::Backend> = Arc::new(mock);
+        let result =
+            crate::bridge::pollers::wait_for_server_ready(&backend, std::time::Duration::from_secs(10)).await;
+        assert!(
+            result.is_ok(),
+            "readiness wait must recover after the startup window: {result:?}"
+        );
+    }
+
+    /// A server that never serves a request must fail the readiness wait, so
+    /// the lazy start reports the failure instead of hanging the turn
+    /// silently.
+    #[tokio::test]
+    async fn readiness_wait_fails_when_server_never_serves() {
+        let mock = MockBackend::new(realistic_parts());
+        mock.hang_list_sessions
+            .store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
+        let backend: Arc<dyn crate::opencode::Backend> = Arc::new(mock);
+        let result =
+            crate::bridge::pollers::wait_for_server_ready(&backend, std::time::Duration::from_secs(2)).await;
+        assert!(
+            result.is_err(),
+            "readiness wait must fail when the server never serves"
         );
     }
 
