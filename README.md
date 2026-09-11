@@ -30,6 +30,11 @@ own binary in place, which a root-owned path like `/usr/local/bin` would block:
   `PATH` (via the Environment Variables dialog), then reopen the terminal.
   `AppData\Local` is user-writable and not roamed, unlike `AppData\Roaming`.
 
+Or install from [crates.io](https://crates.io/crates/colark) (any platform with a
+Rust toolchain, edition 2024): `cargo install colark`. The binary is still named
+`cola`, and self-update still targets the GitHub release channel, so a
+`cargo install`-ed binary can move itself onto it via `/update`.
+
 Or build from source (Rust toolchain, edition 2024): `cargo build --release`.
 The [user guide](docs/user-guide.md#install) explains each choice in detail.
 
