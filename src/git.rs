@@ -20,18 +20,43 @@ pub fn project_name(dir: &str) -> Option<String> {
 /// Read the git state of `dir`: the current branch (or short commit hash when
 /// detached) and whether the working tree is dirty. Strictly best effort — a
 /// non-git directory or any git failure yields the default (no branch, clean)
-/// so the card footer simply omits the git halves. The dirty flag is only
-/// reported alongside a resolved branch: an empty repo (no HEAD) has a
-/// succeeding `status --porcelain` but a failing `rev-parse`, and a lone ⚠
-/// with no branch is exactly the "omit the halves" case the footer must avoid.
+/// so the card footer simply omits the git halves. The halves are omitted
+/// together: an empty repo (no HEAD) has a succeeding `status --porcelain` but
+/// a failing `rev-parse`, and a failed status read — indistinguishable from a
+/// clean tree at the `git()` level — yields no state at all, so a turn-end
+/// refresh keeps the start capture instead of clearing its ⚠ as if clean.
 pub async fn read_state(dir: &str) -> GitState {
     let branch = match git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]).await {
         Some(branch) if branch != "HEAD" => Some(branch),
         Some(_) => git(dir, &["rev-parse", "--short", "HEAD"]).await,
         None => None,
     };
-    let dirty = branch.is_some() && git(dir, &["status", "--porcelain"]).await.is_some();
-    GitState { branch, dirty }
+    let Some(branch) = branch else {
+        return GitState::default();
+    };
+    match status_dirty(dir).await {
+        Some(dirty) => GitState {
+            branch: Some(branch),
+            dirty,
+        },
+        None => GitState::default(),
+    }
+}
+
+/// `git status --porcelain`: `Some(true)` when the working tree has changes,
+/// `Some(false)` when the command succeeded with no output (clean), `None`
+/// when git is unavailable or the command failed. `git()` cannot be reused
+/// here — it maps a clean tree and a failed command to the same `None`.
+async fn status_dirty(dir: &str) -> Option<bool> {
+    let out = tokio::process::Command::new("git")
+        .args(["-C", dir, "status", "--porcelain"])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
 }
 
 /// Run a git command in `dir`; returns trimmed stdout, or None when git is
@@ -154,6 +179,32 @@ mod tests {
         let dir = temp_dir("git-empty");
         run(&dir, &["init", "-b", "main"]);
         std::fs::write(dir.join("untracked.txt"), "new").unwrap();
+
+        let s = dir.to_string_lossy().to_string();
+        assert_eq!(read_state(&s).await, GitState::default());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed `status --porcelain` must not be mistaken for a clean tree:
+    /// with the index broken, `rev-parse` still resolves the branch but
+    /// `status` fails — the read must yield no state, so a turn-end refresh
+    /// keeps the start capture instead of clearing its ⚠ (ADR-0019).
+    #[tokio::test]
+    async fn failed_status_read_yields_no_state() {
+        let dir = temp_dir("git-status-fail");
+        run(&dir, &["init", "-b", "main"]);
+        run(&dir, &["config", "user.email", "test@example.com"]);
+        run(&dir, &["config", "user.name", "test"]);
+        std::fs::write(dir.join("a.txt"), "hello").unwrap();
+        run(&dir, &["add", "a.txt"]);
+        run(&dir, &["commit", "-m", "init"]);
+
+        // Break the index (a directory cannot be mapped as the index file):
+        // `rev-parse` reads HEAD and succeeds, `status` fails.
+        let index = dir.join(".git/index");
+        std::fs::remove_file(&index).unwrap();
+        std::fs::create_dir(&index).unwrap();
 
         let s = dir.to_string_lossy().to_string();
         assert_eq!(read_state(&s).await, GitState::default());

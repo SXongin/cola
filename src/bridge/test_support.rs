@@ -993,6 +993,19 @@ pub(crate) mod integration_tests {
         dir
     }
 
+    /// The last card the app flushed in place — the finalized card.
+    async fn final_card(platform: &RecordingPlatform) -> serde_json::Value {
+        let calls = platform.calls.lock().await;
+        calls
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                PlatformCall::UpdateMessage { card, .. } => Some(card.clone()),
+                _ => None,
+            })
+            .expect("the final card must be updated in place")
+    }
+
     /// Map a session to a directory in the SessionStore, so a card action's
     /// reply routes to the owning instance (the permission/question cards do
     /// this via their payload; tests that seed state directly need the store).
@@ -1086,16 +1099,7 @@ pub(crate) mod integration_tests {
         ))
         .await;
 
-        let calls = platform.calls.lock().await.clone();
-        let final_card = calls
-            .iter()
-            .rev()
-            .find_map(|c| match c {
-                PlatformCall::UpdateMessage { card, .. } => Some(card.clone()),
-                _ => None,
-            })
-            .expect("the final card must be updated in place");
-        let text = final_card.to_string();
+        let text = final_card(&platform).await.to_string();
         assert!(
             text.contains("· feat/ai-work"),
             "final footer must show the end branch: {text}"
@@ -1136,19 +1140,51 @@ pub(crate) mod integration_tests {
         ))
         .await;
 
-        let calls = platform.calls.lock().await.clone();
-        let final_card = calls
-            .iter()
-            .rev()
-            .find_map(|c| match c {
-                PlatformCall::UpdateMessage { card, .. } => Some(card.clone()),
-                _ => None,
-            })
-            .expect("the final card must be updated in place");
-        let text = final_card.to_string();
+        let text = final_card(&platform).await.to_string();
         assert!(
             text.contains("· main ⚠"),
             "final footer must show the AI's uncommitted changes: {text}"
+        );
+    }
+
+    /// ADR-0019: a PARTIAL turn-end read — the branch still resolves but the
+    /// `status` command fails (e.g. index lock contention) — must keep the
+    /// start capture. A failed status read is not a clean tree; clearing the
+    /// start ⚠ would silently lie about the working tree.
+    #[tokio::test]
+    async fn turn_footer_keeps_start_capture_when_the_end_status_read_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git_repo();
+        let repo_path = repo.path().to_path_buf();
+        // The tree starts dirty (untracked file): the start card shows `main ⚠`.
+        std::fs::write(repo_path.join("pre-existing.txt"), "wip").unwrap();
+        let mut cfg = test_config(&dir.path().join("sessions.json"));
+        cfg.bridge.work_dir = Some(repo_path.clone());
+
+        let mut mock = MockBackend::new(realistic_parts());
+        mock.on_prompt = Some(Box::new(move || {
+            // Break the index mid-turn: `rev-parse` reads HEAD and still
+            // resolves `main`, while `git status --porcelain` fails.
+            let index = repo_path.join(".git/index");
+            std::fs::remove_file(&index).unwrap();
+            std::fs::create_dir(&index).unwrap();
+        }));
+        let (app, platform) = build_app(cfg, mock).await;
+
+        app.handle_message(incoming(
+            "msg_1".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "干点活".into(),
+            None,
+        ))
+        .await;
+
+        let text = final_card(&platform).await.to_string();
+        assert!(
+            text.contains("· main ⚠"),
+            "a failed end read must keep the start capture: {text}"
         );
     }
 
