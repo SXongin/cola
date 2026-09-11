@@ -586,8 +586,11 @@ async fn external_render_loop(
 }
 
 /// Mark the accumulator's card Done and flush it — the terminal state for a
-/// reply that finished (or timed out with content rendered).
+/// reply that finished (or timed out with content rendered). The work context
+/// is refreshed first (ADR-0019), so the final card shows where the turn
+/// landed (branch/dirty) rather than only where it started.
 async fn finalize_done(core: &Arc<SharedCore>, session_id: &str) {
+    crate::bridge::streaming::refresh_work_context(core, session_id).await;
     {
         let mut cards = core.cards.lock().await;
         if let Some(card) = cards.get_mut(session_id) {

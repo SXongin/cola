@@ -1,5 +1,7 @@
+use crate::bridge::core::SharedCore;
 use crate::feishu::card::{CardBuilder, CardState, ToolPanel};
 use indexmap::IndexMap;
+use std::sync::Arc;
 
 /// One entry on a turn's chronological timeline. The card renders text,
 /// reasoning and tool panels in this order, matching how OpenChamber shows them
@@ -122,10 +124,12 @@ pub struct StreamAccumulator {
     pub directory: Option<String>,
     /// Project name (directory basename) for the Turn Footer's 📁 segment.
     pub project_name: Option<String>,
-    /// Git branch at turn start (short commit hash when detached).
+    /// Git branch: captured at turn start, refreshed at turn end (ADR-0019);
+    /// the short commit hash when detached.
     pub branch: Option<String>,
-    /// Working tree was dirty at turn start, including untracked files. Only
-    /// set alongside `branch` (ADR-0019: the halves are omitted together).
+    /// Working tree differs from HEAD, including untracked files: captured at
+    /// turn start, refreshed at turn end. Only set alongside `branch`
+    /// (ADR-0019: the halves are omitted together).
     pub dirty: bool,
     /// The session/thread name; shown as the card subtitle so the header can
     /// stay focused on state (the question is already in the reply context).
@@ -191,6 +195,7 @@ impl StreamAccumulator {
     /// dirty state — measured BEFORE the prompt runs, so the dirty flag reflects
     /// the state the AI operates on, not the changes it leaves behind. Best
     /// effort: an empty or non-git directory leaves the fields unset.
+    /// `refresh_work_context` re-reads the git halves when the turn ends.
     pub async fn attach_work_context(&mut self, dir: &str) {
         if dir.is_empty() {
             self.directory = None;
@@ -198,9 +203,18 @@ impl StreamAccumulator {
         }
         self.directory = Some(dir.to_string());
         self.project_name = crate::git::project_name(dir);
-        let state = crate::git::read_state(dir).await;
-        self.branch = state.branch;
-        self.dirty = state.dirty;
+        self.apply_git_state(crate::git::read_state(dir).await);
+    }
+
+    /// Apply freshly read git state to the work-context halves. The halves move
+    /// together and never regress: only a resolved branch overwrites them, so a
+    /// failed or empty read (transient git failure, repo gone) keeps the last
+    /// known state rather than dropping `branch ⚠` from the footer.
+    pub fn apply_git_state(&mut self, state: crate::git::GitState) {
+        if let Some(branch) = state.branch {
+            self.branch = Some(branch);
+            self.dirty = state.dirty;
+        }
     }
 
     /// The header phase for the current state: None when the turn finished or
@@ -505,10 +519,12 @@ impl StreamAccumulator {
         }
 
         // Card footer — work context (ADR-0019). The 📁 segment (project ·
-        // branch · dirty) is captured at turn start and shows on every card,
-        // so a wrong-branch run is visible before it completes; the model
-        // and context-window ratio are end-of-turn facts, so they append
-        // only on the final card (include_tail).
+        // branch · dirty) is captured at turn start — so a wrong-branch run is
+        // visible before it completes — and refreshed at turn end, so the final
+        // card shows where the turn landed (a branch the AI created or switched
+        // to, and whether it left uncommitted work); the model and
+        // context-window ratio are end-of-turn facts, so they append only on the
+        // final card (include_tail).
         let mut footer_parts: Vec<String> = Vec::new();
         if let Some(dir) = &self.directory {
             let name = self.project_name.as_deref().unwrap_or(dir);
@@ -547,6 +563,25 @@ impl StreamAccumulator {
         }
 
         builder.build()
+    }
+}
+
+/// Refresh the live card's work context at turn end (ADR-0019): re-read the
+/// session directory's git state so the final card shows where the turn landed
+/// — a branch the AI created or switched to, and whether it left uncommitted
+/// work. The read shells out to git, so it runs OUTSIDE the cards lock; the
+/// lock only wraps the field swap. Best effort: a missing card or directory is
+/// a no-op, and a failed read keeps the start capture (`apply_git_state`).
+pub(crate) async fn refresh_work_context(core: &Arc<SharedCore>, session_id: &str) {
+    let dir = {
+        let cards = core.cards.lock().await;
+        cards.get(session_id).and_then(|c| c.acc.directory.clone())
+    };
+    let Some(dir) = dir else { return };
+    let state = crate::git::read_state(&dir).await;
+    let mut cards = core.cards.lock().await;
+    if let Some(card) = cards.get_mut(session_id) {
+        card.acc.apply_git_state(state);
     }
 }
 
@@ -657,6 +692,35 @@ mod tests {
         let text = acc.build_card().to_string();
         assert!(text.contains("📁 plain-dir"), "missing: {}", text);
         assert!(!text.contains("⚠"), "no dirty marker expected: {}", text);
+    }
+
+    /// ADR-0019: the turn-end refresh overwrites both git halves (branch moves,
+    /// dirty flips), while an unresolved read keeps the last known state so the
+    /// footer never degrades below the start capture.
+    #[test]
+    fn apply_git_state_refreshes_halves_and_never_regresses() {
+        use crate::git::GitState;
+
+        let mut acc = StreamAccumulator::new("test");
+        acc.apply_git_state(GitState {
+            branch: Some("main".into()),
+            dirty: true,
+        });
+        assert_eq!(acc.branch.as_deref(), Some("main"));
+        assert!(acc.dirty);
+
+        // Failed/empty end read: the start capture stays.
+        acc.apply_git_state(GitState::default());
+        assert_eq!(acc.branch.as_deref(), Some("main"));
+        assert!(acc.dirty);
+
+        // Successful end read: the AI switched branch and committed.
+        acc.apply_git_state(GitState {
+            branch: Some("feat/ai-work".into()),
+            dirty: false,
+        });
+        assert_eq!(acc.branch.as_deref(), Some("feat/ai-work"));
+        assert!(!acc.dirty);
     }
 
     /// ADR-0019: the 📁 segment renders on every card (include_tail=false),

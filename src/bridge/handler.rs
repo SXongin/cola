@@ -752,6 +752,11 @@ impl App {
                 );
             }
         }
+        // Refresh the Turn Footer's work context at turn end (ADR-0019): the AI
+        // may have created or switched branches, or committed, so re-read the
+        // git state before the final flush — the footer shows where the turn
+        // landed, not just where it started.
+        crate::bridge::streaming::refresh_work_context(&self.core, &session_id).await;
         // Compute the context-usage ratio for the card footer (input tokens ÷
         // the model's context window), then flush so the footer is on the card.
         if prompt_err.is_none() {
