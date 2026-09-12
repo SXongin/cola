@@ -464,3 +464,99 @@ impl RenderPoll {
         let _ = self.handle.await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::test_support::{
+        MockBackend, RecordingPlatform, build_app, realistic_parts, seed_entry, test_config, test_work_dir,
+    };
+
+    fn ctx(session_id: &str, text: &str) -> PromptContext {
+        PromptContext {
+            session_id: session_id.into(),
+            thread_key: ThreadKey::new("chat_1".into(), "chat_1".into()),
+            text: text.into(),
+            message_id: "msg_1".into(),
+            subtitle: "p2p".into(),
+            existing_card_id: None,
+            requester_open_id: None,
+            is_group: false,
+            cola_message_id: None,
+            images: Vec::new(),
+        }
+    }
+
+    /// A failed Loading reply must not leave the session looking busy forever:
+    /// the early error return used to skip the guard release.
+    #[tokio::test]
+    async fn failed_loading_reply_releases_the_guard() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut platform = RecordingPlatform::new();
+        platform.fail_reply_card = true;
+        let app = Arc::new(
+            App::new(
+                cfg,
+                Arc::new(MockBackend::new(realistic_parts())),
+                Arc::new(platform),
+            )
+            .unwrap(),
+        );
+
+        let err = Turn::run(&app, ctx("ses_a", "hi")).await;
+
+        assert!(err.is_err(), "the failed Loading reply must surface");
+        assert!(
+            !app.inflight.lock().await.contains("ses_a"),
+            "the busy guard must be released"
+        );
+    }
+
+    /// A prompt error still ends the turn and releases the guard, so the next
+    /// message is not throttled.
+    #[tokio::test]
+    async fn prompt_error_releases_the_guard() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.prompt_error = Some("provider 503".into());
+        let (app, _platform) = build_app(cfg, backend).await;
+
+        Turn::run(&app, ctx("ses_a", "hi")).await.unwrap();
+
+        assert!(!app.inflight.lock().await.contains("ses_a"));
+    }
+
+    /// The Turn Footer reports the variant the attempt actually sent, captured
+    /// at send time (ADR-0019).
+    #[tokio::test]
+    async fn footer_records_the_variant_the_attempt_sent() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        let sent_variants = backend.prompt_variants.clone();
+        let (app, _platform) = build_app(cfg, backend).await;
+        let mut entry = crate::config::SessionEntry::new(
+            ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "ses_a",
+            "/tmp/a",
+        );
+        entry.variant = Some("high".into());
+        seed_entry(&app, entry).await;
+
+        Turn::run(&app, ctx("ses_a", "hi")).await.unwrap();
+
+        assert_eq!(
+            sent_variants.lock().await.as_slice(),
+            &[Some("high".to_string())],
+            "the attempt sends the session's variant"
+        );
+        let cards = app.cards.lock().await;
+        let footer_variant = cards.get("ses_a").and_then(|c| c.acc.variant.clone());
+        assert_eq!(footer_variant.as_deref(), Some("high"));
+    }
+}

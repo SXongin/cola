@@ -370,6 +370,12 @@ async fn stale_session_mapping_is_recreated_on_404() {
         .get_active(&thread)
         .map(|e| e.session_id.clone());
     assert_eq!(sid.as_deref(), Some("ses_new"));
+
+    // The busy guard must not linger on the dead id or stay held on the fresh
+    // one: recreate moved it and finish released it.
+    let inflight = app.inflight.lock().await;
+    assert!(!inflight.contains("ses_old"), "dead id guard must be released");
+    assert!(!inflight.contains("ses_new"), "fresh id guard must be released");
 }
 
 /// ADR-0023: when a cola-created topic's session 404s and is recreated, the
