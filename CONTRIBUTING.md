@@ -154,3 +154,19 @@ release cannot be revoked. Two operational rules follow:
   cannot reach that version.
 - If a version must be yanked on crates.io, remove the matching GitHub Release
   too, or GitHub-channel installs keep receiving it.
+
+### Release smoke test
+
+Before tagging, run this six-point smoke test in a real Feishu chat. No second
+bot or test group is needed, and it is the only check that Feishu itself accepts
+the cards cola builds:
+
+1. Send a message — the Done card renders and updates in place as the turn
+   progresses.
+2. Trigger a tool permission — the permission button round-trips and the answer
+   reaches the tool.
+3. Trigger the `question` tool — the question button round-trips.
+4. Run `/topic` in a group — the topic is created and shows up in the group's
+   topic list.
+5. Run `/model` — the model picker card appears.
+6. Start a session in a non-git directory — cola starts it without error.

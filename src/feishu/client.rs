@@ -206,45 +206,6 @@ impl Client {
             })
     }
 
-    /// Send a text message to a user (by open_id) or chat. Only the live e2e
-    /// harness uses this.
-    #[cfg(test)]
-    pub async fn send_text(
-        &self,
-        receive_id_type: &str,
-        receive_id: &str,
-        text: &str,
-    ) -> crate::error::Result<String> {
-        let token = self.get_access_token().await?;
-        let body = serde_json::json!({
-            "receive_id": receive_id,
-            "msg_type": "text",
-            "content": serde_json::json!({"text": text}).to_string()
-        });
-
-        let resp: MessageResponse = self
-            .http
-            .post(format!(
-                "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={}",
-                receive_id_type
-            ))
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
-
-        if resp.code != 0 {
-            Err(crate::error::BridgeError::Feishu(format!(
-                "send error {}: {}",
-                resp.code, resp.msg
-            )))
-        } else {
-            Ok(resp.data.message_id)
-        }
-    }
-
     /// Send an interactive card to a user (by open_id) or chat.
     pub async fn send_card(
         &self,
@@ -528,10 +489,10 @@ impl Client {
         }
     }
 
-    /// List messages in a chat (used by the live end-to-end harness: a second
-    /// Feishu bot reads what the cola bot actually sent). Queried without a
-    /// time window — Feishu's start_time/end_time filter returns empty for
-    /// recent messages on this API, so the harness filters client-side.
+    /// List the most recent messages in a chat or topic (newest first, a single
+    /// page of 50). Production use: `resolve_topic_anchor` scans a topic's
+    /// messages for the newest cola message to anchor a card reply — the send
+    /// API cannot target a `thread_id`.
     #[allow(dead_code)]
     pub async fn list_messages(
         &self,
