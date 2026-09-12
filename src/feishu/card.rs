@@ -20,6 +20,10 @@ pub enum CardState {
 /// markdown), so cap the number of tool panels rendered in one card.
 /// A question with more options than this collapses them into a folding/// `overflow` group instead of a tall stack of buttons.
 const MAX_VISIBLE_OPTIONS: usize = 3;
+/// Display cap for a Custom Answer button label. Long or multiline answers
+/// collapse and truncate in the button only; the stored answer and the click
+/// value keep the raw text.
+const CUSTOM_ANSWER_LABEL_CHARS: usize = 20;
 /// How much text ONE card carries before it is finalized and the rest continues
 /// on the next card. Kept below Feishu's card limits so a card full of text
 /// never overflows; long answers flow across continuation cards instead of a
@@ -837,9 +841,11 @@ pub fn question_summary(questions: &[crate::opencode::client::QuestionInfo]) -> 
 /// true) — an input form; a multi-select question (`multiple`) renders toggle
 /// buttons whose clicks add/remove labels in the running selection ("已选"),
 /// committed by a per-question "确定该题" button right under its own options.
-/// `done[i]` marks a finalized question (a single-select answered by a click, a
-/// multi-select confirmed) — it renders as a static "✅ … 已选" line instead of
-/// controls, so answering one question never silently submits the others.
+/// Custom Answers (user-typed entries) render as selected toggle buttons too —
+/// clicking one removes it. `done[i]` marks a finalized question (a
+/// single-select answered by a click, a multi-select confirmed) — it renders as
+/// a static "✅ … 已选" line instead of controls, so answering one question
+/// never silently submits the others.
 /// `answered[i]` is the DISPLAY selection: the locked answer for done questions,
 /// or the in-progress toggles of an open multi-select. A submit button appears
 /// when some (but not all) questions are answered (skip remaining); a reject
@@ -959,6 +965,36 @@ pub fn question_elements(
                             "directory": directory,
                             "question_index": i,
                             "answer": opt.label,
+                        },
+                    }));
+                }
+            }
+
+            // Custom Answers: user-typed entries in the selection, rendered as
+            // selected buttons exactly like a picked option — a click removes
+            // the entry through the same toggle path (`reply: "answer"`). The
+            // button label is display-only (whitespace collapsed, long text
+            // truncated); the value carries the raw answer verbatim.
+            if multi && let Some(Some(labels)) = answered.get(i) {
+                for label in labels {
+                    if q.options.iter().any(|opt| &opt.label == label) {
+                        continue;
+                    }
+                    elements.push(json!({
+                        "tag": "button",
+                        "text": {
+                            "tag": "plain_text",
+                            "content": format!("✅ {}", custom_answer_label(label)),
+                        },
+                        "type": "primary",
+                        "value": {
+                            "action": "question",
+                            "reply": "answer",
+                            "request_id": request_id,
+                            "session_id": session_id,
+                            "directory": directory,
+                            "question_index": i,
+                            "answer": label,
                         },
                     }));
                 }
@@ -1088,6 +1124,20 @@ pub fn question_elements(
     }));
 
     elements
+}
+
+/// Display label for a Custom Answer button: whitespace (newlines included)
+/// collapses to single spaces and long text truncates with an ellipsis. The
+/// stored answer and the callback value keep the raw text.
+fn custom_answer_label(raw: &str) -> String {
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = collapsed.chars();
+    let head: String = chars.by_ref().take(CUSTOM_ANSWER_LABEL_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
 }
 
 /// Build the interactive question card (JSON 2.0): a header plus the question
@@ -2690,6 +2740,84 @@ mod tests {
             form.to_string().contains("\"reply\":\"custom\""),
             "multi-select custom form must reply with custom: {}",
             form
+        );
+    }
+
+    #[test]
+    fn multi_select_custom_answers_render_as_removable_buttons() {
+        let questions = vec![crate::opencode::client::QuestionInfo {
+            question: "选择水果".into(),
+            header: "水果".into(),
+            options: vec![crate::opencode::client::QuestionOption {
+                label: "苹果".into(),
+                description: String::new(),
+            }],
+            multiple: Some(true),
+            custom: None,
+        }];
+        // The selection holds an option and a multiline Custom Answer; the
+        // custom label is not an option label, so it gets its own chip.
+        let answered = vec![Some(vec!["苹果".to_string(), "自定\n答案".to_string()])];
+        let card = build_question_card("que_1", "ses_1", &questions, "/tmp/proj/lib", &answered, &[false]);
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let chip = elements
+            .iter()
+            .find(|e| e["tag"] == "button" && e["value"]["answer"] == "自定\n答案")
+            .expect("Custom Answer chip missing");
+        // The chip re-enters as a normal toggle; the RAW text rides in `value`.
+        assert_eq!(chip["value"]["reply"], "answer");
+        assert_eq!(chip["value"]["question_index"], 0);
+        assert_eq!(chip["type"], "primary");
+        // Display label is collapsed; the value keeps the raw newline.
+        assert_eq!(chip["text"]["content"], "✅ 自定 答案");
+        // The option renders exactly one button — the custom walk skips it.
+        assert_eq!(
+            elements
+                .iter()
+                .filter(|e| e["tag"] == "button" && e["value"]["answer"] == "苹果")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn custom_answer_button_label_collapses_and_truncates() {
+        // Whitespace (newlines included) collapses to single spaces.
+        assert_eq!(custom_answer_label("  a\n\nb  c "), "a b c");
+        // At the cap: no ellipsis.
+        let exact = "二".repeat(CUSTOM_ANSWER_LABEL_CHARS);
+        assert_eq!(custom_answer_label(&exact), exact);
+        // Over the cap: truncated with a single ellipsis.
+        let long = "一".repeat(CUSTOM_ANSWER_LABEL_CHARS + 5);
+        let label = custom_answer_label(&long);
+        assert_eq!(label.chars().count(), CUSTOM_ANSWER_LABEL_CHARS + 1);
+        assert!(label.ends_with('…'));
+    }
+
+    #[test]
+    fn single_select_never_renders_custom_answer_buttons() {
+        // Defensive: a single-select custom answer replaces and finalizes on
+        // submit, so a non-option label never gets a removable chip (the chip
+        // path is multi-only). Rendered with done=false to exercise the guard.
+        let questions = vec![crate::opencode::client::QuestionInfo {
+            question: "选择目录".into(),
+            header: "目录".into(),
+            options: vec![crate::opencode::client::QuestionOption {
+                label: "/a".into(),
+                description: String::new(),
+            }],
+            multiple: None,
+            custom: None,
+        }];
+        let answered = vec![Some(vec!["自定".to_string()])];
+        let card = build_question_card("que_1", "ses_1", &questions, "/tmp/proj/lib", &answered, &[false]);
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert!(
+            elements
+                .iter()
+                .all(|e| !(e["tag"] == "button" && e["value"]["answer"] == "自定")),
+            "single-select must not grow a Custom Answer chip: {}",
+            card
         );
     }
 

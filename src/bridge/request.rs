@@ -488,8 +488,16 @@ impl RequestKind for QuestionKind {
                     .unwrap_or("")
                     .to_string();
                 // "confirm" carries no typed answer (the selection is already
-                // recorded); every other reply needs one.
+                // recorded); every other reply needs one. A blank custom
+                // submission is a common accident and gets an explicit hint; a
+                // blank option click (malformed/stale payload) stays silent.
                 if answer.is_empty() && reply != "confirm" {
+                    if reply == "custom" {
+                        return Some(CardActionResult {
+                            card: None,
+                            toast: Some("请输入自定义答案".to_string()),
+                        });
+                    }
                     return None;
                 }
                 // A request is submitted ONLY when every question has an answer
@@ -525,12 +533,24 @@ impl RequestKind for QuestionKind {
                 // confirmed multi-selects). The separation is what lets a
                 // multi-select stay open while the user keeps toggling, without
                 // ever auto-submitting mid-composition.
-                let (answered_count, display, done) = {
+                let (answered_count, display, done, outcome) = {
                     let mut partial = flow.question_partial.lock().await;
                     let mut toggles = flow.question_toggles.lock().await;
+                    let mut outcome = None;
                     if multi {
+                        // Read the selection BEFORE mutating so the toast can
+                        // tell add from remove, and a deduped custom from a
+                        // fresh one.
+                        let selected = toggle_selected(&toggles, req_id, index, &answer);
                         match reply {
-                            "custom" => record_append_answer(&mut toggles, req_id, n, index, &answer),
+                            "custom" => {
+                                outcome = Some(if selected {
+                                    MultiOutcome::Duplicate
+                                } else {
+                                    MultiOutcome::Added
+                                });
+                                record_append_answer(&mut toggles, req_id, n, index, &answer);
+                            }
                             "confirm" => {
                                 // A stale card may re-confirm an already-done
                                 // question (re-render hasn't removed the button
@@ -556,13 +576,19 @@ impl RequestKind for QuestionKind {
                                 }
                             }
                             _ => {
+                                outcome = Some(if selected {
+                                    MultiOutcome::Removed
+                                } else {
+                                    MultiOutcome::Added
+                                });
                                 record_toggle_answer(&mut toggles, req_id, n, index, &answer);
                             }
                         }
                     } else {
                         record_answer(&mut partial, req_id, n, index, &answer);
                     }
-                    merge_question_state(&partial, &toggles, req_id, n)
+                    let (count, display, done) = merge_question_state(&partial, &toggles, req_id, n);
+                    (count, display, done, outcome)
                 };
                 // Keep the inline card's display answers and done flags in sync.
                 if inline
@@ -646,7 +672,7 @@ impl RequestKind for QuestionKind {
                         card: None,
                         toast: None,
                     };
-                    r.toast = Some(action_toast(reply, multi, n - answered_count));
+                    r.toast = Some(action_toast(reply, n - answered_count, outcome));
                     // Build on a CLONE so a card-component-limit split can't
                     // advance the live accumulator's `render_from` from inside
                     // the click handler (flush_card owns that flow). Only take
@@ -690,7 +716,7 @@ impl RequestKind for QuestionKind {
                         card: Some(card),
                         toast: None,
                     };
-                    r.toast = Some(action_toast(reply, multi, remaining));
+                    r.toast = Some(action_toast(reply, remaining, outcome));
                     Some(r)
                 }
             }
@@ -1847,10 +1873,12 @@ fn record_toggle_answer(
 }
 
 /// Multi-select custom-answer variant of `record_toggle_answer`: ADDS the typed
-/// label to the question's toggled set (dedupe) but never removes it — a custom
-/// answer is a fresh choice, not something a re-click should toggle away.
-/// Writes into the LIVE toggles map (not the final answers), like option
-/// toggles, so the question still awaits its 确定该题 confirm.
+/// label to the question's toggled set (dedupe) but never removes it — the
+/// compose box only ever adds. Removal has its own affordance: the rendered
+/// Custom Answer button re-enters as a normal toggle (`reply: "answer"`), which
+/// `record_toggle_answer` handles. Writes into the LIVE toggles map (not the
+/// final answers), like option toggles, so the question still awaits its 确定该题
+/// confirm.
 fn record_append_answer(
     toggles: &mut HashMap<String, Vec<Option<Vec<String>>>>,
     req_id: &str,
@@ -1896,17 +1924,48 @@ fn merge_question_state(
     (count, display, done)
 }
 
-/// Toast after a question-card interaction, depending on the action:
-/// single-select clicks/customs report how many questions remain open,
-/// multi-select toggles/customs just acknowledge the recorded option, and a
-/// multi-select 确定该题 reports how many questions are still left.
-fn action_toast(reply: &str, multi: bool, remaining: usize) -> String {
+/// Whether `answer` is currently in the live toggles for one question. Read
+/// BEFORE recording so the handler can name the outcome in the toast without
+/// changing what the recorders do.
+fn toggle_selected(
+    toggles: &HashMap<String, Vec<Option<Vec<String>>>>,
+    req_id: &str,
+    index: usize,
+    answer: &str,
+) -> bool {
+    toggles
+        .get(req_id)
+        .and_then(|slots| slots.get(index))
+        .and_then(|slot| slot.as_ref())
+        .is_some_and(|labels| labels.iter().any(|l| l == answer))
+}
+
+/// What one multi-select interaction did to the selection: an option or Custom
+/// Answer added, one removed, or a Custom Answer that was already selected
+/// (append dedupes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MultiOutcome {
+    Added,
+    Removed,
+    Duplicate,
+}
+
+/// Toast after a question-card interaction. A multi-select add, removal and
+/// deduped custom each name what happened, so the user can tell "added" from
+/// "was already there" without re-reading the card; 确定该题 reports how many
+/// questions are still left, and a single-select answer reports how many remain.
+fn action_toast(reply: &str, remaining: usize, outcome: Option<MultiOutcome>) -> String {
     if reply == "confirm" {
-        format!("已确定该题，还有 {} 题未答", remaining)
-    } else if multi {
-        "已记录选项".to_string()
-    } else {
-        answer_recorded_toast(remaining)
+        return format!("已确定该题，还有 {} 题未答", remaining);
+    }
+    match outcome {
+        Some(MultiOutcome::Duplicate) => "该选项已在已选中".to_string(),
+        Some(MultiOutcome::Removed) => "已移除选项".to_string(),
+        // A typed custom answer is its own kind of add; an option click is just
+        // an option.
+        Some(MultiOutcome::Added) if reply == "custom" => "已添加自定义答案".to_string(),
+        Some(MultiOutcome::Added) => "已添加选项".to_string(),
+        None => answer_recorded_toast(remaining),
     }
 }
 
@@ -2110,5 +2169,40 @@ Index: /proj/src/main.rs
         assert_eq!(count, 1);
         assert_eq!(done, vec![true]);
         assert_eq!(display, vec![Some(vec!["苹果".to_string(), "香蕉".to_string()])]);
+    }
+
+    #[test]
+    fn toggle_selected_reads_the_live_toggles() {
+        let mut toggles = HashMap::new();
+        assert!(!toggle_selected(&toggles, "q1", 0, "a"));
+        record_toggle_answer(&mut toggles, "q1", 1, 0, "a");
+        assert!(toggle_selected(&toggles, "q1", 0, "a"));
+        assert!(!toggle_selected(&toggles, "q1", 0, "b"));
+        // A different question index is a different selection.
+        assert!(!toggle_selected(&toggles, "q1", 1, "a"));
+        // Exact match only — a custom answer with the same prefix is not it.
+        record_append_answer(&mut toggles, "q2", 1, 0, "a b");
+        assert!(toggle_selected(&toggles, "q2", 0, "a b"));
+        assert!(!toggle_selected(&toggles, "q2", 0, "a"));
+    }
+
+    #[test]
+    fn action_toast_names_each_outcome() {
+        assert_eq!(
+            action_toast("custom", 1, Some(MultiOutcome::Added)),
+            "已添加自定义答案"
+        );
+        assert_eq!(action_toast("answer", 1, Some(MultiOutcome::Added)), "已添加选项");
+        assert_eq!(
+            action_toast("answer", 1, Some(MultiOutcome::Removed)),
+            "已移除选项"
+        );
+        assert_eq!(
+            action_toast("custom", 1, Some(MultiOutcome::Duplicate)),
+            "该选项已在已选中"
+        );
+        assert_eq!(action_toast("confirm", 2, None), "已确定该题，还有 2 题未答");
+        // A single-select click keeps its remaining-questions count.
+        assert_eq!(action_toast("answer", 1, None), "已记录答案，还有 1 题未答");
     }
 }
