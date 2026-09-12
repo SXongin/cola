@@ -32,6 +32,19 @@ async fn read_body_with_diag(resp: reqwest::Response, what: &str) -> crate::erro
     Ok(text)
 }
 
+/// Decode a JSON body, surfacing a snippet when it isn't JSON instead of the
+/// bare reqwest decode error. The HTTP-status half lives in
+/// [`read_body_with_diag`]; every public method pairs the two so a 5xx with a
+/// success-shaped body can never read as success.
+fn parse_json<T: serde::de::DeserializeOwned>(text: &str, what: &str) -> crate::error::Result<T> {
+    serde_json::from_str(text).map_err(|e| {
+        crate::error::BridgeError::Feishu(format!(
+            "parse {what}: {e} — body: {}",
+            text.chars().take(200).collect::<String>()
+        ))
+    })
+}
+
 struct CachedToken {
     token: String,
     expires_at: chrono::DateTime<chrono::Utc>,
@@ -86,12 +99,7 @@ impl Client {
             "token",
         )
         .await?;
-        let resp: TokenResponse = serde_json::from_str(&text).map_err(|e| {
-            crate::error::BridgeError::Feishu(format!(
-                "parse token response: {e} — body: {}",
-                text.chars().take(200).collect::<String>()
-            ))
-        })?;
+        let resp: TokenResponse = parse_json(&text, "token response")?;
 
         if resp.code != 0 {
             return Err(crate::error::BridgeError::Feishu(format!(
@@ -134,12 +142,7 @@ impl Client {
             "reply card",
         )
         .await?;
-        let resp: MessageResponse = serde_json::from_str(&text).map_err(|e| {
-            crate::error::BridgeError::Feishu(format!(
-                "parse reply card response: {e} — body: {}",
-                text.chars().take(200).collect::<String>()
-            ))
-        })?;
+        let resp: MessageResponse = parse_json(&text, "reply card response")?;
 
         if resp.code != 0 {
             Err(crate::error::BridgeError::Feishu(format!(
@@ -165,17 +168,13 @@ impl Client {
             .send()
             .await?;
 
-        let status = resp.status();
-        let text = resp.text().await?;
+        let text = read_body_with_diag(resp, "ws endpoint").await?;
         tracing::debug!(
-            "WS endpoint response: {} body={}",
-            status,
-            &text[..text.len().min(500)]
+            "WS endpoint response: body={}",
+            text.chars().take(500).collect::<String>()
         );
 
-        let resp_data: WsEndpointResponse = serde_json::from_str(&text).map_err(|e| {
-            crate::error::BridgeError::Feishu(format!("parse ws endpoint: {e} — body: {text}"))
-        })?;
+        let resp_data: WsEndpointResponse = parse_json(&text, "ws endpoint")?;
 
         if resp_data.code != 0 {
             Err(crate::error::BridgeError::Feishu(format!(
@@ -199,16 +198,13 @@ impl Client {
             .send()
             .await?;
 
-        let status = resp.status();
-        let text = resp.text().await?;
+        let text = read_body_with_diag(resp, "bot info").await?;
         tracing::debug!(
-            "bot info response: {} body={}",
-            status,
-            &text[..text.len().min(500)]
+            "bot info response: body={}",
+            text.chars().take(500).collect::<String>()
         );
 
-        let parsed: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| crate::error::BridgeError::Feishu(format!("parse bot info: {e} — body: {text}")))?;
+        let parsed: serde_json::Value = parse_json(&text, "bot info")?;
         let code = parsed["code"].as_i64().unwrap_or(-1);
         if code != 0 {
             return Err(crate::error::BridgeError::Feishu(format!(
@@ -237,17 +233,19 @@ impl Client {
             "content": card.to_string()
         });
 
-        let resp: MessageResponse = self
-            .http
-            .post(self.endpoint(&format!(
-                "/open-apis/im/v1/messages?receive_id_type={receive_id_type}"
-            )))
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
+        let text = read_body_with_diag(
+            self.http
+                .post(self.endpoint(&format!(
+                    "/open-apis/im/v1/messages?receive_id_type={receive_id_type}"
+                )))
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await?,
+            "send card",
+        )
+        .await?;
+        let resp: MessageResponse = parse_json(&text, "send card response")?;
 
         if resp.code != 0 {
             Err(crate::error::BridgeError::Feishu(format!(
@@ -273,15 +271,17 @@ impl Client {
             }).to_string()
         });
 
-        let resp: MessageResponse = self
-            .http
-            .post(self.endpoint(&format!("/open-apis/im/v1/messages/{message_id}/reply")))
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
+        let text = read_body_with_diag(
+            self.http
+                .post(self.endpoint(&format!("/open-apis/im/v1/messages/{message_id}/reply")))
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await?,
+            "reply text",
+        )
+        .await?;
+        let resp: MessageResponse = parse_json(&text, "reply text response")?;
 
         if resp.code != 0 {
             Err(crate::error::BridgeError::Feishu(format!(
@@ -317,15 +317,17 @@ impl Client {
             "content": card.to_string()
         });
 
-        let resp: MessageResponse = self
-            .http
-            .post(self.endpoint(&format!("/open-apis/im/v1/messages/{message_id}/reply")))
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
+        let text = read_body_with_diag(
+            self.http
+                .post(self.endpoint(&format!("/open-apis/im/v1/messages/{message_id}/reply")))
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await?,
+            "reply card in thread",
+        )
+        .await?;
+        let resp: MessageResponse = parse_json(&text, "reply card in thread response")?;
 
         if resp.code != 0 {
             Err(crate::error::BridgeError::Feishu(format!(
@@ -377,15 +379,17 @@ impl Client {
             "content": serde_json::json!({"text": content}).to_string()
         });
 
-        let resp: MessageResponse = self
-            .http
-            .post(self.endpoint(&format!("/open-apis/im/v1/messages/{message_id}/reply")))
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
+        let text = read_body_with_diag(
+            self.http
+                .post(self.endpoint(&format!("/open-apis/im/v1/messages/{message_id}/reply")))
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await?,
+            "reply completion notice",
+        )
+        .await?;
+        let resp: MessageResponse = parse_json(&text, "reply completion notice response")?;
 
         if resp.code != 0 {
             Err(crate::error::BridgeError::Feishu(format!(
@@ -409,14 +413,13 @@ impl Client {
             "/open-apis/contact/v3/users/{open_id}?user_id_type=open_id"
         ));
         let resp = self.http.get(url).bearer_auth(&token).send().await?;
-        let text = resp.text().await?;
-        let v: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| crate::error::BridgeError::Feishu(format!("parse user info: {e} — body: {text}")))?;
+        let text = read_body_with_diag(resp, "user info").await?;
+        let v: serde_json::Value = parse_json(&text, "user info")?;
         let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
         if code != 0 {
             tracing::debug!(
                 "user_name lookup failed ({code}): {}",
-                &text[..text.len().min(200)]
+                text.chars().take(200).collect::<String>()
             );
             return Ok(None);
         }
@@ -424,7 +427,7 @@ impl Client {
         if name.is_none() {
             tracing::debug!(
                 "user_name lookup returned no name: {}",
-                &text[..text.len().min(300)]
+                text.chars().take(300).collect::<String>()
             );
         }
         Ok(name)
@@ -440,14 +443,13 @@ impl Client {
         let token = self.get_access_token().await?;
         let url = self.endpoint(&format!("/open-apis/im/v1/chats/{chat_id}"));
         let resp = self.http.get(url).bearer_auth(&token).send().await?;
-        let text = resp.text().await?;
-        let v: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| crate::error::BridgeError::Feishu(format!("parse chat info: {e} — body: {text}")))?;
+        let text = read_body_with_diag(resp, "chat info").await?;
+        let v: serde_json::Value = parse_json(&text, "chat info")?;
         let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
         if code != 0 {
             tracing::debug!(
                 "chat_name lookup failed ({code}): {}",
-                &text[..text.len().min(200)]
+                text.chars().take(200).collect::<String>()
             );
             return Ok(None);
         }
@@ -455,7 +457,7 @@ impl Client {
         if name.is_none() {
             tracing::debug!(
                 "chat_name lookup returned no name: {}",
-                &text[..text.len().min(300)]
+                text.chars().take(300).collect::<String>()
             );
         }
         Ok(name)
@@ -472,15 +474,17 @@ impl Client {
             "content": card_json.to_string()
         });
 
-        let resp: ApiResponse = self
-            .http
-            .patch(self.endpoint(&format!("/open-apis/im/v1/messages/{message_id}")))
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
+        let text = read_body_with_diag(
+            self.http
+                .patch(self.endpoint(&format!("/open-apis/im/v1/messages/{message_id}")))
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await?,
+            "update message",
+        )
+        .await?;
+        let resp: ApiResponse = parse_json(&text, "update message response")?;
 
         if resp.code != 0 {
             Err(crate::error::BridgeError::Feishu(format!(
@@ -517,20 +521,8 @@ impl Client {
             .bearer_auth(&token)
             .send()
             .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            eprintln!(
-                "list_messages failed: {} — body: {}",
-                status,
-                &text[..text.len().min(500)]
-            );
-            return Err(crate::error::BridgeError::Feishu(format!(
-                "list messages failed: {}",
-                status
-            )));
-        }
-        let resp: MessagesResponse = resp.json().await?;
+        let text = read_body_with_diag(resp, "list messages").await?;
+        let resp: MessagesResponse = parse_json(&text, "list messages response")?;
 
         if resp.code != 0 {
             Err(crate::error::BridgeError::Feishu(format!(
@@ -560,21 +552,19 @@ impl Client {
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await?;
-        let text = resp.text().await?;
-        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-            crate::error::BridgeError::Feishu(format!("parse get_message: {e} — body: {text}"))
-        })?;
+        let text = read_body_with_diag(resp, "get message").await?;
+        let v: serde_json::Value = parse_json(&text, "get_message")?;
         let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
         if code != 0 {
             return Err(crate::error::BridgeError::Feishu(format!(
                 "get message error {code}: {}",
-                &text[..text.len().min(300)]
+                text.chars().take(300).collect::<String>()
             )));
         }
         let Some(item) = v["data"]["items"].get(0) else {
             return Err(crate::error::BridgeError::Feishu(format!(
                 "get message error: no data for {message_id} — body: {}",
-                &text[..text.len().min(300)]
+                text.chars().take(300).collect::<String>()
             )));
         };
         let mentions: Vec<crate::feishu::event::Mention> = serde_json::from_value(
@@ -618,7 +608,7 @@ impl Client {
             let text = resp.text().await.unwrap_or_default();
             return Err(crate::error::BridgeError::Feishu(format!(
                 "download image failed: {status}: {}",
-                &text[..text.len().min(300)]
+                text.chars().take(300).collect::<String>()
             )));
         }
         let mime = resp
@@ -1216,7 +1206,9 @@ mod tests {
         );
 
         let request = last_request(&server);
+        assert_eq!(request.method, "GET");
         assert_eq!(request.path, "/open-apis/im/v1/messages/om_7");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
         assert_eq!(
             request.query_param("card_msg_content_type").as_deref(),
             Some("raw_card_content")
@@ -1239,7 +1231,9 @@ mod tests {
         assert_eq!(image.data, b"PNGDATA");
 
         let request = last_request(&server);
+        assert_eq!(request.method, "GET");
         assert_eq!(request.path, "/open-apis/im/v1/messages/om_7/resources/img_1");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
         assert_eq!(request.query_param("type").as_deref(), Some("image"));
     }
 
@@ -1276,7 +1270,9 @@ mod tests {
         assert_eq!(client.user_name("ou_1").await.unwrap().as_deref(), Some("Alice"));
 
         let request = last_request(&server);
+        assert_eq!(request.method, "GET");
         assert_eq!(request.path, "/open-apis/contact/v3/users/ou_1");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
         assert_eq!(request.query_param("user_id_type").as_deref(), Some("open_id"));
     }
 
@@ -1304,7 +1300,12 @@ mod tests {
         );
 
         assert_eq!(client.chat_name("oc_1").await.unwrap().as_deref(), Some("Team"));
-        assert_eq!(last_request(&server).path, "/open-apis/im/v1/chats/oc_1");
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/open-apis/im/v1/chats/oc_1");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
+        assert_eq!(request.query, "");
     }
 
     #[tokio::test]
@@ -1454,5 +1455,301 @@ mod tests {
             message.contains("parse token response"),
             "unexpected error: {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn send_card_maps_5xx_to_a_diagnostic_error_even_with_a_valid_body() {
+        let (server, client) = wire_client().await;
+        // A success-shaped body must not rescue a 5xx.
+        server.route(
+            "POST",
+            "/open-apis/im/v1/messages",
+            500,
+            r#"{"code":0,"msg":"gateway ok?","data":{"message_id":"om_x"}}"#,
+        );
+
+        let message = feishu_error(
+            client
+                .send_card("chat_id", "oc_123", &serde_json::json!({}))
+                .await
+                .unwrap_err(),
+        );
+
+        assert!(message.contains("send card HTTP 500"), "unexpected: {message}");
+        assert!(message.contains("gateway ok?"), "unexpected: {message}");
+        let request = last_request(&server);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/open-apis/im/v1/messages");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
+    }
+
+    #[tokio::test]
+    async fn reply_text_maps_5xx_to_a_diagnostic_error() {
+        let (server, client) = wire_client().await;
+        server.route_raw(
+            "POST",
+            "/open-apis/im/v1/messages/om_42/reply",
+            500,
+            "text/html",
+            "<html>boom</html>",
+        );
+
+        let message = feishu_error(client.reply_text("om_42", "hi").await.unwrap_err());
+
+        assert!(message.contains("reply text HTTP 500"), "unexpected: {message}");
+        assert!(message.contains("boom"), "unexpected: {message}");
+        let request = last_request(&server);
+        assert_eq!(request.path, "/open-apis/im/v1/messages/om_42/reply");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
+    }
+
+    #[tokio::test]
+    async fn reply_card_in_thread_maps_5xx_to_a_diagnostic_error() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/messages/om_42/reply",
+            503,
+            r#"{"code":0,"msg":"upstream"}"#,
+        );
+
+        let message = feishu_error(
+            client
+                .reply_card_in_thread("om_42", &serde_json::json!({}))
+                .await
+                .unwrap_err(),
+        );
+
+        assert!(
+            message.contains("reply card in thread HTTP 503"),
+            "unexpected: {message}"
+        );
+        assert!(message.contains("upstream"), "unexpected: {message}");
+    }
+
+    #[tokio::test]
+    async fn reply_completion_notice_maps_5xx_to_a_diagnostic_error() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/messages/om_42/reply",
+            502,
+            r#"{"code":0,"msg":"bad gateway"}"#,
+        );
+
+        let message = feishu_error(
+            client
+                .reply_completion_notice("om_42", "ou_1", None, "任务完成")
+                .await
+                .unwrap_err(),
+        );
+
+        assert!(
+            message.contains("reply completion notice HTTP 502"),
+            "unexpected: {message}"
+        );
+        assert!(message.contains("bad gateway"), "unexpected: {message}");
+    }
+
+    #[tokio::test]
+    async fn update_message_maps_a_non_json_error_page_to_a_diagnostic_error() {
+        let (server, client) = wire_client().await;
+        server.route_raw(
+            "PATCH",
+            "/open-apis/im/v1/messages/om_42",
+            403,
+            "text/html",
+            "<html>blocked by proxy</html>",
+        );
+
+        let message = feishu_error(
+            client
+                .update_message("om_42", &serde_json::json!({}))
+                .await
+                .unwrap_err(),
+        );
+
+        assert!(
+            message.contains("update message HTTP 403"),
+            "unexpected: {message}"
+        );
+        assert!(message.contains("blocked by proxy"), "unexpected: {message}");
+        assert_eq!(last_request(&server).method, "PATCH");
+    }
+
+    #[tokio::test]
+    async fn list_messages_maps_5xx_to_a_diagnostic_error_with_the_body() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "GET",
+            "/open-apis/im/v1/messages",
+            500,
+            r#"{"code":-1,"msg":"store down"}"#,
+        );
+
+        let message = feishu_error(client.list_messages("thread", "omt_1").await.unwrap_err());
+
+        assert!(
+            message.contains("list messages HTTP 500"),
+            "unexpected: {message}"
+        );
+        assert!(message.contains("store down"), "unexpected: {message}");
+        assert_eq!(last_request(&server).method, "GET");
+    }
+
+    #[tokio::test]
+    async fn success_bodies_that_are_not_json_are_parse_errors() {
+        let (server, client) = wire_client().await;
+        let html = "<html>not json</html>";
+        server.route_raw("POST", "/open-apis/im/v1/messages", 200, "text/html", html);
+        server.route_raw(
+            "POST",
+            "/open-apis/im/v1/messages/om_42/reply",
+            200,
+            "text/html",
+            html,
+        );
+        server.route_raw("PATCH", "/open-apis/im/v1/messages/om_42", 200, "text/html", html);
+        server.route_raw("GET", "/open-apis/im/v1/messages", 200, "text/html", html);
+        let card = serde_json::json!({});
+
+        let cases = [
+            (
+                "parse send card response",
+                feishu_error(client.send_card("chat_id", "oc_1", &card).await.unwrap_err()),
+            ),
+            (
+                "parse reply text response",
+                feishu_error(client.reply_text("om_42", "hi").await.unwrap_err()),
+            ),
+            (
+                "parse reply card in thread response",
+                feishu_error(client.reply_card_in_thread("om_42", &card).await.unwrap_err()),
+            ),
+            (
+                "parse reply completion notice response",
+                feishu_error(
+                    client
+                        .reply_completion_notice("om_42", "ou_1", None, "hi")
+                        .await
+                        .unwrap_err(),
+                ),
+            ),
+            (
+                "parse update message response",
+                feishu_error(client.update_message("om_42", &card).await.unwrap_err()),
+            ),
+            (
+                "parse list messages response",
+                feishu_error(client.list_messages("thread", "omt_1").await.unwrap_err()),
+            ),
+        ];
+        for (needle, message) in cases {
+            assert!(message.contains(needle), "expected {needle:?} in: {message}");
+            assert!(
+                message.contains("not json"),
+                "expected body snippet in: {message}"
+            );
+        }
+        assert_eq!(server.request_count(), 7, "token plus one request per method");
+    }
+
+    #[tokio::test]
+    async fn a_5xx_is_never_success_even_with_a_valid_body() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "GET",
+            "/open-apis/bot/v3/info",
+            500,
+            r#"{"code":0,"msg":"ok","bot":{"open_id":"ou_bot"}}"#,
+        );
+        server.route(
+            "POST",
+            "/callback/ws/endpoint",
+            500,
+            r#"{"code":0,"msg":"ok","data":{"URL":"wss://ws.example"}}"#,
+        );
+        server.route(
+            "GET",
+            "/open-apis/contact/v3/users/ou_1",
+            500,
+            r#"{"code":0,"msg":"ok","data":{"user":{"name":"Alice"}}}"#,
+        );
+        server.route(
+            "GET",
+            "/open-apis/im/v1/chats/oc_1",
+            500,
+            r#"{"code":0,"msg":"ok","data":{"name":"Team"}}"#,
+        );
+        server.route(
+            "GET",
+            "/open-apis/im/v1/messages/om_7",
+            500,
+            r#"{"code":0,"msg":"ok","data":{"items":[{"msg_type":"text","body":{"content":"{}"}}]}}"#,
+        );
+
+        let cases = [
+            ("bot info", feishu_error(client.bot_open_id().await.unwrap_err())),
+            (
+                "ws endpoint",
+                feishu_error(client.get_ws_endpoint().await.unwrap_err()),
+            ),
+            (
+                "user info",
+                feishu_error(client.user_name("ou_1").await.unwrap_err()),
+            ),
+            (
+                "chat info",
+                feishu_error(client.chat_name("oc_1").await.unwrap_err()),
+            ),
+            (
+                "get message",
+                feishu_error(client.get_message("om_7").await.unwrap_err()),
+            ),
+        ];
+        for (label, message) in cases {
+            assert!(
+                message.contains(&format!("{label} HTTP 500")),
+                "case {label}: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn body_inspecting_methods_report_non_json_bodies_as_parse_errors() {
+        let (server, client) = wire_client().await;
+        let html = "<html>nope</html>";
+        server.route_raw("GET", "/open-apis/bot/v3/info", 200, "text/html", html);
+        server.route_raw("POST", "/callback/ws/endpoint", 200, "text/html", html);
+        server.route_raw("GET", "/open-apis/contact/v3/users/ou_1", 200, "text/html", html);
+        server.route_raw("GET", "/open-apis/im/v1/chats/oc_1", 200, "text/html", html);
+        server.route_raw("GET", "/open-apis/im/v1/messages/om_7", 200, "text/html", html);
+
+        let cases = [
+            (
+                "parse bot info",
+                feishu_error(client.bot_open_id().await.unwrap_err()),
+            ),
+            (
+                "parse ws endpoint",
+                feishu_error(client.get_ws_endpoint().await.unwrap_err()),
+            ),
+            (
+                "parse user info",
+                feishu_error(client.user_name("ou_1").await.unwrap_err()),
+            ),
+            (
+                "parse chat info",
+                feishu_error(client.chat_name("oc_1").await.unwrap_err()),
+            ),
+            (
+                "parse get_message",
+                feishu_error(client.get_message("om_7").await.unwrap_err()),
+            ),
+        ];
+        for (needle, message) in cases {
+            assert!(message.contains(needle), "expected {needle:?} in: {message}");
+            assert!(message.contains("nope"), "expected body snippet in: {message}");
+        }
     }
 }
