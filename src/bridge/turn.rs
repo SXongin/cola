@@ -123,7 +123,15 @@ impl Turn {
                 }
                 Some(cid)
             }
-            None => Some(app.feishu.reply_card(&message_id, &loading).await?),
+            None => match app.feishu.reply_card(&message_id, &loading).await {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    // The turn never started: release the guard so the session
+                    // does not look busy until a restart.
+                    release_inflight(app, &session_id).await;
+                    return Err(e);
+                }
+            },
         };
         let epoch_ms = chrono::Utc::now().timestamp_millis();
         {
@@ -202,12 +210,18 @@ impl Turn {
     /// survives, and carries the turn's live state (card accumulator, inflight
     /// guard, cover title) across to the fresh session.
     async fn recreate(&mut self, app: &Arc<App>) -> crate::error::Result<()> {
-        let old_entry = app.remove_session(&self.session_id).await?;
+        let old_entry = match app.remove_session(&self.session_id).await {
+            Ok(entry) => entry,
+            Err(e) => {
+                release_inflight(app, &self.session_id).await;
+                return Err(e);
+            }
+        };
         let directory = old_entry
             .as_ref()
             .and_then(|e| (!e.directory.is_empty()).then_some(e.directory.clone()))
             .unwrap_or_else(|| app.default_session_directory());
-        let fresh_id = app
+        let fresh_id = match app
             .create_fresh_session(
                 &self.thread_key,
                 &self.text,
@@ -215,7 +229,16 @@ impl Turn {
                 old_entry.as_ref().and_then(|e| e.topic_anchor.clone()),
                 old_entry.as_ref().and_then(|e| e.topic_root.clone()),
             )
-            .await?;
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                // The dead mapping is gone but the guard still names the old
+                // session: release it so the thread is not stuck busy.
+                release_inflight(app, &self.session_id).await;
+                return Err(e);
+            }
+        };
         // Re-key the session's live card (accumulator + card identity in one
         // CardSession) from the dead session to the new one — a single remap
         // instead of three maps kept in lockstep.
@@ -406,9 +429,15 @@ impl Turn {
 
     /// Release this turn's busy guard. Idempotent.
     async fn release(&self, app: &Arc<App>) {
-        let mut inflight = app.inflight.lock().await;
-        inflight.remove(&self.session_id);
+        release_inflight(app, &self.session_id).await;
     }
+}
+
+/// Release a session's busy guard. A free function so the phases' error paths
+/// can release before any [`Turn`] state is settled; idempotent.
+async fn release_inflight(app: &Arc<App>, session_id: &str) {
+    let mut inflight = app.inflight.lock().await;
+    inflight.remove(session_id);
 }
 
 /// One attempt's incremental renderer: the poll loop plus its stop flag. Owns
