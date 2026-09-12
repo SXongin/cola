@@ -10,9 +10,9 @@ async fn external_message_from_shared_store_notifies_feishu() {
     let (app, platform) = build_app(cfg, mock).await;
 
     // A known session whose chat the notification goes to.
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -22,9 +22,9 @@ async fn external_message_from_shared_store_notifies_feishu() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.persist().unwrap();
-    }
+        },
+    )
+    .await;
     // Baseline: a minute ago, so the fresh user message is "new".
     let watermark = chrono::Utc::now().timestamp_millis() - 60_000;
     app.external
@@ -74,9 +74,9 @@ async fn external_poller_recovers_when_messages_hangs() {
     mock.hang_messages.store(1, std::sync::atomic::Ordering::SeqCst);
     let (app, platform) = build_app(cfg, mock).await;
 
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -86,9 +86,9 @@ async fn external_poller_recovers_when_messages_hangs() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.persist().unwrap();
-    }
+        },
+    )
+    .await;
     // Baseline: a minute ago, so the fresh user message is "new".
     let watermark = chrono::Utc::now().timestamp_millis() - 60_000;
     app.external
@@ -151,9 +151,9 @@ async fn cola_own_message_after_heal_is_never_notified_external() {
     );
     let (app, platform) = build_app(cfg, mock).await;
 
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -163,9 +163,9 @@ async fn cola_own_message_after_heal_is_never_notified_external() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.persist().unwrap();
-    }
+        },
+    )
+    .await;
     // Stale watermark: the old run_prompt-era epoch predates the message the
     // dying server actually persisted — the exact state that caused the bug.
     let stale = chrono::Utc::now().timestamp_millis() - 60_000;
@@ -226,9 +226,9 @@ async fn newer_external_message_after_cola_own_still_notifies() {
     mock.external_user_message = Some("OpenChamber 后来发的消息".to_string());
     let (app, platform) = build_app(cfg, mock).await;
 
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -238,9 +238,9 @@ async fn newer_external_message_after_cola_own_still_notifies() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.persist().unwrap();
-    }
+        },
+    )
+    .await;
     let stale = chrono::Utc::now().timestamp_millis() - 60_000;
     app.external
         .last_user_msg_epoch
@@ -292,10 +292,10 @@ async fn external_message_to_historical_session_is_not_notified() {
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
 
     // Active session A; historical session B mapped to the SAME lobby.
-    {
-        let mut store = app.sessions.lock().await;
-        // set_active pushes to the front, so the LAST call is the active one.
-        store.set_active(crate::config::SessionEntry {
+    // set_active pushes to the front, so the LAST call is the active one.
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_historical".into(),
             directory: "/tmp/hist".into(),
@@ -305,8 +305,12 @@ async fn external_message_to_historical_session_is_not_notified() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.set_active(crate::config::SessionEntry {
+        },
+    )
+    .await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_active".into(),
             directory: "/tmp/active".into(),
@@ -316,9 +320,9 @@ async fn external_message_to_historical_session_is_not_notified() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.persist().unwrap();
-    }
+        },
+    )
+    .await;
     // The ACTIVE session is `ses_active` (last set_active pushes to front).
     assert_eq!(
         app.sessions.lock().await.get_active(&key).unwrap().session_id,
@@ -387,11 +391,11 @@ async fn reactivated_session_resyncs_silently() {
     let (app, platform) = build_app(cfg, mock).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
 
-    {
-        let mut store = app.sessions.lock().await;
-        // set_active pushes to the front, so the LAST call is the active one
-        // (ses_old, the session being reactivated by /switch).
-        store.set_active(crate::config::SessionEntry {
+    // set_active pushes to the front, so the LAST call is the active one
+    // (ses_old, the session being reactivated by /switch).
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_new".into(),
             directory: "/tmp/new".into(),
@@ -401,8 +405,12 @@ async fn reactivated_session_resyncs_silently() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.set_active(crate::config::SessionEntry {
+        },
+    )
+    .await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_old".into(),
             directory: "/tmp/old".into(),
@@ -412,9 +420,9 @@ async fn reactivated_session_resyncs_silently() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.persist().unwrap();
-    }
+        },
+    )
+    .await;
     // ses_old is the active session after the /switch back.
     assert_eq!(
         app.sessions.lock().await.get_active(&key).unwrap().session_id,
@@ -483,9 +491,9 @@ async fn external_message_to_topic_session_notifies_into_thread() {
     // A TOPIC-backed session (thread_id != chat_id) with NO persisted
     // anchor (like the old /topic sessions) — the anchor must be resolved
     // by querying the thread.
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_topic_ext".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -495,9 +503,9 @@ async fn external_message_to_topic_session_notifies_into_thread() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.persist().unwrap();
-    }
+        },
+    )
+    .await;
     let watermark = chrono::Utc::now().timestamp_millis() - 60_000;
     app.external
         .last_user_msg_epoch
@@ -559,9 +567,9 @@ async fn external_message_reply_renders_into_notification_card() {
     let (app, platform) = build_app(cfg, mock).await;
 
     // A known session whose chat the notification goes to.
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: repo.path().to_string_lossy().to_string(),
@@ -571,9 +579,9 @@ async fn external_message_reply_renders_into_notification_card() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.persist().unwrap();
-    }
+        },
+    )
+    .await;
     let watermark = chrono::Utc::now().timestamp_millis() - 60_000;
     app.external
         .poll_interval_ms
@@ -758,9 +766,9 @@ async fn external_reply_render_times_out_and_finalizes_partial_content() {
     let (app, platform) = build_app(cfg, mock).await;
 
     // A known session whose chat the notification goes to.
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -770,9 +778,9 @@ async fn external_reply_render_times_out_and_finalizes_partial_content() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.persist().unwrap();
-    }
+        },
+    )
+    .await;
     // Tiny cadences + timeout so the whole branch runs in milliseconds.
     app.external
         .poll_interval_ms

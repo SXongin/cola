@@ -110,11 +110,10 @@ async fn question_card_action_posts_answer_back() {
         },
     );
     // Seed the session → directory mapping so the reply routes correctly.
-    {
-        let thread = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
-            thread_key: thread,
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_1".into(),
             directory: "/work".into(),
             agent: None,
@@ -123,8 +122,9 @@ async fn question_card_action_posts_answer_back() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     // User clicks the "/a" option button.
     let value = serde_json::json!({
@@ -203,11 +203,10 @@ async fn completing_last_question_replaces_card_with_full_qa_summary() {
             ],
         },
     );
-    {
-        let thread = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
-            thread_key: thread,
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_1".into(),
             directory: "/work".into(),
             agent: None,
@@ -216,8 +215,9 @@ async fn completing_last_question_replaces_card_with_full_qa_summary() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     let value_for = |index: usize, answer: &str| {
         serde_json::json!({

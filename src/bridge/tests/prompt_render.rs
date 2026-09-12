@@ -21,13 +21,7 @@ async fn handle_prompt_renders_reasoning_tools_and_text() {
     // First call must be the Loading reply card.
     assert!(matches!(calls.first(), Some(PlatformCall::ReplyCard { .. })));
     // At least one card update (flush) must follow.
-    let updates: Vec<_> = calls
-        .iter()
-        .filter_map(|c| match c {
-            PlatformCall::UpdateMessage { card, .. } => Some(card.clone()),
-            _ => None,
-        })
-        .collect();
+    let updates = platform.updated_cards().await;
     assert!(!updates.is_empty(), "expected card updates, got: {:?}", calls);
 
     let final_card = updates.last().unwrap().clone();
@@ -429,9 +423,9 @@ async fn subtitle_falls_back_to_id_tail_without_server_title() {
     let (app, _) = build_app(cfg, MockBackend::new(realistic_parts())).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
 
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_01ba0ed03ffeRvYNWua6mg8d9c".into(),
             directory: "/tmp/x".into(),
@@ -441,8 +435,9 @@ async fn subtitle_falls_back_to_id_tail_without_server_title() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     // No server title → the id-tail alone identifies the session (no cola
     // side name to fall back on; the current prompt is never echoed).
@@ -470,9 +465,9 @@ async fn subtitle_degrades_when_session_info_hangs() {
         .store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
     let (app, _) = build_app(cfg, mock).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_01ba0ed03ffeRvYNWua6mg8d9c".into(),
             directory: "/tmp/x".into(),
@@ -482,8 +477,9 @@ async fn subtitle_degrades_when_session_info_hangs() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
     // The fetch hangs forever; the subtitle must still return (id-tail
     // only) within the bound instead of hanging the prompt flow.
     let subtitle = tokio::time::timeout(
@@ -544,9 +540,9 @@ async fn subtitle_ignores_server_default_title() {
     let (app, _) = build_app(cfg, mock).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
 
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_00ea4e77cffez1fo4wrNuJyHF0".into(),
             directory: "/tmp/y".into(),
@@ -556,8 +552,9 @@ async fn subtitle_ignores_server_default_title() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
     assert_eq!(
         crate::bridge::render::session_subtitle(&app.core, &key, "另一个问题").await,
         "00ea4e7"
@@ -579,9 +576,9 @@ async fn subtitle_prefers_server_title() {
     let (app, _) = build_app(cfg, mock).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
 
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/x".into(),
@@ -591,8 +588,9 @@ async fn subtitle_prefers_server_title() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
     assert_eq!(
         crate::bridge::render::session_subtitle(&app.core, &key, "问题").await,
         "OpenChamber 显示的标题 · test"
@@ -619,9 +617,9 @@ async fn refresh_session_title_updates_live_card_on_server_rename() {
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
 
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/x".into(),
@@ -631,8 +629,9 @@ async fn refresh_session_title_updates_live_card_on_server_rename() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     // Simulate an in-flight turn whose card was captured with the OLD
     // default subtitle before the server auto-titled the session.
@@ -679,9 +678,9 @@ async fn refresh_session_title_syncs_cover_card_mid_turn() {
     let (app, platform) = build_app(cfg, mock).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into());
 
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/x".into(),
@@ -691,15 +690,10 @@ async fn refresh_session_title_syncs_cover_card_mid_turn() {
             topic_anchor: Some("om_seed".into()),
             topic_root: Some("om_cover".into()),
             variant: None,
-        });
-    }
-    app.core.cover_titles.lock().await.insert(
-        "ses_test".into(),
-        crate::bridge::core::CoverTitle {
-            title: "cola".into(),
-            model: None,
         },
-    );
+    )
+    .await;
+    seed_cover_title(&app, "ses_test", "cola").await;
     // An in-flight turn whose card was captured with the OLD subtitle
     // (before the server auto-titled the session).
     let mut acc = crate::bridge::streaming::StreamAccumulator::new("test");

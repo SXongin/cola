@@ -65,9 +65,9 @@ async fn model_card_button_records_override() {
     }];
     let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -77,8 +77,9 @@ async fn model_card_button_records_override() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     // Step 1: pick a provider → the ack card becomes that provider's model
     // picker.
@@ -184,9 +185,9 @@ async fn agent_card_picker_and_button() {
     ];
     let (app, platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -196,8 +197,9 @@ async fn agent_card_picker_and_button() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -286,9 +288,9 @@ async fn agent_text_reset_flag_clears_override() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -298,8 +300,9 @@ async fn agent_text_reset_flag_clears_override() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -319,18 +322,7 @@ async fn agent_text_reset_flag_clears_override() {
             .is_none(),
         "--reset must clear the agent override"
     );
-    let text = platform
-        .calls
-        .lock()
-        .await
-        .clone()
-        .into_iter()
-        .filter_map(|c| match c {
-            PlatformCall::ReplyText { text, .. } => Some(text),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let text = platform.texts().await.join("\n");
     assert!(text.contains("已清除 Agent"), "clear reply: {text}");
 
     // A bare name never clears — it records the override.
@@ -363,9 +355,9 @@ async fn autoaccept_card_toggles_flag() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -375,8 +367,9 @@ async fn autoaccept_card_toggles_flag() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -421,9 +414,9 @@ async fn name_patches_server_title() {
     let backend = MockBackend::new(realistic_parts());
     let title_calls = backend.update_title_calls.clone();
     let (app, _platform) = build_app(cfg, backend).await;
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -433,8 +426,9 @@ async fn name_patches_server_title() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -469,9 +463,9 @@ async fn name_patches_cover_card_in_cover_rooted_topic() {
         .unwrap()
         .insert("ses_test".into(), "新名字".into());
     let (app, platform) = build_app(cfg, backend).await;
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -481,15 +475,10 @@ async fn name_patches_cover_card_in_cover_rooted_topic() {
             topic_anchor: Some("om_seed".into()),
             topic_root: Some("om_cover".into()),
             variant: None,
-        });
-    }
-    app.core.cover_titles.lock().await.insert(
-        "ses_test".into(),
-        crate::bridge::core::CoverTitle {
-            title: "旧标题".into(),
-            model: None,
         },
-    );
+    )
+    .await;
+    seed_cover_title(&app, "ses_test", "旧标题").await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -546,9 +535,9 @@ async fn default_server_title_does_not_patch_cover_card() {
         .unwrap()
         .insert("ses_test".into(), "New session - 2024-12-14T05:33:00.000Z".into());
     let (app, platform) = build_app(cfg, backend).await;
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -558,15 +547,10 @@ async fn default_server_title_does_not_patch_cover_card() {
             topic_anchor: Some("om_seed".into()),
             topic_root: Some("om_cover".into()),
             variant: None,
-        });
-    }
-    app.core.cover_titles.lock().await.insert(
-        "ses_test".into(),
-        crate::bridge::core::CoverTitle {
-            title: "cola".into(),
-            model: None,
         },
-    );
+    )
+    .await;
+    seed_cover_title(&app, "ses_test", "cola").await;
 
     let settled = crate::bridge::command::sync_topic_cover_title(&app.core, "ses_test").await;
 
@@ -604,9 +588,9 @@ async fn cover_title_retry_ladder_catches_late_auto_title() {
     let backend = MockBackend::new(realistic_parts());
     let titles = backend.session_titles.clone();
     let (app, platform) = build_app(cfg, backend).await;
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -616,15 +600,10 @@ async fn cover_title_retry_ladder_catches_late_auto_title() {
             topic_anchor: Some("om_seed".into()),
             topic_root: Some("om_cover".into()),
             variant: None,
-        });
-    }
-    app.core.cover_titles.lock().await.insert(
-        "ses_test".into(),
-        crate::bridge::core::CoverTitle {
-            title: "cola".into(),
-            model: None,
         },
-    );
+    )
+    .await;
+    seed_cover_title(&app, "ses_test", "cola").await;
 
     // The title is NOT on the server when the turn ends; the ladder starts
     // and the title lands a moment later.
@@ -677,9 +656,9 @@ async fn model_command_records_override_used_on_next_prompt() {
     let backend = MockBackend::new(realistic_parts());
     let prompt_models = backend.prompt_models.clone();
     let (app, _platform) = build_app(cfg, backend).await;
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -689,8 +668,9 @@ async fn model_command_records_override_used_on_next_prompt() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -739,9 +719,9 @@ async fn think_command_records_variant_used_on_next_prompt() {
     let prompt_variants = backend.prompt_variants.clone();
     let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -751,8 +731,9 @@ async fn think_command_records_variant_used_on_next_prompt() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -802,9 +783,9 @@ async fn think_command_rejects_undeclared_variant() {
     }];
     let (app, platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -814,8 +795,9 @@ async fn think_command_rejects_undeclared_variant() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -857,9 +839,9 @@ async fn think_reset_flag_clears_variant() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -869,8 +851,9 @@ async fn think_reset_flag_clears_variant() {
             topic_anchor: None,
             topic_root: None,
             variant: Some("high".into()),
-        });
-    }
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -908,9 +891,9 @@ async fn think_bare_default_undeclared_is_rejected() {
     }];
     let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -920,8 +903,9 @@ async fn think_bare_default_undeclared_is_rejected() {
             topic_anchor: None,
             topic_root: None,
             variant: Some("high".into()),
-        });
-    }
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -958,9 +942,9 @@ async fn think_bare_default_declared_is_stored() {
     }];
     let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -970,8 +954,9 @@ async fn think_bare_default_declared_is_stored() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -1008,9 +993,9 @@ async fn think_no_arg_sends_variant_card() {
     }];
     let (app, platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1020,8 +1005,9 @@ async fn think_no_arg_sends_variant_card() {
             topic_anchor: None,
             topic_root: None,
             variant: Some("high".into()),
-        });
-    }
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -1067,9 +1053,9 @@ async fn think_card_button_records_variant() {
     }];
     let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1079,8 +1065,9 @@ async fn think_card_button_records_variant() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     let value = serde_json::json!({
         "action": "think",
@@ -1156,9 +1143,9 @@ async fn model_switch_clears_undeclared_variant() {
     ];
     let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1168,8 +1155,9 @@ async fn model_switch_clears_undeclared_variant() {
             topic_anchor: None,
             topic_root: None,
             variant: Some("high".into()),
-        });
-    }
+        },
+    )
+    .await;
 
     // Switching to the SAME model (declares high) keeps the variant.
     crate::bridge::command::handle_command(
@@ -1228,9 +1216,9 @@ async fn model_switch_keeps_variant_when_new_model_unknown() {
     }];
     let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1240,8 +1228,9 @@ async fn model_switch_keeps_variant_when_new_model_unknown() {
             topic_anchor: None,
             topic_root: None,
             variant: Some("high".into()),
-        });
-    }
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -1272,9 +1261,9 @@ async fn model_command_rejects_malformed_value() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1284,8 +1273,9 @@ async fn model_command_rejects_malformed_value() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -1297,15 +1287,7 @@ async fn model_command_rejects_malformed_value() {
     .await
     .unwrap();
 
-    let calls = platform.calls.lock().await.clone();
-    let text = calls
-        .iter()
-        .filter_map(|c| match c {
-            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let text = platform.texts().await.join("\n");
     assert!(
         text.contains("⚠️") && text.contains("<provider>/<model>"),
         "malformed /model must reply with format guidance: {text}"
@@ -1329,9 +1311,9 @@ async fn model_override_flows_through_supplement_path() {
     let async_models = backend.prompt_async_models.clone();
     let async_calls = backend.prompt_async_calls.clone();
     let (app, _platform) = build_app(cfg, backend).await;
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1341,9 +1323,9 @@ async fn model_override_flows_through_supplement_path() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.persist().unwrap();
-    }
+        },
+    )
+    .await;
     // Record the override on the persisted entry, then mark the session
     // busy so the next message takes the supplement path.
     {
@@ -1385,9 +1367,9 @@ async fn agent_command_records_override_used_on_next_prompt() {
     let backend = MockBackend::new(realistic_parts());
     let prompt_agents = backend.prompt_agents.clone();
     let (app, _platform) = build_app(cfg, backend).await;
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1397,8 +1379,9 @@ async fn agent_command_records_override_used_on_next_prompt() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -1446,9 +1429,9 @@ async fn agent_override_flows_through_supplement_path() {
     let async_agents = backend.prompt_async_agents.clone();
     let async_calls = backend.prompt_async_calls.clone();
     let (app, _platform) = build_app(cfg, backend).await;
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1458,9 +1441,9 @@ async fn agent_override_flows_through_supplement_path() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.persist().unwrap();
-    }
+        },
+    )
+    .await;
     app.inflight.lock().await.insert("ses_test".into());
 
     app.handle_message(incoming(
@@ -1491,9 +1474,9 @@ async fn model_override_persists_across_store_reload() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1503,8 +1486,9 @@ async fn model_override_persists_across_store_reload() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,

@@ -142,9 +142,9 @@ async fn subtask_permission_without_streaming_card_sends_card_to_parent_chat() {
 
     // Map the parent session to a chat WITHOUT an active accumulator (no
     // handle_message call — the turn is finished).
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -154,9 +154,9 @@ async fn subtask_permission_without_streaming_card_sends_card_to_parent_chat() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.persist().unwrap();
-    }
+        },
+    )
+    .await;
 
     tokio::spawn({
         let app = app.clone();
