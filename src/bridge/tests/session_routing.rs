@@ -378,6 +378,63 @@ async fn stale_session_mapping_is_recreated_on_404() {
     assert!(!inflight.contains("ses_new"), "fresh id guard must be released");
 }
 
+/// A failed attempt after a 404 recreate must still offer a working retry. The
+/// Error card's retry button is built from the accumulator's `session_id`, so
+/// recreate must rekey it to the fresh session — otherwise the retry looks the
+/// dead id up in the cards map and silently does nothing.
+#[tokio::test]
+async fn stale_session_recreate_retry_button_names_the_fresh_session() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.session_id = "ses_new".into();
+    backend.stale_session_404 = true;
+    // The recreated session's prompt also fails, producing the Error card
+    // whose retry button this test inspects.
+    backend.prompt_error = Some("provider 503".into());
+    let (app, platform) = build_app(cfg, backend).await;
+
+    let thread = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: thread,
+            session_id: "ses_old".into(),
+            directory: "/tmp/old".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    app.handle_message(incoming(
+        "msg_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+
+    let retry = platform
+        .button_values()
+        .await
+        .into_iter()
+        .find(|v| v.get("action").and_then(|a| a.as_str()) == Some("retry"))
+        .expect("the Error card must offer a retry");
+    assert_eq!(
+        retry.get("session_id").and_then(|s| s.as_str()),
+        Some("ses_new"),
+        "the retry must name the recreated session"
+    );
+}
+
 /// ADR-0023: when a cola-created topic's session 404s and is recreated, the
 /// topic's creation messages (`topic_anchor`/`topic_root`) survive the
 /// recreate — they are Feishu message ids, not session state — so the
