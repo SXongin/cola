@@ -553,21 +553,8 @@ pub(crate) async fn handle_command(
                     return Ok(());
                 }
             };
-            let entry = SessionEntry {
-                thread_key: thread_key.clone(),
-                session_id: session.id.clone(),
-                directory: dir_str.clone(),
-                agent: None,
-                model: None,
-                auto_accept: false,
-                topic_anchor: None,
-                topic_root: None,
-                variant: None,
-            };
-            let mut store = core.sessions.lock().await;
-            store.set_active(entry);
-            store.persist()?;
-            core.invalidate_session_list_cache().await;
+            let entry = SessionEntry::new(thread_key.clone(), session.id.clone(), dir_str.clone());
+            core.activate_session(entry).await?;
             core.feishu
                 .reply_text(
                     message_id,
@@ -600,21 +587,8 @@ pub(crate) async fn handle_command(
             if let Some(n) = &name {
                 core.opencode.update_session_title(&session.id, n).await?;
             }
-            let entry = SessionEntry {
-                thread_key: thread_key.clone(),
-                session_id: session.id.clone(),
-                directory,
-                agent: None,
-                model: None,
-                auto_accept: false,
-                topic_anchor: None,
-                topic_root: None,
-                variant: None,
-            };
-            let mut store = core.sessions.lock().await;
-            store.set_active(entry);
-            store.persist()?;
-            core.invalidate_session_list_cache().await;
+            let entry = SessionEntry::new(thread_key.clone(), session.id.clone(), directory);
+            core.activate_session(entry).await?;
             let label = name.unwrap_or_else(|| format!("sess-{}", uuid::Uuid::new_v4()));
             core.feishu
                 .reply_text(message_id, &format!("Created \"{}\".", label))
@@ -738,11 +712,8 @@ pub(crate) async fn handle_command(
                         0
                     };
                     if let Some(e) = entry {
-                        let mut store = core.sessions.lock().await;
-                        let mut e = e.clone();
-                        e.auto_accept = on;
-                        store.set_active(e);
-                        store.persist()?;
+                        core.update_session(&e.session_id, |entry| entry.auto_accept = on)
+                            .await?;
                     }
                     let state = if on { "开" } else { "关" };
                     let extra = if on && approved > 0 {
@@ -796,7 +767,7 @@ pub(crate) async fn handle_command(
                 let store = core.sessions.lock().await;
                 store.get_active(&thread_key).cloned()
             };
-            let Some(mut entry) = entry else {
+            let Some(entry) = entry else {
                 core.feishu
                     .reply_text(
                         message_id,
@@ -809,12 +780,9 @@ pub(crate) async fn handle_command(
                 return Ok(());
             };
             let cleared = is_reset_flag(&name);
-            entry.agent = if cleared { None } else { Some(name.clone()) };
-            {
-                let mut store = core.sessions.lock().await;
-                store.set_active(entry);
-                store.persist()?;
-            }
+            let agent = if cleared { None } else { Some(name.clone()) };
+            core.update_session(&entry.session_id, |e| e.agent = agent)
+                .await?;
             let msg = if cleared {
                 "已清除 Agent（回到服务器默认）。".to_string()
             } else {
@@ -860,11 +828,11 @@ pub(crate) async fn handle_command(
             // Auto-clear the `/think` variant when the new model doesn't
             // declare it (ADR-0020), shared with the `/model` picker card.
             let cleared_variant = core.clear_variant_for_model(&mut entry, &name).await;
-            {
-                let mut store = core.sessions.lock().await;
-                store.set_active(entry);
-                store.persist()?;
-            }
+            core.update_session(&entry.session_id, |e| {
+                e.model = entry.model.clone();
+                e.variant = entry.variant.clone();
+            })
+            .await?;
             let extra = cleared_variant
                 .map(|v| format!("（已清除思考等级 `{v}`：新模型不支持）"))
                 .unwrap_or_default();
@@ -885,7 +853,7 @@ pub(crate) async fn handle_command(
             // the override (the server's default for the model); a variant
             // literally named `default`/`off`/`reset` is a normal pick, never
             // a clear word.
-            let Some(mut entry) = core.sessions.lock().await.get_active(&thread_key).cloned() else {
+            let Some(entry) = core.sessions.lock().await.get_active(&thread_key).cloned() else {
                 core.feishu
                     .reply_text(
                         message_id,
@@ -918,12 +886,9 @@ pub(crate) async fn handle_command(
                     .await?;
                 return Ok(());
             }
-            entry.variant = if cleared { None } else { Some(name.clone()) };
-            {
-                let mut store = core.sessions.lock().await;
-                store.set_active(entry);
-                store.persist()?;
-            }
+            let variant = if cleared { None } else { Some(name.clone()) };
+            core.update_session(&entry.session_id, |e| e.variant = variant)
+                .await?;
             let msg = if cleared {
                 "已清除思考等级（回到模型默认）。".to_string()
             } else {
@@ -1058,10 +1023,7 @@ async fn handle_switch_action(
             handle_list(core, thread_key, keyword.as_deref(), all, message_id).await
         }
         SwitchAction::Forget => {
-            let mut store = core.sessions.lock().await;
-            let removed = store.remove_thread(thread_key);
-            store.persist()?;
-            core.invalidate_session_list_cache().await;
+            let removed = core.remove_thread_sessions(thread_key).await?;
             if removed.is_empty() {
                 core.feishu.reply_text(message_id, "当前没有映射的会话。").await?;
             } else {
@@ -1463,17 +1425,16 @@ async fn handle_switch(
         .collect();
     if thread_hits.len() == 1 {
         let hit = thread_hits[0];
-        {
-            let mut store = core.sessions.lock().await;
-            if let Some(entry) = store
+        let entry = {
+            let store = core.sessions.lock().await;
+            store
                 .list_thread(thread_key)
                 .into_iter()
                 .find(|e| e.session_id == hit.id)
                 .cloned()
-            {
-                store.set_active(entry);
-                store.persist()?;
-            }
+        };
+        if let Some(entry) = entry {
+            core.activate_session(entry).await?;
         }
         // ADR-0028 suppression: re-activating a session already mapped to
         // this thread reports a snapshot only when there is content to show —
@@ -1796,9 +1757,7 @@ async fn handle_topic_adopt(
             return Ok(());
         }
         // --force: steal the mapping; the other thread becomes sessionless.
-        let mut store = core.sessions.lock().await;
-        store.remove(&info.id);
-        store.persist()?;
+        core.remove_session(&info.id).await?;
     }
     // Create a real topic anchored on the command message and map the adopted
     // session to the new topic's ThreadKey.
@@ -1918,24 +1877,12 @@ async fn open_topic_seeded(
         return Ok((None, anchor));
     };
     let topic_key = crate::config::ThreadKey::new(chat_id.to_string(), thread_id.clone());
-    let entry = SessionEntry {
-        thread_key: topic_key,
-        session_id: session_id.to_string(),
-        directory,
-        agent,
-        model: None,
-        auto_accept: false,
-        topic_anchor: Some(anchor.clone()),
-        topic_root: Some(topic_root),
-        variant: None,
-    };
-    {
-        let mut store = core.sessions.lock().await;
-        store.set_active(entry);
-        store.persist()?;
-    }
+    let mut entry = SessionEntry::new(topic_key, session_id.to_string(), directory);
+    entry.agent = agent;
+    entry.topic_anchor = Some(anchor.clone());
+    entry.topic_root = Some(topic_root);
+    core.activate_session(entry).await?;
     record_cover_title(core, session_id, &display_title, model, cover_id.is_some()).await;
-    core.invalidate_session_list_cache().await;
     Ok((Some(thread_id), anchor))
 }
 
@@ -2074,9 +2021,7 @@ async fn adopt_session(
             return Ok(());
         }
         // --force: steal the mapping; the other thread becomes sessionless.
-        let mut store = core.sessions.lock().await;
-        store.remove(&info.id);
-        store.persist()?;
+        core.remove_session(&info.id).await?;
     }
 
     // ADR-0028: every adoption ends in exactly ONE Session Snapshot card
@@ -2100,23 +2045,10 @@ async fn adopt_session(
     } else {
         None
     };
-    let entry = SessionEntry {
-        thread_key: thread_key.clone(),
-        session_id: info.id.clone(),
-        directory: info.directory.clone(),
-        agent: info.agent.clone(),
-        model: None,
-        auto_accept: false,
-        topic_anchor: anchor.clone(),
-        topic_root: None,
-        variant: None,
-    };
-    {
-        let mut store = core.sessions.lock().await;
-        store.set_active(entry);
-        store.persist()?;
-    }
-    core.invalidate_session_list_cache().await;
+    let mut entry = SessionEntry::new(thread_key.clone(), info.id.clone(), info.directory.clone());
+    entry.agent = info.agent.clone();
+    entry.topic_anchor = anchor.clone();
+    core.activate_session(entry).await?;
     // In a topic the snapshot was already sent inside it (the in-thread send
     // above); don't reply twice.
     if kind != ConversationKind::Topic {

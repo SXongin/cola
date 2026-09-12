@@ -648,12 +648,7 @@ impl App {
             // thread. Reuse the dead session's directory so the user keeps
             // working in the same project, and keep its topic creation
             // messages (ADR-0023) so the injection guard survives the recreate.
-            let old_entry = {
-                let mut store = self.sessions.lock().await;
-                let entry = store.remove(&session_id);
-                store.persist()?;
-                entry
-            };
+            let old_entry = self.remove_session(&session_id).await?;
             let directory = old_entry
                 .as_ref()
                 .and_then(|e| (!e.directory.is_empty()).then_some(e.directory.clone()))
@@ -913,21 +908,10 @@ impl App {
             .opencode
             .create_session(&self.opencode.new_session_input(Some(&directory)))
             .await?;
-        let entry = SessionEntry {
-            thread_key: thread_key.clone(),
-            session_id: session.id.clone(),
-            directory,
-            agent: None,
-            model: None,
-            auto_accept: false,
-            topic_anchor,
-            topic_root,
-            variant: None,
-        };
-        let mut store = self.sessions.lock().await;
-        store.set_active(entry);
-        store.persist()?;
-        self.invalidate_session_list_cache().await;
+        let mut entry = SessionEntry::new(thread_key.clone(), session.id.clone(), directory);
+        entry.topic_anchor = topic_anchor;
+        entry.topic_root = topic_root;
+        self.activate_session(entry).await?;
         Ok(session.id)
     }
 
@@ -1070,25 +1054,14 @@ impl App {
                     .await
                 {
                     Ok(session) => {
-                        let entry = crate::config::SessionEntry {
-                            thread_key: thread_key.clone(),
-                            session_id: session.id.clone(),
+                        let entry = crate::config::SessionEntry::new(
+                            thread_key.clone(),
+                            session.id.clone(),
                             directory,
-                            agent: None,
-                            model: None,
-                            auto_accept: false,
-                            topic_anchor: None,
-                            topic_root: None,
-                            variant: None,
-                        };
-                        {
-                            let mut store = core.sessions.lock().await;
-                            store.set_active(entry);
-                            if let Err(e) = store.persist() {
-                                tracing::warn!("switch card new: persist failed: {}", e);
-                            }
+                        );
+                        if let Err(e) = core.activate_session(entry).await {
+                            tracing::warn!("switch card new: persist failed: {}", e);
                         }
-                        core.invalidate_session_list_cache().await;
                         Some(CardActionResult {
                             card: Some(self.build_switch_card_for(core, &thread_key, "", scope).await),
                             toast: Some("已新建会话".to_string()),
@@ -1255,25 +1228,13 @@ impl App {
         } else {
             None
         };
-        let entry = crate::config::SessionEntry {
-            thread_key: thread_key.clone(),
-            session_id: target.id.clone(),
-            directory: target.directory.clone(),
-            agent: target.agent.clone(),
-            model: None,
-            auto_accept: false,
-            topic_anchor,
-            topic_root: None,
-            variant: None,
-        };
-        {
-            let mut store = core.sessions.lock().await;
-            store.set_active(entry);
-            if let Err(e) = store.persist() {
-                tracing::warn!("switch card adopt: persist failed: {}", e);
-            }
+        let mut entry =
+            crate::config::SessionEntry::new(thread_key.clone(), target.id.clone(), target.directory.clone());
+        entry.agent = target.agent.clone();
+        entry.topic_anchor = topic_anchor;
+        if let Err(e) = core.activate_session(entry).await {
+            tracing::warn!("switch card adopt: persist failed: {}", e);
         }
-        core.invalidate_session_list_cache().await;
         if let (Some(message_id), Some(data)) = (&open_message_id, &claim_data) {
             crate::bridge::external::settle_snapshot_after_send(core, message_id, verb, &target.title, data)
                 .await;
@@ -1398,25 +1359,14 @@ impl App {
                         });
                     }
                 };
-                let entry = crate::config::SessionEntry {
-                    thread_key: thread_key.clone(),
-                    session_id: session.id.clone(),
-                    directory: directory.clone(),
-                    agent: None,
-                    model: None,
-                    auto_accept: false,
-                    topic_anchor: None,
-                    topic_root: None,
-                    variant: None,
-                };
-                {
-                    let mut store = core.sessions.lock().await;
-                    store.set_active(entry);
-                    if let Err(e) = store.persist() {
-                        tracing::warn!("dir card pick: persist failed: {}", e);
-                    }
+                let entry = crate::config::SessionEntry::new(
+                    thread_key.clone(),
+                    session.id.clone(),
+                    directory.clone(),
+                );
+                if let Err(e) = core.activate_session(entry).await {
+                    tracing::warn!("dir card pick: persist failed: {}", e);
                 }
-                core.invalidate_session_list_cache().await;
                 Some(CardActionResult {
                     card: Some(self.build_dir_card_for(core, &thread_key).await),
                     toast: Some(format!("已切换目录并新建会话（`{directory}`）")),
@@ -1517,7 +1467,7 @@ impl App {
             .unwrap_or("")
             .to_string();
         let thread_key = thread_key_from_value(value);
-        let Some(mut entry) = core.sessions.lock().await.get_active(&thread_key).cloned() else {
+        let Some(entry) = core.sessions.lock().await.get_active(&thread_key).cloned() else {
             return Some(CardActionResult {
                 card: None,
                 toast: Some(format!(
@@ -1526,13 +1476,9 @@ impl App {
                 )),
             });
         };
-        entry.agent = if clear { None } else { Some(picked.clone()) };
-        {
-            let mut store = core.sessions.lock().await;
-            store.set_active(entry);
-            if let Err(e) = store.persist() {
-                tracing::warn!("agent card: persist failed: {}", e);
-            }
+        let agent = if clear { None } else { Some(picked.clone()) };
+        if let Err(e) = core.update_session(&entry.session_id, |e| e.agent = agent).await {
+            tracing::warn!("agent card: persist failed: {}", e);
         }
         let (card, _error) = crate::bridge::command::agent_card(core, &thread_key).await;
         Some(CardActionResult {
@@ -1599,12 +1545,14 @@ impl App {
         // Auto-clear the `/think` variant when the new model doesn't declare
         // it (ADR-0020), same as the `/model` text form.
         let cleared_variant = core.clear_variant_for_model(&mut entry, &picked).await;
+        if let Err(e) = core
+            .update_session(&entry.session_id, |e| {
+                e.model = entry.model.clone();
+                e.variant = entry.variant.clone();
+            })
+            .await
         {
-            let mut store = core.sessions.lock().await;
-            store.set_active(entry);
-            if let Err(e) = store.persist() {
-                tracing::warn!("model card: persist failed: {}", e);
-            }
+            tracing::warn!("model card: persist failed: {}", e);
         }
         let extra = cleared_variant
             .map(|v| format!("（已清除思考等级 `{v}`：新模型不支持）"))
@@ -1636,7 +1584,7 @@ impl App {
             .unwrap_or("")
             .to_string();
         let thread_key = thread_key_from_value(value);
-        let Some(mut entry) = core.sessions.lock().await.get_active(&thread_key).cloned() else {
+        let Some(entry) = core.sessions.lock().await.get_active(&thread_key).cloned() else {
             return Some(CardActionResult {
                 card: None,
                 toast: Some(format!(
@@ -1655,13 +1603,12 @@ impl App {
                 toast: Some(format!("当前模型 `{provider}/{model}` 不支持思考等级 `{picked}`")),
             });
         }
-        entry.variant = if clear { None } else { Some(picked.clone()) };
+        let variant = if clear { None } else { Some(picked.clone()) };
+        if let Err(e) = core
+            .update_session(&entry.session_id, |e| e.variant = variant)
+            .await
         {
-            let mut store = core.sessions.lock().await;
-            store.set_active(entry);
-            if let Err(e) = store.persist() {
-                tracing::warn!("think card: persist failed: {}", e);
-            }
+            tracing::warn!("think card: persist failed: {}", e);
         }
         let (card, _error) = crate::bridge::command::think_card(core, &thread_key).await;
         Some(CardActionResult {
@@ -1709,13 +1656,12 @@ impl App {
             core.approve_pending_for_session(&e.session_id, &e.directory)
                 .await;
         }
-        if let Some(mut e) = current_entry {
-            e.auto_accept = on;
-            let mut store = core.sessions.lock().await;
-            store.set_active(e);
-            if let Err(e) = store.persist() {
-                tracing::warn!("autoaccept card: persist failed: {}", e);
-            }
+        if let Some(e) = current_entry
+            && let Err(err) = core
+                .update_session(&e.session_id, |entry| entry.auto_accept = on)
+                .await
+        {
+            tracing::warn!("autoaccept card: persist failed: {}", err);
         }
         let current_on = core
             .sessions

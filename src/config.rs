@@ -271,6 +271,24 @@ pub struct SessionEntry {
     pub topic_root: Option<String>,
 }
 
+impl SessionEntry {
+    /// A mapping entry with every optional field at its default; the flow that
+    /// creates the mapping sets exactly the extras it carries.
+    pub fn new(thread_key: ThreadKey, session_id: impl Into<String>, directory: impl Into<String>) -> Self {
+        Self {
+            thread_key,
+            session_id: session_id.into(),
+            directory: directory.into(),
+            agent: None,
+            model: None,
+            variant: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

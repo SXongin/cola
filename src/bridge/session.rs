@@ -37,6 +37,30 @@ impl SessionStore {
         self.entries.insert(0, entry);
     }
 
+    /// Promote `entry` as its thread's active session and persist the store.
+    /// The durable half of every create/adopt/promote path: callers cannot
+    /// forget the save.
+    pub fn activate(&mut self, entry: SessionEntry) -> crate::error::Result<()> {
+        self.set_active(entry);
+        self.persist()
+    }
+
+    /// Mutate the mapped session in place and persist, returning the updated
+    /// entry (`None` when `session_id` is not mapped). Used for the
+    /// per-session overrides (`/agent`, `/model`, `/think`, `/autoaccept`).
+    pub fn update<F>(&mut self, session_id: &str, f: F) -> crate::error::Result<Option<SessionEntry>>
+    where
+        F: FnOnce(&mut SessionEntry),
+    {
+        let Some(entry) = self.entries.iter_mut().find(|e| e.session_id == session_id) else {
+            return Ok(None);
+        };
+        f(entry);
+        let updated = entry.clone();
+        self.persist()?;
+        Ok(Some(updated))
+    }
+
     /// Remove a session entry by session ID.
     pub fn remove(&mut self, session_id: &str) -> Option<SessionEntry> {
         if let Some(pos) = self.entries.iter().position(|e| e.session_id == session_id) {
@@ -44,6 +68,13 @@ impl SessionStore {
         } else {
             None
         }
+    }
+
+    /// Remove a mapping and persist the store.
+    pub fn remove_persist(&mut self, session_id: &str) -> crate::error::Result<Option<SessionEntry>> {
+        let removed = self.remove(session_id);
+        self.persist()?;
+        Ok(removed)
     }
 
     /// Remove every session entry mapped to a thread (used by `/forget`).
@@ -56,6 +87,14 @@ impl SessionStore {
             .collect();
         self.entries.retain(|e| &e.thread_key != key);
         removed
+    }
+
+    /// Remove every mapping of a thread and persist the store (used by
+    /// `/switch forget`).
+    pub fn remove_thread_persist(&mut self, key: &ThreadKey) -> crate::error::Result<Vec<SessionEntry>> {
+        let removed = self.remove_thread(key);
+        self.persist()?;
+        Ok(removed)
     }
 
     /// Find the ThreadKey for a given session ID.

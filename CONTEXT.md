@@ -73,6 +73,10 @@ A Feishu topic, identified by `thread_id` (`omt_...`). Retained in code as `Thre
 The single session of a chat/topic that messages route to and that external-message sync follows. Exactly one per ThreadKey at a time (the SessionStore's first entry); `/switch` and `/new` promote a session to active, and cola derives the conversation's current project from it.
 _Avoid_: Current session, latest session, selected session
 
+**Session Mapping**:
+Cola's record of which Sessions a Chat or Topic has activated, and which one is its Active Session. Established when a Session is opened or adopted for a conversation and remembered across restarts; distinct from the Session itself, whose identity lives on the Backend (ADR-0007), and from the server's session list, which is Backend state rather than cola's.
+_Avoid_: Session list, session store, mapping table
+
 **Cola-Authored Message**:
 A user message cola itself submitted to the Backend on behalf of a Feishu Chat/Topic, as opposed to an External Message. Self-identifying: cola chooses the message's id (`msg_cola_…`) at send time and the Backend persists that id, so authorship survives a server crash/replacement and even a cola restart without any cola-side ledger. Recognised by the `msg_cola_` id prefix.
 _Avoid_: Outbound message, own prompt (a prompt is the send action, not the stored message)
@@ -188,6 +192,7 @@ _Avoid_: Notification, message, signal
 
 - A **Bot** contains one **Platform** and one or more **Backend** adapters
 - A **Chat** contains many **Topics**; a **Chat** may hold several **Sessions** directly (lobby), while a **Topic** holds exactly one **Session**
+- A **Chat** or **Topic** has one **Session Mapping**: the set of **Session**s it has activated, with exactly one of them its **Active Session**
 - A **Topic** is created around its **Topic Root** and, when cola opens it, is anchored on its **Topic Anchor**; a cola-created **Topic Root** is a **Topic Cover Card**
 - A **Session** contains many **Turns** and has one **Project** and one optional **Agent**
 - A **Session** receives many **Permissions** and **Questions**
