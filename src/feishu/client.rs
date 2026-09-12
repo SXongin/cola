@@ -1,9 +1,15 @@
 use crate::config::FeishuConfig;
 use serde::Deserialize;
 
+/// The Feishu open platform host used in production.
+const DEFAULT_BASE_URL: &str = "https://open.feishu.cn";
+
 /// A minimal Feishu REST client.
 pub struct Client {
     http: reqwest::Client,
+    /// Scheme + host every REST call is built on. Production uses the Feishu
+    /// open platform; wire tests point it at a local fake server (ADR-0031).
+    base_url: String,
     app_id: String,
     app_secret: String,
     access_token: std::sync::Mutex<Option<CachedToken>>,
@@ -33,12 +39,26 @@ struct CachedToken {
 
 impl Client {
     pub fn new(cfg: FeishuConfig) -> Self {
+        Self::with_base_url(cfg, DEFAULT_BASE_URL)
+    }
+
+    /// Build a client against an alternate Feishu-compatible base URL. Normal
+    /// production code uses [`Client::new`]; wire tests point this at a local
+    /// fake server so the HTTP layer itself is exercised end to end (ADR-0031).
+    /// A trailing slash is tolerated.
+    pub fn with_base_url(cfg: FeishuConfig, base_url: impl Into<String>) -> Self {
         Self {
             http: reqwest::Client::new(),
+            base_url: base_url.into().trim_end_matches('/').to_string(),
             app_id: cfg.app_id,
             app_secret: cfg.app_secret,
             access_token: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Build a full endpoint URL from an absolute path beginning with `/`.
+    fn endpoint(&self, path: &str) -> String {
+        format!("{}{path}", self.base_url)
     }
 
     /// Obtain a tenant access token, caching it until expiry.
@@ -59,7 +79,7 @@ impl Client {
 
         let text = read_body_with_diag(
             self.http
-                .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
+                .post(self.endpoint("/open-apis/auth/v3/tenant_access_token/internal"))
                 .json(&body)
                 .send()
                 .await?,
@@ -107,8 +127,8 @@ impl Client {
         let text = read_body_with_diag(
             self.http
                 .post(format!(
-                    "https://open.feishu.cn/open-apis/im/v1/messages/{}/reply",
-                    message_id
+                    "{}/open-apis/im/v1/messages/{}/reply",
+                    self.base_url, message_id
                 ))
                 .bearer_auth(&token)
                 .json(&body)
@@ -143,7 +163,7 @@ impl Client {
 
         let resp = self
             .http
-            .post("https://open.feishu.cn/callback/ws/endpoint")
+            .post(self.endpoint("/callback/ws/endpoint"))
             .json(&body)
             .send()
             .await?;
@@ -177,7 +197,7 @@ impl Client {
         let token = self.get_access_token().await?;
         let resp = self
             .http
-            .get("https://open.feishu.cn/open-apis/bot/v3/info")
+            .get(self.endpoint("/open-apis/bot/v3/info"))
             .bearer_auth(&token)
             .send()
             .await?;
@@ -223,8 +243,8 @@ impl Client {
         let resp: MessageResponse = self
             .http
             .post(format!(
-                "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={}",
-                receive_id_type
+                "{}/open-apis/im/v1/messages?receive_id_type={}",
+                self.base_url, receive_id_type
             ))
             .bearer_auth(&token)
             .json(&body)
@@ -260,8 +280,8 @@ impl Client {
         let resp: MessageResponse = self
             .http
             .post(format!(
-                "https://open.feishu.cn/open-apis/im/v1/messages/{}/reply",
-                message_id
+                "{}/open-apis/im/v1/messages/{}/reply",
+                self.base_url, message_id
             ))
             .bearer_auth(&token)
             .json(&body)
@@ -307,8 +327,8 @@ impl Client {
         let resp: MessageResponse = self
             .http
             .post(format!(
-                "https://open.feishu.cn/open-apis/im/v1/messages/{}/reply",
-                message_id
+                "{}/open-apis/im/v1/messages/{}/reply",
+                self.base_url, message_id
             ))
             .bearer_auth(&token)
             .json(&body)
@@ -370,8 +390,8 @@ impl Client {
         let resp: MessageResponse = self
             .http
             .post(format!(
-                "https://open.feishu.cn/open-apis/im/v1/messages/{}/reply",
-                message_id
+                "{}/open-apis/im/v1/messages/{}/reply",
+                self.base_url, message_id
             ))
             .bearer_auth(&token)
             .json(&body)
@@ -399,8 +419,8 @@ impl Client {
     pub async fn user_name(&self, open_id: &str) -> crate::error::Result<Option<String>> {
         let token = self.get_access_token().await?;
         let url = format!(
-            "https://open.feishu.cn/open-apis/contact/v3/users/{}?user_id_type=open_id",
-            open_id
+            "{}/open-apis/contact/v3/users/{}?user_id_type=open_id",
+            self.base_url, open_id
         );
         let resp = self.http.get(url).bearer_auth(&token).send().await?;
         let text = resp.text().await?;
@@ -432,7 +452,7 @@ impl Client {
     /// Response shape: `GET /im/v1/chats/{chat_id}` → `data.name`.
     pub async fn chat_name(&self, chat_id: &str) -> crate::error::Result<Option<String>> {
         let token = self.get_access_token().await?;
-        let url = format!("https://open.feishu.cn/open-apis/im/v1/chats/{}", chat_id);
+        let url = format!("{}/open-apis/im/v1/chats/{}", self.base_url, chat_id);
         let resp = self.http.get(url).bearer_auth(&token).send().await?;
         let text = resp.text().await?;
         let v: serde_json::Value = serde_json::from_str(&text)
@@ -469,8 +489,8 @@ impl Client {
         let resp: ApiResponse = self
             .http
             .patch(format!(
-                "https://open.feishu.cn/open-apis/im/v1/messages/{}",
-                message_id
+                "{}/open-apis/im/v1/messages/{}",
+                self.base_url, message_id
             ))
             .bearer_auth(&token)
             .json(&body)
@@ -502,7 +522,7 @@ impl Client {
         let token = self.get_access_token().await?;
         let resp = self
             .http
-            .get("https://open.feishu.cn/open-apis/im/v1/messages")
+            .get(self.endpoint("/open-apis/im/v1/messages"))
             .query(&[
                 ("container_id_type", container_id_type),
                 ("container_id", container_id),
@@ -551,8 +571,8 @@ impl Client {
         let resp = self
             .http
             .get(format!(
-                "https://open.feishu.cn/open-apis/im/v1/messages/{}?card_msg_content_type=raw_card_content",
-                message_id
+                "{}/open-apis/im/v1/messages/{}?card_msg_content_type=raw_card_content",
+                self.base_url, message_id
             ))
             .bearer_auth(&token)
             .timeout(std::time::Duration::from_secs(5))
@@ -605,8 +625,8 @@ impl Client {
         let resp = self
             .http
             .get(format!(
-                "https://open.feishu.cn/open-apis/im/v1/messages/{}/resources/{}?type=image",
-                message_id, image_key
+                "{}/open-apis/im/v1/messages/{}/resources/{}?type=image",
+                self.base_url, message_id, image_key
             ))
             .bearer_auth(&token)
             .timeout(std::time::Duration::from_secs(10))
@@ -688,7 +708,8 @@ struct MessageData {
     thread_id: Option<String>,
 }
 
-/// A message returned by `list_messages` — used by the live E2E harness.
+/// A message returned by `list_messages` — the newest-first page
+/// `resolve_topic_anchor` scans for a reply anchor.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct ChatMessage {
@@ -754,4 +775,103 @@ struct MessagesResponse {
 struct MessagesData {
     #[serde(default)]
     items: Vec<ChatMessage>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_http::TestHttpServer;
+
+    const TOKEN_PATH: &str = "/open-apis/auth/v3/tenant_access_token/internal";
+
+    fn test_config() -> FeishuConfig {
+        FeishuConfig {
+            app_id: "cli_test".into(),
+            app_secret: "secret_test".into(),
+        }
+    }
+
+    async fn token_server(response: serde_json::Value) -> TestHttpServer {
+        let server = TestHttpServer::start().await;
+        server.route("POST", TOKEN_PATH, 200, response.to_string());
+        server
+    }
+
+    #[tokio::test]
+    async fn get_access_token_posts_credentials_and_returns_token() {
+        let server = token_server(serde_json::json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "t-abc",
+            "expire": 7200,
+        }))
+        .await;
+        let client = Client::with_base_url(test_config(), server.base_url());
+
+        let token = client.get_access_token().await.unwrap();
+        assert_eq!(token, "t-abc");
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, TOKEN_PATH);
+        assert_eq!(requests[0].header("content-type"), Some("application/json"));
+        let body: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
+        assert_eq!(body["app_id"], "cli_test");
+        assert_eq!(body["app_secret"], "secret_test");
+    }
+
+    #[tokio::test]
+    async fn get_access_token_caches_until_expiry() {
+        let server = token_server(serde_json::json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "t-abc",
+            "expire": 7200,
+        }))
+        .await;
+        let client = Client::with_base_url(test_config(), server.base_url());
+
+        assert_eq!(client.get_access_token().await.unwrap(), "t-abc");
+        assert_eq!(client.get_access_token().await.unwrap(), "t-abc");
+        assert_eq!(server.request_count(), 1, "a cached token must not re-request");
+    }
+
+    #[tokio::test]
+    async fn get_access_token_refetches_after_expiry() {
+        // expire == 60 leaves zero cache lifetime, so the next call refetches.
+        let server = token_server(serde_json::json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "t-abc",
+            "expire": 60,
+        }))
+        .await;
+        let client = Client::with_base_url(test_config(), server.base_url());
+
+        client.get_access_token().await.unwrap();
+        client.get_access_token().await.unwrap();
+        assert_eq!(server.request_count(), 2, "an expired token must be refetched");
+    }
+
+    #[tokio::test]
+    async fn get_access_token_maps_business_error_code() {
+        let server = token_server(serde_json::json!({
+            "code": 10003,
+            "msg": "invalid app_secret",
+        }))
+        .await;
+        let client = Client::with_base_url(test_config(), server.base_url());
+
+        let err = client.get_access_token().await.unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("token error 10003"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("invalid app_secret"),
+            "unexpected error: {message}"
+        );
+    }
 }
