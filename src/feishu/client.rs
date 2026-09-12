@@ -506,8 +506,8 @@ impl Client {
             .query(&[
                 ("container_id_type", container_id_type),
                 ("container_id", container_id),
-                // Newest first, so recent cards (which the tests wait for) are
-                // on the first page even once the group passes 50 messages.
+                // Newest first, so the newest cola message is on the first
+                // page even once a topic passes 50 messages.
                 ("sort_type", "ByCreateTimeDesc"),
                 ("page_size", "50"),
             ])
