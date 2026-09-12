@@ -275,4 +275,145 @@ mod tests {
         assert_eq!(entry.session_id, "ses_legacy");
         assert_eq!(entry.directory, "/tmp/legacy");
     }
+
+    #[test]
+    fn activate_promotes_and_persists() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path.clone()).unwrap();
+
+        store
+            .activate(make_entry("chat1", "root1", "ses_1", "/tmp/a"))
+            .unwrap();
+        store
+            .activate(make_entry("chat1", "root1", "ses_2", "/tmp/b"))
+            .unwrap();
+        assert_eq!(
+            store
+                .get_active(&ThreadKey::new("chat1".into(), "root1".into()))
+                .unwrap()
+                .session_id,
+            "ses_2"
+        );
+        // Re-activating an existing session promotes it without duplicating.
+        store
+            .activate(make_entry("chat1", "root1", "ses_1", "/tmp/a"))
+            .unwrap();
+        assert_eq!(
+            store
+                .list_thread(&ThreadKey::new("chat1".into(), "root1".into()))
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .get_active(&ThreadKey::new("chat1".into(), "root1".into()))
+                .unwrap()
+                .session_id,
+            "ses_1"
+        );
+        // The promotion is durable.
+        let reloaded = SessionStore::new(path).unwrap();
+        assert_eq!(
+            reloaded
+                .get_active(&ThreadKey::new("chat1".into(), "root1".into()))
+                .unwrap()
+                .session_id,
+            "ses_1"
+        );
+    }
+
+    #[test]
+    fn update_mutates_and_persists() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path.clone()).unwrap();
+        store
+            .activate(make_entry("chat1", "root1", "ses_upd", "/tmp/a"))
+            .unwrap();
+
+        let updated = store
+            .update("ses_upd", |e| {
+                e.model = Some("opencode-go/deepseek".into());
+                e.auto_accept = true;
+            })
+            .unwrap()
+            .expect("mapped session");
+        assert_eq!(updated.model.as_deref(), Some("opencode-go/deepseek"));
+        assert!(updated.auto_accept);
+
+        let reloaded = SessionStore::new(path).unwrap();
+        let entry = reloaded
+            .get_active(&ThreadKey::new("chat1".into(), "root1".into()))
+            .unwrap();
+        assert_eq!(entry.model.as_deref(), Some("opencode-go/deepseek"));
+        assert!(entry.auto_accept);
+    }
+
+    #[test]
+    fn update_unknown_session_returns_none() {
+        let dir = tempdir().unwrap();
+        let mut store = SessionStore::new(dir.path().join("sessions.json")).unwrap();
+        assert!(
+            store
+                .update("ses_missing", |e| e.auto_accept = true)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn remove_persist_removes_and_persists() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path.clone()).unwrap();
+        store
+            .activate(make_entry("chat1", "root1", "ses_rm", "/tmp/y"))
+            .unwrap();
+
+        assert!(store.remove_persist("ses_rm").unwrap().is_some());
+        assert!(store.remove_persist("ses_rm").unwrap().is_none());
+        let reloaded = SessionStore::new(path).unwrap();
+        assert!(
+            reloaded
+                .get_active(&ThreadKey::new("chat1".into(), "root1".into()))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn remove_thread_persist_removes_only_that_thread() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path.clone()).unwrap();
+        let key_a = ThreadKey::new("chat1".into(), "chat1".into());
+        let key_b = ThreadKey::new("chat2".into(), "chat2".into());
+        store
+            .activate(make_entry("chat1", "chat1", "ses_1", "/tmp/a"))
+            .unwrap();
+        store
+            .activate(make_entry("chat2", "chat2", "ses_2", "/tmp/b"))
+            .unwrap();
+
+        let removed = store.remove_thread_persist(&key_a).unwrap();
+        assert_eq!(removed.len(), 1);
+
+        let reloaded = SessionStore::new(path).unwrap();
+        assert!(reloaded.get_active(&key_a).is_none());
+        assert!(reloaded.get_active(&key_b).is_some());
+    }
+
+    #[test]
+    fn persist_failure_is_returned() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path.clone()).unwrap();
+        // Occupy the store path with a directory so the write fails.
+        std::fs::create_dir(&path).unwrap();
+
+        let err = store
+            .activate(make_entry("chat1", "root1", "ses_fail", "/tmp/f"))
+            .unwrap_err();
+        assert!(matches!(err, crate::error::BridgeError::Io(_)));
+    }
 }
