@@ -807,6 +807,15 @@ mod tests {
             .expect("content should be JSON")
     }
 
+    /// Unwrap a client error, asserting it is a Feishu error, and return its
+    /// message.
+    fn feishu_error(err: crate::error::BridgeError) -> String {
+        match err {
+            crate::error::BridgeError::Feishu(message) => message,
+            other => panic!("expected BridgeError::Feishu, got: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn get_access_token_posts_credentials_and_returns_token() {
         let server = token_server(serde_json::json!({
@@ -877,20 +886,15 @@ mod tests {
         .await;
         let client = Client::with_base_url(test_config(), server.base_url());
 
-        let err = client.get_access_token().await.unwrap_err();
-        match err {
-            crate::error::BridgeError::Feishu(message) => {
-                assert!(
-                    message.contains("token error 10003"),
-                    "unexpected error: {message}"
-                );
-                assert!(
-                    message.contains("invalid app_secret"),
-                    "unexpected error: {message}"
-                );
-            }
-            other => panic!("expected BridgeError::Feishu, got: {other:?}"),
-        }
+        let message = feishu_error(client.get_access_token().await.unwrap_err());
+        assert!(
+            message.contains("token error 10003"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("invalid app_secret"),
+            "unexpected error: {message}"
+        );
         assert_eq!(server.request_count(), 1);
         assert_eq!(server.requests()[0].path, TOKEN_PATH);
     }
@@ -956,23 +960,20 @@ mod tests {
             r#"{"code":230001,"msg":"invalid receive_id","data":{"message_id":""}}"#,
         );
 
-        let err = client
-            .send_card("chat_id", "oc_bad", &serde_json::json!({}))
-            .await
-            .unwrap_err();
-        match err {
-            crate::error::BridgeError::Feishu(message) => {
-                assert!(
-                    message.contains("send card error 230001"),
-                    "unexpected error: {message}"
-                );
-                assert!(
-                    message.contains("invalid receive_id"),
-                    "unexpected error: {message}"
-                );
-            }
-            other => panic!("expected BridgeError::Feishu, got: {other:?}"),
-        }
+        let message = feishu_error(
+            client
+                .send_card("chat_id", "oc_bad", &serde_json::json!({}))
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            message.contains("send card error 230001"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("invalid receive_id"),
+            "unexpected error: {message}"
+        );
     }
 
     #[tokio::test]
@@ -1010,7 +1011,11 @@ mod tests {
         assert_eq!(id, "om_reply");
 
         let request = last_request(&server);
+        assert_eq!(request.method, "POST");
         assert_eq!(request.path, "/open-apis/im/v1/messages/om_42/reply");
+        assert_eq!(request.query, "");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
+        assert_eq!(body_json(&request)["msg_type"], "interactive");
         let content = send_content(&request);
         assert_eq!(content["config"]["wide_screen_mode"], true);
         assert_eq!(content["elements"][0]["tag"], "markdown");
@@ -1032,7 +1037,13 @@ mod tests {
         assert_eq!(id, "om_thread");
         assert_eq!(thread_id.as_deref(), Some("omt_1"));
 
-        let body = body_json(&last_request(&server));
+        let request = last_request(&server);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/open-apis/im/v1/messages/om_42/reply");
+        assert_eq!(request.query, "");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
+        let body = body_json(&request);
+        assert_eq!(body["msg_type"], "interactive");
         assert_eq!(body["reply_in_thread"], true);
         assert_eq!(body["content"], card.to_string());
     }
@@ -1052,6 +1063,11 @@ mod tests {
         assert_eq!(thread_id, None);
 
         let request = last_request(&server);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/open-apis/im/v1/messages/om_42/reply");
+        assert_eq!(request.query, "");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
+        assert_eq!(body_json(&request)["msg_type"], "interactive");
         assert_eq!(body_json(&request)["reply_in_thread"], true);
         assert_eq!(send_content(&request)["elements"][0]["content"], "topic title");
     }
@@ -1072,9 +1088,14 @@ mod tests {
             .unwrap();
         assert_eq!(id, "om_notice");
 
-        let content = send_content(&last_request(&server));
+        let request = last_request(&server);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/open-apis/im/v1/messages/om_42/reply");
+        assert_eq!(request.query, "");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
+        assert_eq!(body_json(&request)["msg_type"], "text");
         assert_eq!(
-            content["text"],
+            send_content(&request)["text"],
             "<at user_id=\"ou_1\">Alice &lt;Admin&gt;</at> 任务完成"
         );
     }
@@ -1094,7 +1115,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(send_content(&last_request(&server))["text"], "任务完成");
+        let request = last_request(&server);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/open-apis/im/v1/messages/om_42/reply");
+        assert_eq!(request.query, "");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
+        assert_eq!(body_json(&request)["msg_type"], "text");
+        assert_eq!(send_content(&request)["text"], "任务完成");
     }
 
     #[tokio::test]
@@ -1227,18 +1254,13 @@ mod tests {
             "boom",
         );
 
-        let err = client.download_image("om_7", "img_1").await.unwrap_err();
-        match err {
-            crate::error::BridgeError::Feishu(message) => {
-                assert!(
-                    message.contains("download image failed"),
-                    "unexpected error: {message}"
-                );
-                assert!(message.contains("500"), "unexpected error: {message}");
-                assert!(message.contains("boom"), "unexpected error: {message}");
-            }
-            other => panic!("expected BridgeError::Feishu, got: {other:?}"),
-        }
+        let message = feishu_error(client.download_image("om_7", "img_1").await.unwrap_err());
+        assert!(
+            message.contains("download image failed"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("500"), "unexpected error: {message}");
+        assert!(message.contains("boom"), "unexpected error: {message}");
     }
 
     #[tokio::test]
@@ -1325,16 +1347,11 @@ mod tests {
             r#"{"code":10002,"msg":"bad credentials"}"#,
         );
 
-        let err = client.bot_open_id().await.unwrap_err();
-        match err {
-            crate::error::BridgeError::Feishu(message) => {
-                assert!(
-                    message.contains("bot info error 10002"),
-                    "unexpected error: {message}"
-                );
-            }
-            other => panic!("expected BridgeError::Feishu, got: {other:?}"),
-        }
+        let message = feishu_error(client.bot_open_id().await.unwrap_err());
+        assert!(
+            message.contains("bot info error 10002"),
+            "unexpected error: {message}"
+        );
     }
 
     #[tokio::test]
@@ -1369,16 +1386,11 @@ mod tests {
         );
         let client = Client::with_base_url(test_config(), server.base_url());
 
-        let err = client.get_ws_endpoint().await.unwrap_err();
-        match err {
-            crate::error::BridgeError::Feishu(message) => {
-                assert!(
-                    message.contains("ws endpoint error 1"),
-                    "unexpected error: {message}"
-                );
-            }
-            other => panic!("expected BridgeError::Feishu, got: {other:?}"),
-        }
+        let message = feishu_error(client.get_ws_endpoint().await.unwrap_err());
+        assert!(
+            message.contains("ws endpoint error 1"),
+            "unexpected error: {message}"
+        );
     }
 
     #[tokio::test]
@@ -1392,23 +1404,20 @@ mod tests {
             "<html>blocked by proxy</html>",
         );
 
-        let err = client
-            .reply_card("om_42", &serde_json::json!({}))
-            .await
-            .unwrap_err();
-        match err {
-            crate::error::BridgeError::Feishu(message) => {
-                assert!(
-                    message.contains("reply card HTTP 403"),
-                    "unexpected error: {message}"
-                );
-                assert!(
-                    message.contains("blocked by proxy"),
-                    "unexpected error: {message}"
-                );
-            }
-            other => panic!("expected BridgeError::Feishu, got: {other:?}"),
-        }
+        let message = feishu_error(
+            client
+                .reply_card("om_42", &serde_json::json!({}))
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            message.contains("reply card HTTP 403"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("blocked by proxy"),
+            "unexpected error: {message}"
+        );
     }
 
     #[tokio::test]
@@ -1421,20 +1430,17 @@ mod tests {
             r#"{"code":-1,"msg":"server exploded"}"#,
         );
 
-        let err = client
-            .reply_card("om_42", &serde_json::json!({}))
-            .await
-            .unwrap_err();
-        match err {
-            crate::error::BridgeError::Feishu(message) => {
-                assert!(
-                    message.contains("reply card HTTP 500"),
-                    "unexpected error: {message}"
-                );
-                assert!(message.contains("server exploded"), "unexpected error: {message}");
-            }
-            other => panic!("expected BridgeError::Feishu, got: {other:?}"),
-        }
+        let message = feishu_error(
+            client
+                .reply_card("om_42", &serde_json::json!({}))
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            message.contains("reply card HTTP 500"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("server exploded"), "unexpected error: {message}");
     }
 
     #[tokio::test]
@@ -1443,15 +1449,10 @@ mod tests {
         server.route_raw("POST", TOKEN_PATH, 200, "text/html", "<html>nope</html>");
         let client = Client::with_base_url(test_config(), server.base_url());
 
-        let err = client.get_access_token().await.unwrap_err();
-        match err {
-            crate::error::BridgeError::Feishu(message) => {
-                assert!(
-                    message.contains("parse token response"),
-                    "unexpected error: {message}"
-                );
-            }
-            other => panic!("expected BridgeError::Feishu, got: {other:?}"),
-        }
+        let message = feishu_error(client.get_access_token().await.unwrap_err());
+        assert!(
+            message.contains("parse token response"),
+            "unexpected error: {message}"
+        );
     }
 }
