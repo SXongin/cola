@@ -6,7 +6,7 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** needs-triage
+**Status:** ready-for-agent
 
 现状（2026-09-12）：`reply_card` / `get_access_token` 走 `read_body_with_diag`，但 `send_card` / `reply_text` / `reply_card_in_thread` / `reply_completion_notice` / `update_message` / `list_messages` 直接 `.json().await?`（HTML 或 5xx 会裸露 reqwest decode 错误）；`bot_open_id` / `get_ws_endpoint` / `user_name` / `chat_name` 读完 body 不检查 HTTP status（5xx + `{"code":0}` 会被当成功）。
 
@@ -20,4 +20,4 @@
 
 ## Comments
 
-- 2026-09-12：由 `/code-review` 对 02+03 终态的重跑发现，评审范围 `git diff 20ea1df...5b057b9`。由人类决定是否将 Status 提为 `ready-for-agent`。
+- 2026-09-12：由 `/code-review` 对 02+03 终态的重跑发现，评审范围 `git diff 20ea1df...5b057b9`。当日维护者确认范围并提为 `ready-for-agent`（新增断言补齐项纳入本 ticket）。
