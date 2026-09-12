@@ -154,11 +154,6 @@ pub struct Location {
     pub directory: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct PromptOutput {
-    pub data: PromptResponse,
-}
-
 /// An image attached to a prompt, sent as a data-URL `file` part
 /// (`{type:"file", mime, url:"data:<mime>;base64,..."}`). Requires a
 /// vision-capable model; unsupported models surface an error.
@@ -260,70 +255,6 @@ pub struct QuestionInfo {
 pub struct QuestionOption {
     pub label: String,
     pub description: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct QuestionRepliedData {
-    #[serde(rename = "sessionID")]
-    pub session_id: Option<String>,
-    pub request_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct QuestionRejectedData {
-    #[serde(rename = "sessionID")]
-    pub session_id: Option<String>,
-    pub request_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CompactionStartedData {
-    #[serde(rename = "sessionID")]
-    pub session_id: Option<String>,
-    #[serde(rename = "messageID")]
-    pub message_id: Option<String>,
-    pub reason: Option<String>,
-    pub timestamp: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CompactionEndedData {
-    #[serde(rename = "sessionID")]
-    pub session_id: Option<String>,
-    #[serde(rename = "messageID")]
-    pub message_id: Option<String>,
-    pub reason: Option<String>,
-    pub text: Option<String>,
-    pub recent: Option<String>,
-    pub timestamp: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ContentPart {
-    #[serde(rename = "type")]
-    pub content_type: String,
-    pub text: Option<String>,
-    pub file: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct TokenCount {
-    pub input: Option<i64>,
-    pub output: Option<i64>,
-    pub reasoning: Option<i64>,
-    pub cache: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ErrorMessage {
-    #[serde(rename = "type")]
-    pub error_type: Option<String>,
-    pub message: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PermissionListResponse {
-    pub data: Vec<PermissionRequest>,
 }
 
 /// A session's run state as reported by the server (`GET /session/status`).
