@@ -433,12 +433,11 @@ pub(crate) async fn inline_host_session(
 /// Shared by the permission and question flows (and the retry action).
 pub(crate) fn result_card(title: &str, template: &str, body: &str) -> CardActionResult {
     CardActionResult {
-        card: Some(serde_json::json!({
-            "schema": "2.0",
-            "config": { "wide_screen_mode": true },
-            "header": { "title": { "tag": "plain_text", "content": title }, "template": template },
-            "body": { "elements": [ { "tag": "markdown", "content": body } ] }
-        })),
+        card: Some(crate::feishu::card::card_shell(
+            title,
+            template,
+            vec![serde_json::json!({ "tag": "markdown", "content": body })],
+        )),
         toast: None,
     }
 }

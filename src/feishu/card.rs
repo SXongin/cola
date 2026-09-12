@@ -509,6 +509,32 @@ fn first_chunk(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Assemble a JSON 2.0 card from a ready-made header and body elements: the
+/// one place the schema-2.0 skeleton is written. Callers that only need a
+/// plain-text title plus a color template use [`card_shell`]; the streaming
+/// [`CardBuilder`] passes its own header so it can add a subtitle.
+fn card_with_header(header: serde_json::Value, elements: Vec<serde_json::Value>) -> serde_json::Value {
+    json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true },
+        "header": header,
+        "body": { "elements": elements }
+    })
+}
+
+/// Assemble a JSON 2.0 card whose header is a plain-text title and a color
+/// template. Every non-streaming card goes through this shell, so schema churn
+/// happens in exactly one place.
+pub(crate) fn card_shell(title: &str, template: &str, elements: Vec<serde_json::Value>) -> serde_json::Value {
+    card_with_header(
+        json!({
+            "title": { "tag": "plain_text", "content": title },
+            "template": template
+        }),
+        elements,
+    )
+}
+
 impl CardBuilder {
     pub fn new() -> Self {
         Self {
@@ -627,12 +653,7 @@ impl CardBuilder {
                 "content": subtitle
             });
         }
-        json!({
-            "schema": "2.0",
-            "config": { "wide_screen_mode": true },
-            "header": header,
-            "body": { "elements": elements }
-        })
+        card_with_header(header, elements)
     }
 }
 
@@ -756,15 +777,7 @@ pub fn build_permission_card(
 ) -> serde_json::Value {
     let mut elements = vec![json!({ "tag": "markdown", "content": body })];
     elements.extend(permission_buttons(session_id, request_id, body, directory));
-    json!({
-        "schema": "2.0",
-        "config": { "wide_screen_mode": true },
-        "header": {
-            "title": { "tag": "plain_text", "content": "🔐 权限请求" },
-            "template": "orange"
-        },
-        "body": { "elements": elements }
-    })
+    card_shell("🔐 权限请求", "orange", elements)
 }
 
 /// A display label for a session title: strips raw Feishu mention tokens
@@ -794,15 +807,11 @@ pub fn build_external_message_card(session_name: &str, preview: &str) -> serde_j
         content.push_str(&format!("**{}**\n", session_name));
     }
     content.push_str(preview);
-    json!({
-        "schema": "2.0",
-        "config": { "wide_screen_mode": true },
-        "header": {
-            "title": { "tag": "plain_text", "content": "💬 有新消息" },
-            "template": "blue"
-        },
-        "body": { "elements": [ { "tag": "markdown", "content": content } ] }
-    })
+    card_shell(
+        "💬 有新消息",
+        "blue",
+        vec![json!({ "tag": "markdown", "content": content })],
+    )
 }
 
 /// Replacement for a permission/question card whose request was already resolved
@@ -813,15 +822,11 @@ pub fn build_resolved_elsewhere_card(kind: &str, detail: &str) -> serde_json::Va
     if !detail.is_empty() {
         body.push_str(&format!("\n\n{}", detail));
     }
-    json!({
-        "schema": "2.0",
-        "config": { "wide_screen_mode": true },
-        "header": {
-            "title": { "tag": "plain_text", "content": "✅ 已处理" },
-            "template": "green"
-        },
-        "body": { "elements": [ { "tag": "markdown", "content": body } ] }
-    })
+    card_shell(
+        "✅ 已处理",
+        "green",
+        vec![json!({ "tag": "markdown", "content": body })],
+    )
 }
 
 /// A one-line-per-question summary of a `question` request, for the stale card.
@@ -1151,15 +1156,7 @@ pub fn build_question_card(
     done: &[bool],
 ) -> serde_json::Value {
     let elements = question_elements(request_id, session_id, questions, directory, answered, done);
-    json!({
-        "schema": "2.0",
-        "config": { "wide_screen_mode": true },
-        "header": {
-            "title": { "tag": "plain_text", "content": "❓ AI 想问你" },
-            "template": "blue"
-        },
-        "body": { "elements": elements }
-    })
+    card_shell("❓ AI 想问你", "blue", elements)
 }
 /// One session entry of the `/switch` card: a full-width text row followed by
 /// a button row underneath. The text row is its own `column_set` column (not a
@@ -1340,15 +1337,7 @@ fn picker_card(
             "value": payload,
         }));
     }
-    json!({
-        "schema": "2.0",
-        "config": { "wide_screen_mode": true },
-        "header": {
-            "title": { "tag": "plain_text", "content": header },
-            "template": "blue"
-        },
-        "body": { "elements": elements }
-    })
+    card_shell(header, "blue", elements)
 }
 
 /// The `/agent` picker card: one button per available agent plus a separate
@@ -1650,15 +1639,7 @@ pub fn build_help_card() -> serde_json::Value {
         "tag": "markdown",
         "content": "详细用法发 `/help <命令>`，如 `/help switch`。群话题规则见首次引导。",
     }));
-    json!({
-        "schema": "2.0",
-        "config": { "wide_screen_mode": true },
-        "header": {
-            "title": { "tag": "plain_text", "content": "📖 cola 命令" },
-            "template": "blue"
-        },
-        "body": { "elements": elements }
-    })
+    card_shell("📖 cola 命令", "blue", elements)
 }
 
 /// Build the interactive `/switch` session card (ADR-0012, issue 04): a
@@ -1828,15 +1809,7 @@ pub fn build_switch_card(
         },
     }));
 
-    json!({
-        "schema": "2.0",
-        "config": { "wide_screen_mode": true },
-        "header": {
-            "title": { "tag": "plain_text", "content": "📂 会话管理" },
-            "template": "blue"
-        },
-        "body": { "elements": elements }
-    })
+    card_shell("📂 会话管理", "blue", elements)
 }
 
 /// The confirmation card shown when a `/switch` card op targets a session owned
@@ -1880,49 +1853,43 @@ pub fn build_force_confirm_card(
             "scope": scope.as_str(),
         },
     });
-    json!({
-        "schema": "2.0",
-        "config": { "wide_screen_mode": true },
-        "header": {
-            "title": { "tag": "plain_text", "content": "⚠️ 会话已被占用" },
-            "template": "orange"
-        },
-        "body": {
-            "elements": [
-                {
-                    "tag": "markdown",
-                    "content": format!(
-                        "**{label}** 正被 **{owner_name}** 使用。\n`{}` · `{}`",
-                        target.directory,
-                        crate::bridge::command::id_tail(&target.id)
-                    )
-                },
-                {
-                    "tag": "markdown",
-                    "content": "强制接管后，原来的聊天/话题会失去这个会话（需要重新选择）。"
-                },
-                {
-                    "tag": "column_set",
-                    "flex_mode": "bisect",
-                    "horizontal_spacing": "default",
-                    "columns": [
-                        {
-                            "tag": "column",
-                            "width": "auto",
-                            "vertical_align": "center",
-                            "elements": [ force_btn ]
-                        },
-                        {
-                            "tag": "column",
-                            "width": "auto",
-                            "vertical_align": "center",
-                            "elements": [ back_btn ]
-                        }
-                    ]
-                }
-            ]
-        }
-    })
+    card_shell(
+        "⚠️ 会话已被占用",
+        "orange",
+        vec![
+            json!({
+                "tag": "markdown",
+                "content": format!(
+                    "**{label}** 正被 **{owner_name}** 使用。\n`{}` · `{}`",
+                    target.directory,
+                    crate::bridge::command::id_tail(&target.id)
+                )
+            }),
+            json!({
+                "tag": "markdown",
+                "content": "强制接管后，原来的聊天/话题会失去这个会话（需要重新选择）。"
+            }),
+            json!({
+                "tag": "column_set",
+                "flex_mode": "bisect",
+                "horizontal_spacing": "default",
+                "columns": [
+                    {
+                        "tag": "column",
+                        "width": "auto",
+                        "vertical_align": "center",
+                        "elements": [ force_btn ]
+                    },
+                    {
+                        "tag": "column",
+                        "width": "auto",
+                        "vertical_align": "center",
+                        "elements": [ back_btn ]
+                    }
+                ]
+            }),
+        ],
+    )
 }
 
 /// The `/dir` Recent Directories card (no-arg form): one directory per entry,
@@ -1976,15 +1943,7 @@ pub fn build_dir_card(
         }
     }
 
-    json!({
-        "schema": "2.0",
-        "config": { "wide_screen_mode": true },
-        "header": {
-            "title": { "tag": "plain_text", "content": "📂 最近目录" },
-            "template": "blue"
-        },
-        "body": { "elements": elements }
-    })
+    card_shell("📂 最近目录", "blue", elements)
 }
 
 /// One `/dir` card entry: a full-width text row plus a two-button row beneath
@@ -2049,6 +2008,32 @@ pub(crate) fn truncate_md(text: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn card_shell_builds_the_json_2_0_skeleton() {
+        let card = card_shell(
+            "标题",
+            "blue",
+            vec![json!({ "tag": "markdown", "content": "正文" })],
+        );
+        assert_eq!(card["schema"].as_str().unwrap(), "2.0");
+        assert_eq!(card["config"]["wide_screen_mode"], true);
+        assert_eq!(card["header"]["title"]["content"], "标题");
+        assert_eq!(card["header"]["template"], "blue");
+        assert_eq!(card["body"]["elements"][0]["content"], "正文");
+    }
+
+    #[test]
+    fn card_with_header_carries_the_subtitle() {
+        let header = json!({
+            "title": { "tag": "plain_text", "content": "标题" },
+            "template": "blue",
+            "subtitle": { "tag": "plain_text", "content": "会话" }
+        });
+        let card = card_with_header(header, vec![]);
+        assert_eq!(card["header"]["subtitle"]["content"], "会话");
+        assert_eq!(card["body"]["elements"].as_array().unwrap().len(), 0);
+    }
 
     #[test]
     fn loading_card_header() {
