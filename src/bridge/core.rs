@@ -438,3 +438,55 @@ impl SharedCore {
         .unwrap_or(false)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::test_support::{MockBackend, build_app, realistic_parts, test_config, test_work_dir};
+    use std::sync::atomic::Ordering;
+
+    /// The cache rule is part of the session write interface: creates and
+    /// removes change what `/list` should show, overrides do not.
+    #[tokio::test]
+    async fn activate_invalidates_list_cache_but_update_does_not() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        let sessions_fetches = backend.list_sessions_calls.clone();
+        let (app, _platform) = build_app(cfg, backend).await;
+        let key = ThreadKey::new("chat_1".into(), "chat_1".into());
+
+        app.cached_session_list().await.unwrap();
+        assert_eq!(sessions_fetches.load(Ordering::SeqCst), 1);
+        app.cached_session_list().await.unwrap();
+        assert_eq!(
+            sessions_fetches.load(Ordering::SeqCst),
+            1,
+            "second read is cached"
+        );
+
+        app.activate_session(SessionEntry::new(key, "ses_x", "/work/x"))
+            .await
+            .unwrap();
+        app.cached_session_list().await.unwrap();
+        assert_eq!(sessions_fetches.load(Ordering::SeqCst), 2, "activate invalidates");
+
+        let updated = app
+            .update_session("ses_x", |e| e.agent = Some("build".into()))
+            .await
+            .unwrap()
+            .expect("mapped session");
+        assert_eq!(updated.agent.as_deref(), Some("build"));
+        app.cached_session_list().await.unwrap();
+        assert_eq!(
+            sessions_fetches.load(Ordering::SeqCst),
+            2,
+            "update keeps the cache"
+        );
+
+        assert!(app.remove_session("ses_x").await.unwrap().is_some());
+        app.cached_session_list().await.unwrap();
+        assert_eq!(sessions_fetches.load(Ordering::SeqCst), 3, "remove invalidates");
+    }
+}
