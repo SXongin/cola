@@ -1,4 +1,5 @@
 pub mod client;
+mod parsing;
 pub mod types;
 
 pub use client::Client;
