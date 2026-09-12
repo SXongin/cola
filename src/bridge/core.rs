@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::bridge::session::SessionStore;
-use crate::config::ThreadKey;
+use crate::config::{SessionEntry, ThreadKey};
 use crate::feishu;
 use crate::opencode;
 
@@ -300,6 +300,52 @@ impl SharedCore {
     /// renames a session, so the next `/list`/`/switch`/`/attach` is fresh.
     pub(crate) async fn invalidate_session_list_cache(&self) {
         *self.session_list_cache.lock().await = None;
+    }
+
+    /// Persist `entry` as its thread's active session and drop the session-list
+    /// cache: creating or adopting a session changes what `/list` and `/switch`
+    /// should offer. The cache is dropped even when the save fails, because the
+    /// in-memory mapping already changed.
+    pub(crate) async fn activate_session(&self, entry: SessionEntry) -> crate::error::Result<()> {
+        let result = self.sessions.lock().await.activate(entry);
+        self.invalidate_session_list_cache().await;
+        result
+    }
+
+    /// Mutate the mapped session in place and persist, returning the updated
+    /// entry (`None` when `session_id` is not mapped). The session-list cache
+    /// is untouched: per-session overrides are not server-list state.
+    pub(crate) async fn update_session<F>(
+        &self,
+        session_id: &str,
+        f: F,
+    ) -> crate::error::Result<Option<SessionEntry>>
+    where
+        F: FnOnce(&mut SessionEntry),
+    {
+        self.sessions.lock().await.update(session_id, f)
+    }
+
+    /// Remove a mapping and persist, dropping the session-list cache (the
+    /// `/list`/`/switch` view may no longer mention it).
+    pub(crate) async fn remove_session(
+        &self,
+        session_id: &str,
+    ) -> crate::error::Result<Option<SessionEntry>> {
+        let result = self.sessions.lock().await.remove_persist(session_id);
+        self.invalidate_session_list_cache().await;
+        result
+    }
+
+    /// Remove every mapping of a thread and persist, dropping the
+    /// session-list cache (`/switch forget`).
+    pub(crate) async fn remove_thread_sessions(
+        &self,
+        key: &ThreadKey,
+    ) -> crate::error::Result<Vec<SessionEntry>> {
+        let result = self.sessions.lock().await.remove_thread_persist(key);
+        self.invalidate_session_list_cache().await;
+        result
     }
 
     /// Turn a session's Auto-Accept flag on/off, resolving the owning session
