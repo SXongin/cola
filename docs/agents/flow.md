@@ -32,4 +32,4 @@ A starting situation that generates work, then merges onto the main flow.
 
 - **`/improve-codebase-architecture`** — when there's a spare moment, it surfaces deepening opportunities; the one you pick becomes an idea for `/grill-with-docs`.
 
-Standalone skills and the phase-boundary decision (Continue / `/clear` / `/handoff` / subagent / `/compact`) live in `/ask-matt`.
+Standalone skills live in `/ask-matt`, along with the five phase-boundary options: **Continue**, `/clear`, `/handoff`, **subagent**, `/compact`.
