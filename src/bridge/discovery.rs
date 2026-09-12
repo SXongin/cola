@@ -387,12 +387,9 @@ pub fn spawn_self_server(port: u16, password: &str) -> anyhow::Result<i32> {
     for key in &cmd.remove_env {
         child.env_remove(key);
     }
-    // If the launching environment doesn't pin OpenCode config, disable the
-    // interactive question tool: cola answers questions via Feishu cards, so a
-    // blocked question must never hang a session.
-    if std::env::var_os("OPENCODE_CONFIG_CONTENT").is_none() {
-        child.env("OPENCODE_CONFIG_CONTENT", r#"{"tools":{"question":false}}"#);
-    }
+    // The question tool stays enabled on purpose: cola answers it via Feishu
+    // cards (poll GET /question, reply POST /question/{id}/reply), so disabling
+    // it would make those cards unreachable.
     let child = child.spawn()?;
     let pid = child.id() as i32;
     record_self_spawned(pid);
