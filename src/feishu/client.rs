@@ -126,10 +126,7 @@ impl Client {
 
         let text = read_body_with_diag(
             self.http
-                .post(format!(
-                    "{}/open-apis/im/v1/messages/{}/reply",
-                    self.base_url, message_id
-                ))
+                .post(self.endpoint(&format!("/open-apis/im/v1/messages/{message_id}/reply")))
                 .bearer_auth(&token)
                 .json(&body)
                 .send()
@@ -242,10 +239,9 @@ impl Client {
 
         let resp: MessageResponse = self
             .http
-            .post(format!(
-                "{}/open-apis/im/v1/messages?receive_id_type={}",
-                self.base_url, receive_id_type
-            ))
+            .post(self.endpoint(&format!(
+                "/open-apis/im/v1/messages?receive_id_type={receive_id_type}"
+            )))
             .bearer_auth(&token)
             .json(&body)
             .send()
@@ -279,10 +275,7 @@ impl Client {
 
         let resp: MessageResponse = self
             .http
-            .post(format!(
-                "{}/open-apis/im/v1/messages/{}/reply",
-                self.base_url, message_id
-            ))
+            .post(self.endpoint(&format!("/open-apis/im/v1/messages/{message_id}/reply")))
             .bearer_auth(&token)
             .json(&body)
             .send()
@@ -326,10 +319,7 @@ impl Client {
 
         let resp: MessageResponse = self
             .http
-            .post(format!(
-                "{}/open-apis/im/v1/messages/{}/reply",
-                self.base_url, message_id
-            ))
+            .post(self.endpoint(&format!("/open-apis/im/v1/messages/{message_id}/reply")))
             .bearer_auth(&token)
             .json(&body)
             .send()
@@ -389,10 +379,7 @@ impl Client {
 
         let resp: MessageResponse = self
             .http
-            .post(format!(
-                "{}/open-apis/im/v1/messages/{}/reply",
-                self.base_url, message_id
-            ))
+            .post(self.endpoint(&format!("/open-apis/im/v1/messages/{message_id}/reply")))
             .bearer_auth(&token)
             .json(&body)
             .send()
@@ -418,10 +405,9 @@ impl Client {
     /// (NOT `data.name` — reading the wrong path silently returned None).
     pub async fn user_name(&self, open_id: &str) -> crate::error::Result<Option<String>> {
         let token = self.get_access_token().await?;
-        let url = format!(
-            "{}/open-apis/contact/v3/users/{}?user_id_type=open_id",
-            self.base_url, open_id
-        );
+        let url = self.endpoint(&format!(
+            "/open-apis/contact/v3/users/{open_id}?user_id_type=open_id"
+        ));
         let resp = self.http.get(url).bearer_auth(&token).send().await?;
         let text = resp.text().await?;
         let v: serde_json::Value = serde_json::from_str(&text)
@@ -452,7 +438,7 @@ impl Client {
     /// Response shape: `GET /im/v1/chats/{chat_id}` → `data.name`.
     pub async fn chat_name(&self, chat_id: &str) -> crate::error::Result<Option<String>> {
         let token = self.get_access_token().await?;
-        let url = format!("{}/open-apis/im/v1/chats/{}", self.base_url, chat_id);
+        let url = self.endpoint(&format!("/open-apis/im/v1/chats/{chat_id}"));
         let resp = self.http.get(url).bearer_auth(&token).send().await?;
         let text = resp.text().await?;
         let v: serde_json::Value = serde_json::from_str(&text)
@@ -488,10 +474,7 @@ impl Client {
 
         let resp: ApiResponse = self
             .http
-            .patch(format!(
-                "{}/open-apis/im/v1/messages/{}",
-                self.base_url, message_id
-            ))
+            .patch(self.endpoint(&format!("/open-apis/im/v1/messages/{message_id}")))
             .bearer_auth(&token)
             .json(&body)
             .send()
@@ -570,10 +553,9 @@ impl Client {
         let token = self.get_access_token().await?;
         let resp = self
             .http
-            .get(format!(
-                "{}/open-apis/im/v1/messages/{}?card_msg_content_type=raw_card_content",
-                self.base_url, message_id
-            ))
+            .get(self.endpoint(&format!(
+                "/open-apis/im/v1/messages/{message_id}?card_msg_content_type=raw_card_content"
+            )))
             .bearer_auth(&token)
             .timeout(std::time::Duration::from_secs(5))
             .send()
@@ -624,10 +606,9 @@ impl Client {
         let token = self.get_access_token().await?;
         let resp = self
             .http
-            .get(format!(
-                "{}/open-apis/im/v1/messages/{}/resources/{}?type=image",
-                self.base_url, message_id, image_key
-            ))
+            .get(self.endpoint(&format!(
+                "/open-apis/im/v1/messages/{message_id}/resources/{image_key}?type=image"
+            )))
             .bearer_auth(&token)
             .timeout(std::time::Duration::from_secs(10))
             .send()
@@ -835,6 +816,7 @@ mod tests {
         assert_eq!(client.get_access_token().await.unwrap(), "t-abc");
         assert_eq!(client.get_access_token().await.unwrap(), "t-abc");
         assert_eq!(server.request_count(), 1, "a cached token must not re-request");
+        assert_eq!(server.requests()[0].path, TOKEN_PATH);
     }
 
     #[tokio::test]
@@ -849,9 +831,12 @@ mod tests {
         .await;
         let client = Client::with_base_url(test_config(), server.base_url());
 
-        client.get_access_token().await.unwrap();
-        client.get_access_token().await.unwrap();
+        assert_eq!(client.get_access_token().await.unwrap(), "t-abc");
+        assert_eq!(client.get_access_token().await.unwrap(), "t-abc");
         assert_eq!(server.request_count(), 2, "an expired token must be refetched");
+        for request in server.requests() {
+            assert_eq!(request.path, TOKEN_PATH);
+        }
     }
 
     #[tokio::test]
@@ -864,14 +849,20 @@ mod tests {
         let client = Client::with_base_url(test_config(), server.base_url());
 
         let err = client.get_access_token().await.unwrap_err();
-        let message = err.to_string();
-        assert!(
-            message.contains("token error 10003"),
-            "unexpected error: {message}"
-        );
-        assert!(
-            message.contains("invalid app_secret"),
-            "unexpected error: {message}"
-        );
+        match err {
+            crate::error::BridgeError::Feishu(message) => {
+                assert!(
+                    message.contains("token error 10003"),
+                    "unexpected error: {message}"
+                );
+                assert!(
+                    message.contains("invalid app_secret"),
+                    "unexpected error: {message}"
+                );
+            }
+            other => panic!("expected BridgeError::Feishu, got: {other:?}"),
+        }
+        assert_eq!(server.request_count(), 1);
+        assert_eq!(server.requests()[0].path, TOKEN_PATH);
     }
 }
