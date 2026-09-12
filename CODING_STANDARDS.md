@@ -33,7 +33,7 @@ Follow Conventional Commits — see `CONTRIBUTING.md`. The format is enforced by
 - **OpenCode event JSON is camelCase**: `callID`, `sessionID`,
   `assistantMessageID`, `textID`, `reasoningID`. Serde structs need
   `#[serde(rename = "...")]` — a missing rename silently nulls the field.
-- **OpenCode's API paths have no `/api` prefix** (cola exposes no HTTP API of its own — it is a client of the OpenCode backend, so this is about the endpoints `src/opencode/client.rs` calls): `POST /session/{id}/message`, `GET /permission`, `POST /permission/{id}/reply`. The old `/api/...` paths only emit v2 events that never appear in readable tables.
+- **OpenCode's API paths have no `/api` prefix, with one documented exception** (cola exposes no HTTP API of its own — it is a client of the OpenCode backend, so this is about the endpoints `src/opencode/client.rs` calls): prompt, permission and question use the canonical paths — `POST /session/{id}/message`, `GET /permission`, `POST /permission/{id}/reply` — and the old `/api/...` paths only emit v2 events that never appear in readable tables. **Exception: creating a session goes through v2 `POST /api/session`** (parsing the `{data: Session}` envelope), because cola's `CreateSessionInput.location.directory` exists only in v2's `SessionsCreateInput`; canonical `POST /session` has no `location` field, so a session could not be created in the mapped directory. The wire test `create_session_posts_the_input_and_parses_the_data_envelope` pins the request; every other endpoint stays canonical.
 - **Part payloads have no `id`**: a part's `id` is a database column not
   serialised into the part JSON. Dedupe text/reasoning on **content**, never on
   a part `id`.
