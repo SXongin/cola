@@ -6,6 +6,8 @@ mod feishu;
 mod git;
 mod logging;
 mod opencode;
+#[cfg(test)]
+mod test_http;
 mod update;
 mod version;
 
