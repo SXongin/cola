@@ -10,8 +10,8 @@ so a wrong endpoint or a dropped header passed every test in the suite.
 
 The live E2E harness was the only thing that touched the wire, and it rotted:
 ignored in CI, requiring a second bot and a test group, and able to assert only
-card fallbacks, never card bodies. Retiring it (C1) removed the last nominal
-wire coverage without replacing it.
+card fallbacks, never card bodies. Retiring it with the dead harness removed the
+last nominal wire coverage without replacing it.
 
 ## Decision
 
