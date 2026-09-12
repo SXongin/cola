@@ -176,12 +176,11 @@ impl App {
             }
             command::RestartKind::Restart => ("♻️ 已重启".to_string(), "cola 已重启完成。".to_string()),
         };
-        let card = serde_json::json!({
-            "schema": "2.0",
-            "config": { "wide_screen_mode": true },
-            "header": { "title": { "tag": "plain_text", "content": title }, "template": "green" },
-            "body": { "elements": [ { "tag": "markdown", "content": body } ] }
-        });
+        let card = crate::feishu::card::card_shell(
+            &title,
+            "green",
+            vec![serde_json::json!({ "tag": "markdown", "content": body })],
+        );
         // A topic command carries its `thread_id`; the command message itself
         // lives inside the topic, so replying to it keeps the card there.
         let topic_reply_to = notify

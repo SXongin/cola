@@ -197,15 +197,7 @@ pub fn build_snapshot_card_with_state(
     }
     elements.extend(tail_panels(&data.tail));
 
-    json!({
-        "schema": "2.0",
-        "config": { "wide_screen_mode": true },
-        "header": {
-            "title": { "tag": "plain_text", "content": format!("已{verb} {title}") },
-            "template": "blue"
-        },
-        "body": { "elements": elements }
-    })
+    crate::feishu::card::card_shell(&format!("已{verb} {title}"), "blue", elements)
 }
 
 /// Build the compact suppressed-切换 state card (ADR-0028): when a re-switch
@@ -216,17 +208,14 @@ pub fn build_snapshot_card_with_state(
 /// blocks: there is deliberately nothing to report.
 pub fn build_switched_state_card(title: &str, session_id: &str, directory: &str) -> serde_json::Value {
     let title = display_title(title, session_id);
-    json!({
-        "schema": "2.0",
-        "config": { "wide_screen_mode": true },
-        "header": {
-            "title": { "tag": "plain_text", "content": format!("已切换 {title}") },
-            "template": "blue"
-        },
-        "body": { "elements": [
-            { "tag": "markdown", "content": format!("已切换到该会话（目录 `{directory}`）。") }
-        ] }
-    })
+    crate::feishu::card::card_shell(
+        &format!("已切换 {title}"),
+        "blue",
+        vec![json!({
+            "tag": "markdown",
+            "content": format!("已切换到该会话（目录 `{directory}`）。")
+        })],
+    )
 }
 
 #[cfg(test)]
