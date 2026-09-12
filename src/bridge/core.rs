@@ -489,4 +489,36 @@ mod tests {
         app.cached_session_list().await.unwrap();
         assert_eq!(sessions_fetches.load(Ordering::SeqCst), 3, "remove invalidates");
     }
+
+    /// The override write path must not silently switch the Active Session:
+    /// `set_auto_accept` targets any mapped session (it walks the parent
+    /// chain), so a toggle on a non-active mapping updates it in place. The
+    /// old clone-then-`set_active` shape promoted it.
+    #[tokio::test]
+    async fn set_auto_accept_does_not_promote_a_non_active_mapping() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let key = ThreadKey::new("chat_1".into(), "chat_1".into());
+
+        // Two mappings for one thread; the last activated is the active one.
+        app.activate_session(SessionEntry::new(key.clone(), "ses_b", "/work/b"))
+            .await
+            .unwrap();
+        app.activate_session(SessionEntry::new(key.clone(), "ses_a", "/work/a"))
+            .await
+            .unwrap();
+        assert_eq!(app.get_session_id(&key).await.as_deref(), Some("ses_a"));
+
+        app.set_auto_accept("ses_b", "/work/b", true).await;
+
+        assert_eq!(
+            app.get_session_id(&key).await.as_deref(),
+            Some("ses_a"),
+            "toggling auto-accept on a non-active mapping keeps the active session"
+        );
+        let sessions = app.sessions.lock().await;
+        assert!(sessions.entry_for_session("ses_b").unwrap().auto_accept);
+    }
 }
