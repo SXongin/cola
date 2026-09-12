@@ -541,7 +541,7 @@ async fn multi_select_question_toggles_until_submit() {
 
     // Click 苹果 → NOT submitted (multi-select toggles, never auto-submits).
     let r1 = app.handle_card_action(value("苹果")).await.expect("result");
-    assert_eq!(r1.toast.as_deref(), Some("已记录选项"));
+    assert_eq!(r1.toast.as_deref(), Some("已添加选项"));
     let c1 = r1.card.as_ref().expect("re-rendered card").to_string();
     assert!(c1.contains("已选：苹果"), "marker missing: {}", c1);
     assert!(c1.contains("可多选"), "multi hint missing: {}", c1);
@@ -562,6 +562,7 @@ async fn multi_select_question_toggles_until_submit() {
 
     // Click 苹果 again → toggles it OFF, only 香蕉 remains.
     let r3 = app.handle_card_action(value("苹果")).await.expect("result");
+    assert_eq!(r3.toast.as_deref(), Some("已移除选项"));
     let c3 = r3.card.as_ref().expect("re-rendered card").to_string();
     assert!(c3.contains("已选：香蕉"), "toggle off failed: {}", c3);
     assert!(!c3.contains("已选：苹果、香蕉"), "toggle off kept 苹果: {}", c3);
@@ -823,7 +824,7 @@ async fn mixed_single_and_multi_question_waits_for_all_confirmed() {
 
     // Toggle a multi-select option (Q1) → still no submit (not confirmed).
     let r1 = app.handle_card_action(answer(1, "苹果")).await.expect("result");
-    assert_eq!(r1.toast.as_deref(), Some("已记录选项"));
+    assert_eq!(r1.toast.as_deref(), Some("已添加选项"));
     assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
 
     // Type a custom answer into the multi-select (reply "custom") → the
@@ -840,7 +841,7 @@ async fn mixed_single_and_multi_question_waits_for_all_confirmed() {
         }))
         .await
         .expect("result");
-    assert_eq!(r2.toast.as_deref(), Some("已记录选项"));
+    assert_eq!(r2.toast.as_deref(), Some("已添加自定义答案"));
     // The displayed selection now holds the option + the custom label.
     let c2 = r2.card.as_ref().expect("re-rendered card").to_string();
     assert!(c2.contains("已选：苹果、自定义水果"), "append failed: {}", c2);
@@ -868,6 +869,101 @@ async fn mixed_single_and_multi_question_waits_for_all_confirmed() {
             vec!["苹果".to_string(), "自定义水果".to_string()]
         ]
     );
+}
+
+/// A Custom Answer in a multi-select: the submitted text is appended verbatim
+/// (one entry per submission — newlines and punctuation are never split),
+/// re-submitting the same text is a deduped no-op with its own toast, the card
+/// renders the entry as a selected button, clicking that button removes it, and
+/// a blank submission only hints.
+#[tokio::test]
+async fn multi_select_custom_answer_appends_dedupes_and_removes() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let app = Arc::new(App::new(cfg, backend.clone(), Arc::new(RecordingPlatform::new())).unwrap());
+
+    app.question.question_requests.lock().await.insert(
+        "que_custom".into(),
+        opencode::client::QuestionRequest {
+            id: "que_custom".into(),
+            session_id: "ses_1".into(),
+            questions: vec![opencode::client::QuestionInfo {
+                question: "选择水果".into(),
+                header: "水果".into(),
+                options: vec![opencode::client::QuestionOption {
+                    label: "苹果".into(),
+                    description: String::new(),
+                }],
+                multiple: Some(true),
+                custom: None,
+            }],
+        },
+    );
+
+    let custom = |answer: &str| {
+        serde_json::json!({
+            "action": "question",
+            "reply": "custom",
+            "request_id": "que_custom",
+            "session_id": "ses_1",
+            "directory": "/work",
+            "question_index": 0,
+            "answer": answer,
+        })
+    };
+
+    // Append raw text: the newline stays inside the single entry (no split).
+    let r1 = app
+        .handle_card_action(custom("自定\n答案"))
+        .await
+        .expect("result");
+    assert_eq!(r1.toast.as_deref(), Some("已添加自定义答案"));
+    let c1 = r1.card.as_ref().expect("re-rendered card").to_string();
+    assert!(c1.contains("已选：自定"), "custom not in selection: {}", c1);
+    // The removable chip keeps the RAW answer in its value; only the display
+    // label collapses the newline.
+    assert!(
+        c1.contains("\"answer\":\"自定\\n答案\""),
+        "raw answer lost: {}",
+        c1
+    );
+    assert!(
+        c1.contains("✅ 自定 答案"),
+        "collapsed chip label missing: {}",
+        c1
+    );
+
+    // Re-submitting the same text is deduped, with its own toast.
+    let r2 = app
+        .handle_card_action(custom("自定\n答案"))
+        .await
+        .expect("result");
+    assert_eq!(r2.toast.as_deref(), Some("该选项已在已选中"));
+
+    // Clicking the chip (reply "answer" with the raw text) removes it.
+    let r3 = app
+        .handle_card_action(serde_json::json!({
+            "action": "question",
+            "reply": "answer",
+            "request_id": "que_custom",
+            "session_id": "ses_1",
+            "directory": "/work",
+            "question_index": 0,
+            "answer": "自定\n答案",
+        }))
+        .await
+        .expect("result");
+    assert_eq!(r3.toast.as_deref(), Some("已移除选项"));
+    let c3 = r3.card.as_ref().expect("re-rendered card").to_string();
+    assert!(!c3.contains("已选：自定"), "custom kept after removal: {}", c3);
+
+    // A blank submission only hints and changes nothing.
+    let r4 = app.handle_card_action(custom("")).await.expect("result");
+    assert_eq!(r4.toast.as_deref(), Some("请输入自定义答案"));
+    assert!(r4.card.is_none());
+    assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
 }
 
 /// A question raised during an active turn is surfaced INLINE on the
