@@ -1,9 +1,10 @@
 pub mod client;
 pub mod types;
 
-pub use client::{
-    Client, CreateSessionInput, ModelInfo, PermissionRequest, PromptResponse, QuestionRequest, Session,
-    SessionInfo, SessionListInfo, SessionMessage, SessionStatus,
+pub use client::Client;
+pub use types::{
+    CreateSessionInput, ModelInfo, PermissionRequest, PromptResponse, QuestionRequest, Session, SessionInfo,
+    SessionListInfo, SessionMessage, SessionStatus,
 };
 
 use std::sync::Arc;
