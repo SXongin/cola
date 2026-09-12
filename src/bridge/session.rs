@@ -29,7 +29,7 @@ impl SessionStore {
 
     /// Add or promote a session entry as the active one for its thread.
     /// The entry is moved to the front so `get_active` returns it.
-    pub fn set_active(&mut self, entry: SessionEntry) {
+    fn promote(&mut self, entry: SessionEntry) {
         // Remove any existing entry with the same session_id
         if let Some(pos) = self.entries.iter().position(|e| e.session_id == entry.session_id) {
             self.entries.remove(pos);
@@ -41,8 +41,15 @@ impl SessionStore {
     /// The durable half of every create/adopt/promote path: callers cannot
     /// forget the save.
     pub fn activate(&mut self, entry: SessionEntry) -> crate::error::Result<()> {
-        self.set_active(entry);
-        self.persist()
+        self.promote(entry);
+        self.write_to_disk()
+    }
+
+    /// Test-only in-memory promote (seed a store without writing a file); the
+    /// production write path cannot regress to it.
+    #[cfg(test)]
+    pub(crate) fn set_active(&mut self, entry: SessionEntry) {
+        self.promote(entry)
     }
 
     /// Mutate the mapped session in place and persist, returning the updated
@@ -57,12 +64,12 @@ impl SessionStore {
         };
         f(entry);
         let updated = entry.clone();
-        self.persist()?;
+        self.write_to_disk()?;
         Ok(Some(updated))
     }
 
     /// Remove a session entry by session ID.
-    pub fn remove(&mut self, session_id: &str) -> Option<SessionEntry> {
+    fn remove(&mut self, session_id: &str) -> Option<SessionEntry> {
         if let Some(pos) = self.entries.iter().position(|e| e.session_id == session_id) {
             Some(self.entries.remove(pos))
         } else {
@@ -73,12 +80,12 @@ impl SessionStore {
     /// Remove a mapping and persist the store.
     pub fn remove_persist(&mut self, session_id: &str) -> crate::error::Result<Option<SessionEntry>> {
         let removed = self.remove(session_id);
-        self.persist()?;
+        self.write_to_disk()?;
         Ok(removed)
     }
 
     /// Remove every session entry mapped to a thread (used by `/forget`).
-    pub fn remove_thread(&mut self, key: &ThreadKey) -> Vec<SessionEntry> {
+    fn remove_thread(&mut self, key: &ThreadKey) -> Vec<SessionEntry> {
         let removed: Vec<SessionEntry> = self
             .entries
             .iter()
@@ -93,7 +100,7 @@ impl SessionStore {
     /// `/switch forget`).
     pub fn remove_thread_persist(&mut self, key: &ThreadKey) -> crate::error::Result<Vec<SessionEntry>> {
         let removed = self.remove_thread(key);
-        self.persist()?;
+        self.write_to_disk()?;
         Ok(removed)
     }
 
@@ -142,10 +149,17 @@ impl SessionStore {
         self.entries.iter().collect()
     }
 
-    pub fn persist(&self) -> crate::error::Result<()> {
+    fn write_to_disk(&self) -> crate::error::Result<()> {
         let data = serde_json::to_string_pretty(&self.entries)?;
         std::fs::write(&self.path, data)?;
         Ok(())
+    }
+
+    /// Test-only durable write; production reaches it only through
+    /// activate/update/remove_persist/remove_thread_persist.
+    #[cfg(test)]
+    pub(crate) fn persist(&self) -> crate::error::Result<()> {
+        self.write_to_disk()
     }
 }
 

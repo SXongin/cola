@@ -79,8 +79,9 @@ pub struct SharedCore {
     /// Whether to send the group completion notice (from `[bridge] group_completion_notice`).
     pub group_completion_notice: bool,
     /// Cached session-list snapshot for `/list`, `/switch`, `/attach`
-    /// (30 s TTL; invalidated on create/adopt/rename).
-    pub session_list_cache: Arc<Mutex<Option<SessionListCache>>>,
+    /// (30 s TTL; invalidated on create/adopt/rename). Private: the core's
+    /// write wrappers and `invalidate_session_list_cache` own it.
+    session_list_cache: Arc<Mutex<Option<SessionListCache>>>,
     pub opencode: Arc<dyn opencode::Backend>,
     pub feishu: Arc<dyn feishu::Platform>,
     /// When cola may spawn its own `opencode serve` (`auto`/`never`/`eager`,
@@ -372,13 +373,12 @@ impl SharedCore {
             }
         })
         .await;
-        if let Some(mut entry) = owner {
-            entry.auto_accept = on;
-            let mut store = self.sessions.lock().await;
-            store.set_active(entry);
-            if let Err(e) = store.persist() {
-                tracing::warn!("set_auto_accept: persist failed: {}", e);
-            }
+        if let Some(entry) = owner
+            && let Err(e) = self
+                .update_session(&entry.session_id, |e| e.auto_accept = on)
+                .await
+        {
+            tracing::warn!("set_auto_accept: persist failed: {}", e);
         }
         approved
     }
