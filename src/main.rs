@@ -729,7 +729,19 @@ mod tests {
             .spawn()
             .expect("spawn sh");
         let pid = child.id() as i32;
-        assert!(!is_cola_process(pid), "sh must not be considered a cola process");
+        // CI has caught a transient where a freshly spawned child read back as
+        // the PARENT image (this cola test binary) under load. Wait for the
+        // identity read to settle before asserting, so the check tests what it
+        // means to: a child that is not cola.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while is_cola_process(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            !is_cola_process(pid),
+            "sh must not be considered a cola process: {:?}",
+            process_identity(pid)
+        );
         assert!(
             replace_instance(pid).is_err(),
             "must refuse to kill a non-cola PID"
