@@ -23,18 +23,7 @@ async fn session_commands_reply_hint_without_mapped_session() {
             .unwrap();
     }
 
-    let text = platform
-        .calls
-        .lock()
-        .await
-        .clone()
-        .into_iter()
-        .filter_map(|c| match c {
-            PlatformCall::ReplyText { text, .. } => Some(text),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let text = platform.texts().await.join("\n");
     assert!(text.contains("还没有会话"), "every command must hint: {text}");
 }
 

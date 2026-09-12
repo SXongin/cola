@@ -79,6 +79,96 @@ impl RecordingPlatform {
             quoted_messages: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
+
+    /// Every card the app replied to a message with, in call order (C4 query
+    /// helper — no fluent DSL, just the structured payload).
+    pub(crate) async fn replied_cards(&self) -> Vec<serde_json::Value> {
+        self.cards_of(|c| match c {
+            PlatformCall::ReplyCard { card, .. } => Some(card),
+            _ => None,
+        })
+        .await
+    }
+
+    /// Every card the app sent to a chat.
+    pub(crate) async fn sent_cards(&self) -> Vec<serde_json::Value> {
+        self.cards_of(|c| match c {
+            PlatformCall::SendCard { card, .. } => Some(card),
+            _ => None,
+        })
+        .await
+    }
+
+    /// Every in-place card update (the streaming card's flushes).
+    pub(crate) async fn updated_cards(&self) -> Vec<serde_json::Value> {
+        self.cards_of(|c| match c {
+            PlatformCall::UpdateMessage { card, .. } => Some(card),
+            _ => None,
+        })
+        .await
+    }
+
+    /// Every plain text reply.
+    pub(crate) async fn texts(&self) -> Vec<String> {
+        self.calls
+            .lock()
+            .await
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every button `value` payload on every card the platform saw (replied,
+    /// sent, in-thread or updated), in card walk order.
+    pub(crate) async fn button_values(&self) -> Vec<serde_json::Value> {
+        let calls = self.calls.lock().await;
+        let mut out = Vec::new();
+        for call in calls.iter() {
+            match call {
+                PlatformCall::ReplyCard { card, .. }
+                | PlatformCall::SendCard { card, .. }
+                | PlatformCall::UpdateMessage { card, .. }
+                | PlatformCall::ReplyCardInThread { card, .. } => {
+                    collect_button_values(card, &mut out);
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    async fn cards_of(
+        &self,
+        pick: impl Fn(&PlatformCall) -> Option<&serde_json::Value>,
+    ) -> Vec<serde_json::Value> {
+        self.calls.lock().await.iter().filter_map(pick).cloned().collect()
+    }
+}
+
+/// Walk a card and collect every button's `value` payload (buttons nest in
+/// column sets and action blocks, so the walk is recursive).
+fn collect_button_values(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.get("tag").and_then(|t| t.as_str()) == Some("button")
+                && let Some(value) = map.get("value")
+            {
+                out.push(value.clone());
+            }
+            for v in map.values() {
+                collect_button_values(v, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                collect_button_values(v, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[async_trait::async_trait]
@@ -1010,23 +1100,45 @@ pub(crate) async fn final_card(platform: &RecordingPlatform) -> serde_json::Valu
         .expect("the final card must be updated in place")
 }
 
-/// Map a session to a directory in the SessionStore, so a card action's
-/// reply routes to the owning instance (the permission/question cards do
-/// this via their payload; tests that seed state directly need the store).
-pub(crate) async fn seed_session(app: &Arc<App>, session_id: &str, directory: &str) {
-    let thread = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+/// Map `entry` as its thread's active session and persist the store — the
+/// setup tests need instead of reaching into `app.sessions` directly.
+pub(crate) async fn seed_entry(app: &Arc<App>, entry: crate::config::SessionEntry) {
     let mut store = app.sessions.lock().await;
-    store.set_active(crate::config::SessionEntry {
-        thread_key: thread,
-        session_id: session_id.into(),
-        directory: directory.into(),
-        agent: None,
-        model: None,
-        auto_accept: false,
-        topic_anchor: None,
-        topic_root: None,
-        variant: None,
-    });
+    store.set_active(entry);
+    store
+        .persist()
+        .expect("seed_entry: persisting the seeded store failed");
+}
+
+/// Seed the cover-title cache for `session_id` (the topic cover card's title
+/// memory) — the `app.core` setup tests would otherwise do by hand.
+pub(crate) async fn seed_cover_title(app: &Arc<App>, session_id: &str, title: &str) {
+    app.core.cover_titles.lock().await.insert(
+        session_id.into(),
+        crate::bridge::core::CoverTitle {
+            title: title.into(),
+            model: None,
+        },
+    );
+}
+
+/// Seed the chat_1 lobby thread's session with the default entry shape.
+pub(crate) async fn seed_session(app: &Arc<App>, session_id: &str, directory: &str) {
+    seed_entry(
+        app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            session_id: session_id.into(),
+            directory: directory.into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
 }
 
 // ===== Session discovery & adoption (ADR-0008) =====
@@ -1066,17 +1178,21 @@ pub(crate) async fn build_reeswitch_app(
     let mut backend = backend;
     backend.session_list = vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)];
     let (app, platform) = build_app(cfg, backend).await;
-    app.sessions.lock().await.set_active(crate::config::SessionEntry {
-        thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        session_id: "ses_own1".into(),
-        directory: "/work/cola".into(),
-        agent: None,
-        model: None,
-        auto_accept: false,
-        topic_anchor: None,
-        topic_root: None,
-        variant: None,
-    });
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            session_id: "ses_own1".into(),
+            directory: "/work/cola".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
     (app, platform, dir)
 }
 

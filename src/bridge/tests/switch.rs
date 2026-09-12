@@ -14,9 +14,9 @@ async fn list_shows_global_sessions_marking_own() {
     let (app, platform) = build_app(cfg, backend).await;
     // Our own lobby session, so /list marks it active (ADR-0022: only the
     // active session is marked; the 本会话 ownership marker is gone).
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_beta02".into(),
             directory: "/work/cola".into(),
@@ -26,8 +26,9 @@ async fn list_shows_global_sessions_marking_own() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -42,15 +43,7 @@ async fn list_shows_global_sessions_marking_own() {
     .await
     .unwrap();
 
-    let calls = platform.calls.lock().await.clone();
-    let text = calls
-        .iter()
-        .filter_map(|c| match c {
-            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let text = platform.texts().await.join("\n");
     assert!(text.contains("外部会话"), "external session visible: {text}");
     assert!(text.contains("本地会话"), "own session visible: {text}");
     // The newest (updated 300) sorts first; own session marked active.
@@ -90,15 +83,7 @@ async fn list_filters_by_keyword_and_hides_children() {
     )
     .await
     .unwrap();
-    let calls = platform.calls.lock().await.clone();
-    let text = calls
-        .iter()
-        .filter_map(|c| match c {
-            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let text = platform.texts().await.join("\n");
     assert!(text.contains("重写登录模块"), "keyword match: {text}");
     assert!(!text.contains("修 bug"), "non-matching title filtered: {text}");
 
@@ -116,15 +101,7 @@ async fn list_filters_by_keyword_and_hides_children() {
     )
     .await
     .unwrap();
-    let calls = platform.calls.lock().await.clone();
-    let text = calls
-        .iter()
-        .filter_map(|c| match c {
-            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let text = platform.texts().await.join("\n");
     assert!(!text.contains("Child session"), "child hidden by default: {text}");
 
     // --all reveals the child.
@@ -141,15 +118,7 @@ async fn list_filters_by_keyword_and_hides_children() {
     )
     .await
     .unwrap();
-    let calls = platform.calls.lock().await.clone();
-    let text = calls
-        .iter()
-        .filter_map(|c| match c {
-            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let text = platform.texts().await.join("\n");
     assert!(text.contains("child09"), "child shown with --all: {text}");
 }
 
@@ -165,9 +134,9 @@ async fn list_is_cached_within_ttl_and_invalidated_on_rename() {
     let calls_counter = backend.list_sessions_calls.clone();
     let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_alpha01".into(),
             directory: "/work/a".into(),
@@ -177,8 +146,9 @@ async fn list_is_cached_within_ttl_and_invalidated_on_rename() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     // Two /list in a row → one server fetch.
     crate::bridge::command::handle_command(
@@ -285,9 +255,9 @@ async fn attach_rejects_session_owned_by_another_thread_without_force() {
     let platform = Arc::new(platform);
     let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
     // Another thread already owns the session.
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into()),
             session_id: "ses_foreign123abc".into(),
             directory: "/work/foreign".into(),
@@ -297,8 +267,9 @@ async fn attach_rejects_session_owned_by_another_thread_without_force() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -316,15 +287,7 @@ async fn attach_rejects_session_owned_by_another_thread_without_force() {
     // Rejected: the current thread still has no session.
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     assert!(app.sessions.lock().await.get_active(&key).is_none());
-    let calls = platform.calls.lock().await.clone();
-    let text = calls
-        .iter()
-        .filter_map(|c| match c {
-            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let text = platform.texts().await.join("\n");
     assert!(text.contains("隔壁群"), "rejection names the owning chat: {text}");
     assert!(text.contains("--force"), "rejection points at --force: {text}");
 }
@@ -342,9 +305,9 @@ async fn attach_force_steals_mapping_from_other_thread() {
         100,
     )];
     let (app, _platform) = build_app(cfg, backend).await;
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into()),
             session_id: "ses_foreign123abc".into(),
             directory: "/work/foreign".into(),
@@ -354,8 +317,9 @@ async fn attach_force_steals_mapping_from_other_thread() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -386,9 +350,9 @@ async fn forget_unmaps_thread_keeping_server_session() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -398,8 +362,9 @@ async fn forget_unmaps_thread_keeping_server_session() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -525,14 +490,7 @@ async fn switch_reeswitch_suppressed_when_nothing_to_report() {
     .unwrap();
 
     let calls = platform.calls.lock().await.clone();
-    let text = calls
-        .iter()
-        .filter_map(|c| match c {
-            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let text = platform.texts().await.join("\n");
     assert!(text.contains("Switched to"), "one-line ack kept: {text}");
     assert!(
         calls.iter().all(|c| !matches!(c, PlatformCall::ReplyCard { .. })),
@@ -602,15 +560,17 @@ async fn switch_reeswitch_snapshots_on_busy_status() {
     .await
     .unwrap();
 
-    let calls = platform.calls.lock().await.clone();
-    let card = calls
-        .iter()
-        .find_map(|c| match c {
-            PlatformCall::ReplyCard { card, .. } => Some(card.to_string()),
-            _ => None,
-        })
-        .expect("busy reports a snapshot: {calls:?}");
-    assert!(card.contains("运行中"), "busy chip: {card}");
+    let card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .next()
+        .expect("busy reports a snapshot")
+        .to_string();
+    assert!(
+        card.contains(crate::feishu::snapshot_card::BUSY_CHIP),
+        "busy chip: {card}"
+    );
 }
 
 /// ADR-0028: an adopt-time pending request on a re-switch reports a
@@ -643,15 +603,17 @@ async fn switch_reeswitch_snapshots_on_pending_permission() {
     .await
     .unwrap();
 
-    let calls = platform.calls.lock().await.clone();
-    let card = calls
-        .iter()
-        .find_map(|c| match c {
-            PlatformCall::ReplyCard { card, .. } => Some(card.to_string()),
-            _ => None,
-        })
-        .expect("a pending request reports a snapshot: {calls:?}");
-    assert!(card.contains("等待你的确认"), "waiting chip: {card}");
+    let card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .next()
+        .expect("a pending request reports a snapshot")
+        .to_string();
+    assert!(
+        card.contains(crate::feishu::snapshot_card::WAITING_CHIP),
+        "waiting chip: {card}"
+    );
 }
 
 #[tokio::test]
@@ -679,15 +641,7 @@ async fn switch_ambiguous_global_match_lists_candidates() {
     // Ambiguous → no adoption, candidates listed.
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     assert!(app.sessions.lock().await.get_active(&key).is_none());
-    let calls = platform.calls.lock().await.clone();
-    let text = calls
-        .iter()
-        .filter_map(|c| match c {
-            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let text = platform.texts().await.join("\n");
     assert!(text.contains("/switch"), "points at /switch: {text}");
 }
 
@@ -702,9 +656,9 @@ async fn switch_prefers_threads_own_sessions() {
         list_session("ses_foreign", "本项目会话", "/other/place", 100),
     ];
     let (app, _platform) = build_app(cfg, backend).await;
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_own1".into(),
             directory: "/work/cola".into(),
@@ -714,8 +668,12 @@ async fn switch_prefers_threads_own_sessions() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.set_active(crate::config::SessionEntry {
+        },
+    )
+    .await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_other_own".into(),
             directory: "/work/other".into(),
@@ -725,8 +683,9 @@ async fn switch_prefers_threads_own_sessions() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -770,13 +729,10 @@ async fn switch_no_arg_sends_session_card() {
     .await
     .unwrap();
 
-    let calls = platform.calls.lock().await.clone();
-    let card = calls
-        .iter()
-        .filter_map(|c| match c {
-            PlatformCall::ReplyCard { card, .. } => Some(card.clone()),
-            _ => None,
-        })
+    let card = platform
+        .replied_cards()
+        .await
+        .into_iter()
         .next()
         .expect("a switch card should be sent");
     let text = card.to_string();
@@ -786,6 +742,15 @@ async fn switch_no_arg_sends_session_card() {
     assert!(text.contains("接管"), "adopt button: {text}");
     assert!(text.contains("＋ 新建会话"), "new button: {text}");
     assert!(text.contains("switch_search"), "search form: {text}");
+    // The row buttons carry the structured payload (C4 query helper): each
+    // listed session has an adopt button.
+    let values = platform.button_values().await;
+    for id in ["ses_alpha01", "ses_beta02"] {
+        assert!(
+            values.iter().any(|v| v["session_id"] == id && v["op"] == "adopt"),
+            "session {id} needs an adopt button: {values:?}"
+        );
+    }
 }
 
 /// `/switch` (no args) defaults to the current directory (ADR-0022): with
@@ -802,9 +767,9 @@ async fn switch_card_defaults_to_current_directory_scope() {
         list_session("ses_beta02", "修 bug", "/work/cola", 300),
     ];
     let (app, platform) = build_app(cfg, backend).await;
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_beta02".into(),
             directory: "/work/cola".into(),
@@ -814,8 +779,9 @@ async fn switch_card_defaults_to_current_directory_scope() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -863,9 +829,9 @@ async fn switch_card_scope_toggle_shows_whole_store() {
         list_session("ses_beta02", "修 bug", "/work/cola", 300),
     ];
     let (app, _platform) = build_app(cfg, backend).await;
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_beta02".into(),
             directory: "/work/cola".into(),
@@ -875,8 +841,9 @@ async fn switch_card_scope_toggle_shows_whole_store() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     let value = serde_json::json!({
         "action": "switch",
@@ -1010,9 +977,9 @@ async fn switch_card_adopt_occupied_offers_force_confirm() {
         .insert("oc_group_other".into(), "隔壁群".into());
     let platform = Arc::new(platform);
     let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into()),
             session_id: "ses_owned".into(),
             directory: "/work/auth".into(),
@@ -1022,8 +989,9 @@ async fn switch_card_adopt_occupied_offers_force_confirm() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     let value = serde_json::json!({
         "action": "switch",
@@ -1073,9 +1041,9 @@ async fn switch_card_force_adopt_steals_owned_session() {
     let platform = Arc::new(platform);
     let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
     let other = crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: other.clone(),
             session_id: "ses_owned".into(),
             directory: "/work/auth".into(),
@@ -1085,8 +1053,9 @@ async fn switch_card_force_adopt_steals_owned_session() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     let value = serde_json::json!({
         "action": "switch",
@@ -1153,9 +1122,9 @@ async fn switch_card_switch_on_mapped_session_patches_to_snapshot() {
     let (app, _platform) = build_app(cfg, backend).await;
     // The session is mapped to this thread but NOT active (a stacked
     // session) — the row shows 切换.
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_own1".into(),
             directory: "/work/cola".into(),
@@ -1165,8 +1134,12 @@ async fn switch_card_switch_on_mapped_session_patches_to_snapshot() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.set_active(crate::config::SessionEntry {
+        },
+    )
+    .await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_active".into(),
             directory: "/work/active".into(),
@@ -1176,8 +1149,9 @@ async fn switch_card_switch_on_mapped_session_patches_to_snapshot() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     let value = serde_json::json!({
         "action": "switch",
@@ -1231,9 +1205,9 @@ async fn switch_card_switch_suppressed_patches_to_compact_state() {
     // ses_own1 is mapped to this thread but NOT active (a stacked
     // session) — the row shows 切换, and this is a re-activation, not the
     // already-active ✅ row.
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_own1".into(),
             directory: "/work/cola".into(),
@@ -1243,8 +1217,12 @@ async fn switch_card_switch_suppressed_patches_to_compact_state() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.set_active(crate::config::SessionEntry {
+        },
+    )
+    .await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_active".into(),
             directory: "/work/active".into(),
@@ -1254,8 +1232,9 @@ async fn switch_card_switch_suppressed_patches_to_compact_state() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     let value = serde_json::json!({
         "action": "switch",
@@ -1341,9 +1320,9 @@ async fn switch_card_new_action_creates_session_in_current_project() {
     let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     // Root an existing session in /work/proj so "current project" is set.
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_old".into(),
             directory: "/work/proj".into(),
@@ -1353,8 +1332,9 @@ async fn switch_card_new_action_creates_session_in_current_project() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     let value = serde_json::json!({
         "action": "switch",

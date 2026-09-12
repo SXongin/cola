@@ -47,12 +47,12 @@ async fn topic_command_creates_topic_mapped_to_new_session() {
     );
     // The cover card carries the session brief; the in-topic seed is only a
     // short hint (the brief lives on the root card at the top of the thread).
-    let cover = calls
-        .iter()
-        .find_map(|c| match c {
-            PlatformCall::SendCard { card, .. } => Some(card.to_string()),
-            _ => None,
-        })
+    let cover = platform
+        .sent_cards()
+        .await
+        .into_iter()
+        .next()
+        .map(|c| c.to_string())
         .expect("cover card JSON");
     assert!(
         cover.contains("💬 `api-refactor`") && cover.contains("会话 `topic`"),
@@ -130,13 +130,7 @@ async fn topic_cover_send_failure_falls_back_to_command_root() {
     // A stale cover-title entry may already exist (e.g. the session was
     // previously adopted into a cover-rooted topic); the fallback must drop
     // it so the post-turn hook never patches the user's command message.
-    app.core.cover_titles.lock().await.insert(
-        "ses_test".into(),
-        crate::bridge::core::CoverTitle {
-            title: "旧封面".into(),
-            model: None,
-        },
-    );
+    seed_cover_title(&app, "ses_test", "旧封面").await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -192,9 +186,9 @@ async fn topic_cover_card_updated_with_auto_title_after_turn() {
     let (app, platform) = build_app(cfg, backend).await;
 
     let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: topic_key.clone(),
             session_id: "ses_t1".into(),
             directory: "/work/t".into(),
@@ -204,15 +198,10 @@ async fn topic_cover_card_updated_with_auto_title_after_turn() {
             topic_anchor: Some("om_seed".into()),
             topic_root: Some("om_cover".into()),
             variant: None,
-        });
-    }
-    app.core.cover_titles.lock().await.insert(
-        "ses_t1".into(),
-        crate::bridge::core::CoverTitle {
-            title: "旧标题".into(),
-            model: None,
         },
-    );
+    )
+    .await;
+    seed_cover_title(&app, "ses_t1", "旧标题").await;
 
     app.handle_message(crate::bridge::IncomingMessage {
         message_id: "msg_1".into(),
@@ -572,18 +561,21 @@ async fn topic_command_gate_rejects_banned_commands_and_lets_others_through() {
         let cfg = test_config(&state_dir.path().join("sessions.json"));
         let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
         if case.has_session {
-            let mut store = app.sessions.lock().await;
-            store.set_active(crate::config::SessionEntry {
-                thread_key: topic_key.clone(),
-                session_id: "ses_owned".into(),
-                directory: "/work/topic".into(),
-                agent: None,
-                model: None,
-                auto_accept: false,
-                topic_anchor: None,
-                topic_root: None,
-                variant: None,
-            });
+            seed_entry(
+                &app,
+                crate::config::SessionEntry {
+                    thread_key: topic_key.clone(),
+                    session_id: "ses_owned".into(),
+                    directory: "/work/topic".into(),
+                    agent: None,
+                    model: None,
+                    auto_accept: false,
+                    topic_anchor: None,
+                    topic_root: None,
+                    variant: None,
+                },
+            )
+            .await;
         }
 
         crate::bridge::command::handle_command(
@@ -597,13 +589,7 @@ async fn topic_command_gate_rejects_banned_commands_and_lets_others_through() {
         .unwrap();
 
         let calls = platform.calls.lock().await.clone();
-        let replies: Vec<String> = calls
-            .iter()
-            .filter_map(|c| match c {
-                PlatformCall::ReplyText { text, .. } => Some(text.clone()),
-                _ => None,
-            })
-            .collect();
+        let replies = platform.texts().await;
         let label = format!("case {i} ({:?}, has_session={})", case.cmd, case.has_session);
         if let Some(reason) = case.rejection {
             assert_eq!(
@@ -735,14 +721,7 @@ async fn topic_adopt_rejects_child_session() {
     .unwrap();
 
     let calls = platform.calls.lock().await.clone();
-    let text = calls
-        .iter()
-        .filter_map(|c| match c {
-            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let text = platform.texts().await.join("\n");
     assert!(text.contains("子任务"), "rejection mentions sub-task: {text}");
     assert!(
         calls
@@ -768,9 +747,9 @@ async fn topic_adopt_rejects_owned_session_without_force() {
         .insert("oc_group_other".into(), "隔壁群".into());
     let platform = Arc::new(platform);
     let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into()),
             session_id: "ses_owned".into(),
             directory: "/work/auth".into(),
@@ -780,8 +759,9 @@ async fn topic_adopt_rejects_owned_session_without_force() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -797,14 +777,7 @@ async fn topic_adopt_rejects_owned_session_without_force() {
     .unwrap();
 
     let calls = platform.calls.lock().await.clone();
-    let text = calls
-        .iter()
-        .filter_map(|c| match c {
-            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let text = platform.texts().await.join("\n");
     assert!(text.contains("隔壁群"), "rejection names the owning chat: {text}");
     assert!(
         text.contains("--force"),
@@ -828,9 +801,9 @@ async fn topic_adopt_force_steals_mapping() {
     let mut backend = MockBackend::new(realistic_parts());
     backend.session_list = vec![list_session("ses_owned", "被占用的会话", "/work/auth", 100)];
     let (app, _platform) = build_app(cfg, backend).await;
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into()),
             session_id: "ses_owned".into(),
             directory: "/work/auth".into(),
@@ -840,8 +813,9 @@ async fn topic_adopt_force_steals_mapping() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -894,13 +868,11 @@ async fn topic_adopt_no_arg_sends_switch_card() {
     .await
     .unwrap();
 
-    let calls = platform.calls.lock().await.clone();
-    let card = calls
-        .iter()
-        .find_map(|c| match c {
-            PlatformCall::ReplyCard { card, .. } => Some(card.clone()),
-            _ => None,
-        })
+    let card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .next()
         .expect("a session card is sent");
     let card_str = card.to_string();
     assert!(
@@ -910,6 +882,14 @@ async fn topic_adopt_no_arg_sends_switch_card() {
     assert!(
         card_str.contains("ses_alpha01"),
         "card lists the session: {card_str}"
+    );
+    // The "建话题接管" row button carries the structured op payload.
+    let values = platform.button_values().await;
+    assert!(
+        values
+            .iter()
+            .any(|v| v["op"] == "topic_adopt" && v["session_id"] == "ses_alpha01"),
+        "the picker rows need a topic_adopt button: {values:?}"
     );
 }
 
@@ -976,9 +956,9 @@ async fn switch_card_topic_adopt_occupied_offers_force_confirm() {
         .insert("oc_group_other".into(), "隔壁群".into());
     let platform = Arc::new(platform);
     let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into()),
             session_id: "ses_owned".into(),
             directory: "/work/auth".into(),
@@ -988,8 +968,9 @@ async fn switch_card_topic_adopt_occupied_offers_force_confirm() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     let value = serde_json::json!({
         "action": "switch",
@@ -1045,9 +1026,9 @@ async fn switch_card_force_topic_adopt_steals_owned_session() {
     let platform = Arc::new(platform);
     let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
     let other = crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: other.clone(),
             session_id: "ses_owned".into(),
             directory: "/work/auth".into(),
@@ -1057,8 +1038,9 @@ async fn switch_card_force_topic_adopt_steals_owned_session() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     let value = serde_json::json!({
         "action": "switch",
@@ -1109,9 +1091,9 @@ async fn switch_card_force_topic_adopt_failure_keeps_old_owner() {
     let platform = Arc::new(platform);
     let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
     let other = crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: other.clone(),
             session_id: "ses_owned".into(),
             directory: "/work/auth".into(),
@@ -1121,8 +1103,9 @@ async fn switch_card_force_topic_adopt_failure_keeps_old_owner() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     let value = serde_json::json!({
         "action": "switch",
@@ -1247,14 +1230,7 @@ async fn topic_command_rejects_nonexistent_directory() {
     .unwrap();
 
     let calls = platform.calls.lock().await.clone();
-    let text = calls
-        .iter()
-        .filter_map(|c| match c {
-            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let text = platform.texts().await.join("\n");
     assert!(
         text.contains("目录不存在") && text.contains("/nonexistent/dir/xyz"),
         "/topic with a bad dir must reply a clear error: {text}"
@@ -1352,17 +1328,21 @@ async fn topic_plain_reply_skips_own_root_and_seed_injection() {
     let app = Arc::new(App::new(cfg, Arc::new(backend), Arc::new(platform)).unwrap());
     // The cola-created topic already owns a session; its creation messages
     // are the thread root (the `/topic` command) and the seed card.
-    app.sessions.lock().await.set_active(crate::config::SessionEntry {
-        thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
-        session_id: "ses_topic".into(),
-        directory: "/work/topic".into(),
-        agent: None,
-        model: None,
-        auto_accept: false,
-        topic_anchor: Some("om_seed".into()),
-        topic_root: Some("om_root_cmd".into()),
-        variant: None,
-    });
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
+            session_id: "ses_topic".into(),
+            directory: "/work/topic".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: Some("om_seed".into()),
+            topic_root: Some("om_root_cmd".into()),
+            variant: None,
+        },
+    )
+    .await;
 
     for pid in ["om_root_cmd", "om_seed"] {
         prompt_calls.lock().await.clear();
@@ -1404,17 +1384,21 @@ async fn topic_explicit_quote_of_real_message_still_injects() {
         },
     );
     let app = Arc::new(App::new(cfg, Arc::new(backend), Arc::new(platform)).unwrap());
-    app.sessions.lock().await.set_active(crate::config::SessionEntry {
-        thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
-        session_id: "ses_topic".into(),
-        directory: "/work/topic".into(),
-        agent: None,
-        model: None,
-        auto_accept: false,
-        topic_anchor: Some("om_seed".into()),
-        topic_root: Some("om_root_cmd".into()),
-        variant: None,
-    });
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
+            session_id: "ses_topic".into(),
+            directory: "/work/topic".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: Some("om_seed".into()),
+            topic_root: Some("om_root_cmd".into()),
+            variant: None,
+        },
+    )
+    .await;
 
     app.handle_message(crate::bridge::IncomingMessage {
         message_id: "msg_q".into(),
@@ -1455,17 +1439,21 @@ async fn manual_topic_plain_reply_injects_user_root() {
         },
     );
     let app = Arc::new(App::new(cfg, Arc::new(backend), Arc::new(platform)).unwrap());
-    app.sessions.lock().await.set_active(crate::config::SessionEntry {
-        thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
-        session_id: "ses_topic".into(),
-        directory: "/work/topic".into(),
-        agent: None,
-        model: None,
-        auto_accept: false,
-        topic_anchor: None,
-        topic_root: None,
-        variant: None,
-    });
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
+            session_id: "ses_topic".into(),
+            directory: "/work/topic".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
 
     app.handle_message(crate::bridge::IncomingMessage {
         message_id: "msg_manual".into(),

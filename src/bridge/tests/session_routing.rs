@@ -127,9 +127,9 @@ async fn topic_message_isolates_session_from_lobby() {
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
     // Seed distinct sessions for the lobby key and the topic key.
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_lobby".into(),
             directory: "/tmp/lobby".into(),
@@ -139,8 +139,12 @@ async fn topic_message_isolates_session_from_lobby() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.set_active(crate::config::SessionEntry {
+        },
+    )
+    .await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "omt_topic_1".into()),
             session_id: "ses_topic".into(),
             directory: "/tmp/topic".into(),
@@ -150,9 +154,9 @@ async fn topic_message_isolates_session_from_lobby() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.persist().unwrap();
-    }
+        },
+    )
+    .await;
 
     // Lobby message routes to the lobby session; topic message routes to
     // the topic session — never creating or switching across.
@@ -219,9 +223,9 @@ async fn p2p_topic_isolated_from_p2p_top_level() {
     let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
     // Seed a p2p top-level session and a p2p topic session.
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("oc_p2p_1".into(), "oc_p2p_1".into()),
             session_id: "ses_top".into(),
             directory: "/tmp/top".into(),
@@ -231,8 +235,12 @@ async fn p2p_topic_isolated_from_p2p_top_level() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.set_active(crate::config::SessionEntry {
+        },
+    )
+    .await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("oc_p2p_1".into(), "omt_p2p_1".into()),
             session_id: "ses_p2p_topic".into(),
             directory: "/tmp/ptopic".into(),
@@ -242,9 +250,9 @@ async fn p2p_topic_isolated_from_p2p_top_level() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.persist().unwrap();
-    }
+        },
+    )
+    .await;
 
     app.handle_message(incoming(
         "msg_1".into(),
@@ -299,9 +307,9 @@ async fn stale_session_mapping_is_recreated_on_404() {
     // ses_old 404s, cola must create a FRESH session, not fall through to
     // the next stale mapping.
     let thread = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: thread.clone(),
             session_id: "ses_old2".into(),
             directory: "/tmp/old2".into(),
@@ -311,8 +319,12 @@ async fn stale_session_mapping_is_recreated_on_404() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.set_active(crate::config::SessionEntry {
+        },
+    )
+    .await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: thread.clone(),
             session_id: "ses_old".into(),
             directory: "/tmp/old".into(),
@@ -322,9 +334,9 @@ async fn stale_session_mapping_is_recreated_on_404() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.persist().unwrap();
-    }
+        },
+    )
+    .await;
 
     app.handle_message(incoming(
         "msg_1".into(),
@@ -376,9 +388,9 @@ async fn stale_topic_recreate_preserves_creation_messages() {
     let (app, _platform) = build_app(cfg, backend).await;
 
     let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: topic_key.clone(),
             session_id: "ses_old".into(),
             directory: "/work/topic".into(),
@@ -388,17 +400,12 @@ async fn stale_topic_recreate_preserves_creation_messages() {
             topic_anchor: Some("om_seed".into()),
             topic_root: Some("om_root_cmd".into()),
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
     // The cover-title sync state belongs to the topic, not the session —
     // it must move to the recreated session so the hook keeps patching.
-    app.core.cover_titles.lock().await.insert(
-        "ses_old".into(),
-        crate::bridge::core::CoverTitle {
-            title: "旧标题".into(),
-            model: None,
-        },
-    );
+    seed_cover_title(&app, "ses_old", "旧标题").await;
 
     // The first message 404s on the stale session; cola recreates and retries.
     app.handle_message(crate::bridge::IncomingMessage {
@@ -464,9 +471,9 @@ async fn message_during_inflight_goes_to_supplement_path() {
     let sup_calls = backend.prompt_async_calls.clone();
     let sup_ids = backend.prompt_async_message_ids.clone();
     let (app, platform) = build_app(cfg, backend).await;
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -476,9 +483,9 @@ async fn message_during_inflight_goes_to_supplement_path() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.persist().unwrap();
-    }
+        },
+    )
+    .await;
     app.inflight.lock().await.insert("ses_test".to_string());
 
     app.handle_message(incoming(

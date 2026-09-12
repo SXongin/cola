@@ -217,9 +217,9 @@ async fn dir_card_pick_current_directory_toasts_only() {
     backend.session_list = vec![list_session("ses_a", "项目A", "/work/a", 100)];
     let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: key.clone(),
             session_id: "ses_a".into(),
             directory: "/work/a".into(),
@@ -229,8 +229,9 @@ async fn dir_card_pick_current_directory_toasts_only() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     let value = serde_json::json!({
         "action": "dir",
@@ -353,9 +354,9 @@ async fn dir_card_topic_on_current_directory_opens_topic() {
     let backend = MockBackend::new(realistic_parts());
     let (app, _platform) = build_app(cfg, backend).await;
     let lobby_key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: lobby_key.clone(),
             session_id: "ses_a".into(),
             directory: "/work/a".into(),
@@ -365,8 +366,9 @@ async fn dir_card_topic_on_current_directory_opens_topic() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-    }
+        },
+    )
+    .await;
 
     let value = serde_json::json!({
         "action": "dir",

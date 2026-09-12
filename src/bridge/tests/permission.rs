@@ -607,9 +607,9 @@ async fn auto_accept_session_answers_permission_without_card() {
     let (app, platform) = build_app(cfg, mock).await;
 
     // Enable `/autoaccept` on the session.
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -619,9 +619,9 @@ async fn auto_accept_session_answers_permission_without_card() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.persist().unwrap();
-    }
+        },
+    )
+    .await;
 
     tokio::spawn({
         let app = app.clone();
@@ -677,9 +677,9 @@ async fn autoaccept_on_approves_already_pending_permission() {
 
     // Session already mapped but autoaccept OFF — the permission would have
     // been surfaced as a card before the user enabled it.
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -689,9 +689,9 @@ async fn autoaccept_on_approves_already_pending_permission() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.persist().unwrap();
-    }
+        },
+    )
+    .await;
 
     // Now the user turns autoaccept on via the command.
     crate::bridge::command::handle_command(
@@ -742,9 +742,9 @@ async fn autoaccept_on_approves_child_session_permission() {
     let perm_calls = mock.reply_permission_calls.clone();
     let (app, _platform) = build_app(cfg, mock).await;
 
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -754,9 +754,9 @@ async fn autoaccept_on_approves_child_session_permission() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-        });
-        store.persist().unwrap();
-    }
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -843,9 +843,9 @@ async fn separate_permission_card_sent_into_topic_for_topic_session() {
 
     // Map the session to a TOPIC (thread_id != chat_id) with an anchor
     // message inside the topic, no accumulator.
-    {
-        let mut store = app.sessions.lock().await;
-        store.set_active(crate::config::SessionEntry {
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_topic_1".into()),
             session_id: "ses_topic".into(),
             directory: "/tmp/topic".into(),
@@ -855,9 +855,9 @@ async fn separate_permission_card_sent_into_topic_for_topic_session() {
             topic_anchor: Some("msg_in_topic_anchor".into()),
             topic_root: None,
             variant: None,
-        });
-        store.persist().unwrap();
-    }
+        },
+    )
+    .await;
 
     tokio::spawn({
         let app = app.clone();
