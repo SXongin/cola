@@ -1160,7 +1160,8 @@ mod tests {
             directory: "/w".into(),
         });
         assert!(
-            acc.header_sig().contains("等待你的授权"),
+            acc.header_sig()
+                .contains(crate::feishu::card::AWAITING_ACTION_TITLE),
             "pending permission must flip the header: {}",
             acc.header_sig()
         );

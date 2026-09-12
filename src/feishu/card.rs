@@ -632,6 +632,10 @@ impl CardBuilder {
     }
 }
 
+/// The header title while a permission/question blocks the turn (ADR-0014).
+/// Tests assert this constant so the copy lives in one place.
+pub(crate) const AWAITING_ACTION_TITLE: &str = "⏳ 等待你的授权/回答";
+
 /// Header title + template for a card. `running_tool` is the tool currently
 /// running (from the builder's tools), driving the "⏳ tool" streaming header.
 /// Active states append the progress signals passed in from the accumulator;
@@ -643,7 +647,7 @@ pub(crate) fn header_title_and_template(
     progress: &HeaderProgress,
 ) -> (String, &'static str) {
     if progress.waiting {
-        return ("⏳ 等待你的授权/回答".to_string(), "orange");
+        return (AWAITING_ACTION_TITLE.to_string(), "orange");
     }
     let (label, template) = match state {
         CardState::Loading => ("⏳ 思考中".to_string(), "blue"),
@@ -2370,7 +2374,7 @@ mod tests {
             .build();
         assert_eq!(
             card["header"]["title"]["content"].as_str().unwrap(),
-            "⏳ 等待你的授权/回答"
+            AWAITING_ACTION_TITLE
         );
         assert_eq!(card["header"]["template"].as_str().unwrap(), "orange");
     }
