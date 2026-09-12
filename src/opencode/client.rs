@@ -109,22 +109,43 @@ impl Client {
     /// server; the username is still pinned so a later reconnect carries Basic
     /// auth with both parts.
     pub fn new(model: Option<&str>, server: Option<crate::bridge::discovery::ResolvedServer>) -> Self {
-        let username = server
-            .as_ref()
-            .map(|s| s.username.clone())
-            .unwrap_or_else(|| crate::bridge::discovery::DEFAULT_SERVER_USERNAME.to_string());
+        match server {
+            Some(crate::bridge::discovery::ResolvedServer {
+                url,
+                username,
+                password,
+            }) => Self::with_base_url(model, url, Some(&username), Some(&password)),
+            None => Self::with_base_url(
+                model,
+                String::new(),
+                Some(crate::bridge::discovery::DEFAULT_SERVER_USERNAME),
+                None,
+            ),
+        }
+    }
+
+    /// Build a client against an explicit base URL and credentials. Production
+    /// normally goes through [`Client::new`] (a discovered server) or
+    /// [`Client::reconnect`] (the live endpoint was replaced); this constructor
+    /// also lets tests point the real client at a local fake server so the
+    /// HTTP layer is exercised end to end (ADR-0031). A trailing slash is
+    /// tolerated.
+    ///
+    /// Basic auth is attached only when BOTH username and password are present
+    /// — a half-credential must never reach the wire (the server checks the
+    /// username too, so a password-only request 401s).
+    pub fn with_base_url(
+        model: Option<&str>,
+        base_url: impl Into<String>,
+        username: Option<&str>,
+        password: Option<&str>,
+    ) -> Self {
         Self {
             http: Arc::new(std::sync::RwLock::new(HttpHandle {
-                client: build_http_client(
-                    &Some(username.clone()),
-                    &server.as_ref().map(|s| s.password.clone()),
-                ),
-                base_url: server
-                    .as_ref()
-                    .map(|s| s.url.trim_end_matches('/').to_string())
-                    .unwrap_or_default(),
+                client: build_http_client(&username.map(str::to_string), &password.map(str::to_string)),
+                base_url: base_url.into().trim_end_matches('/').to_string(),
             })),
-            username: Some(username),
+            username: username.map(str::to_string),
             model: model.and_then(parse_model),
         }
     }
@@ -1406,5 +1427,803 @@ mod tests {
         assert!(is_cola_message_id(&a));
         assert!(!is_cola_message_id("msg_serverside"));
         assert!(!is_cola_message_id("msg_cola")); // no trailing separator
+    }
+}
+
+/// Wire tests: the real `reqwest` client against a local fake server
+/// (ADR-0031). Each test asserts both sides of the exchange — the recorded
+/// request (method / path / query / headers / body) and what the client parsed
+/// back. No HTTP library is mocked and no private state is touched.
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use crate::error::BridgeError;
+    use crate::test_http::{RecordedRequest, TestHttpServer};
+
+    /// A client pointed at the fake server with both Basic-auth parts set —
+    /// what discovery hands production.
+    fn wire_client(server: &TestHttpServer, model: Option<&str>) -> Client {
+        Client::with_base_url(model, server.base_url(), Some("opencode"), Some("secret"))
+    }
+
+    /// The request at `index` in arrival order.
+    fn request_at(server: &TestHttpServer, index: usize) -> RecordedRequest {
+        server
+            .requests()
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| panic!("request {index} should have been sent"))
+    }
+
+    fn last_request(server: &TestHttpServer) -> RecordedRequest {
+        server.requests().pop().expect("a request should have been sent")
+    }
+
+    fn body_json(request: &RecordedRequest) -> serde_json::Value {
+        serde_json::from_str(&request.body).expect("request body should be JSON")
+    }
+
+    fn expected_basic(username: &str, password: &str) -> String {
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
+        )
+    }
+
+    fn opencode_error(err: BridgeError) -> String {
+        match err {
+            BridgeError::OpenCode(message) => message,
+            other => panic!("expected BridgeError::OpenCode, got: {other:?}"),
+        }
+    }
+
+    fn not_found_error(err: BridgeError) -> String {
+        match err {
+            BridgeError::NotFound(message) => message,
+            other => panic!("expected BridgeError::NotFound, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn new_binds_the_resolved_server_url_and_credentials() {
+        let server = TestHttpServer::start().await;
+        server.route("GET", "/provider", 200, r#"{"all":[],"connected":[]}"#);
+        let client = Client::new(
+            None,
+            Some(crate::bridge::discovery::ResolvedServer {
+                url: server.base_url(),
+                username: "custom-user".to_string(),
+                password: "custom-pass".to_string(),
+            }),
+        );
+
+        assert_eq!(client.base_url(), server.base_url());
+        let _ = client.list_models().await;
+        let expected = expected_basic("custom-user", "custom-pass");
+        assert_eq!(
+            last_request(&server).header("authorization"),
+            Some(expected.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn with_base_url_trims_a_trailing_slash() {
+        let server = TestHttpServer::start().await;
+        server.route("GET", "/provider", 200, r#"{"all":[],"connected":[]}"#);
+        let client = Client::with_base_url(None, format!("{}/", server.base_url()), None, None);
+
+        assert_eq!(client.base_url(), server.base_url());
+        assert_eq!(client.model_context_window("p", "m").await.unwrap(), None);
+        assert_eq!(last_request(&server).path, "/provider");
+    }
+
+    #[tokio::test]
+    async fn basic_auth_is_sent_only_when_both_credentials_are_present() {
+        let server = TestHttpServer::start().await;
+        server.route("GET", "/provider", 200, r#"{"all":[],"connected":[]}"#);
+
+        struct Case {
+            label: &'static str,
+            username: Option<&'static str>,
+            password: Option<&'static str>,
+            expected_auth: Option<String>,
+        }
+        let cases = [
+            Case {
+                label: "both",
+                username: Some("opencode"),
+                password: Some("secret"),
+                expected_auth: Some(expected_basic("opencode", "secret")),
+            },
+            Case {
+                label: "username only",
+                username: Some("opencode"),
+                password: None,
+                expected_auth: None,
+            },
+            Case {
+                label: "password only",
+                username: None,
+                password: Some("secret"),
+                expected_auth: None,
+            },
+            Case {
+                label: "neither",
+                username: None,
+                password: None,
+                expected_auth: None,
+            },
+        ];
+        for case in &cases {
+            let client = Client::with_base_url(None, server.base_url(), case.username, case.password);
+            let _ = client.list_models().await;
+        }
+
+        assert_eq!(server.request_count(), cases.len());
+        for (index, case) in cases.iter().enumerate() {
+            assert_eq!(
+                request_at(&server, index).header("authorization"),
+                case.expected_auth.as_deref(),
+                "case: {}",
+                case.label
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_posts_the_message_endpoint_with_parts_model_variant_agent_and_message_id() {
+        let server = TestHttpServer::start().await;
+        server.route(
+            "POST",
+            "/session/ses_1/message",
+            200,
+            serde_json::json!({
+                "info": {"id": "msg_a1", "parentID": "msg_u1"},
+                "parts": [{"type": "text", "text": "reply"}],
+            })
+            .to_string(),
+        );
+        let client = wire_client(&server, None);
+        let model = parse_model("opencode-go/deepseek-v4-flash").unwrap();
+        let images = vec![ImageInput {
+            mime: "image/png".to_string(),
+            data_base64: "QUJD".to_string(),
+        }];
+
+        let response = client
+            .prompt(
+                "ses_1",
+                "hello",
+                &images,
+                Some(&model),
+                Some("high"),
+                Some("build"),
+                Some("msg_cola_abc"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.id, "msg_a1");
+        assert_eq!(response.parent_id.as_deref(), Some("msg_u1"));
+        assert_eq!(
+            response.parts,
+            serde_json::json!([{"type": "text", "text": "reply"}])
+        );
+        assert!(response.error.is_none());
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/session/ses_1/message");
+        assert_eq!(request.query, "");
+        assert_eq!(request.header("content-type"), Some("application/json"));
+        let expected = expected_basic("opencode", "secret");
+        assert_eq!(request.header("authorization"), Some(expected.as_str()));
+        let body = body_json(&request);
+        assert_eq!(body["parts"][0]["type"], "text");
+        assert_eq!(body["parts"][0]["text"], "hello");
+        assert_eq!(body["parts"][1]["type"], "file");
+        assert_eq!(body["parts"][1]["mime"], "image/png");
+        assert_eq!(body["parts"][1]["url"], "data:image/png;base64,QUJD");
+        assert_eq!(body["model"]["providerID"], "opencode-go");
+        assert_eq!(body["model"]["modelID"], "deepseek-v4-flash");
+        assert_eq!(body["variant"], "high");
+        assert_eq!(body["agent"], "build");
+        assert_eq!(body["messageID"], "msg_cola_abc");
+    }
+
+    #[tokio::test]
+    async fn prompt_model_prefers_the_override_then_the_configured_default_then_the_server() {
+        let server = TestHttpServer::start().await;
+        server.route(
+            "POST",
+            "/session/ses_override/message",
+            200,
+            r#"{"info":{"id":"msg_1"},"parts":[]}"#,
+        );
+        server.route(
+            "POST",
+            "/session/ses_default/message",
+            200,
+            r#"{"info":{"id":"msg_2"},"parts":[]}"#,
+        );
+        server.route(
+            "POST",
+            "/session/ses_server/message",
+            200,
+            r#"{"info":{"id":"msg_3"},"parts":[]}"#,
+        );
+        let client = wire_client(&server, Some("opencode-go/configured-model"));
+        let override_model = parse_model("other/override-model").unwrap();
+
+        client
+            .prompt("ses_override", "a", &[], Some(&override_model), None, None, None)
+            .await
+            .unwrap();
+        client
+            .prompt("ses_default", "b", &[], None, None, None, None)
+            .await
+            .unwrap();
+        let client_without_default = wire_client(&server, None);
+        client_without_default
+            .prompt("ses_server", "c", &[], None, None, None, None)
+            .await
+            .unwrap();
+
+        let override_body = body_json(&request_at(&server, 0));
+        assert_eq!(override_body["model"]["providerID"], "other");
+        assert_eq!(override_body["model"]["modelID"], "override-model");
+        let default_body = body_json(&request_at(&server, 1));
+        assert_eq!(default_body["model"]["providerID"], "opencode-go");
+        assert_eq!(default_body["model"]["modelID"], "configured-model");
+        let server_body = body_json(&request_at(&server, 2));
+        assert!(
+            server_body.get("model").is_none(),
+            "neither override nor default must leave the model to the server: {server_body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_surfaces_a_provider_error_carried_on_a_200_response() {
+        let server = TestHttpServer::start().await;
+        server.route(
+            "POST",
+            "/session/ses_1/message",
+            200,
+            serde_json::json!({
+                "info": {"id": "msg_a1", "error": {"data": {"message": "provider 503"}}},
+                "parts": [],
+            })
+            .to_string(),
+        );
+        let client = wire_client(&server, None);
+
+        let response = client
+            .prompt("ses_1", "hi", &[], None, None, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(response.error.as_deref(), Some("provider 503"));
+    }
+
+    #[tokio::test]
+    async fn prompt_maps_404_to_session_not_found() {
+        let server = TestHttpServer::start().await; // no route -> 404
+        let client = wire_client(&server, None);
+
+        let err = client
+            .prompt("ses_gone", "hi", &[], None, None, None, None)
+            .await
+            .unwrap_err();
+
+        match err {
+            BridgeError::SessionNotFound(id) => assert_eq!(id, "ses_gone"),
+            other => panic!("expected BridgeError::SessionNotFound, got: {other:?}"),
+        }
+        assert_eq!(last_request(&server).path, "/session/ses_gone/message");
+    }
+
+    #[tokio::test]
+    async fn prompt_maps_a_failed_status_to_a_diagnostic_opencode_error() {
+        let server = TestHttpServer::start().await;
+        server.route("POST", "/session/ses_1/message", 500, r#"{"error":"boom"}"#);
+        let client = wire_client(&server, None);
+
+        let message = opencode_error(
+            client
+                .prompt("ses_1", "hi", &[], None, None, None, None)
+                .await
+                .unwrap_err(),
+        );
+
+        assert!(message.contains("prompt ses_1 failed"), "unexpected: {message}");
+        assert!(message.contains("500"), "unexpected: {message}");
+        assert!(message.contains("boom"), "unexpected: {message}");
+    }
+
+    #[tokio::test]
+    async fn prompt_reports_a_non_json_success_body_as_a_decode_error() {
+        let server = TestHttpServer::start().await;
+        server.route_raw(
+            "POST",
+            "/session/ses_1/message",
+            200,
+            "text/html",
+            "<html>oops</html>",
+        );
+        let client = wire_client(&server, None);
+
+        let message = opencode_error(
+            client
+                .prompt("ses_1", "hi", &[], None, None, None, None)
+                .await
+                .unwrap_err(),
+        );
+
+        assert!(message.contains("prompt decode"), "unexpected: {message}");
+        assert!(message.contains("oops"), "unexpected: {message}");
+    }
+
+    #[tokio::test]
+    async fn prompt_async_posts_fire_and_forget_with_the_same_payload() {
+        let server = TestHttpServer::start().await;
+        server.route("POST", "/session/ses_1/prompt_async", 204, "");
+        let client = wire_client(&server, None);
+        let model = parse_model("opencode-go/deepseek-v4-flash").unwrap();
+
+        client
+            .prompt_async(
+                "ses_1",
+                "supplement",
+                &[],
+                Some(&model),
+                Some("low"),
+                Some("build"),
+                Some("msg_cola_def"),
+            )
+            .await
+            .unwrap();
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/session/ses_1/prompt_async");
+        assert_eq!(request.query, "");
+        let body = body_json(&request);
+        assert_eq!(body["parts"][0]["type"], "text");
+        assert_eq!(body["parts"][0]["text"], "supplement");
+        assert_eq!(body["model"]["modelID"], "deepseek-v4-flash");
+        assert_eq!(body["variant"], "low");
+        assert_eq!(body["agent"], "build");
+        assert_eq!(body["messageID"], "msg_cola_def");
+    }
+
+    #[tokio::test]
+    async fn prompt_async_maps_a_failed_status_to_a_diagnostic_opencode_error() {
+        let server = TestHttpServer::start().await;
+        server.route("POST", "/session/ses_1/prompt_async", 500, "nope");
+        let client = wire_client(&server, None);
+
+        let message = opencode_error(
+            client
+                .prompt_async("ses_1", "hi", &[], None, None, None, None)
+                .await
+                .unwrap_err(),
+        );
+
+        assert!(message.contains("prompt_async ses_1"), "unexpected: {message}");
+        assert!(message.contains("500"), "unexpected: {message}");
+        assert!(message.contains("nope"), "unexpected: {message}");
+    }
+
+    #[tokio::test]
+    async fn create_session_posts_the_input_and_parses_the_data_envelope() {
+        let server = TestHttpServer::start().await;
+        server.route(
+            "POST",
+            "/api/session",
+            200,
+            serde_json::json!({
+                "data": {
+                    "id": "ses_new",
+                    "projectID": "proj_x",
+                    "agent": "build",
+                    "cost": 0.0,
+                    "time": {"created": 1700000000000i64, "updated": 1700000100000i64},
+                    "title": "新会话",
+                    "location": {"directory": "/work/cola"},
+                },
+            })
+            .to_string(),
+        );
+        let client = wire_client(&server, None);
+        let input = CreateSessionInput {
+            id: None,
+            agent: Some("build".to_string()),
+            model: parse_model("opencode-go/deepseek-v4-flash"),
+            location: Some(Location {
+                directory: "/work/cola".to_string(),
+            }),
+        };
+
+        let session = client.create_session(&input).await.unwrap();
+
+        assert_eq!(session.id, "ses_new");
+        assert_eq!(session.title.as_deref(), Some("新会话"));
+        assert_eq!(session.agent.as_deref(), Some("build"));
+        assert_eq!(
+            session.time.as_ref().map(|time| time.created),
+            Some(1700000000000)
+        );
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/api/session");
+        assert_eq!(request.query, "");
+        let body = body_json(&request);
+        assert!(body.get("id").is_none(), "an unset id must be omitted: {body}");
+        assert_eq!(body["agent"], "build");
+        assert_eq!(body["model"]["providerID"], "opencode-go");
+        assert_eq!(body["model"]["id"], "deepseek-v4-flash");
+        assert_eq!(body["location"]["directory"], "/work/cola");
+    }
+
+    #[tokio::test]
+    async fn list_sessions_gets_the_experimental_route_and_parses_camelcase_entries() {
+        let server = TestHttpServer::start().await;
+        server.route(
+            "GET",
+            "/experimental/session",
+            200,
+            serde_json::json!([{
+                "id": "ses_a",
+                "title": "重构",
+                "directory": "/work/cola",
+                "parentID": "ses_parent",
+                "agent": "build",
+                "model": {"id": "deepseek-v4-flash", "providerID": "opencode-go"},
+                "time": {"created": 1700000000000i64, "updated": 1700000100000i64},
+            }])
+            .to_string(),
+        );
+        let client = wire_client(&server, None);
+
+        let sessions = client.list_sessions().await.unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "ses_a");
+        assert_eq!(sessions[0].title, "重构");
+        assert_eq!(sessions[0].directory, "/work/cola");
+        assert_eq!(sessions[0].parent_id.as_deref(), Some("ses_parent"));
+        assert!(sessions[0].is_child());
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/experimental/session");
+        assert_eq!(request.query, "");
+    }
+
+    #[tokio::test]
+    async fn list_sessions_falls_back_to_the_project_scoped_route_on_404() {
+        let server = TestHttpServer::start().await;
+        server.route("GET", "/experimental/session", 404, r#"{"error":"no"}"#);
+        server.route(
+            "GET",
+            "/session",
+            200,
+            serde_json::json!([{
+                "id": "ses_old",
+                "title": "old",
+                "directory": "/w",
+                "time": {"created": 1, "updated": 2},
+            }])
+            .to_string(),
+        );
+        let client = wire_client(&server, None);
+
+        let sessions = client.list_sessions().await.unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "ses_old");
+        assert_eq!(server.request_count(), 2);
+        assert_eq!(request_at(&server, 0).path, "/experimental/session");
+        assert_eq!(request_at(&server, 1).path, "/session");
+    }
+
+    #[tokio::test]
+    async fn list_sessions_only_falls_back_on_404() {
+        let server = TestHttpServer::start().await;
+        server.route("GET", "/experimental/session", 500, r#"{"error":"boom"}"#);
+        let client = wire_client(&server, None);
+
+        let err = client.list_sessions().await.unwrap_err();
+
+        assert!(matches!(err, BridgeError::Http(_)), "unexpected: {err:?}");
+        assert_eq!(server.request_count(), 1, "a 500 must not fall back to /session");
+        assert_eq!(request_at(&server, 0).path, "/experimental/session");
+    }
+
+    #[tokio::test]
+    async fn update_session_title_patches_the_canonical_session_route() {
+        let server = TestHttpServer::start().await;
+        server.route("PATCH", "/session/ses_1", 200, r#"{"id":"ses_1"}"#);
+        let client = wire_client(&server, None);
+
+        client.update_session_title("ses_1", "新标题").await.unwrap();
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "PATCH");
+        assert_eq!(request.path, "/session/ses_1");
+        assert_eq!(request.query, "");
+        assert_eq!(body_json(&request), serde_json::json!({"title": "新标题"}));
+    }
+
+    #[tokio::test]
+    async fn session_info_sends_the_directory_scope_and_parses_the_parent_chain() {
+        let server = TestHttpServer::start().await;
+        server.route(
+            "GET",
+            "/session/ses_child",
+            200,
+            serde_json::json!({
+                "id": "ses_child",
+                "parentID": "ses_parent",
+                "title": "子会话",
+                "model": {"providerID": "opencode-go", "id": "deepseek-v4-flash"},
+            })
+            .to_string(),
+        );
+        let client = wire_client(&server, None);
+
+        let info = client
+            .session_info("ses_child", Some("/work/cola"))
+            .await
+            .unwrap();
+
+        assert_eq!(info.id, "ses_child");
+        assert_eq!(info.parent_id.as_deref(), Some("ses_parent"));
+        assert_eq!(info.title.as_deref(), Some("子会话"));
+        let model = info.model.as_ref().expect("model should parse");
+        assert_eq!(model.provider_id, "opencode-go");
+        assert_eq!(model.id, "deepseek-v4-flash");
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/session/ses_child");
+        assert_eq!(request.query_param("directory").as_deref(), Some("/work/cola"));
+
+        client.session_info("ses_child", None).await.unwrap();
+        assert_eq!(request_at(&server, 1).query, "", "no directory means no query");
+    }
+
+    #[tokio::test]
+    async fn session_status_parses_each_status_and_treats_an_absent_session_as_idle() {
+        let server = TestHttpServer::start().await;
+        server.route(
+            "GET",
+            "/session/status",
+            200,
+            serde_json::json!({
+                "ses_idle": {"type": "idle"},
+                "ses_busy": {"type": "busy"},
+                "ses_retry": {"type": "retry", "attempt": 1, "message": "boom", "next": 5000},
+                "ses_weird": {"type": "zombie"},
+            })
+            .to_string(),
+        );
+        let client = wire_client(&server, None);
+
+        assert_eq!(
+            client
+                .session_status("ses_idle", Some("/work/cola"))
+                .await
+                .unwrap(),
+            Some(SessionStatus::Idle)
+        );
+        assert_eq!(
+            client.session_status("ses_busy", None).await.unwrap(),
+            Some(SessionStatus::Busy)
+        );
+        assert_eq!(
+            client.session_status("ses_retry", None).await.unwrap(),
+            Some(SessionStatus::Retry)
+        );
+        assert_eq!(client.session_status("ses_weird", None).await.unwrap(), None);
+        assert_eq!(
+            client.session_status("ses_absent", None).await.unwrap(),
+            Some(SessionStatus::Idle)
+        );
+
+        assert_eq!(request_at(&server, 0).path, "/session/status");
+        assert_eq!(
+            request_at(&server, 0).query_param("directory").as_deref(),
+            Some("/work/cola")
+        );
+        assert_eq!(request_at(&server, 1).query, "", "no directory means no query");
+    }
+
+    #[tokio::test]
+    async fn session_status_surfaces_http_and_decode_failures() {
+        let down = TestHttpServer::start().await;
+        down.route("GET", "/session/status", 500, r#"{"error":"boom"}"#);
+        let client = wire_client(&down, None);
+        let message = opencode_error(client.session_status("ses_1", None).await.unwrap_err());
+        assert!(message.contains("session status failed"), "unexpected: {message}");
+        assert!(message.contains("500"), "unexpected: {message}");
+
+        let garbled = TestHttpServer::start().await;
+        garbled.route_raw("GET", "/session/status", 200, "text/html", "<html>nope</html>");
+        let client = wire_client(&garbled, None);
+        let message = opencode_error(client.session_status("ses_1", None).await.unwrap_err());
+        assert!(message.contains("session status parse"), "unexpected: {message}");
+        assert!(message.contains("nope"), "unexpected: {message}");
+    }
+
+    #[tokio::test]
+    async fn list_permissions_sends_the_directory_scope_and_parses_requests() {
+        let server = TestHttpServer::start().await;
+        server.route(
+            "GET",
+            "/permission",
+            200,
+            serde_json::json!([{
+                "id": "per_1",
+                "sessionID": "ses_1",
+                "permission": "bash",
+                "patterns": ["rm -rf *"],
+                "always": [],
+                "metadata": {"command": "rm"},
+            }])
+            .to_string(),
+        );
+        let client = wire_client(&server, None);
+
+        let permissions = client.list_permissions(Some("/work/cola")).await.unwrap();
+
+        assert_eq!(permissions.len(), 1);
+        assert_eq!(permissions[0].request_id, "per_1");
+        assert_eq!(permissions[0].session_id.as_deref(), Some("ses_1"));
+        assert_eq!(permissions[0].permission.as_deref(), Some("bash"));
+        assert_eq!(permissions[0].patterns, vec!["rm -rf *"]);
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/permission");
+        assert_eq!(request.query_param("directory").as_deref(), Some("/work/cola"));
+    }
+
+    #[tokio::test]
+    async fn list_permissions_maps_a_failed_status_to_a_diagnostic_opencode_error() {
+        let server = TestHttpServer::start().await;
+        server.route("GET", "/permission", 502, r#"{"error":"bad gateway"}"#);
+        let client = wire_client(&server, None);
+
+        let message = opencode_error(client.list_permissions(None).await.unwrap_err());
+
+        assert!(
+            message.contains("permission list failed"),
+            "unexpected: {message}"
+        );
+        assert!(message.contains("502"), "unexpected: {message}");
+    }
+
+    #[tokio::test]
+    async fn reply_permission_posts_the_reply_with_the_directory_scope() {
+        let server = TestHttpServer::start().await;
+        server.route("POST", "/permission/per_1/reply", 200, r#"{"code":0}"#);
+        server.route(
+            "POST",
+            "/permission/per_gone/reply",
+            404,
+            r#"{"error":"not found"}"#,
+        );
+        let client = wire_client(&server, None);
+
+        client
+            .reply_permission("per_1", "always", Some("/work/cola"))
+            .await
+            .unwrap();
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/permission/per_1/reply");
+        assert_eq!(request.query_param("directory").as_deref(), Some("/work/cola"));
+        assert_eq!(body_json(&request), serde_json::json!({"reply": "always"}));
+
+        // A 404 means the request was already resolved elsewhere — the benign
+        // NotFound variant, not a transport failure.
+        let message = not_found_error(
+            client
+                .reply_permission("per_gone", "once", None)
+                .await
+                .unwrap_err(),
+        );
+        assert!(message.contains("permission per_gone"), "unexpected: {message}");
+    }
+
+    #[tokio::test]
+    async fn list_questions_sends_the_directory_scope_and_parses_questions() {
+        let server = TestHttpServer::start().await;
+        server.route(
+            "GET",
+            "/question",
+            200,
+            serde_json::json!([{
+                "id": "q_1",
+                "sessionID": "ses_1",
+                "questions": [{
+                    "question": "选哪个？",
+                    "header": "选择",
+                    "options": [
+                        {"label": "A", "description": "first"},
+                        {"label": "B", "description": "second"},
+                    ],
+                    "multiple": true,
+                    "custom": false,
+                }],
+            }])
+            .to_string(),
+        );
+        let client = wire_client(&server, None);
+
+        let questions = client.list_questions(Some("/work/cola")).await.unwrap();
+
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].id, "q_1");
+        assert_eq!(questions[0].session_id, "ses_1");
+        assert_eq!(questions[0].questions[0].question, "选哪个？");
+        assert_eq!(questions[0].questions[0].options[0].label, "A");
+        assert_eq!(questions[0].questions[0].multiple, Some(true));
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/question");
+        assert_eq!(request.query_param("directory").as_deref(), Some("/work/cola"));
+    }
+
+    #[tokio::test]
+    async fn reply_question_posts_answers_with_the_directory_scope() {
+        let server = TestHttpServer::start().await;
+        server.route("POST", "/question/q_1/reply", 200, r#"{"code":0}"#);
+        server.route("POST", "/question/q_gone/reply", 404, r#"{"error":"not found"}"#);
+        let client = wire_client(&server, None);
+
+        client
+            .reply_question(
+                "q_1",
+                &[vec!["A".to_string()], vec!["B".to_string(), "C".to_string()]],
+                Some("/work/cola"),
+            )
+            .await
+            .unwrap();
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/question/q_1/reply");
+        assert_eq!(request.query_param("directory").as_deref(), Some("/work/cola"));
+        assert_eq!(
+            body_json(&request),
+            serde_json::json!({"answers": [["A"], ["B", "C"]]})
+        );
+
+        let message = not_found_error(client.reply_question("q_gone", &[], None).await.unwrap_err());
+        assert!(message.contains("question q_gone"), "unexpected: {message}");
+    }
+
+    #[tokio::test]
+    async fn reject_question_posts_with_the_directory_scope() {
+        let server = TestHttpServer::start().await;
+        server.route("POST", "/question/q_1/reject", 200, r#"{"code":0}"#);
+        server.route("POST", "/question/q_gone/reject", 404, r#"{"error":"not found"}"#);
+        let client = wire_client(&server, None);
+
+        client.reject_question("q_1", Some("/work/cola")).await.unwrap();
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/question/q_1/reject");
+        assert_eq!(request.query_param("directory").as_deref(), Some("/work/cola"));
+        assert_eq!(request.body, "", "reject carries no body");
+
+        let message = not_found_error(client.reject_question("q_gone", None).await.unwrap_err());
+        assert!(message.contains("question q_gone"), "unexpected: {message}");
     }
 }
