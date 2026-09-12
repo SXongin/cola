@@ -9,6 +9,7 @@ pub mod request;
 pub mod session;
 pub mod snapshot;
 pub mod streaming;
+pub mod turn;
 
 #[cfg(test)]
 pub(crate) mod test_support;
