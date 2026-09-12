@@ -103,8 +103,8 @@ Note: CI's Format job is `cargo fmt --all -- --check` — clippy and rustc do
    merge — it lands on `main` as the commit message's subject, so make it
    accurate and complete).
 2. **Description** answers: what changed, why, and how it was verified.
-3. Reference the originating issue/spec when one exists (`.scratch/<feature>/`
-   files or a GitHub issue number).
+3. Reference the originating issue/spec when one exists (a GitHub issue
+   number; archive specs live under `.scratch/<feature>/`).
 4. Record architectural decisions as ADRs in `docs/adr/` when the change is
    hard to reverse.
 5. Do not merge until CI (fmt, clippy, test, release build, dependency audit) is
