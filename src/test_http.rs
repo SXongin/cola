@@ -132,6 +132,18 @@ impl Drop for TestHttpServer {
     }
 }
 
+/// A transport that never routes through the developer machine's env proxy.
+/// Wire tests bind a loopback fake server and must behave the same in a
+/// proxied shell as in CI (ticket 09); production clients keep honoring env
+/// proxies. Auth headers stay the caller's business, built exactly as
+/// production builds them (ADR-0031).
+pub fn no_proxy_transport() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("failed to build the no-proxy test transport")
+}
+
 async fn handle_connection(stream: tokio::net::TcpStream, state: Arc<ServerState>) {
     let mut reader = tokio::io::BufReader::new(stream);
     let Some(request) = read_request(&mut reader).await else {
@@ -243,7 +255,7 @@ mod tests {
         let server = TestHttpServer::start().await;
         server.route("POST", "/echo", 200, r#"{"code":0}"#);
 
-        let response = reqwest::Client::new()
+        let response = no_proxy_transport()
             .post(format!("{}/echo?a=1&b=two", server.base_url()))
             .header("x-test", "yes")
             .body("hello")
@@ -267,7 +279,7 @@ mod tests {
     async fn unrouted_request_gets_a_diagnostic_404() {
         let server = TestHttpServer::start().await;
 
-        let response = reqwest::Client::new()
+        let response = no_proxy_transport()
             .get(format!("{}/nope", server.base_url()))
             .send()
             .await

@@ -52,6 +52,17 @@ struct HttpHandle {
 /// Basic auth (OpenCode server password). Reused on reconnect so a changed
 /// password produces a fresh client.
 fn build_http_client(username: &Option<String>, password: &Option<String>) -> reqwest::Client {
+    build_http_client_with(username, password, false)
+}
+
+/// The shared transport builder. `no_proxy` is set only by wire tests: their
+/// fake server is loopback, and a developer shell that exports `http_proxy`
+/// must not intercept it — production keeps honoring env proxies (ticket 09).
+fn build_http_client_with(
+    username: &Option<String>,
+    password: &Option<String>,
+    no_proxy: bool,
+) -> reqwest::Client {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(reqwest::header::CONTENT_TYPE, "application/json".parse().unwrap());
 
@@ -62,6 +73,10 @@ fn build_http_client(username: &Option<String>, password: &Option<String>) -> re
         // real turns. Long waits on an established connection are bounded by
         // the callers that can afford to give up (e.g. the request poller).
         .connect_timeout(std::time::Duration::from_secs(10));
+
+    if no_proxy {
+        builder = builder.no_proxy();
+    }
 
     if let (Some(user), Some(pass)) = (username, password) {
         let auth = format!("{}:{}", user, pass);
@@ -397,6 +412,13 @@ impl Client {
             .json(&body)
             .send()
             .await?;
+        // Same canonical 404 meaning as `prompt`: the session does not exist on
+        // this server. Keep the taxonomy aligned (`is_session_not_found`) even
+        // though today's only caller replies the same way for every error —
+        // the wire client reports what the server said, the bridge decides.
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(crate::error::BridgeError::SessionNotFound(session_id.to_string()));
+        }
         if !resp.status().is_success() {
             return Err(crate::error::BridgeError::OpenCode(format!(
                 "prompt_async {}: {} {}",
@@ -820,6 +842,7 @@ pub struct ModelOption {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
+    #[serde(rename = "projectID")]
     pub project_id: Option<String>,
     pub agent: Option<String>,
     pub title: Option<String>,
@@ -1441,9 +1464,23 @@ mod wire_tests {
     use crate::test_http::{RecordedRequest, TestHttpServer};
 
     /// A client pointed at the fake server with both Basic-auth parts set —
-    /// what discovery hands production.
+    /// what discovery hands production. The transport is swapped for a
+    /// no-proxy one so a developer shell's `http_proxy` cannot intercept the
+    /// loopback fake server (ticket 09); construction itself stays production's.
     fn wire_client(server: &TestHttpServer, model: Option<&str>) -> Client {
-        Client::with_base_url(model, server.base_url(), Some("opencode"), Some("secret"))
+        without_env_proxy(
+            Client::with_base_url(model, server.base_url(), Some("opencode"), Some("secret")),
+            Some("opencode"),
+            Some("secret"),
+        )
+    }
+
+    /// Point a wire-test client at the no-proxy transport, keeping every other
+    /// byte of its construction exactly as production built it (ADR-0031).
+    fn without_env_proxy(client: Client, username: Option<&str>, password: Option<&str>) -> Client {
+        client.http.write().unwrap().client =
+            build_http_client_with(&username.map(str::to_string), &password.map(str::to_string), true);
+        client
     }
 
     /// The request at `index` in arrival order.
@@ -1488,13 +1525,17 @@ mod wire_tests {
     async fn new_binds_the_resolved_server_url_and_credentials() {
         let server = TestHttpServer::start().await;
         server.route("GET", "/provider", 200, r#"{"all":[],"connected":[]}"#);
-        let client = Client::new(
-            None,
-            Some(crate::bridge::discovery::ResolvedServer {
-                url: server.base_url(),
-                username: "custom-user".to_string(),
-                password: "custom-pass".to_string(),
-            }),
+        let client = without_env_proxy(
+            Client::new(
+                None,
+                Some(crate::bridge::discovery::ResolvedServer {
+                    url: server.base_url(),
+                    username: "custom-user".to_string(),
+                    password: "custom-pass".to_string(),
+                }),
+            ),
+            Some("custom-user"),
+            Some("custom-pass"),
         );
 
         assert_eq!(client.base_url(), server.base_url());
@@ -1510,7 +1551,11 @@ mod wire_tests {
     async fn with_base_url_trims_a_trailing_slash() {
         let server = TestHttpServer::start().await;
         server.route("GET", "/provider", 200, r#"{"all":[],"connected":[]}"#);
-        let client = Client::with_base_url(None, format!("{}/", server.base_url()), None, None);
+        let client = without_env_proxy(
+            Client::with_base_url(None, format!("{}/", server.base_url()), None, None),
+            None,
+            None,
+        );
 
         assert_eq!(client.base_url(), server.base_url());
         assert_eq!(client.model_context_window("p", "m").await.unwrap(), None);
@@ -1555,7 +1600,11 @@ mod wire_tests {
             },
         ];
         for case in &cases {
-            let client = Client::with_base_url(None, server.base_url(), case.username, case.password);
+            let client = without_env_proxy(
+                Client::with_base_url(None, server.base_url(), case.username, case.password),
+                case.username,
+                case.password,
+            );
             let _ = client.list_models().await;
         }
 
@@ -1815,6 +1864,22 @@ mod wire_tests {
     }
 
     #[tokio::test]
+    async fn prompt_async_maps_404_to_session_not_found() {
+        let server = TestHttpServer::start().await; // no route -> 404
+        let client = wire_client(&server, None);
+
+        let err = client
+            .prompt_async("ses_gone", "hi", &[], None, None, None, None)
+            .await
+            .unwrap_err();
+
+        match err {
+            BridgeError::SessionNotFound(id) => assert_eq!(id, "ses_gone"),
+            other => panic!("expected BridgeError::SessionNotFound, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn create_session_posts_the_input_and_parses_the_data_envelope() {
         let server = TestHttpServer::start().await;
         server.route(
@@ -1847,6 +1912,7 @@ mod wire_tests {
         let session = client.create_session(&input).await.unwrap();
 
         assert_eq!(session.id, "ses_new");
+        assert_eq!(session.project_id.as_deref(), Some("proj_x"));
         assert_eq!(session.title.as_deref(), Some("新会话"));
         assert_eq!(session.agent.as_deref(), Some("build"));
         assert_eq!(
