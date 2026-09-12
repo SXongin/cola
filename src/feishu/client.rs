@@ -761,7 +761,7 @@ struct MessagesData {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_http::TestHttpServer;
+    use crate::test_http::{RecordedRequest, TestHttpServer};
 
     const TOKEN_PATH: &str = "/open-apis/auth/v3/tenant_access_token/internal";
 
@@ -776,6 +776,35 @@ mod tests {
         let server = TestHttpServer::start().await;
         server.route("POST", TOKEN_PATH, 200, response.to_string());
         server
+    }
+
+    /// A server with a working token route plus a client pointed at it.
+    async fn wire_client() -> (TestHttpServer, Client) {
+        let server = token_server(serde_json::json!({
+            "code": 0,
+            "msg": "ok",
+            "tenant_access_token": "t-abc",
+            "expire": 7200,
+        }))
+        .await;
+        let client = Client::with_base_url(test_config(), server.base_url());
+        (server, client)
+    }
+
+    /// The request under test (the token fetch comes first in the log).
+    fn last_request(server: &TestHttpServer) -> RecordedRequest {
+        server.requests().pop().expect("a request should have been sent")
+    }
+
+    fn body_json(request: &RecordedRequest) -> serde_json::Value {
+        serde_json::from_str(&request.body).expect("request body should be JSON")
+    }
+
+    /// Parse the JSON string inside a message `content` field (a card or text).
+    fn send_content(request: &RecordedRequest) -> serde_json::Value {
+        let body = body_json(request);
+        serde_json::from_str(body["content"].as_str().expect("content should be a string"))
+            .expect("content should be JSON")
     }
 
     #[tokio::test]
@@ -864,5 +893,565 @@ mod tests {
         }
         assert_eq!(server.request_count(), 1);
         assert_eq!(server.requests()[0].path, TOKEN_PATH);
+    }
+
+    #[tokio::test]
+    async fn reply_card_sends_interactive_content_and_returns_message_id() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/messages/om_42/reply",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"message_id":"om_reply"}}"#,
+        );
+        let card = serde_json::json!({"elements": [{"tag": "markdown", "content": "hi"}]});
+
+        let id = client.reply_card("om_42", &card).await.unwrap();
+        assert_eq!(id, "om_reply");
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/open-apis/im/v1/messages/om_42/reply");
+        assert_eq!(request.query, "");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
+        let body = body_json(&request);
+        assert_eq!(body["msg_type"], "interactive");
+        assert_eq!(body["content"], card.to_string());
+    }
+
+    #[tokio::test]
+    async fn send_card_carries_receive_id_type_and_receive_id() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/messages",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"message_id":"om_sent"}}"#,
+        );
+        let card = serde_json::json!({"elements": []});
+
+        let id = client.send_card("chat_id", "oc_123", &card).await.unwrap();
+        assert_eq!(id, "om_sent");
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/open-apis/im/v1/messages");
+        assert_eq!(request.query_param("receive_id_type").as_deref(), Some("chat_id"));
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
+        let body = body_json(&request);
+        assert_eq!(body["receive_id"], "oc_123");
+        assert_eq!(body["msg_type"], "interactive");
+        assert_eq!(body["content"], card.to_string());
+    }
+
+    #[tokio::test]
+    async fn send_card_maps_business_error_code() {
+        let (server, client) = wire_client().await;
+        // Feishu error envelopes still carry a `data` object; the client maps
+        // the non-zero code to a diagnostic error.
+        server.route(
+            "POST",
+            "/open-apis/im/v1/messages",
+            200,
+            r#"{"code":230001,"msg":"invalid receive_id","data":{"message_id":""}}"#,
+        );
+
+        let err = client
+            .send_card("chat_id", "oc_bad", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        match err {
+            crate::error::BridgeError::Feishu(message) => {
+                assert!(
+                    message.contains("send card error 230001"),
+                    "unexpected error: {message}"
+                );
+                assert!(
+                    message.contains("invalid receive_id"),
+                    "unexpected error: {message}"
+                );
+            }
+            other => panic!("expected BridgeError::Feishu, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_message_patches_the_card() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "PATCH",
+            "/open-apis/im/v1/messages/om_42",
+            200,
+            r#"{"code":0,"msg":"ok"}"#,
+        );
+        let card = serde_json::json!({"elements": [{"tag": "markdown", "content": "updated"}]});
+
+        client.update_message("om_42", &card).await.unwrap();
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "PATCH");
+        assert_eq!(request.path, "/open-apis/im/v1/messages/om_42");
+        assert_eq!(request.query, "");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
+        assert_eq!(body_json(&request)["content"], card.to_string());
+    }
+
+    #[tokio::test]
+    async fn reply_text_wraps_text_in_a_markdown_card() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/messages/om_42/reply",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"message_id":"om_reply"}}"#,
+        );
+
+        let id = client.reply_text("om_42", "hello <world>").await.unwrap();
+        assert_eq!(id, "om_reply");
+
+        let request = last_request(&server);
+        assert_eq!(request.path, "/open-apis/im/v1/messages/om_42/reply");
+        let content = send_content(&request);
+        assert_eq!(content["config"]["wide_screen_mode"], true);
+        assert_eq!(content["elements"][0]["tag"], "markdown");
+        assert_eq!(content["elements"][0]["content"], "hello <world>");
+    }
+
+    #[tokio::test]
+    async fn reply_card_in_thread_requests_a_thread_reply_and_parses_thread_id() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/messages/om_42/reply",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"message_id":"om_thread","thread_id":"omt_1"}}"#,
+        );
+        let card = serde_json::json!({"elements": []});
+
+        let (id, thread_id) = client.reply_card_in_thread("om_42", &card).await.unwrap();
+        assert_eq!(id, "om_thread");
+        assert_eq!(thread_id.as_deref(), Some("omt_1"));
+
+        let body = body_json(&last_request(&server));
+        assert_eq!(body["reply_in_thread"], true);
+        assert_eq!(body["content"], card.to_string());
+    }
+
+    #[tokio::test]
+    async fn reply_in_thread_without_topic_returns_none() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/messages/om_42/reply",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"message_id":"om_thread"}}"#,
+        );
+
+        let (id, thread_id) = client.reply_in_thread("om_42", "topic title").await.unwrap();
+        assert_eq!(id, "om_thread");
+        assert_eq!(thread_id, None);
+
+        let request = last_request(&server);
+        assert_eq!(body_json(&request)["reply_in_thread"], true);
+        assert_eq!(send_content(&request)["elements"][0]["content"], "topic title");
+    }
+
+    #[tokio::test]
+    async fn reply_completion_notice_mentions_and_escapes_the_name() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/messages/om_42/reply",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"message_id":"om_notice"}}"#,
+        );
+
+        let id = client
+            .reply_completion_notice("om_42", "ou_1", Some("Alice <Admin>"), "任务完成")
+            .await
+            .unwrap();
+        assert_eq!(id, "om_notice");
+
+        let content = send_content(&last_request(&server));
+        assert_eq!(
+            content["text"],
+            "<at user_id=\"ou_1\">Alice &lt;Admin&gt;</at> 任务完成"
+        );
+    }
+
+    #[tokio::test]
+    async fn reply_completion_notice_without_name_is_plain_text() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/messages/om_42/reply",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"message_id":"om_notice"}}"#,
+        );
+
+        client
+            .reply_completion_notice("om_42", "ou_1", None, "任务完成")
+            .await
+            .unwrap();
+
+        assert_eq!(send_content(&last_request(&server))["text"], "任务完成");
+    }
+
+    #[tokio::test]
+    async fn list_messages_sends_the_newest_first_query_and_parses_items() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "GET",
+            "/open-apis/im/v1/messages",
+            200,
+            serde_json::json!({
+                "code": 0,
+                "msg": "ok",
+                "data": {
+                    "items": [{
+                        "message_id": "om_1",
+                        "msg_type": "interactive",
+                        "create_time": "1720000000000",
+                        "chat_id": "oc_1",
+                        "sender": {"id": "cli_bot", "sender_type": "app"},
+                        "body": {"content": "card"},
+                    }],
+                },
+            })
+            .to_string(),
+        );
+
+        let messages = client.list_messages("thread", "omt_1").await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id, "om_1");
+        assert_eq!(messages[0].msg_type, "interactive");
+        assert_eq!(messages[0].chat_id, "oc_1");
+        assert_eq!(
+            messages[0]
+                .sender
+                .as_ref()
+                .and_then(|sender| sender.sender_type.as_deref()),
+            Some("app")
+        );
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/open-apis/im/v1/messages");
+        assert_eq!(
+            request.query_param("container_id_type").as_deref(),
+            Some("thread")
+        );
+        assert_eq!(request.query_param("container_id").as_deref(), Some("omt_1"));
+        assert_eq!(
+            request.query_param("sort_type").as_deref(),
+            Some("ByCreateTimeDesc")
+        );
+        assert_eq!(request.query_param("page_size").as_deref(), Some("50"));
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
+    }
+
+    #[tokio::test]
+    async fn get_message_requests_raw_card_content_and_parses_mentions() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "GET",
+            "/open-apis/im/v1/messages/om_7",
+            200,
+            serde_json::json!({
+                "code": 0,
+                "msg": "ok",
+                "data": {
+                    "items": [{
+                        "msg_type": "text",
+                        "body": {"content": r#"{"text":"hi"}"#},
+                        "mentions": [{
+                            "key": "@_user_1",
+                            "id": {"open_id": "ou_1"},
+                            "name": "Alice",
+                        }],
+                    }],
+                },
+            })
+            .to_string(),
+        );
+
+        let message = client.get_message("om_7").await.unwrap();
+        assert_eq!(message.msg_type, "text");
+        assert_eq!(message.content, r#"{"text":"hi"}"#);
+        assert_eq!(message.mentions.len(), 1);
+        assert_eq!(message.mentions[0].name.as_deref(), Some("Alice"));
+        assert_eq!(
+            message.mentions[0]
+                .id
+                .as_ref()
+                .and_then(|id| id.open_id.as_deref()),
+            Some("ou_1")
+        );
+
+        let request = last_request(&server);
+        assert_eq!(request.path, "/open-apis/im/v1/messages/om_7");
+        assert_eq!(
+            request.query_param("card_msg_content_type").as_deref(),
+            Some("raw_card_content")
+        );
+    }
+
+    #[tokio::test]
+    async fn download_image_passes_through_bytes_and_content_type() {
+        let (server, client) = wire_client().await;
+        server.route_raw(
+            "GET",
+            "/open-apis/im/v1/messages/om_7/resources/img_1",
+            200,
+            "image/png",
+            b"PNGDATA".to_vec(),
+        );
+
+        let image = client.download_image("om_7", "img_1").await.unwrap();
+        assert_eq!(image.mime, "image/png");
+        assert_eq!(image.data, b"PNGDATA");
+
+        let request = last_request(&server);
+        assert_eq!(request.path, "/open-apis/im/v1/messages/om_7/resources/img_1");
+        assert_eq!(request.query_param("type").as_deref(), Some("image"));
+    }
+
+    #[tokio::test]
+    async fn download_image_maps_http_error() {
+        let (server, client) = wire_client().await;
+        server.route_raw(
+            "GET",
+            "/open-apis/im/v1/messages/om_7/resources/img_1",
+            500,
+            "text/plain",
+            "boom",
+        );
+
+        let err = client.download_image("om_7", "img_1").await.unwrap_err();
+        match err {
+            crate::error::BridgeError::Feishu(message) => {
+                assert!(
+                    message.contains("download image failed"),
+                    "unexpected error: {message}"
+                );
+                assert!(message.contains("500"), "unexpected error: {message}");
+                assert!(message.contains("boom"), "unexpected error: {message}");
+            }
+            other => panic!("expected BridgeError::Feishu, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn user_name_reads_the_nested_name() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "GET",
+            "/open-apis/contact/v3/users/ou_1",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"user":{"name":"Alice"}}}"#,
+        );
+
+        assert_eq!(client.user_name("ou_1").await.unwrap().as_deref(), Some("Alice"));
+
+        let request = last_request(&server);
+        assert_eq!(request.path, "/open-apis/contact/v3/users/ou_1");
+        assert_eq!(request.query_param("user_id_type").as_deref(), Some("open_id"));
+    }
+
+    #[tokio::test]
+    async fn user_name_degrades_to_none_on_business_error() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "GET",
+            "/open-apis/contact/v3/users/ou_1",
+            200,
+            r#"{"code":99991,"msg":"no permission"}"#,
+        );
+
+        assert_eq!(client.user_name("ou_1").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn chat_name_reads_the_name() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "GET",
+            "/open-apis/im/v1/chats/oc_1",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"name":"Team"}}"#,
+        );
+
+        assert_eq!(client.chat_name("oc_1").await.unwrap().as_deref(), Some("Team"));
+        assert_eq!(last_request(&server).path, "/open-apis/im/v1/chats/oc_1");
+    }
+
+    #[tokio::test]
+    async fn chat_name_degrades_to_none_on_business_error() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "GET",
+            "/open-apis/im/v1/chats/oc_1",
+            200,
+            r#"{"code":99991,"msg":"no permission"}"#,
+        );
+
+        assert_eq!(client.chat_name("oc_1").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn bot_open_id_reads_bot_open_id() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "GET",
+            "/open-apis/bot/v3/info",
+            200,
+            r#"{"code":0,"msg":"ok","bot":{"open_id":"ou_bot"}}"#,
+        );
+
+        assert_eq!(client.bot_open_id().await.unwrap(), "ou_bot");
+
+        let request = last_request(&server);
+        assert_eq!(request.path, "/open-apis/bot/v3/info");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
+    }
+
+    #[tokio::test]
+    async fn bot_open_id_maps_business_error() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "GET",
+            "/open-apis/bot/v3/info",
+            200,
+            r#"{"code":10002,"msg":"bad credentials"}"#,
+        );
+
+        let err = client.bot_open_id().await.unwrap_err();
+        match err {
+            crate::error::BridgeError::Feishu(message) => {
+                assert!(
+                    message.contains("bot info error 10002"),
+                    "unexpected error: {message}"
+                );
+            }
+            other => panic!("expected BridgeError::Feishu, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_ws_endpoint_posts_credentials_and_returns_url() {
+        let server = TestHttpServer::start().await;
+        server.route(
+            "POST",
+            "/callback/ws/endpoint",
+            200,
+            r#"{"code":0,"msg":"ok","data":{"URL":"wss://ws.example"}}"#,
+        );
+        let client = Client::with_base_url(test_config(), server.base_url());
+
+        assert_eq!(client.get_ws_endpoint().await.unwrap(), "wss://ws.example");
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/callback/ws/endpoint");
+        let body = body_json(&request);
+        assert_eq!(body["AppID"], "cli_test");
+        assert_eq!(body["AppSecret"], "secret_test");
+    }
+
+    #[tokio::test]
+    async fn get_ws_endpoint_maps_business_error() {
+        let server = TestHttpServer::start().await;
+        server.route(
+            "POST",
+            "/callback/ws/endpoint",
+            200,
+            r#"{"code":1,"msg":"nope","data":{"URL":""}}"#,
+        );
+        let client = Client::with_base_url(test_config(), server.base_url());
+
+        let err = client.get_ws_endpoint().await.unwrap_err();
+        match err {
+            crate::error::BridgeError::Feishu(message) => {
+                assert!(
+                    message.contains("ws endpoint error 1"),
+                    "unexpected error: {message}"
+                );
+            }
+            other => panic!("expected BridgeError::Feishu, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reply_card_reports_an_html_error_page() {
+        let (server, client) = wire_client().await;
+        server.route_raw(
+            "POST",
+            "/open-apis/im/v1/messages/om_42/reply",
+            403,
+            "text/html",
+            "<html>blocked by proxy</html>",
+        );
+
+        let err = client
+            .reply_card("om_42", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        match err {
+            crate::error::BridgeError::Feishu(message) => {
+                assert!(
+                    message.contains("reply card HTTP 403"),
+                    "unexpected error: {message}"
+                );
+                assert!(
+                    message.contains("blocked by proxy"),
+                    "unexpected error: {message}"
+                );
+            }
+            other => panic!("expected BridgeError::Feishu, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reply_card_reports_http_5xx() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/messages/om_42/reply",
+            500,
+            r#"{"code":-1,"msg":"server exploded"}"#,
+        );
+
+        let err = client
+            .reply_card("om_42", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        match err {
+            crate::error::BridgeError::Feishu(message) => {
+                assert!(
+                    message.contains("reply card HTTP 500"),
+                    "unexpected error: {message}"
+                );
+                assert!(message.contains("server exploded"), "unexpected error: {message}");
+            }
+            other => panic!("expected BridgeError::Feishu, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_non_json_body_is_a_parse_error() {
+        let server = TestHttpServer::start().await;
+        server.route_raw("POST", TOKEN_PATH, 200, "text/html", "<html>nope</html>");
+        let client = Client::with_base_url(test_config(), server.base_url());
+
+        let err = client.get_access_token().await.unwrap_err();
+        match err {
+            crate::error::BridgeError::Feishu(message) => {
+                assert!(
+                    message.contains("parse token response"),
+                    "unexpected error: {message}"
+                );
+            }
+            other => panic!("expected BridgeError::Feishu, got: {other:?}"),
+        }
     }
 }
