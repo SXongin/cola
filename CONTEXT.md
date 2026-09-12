@@ -110,8 +110,15 @@ The "开启自动授权" control on a permission card (inline or standalone). On
 _Avoid_: Auto-authorize button, approve-all switch
 
 **Question**:
-A structured multi-choice prompt from the AI backend, distinct from permissions. User selects options to reply.
+A structured multi-choice prompt from the AI backend, distinct from
+permissions. User selects options to reply.
 _Avoid_: Poll, survey, prompt
+
+**Custom Answer** (自定义答案):
+A user-typed entry in a multi-select **Question**'s selection, standing
+alongside the backend's options: kept verbatim (never split or trimmed) and
+individually removable. Distinct from an option, which the backend supplied.
+_Avoid_: Free-text answer, custom option, note
 
 **Session Snapshot** (会话快照):
 The one read-only card a Chat/Topic receives when it activates a Session it was not already following — a first adoption, `/attach`, `/topic --adopt`, or the re-activation of a mapped Session — replacing the bare adoption confirmation. It answers what the operator cannot know at takeover: whether the last Turn ended (status line 等待你的确认 / 运行中 / 需要重试 / 空闲), what is blocked on the user (adopt-time Permissions and Questions, actionable inline), and what was recently said (最近对话 tail). Purely a read: it never prompts the Backend, writes to the Session, or disturbs a running Turn. Suppressed when re-activating a Session whose recent life is already fully visible in this Chat/Topic (the switch then confirms in one text line). An adopted-busy Session's in-flight external Turn is followed into the card until completion; every other snapshot is one-shot.
