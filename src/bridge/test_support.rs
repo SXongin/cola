@@ -922,7 +922,7 @@ pub fn long_answer_parts() -> serde_json::Value {
 
 pub(crate) mod integration_tests {
     use super::*;
-    use crate::bridge::command::{Command, RestartKind, RestartNotify, SwitchAction};
+    use crate::bridge::command::{AutoAcceptAction, Command, RestartKind, RestartNotify, SwitchAction};
 
     /// Build a `ModelOption` with the given id and declared variants.
     fn model_option(id: &str, variants: &[&str]) -> crate::opencode::client::ModelOption {
@@ -4354,39 +4354,259 @@ pub(crate) mod integration_tests {
         assert!(store.get_active(&lobby_key).is_none());
     }
 
-    /// `/topic` invoked from inside a topic is rejected with a note rather than
-    /// nesting another topic.
+    /// The topic command gate (ADR-0007, ADR-0023) is one rule table
+    /// (`Command::topic_rejection`, called from `handle_command`): `/topic` and
+    /// its adopt forms are rejected in ANY topic; `/dir`, `/switch` and `/new`
+    /// only once the topic is bound. This table drives every class through the
+    /// real dispatcher — a banned command gets exactly one rejection reply and
+    /// nothing else, an allowed command is never intercepted.
     #[tokio::test]
-    async fn topic_command_rejected_inside_existing_topic() {
-        let _wd = test_work_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = test_config(&dir.path().join("sessions.json"));
-        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    async fn topic_command_gate_rejects_banned_commands_and_lets_others_through() {
+        use crate::bridge::command::{
+            TOPIC_ADOPT_NEST_REJECTION, TOPIC_NEST_REJECTION, TOPIC_SELECTION_REJECTION,
+        };
 
-        crate::bridge::command::handle_command(
-            &app.core,
-            Command::Topic {
-                directory: Some("/root/proj/lib".into()),
-                name: None,
+        struct Case {
+            cmd: Command,
+            has_session: bool,
+            rejection: Option<&'static str>,
+        }
+
+        let work = tempfile::tempdir().unwrap();
+        let dir = work.path().to_string_lossy().to_string();
+        let cases = [
+            // `/topic` family: banned in ANY topic, bound or not.
+            Case {
+                cmd: Command::Topic {
+                    directory: Some(dir.clone()),
+                    name: None,
+                },
+                has_session: false,
+                rejection: Some(TOPIC_NEST_REJECTION),
             },
-            crate::config::ThreadKey::new("chat_1".into(), "omt_existing".into()),
-            "msg_topic",
-            crate::config::ConversationKind::Topic,
-        )
-        .await
-        .unwrap();
+            Case {
+                cmd: Command::Topic {
+                    directory: None,
+                    name: Some("n".into()),
+                },
+                has_session: true,
+                rejection: Some(TOPIC_NEST_REJECTION),
+            },
+            Case {
+                cmd: Command::TopicAdopt {
+                    keyword: "kw".into(),
+                    force: false,
+                },
+                has_session: false,
+                rejection: Some(TOPIC_ADOPT_NEST_REJECTION),
+            },
+            Case {
+                cmd: Command::TopicAdoptCard,
+                has_session: true,
+                rejection: Some(TOPIC_ADOPT_NEST_REJECTION),
+            },
+            // Selection commands: banned only once the topic is bound.
+            Case {
+                cmd: Command::Dir(dir.clone()),
+                has_session: true,
+                rejection: Some(TOPIC_SELECTION_REJECTION),
+            },
+            Case {
+                cmd: Command::DirCard,
+                has_session: true,
+                rejection: Some(TOPIC_SELECTION_REJECTION),
+            },
+            Case {
+                cmd: Command::Switch(SwitchAction::Match("kw".into())),
+                has_session: true,
+                rejection: Some(TOPIC_SELECTION_REJECTION),
+            },
+            Case {
+                cmd: Command::Switch(SwitchAction::Card),
+                has_session: true,
+                rejection: Some(TOPIC_SELECTION_REJECTION),
+            },
+            Case {
+                cmd: Command::Switch(SwitchAction::List {
+                    keyword: None,
+                    all: false,
+                }),
+                has_session: true,
+                rejection: Some(TOPIC_SELECTION_REJECTION),
+            },
+            Case {
+                cmd: Command::Switch(SwitchAction::Forget),
+                has_session: true,
+                rejection: Some(TOPIC_SELECTION_REJECTION),
+            },
+            Case {
+                cmd: Command::Switch(SwitchAction::Attach {
+                    query: "ses_x".into(),
+                    force: false,
+                }),
+                has_session: true,
+                rejection: Some(TOPIC_SELECTION_REJECTION),
+            },
+            Case {
+                cmd: Command::New(None),
+                has_session: true,
+                rejection: Some(TOPIC_SELECTION_REJECTION),
+            },
+            // Selection commands in an UNBOUND topic pass...
+            Case {
+                cmd: Command::Dir(dir.clone()),
+                has_session: false,
+                rejection: None,
+            },
+            Case {
+                cmd: Command::DirCard,
+                has_session: false,
+                rejection: None,
+            },
+            Case {
+                cmd: Command::Switch(SwitchAction::Match("kw".into())),
+                has_session: false,
+                rejection: None,
+            },
+            Case {
+                cmd: Command::Switch(SwitchAction::List {
+                    keyword: None,
+                    all: false,
+                }),
+                has_session: false,
+                rejection: None,
+            },
+            Case {
+                cmd: Command::Switch(SwitchAction::Forget),
+                has_session: false,
+                rejection: None,
+            },
+            Case {
+                cmd: Command::Switch(SwitchAction::Attach {
+                    query: "ses_x".into(),
+                    force: false,
+                }),
+                has_session: false,
+                rejection: None,
+            },
+            Case {
+                cmd: Command::New(None),
+                has_session: false,
+                rejection: None,
+            },
+            Case {
+                cmd: Command::New(Some("n".into())),
+                has_session: false,
+                rejection: None,
+            },
+            // ...and control commands even in a bound topic.
+            Case {
+                cmd: Command::Name("n".into()),
+                has_session: true,
+                rejection: None,
+            },
+            Case {
+                cmd: Command::Stop,
+                has_session: true,
+                rejection: None,
+            },
+            Case {
+                cmd: Command::Compact,
+                has_session: true,
+                rejection: None,
+            },
+            Case {
+                cmd: Command::Agent("--reset".into()),
+                has_session: true,
+                rejection: None,
+            },
+            Case {
+                cmd: Command::Think("--reset".into()),
+                has_session: true,
+                rejection: None,
+            },
+            Case {
+                cmd: Command::AutoAccept(AutoAcceptAction::Status),
+                has_session: true,
+                rejection: None,
+            },
+            Case {
+                cmd: Command::Help(None),
+                has_session: true,
+                rejection: None,
+            },
+            Case {
+                cmd: Command::Version,
+                has_session: true,
+                rejection: None,
+            },
+        ];
 
-        // No session created, no topic created — just a plain text note.
-        let calls = platform.calls.lock().await.clone();
-        assert!(
-            calls
+        let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_gate".into());
+        for (i, case) in cases.iter().enumerate() {
+            let _wd = test_work_dir();
+            let state_dir = tempfile::tempdir().unwrap();
+            let cfg = test_config(&state_dir.path().join("sessions.json"));
+            let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+            if case.has_session {
+                let mut store = app.sessions.lock().await;
+                store.set_active(crate::config::SessionEntry {
+                    thread_key: topic_key.clone(),
+                    session_id: "ses_owned".into(),
+                    directory: "/work/topic".into(),
+                    agent: None,
+                    model: None,
+                    auto_accept: false,
+                    topic_anchor: None,
+                    topic_root: None,
+                    variant: None,
+                });
+            }
+
+            crate::bridge::command::handle_command(
+                &app.core,
+                case.cmd.clone(),
+                topic_key.clone(),
+                "msg_gate",
+                crate::config::ConversationKind::Topic,
+            )
+            .await
+            .unwrap();
+
+            let calls = platform.calls.lock().await.clone();
+            let replies: Vec<String> = calls
                 .iter()
-                .all(|c| !matches!(c, PlatformCall::ReplyInThread { .. })),
-            "must not create a topic from inside a topic: {calls:?}"
-        );
-        assert!(calls.iter().any(|c| matches!(c, PlatformCall::ReplyText { .. })));
-        let store = app.sessions.lock().await;
-        assert!(store.all_entries().is_empty());
+                .filter_map(|c| match c {
+                    PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect();
+            let label = format!("case {i} ({:?}, has_session={})", case.cmd, case.has_session);
+            if let Some(reason) = case.rejection {
+                assert_eq!(
+                    calls.len(),
+                    1,
+                    "{label}: a banned command must reply once and do nothing else, got {calls:?}"
+                );
+                assert_eq!(replies, vec![reason.to_string()], "{label}: rejection text");
+                assert_eq!(
+                    app.sessions.lock().await.all_entries().len(),
+                    usize::from(case.has_session),
+                    "{label}: a banned command must not create a session mapping"
+                );
+            } else {
+                for reason in [
+                    TOPIC_SELECTION_REJECTION,
+                    TOPIC_NEST_REJECTION,
+                    TOPIC_ADOPT_NEST_REJECTION,
+                ] {
+                    assert!(
+                        !replies.iter().any(|t| t == reason),
+                        "{label}: an allowed command must not be intercepted, got {replies:?}"
+                    );
+                }
+            }
+        }
     }
 
     // ===== /topic --adopt (ADR-0016) =====
@@ -5073,54 +5293,6 @@ pub(crate) mod integration_tests {
         let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
         assert_eq!(entry.session_id, "ses_a");
         assert_eq!(entry.directory, "/work/a");
-    }
-
-    /// A bare `/dir` in a bound topic is rejected like the other selection
-    /// commands — the Recent Directories card is still a Dir command.
-    #[tokio::test]
-    async fn dir_card_is_rejected_in_bound_topic() {
-        let _wd = test_work_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = test_config(&dir.path().join("sessions.json"));
-        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-        let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into());
-        {
-            let mut store = app.sessions.lock().await;
-            store.set_active(crate::config::SessionEntry {
-                thread_key: topic_key.clone(),
-                session_id: "ses_topic".into(),
-                directory: "/work/topic".into(),
-                agent: None,
-                model: None,
-                auto_accept: false,
-                topic_anchor: None,
-                topic_root: None,
-                variant: None,
-            });
-        }
-        platform.calls.lock().await.clear();
-        crate::bridge::command::handle_command(
-            &app.core,
-            Command::DirCard,
-            topic_key.clone(),
-            "msg_topic",
-            crate::config::ConversationKind::Topic,
-        )
-        .await
-        .unwrap();
-        let calls = platform.calls.lock().await.clone();
-        let text = calls
-            .iter()
-            .filter_map(|c| match c {
-                PlatformCall::ReplyText { text, .. } => Some(text.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            text.contains("回主对话操作"),
-            "DirCard must be rejected in a bound topic: {text}"
-        );
     }
 
     /// The `/dir` Recent Directories card's "建话题" op (ADR-0025) wraps a NEW
@@ -10924,81 +11096,6 @@ pub(crate) mod integration_tests {
             app.sessions.lock().await.all_entries().is_empty(),
             "no session mapping should be created: {:?}",
             app.sessions.lock().await.all_entries()
-        );
-    }
-
-    #[tokio::test]
-    async fn topic_with_session_rejects_selection_commands() {
-        let _wd = test_work_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = test_config(&dir.path().join("sessions.json"));
-        let mut backend = MockBackend::new(realistic_parts());
-        backend.session_list = vec![list_session("ses_foreign123abc", "外部会话", "/work/ext", 100)];
-        let (app, platform) = build_app(cfg, backend).await;
-        // The topic already owns a session.
-        {
-            let mut store = app.sessions.lock().await;
-            store.set_active(crate::config::SessionEntry {
-                thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
-                session_id: "ses_topic_owned".into(),
-                directory: "/work/topic".into(),
-                agent: None,
-                model: None,
-                auto_accept: false,
-                topic_anchor: Some("msg_anchor".into()),
-                topic_root: None,
-                variant: None,
-            });
-        }
-        let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into());
-
-        for cmd in [
-            Command::Switch(SwitchAction::List {
-                keyword: None,
-                all: false,
-            }),
-            Command::Switch(SwitchAction::Match("外部".into())),
-            Command::Switch(SwitchAction::Attach {
-                query: "ses_foreign123abc".into(),
-                force: false,
-            }),
-            Command::New(None),
-            Command::Dir("/work/x".into()),
-            Command::DirCard,
-        ] {
-            platform.calls.lock().await.clear();
-            crate::bridge::command::handle_command(
-                &app.core,
-                cmd.clone(),
-                topic_key.clone(),
-                "msg_topic",
-                crate::config::ConversationKind::Topic,
-            )
-            .await
-            .unwrap();
-            let calls = platform.calls.lock().await.clone();
-            let text = calls
-                .iter()
-                .filter_map(|c| match c {
-                    PlatformCall::ReplyText { text, .. } => Some(text.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(
-                text.contains("回主对话操作"),
-                "{cmd:?} must be rejected in a bound topic: {text}"
-            );
-        }
-        // The topic's session mapping is untouched.
-        assert_eq!(
-            app.sessions
-                .lock()
-                .await
-                .get_active(&topic_key)
-                .unwrap()
-                .session_id,
-            "ses_topic_owned"
         );
     }
 

@@ -66,6 +66,43 @@ pub enum Command {
     Forward(String),
 }
 
+impl Command {
+    /// The single source of truth for the "commands restricted inside a topic"
+    /// rule (ADR-0007, ADR-0023): `handle_command` calls this at its top.
+    ///
+    /// - `/topic` and its adopt forms would nest a topic inside a topic: they
+    ///   are rejected in ANY topic, whether or not it already has a session.
+    /// - Session selection/creation (`/dir`, the `/dir` card, `/switch`, `/new`)
+    ///   is allowed while the topic is unbound — the chosen session becomes the
+    ///   topic's one session — and rejected once the topic owns a session.
+    /// - Every other command passes.
+    pub(crate) fn topic_rejection(&self, has_session: bool) -> Option<&'static str> {
+        match self {
+            Command::Topic { .. } => Some(TOPIC_NEST_REJECTION),
+            Command::TopicAdopt { .. } | Command::TopicAdoptCard => Some(TOPIC_ADOPT_NEST_REJECTION),
+            Command::Dir(_) | Command::DirCard | Command::Switch(_) | Command::New(_) if has_session => {
+                Some(TOPIC_SELECTION_REJECTION)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The rejection for `Dir`/`DirCard`/`Switch`/`New` inside a topic that
+/// already owns a session (ADR-0007): a bound topic is a conversation of its
+/// own, so sessions are chosen from the main conversation.
+pub(crate) const TOPIC_SELECTION_REJECTION: &str = "⚠️ 话题已绑定会话，请回主对话操作。";
+
+/// The rejection for `/topic` inside any topic (ADR-0006, ADR-0023): a topic
+/// never nests inside another topic, bound or not.
+pub(crate) const TOPIC_NEST_REJECTION: &str =
+    "⚠️ /topic 只能从会话顶层使用，不能在话题里再开话题。请在主会话里发 /topic <目录>。";
+
+/// The rejection for `/topic --adopt` inside any topic — one text shared by
+/// the keyword form and the no-arg picker card (ADR-0016, ADR-0023).
+pub(crate) const TOPIC_ADOPT_NEST_REJECTION: &str =
+    "⚠️ /topic --adopt 只能从会话顶层使用，不能在话题里开话题。请在主会话里发 /topic --adopt <会话>。";
+
 /// What `/switch` should do (ADR-0012). The text-direct forms all share the
 /// session store; the no-arg form pops the interactive card.
 #[derive(Debug, Clone, PartialEq)]
@@ -474,23 +511,14 @@ pub(crate) async fn handle_command(
     message_id: &str,
     kind: ConversationKind,
 ) -> crate::error::Result<()> {
-    // Topic single-session gate (ADR-0007): inside a topic that already has
-    // a session, the session-selection/creation commands are rejected. A
-    // topic that never had a session may use them — their outcome becomes
-    // that topic's single session.
+    // Topic command gate (ADR-0007, ADR-0023): the rule lives in
+    // `Command::topic_rejection`, so every command — including future ones —
+    // is restricted by one table from this single call site.
     if kind == ConversationKind::Topic {
-        let blocked = matches!(
-            cmd,
-            Command::Dir(_) | Command::DirCard | Command::Switch(_) | Command::New(_)
-        );
-        if blocked {
-            let has_session = core.sessions.lock().await.get_active(&thread_key).is_some();
-            if has_session {
-                core.feishu
-                    .reply_text(message_id, "⚠️ 话题已绑定会话，请回主对话操作。")
-                    .await?;
-                return Ok(());
-            }
+        let has_session = core.sessions.lock().await.get_active(&thread_key).is_some();
+        if let Some(reason) = cmd.topic_rejection(has_session) {
+            core.feishu.reply_text(message_id, reason).await?;
+            return Ok(());
         }
     }
     match cmd {
@@ -593,17 +621,6 @@ pub(crate) async fn handle_command(
                 .await?;
         }
         Command::Topic { directory, name } => {
-            // Opening a topic from inside another topic would nest
-            // confusingly; only create topics from a non-topic message.
-            if kind == ConversationKind::Topic {
-                core.feishu
-                    .reply_text(
-                        message_id,
-                        "⚠️ /topic 只能从会话顶层使用，不能在话题里再开话题。请在主会话里发 /topic <目录>。",
-                    )
-                    .await?;
-                return Ok(());
-            }
             // Bare `/topic` (directory: None) inherits the conversation's
             // current project, exactly like `/new`; an explicit directory goes
             // through the same existence check as `/dir`.
@@ -671,29 +688,9 @@ pub(crate) async fn handle_command(
             }
         }
         Command::TopicAdopt { keyword, force } => {
-            // Opening a topic from inside another topic would nest
-            // confusingly; only create topics from a non-topic message.
-            if kind == ConversationKind::Topic {
-                core.feishu
-                    .reply_text(
-                        message_id,
-                        "⚠️ /topic --adopt 只能从会话顶层使用，不能在话题里开话题。请在主会话里发 /topic --adopt <会话>。",
-                    )
-                    .await?;
-                return Ok(());
-            }
             handle_topic_adopt(core, &thread_key, &keyword, force, message_id).await?;
         }
         Command::TopicAdoptCard => {
-            if kind == ConversationKind::Topic {
-                core.feishu
-                    .reply_text(
-                        message_id,
-                        "⚠️ /topic --adopt 只能从会话顶层使用，不能在话题里开话题。请在主会话里发 /topic --adopt。",
-                    )
-                    .await?;
-                return Ok(());
-            }
             // Reuse the `/switch` session card, whose per-row button now also
             // offers "建话题接管" (ADR-0016). The card action handler creates
             // the topic via the card's own `open_message_id`.
