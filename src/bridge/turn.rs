@@ -241,10 +241,14 @@ impl Turn {
         };
         // Re-key the session's live card (accumulator + card identity in one
         // CardSession) from the dead session to the new one — a single remap
-        // instead of three maps kept in lockstep.
+        // instead of three maps kept in lockstep. The accumulator's own
+        // `session_id` travels too: the Error card's retry button is built from
+        // it, so a post-recreate error must still offer a retry that resolves
+        // against the fresh mapping.
         {
             let mut cards = app.cards.lock().await;
-            if let Some(card) = cards.remove(&self.session_id) {
+            if let Some(mut card) = cards.remove(&self.session_id) {
+                card.acc.session_id = Some(fresh_id.clone());
                 cards.insert(fresh_id.clone(), card);
             }
         }
