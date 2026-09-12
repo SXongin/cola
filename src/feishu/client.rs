@@ -15,6 +15,12 @@ pub struct Client {
     access_token: std::sync::Mutex<Option<CachedToken>>,
 }
 
+/// A UTF-8-safe prefix of `text` for diagnostics: byte slicing would panic
+/// when the limit lands inside a multi-byte character.
+fn body_snippet(text: &str, limit: usize) -> String {
+    text.chars().take(limit).collect()
+}
+
 /// Read a response body, surfacing the HTTP status and a body snippet on any
 /// failure. Feishu (or an intermediary proxy) can answer with non-JSON bodies
 /// — HTML error pages, block pages — and a bare decode error ("error decoding
@@ -26,7 +32,7 @@ async fn read_body_with_diag(resp: reqwest::Response, what: &str) -> crate::erro
     if !status.is_success() {
         return Err(crate::error::BridgeError::Feishu(format!(
             "{what} HTTP {status}: {}",
-            text.chars().take(200).collect::<String>()
+            body_snippet(&text, 200)
         )));
     }
     Ok(text)
@@ -38,10 +44,7 @@ async fn read_body_with_diag(resp: reqwest::Response, what: &str) -> crate::erro
 /// success-shaped body can never read as success.
 fn parse_json<T: serde::de::DeserializeOwned>(text: &str, what: &str) -> crate::error::Result<T> {
     serde_json::from_str(text).map_err(|e| {
-        crate::error::BridgeError::Feishu(format!(
-            "parse {what}: {e} — body: {}",
-            text.chars().take(200).collect::<String>()
-        ))
+        crate::error::BridgeError::Feishu(format!("parse {what}: {e} — body: {}", body_snippet(text, 200)))
     })
 }
 
@@ -169,10 +172,7 @@ impl Client {
             .await?;
 
         let text = read_body_with_diag(resp, "ws endpoint").await?;
-        tracing::debug!(
-            "WS endpoint response: body={}",
-            text.chars().take(500).collect::<String>()
-        );
+        tracing::debug!("WS endpoint response: body={}", body_snippet(&text, 500));
 
         let resp_data: WsEndpointResponse = parse_json(&text, "ws endpoint")?;
 
@@ -199,10 +199,7 @@ impl Client {
             .await?;
 
         let text = read_body_with_diag(resp, "bot info").await?;
-        tracing::debug!(
-            "bot info response: body={}",
-            text.chars().take(500).collect::<String>()
-        );
+        tracing::debug!("bot info response: body={}", body_snippet(&text, 500));
 
         let parsed: serde_json::Value = parse_json(&text, "bot info")?;
         let code = parsed["code"].as_i64().unwrap_or(-1);
@@ -417,18 +414,12 @@ impl Client {
         let v: serde_json::Value = parse_json(&text, "user info")?;
         let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
         if code != 0 {
-            tracing::debug!(
-                "user_name lookup failed ({code}): {}",
-                text.chars().take(200).collect::<String>()
-            );
+            tracing::debug!("user_name lookup failed ({code}): {}", body_snippet(&text, 200));
             return Ok(None);
         }
         let name = v["data"]["user"]["name"].as_str().map(|s| s.to_string());
         if name.is_none() {
-            tracing::debug!(
-                "user_name lookup returned no name: {}",
-                text.chars().take(300).collect::<String>()
-            );
+            tracing::debug!("user_name lookup returned no name: {}", body_snippet(&text, 300));
         }
         Ok(name)
     }
@@ -447,18 +438,12 @@ impl Client {
         let v: serde_json::Value = parse_json(&text, "chat info")?;
         let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
         if code != 0 {
-            tracing::debug!(
-                "chat_name lookup failed ({code}): {}",
-                text.chars().take(200).collect::<String>()
-            );
+            tracing::debug!("chat_name lookup failed ({code}): {}", body_snippet(&text, 200));
             return Ok(None);
         }
         let name = v["data"]["name"].as_str().map(|s| s.to_string());
         if name.is_none() {
-            tracing::debug!(
-                "chat_name lookup returned no name: {}",
-                text.chars().take(300).collect::<String>()
-            );
+            tracing::debug!("chat_name lookup returned no name: {}", body_snippet(&text, 300));
         }
         Ok(name)
     }
@@ -558,13 +543,13 @@ impl Client {
         if code != 0 {
             return Err(crate::error::BridgeError::Feishu(format!(
                 "get message error {code}: {}",
-                text.chars().take(300).collect::<String>()
+                body_snippet(&text, 300)
             )));
         }
         let Some(item) = v["data"]["items"].get(0) else {
             return Err(crate::error::BridgeError::Feishu(format!(
                 "get message error: no data for {message_id} — body: {}",
-                text.chars().take(300).collect::<String>()
+                body_snippet(&text, 300)
             )));
         };
         let mentions: Vec<crate::feishu::event::Mention> = serde_json::from_value(
@@ -608,7 +593,7 @@ impl Client {
             let text = resp.text().await.unwrap_or_default();
             return Err(crate::error::BridgeError::Feishu(format!(
                 "download image failed: {status}: {}",
-                text.chars().take(300).collect::<String>()
+                body_snippet(&text, 300)
             )));
         }
         let mime = resp
@@ -1445,6 +1430,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reply_card_reports_a_non_json_success_body_as_a_parse_error() {
+        let (server, client) = wire_client().await;
+        server.route_raw(
+            "POST",
+            "/open-apis/im/v1/messages/om_42/reply",
+            200,
+            "text/html",
+            "<html>nope</html>",
+        );
+
+        let message = feishu_error(
+            client
+                .reply_card("om_42", &serde_json::json!({}))
+                .await
+                .unwrap_err(),
+        );
+
+        assert!(
+            message.contains("parse reply card response"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("nope"), "unexpected error: {message}");
+    }
+
+    #[tokio::test]
     async fn token_endpoint_non_json_body_is_a_parse_error() {
         let server = TestHttpServer::start().await;
         server.route_raw("POST", TOKEN_PATH, 200, "text/html", "<html>nope</html>");
@@ -1525,6 +1535,10 @@ mod tests {
             "unexpected: {message}"
         );
         assert!(message.contains("upstream"), "unexpected: {message}");
+        let request = last_request(&server);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/open-apis/im/v1/messages/om_42/reply");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
     }
 
     #[tokio::test]
@@ -1549,6 +1563,10 @@ mod tests {
             "unexpected: {message}"
         );
         assert!(message.contains("bad gateway"), "unexpected: {message}");
+        let request = last_request(&server);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/open-apis/im/v1/messages/om_42/reply");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
     }
 
     #[tokio::test]
@@ -1574,7 +1592,10 @@ mod tests {
             "unexpected: {message}"
         );
         assert!(message.contains("blocked by proxy"), "unexpected: {message}");
-        assert_eq!(last_request(&server).method, "PATCH");
+        let request = last_request(&server);
+        assert_eq!(request.method, "PATCH");
+        assert_eq!(request.path, "/open-apis/im/v1/messages/om_42");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
     }
 
     #[tokio::test]
@@ -1594,7 +1615,10 @@ mod tests {
             "unexpected: {message}"
         );
         assert!(message.contains("store down"), "unexpected: {message}");
-        assert_eq!(last_request(&server).method, "GET");
+        let request = last_request(&server);
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/open-apis/im/v1/messages");
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
     }
 
     #[tokio::test]
@@ -1713,6 +1737,7 @@ mod tests {
                 "case {label}: {message}"
             );
         }
+        assert_eq!(server.request_count(), 6, "token plus one request per method");
     }
 
     #[tokio::test]
@@ -1751,5 +1776,6 @@ mod tests {
             assert!(message.contains(needle), "expected {needle:?} in: {message}");
             assert!(message.contains("nope"), "expected body snippet in: {message}");
         }
+        assert_eq!(server.request_count(), 6, "token plus one request per method");
     }
 }
