@@ -4,6 +4,10 @@ A bridge bot that brings the OpenCode AI coding experience into Feishu.
 
 ## Agent skills
 
+### Skill flow
+
+Which skill runs when: the main flow (idea → ship), the bug/issue on-ramps, and the local bindings. See `docs/agents/flow.md`.
+
 ### Issue tracker
 
 Issues live as markdown files under `.scratch/`. See `docs/agents/issue-tracker.md`.
