@@ -14,7 +14,7 @@ Keep steps 1–3 in one unbroken context window, so the grilling, spec, and tick
 
    Done when the one design question is answered.
 3. **Is this a multi-session build?**
-   - **Yes** → `/to-spec` turns the thread into a spec, then `/to-tickets` cuts it into tracer bullets with `Blocked by:` edges under `.scratch/<feature>/issues/` (`issue-tracker.md`). Then one `/implement` per ticket, blockers first, clearing context between tickets — each ticket is self-contained.
+   - **Yes** → `/to-spec` turns the thread into a spec, then `/to-tickets` cuts it into tracer-bullet GitHub issues with native blocking edges (`issue-tracker.md`). Then one `/implement` per issue, blockers first, clearing context between tickets — each issue is self-contained.
    - **No** → `/implement` right here, in this context window.
 4. **`/implement` drives `/tdd`** — one red-green slice at a time — and closes with **`/code-review`**, the two-axis Standards + Spec review, before committing. Done when both axes are clean or their findings are fixed.
 
@@ -24,7 +24,7 @@ All of it runs under the `CONTRIBUTING.md` branch loop: start on `main`, branch,
 
 A starting situation that generates work, then merges onto the main flow.
 
-- **Raw issues piling up** → **`/triage`**. For issues you didn't create — bug reports and incoming requests, never the tickets `/to-tickets` already produced. It writes the `Status:` labels that make an issue agent-ready (`triage-labels.md`), and `/implement` picks it up from there.
+- **Raw issues piling up** → **`/triage`**. For issues you didn't create — bug reports and incoming requests, never the tickets `/to-tickets` already produced. It applies the triage labels that make an issue agent-ready (`triage-labels.md`), and `/implement` picks it up from there.
 - **Something's broken** → **`/diagnosing-bugs`**. For the bug that resists a first glance: it refuses to theorise until one command already goes red on *this* bug, then fixes with a regression test. A post-mortem that finds no seam to lock the bug down hands off to `/improve-codebase-architecture`.
 - **A huge, foggy effort** → **`/wayfinder`**. When the way from here to the destination isn't visible, it charts a shared map of decision tickets and resolves them until the fog lifts, then hands off to `/to-spec`, which collapses the map into a buildable plan before `/to-tickets`. Save it for work too big for one session; a well-scoped feature goes straight to step 3.
 

@@ -10,11 +10,11 @@ Which skill runs when: the main flow (idea → ship), the bug/issue on-ramps, an
 
 ### Issue tracker
 
-Issues live as markdown files under `.scratch/`. See `docs/agents/issue-tracker.md`.
+Issues live as GitHub issues on `SXongin/cola` (use `gh`); `.scratch/` is a frozen pre-GitHub archive. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
-Five canonical labels mapped to `Status:` values in issue files. See `docs/agents/triage-labels.md`.
+Five canonical GitHub labels: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
 
 ### Domain docs
 
