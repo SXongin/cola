@@ -485,7 +485,6 @@ impl Client {
     /// page of 50). Production use: `resolve_topic_anchor` scans a topic's
     /// messages for the newest cola message to anchor a card reply — the send
     /// API cannot target a `thread_id`.
-    #[allow(dead_code)]
     pub async fn list_messages(
         &self,
         container_id_type: &str,
@@ -762,8 +761,16 @@ mod tests {
             "expire": 7200,
         }))
         .await;
-        let client = Client::with_base_url(test_config(), server.base_url());
+        let client = without_env_proxy(Client::with_base_url(test_config(), server.base_url()));
         (server, client)
+    }
+
+    /// Swap a test client's transport so loopback traffic never goes through
+    /// the developer machine's env proxy (ticket 09). The client itself is the
+    /// production one built by `with_base_url` under test (ADR-0031).
+    fn without_env_proxy(mut client: Client) -> Client {
+        client.http = crate::test_http::no_proxy_transport();
+        client
     }
 
     /// The request under test (the token fetch comes first in the log).
@@ -800,7 +807,7 @@ mod tests {
             "expire": 7200,
         }))
         .await;
-        let client = Client::with_base_url(test_config(), server.base_url());
+        let client = without_env_proxy(Client::with_base_url(test_config(), server.base_url()));
 
         let token = client.get_access_token().await.unwrap();
         assert_eq!(token, "t-abc");
@@ -824,7 +831,7 @@ mod tests {
             "expire": 7200,
         }))
         .await;
-        let client = Client::with_base_url(test_config(), server.base_url());
+        let client = without_env_proxy(Client::with_base_url(test_config(), server.base_url()));
 
         assert_eq!(client.get_access_token().await.unwrap(), "t-abc");
         assert_eq!(client.get_access_token().await.unwrap(), "t-abc");
@@ -842,7 +849,7 @@ mod tests {
             "expire": 60,
         }))
         .await;
-        let client = Client::with_base_url(test_config(), server.base_url());
+        let client = without_env_proxy(Client::with_base_url(test_config(), server.base_url()));
 
         assert_eq!(client.get_access_token().await.unwrap(), "t-abc");
         assert_eq!(client.get_access_token().await.unwrap(), "t-abc");
@@ -859,7 +866,7 @@ mod tests {
             "msg": "invalid app_secret",
         }))
         .await;
-        let client = Client::with_base_url(test_config(), server.base_url());
+        let client = without_env_proxy(Client::with_base_url(test_config(), server.base_url()));
 
         let message = feishu_error(client.get_access_token().await.unwrap_err());
         assert!(
@@ -1349,7 +1356,7 @@ mod tests {
             200,
             r#"{"code":0,"msg":"ok","data":{"URL":"wss://ws.example"}}"#,
         );
-        let client = Client::with_base_url(test_config(), server.base_url());
+        let client = without_env_proxy(Client::with_base_url(test_config(), server.base_url()));
 
         assert_eq!(client.get_ws_endpoint().await.unwrap(), "wss://ws.example");
 
@@ -1370,7 +1377,7 @@ mod tests {
             200,
             r#"{"code":1,"msg":"nope","data":{"URL":""}}"#,
         );
-        let client = Client::with_base_url(test_config(), server.base_url());
+        let client = without_env_proxy(Client::with_base_url(test_config(), server.base_url()));
 
         let message = feishu_error(client.get_ws_endpoint().await.unwrap_err());
         assert!(
@@ -1458,7 +1465,7 @@ mod tests {
     async fn token_endpoint_non_json_body_is_a_parse_error() {
         let server = TestHttpServer::start().await;
         server.route_raw("POST", TOKEN_PATH, 200, "text/html", "<html>nope</html>");
-        let client = Client::with_base_url(test_config(), server.base_url());
+        let client = without_env_proxy(Client::with_base_url(test_config(), server.base_url()));
 
         let message = feishu_error(client.get_access_token().await.unwrap_err());
         assert!(
