@@ -7,11 +7,21 @@ use serde_json::json;
 /// One hint phrase shown under the 运行中 chip when the adopted session is busy
 /// (ADR-0028): the snapshot's only live behaviour, the busy-follow (ticket 06),
 /// will stream the in-flight turn into this card, so the chip says so up front.
-const BUSY_HINT: &str = "有新进展会自动更新";
+pub(crate) const BUSY_HINT: &str = "有新进展会自动更新";
+
+/// The busy run-state chip (ADR-0028). Tests assert this constant so a copy
+/// tweak lives in one place.
+pub(crate) const BUSY_CHIP: &str = "⚙️ 运行中";
+
+/// The retry run-state chip.
+pub(crate) const RETRY_CHIP: &str = "🔁 需要重试";
+
+/// The idle run-state chip.
+pub(crate) const IDLE_CHIP: &str = "✅ 空闲";
 
 /// The 等待你的确认 chip, shown when the session has an adopt-time pending
 /// request — the operator's action beats the server's run state.
-const WAITING_CHIP: &str = "⏳ 等待你的确认";
+pub(crate) const WAITING_CHIP: &str = "⏳ 等待你的确认";
 
 /// The status chip content for a server run state (ADR-0028 precedence
 /// 等待你的确认 > 运行中 > 需要重试 > 空闲; a busy session carries one hint
@@ -22,9 +32,9 @@ fn status_chip(has_pending: bool, status: Option<opencode::SessionStatus>) -> Op
         return Some(WAITING_CHIP.to_string());
     }
     match status {
-        Some(opencode::SessionStatus::Busy) => Some(format!("⚙️ 运行中\n{BUSY_HINT}")),
-        Some(opencode::SessionStatus::Retry) => Some("🔁 需要重试".to_string()),
-        Some(opencode::SessionStatus::Idle) => Some("✅ 空闲".to_string()),
+        Some(opencode::SessionStatus::Busy) => Some(format!("{BUSY_CHIP}\n{BUSY_HINT}")),
+        Some(opencode::SessionStatus::Retry) => Some(RETRY_CHIP.to_string()),
+        Some(opencode::SessionStatus::Idle) => Some(IDLE_CHIP.to_string()),
         None => None,
     }
 }
@@ -302,31 +312,31 @@ mod tests {
         // Pending beats every run state.
         assert_eq!(
             status_chip(true, Some(opencode::SessionStatus::Busy)).as_deref(),
-            Some("⏳ 等待你的确认")
+            Some(WAITING_CHIP)
         );
         assert_eq!(
             status_chip(true, Some(opencode::SessionStatus::Retry)).as_deref(),
-            Some("⏳ 等待你的确认")
+            Some(WAITING_CHIP)
         );
         assert_eq!(
             status_chip(true, Some(opencode::SessionStatus::Idle)).as_deref(),
-            Some("⏳ 等待你的确认")
+            Some(WAITING_CHIP)
         );
-        assert_eq!(status_chip(true, None).as_deref(), Some("⏳ 等待你的确认"));
+        assert_eq!(status_chip(true, None).as_deref(), Some(WAITING_CHIP));
 
         // No pending: the server state decides.
         assert!(
             status_chip(false, Some(opencode::SessionStatus::Busy))
                 .unwrap()
-                .contains("运行中")
+                .contains(BUSY_CHIP)
         );
         assert_eq!(
             status_chip(false, Some(opencode::SessionStatus::Retry)).as_deref(),
-            Some("🔁 需要重试")
+            Some(RETRY_CHIP)
         );
         assert_eq!(
             status_chip(false, Some(opencode::SessionStatus::Idle)).as_deref(),
-            Some("✅ 空闲")
+            Some(IDLE_CHIP)
         );
         // Unknown status and nothing pending → no chip, never guessed.
         assert_eq!(status_chip(false, None), None);
@@ -337,7 +347,7 @@ mod tests {
         let d = data(Some(opencode::SessionStatus::Busy), vec![], vec![]);
         let card = build_snapshot_card("接管", "t", &d);
         let body = elements(&card)[0]["content"].as_str().unwrap();
-        assert!(body.contains("运行中"));
+        assert!(body.contains(BUSY_CHIP));
         assert!(body.contains(BUSY_HINT));
     }
 
@@ -351,7 +361,7 @@ mod tests {
             els.is_empty()
                 || !els[0]["content"]
                     .as_str()
-                    .is_some_and(|c| c.contains("空闲") || c.contains("运行中"))
+                    .is_some_and(|c| c.contains(IDLE_CHIP) || c.contains(BUSY_CHIP))
         );
     }
 
