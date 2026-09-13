@@ -1361,6 +1361,72 @@ async fn vanished_directory_is_no_longer_treated_as_known() {
     );
 }
 
+/// #130: an inline late click never replaces the streaming card — it gets a
+/// card-less ack with the classified toast (neutral when the directory is
+/// known, truthful stale otherwise).
+#[tokio::test]
+async fn late_inline_click_is_cardless_and_classified() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
+    seed_work_dir(&app).await;
+    {
+        let mut cards = app.cards.lock().await;
+        cards.insert(
+            "ses_1".into(),
+            crate::bridge::streaming::CardSession::new(
+                crate::bridge::streaming::StreamAccumulator::new("test"),
+                None,
+            ),
+        );
+    }
+
+    // A pruned sweep marks /work as a known directory.
+    app.question
+        .remember_question(&question_request("que_1"), "/work")
+        .await;
+    let mut seen = std::collections::HashSet::new();
+    app.question.sweep(&app.core, &mut seen).await;
+
+    let value = |id: &str, directory: &str| {
+        serde_json::json!({
+            "action": "question",
+            "reply": "answer",
+            "request_id": id,
+            "session_id": "ses_1",
+            "directory": directory,
+            "question_index": 0,
+            "answer": "/a",
+        })
+    };
+
+    // Known directory, state gone → neutral toast, no card replacement.
+    let neutral = app
+        .handle_card_action(value("que_1", "/work"))
+        .await
+        .expect("result");
+    assert!(
+        neutral.card.is_none(),
+        "an inline answer must not replace the streaming card"
+    );
+    assert_eq!(neutral.toast.as_deref(), Some("该问题已处理"));
+
+    // Unknown directory → truthful stale toast, still card-less.
+    let stale = app
+        .handle_card_action(value("que_1", "/other"))
+        .await
+        .expect("result");
+    assert!(
+        stale.card.is_none(),
+        "an inline answer must not replace the streaming card"
+    );
+    assert_eq!(stale.toast.as_deref(), Some("此卡片已失效"));
+    assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
+}
+
 /// #130: after the sweep pruned a request resolved elsewhere, a late click on
 /// its card gets the neutral result — no backend call, no silent no-op, and no
 /// revived per-request state.
