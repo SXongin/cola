@@ -8,7 +8,7 @@ on:
     tags: ['[0-9]+.[0-9]+.[0-9]+*']
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   release:
@@ -27,6 +27,10 @@ jobs:
             target: x86_64-pc-windows-msvc
             archive: zip
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -70,6 +74,12 @@ jobs:
           name: cola-${{ matrix.target }}
           path: dist/
           if-no-files-found: error
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
 
   test:
     name: Test
