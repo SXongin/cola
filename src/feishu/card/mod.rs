@@ -147,7 +147,7 @@ pub(crate) fn fenced_code(text: &str, lang: Option<&str>) -> String {
 /// placeholders (the caller then shows the session ID instead). Used for card
 /// subtitles and notification cards.
 pub fn clean_session_label(name: &str) -> String {
-    let cleaned = crate::feishu::ws::strip_mention_tokens(name);
+    let cleaned = crate::feishu::message::strip_mention_tokens(name);
     if (cleaned.starts_with("sess-") && cleaned.len() == 41)
         || cleaned.starts_with("New session - ")
         || cleaned.starts_with("Child session - ")
