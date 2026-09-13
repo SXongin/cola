@@ -53,13 +53,16 @@ byproduct**. Concretely:
    does not need. The target immediately justified itself — see the overflow
    fix it forced in `read_len_delimited`.
 6. **AI review is the review gate until a human co-maintainer exists.**
-   CodeRabbit (free for public repositories) reviews every PR; with
+   CodeRabbit (free for public repositories) reviews a PR on request; with
    `request_changes_workflow: true` it approves once its unresolved comments
-   are resolved and the latest commit is reviewed. Scorecard counts the
-   approval, closing the last solvable gap. This is a deliberate trade: for a
-   solo project an AI second pass is better than no gate at all, and GitHub
-   itself now sanctions bot approvals. The admin bypass still exists, so the
-   bot can never lock the maintainer out.
+   are resolved and the latest commit is reviewed. Public repositories under
+   10 stars never receive automatic reviews (CodeRabbit's documented anti-spam
+   threshold), so each PR is triggered with `@coderabbitai review` — one
+   command, not a review by hand. Scorecard counts the approval, closing the
+   last solvable gap. This is a deliberate trade: for a solo project an AI
+   second pass is better than no gate at all, and GitHub itself now sanctions
+   bot approvals. The admin bypass still exists, so the bot can never lock the
+   maintainer out.
 
 **Explicit no-s.** We are not pursuing the CII Best Practices badge (hours of
 self-attestation for at most +0.2), multi-organization `Contributors` (not
