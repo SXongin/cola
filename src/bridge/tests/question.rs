@@ -1240,6 +1240,136 @@ async fn sweep_keeps_state_when_the_directory_list_fails() {
     );
 }
 
+/// #144: a directory whose list call fails must not clear its live question
+/// surfaces — the standalone card, the inline section and the snapshot claim
+/// all survive until a SUCCESSFUL list proves the request gone.
+#[tokio::test]
+async fn failed_directory_list_keeps_question_surfaces() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    app.question
+        .list_timeout_ms
+        .store(30, std::sync::atomic::Ordering::Relaxed);
+    seed_work_dir(&app).await;
+
+    // One live surface per request, all owned by the failing directory /work.
+    app.question.sent_cards.lock().await.insert(
+        "que_card".into(),
+        crate::bridge::request::SentCard {
+            message_id: "om_card".into(),
+            summary: "选择目录".into(),
+            directory: "/work".into(),
+        },
+    );
+    {
+        let mut cards = app.cards.lock().await;
+        let mut acc = crate::bridge::streaming::StreamAccumulator::new("test");
+        acc.pending_questions
+            .push(crate::bridge::streaming::PendingQuestion {
+                request_id: "que_inline".into(),
+                session_id: "ses_1".into(),
+                questions: vec![],
+                directory: "/work".into(),
+                answers: vec![],
+                done: vec![],
+            });
+        cards.insert(
+            "ses_1".into(),
+            crate::bridge::streaming::CardSession::new(acc, None),
+        );
+    }
+    app.core.snapshot_claims.lock().await.claim(
+        "om_snapshot",
+        "已接管",
+        "标题",
+        &crate::bridge::snapshot::SnapshotData {
+            session_id: "ses_1".into(),
+            directory: "/work".into(),
+            status: None,
+            pending: vec![crate::bridge::request::PendingRequest::Question(
+                question_request("que_claim"),
+            )],
+            tail: vec![],
+            newest_user_epoch: None,
+            newest_user_is_cola_authored: false,
+        },
+    );
+
+    // The list call hangs: /work said nothing this sweep.
+    backend
+        .hang_list_questions
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let mut seen = std::collections::HashSet::new();
+    app.question.sweep(&app.core, &mut seen).await;
+
+    assert!(
+        app.question.sent_cards.lock().await.contains_key("que_card"),
+        "a failed list must not mark the standalone card stale"
+    );
+    assert!(
+        app.cards.lock().await.get("ses_1").is_some_and(|c| c
+            .acc
+            .pending_questions
+            .iter()
+            .any(|q| q.request_id == "que_inline")),
+        "a failed list must not drop the inline section"
+    );
+    assert!(
+        app.core.snapshot_claims.lock().await.contains("que_claim"),
+        "a failed list must not drop the snapshot claim"
+    );
+    let first_calls = platform.calls.lock().await.clone();
+    assert!(
+        first_calls.iter().all(|c| !matches!(
+            c,
+            PlatformCall::UpdateMessage { message_id, .. }
+                if message_id == "om_card" || message_id == "om_snapshot"
+        )),
+        "a failed list must not re-render any surface: {first_calls:?}"
+    );
+
+    // The next sweep lists /work successfully with the requests gone: every
+    // cleanup fires.
+    app.question.sweep(&app.core, &mut seen).await;
+
+    assert!(
+        !app.question.sent_cards.lock().await.contains_key("que_card"),
+        "a successful list must still stale the gone card"
+    );
+    assert!(
+        !app.cards.lock().await.get("ses_1").is_some_and(|c| c
+            .acc
+            .pending_questions
+            .iter()
+            .any(|q| q.request_id == "que_inline")),
+        "a successful list must still drop the gone inline section"
+    );
+    assert!(
+        !app.core.snapshot_claims.lock().await.contains("que_claim"),
+        "a successful list must still drop the gone claim"
+    );
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        calls.iter().any(|c| matches!(
+            c,
+            PlatformCall::UpdateMessage { message_id, card }
+                if message_id == "om_card" && card.to_string().contains("已处理")
+        )),
+        "the standalone card is marked stale: {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|c| matches!(
+            c,
+            PlatformCall::UpdateMessage { message_id, .. } if message_id == "om_snapshot"
+        )),
+        "the snapshot is re-rendered without the block: {calls:?}"
+    );
+}
+
 /// #130: the sweep must not wipe an in-progress multi-select. A refresh keeps
 /// the live toggles, and the prune keeps the entry while it is pending.
 #[tokio::test]

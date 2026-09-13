@@ -158,17 +158,27 @@ impl SnapshotClaims {
     /// Drop the claims of `kind` whose request left the pending list (resolved
     /// by another client, or already dropped by a button click), tombstone
     /// them, and re-render each affected host ONCE without the resolved
-    /// blocks. Returns `(message_id, card)` for the caller to patch; never
-    /// marks the snapshot stale — that patch targets standalone cards.
+    /// blocks. A claim hosted from a directory whose list call failed is kept:
+    /// that directory said nothing, so its request may still be pending
+    /// (#130, #144). Returns `(message_id, card)` for the caller to patch;
+    /// never marks the snapshot stale — that patch targets standalone cards.
     pub fn drop_vanished(
         &mut self,
         kind: ClaimKind,
         pending: &HashSet<String>,
+        failed_dirs: &HashSet<String>,
     ) -> Vec<(String, serde_json::Value)> {
         let resolved: Vec<String> = self
             .claims
             .iter()
-            .filter(|(id, (_, k))| *k == kind && !pending.contains(*id))
+            .filter(|(id, (message_id, k))| {
+                *k == kind
+                    && !pending.contains(*id)
+                    && !self
+                        .hosts
+                        .get(message_id)
+                        .is_some_and(|host| failed_dirs.contains(&host.data.directory))
+            })
             .map(|(id, _)| id.clone())
             .collect();
         if resolved.is_empty() {
@@ -370,7 +380,7 @@ mod tests {
         claims.claim("mid_2", "接管", "title", &data_with(&["p3"]));
         // p1 vanished (kind permission); p2 stays pending.
         let pending: HashSet<String> = ["p2".to_string(), "p3".to_string()].into_iter().collect();
-        let dropped = claims.drop_vanished(ClaimKind::Permission, &pending);
+        let dropped = claims.drop_vanished(ClaimKind::Permission, &pending, &HashSet::new());
         assert_eq!(dropped.len(), 1, "only the affected host is rebuilt");
         assert_eq!(dropped[0].0, "mid_1");
         assert!(!claims.contains("p1"));
@@ -380,7 +390,7 @@ mod tests {
 
         // The last claim of mid_2 vanishing drops the whole host.
         let pending: HashSet<String> = ["p2".to_string()].into_iter().collect();
-        let dropped = claims.drop_vanished(ClaimKind::Permission, &pending);
+        let dropped = claims.drop_vanished(ClaimKind::Permission, &pending, &HashSet::new());
         assert_eq!(dropped.len(), 1);
         assert_eq!(dropped[0].0, "mid_2");
         assert!(claims.host_pending("mid_2").is_none());
@@ -390,12 +400,26 @@ mod tests {
         );
     }
 
+    /// #144: a claim hosted from a directory whose list call failed must
+    /// survive — that directory said nothing, so the request may still be
+    /// pending.
+    #[test]
+    fn drop_vanished_keeps_claims_from_a_failed_directory() {
+        let mut claims = SnapshotClaims::default();
+        claims.claim("mid_1", "接管", "title", &data_with(&["p1"]));
+        let failed: HashSet<String> = ["/work".to_string()].into_iter().collect();
+        let dropped = claims.drop_vanished(ClaimKind::Permission, &HashSet::new(), &failed);
+        assert!(dropped.is_empty(), "a failed list must not drop the claim");
+        assert!(claims.contains("p1"));
+        assert!(!claims.is_tombstoned("p1"));
+    }
+
     #[test]
     fn drop_vanished_only_touches_its_own_kind() {
         let mut claims = SnapshotClaims::default();
         claims.claim("mid_1", "接管", "title", &data_with(&["p1"]));
         let pending: HashSet<String> = HashSet::new();
-        let dropped = claims.drop_vanished(ClaimKind::Question, &pending);
+        let dropped = claims.drop_vanished(ClaimKind::Question, &pending, &HashSet::new());
         assert!(dropped.is_empty(), "a permission claim survives the other sweep");
         assert!(claims.contains("p1"));
     }
