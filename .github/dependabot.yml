@@ -19,8 +19,9 @@ updates:
       interval: weekly
     open-pull-requests-limit: 10
     groups:
-      # Actions are pinned to major tags (v4, v2, ...), so group them all into
-      # a single PR rather than one PR per action.
+      # Actions are pinned to full commit SHAs (with a `# vX.Y.Z` comment, which
+      # Dependabot keeps in sync), so group them all into a single PR rather
+      # than one PR per action.
       github-actions:
         patterns:
           - "*"
