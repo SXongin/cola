@@ -25,7 +25,7 @@ pub struct PendingPermission {
 
 /// A `question` tool request surfaced inline on the streaming card. `answers[i]`
 /// tracks which questions are already answered (None = open), kept in sync with
-/// `App.question_partial`.
+/// the flow's [`crate::bridge::request::QuestionState`].
 #[derive(Debug, Clone)]
 pub struct PendingQuestion {
     pub request_id: String,

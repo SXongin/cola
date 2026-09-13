@@ -412,14 +412,7 @@ async fn snapshot_question_block_answers_and_patches() {
 
     // The claim remembered the full question request (the poll loop never
     // saw it, so prepare() never ran).
-    assert!(
-        app.core
-            .question
-            .question_requests
-            .lock()
-            .await
-            .contains_key("q_1")
-    );
+    assert!(app.core.question.has_question("q_1").await);
 
     // First question answered → still open overall → the snapshot re-renders
     // WITH the block, showing the live ✅ on the answered question.
@@ -848,14 +841,7 @@ async fn busy_follow_question_block_resolves() {
         .cloned()
         .expect("follow armed");
     assert_eq!(acc.acc.pending_questions.len(), 1);
-    assert!(
-        app.core
-            .question
-            .question_requests
-            .lock()
-            .await
-            .contains_key("q_1")
-    );
+    assert!(app.core.question.has_question("q_1").await);
 
     // Click an option: the single question is answered → the request
     // submits and the section is stripped from the follow card.
