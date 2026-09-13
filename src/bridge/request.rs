@@ -42,11 +42,6 @@ impl PendingRequest {
     }
 }
 
-/// Partial answers recorded for a pending question request: `answers[i]` is
-/// `None` until the user answers question `i`. A request is only submitted once
-/// every slot is filled (or the user clicks "submit/skip").
-type QuestionPartial = HashMap<String, Vec<Option<Vec<String>>>>;
-
 /// The deltas that make a permission request and a question request different.
 /// Everything else — the poll loop, the card delivery, the double-click guard
 /// primitive and the error-result block — lives once in [`RequestFlow`].
@@ -365,11 +360,149 @@ async fn should_auto_accept(core: &Arc<SharedCore>, session_id: &str, directory:
     .unwrap_or(false)
 }
 
+/// One pending question request's whole in-flight state: what the AI asked,
+/// where the request lives, the finalized answers and the live multi-select
+/// toggles. One entry per request replaces the four parallel maps that had to
+/// be mutated in lockstep — a missed map used to be a silent bug.
+pub struct QuestionState {
+    /// The full request, kept so its card can be rebuilt with partial answers.
+    request: opencode::client::QuestionRequest,
+    /// Owning directory, recorded where the poll loop knows it. The question
+    /// card's `name` no longer carries the directory (Feishu caps `name` at
+    /// 100 chars), so a value-less form-submit callback re-resolves it here
+    /// (sub-task child sessions aren't in the session store — pitfall 11).
+    dir: String,
+    /// FINAL answers: `answers[i]` is `None` until question `i` is finalized.
+    /// A request is only submitted once every slot is filled (or the user
+    /// clicks "submit/skip").
+    answers: Vec<Option<Vec<String>>>,
+    /// LIVE multi-select toggles, kept SEPARATE from `answers` so an
+    /// in-progress multi-select (labels toggled but not yet confirmed) never
+    /// counts as answered — the request can only auto-submit once every
+    /// question is finalized (single-select clicked, multi-select confirmed).
+    toggles: Vec<Option<Vec<String>>>,
+}
+
+impl QuestionState {
+    fn new(request: opencode::client::QuestionRequest, dir: String) -> Self {
+        let slots = vec![None; request.questions.len()];
+        Self {
+            request,
+            dir,
+            answers: slots.clone(),
+            toggles: slots,
+        }
+    }
+
+    /// Update the remembered request/dir in place, keeping recorded answers and
+    /// toggles: a re-armed follow or a re-claim must not wipe what the user
+    /// already selected.
+    fn refresh(&mut self, request: &opencode::client::QuestionRequest, dir: &str) {
+        self.request = request.clone();
+        self.dir = dir.to_string();
+        self.answers.resize(request.questions.len(), None);
+        self.toggles.resize(request.questions.len(), None);
+    }
+
+    fn len(&self) -> usize {
+        self.request.questions.len()
+    }
+
+    fn is_multi(&self, index: usize) -> bool {
+        self.request
+            .questions
+            .get(index)
+            .is_some_and(|q| q.multiple == Some(true))
+    }
+
+    /// Record a single-select answer (replaces any previous one).
+    fn record_answer(&mut self, index: usize, answer: &str) {
+        if index < self.answers.len() {
+            self.answers[index] = Some(vec![answer.to_string()]);
+        }
+    }
+
+    /// Toggle a label in an open multi-select: add if absent, remove if
+    /// present. Removing the last label reverts the slot to `None` (the
+    /// question is open again).
+    fn record_toggle(&mut self, index: usize, answer: &str) {
+        if index >= self.toggles.len() {
+            return;
+        }
+        let empty = {
+            let set = self.toggles[index].get_or_insert_with(Vec::new);
+            if let Some(pos) = set.iter().position(|l| l == answer) {
+                set.remove(pos);
+            } else {
+                set.push(answer.to_string());
+            }
+            set.is_empty()
+        };
+        if empty {
+            self.toggles[index] = None;
+        }
+    }
+
+    /// Append a typed custom label to an open multi-select (never removes; a
+    /// duplicate is a no-op). Removal has its own affordance: the rendered
+    /// Custom Answer button re-enters as a normal toggle (`reply: "answer"`).
+    fn record_append(&mut self, index: usize, answer: &str) {
+        if index >= self.toggles.len() {
+            return;
+        }
+        let set = self.toggles[index].get_or_insert_with(Vec::new);
+        if !set.iter().any(|l| l == answer) {
+            set.push(answer.to_string());
+        }
+    }
+
+    /// Lock the live toggles of question `index` into its final answer (empty
+    /// allowed — "不选"). A stale confirm of an already-finalized question is a
+    /// no-op, never overwriting the locked answer.
+    fn confirm(&mut self, index: usize) {
+        if index >= self.answers.len() || self.answers[index].is_some() {
+            return;
+        }
+        self.answers[index] = Some(self.toggles[index].take().unwrap_or_default());
+    }
+
+    /// Whether `answer` is currently in the live toggles for one question.
+    /// Read BEFORE recording so the caller can name the outcome in the toast.
+    fn toggle_selected(&self, index: usize, answer: &str) -> bool {
+        self.toggles
+            .get(index)
+            .and_then(|slot| slot.as_ref())
+            .is_some_and(|labels| labels.iter().any(|l| l == answer))
+    }
+
+    /// What the card should display: `display[i]` is the locked answer for
+    /// finalized questions or the live toggles of an open multi-select;
+    /// `done[i]` marks finalized questions. Returns `(count, display, done)`
+    /// where `count` counts FINAL answers only — in-progress toggles never
+    /// drive auto-submit.
+    fn merge(&self) -> (usize, Vec<Option<Vec<String>>>, Vec<bool>) {
+        let n = self.answers.len();
+        let mut display = vec![None; n];
+        let mut done = vec![false; n];
+        let mut count = 0;
+        for i in 0..n {
+            if let Some(labels) = &self.answers[i] {
+                display[i] = Some(labels.clone());
+                done[i] = true;
+                count += 1;
+            } else if let Some(labels) = &self.toggles[i] {
+                display[i] = Some(labels.clone());
+            }
+        }
+        (count, display, done)
+    }
+}
+
 /// The question kind: remembers the full request (via the flow, to rebuild
 /// cards with partial answers), accumulates answers across slots, and submits
 /// once every question is answered (or the user clicks submit/skip). The
-/// remembered requests and partial slots live on the [`RequestFlow`] so tests
-/// can seed them directly.
+/// per-request state lives on the [`RequestFlow`] ([`QuestionState`]), so tests
+/// seed it through [`RequestFlow::remember_question`].
 pub struct QuestionKind;
 
 #[async_trait::async_trait]
@@ -396,19 +529,7 @@ impl RequestKind for QuestionKind {
         dir: &str,
     ) -> bool {
         if let PendingRequest::Question(q) = req {
-            flow.question_requests
-                .lock()
-                .await
-                .insert(q.id.clone(), q.clone());
-            // Record the owning directory: the submit-button `name` on the
-            // question card no longer carries it (Feishu caps `name` at 100
-            // chars), so a value-less form-submit callback re-resolves it here
-            // instead of the session store (sub-task child sessions aren't in
-            // it — see pitfall 11).
-            flow.question_dirs
-                .lock()
-                .await
-                .insert(q.id.clone(), dir.to_string());
+            flow.remember_question(q, dir).await;
         }
         false
     }
@@ -512,36 +633,31 @@ impl RequestKind for QuestionKind {
                             .unwrap_or_else(|| question_replay_card(inline)),
                     );
                 }
-                let n = {
-                    let reqs = flow.question_requests.lock().await;
-                    reqs.get(req_id).map(|r| r.questions.len())
-                };
-                let Some(n) = n else {
-                    return None; // stale card for an already-submitted request
-                };
-                let multi = {
-                    let reqs = flow.question_requests.lock().await;
-                    reqs.get(req_id)
-                        .is_some_and(|r| r.questions.get(index).is_some_and(|q| q.multiple == Some(true)))
+                // The state must still be live: a gone entry means the card is
+                // stale (the request was already submitted/answered).
+                let (n, multi) = {
+                    let states = flow.question_state.lock().await;
+                    let state = states.get(req_id)?;
+                    (state.len(), state.is_multi(index))
                 };
                 // "custom"/"confirm" only exist on multi-select questions.
                 if (reply == "custom" || reply == "confirm") && !multi {
                     return None;
                 }
-                // Multi-select answers compose in a SEPARATE toggles map; the
-                // partial map holds only FINAL answers (single-select clicks,
-                // confirmed multi-selects). The separation is what lets a
-                // multi-select stay open while the user keeps toggling, without
+                // Multi-select answers compose in the SEPARATE toggles slot;
+                // the answers slot holds only FINAL answers (single-select
+                // clicks, confirmed multi-selects). The separation is what lets
+                // a multi-select stay open while the user keeps toggling, without
                 // ever auto-submitting mid-composition.
                 let (answered_count, display, done, outcome) = {
-                    let mut partial = flow.question_partial.lock().await;
-                    let mut toggles = flow.question_toggles.lock().await;
+                    let mut states = flow.question_state.lock().await;
+                    let state = states.get_mut(req_id)?;
                     let mut outcome = None;
                     if multi {
                         // Read the selection BEFORE mutating so the toast can
                         // tell add from remove, and a deduped custom from a
                         // fresh one.
-                        let selected = toggle_selected(&toggles, req_id, index, &answer);
+                        let selected = state.toggle_selected(index, &answer);
                         match reply {
                             "custom" => {
                                 outcome = Some(if selected {
@@ -549,45 +665,27 @@ impl RequestKind for QuestionKind {
                                 } else {
                                     MultiOutcome::Added
                                 });
-                                record_append_answer(&mut toggles, req_id, n, index, &answer);
+                                state.record_append(index, &answer);
                             }
-                            "confirm" => {
-                                // A stale card may re-confirm an already-done
-                                // question (re-render hasn't removed the button
-                                // yet, and other questions remain open). A
-                                // second confirm must be a no-op, not overwrite
-                                // the locked answer with the (now-empty)
-                                // toggles slot.
-                                if index < n
-                                    && !partial
-                                        .get(req_id)
-                                        .and_then(|s| s.get(index))
-                                        .is_some_and(|slot| slot.is_some())
-                                {
-                                    // Lock the toggled set into the final answer.
-                                    let set = toggles
-                                        .get_mut(req_id)
-                                        .and_then(|s| s.get_mut(index))
-                                        .and_then(|slot| slot.take())
-                                        .unwrap_or_default();
-                                    let slot =
-                                        partial.entry(req_id.to_string()).or_insert_with(|| vec![None; n]);
-                                    slot[index] = Some(set);
-                                }
-                            }
+                            // A stale card may re-confirm an already-done
+                            // question (re-render hasn't removed the button
+                            // yet, and other questions remain open); `confirm`
+                            // is a no-op then, never overwriting the locked
+                            // answer with the (now-empty) toggles slot.
+                            "confirm" => state.confirm(index),
                             _ => {
                                 outcome = Some(if selected {
                                     MultiOutcome::Removed
                                 } else {
                                     MultiOutcome::Added
                                 });
-                                record_toggle_answer(&mut toggles, req_id, n, index, &answer);
+                                state.record_toggle(index, &answer);
                             }
                         }
                     } else {
-                        record_answer(&mut partial, req_id, n, index, &answer);
+                        state.record_answer(index, &answer);
                     }
-                    let (count, display, done) = merge_question_state(&partial, &toggles, req_id, n);
+                    let (count, display, done) = state.merge();
                     (count, display, done, outcome)
                 };
                 // Keep the inline card's display answers and done flags in sync.
@@ -618,7 +716,7 @@ impl RequestKind for QuestionKind {
                                 .unwrap_or_else(|| question_replay_card(inline)),
                         );
                     }
-                    let (questions, answers) = question_snapshot(flow, req_id).await;
+                    let (questions, answers) = flow.question_snapshot(req_id).await;
                     if let Some(r) = settle_question_reply(
                         flow,
                         core,
@@ -700,8 +798,8 @@ impl RequestKind for QuestionKind {
                     // answered ones as done and the rest open.
                     let remaining = n - answered_count;
                     let req = {
-                        let reqs = flow.question_requests.lock().await;
-                        reqs.get(req_id).cloned()
+                        let states = flow.question_state.lock().await;
+                        states.get(req_id).map(|s| s.request.clone())
                     };
                     let req = req?;
                     let card = crate::feishu::card::build_question_card(
@@ -731,7 +829,7 @@ impl RequestKind for QuestionKind {
                             .unwrap_or_else(|| question_replay_card(inline)),
                     );
                 }
-                let (questions, answers) = question_snapshot(flow, req_id).await;
+                let (questions, answers) = flow.question_snapshot(req_id).await;
                 if let Some(r) = settle_question_reply(
                     flow,
                     core,
@@ -895,24 +993,12 @@ pub struct RequestFlow {
     /// request_id → (card message_id, description) of the card cola sent (used
     /// to mark a card stale when the request is resolved by ANOTHER client).
     pub sent_cards: Arc<Mutex<HashMap<String, (String, String)>>>,
-    /// request_id → pending question request (question kind only; the AI asks
-    /// the user and cola posts the answer back from the question card).
-    pub question_requests: Arc<Mutex<HashMap<String, opencode::client::QuestionRequest>>>,
-    /// request_id → owning directory (question kind only). Filled at poll time
-    /// (where `dir` is known) as the fallback for form-submit callbacks whose
-    /// card `name` no longer carries the directory (see question_elements).
-    pub question_dirs: Arc<Mutex<HashMap<String, String>>>,
-    /// request_id → FINAL answers (None = not answered yet; question kind
-    /// only). A request is only submitted once EVERY question has an answer (or
-    /// the user clicks "submit/skip"), because `reply_question` expects answers
-    /// for all of them.
-    pub question_partial: Arc<Mutex<QuestionPartial>>,
-    /// request_id → LIVE multi-select toggles (question kind only). Kept
-    /// SEPARATE from `question_partial` so an in-progress multi-select (labels
-    /// toggled but not yet confirmed) never counts as answered — the request
-    /// can only auto-submit once every question is finalized (single-select
-    /// clicked, multi-select confirmed via its 确定该题 button).
-    pub question_toggles: Arc<Mutex<QuestionPartial>>,
+    /// request_id → the question request's whole in-flight state: the request,
+    /// its owning directory, the finalized answers and the live multi-select
+    /// toggles (question kind only; the permission flow's map stays empty). One
+    /// entry per request, so no transition can update one field without the
+    /// others.
+    question_state: Arc<Mutex<HashMap<String, QuestionState>>>,
     /// request_id → the WINNING click's result. A losing click re-serves this
     /// instead of rendering its own decision — otherwise a rapid second click
     /// on a different button (允许一次 vs 总是允许) would flip the card to a
@@ -928,10 +1014,7 @@ impl RequestFlow {
             poll_interval_ms: std::sync::atomic::AtomicU64::new(3000),
             list_timeout_ms: std::sync::atomic::AtomicU64::new(30_000),
             sent_cards: Arc::new(Mutex::new(HashMap::new())),
-            question_requests: Arc::new(Mutex::new(HashMap::new())),
-            question_dirs: Arc::new(Mutex::new(HashMap::new())),
-            question_partial: Arc::new(Mutex::new(HashMap::new())),
-            question_toggles: Arc::new(Mutex::new(HashMap::new())),
+            question_state: Arc::new(Mutex::new(HashMap::new())),
             answered_results: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -976,27 +1059,90 @@ impl RequestFlow {
         self.answered_results.lock().await.get(req_id).cloned()
     }
 
-    /// Drop a question request's in-flight state once it is finalized: the
-    /// remembered request, its owning directory, and any live multi-select
-    /// toggles. The final answers in `question_partial` are consumed separately
-    /// (to build the reply payload) and `sent_cards` is cleared only where the
-    /// request was actually delivered as its own card.
-    pub(crate) async fn remove_question(&self, req_id: &str) {
-        self.question_requests.lock().await.remove(req_id);
-        self.question_dirs.lock().await.remove(req_id);
-        self.question_toggles.lock().await.remove(req_id);
+    /// Remember a pending question request so its card/block buttons can
+    /// resolve: the full request (card rebuilds) and its owning directory
+    /// (routing a reply whose callback no longer carries one). Refreshing an
+    /// already-remembered request keeps its recorded answers/toggles.
+    pub(crate) async fn remember_question(&self, req: &opencode::client::QuestionRequest, dir: &str) {
+        let mut states = self.question_state.lock().await;
+        match states.entry(req.id.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().refresh(req, dir);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(QuestionState::new(req.clone(), dir.to_string()));
+            }
+        }
     }
 
-    /// The pending request's questions (empty once the request was dropped).
-    /// Completion cards render the full Q&A from them, so callers capture the
-    /// list before `remove_question` discards the request.
-    pub(crate) async fn questions_of(&self, req_id: &str) -> Vec<opencode::client::QuestionInfo> {
-        self.question_requests
+    /// Whether `req_id` is a remembered (pending) question request. Test-only
+    /// today: the production poll loop tracks self-surfaced ids in its own
+    /// `seen` set.
+    #[cfg(test)]
+    pub(crate) async fn has_question(&self, req_id: &str) -> bool {
+        self.question_state.lock().await.contains_key(req_id)
+    }
+
+    /// The remembered owning directory of a question request, used as the
+    /// fallback when a card callback carries none.
+    pub(crate) async fn question_dir(&self, req_id: &str) -> Option<String> {
+        self.question_state
             .lock()
             .await
             .get(req_id)
-            .map(|r| r.questions.clone())
-            .unwrap_or_default()
+            .map(|s| s.dir.clone())
+    }
+
+    /// Drop a question request's in-flight state once it is finalized: the
+    /// remembered request, its owning directory, the final answers and any live
+    /// multi-select toggles. `sent_cards` is cleared only where the request was
+    /// actually delivered as its own card.
+    pub(crate) async fn remove_question(&self, req_id: &str) {
+        self.question_state.lock().await.remove(req_id);
+    }
+
+    /// The remembered questions and their current answers, captured for the
+    /// reply payload and the completion card. The answers are CLONED, not
+    /// consumed: a genuine reply failure rolls the guard claim back and the
+    /// state must stay intact so the click can be retried.
+    async fn question_snapshot(
+        &self,
+        req_id: &str,
+    ) -> (Vec<opencode::client::QuestionInfo>, Vec<Vec<String>>) {
+        let states = self.question_state.lock().await;
+        let Some(state) = states.get(req_id) else {
+            return (Vec::new(), Vec::new());
+        };
+        let answers = state
+            .answers
+            .iter()
+            .map(|a| a.clone().unwrap_or_default())
+            .collect();
+        (state.request.questions.clone(), answers)
+    }
+
+    /// The live answer state (display + done flags) of the question requests
+    /// among `pending`, for a snapshot re-render after an interaction — the
+    /// 已选/✅ markers the standalone question cards show.
+    pub(crate) async fn live_snapshot_state(
+        &self,
+        pending: &[PendingRequest],
+    ) -> crate::feishu::snapshot_card::SnapshotQuestionState {
+        let states = self.question_state.lock().await;
+        let mut out = crate::feishu::snapshot_card::SnapshotQuestionState::new();
+        for req in pending {
+            if let PendingRequest::Question(q) = req {
+                let (_, display, done) = match states.get(&q.id) {
+                    Some(state) => state.merge(),
+                    None => (0, vec![None; q.questions.len()], vec![false; q.questions.len()]),
+                };
+                out.insert(
+                    q.id.clone(),
+                    crate::feishu::snapshot_card::QuestionBlockState { display, done },
+                );
+            }
+        }
+        out
     }
 
     /// Independent poller: surfaces pending requests as cards (inline on a
@@ -1169,7 +1315,7 @@ impl RequestFlow {
                 if from_store.is_some() {
                     from_store
                 } else {
-                    self.question_dirs.lock().await.get(req_id).cloned()
+                    self.question_dir(req_id).await
                 }
             }
         };
@@ -1243,7 +1389,7 @@ impl RequestFlow {
                         .map(|h| h.data.pending.clone())
                         .unwrap_or_default()
                 };
-                let state = question_state_for(core, &pending).await;
+                let state = core.question.live_snapshot_state(&pending).await;
                 result.card = rebuild_snapshot_host(core, &message_id, &state).await;
             } else {
                 // Resolved: drop the block from the snapshot and patch it in
@@ -1295,31 +1441,9 @@ fn question_replay_card(inline: bool) -> CardActionResult {
     r
 }
 
-/// Capture a question request's questions and its current answers for the
-/// completion card and the reply payload. The answers are CLONED, not
-/// consumed: a genuine reply failure rolls the guard claim back and the state
-/// must stay intact so the click can be retried.
-async fn question_snapshot(
-    flow: &RequestFlow,
-    req_id: &str,
-) -> (Vec<opencode::client::QuestionInfo>, Vec<Vec<String>>) {
-    let questions = flow.questions_of(req_id).await;
-    let answers = flow
-        .question_partial
-        .lock()
-        .await
-        .get(req_id)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|a| a.unwrap_or_default())
-        .collect();
-    (questions, answers)
-}
-
 /// Apply a question reply's outcome to the guard and the in-flight state:
-/// - `Ok`: the reply landed — drop the request's partial/remembered/card
-///   state and return `None` (the caller renders its completion card).
+/// - `Ok`: the reply landed — drop the request's remembered state and return
+///   `None` (the caller renders its completion card).
 /// - 404: resolved elsewhere — drop the state, remember the neutral card (so a
 ///   losing click re-serves it) and return it.
 /// - other: genuine failure — keep the state, roll the claim back for a retry,
@@ -1334,14 +1458,12 @@ async fn settle_question_reply(
 ) -> Option<CardActionResult> {
     match result {
         Ok(()) => {
-            flow.question_partial.lock().await.remove(req_id);
             flow.remove_question(req_id).await;
             flow.sent_cards.lock().await.remove(req_id);
             None
         }
         Err(e) if e.is_not_found() => {
             tracing::info!("Question already resolved: {}", e);
-            flow.question_partial.lock().await.remove(req_id);
             flow.remove_question(req_id).await;
             flow.sent_cards.lock().await.remove(req_id);
             let r = already_handled_result(kind, inline, "该问题已处理");
@@ -1531,16 +1653,7 @@ pub(crate) async fn claim_snapshot_pendings(
             req.session_id()
         );
         if let PendingRequest::Question(q) = req {
-            core.question
-                .question_requests
-                .lock()
-                .await
-                .insert(q.id.clone(), q.clone());
-            core.question
-                .question_dirs
-                .lock()
-                .await
-                .insert(q.id.clone(), data.directory.clone());
+            core.question.remember_question(q, &data.directory).await;
         }
     }
 }
@@ -1568,29 +1681,6 @@ async fn prune_snapshot_host(core: &Arc<SharedCore>, message_id: &str) {
             registry.tombstones.remove(req.id());
         }
     }
-}
-
-/// The live answer state (display + done flags) of the question requests among
-/// `pending`, for a snapshot re-render after an interaction — the 已选/✅
-/// markers the standalone question cards show.
-async fn question_state_for(
-    core: &Arc<SharedCore>,
-    pending: &[PendingRequest],
-) -> crate::feishu::snapshot_card::SnapshotQuestionState {
-    let partial = core.question.question_partial.lock().await;
-    let toggles = core.question.question_toggles.lock().await;
-    let mut out = crate::feishu::snapshot_card::SnapshotQuestionState::new();
-    for req in pending {
-        if let PendingRequest::Question(q) = req {
-            let n = q.questions.len();
-            let (_, display, done) = merge_question_state(&partial, &toggles, &q.id, n);
-            out.insert(
-                q.id.clone(),
-                crate::feishu::snapshot_card::QuestionBlockState { display, done },
-            );
-        }
-    }
-    out
 }
 
 /// ADR-0028: rebuild a claimed snapshot card from its stored adopt-time state,
@@ -1826,120 +1916,6 @@ pub(crate) fn describe_permission(p: &opencode::client::PermissionRequest) -> St
     s
 }
 
-/// Record one answer into the partial-answer slots for a question request.
-/// Returns `(answered_count, slot)` where `slot` is the full (cloned) answer
-/// vector — the caller syncs it to the inline card and submits once
-/// `answered_count == n`.
-fn record_answer(
-    partial: &mut HashMap<String, Vec<Option<Vec<String>>>>,
-    req_id: &str,
-    n: usize,
-    index: usize,
-    answer: &str,
-) -> (usize, Vec<Option<Vec<String>>>) {
-    let slot = partial.entry(req_id.to_string()).or_insert_with(|| vec![None; n]);
-    if index < n {
-        slot[index] = Some(vec![answer.to_string()]);
-    }
-    let count = slot.iter().filter(|a| a.is_some()).count();
-    (count, slot.clone())
-}
-
-/// Multi-select variant of `record_answer`: each click toggles the label in the
-/// question's answer set (add if absent, remove if present). Toggling the last
-/// label off reverts the slot to `None` (the question is open again). Used only
-/// for questions with `multiple: true`, which never auto-finalize on a click.
-fn record_toggle_answer(
-    partial: &mut HashMap<String, Vec<Option<Vec<String>>>>,
-    req_id: &str,
-    n: usize,
-    index: usize,
-    answer: &str,
-) -> (usize, Vec<Option<Vec<String>>>) {
-    let slot = partial.entry(req_id.to_string()).or_insert_with(|| vec![None; n]);
-    if index < n {
-        let current = slot[index].get_or_insert_with(Vec::new);
-        if let Some(pos) = current.iter().position(|l| l == answer) {
-            current.remove(pos);
-        } else {
-            current.push(answer.to_string());
-        }
-        if current.is_empty() {
-            slot[index] = None;
-        }
-    }
-    let count = slot.iter().filter(|a| a.is_some()).count();
-    (count, slot.clone())
-}
-
-/// Multi-select custom-answer variant of `record_toggle_answer`: ADDS the typed
-/// label to the question's toggled set (dedupe) but never removes it — the
-/// compose box only ever adds. Removal has its own affordance: the rendered
-/// Custom Answer button re-enters as a normal toggle (`reply: "answer"`), which
-/// `record_toggle_answer` handles. Writes into the LIVE toggles map (not the
-/// final answers), like option toggles, so the question still awaits its 确定该题
-/// confirm.
-fn record_append_answer(
-    toggles: &mut HashMap<String, Vec<Option<Vec<String>>>>,
-    req_id: &str,
-    n: usize,
-    index: usize,
-    answer: &str,
-) {
-    let slot = toggles.entry(req_id.to_string()).or_insert_with(|| vec![None; n]);
-    if index < n {
-        let current = slot[index].get_or_insert_with(Vec::new);
-        if !current.iter().any(|l| l == answer) {
-            current.push(answer.to_string());
-        }
-    }
-}
-
-/// Merge the final-answer map (`partial`) with the in-progress multi-select
-/// toggles into what the card should display: `display[i]` is the locked
-/// answer for done questions or the live toggles of an open multi-select;
-/// `done[i]` marks finalized questions. Returns `(count, display, done)` where
-/// `count` is the number of finalized (answered) questions — only the final
-/// answers drive auto-submit, never in-progress toggles.
-fn merge_question_state(
-    partial: &HashMap<String, Vec<Option<Vec<String>>>>,
-    toggles: &HashMap<String, Vec<Option<Vec<String>>>>,
-    req_id: &str,
-    n: usize,
-) -> (usize, Vec<Option<Vec<String>>>, Vec<bool>) {
-    let p = partial.get(req_id);
-    let t = toggles.get(req_id);
-    let mut display = vec![None; n];
-    let mut done = vec![false; n];
-    let mut count = 0;
-    for i in 0..n {
-        if let Some(Some(labels)) = p.and_then(|s| s.get(i)) {
-            display[i] = Some(labels.clone());
-            done[i] = true;
-            count += 1;
-        } else if let Some(Some(labels)) = t.and_then(|s| s.get(i)) {
-            display[i] = Some(labels.clone());
-        }
-    }
-    (count, display, done)
-}
-
-/// Whether `answer` is currently in the live toggles for one question. Read
-/// BEFORE recording so the handler can name the outcome in the toast without
-/// changing what the recorders do.
-fn toggle_selected(
-    toggles: &HashMap<String, Vec<Option<Vec<String>>>>,
-    req_id: &str,
-    index: usize,
-    answer: &str,
-) -> bool {
-    toggles
-        .get(req_id)
-        .and_then(|slots| slots.get(index))
-        .and_then(|slot| slot.as_ref())
-        .is_some_and(|labels| labels.iter().any(|l| l == answer))
-}
-
 /// What one multi-select interaction did to the selection: an option or Custom
 /// Answer added, one removed, or a Custom Answer that was already selected
 /// (append dedupes).
@@ -1979,50 +1955,85 @@ fn answer_recorded_toast(remaining: usize) -> String {
 mod tests {
     use super::*;
 
+    /// A state with one question per `multi` flag (other fields irrelevant to
+    /// the transitions under test).
+    fn state_with(multi: &[bool]) -> QuestionState {
+        let questions = multi
+            .iter()
+            .enumerate()
+            .map(|(i, m)| crate::opencode::client::QuestionInfo {
+                question: format!("q{i}"),
+                header: String::new(),
+                options: vec![],
+                multiple: Some(*m),
+                custom: None,
+            })
+            .collect();
+        QuestionState::new(
+            crate::opencode::client::QuestionRequest {
+                id: "q1".into(),
+                session_id: "ses_1".into(),
+                questions,
+            },
+            "/work".into(),
+        )
+    }
+
     #[test]
     fn record_answer_starts_empty_and_fills_slots() {
-        let mut partial = HashMap::new();
+        let mut state = state_with(&[false, false]);
         // First answer, index 0 of 2.
-        let (count, slot) = record_answer(&mut partial, "q1", 2, 0, "main");
-        assert_eq!(count, 1);
-        assert_eq!(slot, vec![Some(vec!["main".to_string()]), None]);
+        state.record_answer(0, "main");
+        assert_eq!(state.answers, vec![Some(vec!["main".to_string()]), None]);
+        assert_eq!(state.merge().0, 1);
         // Second answer, index 1 → all filled.
-        let (count, slot) = record_answer(&mut partial, "q1", 2, 1, "dev");
-        assert_eq!(count, 2);
+        state.record_answer(1, "dev");
         assert_eq!(
-            slot,
+            state.answers,
             vec![Some(vec!["main".to_string()]), Some(vec!["dev".to_string()])]
         );
+        assert_eq!(state.merge().0, 2);
     }
 
     #[test]
     fn record_answer_replacing_a_slot_keeps_count_stable() {
-        let mut partial = HashMap::new();
-        record_answer(&mut partial, "q1", 2, 0, "a");
-        record_answer(&mut partial, "q1", 2, 1, "b");
+        let mut state = state_with(&[false, false]);
+        state.record_answer(0, "a");
+        state.record_answer(1, "b");
         // Re-answering slot 0 replaces it without changing the count.
-        let (count, slot) = record_answer(&mut partial, "q1", 2, 0, "c");
-        assert_eq!(count, 2);
+        state.record_answer(0, "c");
         assert_eq!(
-            slot,
+            state.answers,
             vec![Some(vec!["c".to_string()]), Some(vec!["b".to_string()])]
         );
+        assert_eq!(state.merge().0, 2);
     }
 
     #[test]
     fn record_answer_out_of_range_index_is_ignored() {
-        let mut partial = HashMap::new();
-        let (count, slot) = record_answer(&mut partial, "q1", 2, 99, "x");
-        assert_eq!(count, 0);
-        assert_eq!(slot, vec![None, None]);
+        let mut state = state_with(&[false, false]);
+        state.record_answer(99, "x");
+        assert_eq!(state.answers, vec![None, None]);
+        assert_eq!(state.merge().0, 0);
     }
 
     #[test]
-    fn record_answer_isolates_requests_by_id() {
-        let mut partial = HashMap::new();
-        record_answer(&mut partial, "q1", 1, 0, "a");
-        let (count, _) = record_answer(&mut partial, "q2", 1, 0, "b");
-        assert_eq!(count, 1); // q2 has its own slots
+    fn remember_refresh_keeps_recorded_answers() {
+        // A re-armed follow or re-claim refreshes request/dir in place; the
+        // user's recorded selection survives.
+        let mut state = state_with(&[false]);
+        state.record_answer(0, "a");
+        state.refresh(&state.request.clone(), "/new");
+        assert_eq!(state.dir, "/new");
+        assert_eq!(state.answers, vec![Some(vec!["a".to_string()])]);
+    }
+
+    #[test]
+    fn is_multi_reads_the_question_flag() {
+        let state = state_with(&[false, true]);
+        assert!(!state.is_multi(0));
+        assert!(state.is_multi(1));
+        assert!(!state.is_multi(99));
     }
 
     fn perm(action: &str, metadata: serde_json::Value) -> crate::opencode::client::PermissionRequest {
@@ -2086,66 +2097,62 @@ Index: /proj/src/main.rs
     }
 
     #[test]
-    fn record_toggle_answer_adds_then_removes_labels() {
-        let mut partial = HashMap::new();
+    fn record_toggle_adds_then_removes_labels() {
+        let mut state = state_with(&[true]);
         // First toggle adds the label.
-        let (count, slot) = record_toggle_answer(&mut partial, "q1", 1, 0, "a");
-        assert_eq!(count, 1);
-        assert_eq!(slot, vec![Some(vec!["a".to_string()])]);
+        state.record_toggle(0, "a");
+        assert_eq!(state.toggles, vec![Some(vec!["a".to_string()])]);
         // Second toggle accumulates a second label.
-        let (count, slot) = record_toggle_answer(&mut partial, "q1", 1, 0, "b");
-        assert_eq!(count, 1);
-        assert_eq!(slot, vec![Some(vec!["a".to_string(), "b".to_string()])]);
+        state.record_toggle(0, "b");
+        assert_eq!(state.toggles, vec![Some(vec!["a".to_string(), "b".to_string()])]);
         // Toggling one off keeps the other.
-        let (count, slot) = record_toggle_answer(&mut partial, "q1", 1, 0, "a");
-        assert_eq!(count, 1);
-        assert_eq!(slot, vec![Some(vec!["b".to_string()])]);
+        state.record_toggle(0, "a");
+        assert_eq!(state.toggles, vec![Some(vec!["b".to_string()])]);
         // Toggling the last off reverts the slot to None (question open again).
-        let (count, slot) = record_toggle_answer(&mut partial, "q1", 1, 0, "b");
-        assert_eq!(count, 0);
-        assert_eq!(slot, vec![None]);
+        state.record_toggle(0, "b");
+        assert_eq!(state.toggles, vec![None]);
+        // An unconfirmed toggle never counts as a final answer.
+        assert_eq!(state.merge().0, 0);
     }
 
     #[test]
-    fn record_toggle_answer_out_of_range_index_is_ignored() {
-        let mut partial = HashMap::new();
-        let (count, slot) = record_toggle_answer(&mut partial, "q1", 2, 99, "x");
-        assert_eq!(count, 0);
-        assert_eq!(slot, vec![None, None]);
+    fn record_toggle_out_of_range_index_is_ignored() {
+        let mut state = state_with(&[true, true]);
+        state.record_toggle(99, "x");
+        assert_eq!(state.toggles, vec![None, None]);
     }
 
     #[test]
-    fn record_append_answer_adds_but_never_toggles_away() {
-        let mut toggles = HashMap::new();
+    fn record_append_adds_but_never_toggles_away() {
+        let mut state = state_with(&[true]);
         // First custom answer adds the label.
-        record_append_answer(&mut toggles, "q1", 1, 0, "自定");
-        assert_eq!(toggles["q1"], vec![Some(vec!["自定".to_string()])]);
+        state.record_append(0, "自定");
+        assert_eq!(state.toggles, vec![Some(vec!["自定".to_string()])]);
         // Re-adding the same custom label is a no-op (deduped).
-        record_append_answer(&mut toggles, "q1", 1, 0, "自定");
-        assert_eq!(toggles["q1"], vec![Some(vec!["自定".to_string()])]);
+        state.record_append(0, "自定");
+        assert_eq!(state.toggles, vec![Some(vec!["自定".to_string()])]);
         // A second custom label accumulates.
-        record_append_answer(&mut toggles, "q1", 1, 0, "另一个");
+        state.record_append(0, "另一个");
         assert_eq!(
-            toggles["q1"],
+            state.toggles,
             vec![Some(vec!["自定".to_string(), "另一个".to_string()])]
         );
     }
 
     #[test]
-    fn record_append_answer_out_of_range_index_is_ignored() {
-        let mut toggles = HashMap::new();
-        record_append_answer(&mut toggles, "q1", 2, 99, "x");
-        assert_eq!(toggles["q1"], vec![None, None]);
+    fn record_append_out_of_range_index_is_ignored() {
+        let mut state = state_with(&[true, true]);
+        state.record_append(99, "x");
+        assert_eq!(state.toggles, vec![None, None]);
     }
 
     #[test]
-    fn merge_question_state_separates_done_from_in_progress_toggles() {
+    fn merge_separates_done_from_in_progress_toggles() {
         // Q0 answered (single-select), Q1 toggled (multi, in progress).
-        let mut partial = HashMap::new();
-        partial.insert("q1".into(), vec![Some(vec!["/a".to_string()]), None]);
-        let mut toggles = HashMap::new();
-        toggles.insert("q1".into(), vec![None, Some(vec!["苹果".to_string()])]);
-        let (count, display, done) = merge_question_state(&partial, &toggles, "q1", 2);
+        let mut state = state_with(&[false, true]);
+        state.record_answer(0, "/a");
+        state.record_toggle(1, "苹果");
+        let (count, display, done) = state.merge();
         // Only the finalized question counts toward submit.
         assert_eq!(count, 1);
         assert_eq!(done, vec![true, false]);
@@ -2157,33 +2164,49 @@ Index: /proj/src/main.rs
     }
 
     #[test]
-    fn merge_question_state_confirmed_multi_select_counts_as_done() {
-        // A confirmed multi-select lands in partial (moved out of toggles).
-        let mut partial = HashMap::new();
-        partial.insert(
-            "q1".into(),
-            vec![Some(vec!["苹果".to_string(), "香蕉".to_string()])],
+    fn merge_confirmed_multi_select_counts_as_done() {
+        // A confirmed multi-select moves its toggles into the final answers.
+        let mut state = state_with(&[true]);
+        state.record_toggle(0, "苹果");
+        state.record_toggle(0, "香蕉");
+        state.confirm(0);
+        assert_eq!(
+            state.answers,
+            vec![Some(vec!["苹果".to_string(), "香蕉".to_string()])]
         );
-        let toggles = HashMap::new();
-        let (count, display, done) = merge_question_state(&partial, &toggles, "q1", 1);
+        assert_eq!(state.toggles, vec![None]);
+        let (count, display, done) = state.merge();
         assert_eq!(count, 1);
         assert_eq!(done, vec![true]);
         assert_eq!(display, vec![Some(vec!["苹果".to_string(), "香蕉".to_string()])]);
     }
 
     #[test]
+    fn confirm_locks_toggles_and_a_stale_confirm_is_a_no_op() {
+        let mut state = state_with(&[true]);
+        // Confirming with nothing toggled is the "不选" path: an empty answer.
+        state.confirm(0);
+        assert_eq!(state.answers, vec![Some(Vec::new())]);
+        // A stale second confirm must not overwrite the locked answer.
+        state.record_toggle(0, "苹果");
+        state.confirm(0);
+        assert_eq!(state.answers, vec![Some(Vec::new())]);
+        assert_eq!(state.toggles, vec![Some(vec!["苹果".to_string()])]);
+    }
+
+    #[test]
     fn toggle_selected_reads_the_live_toggles() {
-        let mut toggles = HashMap::new();
-        assert!(!toggle_selected(&toggles, "q1", 0, "a"));
-        record_toggle_answer(&mut toggles, "q1", 1, 0, "a");
-        assert!(toggle_selected(&toggles, "q1", 0, "a"));
-        assert!(!toggle_selected(&toggles, "q1", 0, "b"));
+        let mut state = state_with(&[true, true]);
+        assert!(!state.toggle_selected(0, "a"));
+        state.record_toggle(0, "a");
+        assert!(state.toggle_selected(0, "a"));
+        assert!(!state.toggle_selected(0, "b"));
         // A different question index is a different selection.
-        assert!(!toggle_selected(&toggles, "q1", 1, "a"));
+        assert!(!state.toggle_selected(1, "a"));
         // Exact match only — a custom answer with the same prefix is not it.
-        record_append_answer(&mut toggles, "q2", 1, 0, "a b");
-        assert!(toggle_selected(&toggles, "q2", 0, "a b"));
-        assert!(!toggle_selected(&toggles, "q2", 0, "a"));
+        state.record_append(1, "a b");
+        assert!(state.toggle_selected(1, "a b"));
+        assert!(!state.toggle_selected(1, "a"));
     }
 
     #[test]

@@ -446,16 +446,7 @@ impl ExternalFlow {
                     // claim path): the poll loop never sees follow-hosted
                     // requests, so `prepare()` never runs for them and the
                     // block's buttons would resolve to nothing.
-                    core.question
-                        .question_requests
-                        .lock()
-                        .await
-                        .insert(q.id.clone(), q.clone());
-                    core.question
-                        .question_dirs
-                        .lock()
-                        .await
-                        .insert(q.id.clone(), data.directory.clone());
+                    core.question.remember_question(q, &data.directory).await;
                 }
             }
         }

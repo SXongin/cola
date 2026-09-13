@@ -86,29 +86,31 @@ async fn question_card_action_posts_answer_back() {
     let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
 
     // The poll loop has surfaced a pending question request.
-    app.question.question_requests.lock().await.insert(
-        "que_1".into(),
-        opencode::client::QuestionRequest {
-            id: "que_1".into(),
-            session_id: "ses_1".into(),
-            questions: vec![opencode::client::QuestionInfo {
-                question: "选择目录".into(),
-                header: "目录".into(),
-                options: vec![
-                    opencode::client::QuestionOption {
-                        label: "/a".into(),
-                        description: String::new(),
-                    },
-                    opencode::client::QuestionOption {
-                        label: "/b".into(),
-                        description: String::new(),
-                    },
-                ],
-                multiple: None,
-                custom: None,
-            }],
-        },
-    );
+    app.question
+        .remember_question(
+            &opencode::client::QuestionRequest {
+                id: "que_1".into(),
+                session_id: "ses_1".into(),
+                questions: vec![opencode::client::QuestionInfo {
+                    question: "选择目录".into(),
+                    header: "目录".into(),
+                    options: vec![
+                        opencode::client::QuestionOption {
+                            label: "/a".into(),
+                            description: String::new(),
+                        },
+                        opencode::client::QuestionOption {
+                            label: "/b".into(),
+                            description: String::new(),
+                        },
+                    ],
+                    multiple: None,
+                    custom: None,
+                }],
+            },
+            "/work",
+        )
+        .await;
     // Seed the session → directory mapping so the reply routes correctly.
     seed_entry(
         &app,
@@ -162,47 +164,49 @@ async fn completing_last_question_replaces_card_with_full_qa_summary() {
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
 
-    app.question.question_requests.lock().await.insert(
-        "que_1".into(),
-        opencode::client::QuestionRequest {
-            id: "que_1".into(),
-            session_id: "ses_1".into(),
-            questions: vec![
-                opencode::client::QuestionInfo {
-                    question: "问题甲".into(),
-                    header: String::new(),
-                    options: vec![
-                        opencode::client::QuestionOption {
-                            label: "/a1".into(),
-                            description: String::new(),
-                        },
-                        opencode::client::QuestionOption {
-                            label: "/a2".into(),
-                            description: String::new(),
-                        },
-                    ],
-                    multiple: None,
-                    custom: None,
-                },
-                opencode::client::QuestionInfo {
-                    question: "问题乙".into(),
-                    header: String::new(),
-                    options: vec![
-                        opencode::client::QuestionOption {
-                            label: "/b1".into(),
-                            description: String::new(),
-                        },
-                        opencode::client::QuestionOption {
-                            label: "/b2".into(),
-                            description: String::new(),
-                        },
-                    ],
-                    multiple: None,
-                    custom: None,
-                },
-            ],
-        },
-    );
+    app.question
+        .remember_question(
+            &opencode::client::QuestionRequest {
+                id: "que_1".into(),
+                session_id: "ses_1".into(),
+                questions: vec![
+                    opencode::client::QuestionInfo {
+                        question: "问题甲".into(),
+                        header: String::new(),
+                        options: vec![
+                            opencode::client::QuestionOption {
+                                label: "/a1".into(),
+                                description: String::new(),
+                            },
+                            opencode::client::QuestionOption {
+                                label: "/a2".into(),
+                                description: String::new(),
+                            },
+                        ],
+                        multiple: None,
+                        custom: None,
+                    },
+                    opencode::client::QuestionInfo {
+                        question: "问题乙".into(),
+                        header: String::new(),
+                        options: vec![
+                            opencode::client::QuestionOption {
+                                label: "/b1".into(),
+                                description: String::new(),
+                            },
+                            opencode::client::QuestionOption {
+                                label: "/b2".into(),
+                                description: String::new(),
+                            },
+                        ],
+                        multiple: None,
+                        custom: None,
+                    },
+                ],
+            },
+            "/work",
+        )
+        .await;
     seed_entry(
         &app,
         crate::config::SessionEntry {
@@ -309,23 +313,25 @@ async fn double_click_on_same_request_replies_once() {
     let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
 
     // A pending single-question request (the same one the card was built for).
-    app.question.question_requests.lock().await.insert(
-        "que_1".into(),
-        opencode::client::QuestionRequest {
-            id: "que_1".into(),
-            session_id: "ses_1".into(),
-            questions: vec![opencode::client::QuestionInfo {
-                question: "选择目录".into(),
-                header: "目录".into(),
-                options: vec![opencode::client::QuestionOption {
-                    label: "/a".into(),
-                    description: String::new(),
+    app.question
+        .remember_question(
+            &opencode::client::QuestionRequest {
+                id: "que_1".into(),
+                session_id: "ses_1".into(),
+                questions: vec![opencode::client::QuestionInfo {
+                    question: "选择目录".into(),
+                    header: "目录".into(),
+                    options: vec![opencode::client::QuestionOption {
+                        label: "/a".into(),
+                        description: String::new(),
+                    }],
+                    multiple: None,
+                    custom: None,
                 }],
-                multiple: None,
-                custom: None,
-            }],
-        },
-    );
+            },
+            "/work",
+        )
+        .await;
 
     let value = serde_json::json!({
         "action": "question",
@@ -369,23 +375,25 @@ async fn question_reply_404_renders_neutral_already_handled() {
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
 
-    app.question.question_requests.lock().await.insert(
-        "que_1".into(),
-        opencode::client::QuestionRequest {
-            id: "que_1".into(),
-            session_id: "ses_1".into(),
-            questions: vec![opencode::client::QuestionInfo {
-                question: "选择目录".into(),
-                header: "目录".into(),
-                options: vec![opencode::client::QuestionOption {
-                    label: "/a".into(),
-                    description: String::new(),
+    app.question
+        .remember_question(
+            &opencode::client::QuestionRequest {
+                id: "que_1".into(),
+                session_id: "ses_1".into(),
+                questions: vec![opencode::client::QuestionInfo {
+                    question: "选择目录".into(),
+                    header: "目录".into(),
+                    options: vec![opencode::client::QuestionOption {
+                        label: "/a".into(),
+                        description: String::new(),
+                    }],
+                    multiple: None,
+                    custom: None,
                 }],
-                multiple: None,
-                custom: None,
-            }],
-        },
-    );
+            },
+            "/work",
+        )
+        .await;
 
     let value = serde_json::json!({
         "action": "question",
@@ -439,14 +447,16 @@ async fn question_with_multiple_parts_waits_for_all_answers() {
             },
         ]
     };
-    app.question.question_requests.lock().await.insert(
-        "que_2".into(),
-        opencode::client::QuestionRequest {
-            id: "que_2".into(),
-            session_id: "ses_1".into(),
-            questions: mk_questions(),
-        },
-    );
+    app.question
+        .remember_question(
+            &opencode::client::QuestionRequest {
+                id: "que_2".into(),
+                session_id: "ses_1".into(),
+                questions: mk_questions(),
+            },
+            "/work",
+        )
+        .await;
 
     let value = |index: u64, answer: &str| {
         serde_json::json!({
@@ -499,33 +509,35 @@ async fn multi_select_question_toggles_until_submit() {
     let backend = Arc::new(MockBackend::new(realistic_parts()));
     let app = Arc::new(App::new(cfg, backend.clone(), Arc::new(RecordingPlatform::new())).unwrap());
 
-    app.question.question_requests.lock().await.insert(
-        "que_multi".into(),
-        opencode::client::QuestionRequest {
-            id: "que_multi".into(),
-            session_id: "ses_1".into(),
-            questions: vec![opencode::client::QuestionInfo {
-                question: "选择水果".into(),
-                header: "水果".into(),
-                options: vec![
-                    opencode::client::QuestionOption {
-                        label: "苹果".into(),
-                        description: String::new(),
-                    },
-                    opencode::client::QuestionOption {
-                        label: "香蕉".into(),
-                        description: String::new(),
-                    },
-                    opencode::client::QuestionOption {
-                        label: "橙子".into(),
-                        description: String::new(),
-                    },
-                ],
-                multiple: Some(true),
-                custom: None,
-            }],
-        },
-    );
+    app.question
+        .remember_question(
+            &opencode::client::QuestionRequest {
+                id: "que_multi".into(),
+                session_id: "ses_1".into(),
+                questions: vec![opencode::client::QuestionInfo {
+                    question: "选择水果".into(),
+                    header: "水果".into(),
+                    options: vec![
+                        opencode::client::QuestionOption {
+                            label: "苹果".into(),
+                            description: String::new(),
+                        },
+                        opencode::client::QuestionOption {
+                            label: "香蕉".into(),
+                            description: String::new(),
+                        },
+                        opencode::client::QuestionOption {
+                            label: "橙子".into(),
+                            description: String::new(),
+                        },
+                    ],
+                    multiple: Some(true),
+                    custom: None,
+                }],
+            },
+            "/work",
+        )
+        .await;
 
     let value = |answer: &str| {
         serde_json::json!({
@@ -598,23 +610,25 @@ async fn multi_select_can_submit_empty_selection() {
     let backend = Arc::new(MockBackend::new(realistic_parts()));
     let app = Arc::new(App::new(cfg, backend.clone(), Arc::new(RecordingPlatform::new())).unwrap());
 
-    app.question.question_requests.lock().await.insert(
-        "que_empty".into(),
-        opencode::client::QuestionRequest {
-            id: "que_empty".into(),
-            session_id: "ses_1".into(),
-            questions: vec![opencode::client::QuestionInfo {
-                question: "选择水果".into(),
-                header: "水果".into(),
-                options: vec![opencode::client::QuestionOption {
-                    label: "苹果".into(),
-                    description: String::new(),
+    app.question
+        .remember_question(
+            &opencode::client::QuestionRequest {
+                id: "que_empty".into(),
+                session_id: "ses_1".into(),
+                questions: vec![opencode::client::QuestionInfo {
+                    question: "选择水果".into(),
+                    header: "水果".into(),
+                    options: vec![opencode::client::QuestionOption {
+                        label: "苹果".into(),
+                        description: String::new(),
+                    }],
+                    multiple: Some(true),
+                    custom: None,
                 }],
-                multiple: Some(true),
-                custom: None,
-            }],
-        },
-    );
+            },
+            "/work",
+        )
+        .await;
 
     // Toggle 苹果 on, then off → back to an open question with NO selection.
     app.handle_card_action(serde_json::json!({
@@ -676,35 +690,37 @@ async fn stale_confirm_on_done_multi_select_is_a_no_op() {
     let backend = Arc::new(MockBackend::new(realistic_parts()));
     let app = Arc::new(App::new(cfg, backend.clone(), Arc::new(RecordingPlatform::new())).unwrap());
 
-    app.question.question_requests.lock().await.insert(
-        "que_stale".into(),
-        opencode::client::QuestionRequest {
-            id: "que_stale".into(),
-            session_id: "ses_1".into(),
-            questions: vec![
-                opencode::client::QuestionInfo {
-                    question: "选择目录".into(),
-                    header: "目录".into(),
-                    options: vec![opencode::client::QuestionOption {
-                        label: "/a".into(),
-                        description: String::new(),
-                    }],
-                    multiple: None,
-                    custom: None,
-                },
-                opencode::client::QuestionInfo {
-                    question: "选择水果".into(),
-                    header: "水果".into(),
-                    options: vec![opencode::client::QuestionOption {
-                        label: "苹果".into(),
-                        description: String::new(),
-                    }],
-                    multiple: Some(true),
-                    custom: None,
-                },
-            ],
-        },
-    );
+    app.question
+        .remember_question(
+            &opencode::client::QuestionRequest {
+                id: "que_stale".into(),
+                session_id: "ses_1".into(),
+                questions: vec![
+                    opencode::client::QuestionInfo {
+                        question: "选择目录".into(),
+                        header: "目录".into(),
+                        options: vec![opencode::client::QuestionOption {
+                            label: "/a".into(),
+                            description: String::new(),
+                        }],
+                        multiple: None,
+                        custom: None,
+                    },
+                    opencode::client::QuestionInfo {
+                        question: "选择水果".into(),
+                        header: "水果".into(),
+                        options: vec![opencode::client::QuestionOption {
+                            label: "苹果".into(),
+                            description: String::new(),
+                        }],
+                        multiple: Some(true),
+                        custom: None,
+                    },
+                ],
+            },
+            "/work",
+        )
+        .await;
 
     let confirm = |index: u64| {
         serde_json::json!({
@@ -775,35 +791,37 @@ async fn mixed_single_and_multi_question_waits_for_all_confirmed() {
     let backend = Arc::new(MockBackend::new(realistic_parts()));
     let app = Arc::new(App::new(cfg, backend.clone(), Arc::new(RecordingPlatform::new())).unwrap());
 
-    app.question.question_requests.lock().await.insert(
-        "que_mix".into(),
-        opencode::client::QuestionRequest {
-            id: "que_mix".into(),
-            session_id: "ses_1".into(),
-            questions: vec![
-                opencode::client::QuestionInfo {
-                    question: "选择目录".into(),
-                    header: "目录".into(),
-                    options: vec![opencode::client::QuestionOption {
-                        label: "/a".into(),
-                        description: String::new(),
-                    }],
-                    multiple: None,
-                    custom: None,
-                },
-                opencode::client::QuestionInfo {
-                    question: "选择水果".into(),
-                    header: "水果".into(),
-                    options: vec![opencode::client::QuestionOption {
-                        label: "苹果".into(),
-                        description: String::new(),
-                    }],
-                    multiple: Some(true),
-                    custom: None,
-                },
-            ],
-        },
-    );
+    app.question
+        .remember_question(
+            &opencode::client::QuestionRequest {
+                id: "que_mix".into(),
+                session_id: "ses_1".into(),
+                questions: vec![
+                    opencode::client::QuestionInfo {
+                        question: "选择目录".into(),
+                        header: "目录".into(),
+                        options: vec![opencode::client::QuestionOption {
+                            label: "/a".into(),
+                            description: String::new(),
+                        }],
+                        multiple: None,
+                        custom: None,
+                    },
+                    opencode::client::QuestionInfo {
+                        question: "选择水果".into(),
+                        header: "水果".into(),
+                        options: vec![opencode::client::QuestionOption {
+                            label: "苹果".into(),
+                            description: String::new(),
+                        }],
+                        multiple: Some(true),
+                        custom: None,
+                    },
+                ],
+            },
+            "/work",
+        )
+        .await;
 
     let answer = |index: u64, a: &str| {
         serde_json::json!({
@@ -884,23 +902,25 @@ async fn multi_select_custom_answer_appends_dedupes_and_removes() {
     let backend = Arc::new(MockBackend::new(realistic_parts()));
     let app = Arc::new(App::new(cfg, backend.clone(), Arc::new(RecordingPlatform::new())).unwrap());
 
-    app.question.question_requests.lock().await.insert(
-        "que_custom".into(),
-        opencode::client::QuestionRequest {
-            id: "que_custom".into(),
-            session_id: "ses_1".into(),
-            questions: vec![opencode::client::QuestionInfo {
-                question: "选择水果".into(),
-                header: "水果".into(),
-                options: vec![opencode::client::QuestionOption {
-                    label: "苹果".into(),
-                    description: String::new(),
+    app.question
+        .remember_question(
+            &opencode::client::QuestionRequest {
+                id: "que_custom".into(),
+                session_id: "ses_1".into(),
+                questions: vec![opencode::client::QuestionInfo {
+                    question: "选择水果".into(),
+                    header: "水果".into(),
+                    options: vec![opencode::client::QuestionOption {
+                        label: "苹果".into(),
+                        description: String::new(),
+                    }],
+                    multiple: Some(true),
+                    custom: None,
                 }],
-                multiple: Some(true),
-                custom: None,
-            }],
-        },
-    );
+            },
+            "/work",
+        )
+        .await;
 
     let custom = |answer: &str| {
         serde_json::json!({
