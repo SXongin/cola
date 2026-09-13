@@ -30,6 +30,15 @@ your `PATH`, in a user-writable directory:
 | macOS (Apple Silicon) | `cola-<version>-aarch64-apple-darwin.tar.gz` | `~/.local/bin` |
 | Windows x86_64 | `cola-<version>-x86_64-pc-windows-msvc.zip` | `%LOCALAPPDATA%\Programs\cola` |
 
+**Verifying a download (optional).** Each release archive carries a GitHub
+build-provenance attestation, so you can confirm it was built by cola's release
+workflow from this repository:
+
+    gh attestation verify cola-<version>-<target>.tar.gz --repo SXongin/cola
+
+(`gh` is the [GitHub CLI](https://cli.github.com).) Integrity is additionally
+covered by the release's `SHA256SUMS`.
+
 **Why a user-writable directory?** cola's self-update replaces its own binary
 in place (`/update`, `cola update`), which requires write permission on the
 binary's directory. In a root-owned location like `/usr/local/bin` (or
