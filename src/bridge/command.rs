@@ -609,49 +609,31 @@ pub(crate) async fn handle_command(
                 }
                 None => core.current_project_directory(&thread_key).await,
             };
-            let session = core
-                .opencode
-                .create_session(&core.opencode.new_session_input(Some(&dir_str)))
-                .await?;
-            // Creation title policy (ADR-0007): a named `/topic` PATCHes the
-            // title; without a name the server default is left for
-            // auto-generation. The display name only drives the anchor text.
-            if let Some(n) = &name {
-                core.opencode.update_session_title(&session.id, n).await?;
-            }
-            let display_name = name.unwrap_or_else(|| {
-                dir_str
-                    .trim_end_matches('/')
-                    .rsplit('/')
-                    .next()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(&dir_str)
-                    .to_string()
-            });
-            // Create a real topic whose root is the topic cover card (ADR-0023),
-            // map the new session to it and record the cover title — shared with
-            // `/topic --adopt` and the `/dir` card's 建话题 op (ADR-0025).
-            match open_topic_for_session(
+            // Open the topic in one transaction: session creation, cover card
+            // (ADR-0023), in-topic seed and Session Mapping all live in
+            // `bridge::topic`.
+            match crate::bridge::topic::open_topic(
                 core,
                 &thread_key.chat_id,
                 message_id,
-                &session.id,
-                dir_str,
-                display_name,
-                None,
-                None,
+                crate::bridge::topic::TopicOpening::Fresh {
+                    directory: dir_str,
+                    name,
+                },
             )
-            .await?
+            .await
             {
-                Some(thread_id) => {
+                Ok(opened) => {
                     tracing::info!(
-                        "topic: created topic {} for session {} in chat {}",
-                        thread_id,
-                        session.id,
+                        "topic: created topic {} (root {}, anchor {}) for session {} in chat {}",
+                        opened.thread_id,
+                        opened.topic_root,
+                        opened.topic_anchor,
+                        opened.session_id,
                         thread_key.chat_id
                     );
                 }
-                None => {
+                Err(crate::bridge::topic::OpenTopicError::NoThreadId) => {
                     core.feishu
                         .reply_text(
                             message_id,
@@ -659,6 +641,7 @@ pub(crate) async fn handle_command(
                         )
                         .await?;
                 }
+                Err(crate::bridge::topic::OpenTopicError::Failed(e)) => return Err(e),
             }
         }
         Command::TopicAdopt { keyword, force } => {
@@ -679,7 +662,7 @@ pub(crate) async fn handle_command(
             if let Some(id) = core.get_session_id(&thread_key).await {
                 core.opencode.update_session_title(&id, &name).await?;
                 core.invalidate_session_list_cache().await;
-                sync_topic_cover_title(core, &id).await;
+                crate::bridge::topic::sync_topic_cover_title(core, &id).await;
             }
             core.feishu
                 .reply_text(message_id, &format!("Renamed to \"{}\".", name))
@@ -1759,19 +1742,29 @@ async fn handle_topic_adopt(
         // --force: steal the mapping; the other thread becomes sessionless.
         core.remove_session(&info.id).await?;
     }
-    // Create a real topic anchored on the command message and map the adopted
-    // session to the new topic's ThreadKey.
-    match create_topic_and_map_adopted(core, thread_key, &info, message_id).await {
-        Ok(Some(thread_id)) => {
+    // Open the topic in one transaction (ADR-0016): the pre-mapping snapshot,
+    // cover card (ADR-0023), in-topic seed, Session Mapping and the snapshot
+    // claim all live in `bridge::topic`.
+    match crate::bridge::topic::open_topic(
+        core,
+        &thread_key.chat_id,
+        message_id,
+        crate::bridge::topic::TopicOpening::Adopt { info },
+    )
+    .await
+    {
+        Ok(opened) => {
             tracing::info!(
-                "topic-adopt: created topic {} for adopted session {} in chat {}",
-                thread_id,
-                info.id,
+                "topic-adopt: created topic {} (root {}, anchor {}) for adopted session {} in chat {}",
+                opened.thread_id,
+                opened.topic_root,
+                opened.topic_anchor,
+                opened.session_id,
                 thread_key.chat_id
             );
             Ok(())
         }
-        Ok(None) => {
+        Err(crate::bridge::topic::OpenTopicError::NoThreadId) => {
             // No thread_id from the platform — report and point at the fallback.
             core.feishu
                 .reply_text(
@@ -1781,178 +1774,8 @@ async fn handle_topic_adopt(
                 .await?;
             Ok(())
         }
-        Err(e) => Err(e),
+        Err(crate::bridge::topic::OpenTopicError::Failed(e)) => Err(e),
     }
-}
-
-/// The reply hint seeded as a fresh topic's first in-topic message
-/// (ADR-0023): it tells the user where to reply. Fresh-session topics
-/// (`/topic`, the `/dir` card's 建话题 op) seed with this text; adopted
-/// sessions seed with their Session Snapshot card instead (ADR-0028).
-const TOPIC_REPLY_HINT: &str = "请在本话题内回复，即可和这个会话对话。";
-
-/// What a newly created topic's FIRST in-topic message carries. That message
-/// is also the persisted `topic_anchor` (fallback-card routing, ADR-0006).
-enum TopicSeed {
-    /// The reply hint text — fresh sessions created around a new session.
-    ReplyHint,
-    /// The adopted session's Session Snapshot card (ADR-0028) — `/topic
-    /// --adopt` and the switch card's 建话题接管 op.
-    Snapshot(serde_json::Value),
-}
-
-/// Wrap an ALREADY-CREATED session in a brand-new Feishu topic: send the cover
-/// card to the chat's top level and anchor the thread on it (ADR-0023), then
-/// map the session to the new topic's `ThreadKey` with the seed message as the
-/// in-topic anchor (ADR-0006/ADR-0028), and record the cover title.
-/// `display_title` is what the cover shows until the server auto-generates a
-/// real title (ADR-0007: `/new`-style sessions are unnamed at creation, so
-/// callers pass the directory basename or the user-given name). Returns the
-/// new topic's `thread_id`, or `None` when the platform returns no thread_id
-/// (the caller reports that to the user). Shared by the text `/topic` form,
-/// `/topic --adopt` (via [`create_topic_and_map_adopted`]) and the `/dir`
-/// card's "建话题" op (ADR-0025), so the cover/anchor/mapping behavior cannot
-/// drift between the topic-creation surfaces.
-// `too-many-arguments` accepted like `picker_card`: every knob is a first-class
-// topic-creation axis, and the callers are the three topic surfaces this
-// helper exists to keep in lockstep.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn open_topic_for_session(
-    core: &Arc<SharedCore>,
-    chat_id: &str,
-    fallback_root: &str,
-    session_id: &str,
-    directory: String,
-    display_title: String,
-    agent: Option<String>,
-    model: Option<String>,
-) -> crate::error::Result<Option<String>> {
-    open_topic_seeded(
-        core,
-        chat_id,
-        fallback_root,
-        session_id,
-        directory,
-        display_title,
-        agent,
-        model,
-        TopicSeed::ReplyHint,
-    )
-    .await
-    .map(|(thread_id, _)| thread_id)
-}
-
-/// The shared body of [`open_topic_for_session`], parameterised by what the
-/// new topic's first in-topic message (its anchor) carries. Returns the new
-/// topic's `thread_id` and the in-topic anchor message id (the first message
-/// inside the topic — the adopt path claims its pendings against it).
-#[allow(clippy::too_many_arguments)]
-async fn open_topic_seeded(
-    core: &Arc<SharedCore>,
-    chat_id: &str,
-    fallback_root: &str,
-    session_id: &str,
-    directory: String,
-    display_title: String,
-    agent: Option<String>,
-    model: Option<String>,
-    seed: TopicSeed,
-) -> crate::error::Result<(Option<String>, String)> {
-    let cover_text = topic_cover_text(
-        &display_title,
-        &directory,
-        session_id,
-        agent.as_deref(),
-        model.as_deref(),
-    )
-    .await;
-    let (anchor, thread_id, topic_root, cover_id) =
-        open_cover_topic(core, chat_id, fallback_root, &cover_text, seed).await?;
-    let Some(thread_id) = thread_id else {
-        tracing::warn!(
-            "topic: no thread_id returned in chat {} for session {}; not mapping session",
-            chat_id,
-            session_id
-        );
-        return Ok((None, anchor));
-    };
-    let topic_key = crate::config::ThreadKey::new(chat_id.to_string(), thread_id.clone());
-    let mut entry = SessionEntry::new(topic_key, session_id.to_string(), directory);
-    entry.agent = agent;
-    entry.topic_anchor = Some(anchor.clone());
-    entry.topic_root = Some(topic_root);
-    core.activate_session(entry).await?;
-    record_cover_title(core, session_id, &display_title, model, cover_id.is_some()).await;
-    Ok((Some(thread_id), anchor))
-}
-
-/// Create a real Feishu topic around an ADOPTED session: the Topic Cover Card
-/// stays the root in the main chat; the session's Session Snapshot card
-/// (ADR-0028) is the first bot message INSIDE the new topic and the persisted
-/// anchor — replacing the reply-hint seed of fresh-session topics. The
-/// snapshot is gathered BEFORE the topic mapping is written, so it reflects
-/// the session's pre-adoption state. Returns the new topic's `thread_id`, or
-/// `None` when the platform returns no thread_id (the caller decides the
-/// message). Shared by the text `/topic --adopt` form and the switch card's
-/// "建话题接管" op (ADR-0016).
-pub(crate) async fn create_topic_and_map_adopted(
-    core: &Arc<SharedCore>,
-    thread_key: &ThreadKey,
-    info: &crate::opencode::SessionListInfo,
-    message_id: &str,
-) -> crate::error::Result<Option<String>> {
-    let (card, data) = snapshot_card_for(core, "接管", info).await;
-    let (thread_id, anchor) = open_topic_seeded(
-        core,
-        &thread_key.chat_id,
-        message_id,
-        &info.id,
-        info.directory.clone(),
-        info.title.clone(),
-        info.agent.clone(),
-        model_display(info.model.as_ref()),
-        TopicSeed::Snapshot(card),
-    )
-    .await?;
-    // ADR-0028: claim the snapshot's embedded pendings against the in-topic
-    // snapshot message (the topic's first message + anchor) so the poll loop
-    // never duplicates them. Not claimed when the topic could not be opened
-    // (no thread_id) — the poller keeps today's standalone flow for them.
-    if thread_id.is_some() {
-        crate::bridge::external::settle_snapshot_after_send(core, &anchor, "接管", &info.title, &data).await;
-    }
-    Ok(thread_id)
-}
-
-/// ADR-0028: gather an adopted session's snapshot data (status, adopt-time
-/// pendings, transcript tail) from server reads, restrict the pendings to the
-/// claimable ones (the session's own, not already surfaced elsewhere), and
-/// build its card with the given takeover verb (接管/切换). Shared by every
-/// adoption surface so the gather-before-mapping sequence cannot drift between
-/// them. Returns the card together with the filtered data — the caller sends
-/// the card and then claims the pendings with its message id.
-pub(crate) async fn snapshot_card_for(
-    core: &Arc<SharedCore>,
-    verb: &str,
-    info: &crate::opencode::SessionListInfo,
-) -> (serde_json::Value, crate::bridge::snapshot::SnapshotData) {
-    let data = crate::bridge::snapshot::gather_snapshot(&core.opencode, &info.id, &info.directory).await;
-    snapshot_card_from_data(core, verb, &info.title, data).await
-}
-
-/// ADR-0028: the filter+build half of [`snapshot_card_for`] — restrict the
-/// gathered data to the claimable pendings and build the card. Shared by the
-/// switch-card 切换 op, which gathers first (the suppression decision needs
-/// the raw data) and then filters, so the two surfaces cannot drift.
-pub(crate) async fn snapshot_card_from_data(
-    core: &Arc<SharedCore>,
-    verb: &str,
-    title: &str,
-    data: crate::bridge::snapshot::SnapshotData,
-) -> (serde_json::Value, crate::bridge::snapshot::SnapshotData) {
-    let data = crate::bridge::snapshot_claims::claimable_pendings(core, data).await;
-    let card = crate::feishu::snapshot_card::build_snapshot_card(verb, title, &data);
-    (card, data)
 }
 
 /// Adopt a server session as the current thread's session, honoring the
@@ -2029,7 +1852,7 @@ async fn adopt_session(
     // nothing. Gathered BEFORE the mapping write below, so the card reflects
     // the session's pre-adoption state; each field is best-effort, so a read
     // failure degrades that field rather than blocking the adoption.
-    let (card, data) = snapshot_card_for(core, "接管", info).await;
+    let (card, data) = crate::bridge::snapshot::snapshot_card_for(core, "接管", info).await;
 
     let anchor = if kind == ConversationKind::Topic {
         // The snapshot is sent inside the topic and doubles as the fallback-card
@@ -2065,247 +1888,6 @@ async fn adopt_session(
 /// as a query, so a copy-pasted card hash resolves without the `ses_` prefix.
 pub(crate) fn id_tail(id: &str) -> String {
     id.strip_prefix("ses_").unwrap_or(id).chars().take(7).collect()
-}
-
-/// Build the topic cover card's text (ADR-0023): a session brief laid out for
-/// the chat-list entry — the list shows the card's first ~3 lines, so line 1
-/// is the title, line 2 the project + git state, line 3 the session + dir.
-/// No creation verb and no footer: the reply hint lives only on the first
-/// message inside the topic, where the user actually sees it. Used both at
-/// creation and by the title-sync hook (patching the card keeps the list
-/// entry current). Purely human-facing: the injection guard never feeds the
-/// topic's own root or anchor back into prompts, so richness costs no tokens.
-pub(crate) async fn topic_cover_text(
-    title: &str,
-    dir: &str,
-    session_id: &str,
-    agent: Option<&str>,
-    model: Option<&str>,
-) -> String {
-    let git = crate::git::read_state(dir).await;
-    let mut s = format!("💬 `{title}`\n`{}`", dir_basename(dir));
-    if let Some(branch) = git.branch.as_deref() {
-        s.push_str(&format!(" · `{branch}`{}", if git.dirty { " ⚠" } else { "" }));
-    }
-    s.push_str(&format!("\n会话 `{}` · `{dir}`", id_tail(session_id)));
-    if let Some(agent) = agent {
-        s.push_str(&format!(" · agent `{agent}`"));
-    }
-    if let Some(model) = model {
-        s.push_str(&format!(" · 模型 `{model}`"));
-    }
-    s
-}
-
-/// Send the topic cover card to the chat's top level, then anchor the new
-/// thread on it — the card becomes the thread root, so the chat-list topic
-/// entry shows the session brief permanently (ADR-0023). Returns the cover
-/// message id, or `None` when sending fails (the caller then anchors the
-/// thread on the user's command message instead).
-async fn send_topic_cover(core: &Arc<SharedCore>, chat_id: &str, text: &str) -> Option<String> {
-    let card = crate::feishu::client::markdown_card(text);
-    match core.feishu.send_card("chat_id", chat_id, &card).await {
-        Ok(id) => Some(id),
-        Err(e) => {
-            tracing::warn!("topic cover card send failed: {e}; anchoring on the command message");
-            None
-        }
-    }
-}
-
-/// ADR-0023: open a topic whose root is the topic cover card — the session
-/// brief sent to the chat's top level, so the chat-list topic entry shows it
-/// permanently. Best-effort: when the cover send fails, the thread anchors on
-/// `fallback_root` (the user's command message) instead. The topic's FIRST
-/// in-topic message is `seed` (the reply hint for fresh sessions, the Session
-/// Snapshot card for adopted ones, ADR-0028) and becomes the in-topic anchor.
-/// Returns the created reply's message id (the anchor), the new thread_id, the
-/// root message id (`topic_root`), and the cover id (`None` on fallback).
-/// Shared by `/topic` and `/topic --adopt`.
-async fn open_cover_topic(
-    core: &Arc<SharedCore>,
-    chat_id: &str,
-    fallback_root: &str,
-    cover_text: &str,
-    seed: TopicSeed,
-) -> crate::error::Result<(String, Option<String>, String, Option<String>)> {
-    let cover_id = send_topic_cover(core, chat_id, cover_text).await;
-    let root = cover_id.clone().unwrap_or_else(|| fallback_root.to_string());
-    let (anchor, thread_id) = match seed {
-        TopicSeed::ReplyHint => core.feishu.reply_in_thread(&root, TOPIC_REPLY_HINT).await?,
-        TopicSeed::Snapshot(card) => core.feishu.reply_card_in_thread(&root, &card).await?,
-    };
-    Ok((anchor, thread_id, root, cover_id))
-}
-
-/// ADR-0023: when the server's session title differs from the one shown on the
-/// topic cover card, rebuild the card in place. The cover card is the thread
-/// root, so this is what the chat-list topic entry displays — the patch keeps
-/// the entry current after the first auto-generated title (post-turn hook) or
-/// an immediate `/name`. The recorded title lives only in memory: after a
-/// restart the next completed turn re-syncs the card once (same content,
-/// harmless). Best effort; failures only log. Only cover-rooted topics are
-/// patched — command-rooted fallback topics record nothing, so they
-/// short-circuit.
-///
-/// Returns `true` when the card is settled (nothing more to do: no cover
-/// topic, already synced, or patched) and `false` when the server title is
-/// not (yet) available or the patch failed — callers like the post-turn retry
-/// ladder use this to decide whether to try again later.
-pub(crate) async fn sync_topic_cover_title(core: &Arc<SharedCore>, session_id: &str) -> bool {
-    let (root_id, directory, agent, recorded) = {
-        let store = core.sessions.lock().await;
-        match store.entry_for_session(session_id) {
-            Some(e) => {
-                let recorded = core.cover_titles.lock().await.get(session_id).cloned();
-                (
-                    e.topic_root.clone(),
-                    e.directory.clone(),
-                    e.agent.clone(),
-                    recorded,
-                )
-            }
-            None => return true,
-        }
-    };
-    let (Some(root_id), Some(recorded)) = (root_id, recorded) else {
-        return true;
-    };
-    let Ok(info) = core.opencode.session_info(session_id, Some(&directory)).await else {
-        return false;
-    };
-    // Never patch a default title over the recorded one: the server's initial
-    // `New session - <ts>` (or empty) would otherwise replace the meaningful
-    // creation title (e.g. the directory name) the moment the auto-title has
-    // not (yet) been generated.
-    let Some(title) = info
-        .title
-        .filter(|t| !t.is_empty() && !crate::feishu::card::clean_session_label(t).is_empty())
-    else {
-        return false;
-    };
-    if title == recorded.title {
-        return true;
-    }
-    let text = topic_cover_text(
-        &title,
-        &directory,
-        session_id,
-        agent.as_deref(),
-        recorded.model.as_deref(),
-    )
-    .await;
-    let card = crate::feishu::client::markdown_card(&text);
-    match core.feishu.update_message(&root_id, &card).await {
-        Ok(()) => {
-            tracing::info!("topic cover card updated for session {}: {}", session_id, title);
-            core.cover_titles.lock().await.insert(
-                session_id.to_string(),
-                crate::bridge::core::CoverTitle {
-                    title,
-                    model: recorded.model,
-                },
-            );
-            true
-        }
-        Err(e) => {
-            tracing::warn!("topic cover card update failed for session {}: {}", session_id, e);
-            false
-        }
-    }
-}
-
-/// ADR-0023: after a completed turn the auto-title may still be in flight —
-/// the title agent races the turn, and on short turns it lands AFTER the turn
-/// ends. Retry the cover sync at 10/30/60/120 s after the turn so the
-/// chat-list topic entry follows even if the user stops here. Each attempt is
-/// one cheap `session_info` GET and stops as soon as the title is settled
-/// (patched, already equal, or no cover topic); the ladder gives up after two
-/// minutes, leaving later turns' hooks to catch up. Detached task: holds no
-/// locks across sleeps. Only meaningful when the initial sync did not settle —
-/// callers gate on its return value.
-pub(crate) fn spawn_cover_title_retry(core: &Arc<SharedCore>, session_id: &str) {
-    spawn_cover_title_retry_at(
-        core,
-        session_id,
-        &[
-            std::time::Duration::from_secs(10),
-            std::time::Duration::from_secs(30),
-            std::time::Duration::from_secs(60),
-            std::time::Duration::from_secs(120),
-        ],
-    );
-}
-
-/// The delay-injectable form of [`spawn_cover_title_retry`] (tests use
-/// millisecond delays). `delays` are ABSOLUTE offsets from the call: attempts
-/// happen at each listed time after spawn, not after the previous attempt.
-pub(crate) fn spawn_cover_title_retry_at(
-    core: &Arc<SharedCore>,
-    session_id: &str,
-    delays: &[std::time::Duration],
-) {
-    let core = Arc::clone(core);
-    let sid = session_id.to_string();
-    let delays = delays.to_vec();
-    tokio::spawn(async move {
-        let start = std::time::Instant::now();
-        for delay in delays {
-            let elapsed = start.elapsed();
-            if delay > elapsed {
-                tokio::time::sleep(delay - elapsed).await;
-            }
-            if sync_topic_cover_title(&core, &sid).await {
-                return;
-            }
-        }
-    });
-}
-
-/// ADR-0023: record the title shown on a topic's cover card so the post-turn
-/// hook can sync the server title onto the card. Only cover-rooted topics are
-/// patchable (Feishu updates only the app's own cards) — when no cover card
-/// was sent, any stale entry is dropped so nothing is ever patched onto a
-/// user message.
-async fn record_cover_title(
-    core: &Arc<SharedCore>,
-    session_id: &str,
-    title: &str,
-    model: Option<String>,
-    cover_sent: bool,
-) {
-    let mut covers = core.cover_titles.lock().await;
-    if cover_sent {
-        covers.insert(
-            session_id.to_string(),
-            crate::bridge::core::CoverTitle {
-                title: title.to_string(),
-                model,
-            },
-        );
-    } else {
-        covers.remove(session_id);
-    }
-}
-
-/// The display identity of a session's model from the list payload
-/// (`providerID/modelID@variant`), matching how cola renders model identity
-/// elsewhere. Returns None when the payload carries no model.
-fn model_display(model: Option<&serde_json::Value>) -> Option<String> {
-    let v = model?;
-    let id = match v {
-        serde_json::Value::String(s) => return Some(s.clone()),
-        _ => v.get("id").and_then(|x| x.as_str())?,
-    };
-    let mut s = match v.get("providerID").and_then(|x| x.as_str()) {
-        Some(p) => format!("{p}/{id}"),
-        None => id.to_string(),
-    };
-    if let Some(variant) = v.get("variant").and_then(|x| x.as_str()) {
-        s.push('@');
-        s.push_str(variant);
-    }
-    Some(s)
 }
 
 /// The basename of a working directory, for display (e.g. "cola" for
@@ -2502,36 +2084,6 @@ mod tests {
             SessionResolution::Hit(s) => assert_eq!(s.id, "ses_1a2bXxxxx"),
             _ => panic!("the prefix hit must win"),
         }
-    }
-
-    #[test]
-    fn model_display_formats_provider_model_and_variant() {
-        use serde_json::json;
-        // Full identity: providerID/modelID@variant (ADR-0019 model identity).
-        assert_eq!(
-            model_display(Some(
-                &json!({"id": "deepseek-v4-flash", "providerID": "opencode-go", "variant": "low"})
-            ))
-            .as_deref(),
-            Some("opencode-go/deepseek-v4-flash@low")
-        );
-        // No variant.
-        assert_eq!(
-            model_display(Some(&json!({"id": "gpt-4o", "providerID": "openai"}))).as_deref(),
-            Some("openai/gpt-4o")
-        );
-        // No provider: bare id.
-        assert_eq!(
-            model_display(Some(&json!({"id": "claude"}))).as_deref(),
-            Some("claude")
-        );
-        // A bare string payload passes through.
-        assert_eq!(
-            model_display(Some(&json!("openai/gpt-4o"))).as_deref(),
-            Some("openai/gpt-4o")
-        );
-        // No model at all.
-        assert_eq!(model_display(None), None);
     }
 
     #[test]

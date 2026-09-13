@@ -101,7 +101,7 @@ pub(crate) async fn refresh_session_title(core: &Arc<SharedCore>, session_id: &s
     // the server title changes mid-turn (not only at turn end), so the list
     // entry updates as early as the title agent finishes (ADR-0023). Only
     // fires on this change tick; the per-tick cost is unchanged.
-    crate::bridge::command::sync_topic_cover_title(core, session_id).await;
+    crate::bridge::topic::sync_topic_cover_title(core, session_id).await;
     true
 }
 

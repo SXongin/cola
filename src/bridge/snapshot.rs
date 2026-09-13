@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::bridge::core::SharedCore;
 use crate::opencode;
 
 /// Read-side state for the Session Snapshot card (ADR-0028). Built purely from
@@ -174,6 +175,37 @@ pub(crate) async fn gather_snapshot(
         newest_user_epoch,
         newest_user_is_cola_authored,
     }
+}
+
+/// ADR-0028: gather an adopted session's snapshot data (status, adopt-time
+/// pendings, transcript tail) from server reads, restrict the pendings to the
+/// claimable ones (the session's own, not already surfaced elsewhere), and
+/// build its card with the given takeover verb (接管/切换). Shared by every
+/// adoption surface so the gather-before-mapping sequence cannot drift between
+/// them. Returns the card together with the filtered data — the caller sends
+/// the card and then claims the pendings with its message id.
+pub(crate) async fn snapshot_card_for(
+    core: &Arc<SharedCore>,
+    verb: &str,
+    info: &crate::opencode::SessionListInfo,
+) -> (serde_json::Value, SnapshotData) {
+    let data = gather_snapshot(&core.opencode, &info.id, &info.directory).await;
+    snapshot_card_from_data(core, verb, &info.title, data).await
+}
+
+/// ADR-0028: the filter+build half of [`snapshot_card_for`] — restrict the
+/// gathered data to the claimable pendings and build the card. Shared by the
+/// switch-card 切换 op, which gathers first (the suppression decision needs
+/// the raw data) and then filters, so the two surfaces cannot drift.
+pub(crate) async fn snapshot_card_from_data(
+    core: &Arc<SharedCore>,
+    verb: &str,
+    title: &str,
+    data: SnapshotData,
+) -> (serde_json::Value, SnapshotData) {
+    let data = crate::bridge::snapshot_claims::claimable_pendings(core, data).await;
+    let card = crate::feishu::snapshot_card::build_snapshot_card(verb, title, &data);
+    (card, data)
 }
 
 /// The newest user message (by created time), if any — `(created, id)`. A

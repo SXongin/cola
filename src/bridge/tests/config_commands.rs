@@ -552,7 +552,7 @@ async fn default_server_title_does_not_patch_cover_card() {
     .await;
     seed_cover_title(&app, "ses_test", "cola").await;
 
-    let settled = crate::bridge::command::sync_topic_cover_title(&app.core, "ses_test").await;
+    let settled = crate::bridge::topic::sync_topic_cover_title(&app.core, "ses_test").await;
 
     let calls = platform.calls.lock().await.clone();
     assert!(
@@ -607,7 +607,7 @@ async fn cover_title_retry_ladder_catches_late_auto_title() {
 
     // The title is NOT on the server when the turn ends; the ladder starts
     // and the title lands a moment later.
-    crate::bridge::command::spawn_cover_title_retry_at(
+    crate::bridge::topic::spawn_cover_title_retry_at(
         &app.core,
         "ses_test",
         &[
