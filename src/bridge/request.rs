@@ -86,8 +86,15 @@ pub trait RequestKind: Send + Sync {
     /// another client).
     fn summary(&self, req: &PendingRequest) -> String;
 
-    /// Drop inline sections whose request vanished (answered elsewhere).
-    fn retain_inline(&self, acc: &mut StreamAccumulator, pending: &std::collections::HashSet<String>);
+    /// Drop inline sections whose request vanished (answered elsewhere). An
+    /// item owned by a directory whose list call failed is kept: unknown must
+    /// never be read as resolved (#130, #144).
+    fn retain_inline(
+        &self,
+        acc: &mut StreamAccumulator,
+        pending: &std::collections::HashSet<String>,
+        failed_dirs: &std::collections::HashSet<String>,
+    );
 
     /// The snapshot-claim kind of this flow's requests (ADR-0028): each flow's
     /// poll sweep only drops claims of its own kind.
@@ -207,9 +214,14 @@ impl RequestKind for PermissionKind {
         }
     }
 
-    fn retain_inline(&self, acc: &mut StreamAccumulator, pending: &std::collections::HashSet<String>) {
+    fn retain_inline(
+        &self,
+        acc: &mut StreamAccumulator,
+        pending: &std::collections::HashSet<String>,
+        failed_dirs: &std::collections::HashSet<String>,
+    ) {
         acc.pending_permissions
-            .retain(|p| pending.contains(&p.request_id));
+            .retain(|p| pending.contains(&p.request_id) || failed_dirs.contains(&p.directory));
     }
 
     fn claim_kind(&self) -> ClaimKind {
@@ -440,8 +452,14 @@ impl RequestKind for QuestionKind {
         }
     }
 
-    fn retain_inline(&self, acc: &mut StreamAccumulator, pending: &std::collections::HashSet<String>) {
-        acc.pending_questions.retain(|q| pending.contains(&q.request_id));
+    fn retain_inline(
+        &self,
+        acc: &mut StreamAccumulator,
+        pending: &std::collections::HashSet<String>,
+        failed_dirs: &std::collections::HashSet<String>,
+    ) {
+        acc.pending_questions
+            .retain(|q| pending.contains(&q.request_id) || failed_dirs.contains(&q.directory));
     }
 
     fn claim_kind(&self) -> ClaimKind {
@@ -844,6 +862,18 @@ impl RequestKind for QuestionKind {
     }
 }
 
+/// A request card cola sent: the live Message id, the summary shown when the
+/// card is marked stale, and the owning directory. The directory lets the
+/// sweep skip cleanups for a directory whose list call failed — "absent from
+/// the pending list" only speaks for directories that listed successfully
+/// (#130, #144).
+#[derive(Clone)]
+pub struct SentCard {
+    pub message_id: String,
+    pub summary: String,
+    pub directory: String,
+}
+
 /// The fused permission/question flow. The poll loop, card delivery, double-click
 /// guard primitive and error-result block live here once; the kind supplies the
 /// deltas.
@@ -859,9 +889,9 @@ pub struct RequestFlow {
     /// hung call cannot freeze the poller forever. Defaults to 30 s; tests
     /// store a small value so the timeout branch runs without sleeping.
     pub list_timeout_ms: std::sync::atomic::AtomicU64,
-    /// request_id → (card message_id, description) of the card cola sent (used
-    /// to mark a card stale when the request is resolved by ANOTHER client).
-    pub sent_cards: Arc<Mutex<HashMap<String, (String, String)>>>,
+    /// request_id → the card cola sent (used to mark a card stale when the
+    /// request is resolved by ANOTHER client).
+    pub sent_cards: Arc<Mutex<HashMap<String, SentCard>>>,
     /// Directories whose list call has SUCCEEDED at least once in this process
     /// (#130). A question card only exists after its state was recorded, so
     /// for one of these directories a missing state entry proves the request
@@ -1205,10 +1235,14 @@ impl RequestFlow {
                             }
                         };
                         if let Some(mid) = sent_id {
-                            self.sent_cards
-                                .lock()
-                                .await
-                                .insert(req.id().to_string(), (mid, self.kind.summary(req)));
+                            self.sent_cards.lock().await.insert(
+                                req.id().to_string(),
+                                SentCard {
+                                    message_id: mid,
+                                    summary: self.kind.summary(req),
+                                    directory: dir.clone(),
+                                },
+                            );
                         } else {
                             tracing::warn!(
                                 "{} card send failed on session {}",
@@ -1225,14 +1259,16 @@ impl RequestFlow {
             }
         }
         // Mark stale: a card cola sent whose request is no longer pending
-        // (resolved by another client) and was NOT answered by cola.
-        mark_stale_cards(core, &pending, &self.sent_cards, self.kind.label()).await;
+        // (resolved by another client) and was NOT answered by cola. A card
+        // owned by a directory whose list failed stays live (#144).
+        mark_stale_cards(core, &pending, &self.sent_cards, &failed_dirs, self.kind.label()).await;
         // Drop inline sections whose request vanished (answered elsewhere) —
-        // the streaming card re-renders without them.
+        // the streaming card re-renders without them. Sections owned by a
+        // failed directory stay (#144).
         {
             let mut cards = core.cards.lock().await;
             for card in cards.values_mut() {
-                self.kind.retain_inline(&mut card.acc, &pending);
+                self.kind.retain_inline(&mut card.acc, &pending, &failed_dirs);
             }
         }
         // ADR-0028: a claimed request that left the pending list was
@@ -1240,14 +1276,15 @@ impl RequestFlow {
         // re-renders synchronously; this just cleans the registry) or by
         // another client (the block must drop from the snapshot). The
         // snapshot card itself is never marked stale — that targets
-        // standalone cards. The registry returns the rebuilt cards; the
-        // flow patches them (never holding the registry lock across the
-        // Feishu call).
-        let dropped = core
-            .snapshot_claims
-            .lock()
-            .await
-            .drop_vanished(self.kind.claim_kind(), &pending);
+        // standalone cards. A claim hosted from a directory whose list failed
+        // stays: that directory said nothing (#144). The registry returns the
+        // rebuilt cards; the flow patches them (never holding the registry
+        // lock across the Feishu call).
+        let dropped =
+            core.snapshot_claims
+                .lock()
+                .await
+                .drop_vanished(self.kind.claim_kind(), &pending, &failed_dirs);
         for (message_id, card) in dropped {
             if let Err(e) = core.feishu.update_message(&message_id, &card).await {
                 tracing::warn!("snapshot claim drop: card update failed: {}", e);

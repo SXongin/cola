@@ -258,11 +258,14 @@ async fn adopt_skips_already_surfaced_pending() {
     backend.permissions = vec![perm_request("per_1", "ses_alpha01", "ls -la")];
     let (app, platform) = build_app(cfg, backend).await;
     // The request was already surfaced as a standalone card.
-    app.permission
-        .sent_cards
-        .lock()
-        .await
-        .insert("per_1".into(), ("om_existing".into(), "bash".into()));
+    app.permission.sent_cards.lock().await.insert(
+        "per_1".into(),
+        crate::bridge::request::SentCard {
+            message_id: "om_existing".into(),
+            summary: "bash".into(),
+            directory: "/work/ext".into(),
+        },
+    );
 
     crate::bridge::command::handle_command(
         &app.core,

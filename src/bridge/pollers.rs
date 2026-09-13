@@ -5,6 +5,7 @@ use tokio::sync::Mutex;
 use crate::bridge::core::SharedCore;
 use crate::bridge::discovery::{self, ServerCandidate};
 use crate::bridge::handler::CardActionResult;
+use crate::bridge::request::SentCard;
 use crate::config::ServerStartPolicy;
 use crate::opencode;
 
@@ -445,11 +446,14 @@ pub(crate) fn result_card(title: &str, template: &str, body: &str) -> CardAction
 /// Mark permission/question cards as "already handled" when the underlying
 /// request disappeared without cola answering it (another client resolved it).
 /// The stale card keeps the original request description so the user can see
-/// what was handled. Shared by the permission and question flows.
+/// what was handled. A card owned by a directory whose list call failed stays
+/// live — that directory said nothing, so its requests may still be pending
+/// (#130, #144). Shared by the permission and question flows.
 pub(crate) async fn mark_stale_cards(
     core: &Arc<SharedCore>,
     pending: &std::collections::HashSet<String>,
-    sent: &Arc<Mutex<HashMap<String, (String, String)>>>,
+    sent: &Arc<Mutex<HashMap<String, SentCard>>>,
+    failed_dirs: &std::collections::HashSet<String>,
     kind: &str,
 ) {
     let stale: Vec<(String, String, String)> = {
@@ -457,8 +461,10 @@ pub(crate) async fn mark_stale_cards(
         let answered = core.answered_requests.lock().await;
         sent_map
             .into_iter()
-            .filter(|(rid, _)| !pending.contains(rid) && !answered.contains(rid))
-            .map(|(rid, (mid, desc))| (rid, mid, desc))
+            .filter(|(rid, card)| {
+                !pending.contains(rid) && !answered.contains(rid) && !failed_dirs.contains(&card.directory)
+            })
+            .map(|(rid, card)| (rid, card.message_id, card.summary))
             .collect()
     };
     for (rid, mid, desc) in stale {
