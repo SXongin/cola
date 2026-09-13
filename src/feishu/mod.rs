@@ -1,6 +1,7 @@
 pub mod card;
 pub mod client;
 pub mod event;
+pub(crate) mod pbbp2;
 pub mod snapshot_card;
 pub mod ws;
 
