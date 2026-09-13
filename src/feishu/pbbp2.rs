@@ -70,59 +70,35 @@ impl Frame {
                 }
                 (5, 2) => {
                     // Header entry (nested message with key=1, value=2)
-                    let (len, p) = read_varint(data, pos)?;
+                    let (hdr, p) = read_len_delimited(data, pos)?;
                     pos = p;
-                    if pos + len as usize > data.len() {
-                        return None;
-                    }
-                    let hdr = &data[pos..pos + len as usize];
-                    pos += len as usize;
                     if let Some((k, v)) = parse_header(hdr) {
                         frame.headers.insert(k, v);
                     }
                 }
                 (6, 2) => {
                     // PayloadEncoding (string)
-                    let (len, p) = read_varint(data, pos)?;
+                    let (bytes, p) = read_len_delimited(data, pos)?;
                     pos = p;
-                    if pos + len as usize > data.len() {
-                        return None;
-                    }
-                    frame.routing.payload_encoding =
-                        Some(String::from_utf8_lossy(&data[pos..pos + len as usize]).to_string());
-                    pos += len as usize;
+                    frame.routing.payload_encoding = Some(String::from_utf8_lossy(bytes).to_string());
                 }
                 (7, 2) => {
                     // PayloadType (string)
-                    let (len, p) = read_varint(data, pos)?;
+                    let (bytes, p) = read_len_delimited(data, pos)?;
                     pos = p;
-                    if pos + len as usize > data.len() {
-                        return None;
-                    }
-                    frame.routing.payload_type =
-                        Some(String::from_utf8_lossy(&data[pos..pos + len as usize]).to_string());
-                    pos += len as usize;
+                    frame.routing.payload_type = Some(String::from_utf8_lossy(bytes).to_string());
                 }
                 (8, 2) => {
                     // Payload (raw bytes, typically JSON)
-                    let (len, p) = read_varint(data, pos)?;
+                    let (bytes, p) = read_len_delimited(data, pos)?;
                     pos = p;
-                    if pos + len as usize > data.len() {
-                        return None;
-                    }
-                    frame.payload = data[pos..pos + len as usize].to_vec();
-                    pos += len as usize;
+                    frame.payload = bytes.to_vec();
                 }
                 (9, 2) => {
                     // LogIDNew (string)
-                    let (len, p) = read_varint(data, pos)?;
+                    let (bytes, p) = read_len_delimited(data, pos)?;
                     pos = p;
-                    if pos + len as usize > data.len() {
-                        return None;
-                    }
-                    frame.routing.log_id_new =
-                        Some(String::from_utf8_lossy(&data[pos..pos + len as usize]).to_string());
-                    pos += len as usize;
+                    frame.routing.log_id_new = Some(String::from_utf8_lossy(bytes).to_string());
                 }
                 // Skip other fields
                 (_, 0) => {
@@ -162,6 +138,18 @@ fn read_varint(data: &[u8], start: usize) -> Option<(u64, usize)> {
     None
 }
 
+/// Read one length-delimited field: consume the length varint at `start`,
+/// reject a declared length that runs past `data`, and return the field bytes
+/// plus the cursor after them.
+fn read_len_delimited(data: &[u8], start: usize) -> Option<(&[u8], usize)> {
+    let (len, pos) = read_varint(data, start)?;
+    let end = pos + len as usize;
+    if end > data.len() {
+        return None;
+    }
+    Some((&data[pos..end], end))
+}
+
 fn parse_header(data: &[u8]) -> Option<(String, String)> {
     let mut pos = 0;
     let mut key = String::new();
@@ -174,13 +162,9 @@ fn parse_header(data: &[u8]) -> Option<(String, String)> {
         let wire_type = (tag & 0x7) as u32;
 
         if wire_type == 2 {
-            let (len, p) = read_varint(data, pos)?;
+            let (bytes, p) = read_len_delimited(data, pos)?;
             pos = p;
-            if pos + len as usize > data.len() {
-                return None;
-            }
-            let s = String::from_utf8_lossy(&data[pos..pos + len as usize]).to_string();
-            pos += len as usize;
+            let s = String::from_utf8_lossy(bytes).to_string();
             match field_num {
                 1 => key = s,
                 2 => value = s,
@@ -345,6 +329,39 @@ mod tests {
             })
             .unwrap_or_default();
         assert_eq!(event_type, "im.message.receive_v1");
+    }
+
+    /// `read_len_delimited` consumes the length varint and returns the field
+    /// bytes with the cursor after them.
+    #[test]
+    fn read_len_delimited_reads_slice_and_advances() {
+        let data = [0x32, 0x02, b'h', b'i']; // field 6 tag, len 2, "hi"
+        let (bytes, pos) = read_len_delimited(&data, 1).expect("valid field");
+        assert_eq!(bytes, b"hi");
+        assert_eq!(pos, data.len());
+    }
+
+    /// A declared length that runs past the buffer is rejected, never sliced.
+    #[test]
+    fn read_len_delimited_rejects_overrun() {
+        let data = [0x32, 0x03, b'h', b'i']; // len 3, only 2 bytes follow
+        assert!(read_len_delimited(&data, 1).is_none());
+    }
+
+    /// A frame truncated mid-field fails to decode instead of yielding a
+    /// half-parsed one.
+    #[test]
+    fn truncated_frame_does_not_decode() {
+        let bytes = encode(
+            &Routing {
+                seq_id: 1,
+                payload_type: Some("event".to_string()),
+                ..Routing::default()
+            },
+            &[("type", "event")],
+            b"{}",
+        );
+        assert!(Frame::decode(&bytes[..bytes.len() - 1]).is_none());
     }
 
     /// A pbbp2 control "ping" frame from Feishu must be answered with a
