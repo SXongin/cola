@@ -1,9 +1,11 @@
 use std::process::{Command, exit};
 
+mod release;
+
 fn main() {
     let task = std::env::args().nth(1).unwrap_or_else(|| {
         eprintln!("Usage: cargo xtask <task>");
-        eprintln!("Tasks: check, test, clippy, fmt, audit, check-commit-msg");
+        eprintln!("Tasks: check, test, clippy, fmt, audit, check-commit-msg, release");
         exit(1);
     });
 
@@ -14,8 +16,11 @@ fn main() {
         "fmt" => run_fmt(),
         "audit" => run_audit(),
         "check-commit-msg" => run_check_commit_msg(),
+        "release" => release::cli(),
         other => {
-            eprintln!("Unknown task: {other}. Available: check, test, clippy, fmt, audit, check-commit-msg");
+            eprintln!(
+                "Unknown task: {other}. Available: check, test, clippy, fmt, audit, check-commit-msg, release"
+            );
             exit(1);
         }
     }
