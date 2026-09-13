@@ -376,6 +376,7 @@ pub fn command_help(name: &str) -> Option<String> {
 // run the parsed slash commands against the shared core.
 
 use crate::bridge::core::SharedCore;
+use crate::bridge::display::{id_tail, title_or_id_tail};
 use crate::config::{ConversationKind, SessionEntry, ThreadKey};
 use crate::feishu;
 use std::sync::Arc;
@@ -625,10 +626,8 @@ pub(crate) async fn handle_command(
             {
                 Ok(opened) => {
                     tracing::info!(
-                        "topic: created topic {} (root {}, anchor {}) for session {} in chat {}",
+                        "topic: created topic {} for session {} in chat {}",
                         opened.thread_id,
-                        opened.topic_root,
-                        opened.topic_anchor,
                         opened.session_id,
                         thread_key.chat_id
                     );
@@ -1755,10 +1754,8 @@ async fn handle_topic_adopt(
     {
         Ok(opened) => {
             tracing::info!(
-                "topic-adopt: created topic {} (root {}, anchor {}) for adopted session {} in chat {}",
+                "topic-adopt: created topic {} for adopted session {} in chat {}",
                 opened.thread_id,
-                opened.topic_root,
-                opened.topic_anchor,
                 opened.session_id,
                 thread_key.chat_id
             );
@@ -1883,23 +1880,6 @@ async fn adopt_session(
     Ok(())
 }
 
-/// The first 7 characters of a session id with its `ses_` prefix stripped —
-/// the compact display hash on cards. `resolve_session` accepts this bare hash
-/// as a query, so a copy-pasted card hash resolves without the `ses_` prefix.
-pub(crate) fn id_tail(id: &str) -> String {
-    id.strip_prefix("ses_").unwrap_or(id).chars().take(7).collect()
-}
-
-/// The basename of a working directory, for display (e.g. "cola" for
-/// "/root/workspace/dev/cola").
-pub(crate) fn dir_basename(dir: &str) -> String {
-    std::path::Path::new(dir)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| dir.to_string())
-}
-
 /// Normalize a user-supplied directory for `/dir` / `/topic` into an absolute
 /// path the OpenCode server can route by: expand a leading `~`, resolve
 /// relative paths against the working directory, and canonicalize (`..`,
@@ -1981,17 +1961,6 @@ fn candidates_list(header: &str, sessions: &[&crate::opencode::SessionListInfo])
         list.push_str(&format!("- {} · {} · {}\n", s.title, s.directory, id_tail(&s.id)));
     }
     list
-}
-
-/// A session's display title, falling back to the id-tail when the title is a
-/// meaningless default (`New session - ...`, `sess-<uuid>`, etc.).
-pub(crate) fn title_or_id_tail(s: &crate::opencode::SessionListInfo) -> String {
-    let cleaned = crate::feishu::card::clean_session_label(&s.title);
-    if cleaned.is_empty() {
-        id_tail(&s.id)
-    } else {
-        cleaned
-    }
 }
 
 /// Compact relative-time label for a millisecond timestamp.

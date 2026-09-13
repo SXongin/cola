@@ -878,7 +878,7 @@ impl App {
             card: Some(card),
             toast: Some(format!(
                 "已{verb}「{}」",
-                crate::bridge::command::title_or_id_tail(target)
+                crate::bridge::display::title_or_id_tail(target)
             )),
         }
     }
@@ -1030,7 +1030,7 @@ impl App {
                 // Creation title policy (ADR-0007): unnamed, like `/topic
                 // <dir>`; the cover shows the directory basename until the
                 // server auto-generates a title after the first exchange.
-                let display = crate::bridge::command::dir_basename(&directory);
+                let display = crate::bridge::display::dir_basename(&directory);
                 match crate::bridge::topic::open_topic(
                     core,
                     &thread_key.chat_id,

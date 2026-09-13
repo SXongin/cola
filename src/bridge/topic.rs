@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use crate::bridge::core::SharedCore;
+use crate::bridge::display::{dir_basename, id_tail, model_display};
 use crate::config::{SessionEntry, ThreadKey};
 use crate::error::BridgeError;
 use crate::opencode::SessionListInfo;
@@ -31,15 +32,12 @@ pub(crate) enum TopicOpening {
     Adopt { info: SessionListInfo },
 }
 
-/// The opened topic: the session it belongs to, the new Feishu `thread_id`,
-/// the thread root (`topic_root`: the cover card, or the command/card message
-/// when the cover send failed — ADR-0023), and the in-topic seed message
-/// (`topic_anchor`).
+/// The opened topic: the session it belongs to and the new Feishu `thread_id`.
+/// The thread root and in-topic anchor (ADR-0023) are written to the Session
+/// Mapping by the transaction, not returned — no caller needs to re-place them.
 pub(crate) struct OpenedTopic {
     pub session_id: String,
     pub thread_id: String,
-    pub topic_root: String,
-    pub topic_anchor: String,
 }
 
 /// Why a topic could not be opened. `NoThreadId` is the benign platform
@@ -72,7 +70,7 @@ pub(crate) async fn open_topic(
     // Step one: the session side. Fresh creates the session here (so no caller
     // can forget it), Adopt gathers the snapshot while the mapping is still
     // unwritten.
-    let prepared = match opening {
+    let parts = match opening {
         TopicOpening::Fresh { directory, name } => {
             let session = core
                 .opencode
@@ -84,15 +82,15 @@ pub(crate) async fn open_topic(
             if let Some(n) = &name {
                 core.opencode.update_session_title(&session.id, n).await?;
             }
-            let display_title = name.unwrap_or_else(|| crate::bridge::command::dir_basename(&directory));
-            Prepared {
+            let display_title = name.unwrap_or_else(|| dir_basename(&directory));
+            OpeningParts {
                 session_id: session.id,
                 directory,
                 display_title,
                 agent: None,
                 model: None,
                 seed: TopicSeed::ReplyHint,
-                claim: None,
+                snapshot_claim: None,
             }
         }
         TopicOpening::Adopt { info } => {
@@ -103,14 +101,17 @@ pub(crate) async fn open_topic(
             // blocking the adoption. The pendings are restricted to the
             // claimable ones (the session's own, not already surfaced).
             let (card, data) = crate::bridge::snapshot::snapshot_card_for(core, "接管", &info).await;
-            Prepared {
+            OpeningParts {
                 session_id: info.id,
                 directory: info.directory,
                 display_title: info.title.clone(),
                 agent: info.agent,
                 model: model_display(info.model.as_ref()),
                 seed: TopicSeed::Snapshot(card),
-                claim: Some((info.title, data)),
+                snapshot_claim: Some(SnapshotClaim {
+                    title: info.title,
+                    data,
+                }),
             }
         }
     };
@@ -118,34 +119,34 @@ pub(crate) async fn open_topic(
     // Step two: the shared cover/anchor/mapping tail. The fallback ladder
     // lives in `open_cover_topic`, so every surface gets it.
     let cover_text = topic_cover_text(
-        &prepared.display_title,
-        &prepared.directory,
-        &prepared.session_id,
-        prepared.agent.as_deref(),
-        prepared.model.as_deref(),
+        &parts.display_title,
+        &parts.directory,
+        &parts.session_id,
+        parts.agent.as_deref(),
+        parts.model.as_deref(),
     )
     .await;
     let (anchor, thread_id, topic_root, cover_id) =
-        open_cover_topic(core, chat_id, fallback_root, &cover_text, prepared.seed).await?;
+        open_cover_topic(core, chat_id, fallback_root, &cover_text, parts.seed).await?;
     let Some(thread_id) = thread_id else {
         tracing::warn!(
             "topic: no thread_id returned in chat {} for session {}; not mapping session",
             chat_id,
-            prepared.session_id
+            parts.session_id
         );
         return Err(OpenTopicError::NoThreadId);
     };
     let topic_key = ThreadKey::new(chat_id.to_string(), thread_id.clone());
-    let mut entry = SessionEntry::new(topic_key, prepared.session_id.clone(), prepared.directory);
-    entry.agent = prepared.agent;
+    let mut entry = SessionEntry::new(topic_key, parts.session_id.clone(), parts.directory);
+    entry.agent = parts.agent;
     entry.topic_anchor = Some(anchor.clone());
-    entry.topic_root = Some(topic_root.clone());
+    entry.topic_root = Some(topic_root);
     core.activate_session(entry).await?;
     record_cover_title(
         core,
-        &prepared.session_id,
-        &prepared.display_title,
-        prepared.model,
+        &parts.session_id,
+        &parts.display_title,
+        parts.model,
         cover_id.is_some(),
     )
     .await;
@@ -153,31 +154,38 @@ pub(crate) async fn open_topic(
     // snapshot message (the topic's first message + anchor) so the poll loop
     // never duplicates them. Not reached when the topic could not be opened
     // (no thread_id) — the poller keeps today's standalone flow for them.
-    if let Some((title, data)) = prepared.claim {
-        crate::bridge::external::settle_snapshot_after_send(core, &anchor, "接管", &title, &data).await;
+    if let Some(claim) = parts.snapshot_claim {
+        crate::bridge::external::settle_snapshot_after_send(core, &anchor, "接管", &claim.title, &claim.data)
+            .await;
     }
     Ok(OpenedTopic {
-        session_id: prepared.session_id,
+        session_id: parts.session_id,
         thread_id,
-        topic_root,
-        topic_anchor: anchor,
     })
 }
 
 /// The session-side facts the opening tail needs, assembled by each
 /// [`TopicOpening`] arm so the cover/anchor/mapping sequence itself exists
 /// once.
-struct Prepared {
+struct OpeningParts {
     session_id: String,
     directory: String,
     display_title: String,
     agent: Option<String>,
     model: Option<String>,
     seed: TopicSeed,
-    /// The adopt snapshot's claimable data and title, settled against the
-    /// in-topic seed after the mapping write (ADR-0028). `None` for fresh
+    /// ADR-0028: the adopt snapshot's title and claimable data, settled
+    /// against the in-topic seed after the mapping write. `None` for fresh
     /// sessions.
-    claim: Option<(String, crate::bridge::snapshot::SnapshotData)>,
+    snapshot_claim: Option<SnapshotClaim>,
+}
+
+/// The snapshot claim (ADR-0028) an adopted topic settles after its in-topic
+/// seed is sent: the title for the claim bookkeeping plus the filtered
+/// snapshot data the poll loop must never duplicate.
+struct SnapshotClaim {
+    title: String,
+    data: crate::bridge::snapshot::SnapshotData,
 }
 
 /// The reply hint seeded as a fresh topic's first in-topic message
@@ -212,14 +220,11 @@ async fn topic_cover_text(
     model: Option<&str>,
 ) -> String {
     let git = crate::git::read_state(dir).await;
-    let mut s = format!("💬 `{title}`\n`{}`", crate::bridge::command::dir_basename(dir));
+    let mut s = format!("💬 `{title}`\n`{}`", dir_basename(dir));
     if let Some(branch) = git.branch.as_deref() {
         s.push_str(&format!(" · `{branch}`{}", if git.dirty { " ⚠" } else { "" }));
     }
-    s.push_str(&format!(
-        "\n会话 `{}` · `{dir}`",
-        crate::bridge::command::id_tail(session_id)
-    ));
+    s.push_str(&format!("\n会话 `{}` · `{dir}`", id_tail(session_id)));
     if let Some(agent) = agent {
         s.push_str(&format!(" · agent `{agent}`"));
     }
@@ -414,60 +419,5 @@ async fn record_cover_title(
         );
     } else {
         covers.remove(session_id);
-    }
-}
-
-/// The display identity of a session's model from the list payload
-/// (`providerID/modelID@variant`), matching how cola renders model identity
-/// elsewhere. Returns None when the payload carries no model.
-fn model_display(model: Option<&serde_json::Value>) -> Option<String> {
-    let v = model?;
-    let id = match v {
-        serde_json::Value::String(s) => return Some(s.clone()),
-        _ => v.get("id").and_then(|x| x.as_str())?,
-    };
-    let mut s = match v.get("providerID").and_then(|x| x.as_str()) {
-        Some(p) => format!("{p}/{id}"),
-        None => id.to_string(),
-    };
-    if let Some(variant) = v.get("variant").and_then(|x| x.as_str()) {
-        s.push('@');
-        s.push_str(variant);
-    }
-    Some(s)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn model_display_formats_provider_model_and_variant() {
-        use serde_json::json;
-        // Full identity: providerID/modelID@variant (ADR-0019 model identity).
-        assert_eq!(
-            model_display(Some(
-                &json!({"id": "deepseek-v4-flash", "providerID": "opencode-go", "variant": "low"})
-            ))
-            .as_deref(),
-            Some("opencode-go/deepseek-v4-flash@low")
-        );
-        // No variant.
-        assert_eq!(
-            model_display(Some(&json!({"id": "gpt-4o", "providerID": "openai"}))).as_deref(),
-            Some("openai/gpt-4o")
-        );
-        // No provider: bare id.
-        assert_eq!(
-            model_display(Some(&json!({"id": "claude"}))).as_deref(),
-            Some("claude")
-        );
-        // A bare string payload passes through.
-        assert_eq!(
-            model_display(Some(&json!("openai/gpt-4o"))).as_deref(),
-            Some("openai/gpt-4o")
-        );
-        // No model at all.
-        assert_eq!(model_display(None), None);
     }
 }
