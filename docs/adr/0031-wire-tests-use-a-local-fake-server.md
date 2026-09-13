@@ -61,3 +61,17 @@ last nominal wire coverage without replacing it.
   parsing and route matching carry two self-tests, and it must stay minimal.
 - A changed URL, query or body now fails with the request log showing exactly
   what was sent — the diagnostic the old harness could not give.
+
+## Update (2026-09-13)
+
+The fake-server seam is now extended to the WebSocket half of Feishu's
+long-connection protocol: `TestWsServer` (`src/test_ws.rs`) plus transport tests
+in `src/feishu/ws.rs` run the production read/write loop against a real loopback
+socket — pong, event acks, dedupe, card-action responses, close and reconnect —
+so the socket layer no longer depends on a live tenant in CI.
+
+The rejection of a revived live E2E still stands, but two of its stated reasons
+have gone stale: card bodies are now readable (`card_msg_content_type` on
+`get_message`), and the third-bot test app already exists. A full design for an
+automated real-Feishu E2E (gray-box, ephemeral group, CI release gate) is
+parked with revisit triggers in issue #146.
