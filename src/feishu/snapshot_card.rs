@@ -144,7 +144,7 @@ pub(crate) fn tail_preview(entry: &TailEntry) -> (&'static str, String) {
 pub(crate) fn display_title(title: &str, session_id: &str) -> String {
     let label = crate::feishu::card::clean_session_label(title);
     if label.is_empty() {
-        crate::bridge::command::id_tail(session_id)
+        crate::bridge::display::id_tail(session_id)
     } else {
         label
     }

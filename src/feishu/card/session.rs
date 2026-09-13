@@ -191,7 +191,7 @@ pub fn build_switch_card(
                     format!(
                         "**{} 的会话**",
                         current_dir
-                            .map(crate::bridge::command::dir_basename)
+                            .map(crate::bridge::display::dir_basename)
                             .unwrap_or_default()
                     )
                 }
@@ -202,20 +202,20 @@ pub fn build_switch_card(
         };
         elements.push(json!({ "tag": "markdown", "content": header }));
         for s in sessions.iter().take(MAX_SWITCH_ROWS) {
-            let label = crate::bridge::command::title_or_id_tail(s);
+            let label = crate::bridge::display::title_or_id_tail(s);
             // ADR-0022: only the active session is marked; the 本会话 ownership
             // marker on mapped-but-not-active rows is dropped.
             let text = if active_id == Some(s.id.as_str()) {
                 format!(
                     "{label} · {} · {}\n_(active)_",
                     s.directory,
-                    crate::bridge::command::id_tail(&s.id)
+                    crate::bridge::display::id_tail(&s.id)
                 )
             } else {
                 format!(
                     "{label} · {} · {}",
                     s.directory,
-                    crate::bridge::command::id_tail(&s.id)
+                    crate::bridge::display::id_tail(&s.id)
                 )
             };
             let btn = if active_id == Some(s.id.as_str()) {
@@ -260,7 +260,7 @@ pub fn build_force_confirm_card(
     force_label: &str,
     scope: crate::bridge::command::SwitchScope,
 ) -> serde_json::Value {
-    let label = crate::bridge::command::title_or_id_tail(target);
+    let label = crate::bridge::display::title_or_id_tail(target);
     let back_btn = json!({
         "tag": "button",
         "text": { "tag": "plain_text", "content": "返回列表" },
@@ -295,7 +295,7 @@ pub fn build_force_confirm_card(
                 "content": format!(
                     "**{label}** 正被 **{owner_name}** 使用。\n`{}` · `{}`",
                     target.directory,
-                    crate::bridge::command::id_tail(&target.id)
+                    crate::bridge::display::id_tail(&target.id)
                 )
             }),
             json!({

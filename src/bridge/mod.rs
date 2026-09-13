@@ -1,6 +1,7 @@
 pub mod command;
 pub mod core;
 pub mod discovery;
+pub mod display;
 pub mod external;
 pub mod handler;
 pub mod pollers;
