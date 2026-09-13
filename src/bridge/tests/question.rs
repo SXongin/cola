@@ -1,5 +1,42 @@
 use crate::bridge::test_support::*;
 
+/// A minimal one-question request for the state-lifecycle tests (#130).
+fn question_request(id: &str) -> opencode::client::QuestionRequest {
+    opencode::client::QuestionRequest {
+        id: id.into(),
+        session_id: "ses_1".into(),
+        questions: vec![opencode::client::QuestionInfo {
+            question: "选择目录".into(),
+            header: "目录".into(),
+            options: vec![opencode::client::QuestionOption {
+                label: "/a".into(),
+                description: String::new(),
+            }],
+            multiple: None,
+            custom: None,
+        }],
+    }
+}
+
+/// Seed a session mapping so the poll sweep has one known directory (`/work`).
+async fn seed_work_dir(app: &Arc<App>) {
+    seed_entry(
+        app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            session_id: "ses_1".into(),
+            directory: "/work".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+}
+
 /// The question kind rides the same poll loop, so the recovery guarantee
 /// must hold for it too: a hung `list_questions` (half-open connection
 /// after a server restart) cannot freeze the question poller.
@@ -277,6 +314,11 @@ async fn question_card_action_rejects() {
     let backend = Arc::new(MockBackend::new(realistic_parts()));
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
+
+    // The poll loop surfaced the request; its state is what a reject resolves.
+    app.question
+        .remember_question(&question_request("que_1"), "/work")
+        .await;
 
     let value = serde_json::json!({
         "action": "question",
@@ -1126,4 +1168,315 @@ async fn inline_question_answered_on_streaming_card() {
             .pending_questions
             .is_empty()
     );
+}
+
+/// #130: a question resolved by another client leaves the pending list. The
+/// sweep must drop its remembered state, while a still-pending request's state
+/// survives so its card keeps resolving.
+#[tokio::test]
+async fn sweep_prunes_state_of_requests_resolved_elsewhere() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    // que_live is still pending; que_gone was resolved elsewhere meanwhile.
+    backend.questions = vec![question_request("que_live")];
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
+    seed_work_dir(&app).await;
+
+    app.question
+        .remember_question(&question_request("que_gone"), "/work")
+        .await;
+    app.question
+        .remember_question(&question_request("que_live"), "/work")
+        .await;
+
+    let mut seen = std::collections::HashSet::new();
+    app.question.sweep(&app.core, &mut seen).await;
+
+    assert!(
+        !app.question.has_question("que_gone").await,
+        "state of a request that left pending must be pruned"
+    );
+    assert!(
+        app.question.has_question("que_live").await,
+        "state of a pending request must survive the sweep"
+    );
+}
+
+/// #130: a directory whose list call fails or times out this sweep says
+/// nothing about its requests — their state must survive (unknown ≠ resolved).
+#[tokio::test]
+async fn sweep_keeps_state_when_the_directory_list_fails() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    // The first list call hangs (half-open connection after a restart); later
+    // calls would serve normally.
+    backend
+        .hang_list_questions
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
+    app.question
+        .list_timeout_ms
+        .store(30, std::sync::atomic::Ordering::Relaxed);
+    seed_work_dir(&app).await;
+
+    app.question
+        .remember_question(&question_request("que_1"), "/work")
+        .await;
+
+    let mut seen = std::collections::HashSet::new();
+    app.question.sweep(&app.core, &mut seen).await;
+
+    assert!(
+        app.question.has_question("que_1").await,
+        "a failed list must not be read as 'resolved'"
+    );
+}
+
+/// #130: the sweep must not wipe an in-progress multi-select. A refresh keeps
+/// the live toggles, and the prune keeps the entry while it is pending.
+#[tokio::test]
+async fn sweep_keeps_partial_multi_select_toggles() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let multi = opencode::client::QuestionRequest {
+        id: "que_multi".into(),
+        session_id: "ses_1".into(),
+        questions: vec![opencode::client::QuestionInfo {
+            question: "选择水果".into(),
+            header: "水果".into(),
+            options: vec![
+                opencode::client::QuestionOption {
+                    label: "苹果".into(),
+                    description: String::new(),
+                },
+                opencode::client::QuestionOption {
+                    label: "香蕉".into(),
+                    description: String::new(),
+                },
+            ],
+            multiple: Some(true),
+            custom: None,
+        }],
+    };
+    let mut backend = MockBackend::new(realistic_parts());
+    // The request is still pending, so the sweep refreshes instead of pruning.
+    backend.questions = vec![multi.clone()];
+    let backend = Arc::new(backend);
+    let app = Arc::new(App::new(cfg, backend.clone(), Arc::new(RecordingPlatform::new())).unwrap());
+    seed_work_dir(&app).await;
+    app.question.remember_question(&multi, "/work").await;
+
+    let value = |reply: &str, answer: &str| {
+        serde_json::json!({
+            "action": "question",
+            "reply": reply,
+            "request_id": "que_multi",
+            "session_id": "ses_1",
+            "directory": "/work",
+            "question_index": 0,
+            "answer": answer,
+        })
+    };
+
+    let toggled = app
+        .handle_card_action(value("answer", "苹果"))
+        .await
+        .expect("toggle result");
+    assert!(
+        toggled.card.unwrap().to_string().contains("已选：苹果"),
+        "toggle must be live before the sweep"
+    );
+
+    let mut seen = std::collections::HashSet::new();
+    app.question.sweep(&app.core, &mut seen).await;
+
+    // The live selection survived: confirming locks it and submits with it.
+    app.handle_card_action(value("confirm", ""))
+        .await
+        .expect("confirm result");
+    let calls = backend.reply_question_calls.lock().await.clone();
+    assert_eq!(calls.len(), 1, "confirming the surviving toggle must submit");
+    assert_eq!(calls[0].1, vec![vec!["苹果".to_string()]]);
+}
+
+/// #130: after the sweep pruned a request resolved elsewhere, a late click on
+/// its card gets the neutral result — no backend call, no silent no-op, and no
+/// revived per-request state.
+#[tokio::test]
+async fn late_click_on_pruned_request_is_neutral_and_stateless() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
+    seed_work_dir(&app).await;
+
+    app.question
+        .remember_question(&question_request("que_1"), "/work")
+        .await;
+
+    // A successful sweep with nothing pending prunes the state.
+    let mut seen = std::collections::HashSet::new();
+    app.question.sweep(&app.core, &mut seen).await;
+    assert!(!app.question.has_question("que_1").await);
+
+    let result = app
+        .handle_card_action(serde_json::json!({
+            "action": "question",
+            "reply": "answer",
+            "request_id": "que_1",
+            "session_id": "ses_1",
+            "directory": "/work",
+            "question_index": 0,
+            "answer": "/a",
+        }))
+        .await
+        .expect("a late click must get a result, never a silent no-op");
+    let card = result.card.expect("standalone card").to_string();
+    assert!(card.contains("已处理"), "neutral card expected: {}", card);
+    assert!(!card.contains("处理失败"), "must not be a failure: {}", card);
+    assert_eq!(
+        backend.reply_question_calls.lock().await.len(),
+        0,
+        "a pruned request must not be replied to"
+    );
+    assert!(
+        !app.question.has_question("que_1").await,
+        "the neutral response must not revive state"
+    );
+}
+
+/// #130: missing state + a directory this process never listed successfully
+/// (fresh restart before the first sweep, unknown directory) proves nothing —
+/// the click must not claim the request was handled. Same truth without a
+/// payload directory.
+#[tokio::test]
+async fn late_click_without_directory_knowledge_is_truthful_not_handled() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
+
+    let value = |directory: Option<&str>| {
+        let mut v = serde_json::json!({
+            "action": "question",
+            "reply": "answer",
+            "request_id": "que_1",
+            "session_id": "ses_1",
+            "question_index": 0,
+            "answer": "/a",
+        });
+        if let Some(d) = directory {
+            v["directory"] = serde_json::Value::String(d.to_string());
+        }
+        v
+    };
+
+    for directory in [Some("/work"), None] {
+        let result = app
+            .handle_card_action(value(directory))
+            .await
+            .expect("a late click must get a result, never a silent no-op");
+        let card = result.card.expect("standalone card").to_string();
+        assert!(
+            card.contains("失效"),
+            "stale-card hint expected (directory={directory:?}): {card}"
+        );
+        assert!(
+            !card.contains("已处理"),
+            "must not claim handled without knowledge (directory={directory:?}): {card}"
+        );
+        assert!(
+            !card.contains("处理失败"),
+            "must not be a failure (directory={directory:?}): {card}"
+        );
+    }
+    assert_eq!(
+        backend.reply_question_calls.lock().await.len(),
+        0,
+        "an unverifiable click must not be replied to"
+    );
+    assert!(
+        !app.question.has_question("que_1").await,
+        "the stale-card response must not create state"
+    );
+}
+
+/// #130: submit/reject ride the same gate, and a gated click must leave no
+/// claim behind — a later legitimate click still replies, and once answered a
+/// double click still re-serves the winning result.
+#[tokio::test]
+async fn gated_submit_leaves_no_claim_and_preserves_replays() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
+
+    let value = |id: &str, reply: &str| {
+        serde_json::json!({
+            "action": "question",
+            "reply": reply,
+            "request_id": id,
+            "session_id": "ses_1",
+            "directory": "/work",
+        })
+    };
+
+    // Gated: no state, unknown directory — no reply, no state revived.
+    app.handle_card_action(value("que_submit", "submit"))
+        .await
+        .expect("gated submit still answers");
+    assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
+    assert!(!app.question.has_question("que_submit").await);
+
+    // The request is re-listed and remembered: submit replies exactly once.
+    app.question
+        .remember_question(&question_request("que_submit"), "/work")
+        .await;
+    let first = app
+        .handle_card_action(value("que_submit", "submit"))
+        .await
+        .expect("submit result");
+    assert_eq!(backend.reply_question_calls.lock().await.len(), 1);
+    // A fast re-click re-serves the winning result, never a second reply.
+    let second = app
+        .handle_card_action(value("que_submit", "submit"))
+        .await
+        .expect("replay result");
+    assert_eq!(first.card, second.card, "double click replays the first result");
+    assert_eq!(backend.reply_question_calls.lock().await.len(), 1);
+
+    // Same composition for reject.
+    app.handle_card_action(value("que_reject", "reject"))
+        .await
+        .expect("gated reject still answers");
+    assert_eq!(backend.reply_question_calls.lock().await.len(), 1);
+    app.question
+        .remember_question(&question_request("que_reject"), "/work")
+        .await;
+    let first = app
+        .handle_card_action(value("que_reject", "reject"))
+        .await
+        .expect("reject result");
+    assert_eq!(backend.reply_question_calls.lock().await.len(), 2);
+    let second = app
+        .handle_card_action(value("que_reject", "reject"))
+        .await
+        .expect("replay result");
+    assert_eq!(first.card, second.card, "double click replays the first result");
+    assert_eq!(backend.reply_question_calls.lock().await.len(), 2);
 }
