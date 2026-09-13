@@ -12,7 +12,7 @@ async fn subtask_permission_routes_to_mapped_parent_and_reply_carries_directory(
     backend
         .session_parents
         .insert(child.into(), backend.session_id.clone());
-    backend.permissions = vec![opencode::client::PermissionRequest {
+    backend.permissions = vec![opencode::types::PermissionRequest {
         request_id: "per_child".into(),
         session_id: Some(child.into()),
         permission: Some("bash".into()),
@@ -130,7 +130,7 @@ async fn subtask_permission_without_streaming_card_sends_card_to_parent_chat() {
     backend
         .session_parents
         .insert(child.into(), backend.session_id.clone());
-    backend.permissions = vec![opencode::client::PermissionRequest {
+    backend.permissions = vec![opencode::types::PermissionRequest {
         request_id: "per_child".into(),
         session_id: Some(child.into()),
         permission: Some("bash".into()),

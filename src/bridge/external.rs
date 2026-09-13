@@ -135,7 +135,7 @@ impl ExternalFlow {
                 let Some((latest, latest_id)) = newest else {
                     continue;
                 };
-                let cola_authored = crate::opencode::client::is_cola_message_id(latest_id);
+                let cola_authored = crate::opencode::parsing::is_cola_message_id(latest_id);
                 let mut map = self.last_user_msg_epoch.lock().await;
                 let watermark = map.get(&sid).copied();
                 if cola_authored {
@@ -322,7 +322,7 @@ impl ExternalFlow {
             core.opencode
                 .session_status(session_id, Some(&data.directory))
                 .await,
-            Ok(Some(crate::opencode::SessionStatus::Busy))
+            Ok(Some(crate::opencode::types::SessionStatus::Busy))
         );
         if !busy_now {
             tracing::info!(
@@ -485,7 +485,7 @@ pub(crate) async fn settle_snapshot_after_send(
     title: &str,
     data: &crate::bridge::snapshot::SnapshotData,
 ) {
-    let followed = data.status == Some(crate::opencode::SessionStatus::Busy)
+    let followed = data.status == Some(crate::opencode::types::SessionStatus::Busy)
         && core
             .external
             .start_snapshot_follow(core, &data.session_id, snapshot_message_id, verb, title, data)
@@ -597,7 +597,7 @@ async fn finalize_done(core: &Arc<SharedCore>, session_id: &str) {
 /// pause to run tools. OpenCode's terminal finish reasons are "stop", "length",
 /// "content-filter", "error" and "unknown"; "tool-calls" only means the step
 /// ended to execute tools and the model will continue.
-fn external_turn_completed(msgs: &[crate::opencode::client::SessionMessage], epoch_ms: i64) -> bool {
+fn external_turn_completed(msgs: &[crate::opencode::types::SessionMessage], epoch_ms: i64) -> bool {
     msgs.iter()
         .filter(|m| m.info.role.as_deref() == Some("assistant"))
         .filter(|m| {
@@ -618,7 +618,7 @@ fn external_turn_completed(msgs: &[crate::opencode::client::SessionMessage], epo
 }
 
 /// Preview of a user message, for the external-message notification card.
-fn user_message_preview(msgs: &[crate::opencode::client::SessionMessage], created: i64) -> String {
+fn user_message_preview(msgs: &[crate::opencode::types::SessionMessage], created: i64) -> String {
     let mut out = String::new();
     for m in msgs {
         if m.info.role.as_deref() != Some("user") {
@@ -641,7 +641,7 @@ fn user_message_preview(msgs: &[crate::opencode::client::SessionMessage], create
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::opencode::client::{MessageInfo, MessageTime, SessionMessage};
+    use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
 
     fn msg(role: &str, created: i64, parts: serde_json::Value) -> SessionMessage {
         SessionMessage {

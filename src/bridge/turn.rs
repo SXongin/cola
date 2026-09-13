@@ -92,7 +92,7 @@ impl Turn {
         // This logical user message keeps ONE id across every attempt of this
         // turn (ADR-0026): a retry carries the previous attempt's id so the
         // server deduplicates; a fresh message generates a new one.
-        let cola_message_id = cola_message_id.unwrap_or_else(crate::opencode::client::cola_message_id);
+        let cola_message_id = cola_message_id.unwrap_or_else(crate::opencode::parsing::cola_message_id);
         // Serialize prompts per session: if one is already in flight, don't let
         // a second message overwrite its accumulator (the two would race on the
         // same card). Reply with a notice only when we own a fresh message.
@@ -178,7 +178,7 @@ impl Turn {
     /// Send one attempt with the incremental renderer attached. The overrides
     /// are captured at send time (ADR-0019), and the renderer always stops
     /// before the response is returned so a retry starts its own cleanly.
-    async fn attempt(&mut self, app: &Arc<App>) -> crate::error::Result<opencode::client::PromptResponse> {
+    async fn attempt(&mut self, app: &Arc<App>) -> crate::error::Result<opencode::types::PromptResponse> {
         let render = RenderPoll::spawn(app, &self.session_id, self.epoch_ms);
         // Capture the variant actually sent this turn AT SEND TIME, not at
         // finalization: a `/think` issued mid-generation must not retro-tag the
@@ -276,7 +276,7 @@ impl Turn {
     async fn finish(
         &mut self,
         app: &Arc<App>,
-        prompt_resp: &crate::error::Result<opencode::client::PromptResponse>,
+        prompt_resp: &crate::error::Result<opencode::types::PromptResponse>,
     ) {
         let prompt_err = match prompt_resp {
             Ok(r) => r.error.clone(),

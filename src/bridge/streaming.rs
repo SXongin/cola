@@ -30,7 +30,7 @@ pub struct PendingPermission {
 pub struct PendingQuestion {
     pub request_id: String,
     pub session_id: String,
-    pub questions: Vec<crate::opencode::client::QuestionInfo>,
+    pub questions: Vec<crate::opencode::types::QuestionInfo>,
     pub directory: String,
     /// Display selection per question (locked answer, or live multi-select
     /// toggles). Mirrors `question_elements`' `answered` slice.

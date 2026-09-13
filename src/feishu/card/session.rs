@@ -85,7 +85,7 @@ pub const MAX_SWITCH_ROWS: usize = 6;
 
 pub fn build_switch_card(
     thread_key: &crate::config::ThreadKey,
-    sessions: &[crate::opencode::client::SessionListInfo],
+    sessions: &[crate::opencode::types::SessionListInfo],
     keyword: &str,
     scope: crate::bridge::command::SwitchScope,
     current_dir: Option<&str>,
@@ -254,7 +254,7 @@ pub fn build_switch_card(
 /// verb (强制接管 / 强制建话题接管).
 pub fn build_force_confirm_card(
     thread_key: &crate::config::ThreadKey,
-    target: &crate::opencode::client::SessionListInfo,
+    target: &crate::opencode::types::SessionListInfo,
     owner_name: &str,
     force_op: &str,
     force_label: &str,
@@ -462,7 +462,7 @@ mod tests {
     #[test]
     fn switch_card_has_no_schema_v2_unsupported_action_container() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let sessions = vec![crate::opencode::client::SessionListInfo {
+        let sessions = vec![crate::opencode::types::SessionListInfo {
             id: "ses_alpha01".into(),
             title: "重写登录".into(),
             directory: "/work/auth".into(),

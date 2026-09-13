@@ -9,7 +9,7 @@ async fn model_no_arg_sends_picker_card() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.provider_models = vec![crate::opencode::client::ProviderModels {
+    backend.provider_models = vec![crate::opencode::types::ProviderModels {
         provider: "opencode".into(),
         models: vec![
             model_option("deepseek-v4-flash", &[]),
@@ -56,7 +56,7 @@ async fn model_card_button_records_override() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.provider_models = vec![crate::opencode::client::ProviderModels {
+    backend.provider_models = vec![crate::opencode::types::ProviderModels {
         provider: "opencode".into(),
         models: vec![
             model_option("deepseek-v4-flash", &[]),
@@ -125,11 +125,11 @@ async fn model_picker_back_button_returns_to_providers() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend.provider_models = vec![
-        crate::opencode::client::ProviderModels {
+        crate::opencode::types::ProviderModels {
             provider: "opencode".into(),
             models: vec![model_option("deepseek-v4-flash", &[])],
         },
-        crate::opencode::client::ProviderModels {
+        crate::opencode::types::ProviderModels {
             provider: "openrouter".into(),
             models: vec![model_option("gpt-4o", &[])],
         },
@@ -164,19 +164,19 @@ async fn agent_card_picker_and_button() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend.agents = vec![
-        crate::opencode::client::AgentInfo {
+        crate::opencode::types::AgentInfo {
             name: "sec-agent".into(),
             description: Some("a subagent".into()),
             mode: Some("subagent".into()),
             hidden: Some(false),
         },
-        crate::opencode::client::AgentInfo {
+        crate::opencode::types::AgentInfo {
             name: "build".into(),
             description: Some("build agent".into()),
             mode: Some("primary".into()),
             hidden: Some(false),
         },
-        crate::opencode::client::AgentInfo {
+        crate::opencode::types::AgentInfo {
             name: "default".into(),
             description: Some("an agent literally named default".into()),
             mode: Some("primary".into()),
@@ -777,7 +777,7 @@ async fn think_command_rejects_undeclared_variant() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.provider_models = vec![crate::opencode::client::ProviderModels {
+    backend.provider_models = vec![crate::opencode::types::ProviderModels {
         provider: "opencode-go".into(),
         models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
     }];
@@ -885,7 +885,7 @@ async fn think_bare_default_undeclared_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.provider_models = vec![crate::opencode::client::ProviderModels {
+    backend.provider_models = vec![crate::opencode::types::ProviderModels {
         provider: "opencode-go".into(),
         models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
     }];
@@ -936,7 +936,7 @@ async fn think_bare_default_declared_is_stored() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.provider_models = vec![crate::opencode::client::ProviderModels {
+    backend.provider_models = vec![crate::opencode::types::ProviderModels {
         provider: "opencode-go".into(),
         models: vec![model_option("deepseek-v4-flash", &["low", "default"])],
     }];
@@ -987,7 +987,7 @@ async fn think_no_arg_sends_variant_card() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.provider_models = vec![crate::opencode::client::ProviderModels {
+    backend.provider_models = vec![crate::opencode::types::ProviderModels {
         provider: "opencode-go".into(),
         models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
     }];
@@ -1047,7 +1047,7 @@ async fn think_card_button_records_variant() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.provider_models = vec![crate::opencode::client::ProviderModels {
+    backend.provider_models = vec![crate::opencode::types::ProviderModels {
         provider: "opencode-go".into(),
         models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
     }];
@@ -1132,11 +1132,11 @@ async fn model_switch_clears_undeclared_variant() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend.provider_models = vec![
-        crate::opencode::client::ProviderModels {
+        crate::opencode::types::ProviderModels {
             provider: "opencode-go".into(),
             models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
         },
-        crate::opencode::client::ProviderModels {
+        crate::opencode::types::ProviderModels {
             provider: "openrouter".into(),
             models: vec![model_option("other-model", &["low"])],
         },
@@ -1210,7 +1210,7 @@ async fn model_switch_keeps_variant_when_new_model_unknown() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.provider_models = vec![crate::opencode::client::ProviderModels {
+    backend.provider_models = vec![crate::opencode::types::ProviderModels {
         provider: "opencode-go".into(),
         models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
     }];

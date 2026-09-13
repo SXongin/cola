@@ -120,7 +120,7 @@ fn picker_card(
 /// agents are listed (the backend is unreachable).
 pub fn build_agent_card(
     thread_key: &crate::config::ThreadKey,
-    agents: &[crate::opencode::client::AgentInfo],
+    agents: &[crate::opencode::types::AgentInfo],
     override_agent: Option<&str>,
     default_agent: Option<&str>,
 ) -> serde_json::Value {
@@ -170,7 +170,7 @@ pub fn build_agent_card(
 /// `/model <provider/model>` text form.
 pub fn build_model_provider_cards(
     thread_key: &crate::config::ThreadKey,
-    providers: &[crate::opencode::client::ProviderModels],
+    providers: &[crate::opencode::types::ProviderModels],
 ) -> Vec<serde_json::Value> {
     let options: Vec<(String, String)> = providers
         .iter()
@@ -206,7 +206,7 @@ pub fn build_model_provider_cards(
 pub fn build_model_picker_cards(
     thread_key: &crate::config::ThreadKey,
     provider: &str,
-    models: &[crate::opencode::client::ModelOption],
+    models: &[crate::opencode::types::ModelOption],
 ) -> Vec<serde_json::Value> {
     // The provider is already chosen (step 1), so the button LABEL shows just
     // the model name — a `provider/model` label truncates in Feishu's button
@@ -362,10 +362,10 @@ mod tests {
     fn provider_cards_chunk_without_exceeding_feishu_limits() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
         // A shared server advertising hundreds of providers.
-        let providers: Vec<crate::opencode::client::ProviderModels> = (0..212)
-            .map(|p| crate::opencode::client::ProviderModels {
+        let providers: Vec<crate::opencode::types::ProviderModels> = (0..212)
+            .map(|p| crate::opencode::types::ProviderModels {
                 provider: format!("provider-{p}"),
-                models: vec![crate::opencode::client::ModelOption {
+                models: vec![crate::opencode::types::ModelOption {
                     id: "m".into(),
                     variants: Vec::new(),
                 }],
@@ -395,8 +395,8 @@ mod tests {
     #[test]
     fn model_picker_chunks_and_has_back_button() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let models: Vec<crate::opencode::client::ModelOption> = (0..400)
-            .map(|i| crate::opencode::client::ModelOption {
+        let models: Vec<crate::opencode::types::ModelOption> = (0..400)
+            .map(|i| crate::opencode::types::ModelOption {
                 id: format!("model-{i}"),
                 variants: Vec::new(),
             })
@@ -483,13 +483,13 @@ mod tests {
     fn agent_card_lists_current_and_clear_button() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
         let agents = vec![
-            crate::opencode::client::AgentInfo {
+            crate::opencode::types::AgentInfo {
                 name: "default".into(),
                 description: None,
                 mode: Some("primary".into()),
                 hidden: Some(false),
             },
-            crate::opencode::client::AgentInfo {
+            crate::opencode::types::AgentInfo {
                 name: "build".into(),
                 description: None,
                 mode: Some("primary".into()),

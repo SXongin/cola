@@ -340,7 +340,7 @@ fn render_part_once(acc: &mut StreamAccumulator, part: &serde_json::Value) -> bo
 /// rendered yet. Returns true if anything new was rendered.
 pub(crate) fn render_new_turn_parts(
     acc: &mut StreamAccumulator,
-    msgs: &[crate::opencode::client::SessionMessage],
+    msgs: &[crate::opencode::types::SessionMessage],
     epoch_ms: i64,
 ) -> bool {
     let mut rendered_any = false;
@@ -453,7 +453,7 @@ pub(crate) async fn render_and_flush(
     core: &Arc<SharedCore>,
     session_id: &str,
     epoch_ms: i64,
-    msgs: &[crate::opencode::client::SessionMessage],
+    msgs: &[crate::opencode::types::SessionMessage],
 ) -> Option<(usize, usize, usize)> {
     // OpenCode auto-renames sessions after a turn; follow the server's live
     // title so the card subtitle doesn't stay on the "new session" default.
@@ -535,7 +535,7 @@ mod tests {
     #[test]
     fn render_part_marks_content_and_tracks_header_phase() {
         use crate::bridge::streaming::HeaderPhase;
-        use crate::opencode::client::{MessageInfo, MessageTime, SessionMessage};
+        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
 
         let epoch = 0;
         let mut acc = StreamAccumulator::new("test");
@@ -620,7 +620,7 @@ mod tests {
 
     #[test]
     fn render_new_turn_parts_filters_turn_and_dedups() {
-        use crate::opencode::client::{MessageInfo, MessageTime, SessionMessage};
+        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
 
         let epoch = 1000;
         let mut acc = StreamAccumulator::new("test");
@@ -684,7 +684,7 @@ mod tests {
 
     #[test]
     fn tool_part_update_re_renders_panel() {
-        use crate::opencode::client::{MessageInfo, MessageTime, SessionMessage};
+        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
 
         let epoch = 0;
         let mut acc = StreamAccumulator::new("test");
@@ -733,7 +733,7 @@ mod tests {
 
     #[test]
     fn empty_then_updated_part_renders_once_with_content() {
-        use crate::opencode::client::{MessageInfo, MessageTime, SessionMessage};
+        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
 
         let epoch = 0;
         let mut acc = StreamAccumulator::new("test");
@@ -788,7 +788,7 @@ mod tests {
     /// (observed: card text 81 → 162 chars).
     #[test]
     fn text_without_id_is_not_rendered_twice() {
-        use crate::opencode::client::{MessageInfo, MessageTime, SessionMessage};
+        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
 
         let epoch = 0;
         let mut acc = StreamAccumulator::new("test");
@@ -828,7 +828,7 @@ mod tests {
     /// must show the error and mark the card failed, not stay stuck "running".
     #[test]
     fn failed_tool_error_part_renders_output_and_error_state() {
-        use crate::opencode::client::{MessageInfo, MessageTime, SessionMessage};
+        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
 
         let epoch = 0;
         let mut acc = StreamAccumulator::new("test");
@@ -883,7 +883,7 @@ mod tests {
     /// object — it must still show up on the panel, not vanish.
     #[test]
     fn failed_tool_string_error_renders_on_panel() {
-        use crate::opencode::client::{MessageInfo, MessageTime, SessionMessage};
+        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
 
         let epoch = 0;
         let mut acc = StreamAccumulator::new("test");
@@ -927,7 +927,7 @@ mod tests {
     /// success sentence. Failures keep their extracted error text.
     #[test]
     fn edit_part_uses_metadata_diff_as_output() {
-        use crate::opencode::client::{MessageInfo, MessageTime, SessionMessage};
+        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
 
         let epoch = 0;
         let mut acc = StreamAccumulator::new("test");
@@ -1017,7 +1017,7 @@ mod tests {
     /// "streaming", then the final card repeats it).
     #[test]
     fn render_parts_fallback_does_not_double_already_rendered_text() {
-        use crate::opencode::client::{MessageInfo, MessageTime, SessionMessage};
+        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
 
         let epoch = 0;
         let mut acc = StreamAccumulator::new("test");

@@ -1,11 +1,15 @@
 use base64::Engine;
 use std::sync::Arc;
 
-// Compatibility shims: every `crate::opencode::client::X` path that predates the
-// DTO/parser move keeps resolving, so call sites did not have to churn (C3
-// precedent).
-pub(crate) use super::parsing::*;
-pub use super::types::*;
+use super::parsing::{
+    build_parts, inject_agent, inject_message_id, inject_model, parse_model, parse_provider_models,
+    parse_session_status_entry,
+};
+use super::types::{
+    AgentInfo, CreateSessionInput, CreateSessionResponse, ImageInput, Location, ModelInfo, PermissionRequest,
+    PromptResponse, ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionMessage,
+    SessionStatus,
+};
 
 /// Lightweight HTTP client for the OpenCode Server REST API.
 ///
@@ -617,14 +621,14 @@ impl Client {
     /// Available agents (`GET /agent`), each with a `name`. Best-effort: an
     /// unreadable/cached failure returns an empty list so the `/agent` card can
     /// degrade to a plain text prompt.
-    pub async fn list_agents(&self) -> Vec<crate::opencode::client::AgentInfo> {
+    pub async fn list_agents(&self) -> Vec<AgentInfo> {
         let Ok(resp) = self.http().get(self.url("/agent")).send().await else {
             return Vec::new();
         };
         let Ok(text) = resp.text().await else {
             return Vec::new();
         };
-        serde_json::from_str::<Vec<crate::opencode::client::AgentInfo>>(&text).unwrap_or_default()
+        serde_json::from_str::<Vec<AgentInfo>>(&text).unwrap_or_default()
     }
 
     /// Available models (`GET /provider`), grouped as `provider → models`,
@@ -637,7 +641,7 @@ impl Client {
     /// server advertises hundreds of providers most of which have no API key,
     /// and a `/model` picker over all of them is unusable. When the response
     /// has no `connected` field (older server) every provider is kept.
-    pub async fn list_models(&self) -> Vec<crate::opencode::client::ProviderModels> {
+    pub async fn list_models(&self) -> Vec<ProviderModels> {
         let Ok(resp) = self.http().get(self.url("/provider")).send().await else {
             return Vec::new();
         };

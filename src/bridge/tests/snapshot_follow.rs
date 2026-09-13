@@ -361,19 +361,19 @@ async fn snapshot_question_block_answers_and_patches() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
-    backend.questions = vec![opencode::client::QuestionRequest {
+    backend.questions = vec![opencode::types::QuestionRequest {
         id: "q_1".into(),
         session_id: "ses_alpha01".into(),
         questions: vec![
-            opencode::client::QuestionInfo {
+            opencode::types::QuestionInfo {
                 question: "选择语言".into(),
                 header: "language".into(),
                 options: vec![
-                    opencode::client::QuestionOption {
+                    opencode::types::QuestionOption {
                         label: "rust".into(),
                         description: String::new(),
                     },
-                    opencode::client::QuestionOption {
+                    opencode::types::QuestionOption {
                         label: "go".into(),
                         description: String::new(),
                     },
@@ -381,10 +381,10 @@ async fn snapshot_question_block_answers_and_patches() {
                 multiple: Some(false),
                 custom: Some(false),
             },
-            opencode::client::QuestionInfo {
+            opencode::types::QuestionInfo {
                 question: "选择框架".into(),
                 header: "framework".into(),
-                options: vec![opencode::client::QuestionOption {
+                options: vec![opencode::types::QuestionOption {
                     label: "axum".into(),
                     description: String::new(),
                 }],
@@ -480,7 +480,7 @@ async fn busy_adopt_streams_turn_into_snapshot() {
     backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
     backend
         .session_statuses
-        .insert("ses_alpha01".into(), Some(opencode::client::SessionStatus::Busy));
+        .insert("ses_alpha01".into(), Some(opencode::types::SessionStatus::Busy));
     backend
         .external_user_messages
         .insert("ses_alpha01".into(), "帮我重构这个模块".into());
@@ -569,7 +569,7 @@ async fn busy_follow_permission_approved_resumes() {
     backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
     backend
         .session_statuses
-        .insert("ses_alpha01".into(), Some(opencode::client::SessionStatus::Busy));
+        .insert("ses_alpha01".into(), Some(opencode::types::SessionStatus::Busy));
     backend
         .external_user_messages
         .insert("ses_alpha01".into(), "帮我重构这个模块".into());
@@ -754,7 +754,7 @@ async fn busy_follow_skips_cola_authored_turn() {
     backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
     backend
         .session_statuses
-        .insert("ses_alpha01".into(), Some(opencode::client::SessionStatus::Busy));
+        .insert("ses_alpha01".into(), Some(opencode::types::SessionStatus::Busy));
     // The newest user message is cola's OWN (a cola prompt mid-turn).
     backend
         .cola_user_messages
@@ -794,17 +794,17 @@ async fn busy_follow_question_block_resolves() {
     backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
     backend
         .session_statuses
-        .insert("ses_alpha01".into(), Some(opencode::client::SessionStatus::Busy));
+        .insert("ses_alpha01".into(), Some(opencode::types::SessionStatus::Busy));
     backend
         .external_user_messages
         .insert("ses_alpha01".into(), "帮我重构这个模块".into());
-    backend.questions = vec![opencode::client::QuestionRequest {
+    backend.questions = vec![opencode::types::QuestionRequest {
         id: "q_1".into(),
         session_id: "ses_alpha01".into(),
-        questions: vec![opencode::client::QuestionInfo {
+        questions: vec![opencode::types::QuestionInfo {
             question: "选择语言".into(),
             header: "language".into(),
-            options: vec![opencode::client::QuestionOption {
+            options: vec![opencode::types::QuestionOption {
                 label: "rust".into(),
                 description: String::new(),
             }],
@@ -882,7 +882,7 @@ async fn user_prompt_during_follow_takes_over() {
     backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
     backend
         .session_statuses
-        .insert("ses_alpha01".into(), Some(opencode::client::SessionStatus::Busy));
+        .insert("ses_alpha01".into(), Some(opencode::types::SessionStatus::Busy));
     backend
         .external_user_messages
         .insert("ses_alpha01".into(), "帮我重构这个模块".into());

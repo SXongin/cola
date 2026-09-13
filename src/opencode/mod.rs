@@ -1,17 +1,16 @@
 pub mod client;
-mod parsing;
+pub(crate) mod parsing;
 pub mod types;
-
-pub use client::Client;
-pub use types::{
-    CreateSessionInput, ModelInfo, PermissionRequest, PromptResponse, QuestionRequest, Session, SessionInfo,
-    SessionListInfo, SessionMessage, SessionStatus,
-};
 
 use std::sync::Arc;
 
 use crate::error::Result;
 use async_trait::async_trait;
+use client::Client;
+use types::{
+    AgentInfo, CreateSessionInput, ImageInput, ModelInfo, PermissionRequest, PromptResponse, ProviderModels,
+    QuestionRequest, Session, SessionInfo, SessionListInfo, SessionMessage, SessionStatus,
+};
 
 /// A directory-scoped handle to the OpenCode backend. Instance routing lives
 /// here: the handle carries the directory, so a caller cannot silently omit
@@ -131,7 +130,7 @@ pub trait Backend: Send + Sync {
         &self,
         session_id: &str,
         text: &str,
-        images: &[client::ImageInput],
+        images: &[ImageInput],
         model: Option<&ModelInfo>,
         variant: Option<&str>,
         agent: Option<&str>,
@@ -146,7 +145,7 @@ pub trait Backend: Send + Sync {
         &self,
         session_id: &str,
         text: &str,
-        images: &[client::ImageInput],
+        images: &[ImageInput],
         model: Option<&ModelInfo>,
         variant: Option<&str>,
         agent: Option<&str>,
@@ -189,15 +188,15 @@ pub trait Backend: Send + Sync {
     /// The model configured as cola's default (`[opencode] model`), if any —
     /// the second rung of the `/think` effective-model resolution (session
     /// override → configured default → server-recorded session model).
-    fn configured_default_model(&self) -> Option<client::ModelInfo>;
+    fn configured_default_model(&self) -> Option<ModelInfo>;
 
     /// Available agents (`GET /agent`), for the `/agent` card picker. Empty on
     /// failure (the card degrades to a text prompt).
-    async fn list_agents(&self) -> Vec<client::AgentInfo>;
+    async fn list_agents(&self) -> Vec<AgentInfo>;
 
     /// Available models grouped by provider (`GET /provider`), for the `/model`
     /// card picker. Empty on failure (the card degrades to a text prompt).
-    async fn list_models(&self) -> Vec<client::ProviderModels>;
+    async fn list_models(&self) -> Vec<ProviderModels>;
 
     /// Fetch a session's info (exposes the parent chain for sub-task sessions).
     async fn session_info(&self, session_id: &str, directory: Option<&str>) -> Result<SessionInfo>;
@@ -252,7 +251,7 @@ impl Backend for Client {
         &self,
         session_id: &str,
         text: &str,
-        images: &[client::ImageInput],
+        images: &[ImageInput],
         model: Option<&ModelInfo>,
         variant: Option<&str>,
         agent: Option<&str>,
@@ -265,7 +264,7 @@ impl Backend for Client {
         &self,
         session_id: &str,
         text: &str,
-        images: &[client::ImageInput],
+        images: &[ImageInput],
         model: Option<&ModelInfo>,
         variant: Option<&str>,
         agent: Option<&str>,
@@ -315,15 +314,15 @@ impl Backend for Client {
         Client::model_context_window(self, provider, model).await
     }
 
-    fn configured_default_model(&self) -> Option<client::ModelInfo> {
+    fn configured_default_model(&self) -> Option<ModelInfo> {
         Client::configured_default_model(self)
     }
 
-    async fn list_agents(&self) -> Vec<client::AgentInfo> {
+    async fn list_agents(&self) -> Vec<AgentInfo> {
         Client::list_agents(self).await
     }
 
-    async fn list_models(&self) -> Vec<client::ProviderModels> {
+    async fn list_models(&self) -> Vec<ProviderModels> {
         Client::list_models(self).await
     }
 

@@ -18,8 +18,8 @@ use crate::opencode;
 /// whichever backend payload the kind produced — permission or question.
 #[derive(Clone)]
 pub enum PendingRequest {
-    Permission(opencode::client::PermissionRequest),
-    Question(opencode::client::QuestionRequest),
+    Permission(opencode::types::PermissionRequest),
+    Question(opencode::types::QuestionRequest),
 }
 
 impl PendingRequest {
@@ -939,7 +939,7 @@ impl RequestFlow {
     /// resolve: the full request (card rebuilds) and its owning directory
     /// (routing a reply whose callback no longer carries one). Refreshing an
     /// already-remembered request keeps its recorded answers/toggles.
-    pub(crate) async fn remember_question(&self, req: &opencode::client::QuestionRequest, dir: &str) {
+    pub(crate) async fn remember_question(&self, req: &opencode::types::QuestionRequest, dir: &str) {
         let mut states = self.question_state.lock().await;
         match states.entry(req.id.clone()) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
@@ -986,7 +986,7 @@ impl RequestFlow {
     async fn question_snapshot(
         &self,
         req_id: &str,
-    ) -> Option<(Vec<opencode::client::QuestionInfo>, Vec<Vec<String>>)> {
+    ) -> Option<(Vec<opencode::types::QuestionInfo>, Vec<Vec<String>>)> {
         let states = self.question_state.lock().await;
         let state = states.get(req_id)?;
         let answers = state
@@ -1563,7 +1563,7 @@ const PERMISSION_DIFF_MAX_CHARS: usize = 1200;
 /// A friendly description of what a permission request asks to do, shown on the
 /// permission card (and reused verbatim by the snapshot card's pending block,
 /// ADR-0028 — the adopt-time block must look and behave like today's cards).
-pub(crate) fn describe_permission(p: &opencode::client::PermissionRequest) -> String {
+pub(crate) fn describe_permission(p: &opencode::types::PermissionRequest) -> String {
     let action = p.permission.as_deref().unwrap_or("?");
     let (emoji, label) = describe_action(action);
     let mut s = format!("{} **{}**\n", emoji, label);
@@ -1647,8 +1647,8 @@ pub(crate) fn describe_permission(p: &opencode::client::PermissionRequest) -> St
 mod tests {
     use super::*;
 
-    fn perm(action: &str, metadata: serde_json::Value) -> crate::opencode::client::PermissionRequest {
-        crate::opencode::client::PermissionRequest {
+    fn perm(action: &str, metadata: serde_json::Value) -> crate::opencode::types::PermissionRequest {
+        crate::opencode::types::PermissionRequest {
             request_id: "per_1".into(),
             session_id: Some("ses_1".into()),
             permission: Some(action.into()),

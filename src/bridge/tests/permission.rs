@@ -7,7 +7,7 @@ async fn permission_poller_sends_card_and_card_action_replies() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![opencode::client::PermissionRequest {
+    backend.permissions = vec![opencode::types::PermissionRequest {
         request_id: "per_1".into(),
         session_id: Some("ses_test".into()),
         permission: Some("bash".into()),
@@ -117,7 +117,7 @@ async fn inline_permission_click_flushes_the_card_immediately() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![opencode::client::PermissionRequest {
+    backend.permissions = vec![opencode::types::PermissionRequest {
         request_id: "per_1".into(),
         session_id: Some("ses_test".into()),
         permission: Some("bash".into()),
@@ -389,7 +389,7 @@ async fn permission_poller_recovers_when_a_list_call_hangs() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![opencode::client::PermissionRequest {
+    backend.permissions = vec![opencode::types::PermissionRequest {
         request_id: "per_hung".into(),
         session_id: Some("ses_test".into()),
         permission: Some("bash".into()),
@@ -466,7 +466,7 @@ async fn autoaccept_toggle_on_permission_card_flips_flag_and_approves() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend.permissions = vec![
-        opencode::client::PermissionRequest {
+        opencode::types::PermissionRequest {
             request_id: "per_aa_toggle".into(),
             session_id: Some("ses_test".into()),
             permission: Some("bash".into()),
@@ -477,7 +477,7 @@ async fn autoaccept_toggle_on_permission_card_flips_flag_and_approves() {
         // A second, already-pending request for the same session — the
         // toggle approves it too and must drop its inline section in the
         // same interaction, not leave it lingering until the next poll.
-        opencode::client::PermissionRequest {
+        opencode::types::PermissionRequest {
             request_id: "per_aa_other".into(),
             session_id: Some("ses_test".into()),
             permission: Some("edit".into()),
@@ -595,7 +595,7 @@ async fn auto_accept_session_answers_permission_without_card() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
-    mock.permissions = vec![opencode::client::PermissionRequest {
+    mock.permissions = vec![opencode::types::PermissionRequest {
         request_id: "per_aa".into(),
         session_id: Some("ses_test".into()),
         permission: Some("bash".into()),
@@ -664,7 +664,7 @@ async fn autoaccept_on_approves_already_pending_permission() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
-    mock.permissions = vec![opencode::client::PermissionRequest {
+    mock.permissions = vec![opencode::types::PermissionRequest {
         request_id: "per_pending".into(),
         session_id: Some("ses_test".into()),
         permission: Some("bash".into()),
@@ -730,7 +730,7 @@ async fn autoaccept_on_approves_child_session_permission() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
-    mock.permissions = vec![opencode::client::PermissionRequest {
+    mock.permissions = vec![opencode::types::PermissionRequest {
         request_id: "per_child".into(),
         session_id: Some("ses_child".into()),
         permission: Some("bash".into()),
@@ -831,7 +831,7 @@ async fn separate_permission_card_sent_into_topic_for_topic_session() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![opencode::client::PermissionRequest {
+    backend.permissions = vec![opencode::types::PermissionRequest {
         request_id: "per_topic".into(),
         session_id: Some("ses_topic".into()),
         permission: Some("bash".into()),
