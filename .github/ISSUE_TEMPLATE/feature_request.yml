@@ -1,0 +1,39 @@
+name: Feature request
+description: Suggest an idea or improvement for cola
+labels: [needs-triage, enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion! Describe the problem first — a clear problem statement
+        is more useful than a fully-specified solution.
+
+        Usage questions belong in [Discussions](https://github.com/SXongin/cola/discussions), not here.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that cola makes hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What would you like cola to do? A Feishu command, card behavior, config option, ...
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you use today, or other designs you thought about.
+    validations:
+      required: false
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmations
+      options:
+        - label: I searched existing issues and discussions and this is not a duplicate.
+          required: true
