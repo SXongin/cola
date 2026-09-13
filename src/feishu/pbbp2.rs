@@ -107,7 +107,11 @@ impl Frame {
                 }
                 (_, 2) => {
                     let (len, p) = read_varint(data, pos)?;
-                    pos = p + len as usize;
+                    let end = p.checked_add(len as usize)?;
+                    if end > data.len() {
+                        return None;
+                    }
+                    pos = end;
                 }
                 (_, 5) => pos += 4,
                 (_, 1) => pos += 8,
@@ -139,11 +143,11 @@ fn read_varint(data: &[u8], start: usize) -> Option<(u64, usize)> {
 }
 
 /// Read one length-delimited field: consume the length varint at `start`,
-/// reject a declared length that runs past `data`, and return the field bytes
-/// plus the cursor after them.
+/// reject a declared length that runs past `data` (including one whose sum
+/// overflows `usize`), and return the field bytes plus the cursor after them.
 fn read_len_delimited(data: &[u8], start: usize) -> Option<(&[u8], usize)> {
     let (len, pos) = read_varint(data, start)?;
-    let end = pos + len as usize;
+    let end = pos.checked_add(len as usize)?;
     if end > data.len() {
         return None;
     }
@@ -396,5 +400,28 @@ mod tests {
         let parsed = Frame::decode(&ping).expect("ping parses");
         assert_eq!(parsed.routing.method, 0); // FrameTypeControl
         assert_eq!(parsed.headers.get("type").map(|s| s.as_str()), Some("ping"));
+    }
+
+    /// A length varint can encode almost `u64::MAX`. A naive `pos + len` wraps
+    /// around and slices backwards; the field must be rejected instead of
+    /// panicking. (Found by the cargo-fuzz target in `fuzz/`.)
+    #[test]
+    fn read_len_delimited_rejects_length_that_overflows() {
+        // Field 8, wire type 2, declared length u64::MAX.
+        let data = [0x42, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01];
+        assert!(read_len_delimited(&data, 1).is_none());
+        assert!(Frame::decode(&data).is_none());
+    }
+
+    /// The unknown-field skip arm had the same wrap, and a wrapped cursor can
+    /// land back on the tag it just skipped — an infinite loop that hangs the
+    /// WS reader. A length whose sum overflows must end the parse.
+    #[test]
+    fn unknown_field_with_wrapping_length_does_not_loop() {
+        // Field 15 wire type 2, then the 10-byte varint for `u64::MAX - 10`:
+        // the cursor moves 11 bytes and the wrapped sum lands back on the tag.
+        let mut data = vec![0x7A];
+        encode_varint(&mut data, u64::MAX - 10);
+        assert!(Frame::decode(&data).is_none());
     }
 }
