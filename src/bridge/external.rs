@@ -491,7 +491,8 @@ pub(crate) async fn settle_snapshot_after_send(
             .start_snapshot_follow(core, &data.session_id, snapshot_message_id, verb, title, data)
             .await;
     if !followed {
-        crate::bridge::request::claim_snapshot_pendings(core, snapshot_message_id, verb, title, data).await;
+        crate::bridge::snapshot_claims::claim_snapshot_pendings(core, snapshot_message_id, verb, title, data)
+            .await;
     }
 }
 

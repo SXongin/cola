@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -7,6 +7,7 @@ use crate::bridge::handler::CardActionResult;
 use crate::bridge::pollers::{
     CardTarget, inline_host_session, mark_stale_cards, resolve_card_target, result_card,
 };
+use crate::bridge::snapshot_claims::ClaimKind;
 use crate::bridge::streaming::StreamAccumulator;
 use crate::opencode;
 
@@ -922,59 +923,6 @@ impl RequestKind for QuestionKind {
     }
 }
 
-/// Which request kind a snapshot claim hosts (ADR-0028). One registry on the
-/// shared core holds both kinds' claims, and each flow's poll sweep only drops
-/// claims of its own kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClaimKind {
-    Permission,
-    Question,
-}
-
-/// The rebuild state of one snapshot card that claims adopt-time pendings
-/// (ADR-0028): the verb + title its header was built with and the full
-/// adopt-time read state. The claimed blocks are a subset of `data.pending`;
-/// re-render filters them by what is still claimed.
-pub struct ClaimedSnapshot {
-    pub verb: String,
-    pub title: String,
-    pub data: crate::bridge::snapshot::SnapshotData,
-}
-
-/// The ADR-0028 claim registry, shared by both flows on one Mutex so the three
-/// maps always change together (claim, re-render, prune are single
-/// operations).
-#[derive(Default)]
-pub struct SnapshotClaimRegistry {
-    /// request_id → (claiming snapshot message id, the request's kind). The
-    /// poll loop treats a claimed id as already-surfaced (no standalone card,
-    /// no re-inline); a claimed id leaving the pending list drops its block.
-    pub claims: HashMap<String, (String, ClaimKind)>,
-    /// snapshot message id → the adopt-time state the card was built from,
-    /// kept so the card can be re-rendered in place when a claimed request
-    /// resolves (via the snapshot's own buttons or by another client).
-    pub hosts: HashMap<String, ClaimedSnapshot>,
-    /// request ids whose block was resolved via a snapshot card. A late second
-    /// click on the same block must keep patching the snapshot — never replace
-    /// the whole card with a standalone result card. Pruned together with the
-    /// host entry once no claim refers to the snapshot anymore.
-    pub tombstones: HashSet<String>,
-}
-
-impl SnapshotClaimRegistry {
-    /// Whether `request_id` is claimed by a snapshot card.
-    pub fn contains(&self, request_id: &str) -> bool {
-        self.claims.contains_key(request_id)
-    }
-
-    /// The claim's owning snapshot message id, if any.
-    pub fn message_of(&self, request_id: &str) -> Option<&str> {
-        self.claims
-            .get(request_id)
-            .map(|(message_id, _)| message_id.as_str())
-    }
-}
-
 /// The fused permission/question flow. The poll loop, card delivery, double-click
 /// guard primitive and error-result block live here once; the kind supplies the
 /// deltas.
@@ -1288,8 +1236,21 @@ impl RequestFlow {
             // re-renders synchronously; this just cleans the registry) or by
             // another client (the block must drop from the snapshot). The
             // snapshot card itself is never marked stale — that targets
-            // standalone cards.
-            drop_resolved_claims(core, self.kind.claim_kind(), &pending).await;
+            // standalone cards. The registry returns the rebuilt cards; the
+            // flow patches them (never holding the registry lock across the
+            // Feishu call).
+            let dropped = core
+                .snapshot_claims
+                .lock()
+                .await
+                .drop_vanished(self.kind.claim_kind(), &pending);
+            for (message_id, card) in dropped {
+                if let Err(e) = core.feishu.update_message(&message_id, &card).await {
+                    tracing::warn!("snapshot claim drop: card update failed: {}", e);
+                } else {
+                    tracing::info!("snapshot {} re-rendered without resolved claims", message_id);
+                }
+            }
         }
     }
 
@@ -1328,7 +1289,7 @@ impl RequestFlow {
         // card.
         let claimed_message = {
             let registry = core.snapshot_claims.lock().await;
-            registry.message_of(req_id).map(|m| m.to_string())
+            registry.claim_of(req_id).map(|(m, _)| m.to_string())
         };
         // Inline interaction: the session (or its sub-task parent chain) has a
         // live streaming card, so the result is NOT returned as a replacement
@@ -1354,7 +1315,7 @@ impl RequestFlow {
         // flight): keep patching the snapshot — never replace the whole card
         // with a standalone result card.
         if claimed_message.is_none()
-            && core.snapshot_claims.lock().await.tombstones.contains(req_id)
+            && core.snapshot_claims.lock().await.is_tombstoned(req_id)
             && let Some(result) = &mut r
         {
             result.card = None;
@@ -1381,23 +1342,24 @@ impl RequestFlow {
                 // (double-click): keep the block and show the live answer
                 // state, so the snapshot mirrors the standalone card's
                 // 已选/✅ markers.
-                let pending = {
-                    let registry = core.snapshot_claims.lock().await;
-                    registry
-                        .hosts
-                        .get(&message_id)
-                        .map(|h| h.data.pending.clone())
-                        .unwrap_or_default()
-                };
+                let pending = core
+                    .snapshot_claims
+                    .lock()
+                    .await
+                    .host_pending(&message_id)
+                    .unwrap_or_default();
                 let state = core.question.live_snapshot_state(&pending).await;
-                result.card = rebuild_snapshot_host(core, &message_id, &state).await;
+                result.card = core.snapshot_claims.lock().await.rebuild(&message_id, &state);
             } else {
                 // Resolved: drop the block from the snapshot and patch it in
-                // place — no new message.
-                unclaim_snapshot_block(core, req_id).await;
+                // place — no new message. `resolve` does the whole transition
+                // (unclaim → tombstone → rebuild → prune) under one lock.
                 let state = crate::feishu::snapshot_card::SnapshotQuestionState::new();
-                result.card = rebuild_snapshot_host(core, &message_id, &state).await;
-                prune_snapshot_host(core, &message_id).await;
+                result.card = core
+                    .snapshot_claims
+                    .lock()
+                    .await
+                    .resolve(req_id, &message_id, &state);
             }
         }
         r
@@ -1545,227 +1507,6 @@ async fn drop_surfaced(flow: &RequestFlow, core: &Arc<SharedCore>, host: &Option
 /// resumes — the card would stay frozen on the pre-answer state.
 async fn flush_inline_card(core: &Arc<SharedCore>, host: &Option<String>, session_id: &str) {
     crate::bridge::render::flush_card(core, host.as_deref().unwrap_or(session_id)).await;
-}
-
-// ===== ADR-0028 snapshot claims =====
-//
-// A snapshot that embeds adopt-time pending blocks claims those requests:
-// the poll loop treats a claimed id as already-surfaced (no standalone card,
-// no re-inline), and when a claimed request leaves the pending list — answered
-// via the snapshot's own buttons or by another client — the snapshot card is
-// re-rendered in place without the block. The registry lives on the shared
-// core because the claim happens at the snapshot emission sites (the command
-// layer) and is consulted by both flows' poll loops.
-
-/// Whether a pending request is already surfaced elsewhere — a standalone card
-/// in a flow's `sent_cards`, an inline section on a live streaming card, or a
-/// block on an EARLIER snapshot (re-switch dedupe). Such a request must NOT be
-/// embedded/claimed by a snapshot: the existing card stays authoritative
-/// (ADR-0028).
-pub(crate) async fn is_already_surfaced(core: &Arc<SharedCore>, req: &PendingRequest) -> bool {
-    match req {
-        PendingRequest::Permission(p) => {
-            if core
-                .permission
-                .sent_cards
-                .lock()
-                .await
-                .contains_key(&p.request_id)
-            {
-                return true;
-            }
-        }
-        PendingRequest::Question(q) => {
-            if core.question.sent_cards.lock().await.contains_key(&q.id) {
-                return true;
-            }
-        }
-    }
-    if core.snapshot_claims.lock().await.contains(req.id()) {
-        return true;
-    }
-    let cards = core.cards.lock().await;
-    cards.values().any(|c| {
-        c.acc.pending_permissions.iter().any(|p| p.request_id == req.id())
-            || c.acc.pending_questions.iter().any(|q| q.request_id == req.id())
-    })
-}
-
-/// ADR-0028: restrict the gathered adopt-time state to the pendings the
-/// snapshot may embed and claim — the adopted session's own requests minus any
-/// already surfaced elsewhere. Called BEFORE the snapshot card is built, so an
-/// already-surfaced request never shows a duplicate block on the snapshot.
-pub(crate) async fn claimable_pendings(
-    core: &Arc<SharedCore>,
-    mut data: crate::bridge::snapshot::SnapshotData,
-) -> crate::bridge::snapshot::SnapshotData {
-    let mut claimable: Vec<PendingRequest> = Vec::new();
-    for req in &data.pending {
-        if is_already_surfaced(core, req).await {
-            tracing::info!(
-                "snapshot: {} {} already surfaced; not embedded",
-                req.id(),
-                req.session_id()
-            );
-            continue;
-        }
-        claimable.push(req.clone());
-    }
-    data.pending = claimable;
-    data
-}
-
-/// ADR-0028: register the snapshot's embedded pendings as claimed — the poll
-/// loop then treats them as surfaced — and remember question requests so the
-/// block buttons resolve (the poll loop never sees claimed requests, so
-/// `prepare()` never ran for them). Called AFTER the snapshot card is sent,
-/// with its message id.
-pub(crate) async fn claim_snapshot_pendings(
-    core: &Arc<SharedCore>,
-    snapshot_message_id: &str,
-    verb: &str,
-    title: &str,
-    data: &crate::bridge::snapshot::SnapshotData,
-) {
-    let mut registry = core.snapshot_claims.lock().await;
-    registry
-        .hosts
-        .entry(snapshot_message_id.to_string())
-        .or_insert_with(|| ClaimedSnapshot {
-            verb: verb.to_string(),
-            title: title.to_string(),
-            data: data.clone(),
-        });
-    for req in &data.pending {
-        let kind = req.claim_kind();
-        registry
-            .claims
-            .insert(req.id().to_string(), (snapshot_message_id.to_string(), kind));
-        tracing::info!(
-            "snapshot {} claims {} {} on session {}",
-            snapshot_message_id,
-            req.id(),
-            if kind == ClaimKind::Permission {
-                "permission"
-            } else {
-                "question"
-            },
-            req.session_id()
-        );
-        if let PendingRequest::Question(q) = req {
-            core.question.remember_question(q, &data.directory).await;
-        }
-    }
-}
-
-/// ADR-0028: drop one claimed request (its block resolved via the snapshot's
-/// buttons) and tombstone it so a late second click keeps patching the
-/// snapshot instead of replacing it with a standalone result card. The caller
-/// re-renders the snapshot and then prunes the host once no claim refers to it.
-pub(crate) async fn unclaim_snapshot_block(core: &Arc<SharedCore>, req_id: &str) {
-    let mut registry = core.snapshot_claims.lock().await;
-    registry.claims.remove(req_id);
-    registry.tombstones.insert(req_id.to_string());
-}
-
-/// ADR-0028: drop the snapshot host (and its tombstones) once no claim refers
-/// to it — the card is fully resolved and nothing can re-render it anymore.
-async fn prune_snapshot_host(core: &Arc<SharedCore>, message_id: &str) {
-    let mut registry = core.snapshot_claims.lock().await;
-    let still_claimed = registry.claims.values().any(|(mid, _)| mid == message_id);
-    if still_claimed {
-        return;
-    }
-    if let Some(host) = registry.hosts.remove(message_id) {
-        for req in &host.data.pending {
-            registry.tombstones.remove(req.id());
-        }
-    }
-}
-
-/// ADR-0028: rebuild a claimed snapshot card from its stored adopt-time state,
-/// filtered to the pendings that are STILL claimed (a block drops the moment
-/// its claim is removed), with the given live question state for the blocks
-/// that remain. Returns the card JSON for the caller to patch (ack path) or
-/// send (poll path); `None` when the host entry is gone.
-pub(crate) async fn rebuild_snapshot_host(
-    core: &Arc<SharedCore>,
-    message_id: &str,
-    question_state: &crate::feishu::snapshot_card::SnapshotQuestionState,
-) -> Option<serde_json::Value> {
-    let (verb, title, mut data) = {
-        let registry = core.snapshot_claims.lock().await;
-        let host = registry.hosts.get(message_id)?;
-        (host.verb.clone(), host.title.clone(), host.data.clone())
-    };
-    let claimed: std::collections::HashSet<String> = {
-        let registry = core.snapshot_claims.lock().await;
-        registry
-            .claims
-            .iter()
-            .filter(|(_, (mid, _))| mid == message_id)
-            .map(|(id, _)| id.clone())
-            .collect()
-    };
-    data.pending.retain(|r| claimed.contains(r.id()));
-    Some(crate::feishu::snapshot_card::build_snapshot_card_with_state(
-        &verb,
-        &title,
-        &data,
-        question_state,
-    ))
-}
-
-/// ADR-0028: drop the claims of this kind's requests that left the pending
-/// list (resolved by another client, or already dropped by a button click) and
-/// re-render the affected snapshot cards in place without the resolved blocks.
-/// Never marks the snapshot stale — that patch targets standalone cards.
-pub(crate) async fn drop_resolved_claims(
-    core: &Arc<SharedCore>,
-    kind: ClaimKind,
-    pending: &std::collections::HashSet<String>,
-) {
-    let resolved: Vec<String> = {
-        let registry = core.snapshot_claims.lock().await;
-        registry
-            .claims
-            .iter()
-            .filter(|(id, (_, k))| *k == kind && !pending.contains(*id))
-            .map(|(id, _)| id.clone())
-            .collect()
-    };
-    if resolved.is_empty() {
-        return;
-    }
-    let affected: Vec<String> = {
-        let registry = core.snapshot_claims.lock().await;
-        let mut messages: Vec<String> = Vec::new();
-        for id in &resolved {
-            if let Some((mid, _)) = registry.claims.get(id)
-                && !messages.contains(mid)
-            {
-                messages.push(mid.clone());
-            }
-        }
-        messages
-    };
-    {
-        let mut registry = core.snapshot_claims.lock().await;
-        for id in &resolved {
-            registry.claims.remove(id);
-            registry.tombstones.insert(id.clone());
-        }
-    }
-    let empty_state = crate::feishu::snapshot_card::SnapshotQuestionState::new();
-    for message_id in affected {
-        if let Some(card) = rebuild_snapshot_host(core, &message_id, &empty_state).await {
-            if let Err(e) = core.feishu.update_message(&message_id, &card).await {
-                tracing::warn!("snapshot claim drop: card update failed: {}", e);
-            }
-            tracing::info!("snapshot {} re-rendered without resolved claims", message_id);
-        }
-        prune_snapshot_host(core, &message_id).await;
-    }
 }
 
 /// Route a question reply/reject to the instance owning the session. The card
