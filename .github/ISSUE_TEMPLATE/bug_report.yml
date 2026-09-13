@@ -1,0 +1,98 @@
+name: Bug report
+description: Something in cola does not work as expected
+labels: [needs-triage, bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Before you start:
+
+        - Search [existing issues](https://github.com/SXongin/cola/issues?q=is%3Aissue) — your problem may already be tracked.
+        - Usage questions belong in [Discussions](https://github.com/SXongin/cola/discussions), not here.
+        - **Never paste your `app_secret`, tokens, or chat contents.** cola logs can
+          contain chat/user IDs and message text — redact them before uploading.
+  - type: input
+    id: version
+    attributes:
+      label: cola version
+      description: "The output of `cola --version` (it includes build provenance)."
+      placeholder: "cola 0.8.2 (release)"
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install cola?
+      options:
+        - GitHub release archive
+        - cargo install colark
+        - cargo binstall colark
+        - Built from source
+        - Not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux x86_64
+        - macOS (Apple Silicon)
+        - Windows x86_64
+        - Other (note it below)
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence that triggers the bug, including the Feishu command or card interaction when relevant.
+      placeholder: |
+        1. DM the bot in Feishu ...
+        2. Run `/dir ...`
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened? Paste the error text and/or screenshots if useful.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen instead?
+    validations:
+      required: false
+  - type: upload
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Attach the relevant log file (default `~/.cola/cola-YYYY-MM-DD.log`) **after removing secrets and
+        personal data** (`app_secret`, tokens, chat IDs, message text). A narrow excerpt around the
+        failure is more useful than the whole file.
+      accept: ".log,.txt,.zip"
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else?
+      description: Related issues, config changes you made, other tools involved, ...
+    validations:
+      required: false
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmations
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I removed secrets and personal data from everything I pasted or attached.
+          required: true
+        - label: This is not a security vulnerability (those go through private reporting, see SECURITY.md).
+          required: true

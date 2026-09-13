@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Usage questions
+    url: https://github.com/SXongin/cola/discussions
+    about: How do I set up / use cola? Ask in Discussions — issues are for bugs and feature requests.
+  - name: User guide
+    url: https://github.com/SXongin/cola/blob/main/docs/user-guide.md
+    about: Installation, configuration, every Feishu command, logs, and troubleshooting.
+  - name: Report a security vulnerability
+    url: https://github.com/SXongin/cola/security/advisories/new
+    about: Report privately — please do not open a public issue. See SECURITY.md.
