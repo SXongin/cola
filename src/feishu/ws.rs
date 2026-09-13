@@ -1072,3 +1072,224 @@ fn dedupe_set_evicts_when_over_cap() {
     // The evicted ids are no longer "seen".
     assert!(!seen.check_and_insert("a"));
 }
+
+/// Transport-level tests: cola's real WS client dials a local fake Feishu
+/// (the endpoint URL comes from the fake HTTP server), so the socket read/write
+/// loop — pong, acks, dispatch, card response, close, reconnect — runs against
+/// a real connection in CI with no credentials and no external network.
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use crate::bridge::handler::CardActionResult;
+    use crate::bridge::{EventSink, IncomingMessage};
+    use crate::config::FeishuConfig;
+    use crate::feishu::client::Client;
+    use crate::test_http::TestHttpServer;
+    use crate::test_ws::TestWsServer;
+    use base64::Engine as _;
+
+    /// An `EventSink` that records what reached the bridge side of the socket.
+    #[derive(Default)]
+    struct RecordingSink {
+        texts: Mutex<Vec<String>>,
+        actions: Mutex<Vec<serde_json::Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EventSink for RecordingSink {
+        async fn handle_message(&self, msg: IncomingMessage) {
+            self.texts.lock().await.push(msg.text);
+        }
+
+        async fn handle_card_action(&self, value: serde_json::Value) -> Option<CardActionResult> {
+            self.actions.lock().await.push(value);
+            Some(CardActionResult {
+                card: Some(serde_json::json!({ "schema": "2.0" })),
+                toast: Some("已处理".into()),
+            })
+        }
+    }
+
+    /// The fake HTTP response serving a WS endpoint, in Feishu's shape
+    /// (`data.URL` is uppercase on the wire).
+    fn ws_endpoint_route(url: &str) -> String {
+        serde_json::json!({
+            "code": 0,
+            "msg": "ok",
+            "data": { "URL": url },
+        })
+        .to_string()
+    }
+
+    fn test_client(base_url: String) -> Arc<dyn Platform> {
+        Arc::new(Client::for_test_server(
+            FeishuConfig {
+                app_id: "cli_test".into(),
+                app_secret: "secret_test".into(),
+            },
+            base_url,
+        ))
+    }
+
+    /// Encode a "type: event" frame holding `payload`, the way Feishu sends one.
+    fn event_bytes(payload: &[u8]) -> Vec<u8> {
+        pbbp2::encode(
+            &Routing {
+                seq_id: 42,
+                service: 1,
+                method: 1,
+                ..Routing::default()
+            },
+            &[("type", "event")],
+            payload,
+        )
+    }
+
+    fn card_action_payload() -> Vec<u8> {
+        serde_json::json!({
+            "header": { "event_type": "card.action.trigger", "event_id": "e_card" },
+            "event": {
+                "action": {
+                    "tag": "button",
+                    "value": {
+                        "action": "perm",
+                        "reply": "once",
+                        "request_id": "p1",
+                        "session_id": "s1"
+                    }
+                }
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// Poll (bounded) until `want` messages reached the sink; the dispatch runs
+    /// on a spawned task after the ack is written.
+    async fn wait_for_texts(sink: &RecordingSink, want: usize) {
+        for _ in 0..200 {
+            if sink.texts.lock().await.len() >= want {
+                return;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        panic!("only {} messages were dispatched", sink.texts.lock().await.len());
+    }
+
+    #[tokio::test]
+    async fn transport_answers_heartbeats_acks_and_dispatches() {
+        let http = TestHttpServer::start().await;
+        let ws_server = TestWsServer::start().await;
+        http.route(
+            "POST",
+            "/callback/ws/endpoint",
+            200,
+            ws_endpoint_route(&ws_server.url()),
+        );
+
+        let recorder = Arc::new(RecordingSink::default());
+        let sink: Arc<dyn EventSink> = recorder.clone();
+        let state = Arc::new(WsState::new());
+        let feishu = test_client(http.base_url());
+
+        let listener = tokio::spawn({
+            let sink = Arc::clone(&sink);
+            let feishu = Arc::clone(&feishu);
+            let state = Arc::clone(&state);
+            async move { connect_and_listen(&sink, &feishu, &state).await }
+        });
+
+        let mut socket = ws_server.accept().await;
+
+        // The server's protocol heartbeat ping must be answered with a pong.
+        socket.send_binary(pbbp2::ping()).await;
+        let pong = Frame::decode(&socket.next_binary(Duration::from_secs(5)).await).expect("pong decodes");
+        assert_eq!(pong.headers.get("type").map(String::as_str), Some("pong"));
+
+        // A message event is acked (code 200, null data, echoed routing) and
+        // then dispatched to the sink.
+        let payload = receive_payload("e_transport", chrono::Utc::now().timestamp_millis());
+        let frame_bytes = event_bytes(&payload);
+        socket.send_binary(frame_bytes.clone()).await;
+        let ack = Frame::decode(&socket.next_binary(Duration::from_secs(5)).await).expect("ack decodes");
+        let ack_json: serde_json::Value = serde_json::from_slice(&ack.payload).expect("ack json");
+        assert_eq!(ack_json["code"], 200);
+        assert_eq!(ack_json["data"], serde_json::Value::Null);
+        assert_eq!(ack.routing.seq_id, 42, "the ack must echo the request routing");
+        wait_for_texts(&recorder, 1).await;
+        assert_eq!(recorder.texts.lock().await[0], "hi");
+
+        // A re-delivery of the same event id is acked but not dispatched twice.
+        socket.send_binary(frame_bytes).await;
+        let dup = Frame::decode(&socket.next_binary(Duration::from_secs(5)).await).expect("dup ack decodes");
+        let dup_json: serde_json::Value = serde_json::from_slice(&dup.payload).unwrap();
+        assert_eq!(dup_json["code"], 200);
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            recorder.texts.lock().await.len(),
+            1,
+            "a duplicate must not dispatch twice"
+        );
+
+        // A card action is dispatched and answered on the same socket with the
+        // result card + toast, base64-wrapped like the Lark SDK does.
+        socket.send_binary(event_bytes(&card_action_payload())).await;
+        let resp =
+            Frame::decode(&socket.next_binary(Duration::from_secs(5)).await).expect("card response decodes");
+        let resp_json: serde_json::Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(resp_json["code"], 200);
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(resp_json["data"].as_str().expect("data is base64"))
+            .expect("data decodes");
+        let inner: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert_eq!(inner["toast"]["content"], "已处理");
+        assert_eq!(inner["card"]["data"]["schema"], "2.0");
+        assert_eq!(recorder.actions.lock().await[0]["request_id"], "p1");
+
+        // A clean server close ends the loop with Ok.
+        socket.close().await;
+        let result = tokio::time::timeout(Duration::from_secs(5), listener)
+            .await
+            .expect("listener task did not finish after close")
+            .expect("listener task panicked");
+        assert!(result.is_ok(), "a clean close should end the loop with Ok");
+    }
+
+    #[tokio::test]
+    async fn event_loop_reconnects_after_the_server_drops_the_connection() {
+        let http = TestHttpServer::start().await;
+        let ws_server = TestWsServer::start().await;
+        http.route(
+            "POST",
+            "/callback/ws/endpoint",
+            200,
+            ws_endpoint_route(&ws_server.url()),
+        );
+
+        let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::default());
+        let state = Arc::new(WsState::new());
+        let feishu = test_client(http.base_url());
+
+        let reconnect = tokio::spawn({
+            let sink = Arc::clone(&sink);
+            let feishu = Arc::clone(&feishu);
+            let state = Arc::clone(&state);
+            async move { event_loop(&sink, &feishu, &state).await }
+        });
+
+        // First connection: drop it like a server restart would.
+        let mut first = ws_server.accept().await;
+        first.close().await;
+
+        // event_loop must dial again (backoff ~1s) and the new socket must be
+        // fully functional.
+        let mut second = tokio::time::timeout(Duration::from_secs(10), ws_server.accept())
+            .await
+            .expect("event_loop did not reconnect");
+        second.send_binary(pbbp2::ping()).await;
+        let pong = Frame::decode(&second.next_binary(Duration::from_secs(5)).await).expect("pong decodes");
+        assert_eq!(pong.headers.get("type").map(String::as_str), Some("pong"));
+
+        reconnect.abort();
+    }
+}

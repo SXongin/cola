@@ -72,6 +72,17 @@ impl Client {
         }
     }
 
+    /// Test-only: the production client pointed at a local fake server, with
+    /// env proxies disabled (ticket 09) so wire and transport tests behave the
+    /// same in a proxied shell as in CI. Production clients keep honoring env
+    /// proxies (ADR-0031).
+    #[cfg(test)]
+    pub(crate) fn for_test_server(cfg: FeishuConfig, base_url: impl Into<String>) -> Self {
+        let mut client = Self::with_base_url(cfg, base_url);
+        client.http = crate::test_http::no_proxy_transport();
+        client
+    }
+
     /// Build a full endpoint URL from an absolute path beginning with `/`.
     fn endpoint(&self, path: &str) -> String {
         format!("{}{path}", self.base_url)
