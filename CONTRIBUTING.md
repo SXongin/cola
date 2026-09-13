@@ -135,15 +135,38 @@ silently overriding it.
 
 ## Releasing
 
-Tags are strict semver **without** a `v` prefix and must match `Cargo.toml`'s
-`version` (the embedded version drives self-update — a mismatch reports "update
-available" forever):
+A release is cut with one command from a clean, up-to-date `main` (ADR-0033):
 
 ```bash
-git tag 1.2.3 && git push origin 1.2.3
+cargo xtask release 1.2.3
 ```
 
-`.github/workflows/release.yml` builds all three platforms and attaches the
+The command is the whole process — do not hand-edit the version or tag by hand:
+
+1. Prints the [release smoke test](#release-smoke-test) and waits for
+   confirmation. `--yes` skips the prompt; pass it only after a human confirmed
+   the smoke test (agents: ask in chat first).
+2. Bumps `Cargo.toml`/`Cargo.lock`, commits `chore(release): bump version to
+   1.2.3` on a `release-1.2.3` branch and pushes it.
+3. Opens the PR and watches CI.
+4. Rebase-merges with the admin bypass once the required checks are green (the
+   `main: review` ruleset requires a PR and one approval — the admin role
+   bypasses both; the `main: CI` ruleset has no bypass, so the checks are
+   always enforced).
+5. Pulls `main` and tags the **merged** commit `1.2.3`, then pushes the tag.
+
+Tags are strict semver **without** a `v` prefix and must match `Cargo.toml`'s
+`version` (the embedded version drives self-update — a mismatch reports "update
+available" forever, ADR-0015). The tag must sit on the commit `main` actually
+contains: a rebase merge can rewrite the branch commit, so a tag created
+before the merge can be left behind (the `0.7.0` failure ADR-0033 cites). The
+command enforces both invariants.
+
+Re-running the command after a failure resumes from the state it finds (fresh
+cut, release branch before the merge, or merged cut with the tag missing); it
+never force-pushes and never moves a tag.
+
+`.github/workflows/release.yml` then builds all three platforms and attaches the
 binaries + `SHA256SUMS` to a GitHub release, then publishes the crate to
 crates.io as `colark`. The GitHub release runs first on purpose (ADR-0030): its
 assets are the self-update channel and must appear atomically, and a crates.io
@@ -157,16 +180,22 @@ release cannot be revoked. Two operational rules follow:
 
 ### Release smoke test
 
-Before tagging, run this six-point smoke test in a real Feishu chat. No second
-bot or test group is needed, and it is the only check that Feishu itself accepts
-the cards cola builds:
+`cargo xtask release` prints this checklist and waits for confirmation
+(`--yes` skips it). It is the only check that Feishu itself accepts the cards
+cola builds, so run it in a real Feishu chat — no second bot or test group is
+needed:
 
-1. Send a message — the Done card renders and updates in place as the turn
-   progresses.
-2. Trigger a tool permission — the permission button round-trips and the answer
-   reaches the tool.
-3. Trigger the `question` tool — the question button round-trips.
-4. Run `/topic` in a group — the topic is created and shows up in the group's
-   topic list.
-5. Run `/model` — the model picker card appears.
-6. Start a session in a non-git directory — cola starts it without error.
+1. **Send a message** — the Done card renders and updates in place as the turn
+   progresses (reasoning collapses, tool panels appear in call order, text
+   streams) without duplicated text.
+2. **Tool permission** — with `/autoaccept` off, make the agent call a gated
+   tool (e.g. ask it to run a shell command). The permission card's
+   允许一次 / 始终允许 / 拒绝 buttons round-trip and the answer reaches the
+   tool.
+3. **Question tool** — ask the agent to use the `question` tool. The question
+   card's buttons round-trip and the turn continues with the chosen answer.
+4. **`/topic` in a group** — @ the bot with `/topic`. The topic is created, it
+   shows up in the group's topic list, and its cover card is the topic root.
+5. **`/model`** — the model picker card appears, and a picked model shows in
+   the next message's footer.
+6. **`/dir <non-git directory>`** — the session starts there without error.
