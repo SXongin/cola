@@ -111,7 +111,7 @@ impl Turn {
             inflight.insert(session_id.clone());
         }
 
-        let loading = crate::feishu::card::CardBuilder::new()
+        let loading = crate::feishu::card::shell::CardBuilder::new()
             .with_state(crate::feishu::card::CardState::Loading)
             .with_subtitle(&subtitle)
             .build();

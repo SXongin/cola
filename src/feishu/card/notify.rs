@@ -1,6 +1,7 @@
 use serde_json::json;
 
-use super::{card_shell, clean_session_label};
+use super::clean_session_label;
+use super::shell::card_shell;
 
 /// A notification card telling the Feishu side that OpenChamber (or another
 /// client on the same store) has posted a new user message to a session.

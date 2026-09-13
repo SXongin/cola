@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use super::card_shell;
+use super::shell::card_shell;
 
 /// Feishu rejects JSON 2.0 cards with more than 200 total components/elements
 /// (ErrCode 11310 "element exceeds the limit"). A single collapsible panel

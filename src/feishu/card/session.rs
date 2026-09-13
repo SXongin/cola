@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use super::card_shell;
+use super::shell::card_shell;
 
 /// One session entry of the `/switch` card: a full-width text row followed by
 /// a button row underneath. The text row is its own `column_set` column (not a

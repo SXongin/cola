@@ -1,6 +1,6 @@
 use crate::bridge::request::describe_permission;
 use crate::bridge::snapshot::{SnapshotData, TailEntry};
-use crate::feishu::card::{permission_buttons, question_elements};
+use crate::feishu::card::question::{permission_buttons, question_elements};
 use crate::opencode;
 use serde_json::json;
 
@@ -119,7 +119,9 @@ fn tail_panels(tail: &[TailEntry]) -> Vec<serde_json::Value> {
         } else {
             chunks
         };
-        panels.push(crate::feishu::card::collapsible_panel_chunks(&title, &chunks));
+        panels.push(crate::feishu::card::shell::collapsible_panel_chunks(
+            &title, &chunks,
+        ));
     }
     panels
 }
@@ -197,7 +199,7 @@ pub fn build_snapshot_card_with_state(
     }
     elements.extend(tail_panels(&data.tail));
 
-    crate::feishu::card::card_shell(&format!("已{verb} {title}"), "blue", elements)
+    crate::feishu::card::shell::card_shell(&format!("已{verb} {title}"), "blue", elements)
 }
 
 /// Build the compact suppressed-切换 state card (ADR-0028): when a re-switch
@@ -208,7 +210,7 @@ pub fn build_snapshot_card_with_state(
 /// blocks: there is deliberately nothing to report.
 pub fn build_switched_state_card(title: &str, session_id: &str, directory: &str) -> serde_json::Value {
     let title = display_title(title, session_id);
-    crate::feishu::card::card_shell(
+    crate::feishu::card::shell::card_shell(
         &format!("已切换 {title}"),
         "blue",
         vec![json!({

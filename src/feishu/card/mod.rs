@@ -1,26 +1,10 @@
-mod help;
-mod notify;
-mod picker;
-mod question;
-mod session;
-mod shell;
-mod tool_render;
-
-pub use help::build_help_card;
-pub use notify::{build_external_message_card, build_resolved_elsewhere_card};
-pub(crate) use picker::{PICKER_BACK_TO_PROVIDERS, PickerLevel};
-pub use picker::{
-    build_agent_card, build_autoaccept_card, build_model_picker_cards, build_model_provider_cards,
-    build_think_card,
-};
-pub use question::{
-    build_permission_card, build_question_card, permission_buttons, question_elements, question_summary,
-};
-pub use session::{build_dir_card, build_force_confirm_card, build_switch_card};
-pub use shell::CardBuilder;
-pub(crate) use shell::{card_shell, collapsible_panel_chunks, header_title_and_template};
-pub(crate) use tool_render::parse_edit_diff;
-pub use tool_render::{TOOL_OUTPUT_MAX_CHARS, ToolPanel};
+pub(crate) mod help;
+pub(crate) mod notify;
+pub(crate) mod picker;
+pub(crate) mod question;
+pub(crate) mod session;
+pub(crate) mod shell;
+pub(crate) mod tool_render;
 
 /// Card state for Feishu interactive message cards.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -184,7 +168,7 @@ mod tests {
         assert_eq!(clean_session_label("@_user_1 你好"), "你好");
         assert_eq!(clean_session_label("frontend-refactor"), "frontend-refactor");
         // A notification card shows the cleaned label, not the raw name.
-        let card = build_external_message_card("sess-7a025fa5-74a1-44e0-b5c5-80b9a21f71bc", "hi");
+        let card = notify::build_external_message_card("sess-7a025fa5-74a1-44e0-b5c5-80b9a21f71bc", "hi");
         let text = card.to_string();
         assert!(!text.contains("sess-"), "raw sess-uuid must not leak: {}", text);
     }

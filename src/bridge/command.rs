@@ -1146,7 +1146,7 @@ async fn send_switch_card(
 ) -> crate::error::Result<()> {
     let (shown, active_id, mapped_ids, scope, current_dir) =
         switch_card_data(core, thread_key, keyword, scope).await;
-    let card = crate::feishu::card::build_switch_card(
+    let card = crate::feishu::card::session::build_switch_card(
         thread_key,
         &shown,
         keyword,
@@ -1202,7 +1202,7 @@ async fn send_dir_card(
     message_id: &str,
 ) -> crate::error::Result<()> {
     let (dirs, current_dir) = dir_card_data(core, thread_key).await;
-    let card = crate::feishu::card::build_dir_card(thread_key, &dirs, current_dir.as_deref());
+    let card = crate::feishu::card::session::build_dir_card(thread_key, &dirs, current_dir.as_deref());
     core.feishu.reply_card(message_id, &card).await?;
     Ok(())
 }
@@ -1239,7 +1239,7 @@ pub(crate) async fn agent_card(
     };
     let agents = core.opencode.list_agents().await;
     let default = server_default_agent(&agents);
-    let card = crate::feishu::card::build_agent_card(
+    let card = crate::feishu::card::picker::build_agent_card(
         thread_key,
         &agents,
         entry.agent.as_deref(),
@@ -1275,7 +1275,7 @@ async fn send_model_card(
     message_id: &str,
 ) -> crate::error::Result<()> {
     let providers = core.opencode.list_models().await;
-    let cards = crate::feishu::card::build_model_provider_cards(thread_key, &providers);
+    let cards = crate::feishu::card::picker::build_model_provider_cards(thread_key, &providers);
     for card in cards {
         core.feishu.reply_card(message_id, &card).await?;
     }
@@ -1316,8 +1316,13 @@ pub(crate) async fn think_card(
         );
     }
     let current = entry.variant.clone();
-    let card =
-        crate::feishu::card::build_think_card(thread_key, &provider, &model, current.as_deref(), &variants);
+    let card = crate::feishu::card::picker::build_think_card(
+        thread_key,
+        &provider,
+        &model,
+        current.as_deref(),
+        &variants,
+    );
     (Some(card), None)
 }
 
@@ -1352,7 +1357,7 @@ async fn send_autoaccept_card(
             .map(|e| e.auto_accept)
             .unwrap_or(false)
     };
-    let card = crate::feishu::card::build_autoaccept_card(thread_key, current_on);
+    let card = crate::feishu::card::picker::build_autoaccept_card(thread_key, current_on);
     core.feishu.reply_card(message_id, &card).await?;
     Ok(())
 }
@@ -1362,7 +1367,7 @@ async fn send_autoaccept_card(
 /// rejects the schema), fall back to the plain-text `help_text()` so the user
 /// always gets something instead of a silent dead `/help`.
 async fn send_help_card(core: &Arc<SharedCore>, message_id: &str) -> crate::error::Result<()> {
-    let card = crate::feishu::card::build_help_card();
+    let card = crate::feishu::card::help::build_help_card();
     match core.feishu.reply_card(message_id, &card).await {
         Ok(_) => Ok(()),
         Err(e) => {

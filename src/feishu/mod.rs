@@ -6,10 +6,9 @@ pub(crate) mod pbbp2;
 pub mod snapshot_card;
 pub mod ws;
 
-pub use client::Client;
-
 use crate::error::Result;
 use async_trait::async_trait;
+use client::Client;
 use serde_json::Value;
 
 /// The Feishu platform, abstracted so the bridge core can be tested with a

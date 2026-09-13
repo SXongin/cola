@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use super::card_shell;
+use super::shell::card_shell;
 
 /// The `/help` reference card: a pure command manual grouped by 会话 / 操作 /
 /// 运维, one line per command with a short description. No buttons — reading is

@@ -1,6 +1,7 @@
 use serde_json::json;
 
-use super::{MAX_CARD_JSON_CHARS, card_shell};
+use super::MAX_CARD_JSON_CHARS;
+use super::shell::card_shell;
 
 /// A generic option-picker card: one button per option. Shared by the
 /// `/agent`, `/model` and `/autoaccept` dual-form cards. Each button carries

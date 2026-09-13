@@ -192,7 +192,7 @@ impl RequestKind for PermissionKind {
             return serde_json::json!({});
         };
         let body = describe_permission(p);
-        crate::feishu::card::build_permission_card(
+        crate::feishu::card::question::build_permission_card(
             p.session_id.as_deref().unwrap_or(""),
             &p.request_id,
             &body,
@@ -423,7 +423,7 @@ impl RequestKind for QuestionKind {
         let PendingRequest::Question(q) = req else {
             return serde_json::json!({});
         };
-        crate::feishu::card::build_question_card(
+        crate::feishu::card::question::build_question_card(
             &q.id,
             &q.session_id,
             &q.questions,
@@ -435,7 +435,7 @@ impl RequestKind for QuestionKind {
 
     fn summary(&self, req: &PendingRequest) -> String {
         match req {
-            PendingRequest::Question(q) => crate::feishu::card::question_summary(&q.questions),
+            PendingRequest::Question(q) => crate::feishu::card::question::question_summary(&q.questions),
             PendingRequest::Permission(_) => String::new(),
         }
     }
@@ -687,7 +687,7 @@ impl RequestKind for QuestionKind {
                     let Some(req) = req else {
                         return Some(flow.missing_question_result(directory, inline).await);
                     };
-                    let card = crate::feishu::card::build_question_card(
+                    let card = crate::feishu::card::question::build_question_card(
                         req_id,
                         &req.session_id,
                         &req.questions,
@@ -1405,7 +1405,9 @@ fn failed_result_card(inline: bool, body: &str, toast: &str) -> CardActionResult
 /// elsewhere" paths look identical.
 fn already_handled_result(kind: &str, inline: bool, toast: &str) -> CardActionResult {
     let mut r = CardActionResult {
-        card: Some(crate::feishu::card::build_resolved_elsewhere_card(kind, "")),
+        card: Some(crate::feishu::card::notify::build_resolved_elsewhere_card(
+            kind, "",
+        )),
         toast: Some(toast.to_string()),
     };
     if inline {
@@ -1588,7 +1590,7 @@ pub(crate) fn describe_permission(p: &opencode::types::PermissionRequest) -> Str
     if matches!(action, "edit" | "patch" | "apply_patch")
         && let Some(diff) = diff
     {
-        let parsed = crate::feishu::card::parse_edit_diff(diff);
+        let parsed = crate::feishu::card::tool_render::parse_edit_diff(diff);
         let path = p
             .metadata
             .as_ref()
