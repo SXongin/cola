@@ -78,6 +78,6 @@ the `/switch` card's existing 建话题接管 op is retrofitted with the same gu
 - Sessions accumulate per click, exactly as repeated `/dir` picks and repeated
   `/topic` calls already do — no dedup.
 - `/topic`'s new-session creation body and the card op must share one helper so
-  cover/anchor/mapping behavior cannot drift (mirroring
-  `create_topic_and_map_adopted` for the adopt path).
+  cover/anchor/mapping behavior cannot drift (as the adopt path does through
+  `bridge::topic::open_topic`).
 - `/help dir`, the user guide and the card row docs need the new affordance.

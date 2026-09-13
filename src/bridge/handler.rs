@@ -837,7 +837,7 @@ impl App {
             match crate::bridge::snapshot::re_switch_emit(&data) {
                 crate::bridge::snapshot::SnapshotEmit::Full => {
                     let (card, data) =
-                        crate::bridge::command::snapshot_card_from_data(core, "切换", &target.title, data)
+                        crate::bridge::snapshot::snapshot_card_from_data(core, "切换", &target.title, data)
                             .await;
                     (card, Some(data))
                 }
@@ -851,7 +851,7 @@ impl App {
                 ),
             }
         } else {
-            let (card, data) = crate::bridge::command::snapshot_card_for(core, "接管", target).await;
+            let (card, data) = crate::bridge::snapshot::snapshot_card_for(core, "接管", target).await;
             (card, Some(data))
         };
         // In a topic the patched card lives INSIDE it, so persist its own
@@ -896,22 +896,22 @@ impl App {
         keyword: &str,
         scope: crate::bridge::command::SwitchScope,
     ) -> CardActionResult {
-        let new_thread_id = match crate::bridge::command::create_topic_and_map_adopted(
+        let new_thread_id = match crate::bridge::topic::open_topic(
             core,
-            thread_key,
-            target,
+            &thread_key.chat_id,
             open_message_id,
+            crate::bridge::topic::TopicOpening::Adopt { info: target.clone() },
         )
         .await
         {
-            Ok(Some(id)) => id,
-            Ok(None) => {
+            Ok(opened) => opened.thread_id,
+            Err(crate::bridge::topic::OpenTopicError::NoThreadId) => {
                 return CardActionResult {
                     card: None,
                     toast: Some("创建话题失败（未返回 thread_id）".to_string()),
                 };
             }
-            Err(e) => {
+            Err(crate::bridge::topic::OpenTopicError::Failed(e)) => {
                 tracing::warn!("switch card topic_adopt: create topic failed: {}", e);
                 return CardActionResult {
                     card: None,
@@ -1027,48 +1027,33 @@ impl App {
                         toast: Some("无法创建话题（缺少卡片消息引用）".to_string()),
                     });
                 };
-                let session = match core
-                    .opencode
-                    .create_session(&core.opencode.new_session_input(Some(&directory)))
-                    .await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!("dir card topic: create session failed: {}", e);
-                        return Some(CardActionResult {
-                            card: None,
-                            toast: Some(format!("创建会话失败：{e}")),
-                        });
-                    }
-                };
                 // Creation title policy (ADR-0007): unnamed, like `/topic
                 // <dir>`; the cover shows the directory basename until the
                 // server auto-generates a title after the first exchange.
                 let display = crate::bridge::command::dir_basename(&directory);
-                match crate::bridge::command::open_topic_for_session(
+                match crate::bridge::topic::open_topic(
                     core,
                     &thread_key.chat_id,
                     open_message_id,
-                    &session.id,
-                    directory.clone(),
-                    display.clone(),
-                    None,
-                    None,
+                    crate::bridge::topic::TopicOpening::Fresh {
+                        directory,
+                        name: None,
+                    },
                 )
                 .await
                 {
-                    Ok(Some(_thread_id)) => Some(CardActionResult {
+                    Ok(_opened) => Some(CardActionResult {
                         card: Some(self.build_dir_card_for(core, &thread_key).await),
                         toast: Some(format!("已建话题并新建会话（{display}）")),
                     }),
-                    Ok(None) => Some(CardActionResult {
+                    Err(crate::bridge::topic::OpenTopicError::NoThreadId) => Some(CardActionResult {
                         card: None,
                         toast: Some(
                             "当前会话不支持创建话题（未返回 thread_id）。请改用 `/dir <目录>` 或在飞书里手动创建话题。"
                                 .to_string(),
                         ),
                     }),
-                    Err(e) => {
+                    Err(crate::bridge::topic::OpenTopicError::Failed(e)) => {
                         tracing::warn!("dir card topic: create topic failed: {}", e);
                         Some(CardActionResult {
                             card: None,

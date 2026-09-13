@@ -371,12 +371,12 @@ impl Turn {
         // `/name` — patch the cover card (the thread root) in place, so the
         // chat-list topic entry stays current. Best effort; failures only log.
         if prompt_err.is_none() {
-            let settled = crate::bridge::command::sync_topic_cover_title(&app.core, &self.session_id).await;
+            let settled = crate::bridge::topic::sync_topic_cover_title(&app.core, &self.session_id).await;
             // The auto-title can still be in flight when a short turn ends
             // (the title agent races the turn); only then retry with backoff,
             // so the cover follows even if the user stops here (ADR-0023).
             if !settled {
-                crate::bridge::command::spawn_cover_title_retry(&app.core, &self.session_id);
+                crate::bridge::topic::spawn_cover_title_retry(&app.core, &self.session_id);
             }
         }
 
