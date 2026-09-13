@@ -6,6 +6,8 @@
 [![crates.io](https://img.shields.io/crates/v/colark.svg)](https://crates.io/crates/colark)
 [![Downloads](https://img.shields.io/crates/d/colark.svg)](https://crates.io/crates/colark)
 [![Release](https://img.shields.io/github/v/release/SXongin/cola.svg)](https://github.com/SXongin/cola/releases/latest)
+[![Platforms](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#1-install)
+[![Last commit](https://img.shields.io/github/last-commit/SXongin/cola)](https://github.com/SXongin/cola/commits/main)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A bridge bot that brings the [OpenCode](https://opencode.ai) AI coding experience
