@@ -8,6 +8,8 @@ mod logging;
 mod opencode;
 #[cfg(test)]
 mod test_http;
+#[cfg(test)]
+mod test_ws;
 mod update;
 mod version;
 
