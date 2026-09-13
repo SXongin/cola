@@ -424,4 +424,23 @@ mod tests {
         encode_varint(&mut data, u64::MAX - 10);
         assert!(Frame::decode(&data).is_none());
     }
+
+    /// The same skip arm rejects a declared length that runs past the buffer
+    /// instead of advancing the cursor beyond it.
+    #[test]
+    fn unknown_field_with_overrunning_length_is_rejected() {
+        // Field 15 wire type 2, declared length 9, only one byte follows.
+        let data = [0x7A, 0x09, 0x00];
+        assert!(Frame::decode(&data).is_none());
+    }
+
+    /// An unknown length-delimited field with a valid length is skipped by
+    /// advancing the cursor over it, not by consuming the rest of the frame.
+    #[test]
+    fn unknown_field_with_valid_length_is_skipped() {
+        // Field 15 wire type 2 with one opaque byte, then payload field 8.
+        let data = [0x7A, 0x01, 0x00, 0x42, 0x02, b'{', b'}'];
+        let frame = Frame::decode(&data).expect("valid frame");
+        assert_eq!(frame.payload, b"{}");
+    }
 }
