@@ -834,123 +834,36 @@ async fn failed_directory_list_keeps_permission_surfaces() {
     let backend = Arc::new(MockBackend::new(realistic_parts()));
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
-    app.permission
-        .list_timeout_ms
-        .store(30, std::sync::atomic::Ordering::Relaxed);
     seed_session(&app, "ses_1", "/work").await;
 
-    // One live surface per request, all owned by the failing directory /work.
-    app.permission.sent_cards.lock().await.insert(
-        "per_card".into(),
-        crate::bridge::request::SentCard {
-            message_id: "om_card".into(),
-            summary: "bash ls -la".into(),
-            directory: "/work".into(),
-        },
-    );
-    {
-        let mut cards = app.cards.lock().await;
-        let mut acc = crate::bridge::streaming::StreamAccumulator::new("test");
-        acc.pending_permissions
-            .push(crate::bridge::streaming::PendingPermission {
-                session_id: "ses_1".into(),
-                request_id: "per_inline".into(),
-                body: "bash ls -la".into(),
-                directory: "/work".into(),
-            });
-        cards.insert(
-            "ses_1".into(),
-            crate::bridge::streaming::CardSession::new(acc, None),
-        );
-    }
-    app.core.snapshot_claims.lock().await.claim(
-        "om_snapshot",
-        "已接管",
-        "标题",
-        &crate::bridge::snapshot::SnapshotData {
+    let mut inline_acc = crate::bridge::streaming::StreamAccumulator::new("test");
+    inline_acc
+        .pending_permissions
+        .push(crate::bridge::streaming::PendingPermission {
             session_id: "ses_1".into(),
+            request_id: "per_inline".into(),
+            body: "bash ls -la".into(),
             directory: "/work".into(),
-            status: None,
-            pending: vec![crate::bridge::request::PendingRequest::Permission(perm_request(
+        });
+    assert_failed_dir_keeps_surfaces(
+        &app,
+        &app.permission,
+        &backend.hang_list_permissions,
+        &platform,
+        FailedDirSurfaces {
+            card_id: "per_card",
+            card_message_id: "om_card",
+            inline_id: "per_inline",
+            snapshot_message_id: "om_snapshot",
+            inline_acc,
+            claim: crate::bridge::request::PendingRequest::Permission(perm_request(
                 "per_claim",
                 "ses_1",
                 "ls -la",
-            ))],
-            tail: vec![],
-            newest_user_epoch: None,
-            newest_user_is_cola_authored: false,
+            )),
         },
-    );
-
-    // The list call hangs: /work said nothing this sweep.
-    backend
-        .hang_list_permissions
-        .store(1, std::sync::atomic::Ordering::SeqCst);
-    let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
-
-    assert!(
-        app.permission.sent_cards.lock().await.contains_key("per_card"),
-        "a failed list must not mark the standalone card stale"
-    );
-    assert!(
-        app.cards.lock().await.get("ses_1").is_some_and(|c| c
-            .acc
-            .pending_permissions
-            .iter()
-            .any(|p| p.request_id == "per_inline")),
-        "a failed list must not drop the inline section"
-    );
-    assert!(
-        app.core.snapshot_claims.lock().await.contains("per_claim"),
-        "a failed list must not drop the snapshot claim"
-    );
-    let first_calls = platform.calls.lock().await.clone();
-    assert!(
-        first_calls.iter().all(|c| !matches!(
-            c,
-            PlatformCall::UpdateMessage { message_id, .. }
-                if message_id == "om_card" || message_id == "om_snapshot"
-        )),
-        "a failed list must not re-render any surface: {first_calls:?}"
-    );
-
-    // The next sweep lists /work successfully with the requests gone: every
-    // cleanup fires.
-    app.permission.sweep(&app.core, &mut seen).await;
-
-    assert!(
-        !app.permission.sent_cards.lock().await.contains_key("per_card"),
-        "a successful list must still stale the gone card"
-    );
-    assert!(
-        !app.cards.lock().await.get("ses_1").is_some_and(|c| c
-            .acc
-            .pending_permissions
-            .iter()
-            .any(|p| p.request_id == "per_inline")),
-        "a successful list must still drop the gone inline section"
-    );
-    assert!(
-        !app.core.snapshot_claims.lock().await.contains("per_claim"),
-        "a successful list must still drop the gone claim"
-    );
-    let calls = platform.calls.lock().await.clone();
-    assert!(
-        calls.iter().any(|c| matches!(
-            c,
-            PlatformCall::UpdateMessage { message_id, card }
-                if message_id == "om_card" && card.to_string().contains("已处理")
-        )),
-        "the standalone card is marked stale: {calls:?}"
-    );
-    assert!(
-        calls.iter().any(|c| matches!(
-            c,
-            PlatformCall::UpdateMessage { message_id, .. } if message_id == "om_snapshot"
-        )),
-        "the snapshot is re-rendered without the block: {calls:?}"
-    );
+    )
+    .await;
 }
 
 /// A topic-backed session with no streaming card falls back to a separate
