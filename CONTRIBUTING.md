@@ -133,6 +133,13 @@ Reviews check two axes separately:
 Flag any place where the diff contradicts an existing ADR explicitly rather than
 silently overriding it.
 
+Every PR also gets an automatic CodeRabbit review (`.coderabbit.yaml`,
+ADR-0034). `request_changes_workflow` is on, so CodeRabbit approves once its
+unresolved comments are addressed and the latest commit has been reviewed —
+that approval is what satisfies the `main: review` ruleset's required review
+for solo work. The admin bypass remains for emergencies; the bot can never lock
+the maintainer out.
+
 ## Releasing
 
 A release is cut with one command from a clean, up-to-date `main` (ADR-0033):
