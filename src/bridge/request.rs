@@ -634,12 +634,23 @@ impl RequestKind for QuestionKind {
                             .unwrap_or_else(|| question_replay_card(inline)),
                     );
                 }
+                // #130: no state entry means the request is no longer ours.
+                // The sweep prunes requests resolved elsewhere, so a late
+                // click must never silently no-op — answer neutrally instead
+                // of replying against a request cola can no longer see.
+                if !flow.question_state.lock().await.contains_key(req_id) {
+                    return Some(flow.missing_question_result(directory, inline).await);
+                }
                 // The state must still be live: a gone entry means the card is
-                // stale (the request was already submitted/answered).
-                let (n, multi) = {
+                // stale (raced a sweep or a settle). Never a silent no-op.
+                let fetched = {
                     let states = flow.question_state.lock().await;
-                    let state = states.get(req_id)?;
-                    (state.len(), state.is_multi(index))
+                    states
+                        .get(req_id)
+                        .map(|state| (state.len(), state.is_multi(index)))
+                };
+                let Some((n, multi)) = fetched else {
+                    return Some(flow.missing_question_result(directory, inline).await);
                 };
                 // "custom"/"confirm" only exist on multi-select questions.
                 if (reply == "custom" || reply == "confirm") && !multi {
@@ -650,44 +661,48 @@ impl RequestKind for QuestionKind {
                 // clicks, confirmed multi-selects). The separation is what lets
                 // a multi-select stay open while the user keeps toggling, without
                 // ever auto-submitting mid-composition.
-                let (answered_count, display, done, outcome) = {
+                let mutated = {
                     let mut states = flow.question_state.lock().await;
-                    let state = states.get_mut(req_id)?;
-                    let mut outcome = None;
-                    if multi {
-                        // Read the selection BEFORE mutating so the toast can
-                        // tell add from remove, and a deduped custom from a
-                        // fresh one.
-                        let selected = state.toggle_selected(index, &answer);
-                        match reply {
-                            "custom" => {
-                                outcome = Some(if selected {
-                                    MultiOutcome::Duplicate
-                                } else {
-                                    MultiOutcome::Added
-                                });
-                                state.record_append(index, &answer);
+                    states.get_mut(req_id).map(|state| {
+                        let mut outcome = None;
+                        if multi {
+                            // Read the selection BEFORE mutating so the toast can
+                            // tell add from remove, and a deduped custom from a
+                            // fresh one.
+                            let selected = state.toggle_selected(index, &answer);
+                            match reply {
+                                "custom" => {
+                                    outcome = Some(if selected {
+                                        MultiOutcome::Duplicate
+                                    } else {
+                                        MultiOutcome::Added
+                                    });
+                                    state.record_append(index, &answer);
+                                }
+                                // A stale card may re-confirm an already-done
+                                // question (re-render hasn't removed the button
+                                // yet, and other questions remain open); `confirm`
+                                // is a no-op then, never overwriting the locked
+                                // answer with the (now-empty) toggles slot.
+                                "confirm" => state.confirm(index),
+                                _ => {
+                                    outcome = Some(if selected {
+                                        MultiOutcome::Removed
+                                    } else {
+                                        MultiOutcome::Added
+                                    });
+                                    state.record_toggle(index, &answer);
+                                }
                             }
-                            // A stale card may re-confirm an already-done
-                            // question (re-render hasn't removed the button
-                            // yet, and other questions remain open); `confirm`
-                            // is a no-op then, never overwriting the locked
-                            // answer with the (now-empty) toggles slot.
-                            "confirm" => state.confirm(index),
-                            _ => {
-                                outcome = Some(if selected {
-                                    MultiOutcome::Removed
-                                } else {
-                                    MultiOutcome::Added
-                                });
-                                state.record_toggle(index, &answer);
-                            }
+                        } else {
+                            state.record_answer(index, &answer);
                         }
-                    } else {
-                        state.record_answer(index, &answer);
-                    }
-                    let (count, display, done) = state.merge();
-                    (count, display, done, outcome)
+                        let (count, display, done) = state.merge();
+                        (count, display, done, outcome)
+                    })
+                };
+                let Some((answered_count, display, done, outcome)) = mutated else {
+                    return Some(flow.missing_question_result(directory, inline).await);
                 };
                 // Keep the inline card's display answers and done flags in sync.
                 if inline
@@ -802,7 +817,9 @@ impl RequestKind for QuestionKind {
                         let states = flow.question_state.lock().await;
                         states.get(req_id).map(|s| s.request.clone())
                     };
-                    let req = req?;
+                    let Some(req) = req else {
+                        return Some(flow.missing_question_result(directory, inline).await);
+                    };
                     let card = crate::feishu::card::build_question_card(
                         req_id,
                         &req.session_id,
@@ -821,6 +838,19 @@ impl RequestKind for QuestionKind {
             }
             "submit" => {
                 // Finalize with whatever was answered (empty for the rest).
+                if flow.is_answered(core, req_id).await {
+                    return Some(
+                        flow.answered_result(req_id)
+                            .await
+                            .unwrap_or_else(|| question_replay_card(inline)),
+                    );
+                }
+                // #130: same gate as "answer" — a state-less click must not
+                // blind-reply. Placed before the claim so a gated click leaves
+                // no answered mark behind.
+                if !flow.question_state.lock().await.contains_key(req_id) {
+                    return Some(flow.missing_question_result(directory, inline).await);
+                }
                 // Atomic claim: a click that loses the race re-serves the
                 // winning result.
                 if !flow.try_mark_answered(core, req_id).await {
@@ -872,6 +902,21 @@ impl RequestKind for QuestionKind {
                 Some(r)
             }
             "reject" => {
+                if flow.is_answered(core, req_id).await {
+                    return Some(flow.answered_result(req_id).await.unwrap_or_else(|| {
+                        let mut r = result_card("🚫 已拒绝回答", "red", "已拒绝回答 AI 的问题。");
+                        if inline {
+                            r.card = None;
+                        }
+                        r
+                    }));
+                }
+                // #130: same gate as "answer" — a state-less click must not
+                // blind-reply. Placed before the claim so a gated click leaves
+                // no answered mark behind.
+                if !flow.question_state.lock().await.contains_key(req_id) {
+                    return Some(flow.missing_question_result(directory, inline).await);
+                }
                 // Atomic claim: a click that loses the race re-serves the
                 // winning result.
                 if !flow.try_mark_answered(core, req_id).await {
@@ -941,6 +986,12 @@ pub struct RequestFlow {
     /// request_id → (card message_id, description) of the card cola sent (used
     /// to mark a card stale when the request is resolved by ANOTHER client).
     pub sent_cards: Arc<Mutex<HashMap<String, (String, String)>>>,
+    /// Directories whose list call has SUCCEEDED at least once in this process
+    /// (#130). A question card only exists after its state was recorded, so
+    /// for one of these directories a missing state entry proves the request
+    /// left the pending list — the late-click classifier uses this instead of
+    /// remembering every pruned request id.
+    listed_dirs: Arc<Mutex<std::collections::HashSet<String>>>,
     /// request_id → the question request's whole in-flight state: the request,
     /// its owning directory, the finalized answers and the live multi-select
     /// toggles (question kind only; the permission flow's map stays empty). One
@@ -962,6 +1013,7 @@ impl RequestFlow {
             poll_interval_ms: std::sync::atomic::AtomicU64::new(3000),
             list_timeout_ms: std::sync::atomic::AtomicU64::new(30_000),
             sent_cards: Arc::new(Mutex::new(HashMap::new())),
+            listed_dirs: Arc::new(Mutex::new(std::collections::HashSet::new())),
             question_state: Arc::new(Mutex::new(HashMap::new())),
             answered_results: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -1093,6 +1145,28 @@ impl RequestFlow {
         out
     }
 
+    /// The result for a click whose question state is gone (#130). It never
+    /// reaches the backend and never records anything: a directory this
+    /// process has listed successfully means the request provably left the
+    /// pending list → neutral "已处理"; otherwise cola cannot know (fresh
+    /// process before the first sweep, failing lists, unknown directory) and
+    /// must not claim the request was handled.
+    pub(crate) async fn missing_question_result(
+        &self,
+        directory: Option<&str>,
+        inline: bool,
+    ) -> CardActionResult {
+        let classified = match directory {
+            Some(dir) => self.listed_dirs.lock().await.contains(dir),
+            None => false,
+        };
+        if classified {
+            already_handled_result(self.kind.label(), inline, "该问题已处理")
+        } else {
+            stale_question_card(inline)
+        }
+    }
+
     /// Independent poller: surfaces pending requests as cards (inline on a
     /// streaming card when possible, else a separate card), auto-resolves where
     /// the kind says so, and marks stale cards when another client resolves a
@@ -1104,154 +1178,189 @@ impl RequestFlow {
                 self.poll_interval_ms.load(std::sync::atomic::Ordering::Relaxed),
             ))
             .await;
-            // Serverless (Lazy Start hasn't attached/spawned yet): there is
-            // nothing to poll — skip quietly until a server appears.
-            if core.opencode.base_url().is_empty() {
-                continue;
-            }
-            // Pending requests live in the server instance for the session's
-            // directory; `GET /permission` / `GET /question` must be scoped with
-            // `?directory=` or they only see the server cwd instance. Check every
-            // known session directory.
-            let directories = { core.sessions.lock().await.directories() };
-            let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for dir in &directories {
-                let backend = core.opencode.clone().for_directory(dir);
-                // Bound the list call: a server restart can leave an in-flight
-                // request on a half-open connection, and without a timeout the
-                // poller would sit on it forever (no cards, no auto-accept).
-                // On timeout the call is cancelled and the next tick retries.
-                let listed = match crate::bridge::bounded_call(
-                    &format!("poll {} ({}) list", self.kind.label(), dir),
-                    self.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
-                    self.kind.list(&backend),
-                )
-                .await
-                {
-                    Some(listed) => listed,
-                    None => continue,
-                };
-                match listed {
-                    Ok(requests) => {
-                        for req in &requests {
-                            pending.insert(req.id().to_string());
-                            // ADR-0028: a claimed request is hosted by a
-                            // snapshot card — already surfaced, never a
-                            // standalone card, never re-inlined.
-                            if core.snapshot_claims.lock().await.contains(req.id()) {
-                                continue;
+            self.sweep(core, &mut seen).await;
+        }
+    }
+
+    /// One poll iteration: list pending requests per known session directory,
+    /// surface the unseen ones, then reconcile everything that left the list
+    /// (stale standalone cards, inline sections, snapshot claims, and the
+    /// remembered question state). Extracted from the loop so tests can drive
+    /// one deterministic sweep.
+    pub(crate) async fn sweep(&self, core: &Arc<SharedCore>, seen: &mut std::collections::HashSet<String>) {
+        // Serverless (Lazy Start hasn't attached/spawned yet): there is
+        // nothing to poll — skip quietly until a server appears.
+        if core.opencode.base_url().is_empty() {
+            return;
+        }
+        // Pending requests live in the server instance for the session's
+        // directory; `GET /permission` / `GET /question` must be scoped with
+        // `?directory=` or they only see the server cwd instance. Check every
+        // known session directory.
+        let directories = { core.sessions.lock().await.directories() };
+        let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Directories whose list call failed (error or timeout) this sweep.
+        // `pending` only speaks for directories that listed SUCCESSFULLY, so
+        // their state must NOT be read as resolved (#130).
+        let mut failed_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Directories that DID list successfully this sweep, remembered on the
+        // flow so a later late click can classify a missing state entry.
+        let mut listed_now: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for dir in &directories {
+            let backend = core.opencode.clone().for_directory(dir);
+            // Bound the list call: a server restart can leave an in-flight
+            // request on a half-open connection, and without a timeout the
+            // poller would sit on it forever (no cards, no auto-accept).
+            // On timeout the call is cancelled and the next tick retries.
+            let listed = match crate::bridge::bounded_call(
+                &format!("poll {} ({}) list", self.kind.label(), dir),
+                self.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
+                self.kind.list(&backend),
+            )
+            .await
+            {
+                Some(listed) => listed,
+                None => {
+                    failed_dirs.insert(dir.clone());
+                    continue;
+                }
+            };
+            match listed {
+                Ok(requests) => {
+                    listed_now.insert(dir.clone());
+                    for req in &requests {
+                        pending.insert(req.id().to_string());
+                        // ADR-0028: a claimed request is hosted by a
+                        // snapshot card — already surfaced, never a
+                        // standalone card, never re-inlined.
+                        if core.snapshot_claims.lock().await.contains(req.id()) {
+                            continue;
+                        }
+                        if seen.contains(req.id()) {
+                            continue;
+                        }
+                        seen.insert(req.id().to_string());
+                        tracing::info!(
+                            "{} ({}): {} on session {}",
+                            self.kind.label(),
+                            dir,
+                            req.id(),
+                            req.session_id()
+                        );
+                        // Kind-specific pre-card handling (auto-accept /
+                        // remember). true → handled, no card needed.
+                        if self.kind.prepare(self, core, req, dir).await {
+                            continue;
+                        }
+                        // One-card-per-turn: surface the request INLINE on the
+                        // streaming card of the session that owns it — the
+                        // session itself, or (sub-task children) its nearest
+                        // ancestor with a live card. Only a separate card when
+                        // there is no active card (e.g. external turns or
+                        // restarts).
+                        if let Some(host) = inline_host_session(core, req.session_id(), Some(dir)).await {
+                            let mut cards = core.cards.lock().await;
+                            if let Some(acc) = cards.get_mut(&host).map(|c| &mut c.acc)
+                                && self.kind.push_inline(acc, req, dir)
+                            {
+                                tracing::info!(
+                                    "{} {} inlined on session {} card",
+                                    self.kind.label(),
+                                    req.id(),
+                                    host
+                                );
+                                drop(cards);
+                                // Flush so the inline section appears NOW — the
+                                // render loop only flushes on new parts, and a
+                                // blocked prompt produces none.
+                                crate::bridge::render::flush_card(core, &host).await;
                             }
-                            if seen.contains(req.id()) {
-                                continue;
+                            continue;
+                        }
+                        let card = self.kind.build_card(req, dir);
+                        // Reply to the message that triggered the prompt for
+                        // this session; fall back to sending into the chat when
+                        // the accumulator is gone (e.g. after a cola restart).
+                        // Sub-task sessions resolve up the parent chain.
+                        let sent_id = match resolve_card_target(core, req.session_id(), dir).await {
+                            Some(CardTarget::ReplyTo(msg_id)) => {
+                                core.feishu.reply_card(&msg_id, &card).await.ok()
                             }
-                            seen.insert(req.id().to_string());
-                            tracing::info!(
-                                "{} ({}): {} on session {}",
-                                self.kind.label(),
-                                dir,
-                                req.id(),
-                                req.session_id()
-                            );
-                            // Kind-specific pre-card handling (auto-accept /
-                            // remember). true → handled, no card needed.
-                            if self.kind.prepare(self, core, req, dir).await {
-                                continue;
+                            Some(CardTarget::Chat(chat_id)) => {
+                                core.feishu.send_card("chat_id", &chat_id, &card).await.ok()
                             }
-                            // One-card-per-turn: surface the request INLINE on the
-                            // streaming card of the session that owns it — the
-                            // session itself, or (sub-task children) its nearest
-                            // ancestor with a live card. Only a separate card when
-                            // there is no active card (e.g. external turns or
-                            // restarts).
-                            if let Some(host) = inline_host_session(core, req.session_id(), Some(dir)).await {
-                                let mut cards = core.cards.lock().await;
-                                if let Some(acc) = cards.get_mut(&host).map(|c| &mut c.acc)
-                                    && self.kind.push_inline(acc, req, dir)
-                                {
-                                    tracing::info!(
-                                        "{} {} inlined on session {} card",
-                                        self.kind.label(),
-                                        req.id(),
-                                        host
-                                    );
-                                    drop(cards);
-                                    // Flush so the inline section appears NOW — the
-                                    // render loop only flushes on new parts, and a
-                                    // blocked prompt produces none.
-                                    crate::bridge::render::flush_card(core, &host).await;
-                                }
-                                continue;
-                            }
-                            let card = self.kind.build_card(req, dir);
-                            // Reply to the message that triggered the prompt for
-                            // this session; fall back to sending into the chat when
-                            // the accumulator is gone (e.g. after a cola restart).
-                            // Sub-task sessions resolve up the parent chain.
-                            let sent_id = match resolve_card_target(core, req.session_id(), dir).await {
-                                Some(CardTarget::ReplyTo(msg_id)) => {
-                                    core.feishu.reply_card(&msg_id, &card).await.ok()
-                                }
-                                Some(CardTarget::Chat(chat_id)) => {
-                                    core.feishu.send_card("chat_id", &chat_id, &card).await.ok()
-                                }
-                                None => {
-                                    tracing::warn!(
-                                        "No reply target or chat for {} on session {}",
-                                        self.kind.label(),
-                                        req.session_id()
-                                    );
-                                    None
-                                }
-                            };
-                            if let Some(mid) = sent_id {
-                                self.sent_cards
-                                    .lock()
-                                    .await
-                                    .insert(req.id().to_string(), (mid, self.kind.summary(req)));
-                            } else {
+                            None => {
                                 tracing::warn!(
-                                    "{} card send failed on session {}",
+                                    "No reply target or chat for {} on session {}",
                                     self.kind.label(),
                                     req.session_id()
                                 );
+                                None
                             }
+                        };
+                        if let Some(mid) = sent_id {
+                            self.sent_cards
+                                .lock()
+                                .await
+                                .insert(req.id().to_string(), (mid, self.kind.summary(req)));
+                        } else {
+                            tracing::warn!(
+                                "{} card send failed on session {}",
+                                self.kind.label(),
+                                req.session_id()
+                            );
                         }
                     }
-                    Err(e) => tracing::warn!("poll {} ({}): {}", self.kind.label(), dir, e),
                 }
-            }
-            // Mark stale: a card cola sent whose request is no longer pending
-            // (resolved by another client) and was NOT answered by cola.
-            mark_stale_cards(core, &pending, &self.sent_cards, self.kind.label()).await;
-            // Drop inline sections whose request vanished (answered elsewhere) —
-            // the streaming card re-renders without them.
-            {
-                let mut cards = core.cards.lock().await;
-                for card in cards.values_mut() {
-                    self.kind.retain_inline(&mut card.acc, &pending);
-                }
-            }
-            // ADR-0028: a claimed request that left the pending list was
-            // resolved — by the snapshot's own buttons (the click handler
-            // re-renders synchronously; this just cleans the registry) or by
-            // another client (the block must drop from the snapshot). The
-            // snapshot card itself is never marked stale — that targets
-            // standalone cards. The registry returns the rebuilt cards; the
-            // flow patches them (never holding the registry lock across the
-            // Feishu call).
-            let dropped = core
-                .snapshot_claims
-                .lock()
-                .await
-                .drop_vanished(self.kind.claim_kind(), &pending);
-            for (message_id, card) in dropped {
-                if let Err(e) = core.feishu.update_message(&message_id, &card).await {
-                    tracing::warn!("snapshot claim drop: card update failed: {}", e);
-                } else {
-                    tracing::info!("snapshot {} re-rendered without resolved claims", message_id);
+                Err(e) => {
+                    tracing::warn!("poll {} ({}): {}", self.kind.label(), dir, e);
+                    failed_dirs.insert(dir.clone());
                 }
             }
         }
+        // Mark stale: a card cola sent whose request is no longer pending
+        // (resolved by another client) and was NOT answered by cola.
+        mark_stale_cards(core, &pending, &self.sent_cards, self.kind.label()).await;
+        // Drop inline sections whose request vanished (answered elsewhere) —
+        // the streaming card re-renders without them.
+        {
+            let mut cards = core.cards.lock().await;
+            for card in cards.values_mut() {
+                self.kind.retain_inline(&mut card.acc, &pending);
+            }
+        }
+        // ADR-0028: a claimed request that left the pending list was
+        // resolved — by the snapshot's own buttons (the click handler
+        // re-renders synchronously; this just cleans the registry) or by
+        // another client (the block must drop from the snapshot). The
+        // snapshot card itself is never marked stale — that targets
+        // standalone cards. The registry returns the rebuilt cards; the
+        // flow patches them (never holding the registry lock across the
+        // Feishu call).
+        let dropped = core
+            .snapshot_claims
+            .lock()
+            .await
+            .drop_vanished(self.kind.claim_kind(), &pending);
+        for (message_id, card) in dropped {
+            if let Err(e) = core.feishu.update_message(&message_id, &card).await {
+                tracing::warn!("snapshot claim drop: card update failed: {}", e);
+            } else {
+                tracing::info!("snapshot {} re-rendered without resolved claims", message_id);
+            }
+        }
+        // #130: remember which directories listed successfully — with that
+        // knowledge a missing state entry proves the request left pending.
+        // (Scope the lock so it is never held together with question_state.)
+        self.listed_dirs.lock().await.extend(listed_now);
+        // #130: forget question state whose request left the pending list —
+        // the flip side of the stale-card / inline / claim cleanups above.
+        // A directory that failed to list is retained: we do not know it
+        // resolved, and unknown must never be read as resolved.
+        self.question_state
+            .lock()
+            .await
+            .retain(|id, state| pending.contains(id) || failed_dirs.contains(&state.dir));
     }
 
     /// Handle a card action on this kind's card: answer / submit / reject. The
@@ -1400,6 +1509,19 @@ fn question_replay_card(inline: bool) -> CardActionResult {
     if inline {
         r.card = None;
     }
+    r
+}
+
+/// The truthful result for a click cola cannot classify: the state is gone and
+/// the directory was never listed successfully (fresh process before the first
+/// sweep, failing lists, unknown directory). The request may or may not be
+/// resolved — the card must not claim either way.
+fn stale_question_card(inline: bool) -> CardActionResult {
+    let mut r = result_card("❓ 卡片已失效", "grey", "此问答卡片已失效，请使用最新卡片作答。");
+    if inline {
+        r.card = None;
+    }
+    r.toast = Some("此卡片已失效".to_string());
     r
 }
 
