@@ -81,6 +81,11 @@ impl SnapshotClaims {
     /// Register a SENT snapshot card as the host of its embedded pendings: the
     /// poll loop then treats every claimed id as already surfaced. Called
     /// after the card was sent, with its message id.
+    ///
+    /// Precondition: every pending is still claimable — `claimable_pendings`
+    /// filtered the ones surfaced elsewhere — so an id is never claimed twice
+    /// by construction. A re-claim would overwrite the existing entry,
+    /// matching the pre-C6 behaviour.
     pub fn claim(&mut self, message_id: &str, verb: &str, title: &str, data: &SnapshotData) {
         self.hosts
             .entry(message_id.to_string())
@@ -132,6 +137,11 @@ impl SnapshotClaims {
     /// patching the snapshot, re-render the host without it, and prune the
     /// host once no claim refers to it. Returns the card JSON to patch in
     /// place (the ack path); `None` when the host entry is already gone.
+    ///
+    /// Precondition: `message_id` is the claim's own host. Callers take it
+    /// from [`Self::claim_of`] (or from the snapshot they just sent); the
+    /// registry does not re-validate, matching the pre-C6 sequence whose
+    /// caller already held the message id.
     pub fn resolve(
         &mut self,
         request_id: &str,
