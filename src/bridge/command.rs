@@ -1449,7 +1449,7 @@ async fn handle_switch(
                 // Restrict to the claimable pendings (an already-surfaced one
                 // stays authoritative) and claim the rest against the sent
                 // snapshot so the poll loop never duplicates them.
-                let data = crate::bridge::request::claimable_pendings(core, data).await;
+                let data = crate::bridge::snapshot_claims::claimable_pendings(core, data).await;
                 let card = crate::feishu::snapshot_card::build_snapshot_card("切换", &hit.title, &data);
                 let mid = core.feishu.reply_card(message_id, &card).await?;
                 crate::bridge::external::settle_snapshot_after_send(core, &mid, "切换", &hit.title, &data)
@@ -1950,7 +1950,7 @@ pub(crate) async fn snapshot_card_from_data(
     title: &str,
     data: crate::bridge::snapshot::SnapshotData,
 ) -> (serde_json::Value, crate::bridge::snapshot::SnapshotData) {
-    let data = crate::bridge::request::claimable_pendings(core, data).await;
+    let data = crate::bridge::snapshot_claims::claimable_pendings(core, data).await;
     let card = crate::feishu::snapshot_card::build_snapshot_card(verb, title, &data);
     (card, data)
 }

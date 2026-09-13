@@ -27,11 +27,8 @@ async fn snapshot_claim_prevents_poller_duplicate() {
     // The adopt claimed the embedded pending against the sent snapshot.
     let claims = app.core.snapshot_claims.lock().await;
     assert_eq!(
-        claims
-            .claims
-            .get("per_1")
-            .map(|(mid, kind)| (mid.as_str(), *kind)),
-        Some(("msg_reply", crate::bridge::request::ClaimKind::Permission))
+        claims.claim_of("per_1"),
+        Some(("msg_reply", crate::bridge::snapshot_claims::ClaimKind::Permission))
     );
 
     tokio::spawn({
@@ -346,9 +343,9 @@ async fn reeswitch_does_not_reclaim_snapshot_pending() {
         cards[1]
     );
     let registry = app.core.snapshot_claims.lock().await;
-    assert_eq!(registry.claims.len(), 1, "one claim, not re-claimed");
+    assert_eq!(registry.claim_count(), 1, "one claim, not re-claimed");
     assert_eq!(
-        registry.message_of("per_1"),
+        registry.claim_of("per_1").map(|(mid, _)| mid),
         Some("msg_reply"),
         "the first snapshot stays authoritative"
     );
@@ -519,7 +516,7 @@ async fn busy_adopt_streams_turn_into_snapshot() {
     assert_eq!(acc.card_message_id.as_deref(), Some("msg_reply"));
     assert!(acc.acc.submit_epoch_ms.is_some(), "turn epoch set");
     assert!(
-        app.core.snapshot_claims.lock().await.claims.is_empty(),
+        app.core.snapshot_claims.lock().await.claim_count() == 0,
         "busy follow hosts its blocks inline, not claimed"
     );
 
@@ -607,7 +604,7 @@ async fn busy_follow_permission_approved_resumes() {
         .cloned()
         .expect("follow armed");
     assert_eq!(acc.acc.pending_permissions.len(), 1);
-    assert!(app.core.snapshot_claims.lock().await.claims.is_empty());
+    assert!(app.core.snapshot_claims.lock().await.claim_count() == 0);
 
     // Approve the block from the snapshot: the normal inline path replies
     // and strips the section — no standalone card, no replacement card.

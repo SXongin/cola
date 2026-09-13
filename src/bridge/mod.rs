@@ -8,6 +8,7 @@ pub mod render;
 pub mod request;
 pub mod session;
 pub mod snapshot;
+pub mod snapshot_claims;
 pub mod streaming;
 pub mod turn;
 

@@ -59,7 +59,7 @@ pub struct SharedCore {
     /// mutations atomic (they always change together). The poll loop treats a
     /// claimed id as already-surfaced (no standalone card, no re-inline); a
     /// claimed id leaving the pending list drops its block.
-    pub snapshot_claims: Arc<Mutex<crate::bridge::request::SnapshotClaimRegistry>>,
+    pub snapshot_claims: Arc<Mutex<crate::bridge::snapshot_claims::SnapshotClaims>>,
     /// request ids already answered on the permission/question cards. Guards
     /// against double-click races (two card callbacks before the result card
     /// replaces the buttons): a second click on the same request is ignored
@@ -114,7 +114,7 @@ impl SharedCore {
             )),
             external: crate::bridge::external::ExternalFlow::new(),
             snapshot_claims: Arc::new(Mutex::new(
-                crate::bridge::request::SnapshotClaimRegistry::default(),
+                crate::bridge::snapshot_claims::SnapshotClaims::default(),
             )),
             answered_requests: Arc::new(Mutex::new(HashSet::new())),
             inflight: Arc::new(Mutex::new(HashSet::new())),
