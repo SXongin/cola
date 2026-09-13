@@ -433,7 +433,7 @@ pub(crate) async fn inline_host_session(
 /// Shared by the permission and question flows (and the retry action).
 pub(crate) fn result_card(title: &str, template: &str, body: &str) -> CardActionResult {
     CardActionResult {
-        card: Some(crate::feishu::card::card_shell(
+        card: Some(crate::feishu::card::shell::card_shell(
             title,
             template,
             vec![serde_json::json!({ "tag": "markdown", "content": body })],
@@ -463,7 +463,7 @@ pub(crate) async fn mark_stale_cards(
     };
     for (rid, mid, desc) in stale {
         sent.lock().await.remove(&rid);
-        let card = crate::feishu::card::build_resolved_elsewhere_card(kind, &desc);
+        let card = crate::feishu::card::notify::build_resolved_elsewhere_card(kind, &desc);
         if let Err(e) = core.feishu.update_message(&mid, &card).await {
             tracing::warn!("mark stale {} card {}: {}", kind, rid, e);
         } else {

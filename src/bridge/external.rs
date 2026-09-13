@@ -172,7 +172,7 @@ impl ExternalFlow {
                     .and_then(|r| r.ok())
                     .and_then(|i| i.title)
                     .unwrap_or_default();
-                    let card = crate::feishu::card::build_external_message_card(&title, &preview);
+                    let card = crate::feishu::card::notify::build_external_message_card(&title, &preview);
                     // A topic session must be reached by replying to a
                     // message INSIDE the topic (the create API rejects
                     // `receive_id_type=thread_id`). Resolve an in-topic

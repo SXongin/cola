@@ -349,7 +349,8 @@ fn first_chunk(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::feishu::card::{CardBuilder, CardState};
+    use crate::feishu::card::CardState;
+    use crate::feishu::card::shell::CardBuilder;
     use serde_json::json;
 
     #[test]

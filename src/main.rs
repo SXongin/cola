@@ -471,7 +471,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.feishu.app_id
     );
 
-    let feishu_client = feishu::Client::new(cfg.feishu.clone());
+    let feishu_client = feishu::client::Client::new(cfg.feishu.clone());
 
     let opencode_client = opencode::client::Client::new(cfg.opencode.model.as_deref(), server);
     let app = Arc::new(bridge::App::new(

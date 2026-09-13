@@ -21,6 +21,8 @@ pub(crate) mod test_support;
 #[cfg(test)]
 pub(crate) mod tests;
 
+/// The bridge module's deliberate entry point: the coordinator every caller
+/// (main, tests) constructs and drives through [`EventSink`].
 pub use handler::App;
 
 use crate::feishu::client::ImageAttachment;

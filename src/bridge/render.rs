@@ -231,7 +231,7 @@ fn render_part(acc: &mut StreamAccumulator, part: &serde_json::Value) {
             };
             acc.push_tool(
                 &call_id,
-                crate::feishu::card::ToolPanel {
+                crate::feishu::card::tool_render::ToolPanel {
                     name: name.to_string(),
                     status: status.to_string(),
                     input,

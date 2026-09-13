@@ -176,7 +176,7 @@ impl App {
             }
             command::RestartKind::Restart => ("♻️ 已重启".to_string(), "cola 已重启完成。".to_string()),
         };
-        let card = crate::feishu::card::card_shell(
+        let card = crate::feishu::card::shell::card_shell(
             &title,
             "green",
             vec![serde_json::json!({ "tag": "markdown", "content": body })],
@@ -649,7 +649,7 @@ impl App {
                     {
                         let owner_label = owner_label(core, &owner_key).await;
                         return Some(CardActionResult {
-                            card: Some(crate::feishu::card::build_force_confirm_card(
+                            card: Some(crate::feishu::card::session::build_force_confirm_card(
                                 &thread_key,
                                 &target,
                                 &owner_label,
@@ -763,7 +763,7 @@ impl App {
                     {
                         let owner_label = owner_label(core, &owner_key).await;
                         return Some(CardActionResult {
-                            card: Some(crate::feishu::card::build_force_confirm_card(
+                            card: Some(crate::feishu::card::session::build_force_confirm_card(
                                 &thread_key,
                                 &target,
                                 &owner_label,
@@ -795,7 +795,7 @@ impl App {
     ) -> serde_json::Value {
         let (shown, active_id, mapped_ids, scope, current_dir) =
             crate::bridge::command::switch_card_data(core, thread_key, keyword, scope).await;
-        crate::feishu::card::build_switch_card(
+        crate::feishu::card::session::build_switch_card(
             thread_key,
             &shown,
             keyword,
@@ -938,7 +938,7 @@ impl App {
         thread_key: &ThreadKey,
     ) -> serde_json::Value {
         let (dirs, current_dir) = crate::bridge::command::dir_card_data(core, thread_key).await;
-        crate::feishu::card::build_dir_card(thread_key, &dirs, current_dir.as_deref())
+        crate::feishu::card::session::build_dir_card(thread_key, &dirs, current_dir.as_deref())
     }
 
     /// Handle a `/dir` Recent Directories card button (ADR-0025): `op:
@@ -1129,18 +1129,18 @@ impl App {
 
         // Level 1: provider navigation — build and swap in the next picker page.
         if value.get("level").and_then(|v| v.as_str())
-            == Some(crate::feishu::card::PickerLevel::Provider.as_str())
+            == Some(crate::feishu::card::picker::PickerLevel::Provider.as_str())
         {
             let providers = core.opencode.list_models().await;
-            let cards = if picked == crate::feishu::card::PICKER_BACK_TO_PROVIDERS {
-                crate::feishu::card::build_model_provider_cards(&thread_key, &providers)
+            let cards = if picked == crate::feishu::card::picker::PICKER_BACK_TO_PROVIDERS {
+                crate::feishu::card::picker::build_model_provider_cards(&thread_key, &providers)
             } else {
                 let models: Vec<crate::opencode::types::ModelOption> = providers
                     .iter()
                     .find(|p| p.provider == picked)
                     .map(|p| p.models.clone())
                     .unwrap_or_default();
-                crate::feishu::card::build_model_picker_cards(&thread_key, &picked, &models)
+                crate::feishu::card::picker::build_model_picker_cards(&thread_key, &picked, &models)
             };
             return Some(Self::picker_pages_result(core, &thread_key, cards).await);
         }
@@ -1291,7 +1291,7 @@ impl App {
             .map(|e| e.auto_accept)
             .unwrap_or(false);
         Some(CardActionResult {
-            card: Some(crate::feishu::card::build_autoaccept_card(
+            card: Some(crate::feishu::card::picker::build_autoaccept_card(
                 &thread_key,
                 current_on,
             )),

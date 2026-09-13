@@ -1,5 +1,7 @@
 use crate::bridge::core::SharedCore;
-use crate::feishu::card::{CardBuilder, CardState, ToolPanel};
+use crate::feishu::card::CardState;
+use crate::feishu::card::shell::CardBuilder;
+use crate::feishu::card::tool_render::ToolPanel;
 use indexmap::IndexMap;
 use std::sync::Arc;
 
@@ -259,7 +261,7 @@ impl StreamAccumulator {
     /// to decide whether the header changed enough to re-flush (ADR-0014).
     pub fn header_sig(&self) -> String {
         let running = self.tools.values().find(|t| t.status == "running");
-        let (title, template) = crate::feishu::card::header_title_and_template(
+        let (title, template) = crate::feishu::card::shell::header_title_and_template(
             &self.card_state,
             running,
             &self.header_progress(),
@@ -379,7 +381,9 @@ impl StreamAccumulator {
                         let output = p
                             .output
                             .as_deref()
-                            .map(|s| first_n_bytes(s, crate::feishu::card::TOOL_OUTPUT_MAX_CHARS))
+                            .map(|s| {
+                                first_n_bytes(s, crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS)
+                            })
                             .unwrap_or(0);
                         400 + input + output
                     });
@@ -470,7 +474,7 @@ impl StreamAccumulator {
             // pending permission renders as a section with its buttons right here.
             for p in &self.pending_permissions {
                 builder = builder.with_text(&format!("🔐 **权限请求**\n{}", p.body));
-                for btn in crate::feishu::card::permission_buttons(
+                for btn in crate::feishu::card::question::permission_buttons(
                     &p.session_id,
                     &p.request_id,
                     &p.body,
@@ -481,7 +485,7 @@ impl StreamAccumulator {
             }
             // Inline question requests (with their current display answers).
             for q in &self.pending_questions {
-                for el in crate::feishu::card::question_elements(
+                for el in crate::feishu::card::question::question_elements(
                     &q.request_id,
                     &q.session_id,
                     &q.questions,
@@ -848,7 +852,7 @@ mod tests {
         // Each full-size tool panel serializes to ~3.4KB; 12 of them (~41KB of
         // body) exceed MAX_CARD_JSON_CHARS but not MAX_CARD_COMPONENTS, so only
         // the size budget can catch the overflow.
-        let big_output = "o".repeat(crate::feishu::card::TOOL_OUTPUT_MAX_CHARS);
+        let big_output = "o".repeat(crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS);
         for i in 0..12 {
             acc.push_tool(
                 &format!("call_{}", i),
@@ -899,7 +903,7 @@ mod tests {
         // chars (fits under MAX_CARD_JSON_CHARS), but the BYTE estimate is
         // 7 * ~9.4K = ~66K bytes (way over) — a char-counted estimate would
         // wrongly ship one ~66KB card and Feishu would reject it.
-        let cjk_output = "中".repeat(crate::feishu::card::TOOL_OUTPUT_MAX_CHARS);
+        let cjk_output = "中".repeat(crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS);
         for i in 0..7 {
             acc.push_tool(
                 &format!("call_{}", i),
