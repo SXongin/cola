@@ -1,5 +1,8 @@
 [workspace]
 members = [".", "xtask"]
+# The cargo-fuzz crate is its own workspace; keep root commands (fmt, clippy,
+# test) from reaching into it.
+exclude = ["fuzz"]
 resolver = "3"
 
 [package]
