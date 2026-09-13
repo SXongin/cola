@@ -530,7 +530,7 @@ impl StreamAccumulator {
         let mut footer_parts: Vec<String> = Vec::new();
         if let Some(dir) = &self.directory {
             let name = self.project_name.as_deref().unwrap_or(dir);
-            let mut segment = format!("📁 {}", crate::feishu::ws::strip_mention_tokens(name));
+            let mut segment = format!("📁 {}", crate::feishu::message::strip_mention_tokens(name));
             match (&self.branch, self.dirty) {
                 (Some(branch), true) => segment.push_str(&format!(" · {} ⚠", branch)),
                 (Some(branch), false) => segment.push_str(&format!(" · {}", branch)),

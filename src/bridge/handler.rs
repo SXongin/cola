@@ -406,7 +406,7 @@ impl App {
             None => false,
         };
         if let Some(pid) = parent_id.as_deref().filter(|_| !parent_is_topic_creation) {
-            let fetch = feishu::ws::quoted_context(&self.feishu, pid);
+            let fetch = feishu::message::quoted_context(&self.feishu, pid);
             let fetch = tokio::time::timeout(std::time::Duration::from_millis(1500), fetch);
             match fetch.await {
                 Ok(Ok(ctx)) => {
