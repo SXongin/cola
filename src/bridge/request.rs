@@ -634,12 +634,10 @@ impl RequestKind for QuestionKind {
                             .unwrap_or_else(|| question_replay_card(inline)),
                     );
                 }
-                // #130: no state entry means the request is no longer ours.
-                // The sweep prunes requests resolved elsewhere, so a late
-                // click must never silently no-op — answer neutrally instead
-                // of replying against a request cola can no longer see.
-                if !flow.question_state.lock().await.contains_key(req_id) {
-                    return Some(flow.missing_question_result(directory, inline).await);
+                // #130: no state entry means the request is no longer ours —
+                // never reply against a request cola can no longer see.
+                if let Some(result) = flow.question_gate(req_id, directory, inline).await {
+                    return Some(result);
                 }
                 // The state must still be live: a gone entry means the card is
                 // stale (raced a sweep or a settle). Never a silent no-op.
@@ -732,7 +730,11 @@ impl RequestKind for QuestionKind {
                                 .unwrap_or_else(|| question_replay_card(inline)),
                         );
                     }
-                    let (questions, answers) = flow.question_snapshot(req_id).await;
+                    // The claim does not pin the state: re-validate so a sweep
+                    // racing the claim cannot submit an empty snapshot.
+                    let Some((questions, answers)) = flow.question_snapshot(req_id).await else {
+                        return Some(flow.missing_after_claim(core, req_id, directory, inline).await);
+                    };
                     if let Some(r) = settle_question_reply(
                         flow,
                         core,
@@ -848,8 +850,8 @@ impl RequestKind for QuestionKind {
                 // #130: same gate as "answer" — a state-less click must not
                 // blind-reply. Placed before the claim so a gated click leaves
                 // no answered mark behind.
-                if !flow.question_state.lock().await.contains_key(req_id) {
-                    return Some(flow.missing_question_result(directory, inline).await);
+                if let Some(result) = flow.question_gate(req_id, directory, inline).await {
+                    return Some(result);
                 }
                 // Atomic claim: a click that loses the race re-serves the
                 // winning result.
@@ -860,7 +862,11 @@ impl RequestKind for QuestionKind {
                             .unwrap_or_else(|| question_replay_card(inline)),
                     );
                 }
-                let (questions, answers) = flow.question_snapshot(req_id).await;
+                // The claim does not pin the state: re-validate so a sweep
+                // racing the claim cannot turn this into a blind reply.
+                let Some((questions, answers)) = flow.question_snapshot(req_id).await else {
+                    return Some(flow.missing_after_claim(core, req_id, directory, inline).await);
+                };
                 if let Some(r) = settle_question_reply(
                     flow,
                     core,
@@ -914,8 +920,8 @@ impl RequestKind for QuestionKind {
                 // #130: same gate as "answer" — a state-less click must not
                 // blind-reply. Placed before the claim so a gated click leaves
                 // no answered mark behind.
-                if !flow.question_state.lock().await.contains_key(req_id) {
-                    return Some(flow.missing_question_result(directory, inline).await);
+                if let Some(result) = flow.question_gate(req_id, directory, inline).await {
+                    return Some(result);
                 }
                 // Atomic claim: a click that loses the race re-serves the
                 // winning result.
@@ -927,6 +933,11 @@ impl RequestKind for QuestionKind {
                         }
                         r
                     }));
+                }
+                // The claim does not pin the state: re-validate so a sweep
+                // racing the claim cannot reject against a vanished request.
+                if !flow.question_state_live(req_id).await {
+                    return Some(flow.missing_after_claim(core, req_id, directory, inline).await);
                 }
                 if let Some(r) = settle_question_reply(
                     flow,
@@ -1104,21 +1115,21 @@ impl RequestFlow {
     /// The remembered questions and their current answers, captured for the
     /// reply payload and the completion card. The answers are CLONED, not
     /// consumed: a genuine reply failure rolls the guard claim back and the
-    /// state must stay intact so the click can be retried.
+    /// state must stay intact so the click can be retried. `None` when the
+    /// state vanished (a sweep raced the click) — the caller must classify
+    /// that (#130), never reply from an empty snapshot.
     async fn question_snapshot(
         &self,
         req_id: &str,
-    ) -> (Vec<opencode::client::QuestionInfo>, Vec<Vec<String>>) {
+    ) -> Option<(Vec<opencode::client::QuestionInfo>, Vec<Vec<String>>)> {
         let states = self.question_state.lock().await;
-        let Some(state) = states.get(req_id) else {
-            return (Vec::new(), Vec::new());
-        };
+        let state = states.get(req_id)?;
         let answers = state
             .answers
             .iter()
             .map(|a| a.clone().unwrap_or_default())
             .collect();
-        (state.request.questions.clone(), answers)
+        Some((state.request.questions.clone(), answers))
     }
 
     /// The live answer state (display + done flags) of the question requests
@@ -1151,11 +1162,7 @@ impl RequestFlow {
     /// pending list → neutral "已处理"; otherwise cola cannot know (fresh
     /// process before the first sweep, failing lists, unknown directory) and
     /// must not claim the request was handled.
-    pub(crate) async fn missing_question_result(
-        &self,
-        directory: Option<&str>,
-        inline: bool,
-    ) -> CardActionResult {
+    async fn missing_question_result(&self, directory: Option<&str>, inline: bool) -> CardActionResult {
         let classified = match directory {
             Some(dir) => self.listed_dirs.lock().await.contains(dir),
             None => false,
@@ -1165,6 +1172,40 @@ impl RequestFlow {
         } else {
             stale_question_card(inline)
         }
+    }
+
+    /// Whether `req_id` still has live question state.
+    async fn question_state_live(&self, req_id: &str) -> bool {
+        self.question_state.lock().await.contains_key(req_id)
+    }
+
+    /// The #130 gate in front of every question click: `Some(result)` when the
+    /// state is gone — the click must not reply, so it gets the classified
+    /// result; `None` when the state is live and the caller may proceed.
+    async fn question_gate(
+        &self,
+        req_id: &str,
+        directory: Option<&str>,
+        inline: bool,
+    ) -> Option<CardActionResult> {
+        if self.question_state_live(req_id).await {
+            return None;
+        }
+        Some(self.missing_question_result(directory, inline).await)
+    }
+
+    /// The classified result for a click whose state vanished AFTER it claimed
+    /// the request: roll the claim back so the reply never happens and the
+    /// fresh card can still answer.
+    async fn missing_after_claim(
+        &self,
+        core: &Arc<SharedCore>,
+        req_id: &str,
+        directory: Option<&str>,
+        inline: bool,
+    ) -> CardActionResult {
+        self.unmark_answered(core, req_id).await;
+        self.missing_question_result(directory, inline).await
     }
 
     /// Independent poller: surfaces pending requests as cards (inline on a
@@ -1351,8 +1392,14 @@ impl RequestFlow {
         }
         // #130: remember which directories listed successfully — with that
         // knowledge a missing state entry proves the request left pending.
-        // (Scope the lock so it is never held together with question_state.)
-        self.listed_dirs.lock().await.extend(listed_now);
+        // A directory that left the session store is forgotten: pending can no
+        // longer speak for it, so its pruned state must NOT be classified as
+        // resolved later. (Scoped so the lock never overlaps question_state.)
+        {
+            let mut known = self.listed_dirs.lock().await;
+            known.retain(|dir| directories.contains(dir));
+            known.extend(listed_now);
+        }
         // #130: forget question state whose request left the pending list —
         // the flip side of the stale-card / inline / claim cleanups above.
         // A directory that failed to list is retained: we do not know it

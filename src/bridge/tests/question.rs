@@ -1308,6 +1308,59 @@ async fn sweep_keeps_partial_multi_select_toggles() {
     assert_eq!(calls[0].1, vec![vec!["苹果".to_string()]]);
 }
 
+/// #130: a directory that leaves the session store stops being polled, so its
+/// pruned state must not be classified as resolved later — the click gets the
+/// truthful stale-card hint instead of a false "已处理".
+#[tokio::test]
+async fn vanished_directory_is_no_longer_treated_as_known() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.questions = vec![question_request("que_1")];
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
+    seed_work_dir(&app).await;
+
+    app.question
+        .remember_question(&question_request("que_1"), "/work")
+        .await;
+
+    // First sweep: the request is pending → state kept, /work known.
+    let mut seen = std::collections::HashSet::new();
+    app.question.sweep(&app.core, &mut seen).await;
+    assert!(app.question.has_question("que_1").await);
+
+    // The session mapping is forgotten: /work is no longer polled, so the
+    // sweep has no evidence the request resolved — it only drops the state.
+    app.core.sessions.lock().await.remove_persist("ses_1").unwrap();
+    app.question.sweep(&app.core, &mut seen).await;
+    assert!(
+        !app.question.has_question("que_1").await,
+        "state of an unpolled directory is dropped"
+    );
+
+    let result = app
+        .handle_card_action(serde_json::json!({
+            "action": "question",
+            "reply": "answer",
+            "request_id": "que_1",
+            "session_id": "ses_1",
+            "directory": "/work",
+            "question_index": 0,
+            "answer": "/a",
+        }))
+        .await
+        .expect("a late click must get a result");
+    let card = result.card.expect("standalone card").to_string();
+    assert!(card.contains("失效"), "stale-card hint expected: {card}");
+    assert!(
+        !card.contains("已处理"),
+        "an unpolled directory must not be read as resolved: {card}"
+    );
+}
+
 /// #130: after the sweep pruned a request resolved elsewhere, a late click on
 /// its card gets the neutral result — no backend call, no silent no-op, and no
 /// revived per-request state.
