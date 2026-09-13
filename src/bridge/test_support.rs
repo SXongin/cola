@@ -1141,6 +1141,138 @@ pub(crate) async fn seed_session(app: &Arc<App>, session_id: &str, directory: &s
     .await;
 }
 
+/// #144 rig: the three live surfaces a pending request may own. The caller
+/// seeds the one session (`ses_1`, `/work`) before passing these to
+/// [`assert_failed_dir_keeps_surfaces`].
+pub(crate) struct FailedDirSurfaces {
+    /// The standalone card's request id and Message id.
+    pub card_id: &'static str,
+    pub card_message_id: &'static str,
+    /// The inline request id, already seeded onto `inline_acc`.
+    pub inline_id: &'static str,
+    /// The snapshot host's Message id; the claim rides `claim`.
+    pub snapshot_message_id: &'static str,
+    /// A stream accumulator carrying the kind's inline section.
+    pub inline_acc: crate::bridge::streaming::StreamAccumulator,
+    /// The request embedded (and claimed) by the snapshot card.
+    pub claim: crate::bridge::request::PendingRequest,
+}
+
+/// #144: drive one hanging-list sweep and one successful-list sweep over the
+/// three surfaces: the first must keep them all ("unknown must never be read
+/// as resolved"), the second must still fire every cleanup. `flow` and `hang`
+/// pick the kind; `surfaces` carries its kind-specific fixtures.
+pub(crate) async fn assert_failed_dir_keeps_surfaces(
+    app: &Arc<App>,
+    flow: &crate::bridge::request::RequestFlow,
+    hang: &std::sync::atomic::AtomicUsize,
+    platform: &Arc<RecordingPlatform>,
+    surfaces: FailedDirSurfaces,
+) {
+    flow.list_timeout_ms
+        .store(30, std::sync::atomic::Ordering::Relaxed);
+    let claim_id = surfaces.claim.id().to_string();
+
+    // One live surface per request, all owned by the failing directory /work.
+    flow.sent_cards.lock().await.insert(
+        surfaces.card_id.into(),
+        crate::bridge::request::SentCard {
+            message_id: surfaces.card_message_id.into(),
+            summary: "待处理的请求".into(),
+            directory: "/work".into(),
+        },
+    );
+    app.cards.lock().await.insert(
+        "ses_1".into(),
+        crate::bridge::streaming::CardSession::new(surfaces.inline_acc, None),
+    );
+    app.core.snapshot_claims.lock().await.claim(
+        surfaces.snapshot_message_id,
+        "已接管",
+        "标题",
+        &crate::bridge::snapshot::SnapshotData {
+            session_id: "ses_1".into(),
+            directory: "/work".into(),
+            status: None,
+            pending: vec![surfaces.claim],
+            tail: vec![],
+            newest_user_epoch: None,
+            newest_user_is_cola_authored: false,
+        },
+    );
+
+    // The list call hangs: /work said nothing this sweep.
+    hang.store(1, std::sync::atomic::Ordering::SeqCst);
+    let mut seen = std::collections::HashSet::new();
+    flow.sweep(&app.core, &mut seen).await;
+
+    assert!(
+        flow.sent_cards.lock().await.contains_key(surfaces.card_id),
+        "a failed list must not mark the standalone card stale"
+    );
+    assert!(
+        inline_surface_live(app, surfaces.inline_id).await,
+        "a failed list must not drop the inline section"
+    );
+    assert!(
+        app.core.snapshot_claims.lock().await.contains(&claim_id),
+        "a failed list must not drop the snapshot claim"
+    );
+    let first_calls = platform.calls.lock().await.clone();
+    assert!(
+        first_calls.iter().all(|c| !matches!(
+            c,
+            PlatformCall::UpdateMessage { message_id, .. }
+                if message_id == surfaces.card_message_id
+                    || message_id == surfaces.snapshot_message_id
+        )),
+        "a failed list must not re-render any surface: {first_calls:?}"
+    );
+
+    // The next sweep lists /work successfully with the requests gone: every
+    // cleanup fires.
+    flow.sweep(&app.core, &mut seen).await;
+
+    assert!(
+        !flow.sent_cards.lock().await.contains_key(surfaces.card_id),
+        "a successful list must still stale the gone card"
+    );
+    assert!(
+        !inline_surface_live(app, surfaces.inline_id).await,
+        "a successful list must still drop the gone inline section"
+    );
+    assert!(
+        !app.core.snapshot_claims.lock().await.contains(&claim_id),
+        "a successful list must still drop the gone claim"
+    );
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        calls.iter().any(|c| matches!(
+            c,
+            PlatformCall::UpdateMessage { message_id, card }
+                if message_id == surfaces.card_message_id && card.to_string().contains("已处理")
+        )),
+        "the standalone card is marked stale: {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|c| matches!(
+            c,
+            PlatformCall::UpdateMessage { message_id, .. }
+                if message_id == surfaces.snapshot_message_id
+        )),
+        "the snapshot is re-rendered without the block: {calls:?}"
+    );
+}
+
+/// Whether any card's accumulator still carries an inline section for `id`
+/// (either kind) — the #144 rig's surface probe.
+async fn inline_surface_live(app: &Arc<App>, id: &str) -> bool {
+    app.cards.lock().await.values().any(|c| {
+        c.acc.pending_permissions.iter().any(|p| p.request_id == id)
+            || c.acc.pending_questions.iter().any(|q| q.request_id == id)
+    })
+}
+
 // ===== Session discovery & adoption (ADR-0008) =====
 
 /// A helper: a session in the shared store with the given title/dir/id.
