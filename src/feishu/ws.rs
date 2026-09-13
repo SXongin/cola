@@ -1,14 +1,10 @@
 use crate::bridge::EventSink;
 use crate::feishu::Platform;
 use crate::feishu::event::{MessageData, MessageReceiveEvent};
-use crate::feishu::pbbp2::{
-    ParsedFrame, build_ping_frame, build_pong_frame, encode_response_frame, parse_frame,
-};
 #[cfg(test)]
-use crate::feishu::pbbp2::{encode_bytes_field, encode_string_field, encode_varint_field};
+use crate::feishu::pbbp2::Routing;
+use crate::feishu::pbbp2::{self, Frame};
 use futures_util::{SinkExt, StreamExt};
-#[cfg(test)]
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::net::TcpStream;
@@ -100,14 +96,26 @@ impl Default for WsState {
     }
 }
 
+/// The reply headers for an event response: echo the request's headers and
+/// append `biz_rt` (processing time ms), matching the Lark SDK.
+fn reply_headers(request: &Frame) -> Vec<(&str, &str)> {
+    let mut headers: Vec<(&str, &str)> = request
+        .headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    headers.push(("biz_rt", "1"));
+    headers
+}
+
 /// Build a response frame for a received card action. Echoes the request
 /// frame's fields (seq_id, log_id, service, method, headers, payload_*)
 /// and sets the payload to the ack JSON, matching the Lark SDK's Response
 /// format: {"code":200,"headers":null,"data":"<base64>"}.
 fn build_response_frame(
-    request: &ParsedFrame,
+    request: &Frame,
     result: Option<&crate::bridge::handler::CardActionResult>,
-) -> Option<Vec<u8>> {
+) -> Vec<u8> {
     use base64::Engine;
 
     // CardActionTriggerResponse: optionally show a Toast and/or update the card
@@ -128,7 +136,7 @@ fn build_response_frame(
     let data_b64 = base64::engine::general_purpose::STANDARD.encode(rsp_json.as_bytes());
     let payload = format!(r#"{{"code":200,"headers":null,"data":"{}"}}"#, data_b64);
 
-    Some(encode_response_frame(request, &payload))
+    pbbp2::encode(&request.routing, &reply_headers(request), payload.as_bytes())
 }
 
 /// Build the ack frame Feishu requires for EVERY ordinary event (message
@@ -136,11 +144,12 @@ fn build_response_frame(
 /// `MessageTypeEvent`; without it Feishu re-delivers the event forever and
 /// eventually stops pushing new ones. Same routing echo as the card response,
 /// but the payload data is null (no card to update).
-fn build_event_ack_frame(request: &ParsedFrame) -> Option<Vec<u8>> {
-    Some(encode_response_frame(
-        request,
-        r#"{"code":200,"headers":null,"data":null}"#,
-    ))
+fn build_event_ack_frame(request: &Frame) -> Vec<u8> {
+    pbbp2::encode(
+        &request.routing,
+        &reply_headers(request),
+        br#"{"code":200,"headers":null,"data":null}"#,
+    )
 }
 
 // --- WebSocket event loop ---
@@ -197,7 +206,7 @@ async fn handle_connection(
         tokio::select! {
             _ = ping_ticker.tick() => {
                 if let Err(e) = ws
-                    .send(tokio_tungstenite::tungstenite::Message::Binary(build_ping_frame().into()))
+                    .send(tokio_tungstenite::tungstenite::Message::Binary(pbbp2::ping().into()))
                     .await
                 {
                     tracing::warn!("WS keepalive ping failed: {}", e);
@@ -253,11 +262,11 @@ async fn handle_connection(
 /// long-connection protocol is at-least-once: an unacked event is re-delivered
 /// forever, and a client that never acks is eventually treated as dead. Same
 /// routing echo as the card response, but the payload data is null.
-async fn send_event_ack(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>, frame: &ParsedFrame) {
-    if let Some(ack_bytes) = build_event_ack_frame(frame)
-        && let Err(e) = ws
-            .send(tokio_tungstenite::tungstenite::Message::Binary(ack_bytes.into()))
-            .await
+async fn send_event_ack(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>, frame: &Frame) {
+    let ack_bytes = build_event_ack_frame(frame);
+    if let Err(e) = ws
+        .send(tokio_tungstenite::tungstenite::Message::Binary(ack_bytes.into()))
+        .await
     {
         tracing::warn!("WS event ack send failed: {}", e);
     }
@@ -396,7 +405,7 @@ pub enum FrameAction {
 ///
 /// `seen` is the (bounded) dedupe set; `bot_open_id` lets the message parse
 /// strip the bot's own @mention placeholder.
-fn process_frame(frame: &ParsedFrame, seen: &mut DedupeSet) -> FrameAction {
+fn process_frame(frame: &Frame, seen: &mut DedupeSet) -> FrameAction {
     let msg_type = frame.headers.get("type").map(|s| s.as_str()).unwrap_or("unknown");
     match msg_type {
         "ping" => FrameAction::Pong,
@@ -468,7 +477,7 @@ async fn handle_binary_frame(
     feishu: &Arc<dyn Platform>,
     state: &Arc<WsState>,
 ) -> crate::error::Result<()> {
-    let frame = match parse_frame(data) {
+    let frame = match Frame::decode(data) {
         Some(v) => v,
         None => {
             tracing::warn!("Failed to parse WS binary frame (len={})", data.len());
@@ -486,10 +495,10 @@ async fn handle_binary_frame(
             tracing::debug!("WS ping (heartbeat)");
             // Answer the server's keepalive ping so it doesn't consider the
             // connection dead. The Lark SDK sends a pong for every ping.
-            if let Some(pong_bytes) = build_pong_frame(&frame)
-                && let Err(e) = ws
-                    .send(tokio_tungstenite::tungstenite::Message::Binary(pong_bytes.into()))
-                    .await
+            let pong_bytes = pbbp2::pong(&frame);
+            if let Err(e) = ws
+                .send(tokio_tungstenite::tungstenite::Message::Binary(pong_bytes.into()))
+                .await
             {
                 tracing::warn!("WS pong send failed: {}", e);
             }
@@ -577,16 +586,14 @@ async fn handle_binary_frame(
             // otherwise Feishu re-delivers it forever (pitfall 8).
             tracing::debug!("card action value: {:?}", value.to_string());
             let result = sink.handle_card_action(value).await;
-            let resp = build_response_frame(&frame, result.as_ref());
-            if let Some(resp_bytes) = resp {
-                if let Err(e) = ws
-                    .send(tokio_tungstenite::tungstenite::Message::Binary(resp_bytes.into()))
-                    .await
-                {
-                    tracing::warn!("WS response send failed: {}", e);
-                } else {
-                    tracing::info!("Sent card action ack");
-                }
+            let resp_bytes = build_response_frame(&frame, result.as_ref());
+            if let Err(e) = ws
+                .send(tokio_tungstenite::tungstenite::Message::Binary(resp_bytes.into()))
+                .await
+            {
+                tracing::warn!("WS response send failed: {}", e);
+            } else {
+                tracing::info!("Sent card action ack");
             }
         }
         FrameAction::None => {
@@ -1020,29 +1027,29 @@ mod tests {
     /// can match the ack to the original card action.
     #[test]
     fn response_frame_echoes_request_fields() {
-        let mut bytes = Vec::new();
-        encode_varint_field(&mut bytes, 1, 99);
-        encode_varint_field(&mut bytes, 2, 5);
-        encode_varint_field(&mut bytes, 3, 12);
-        encode_varint_field(&mut bytes, 4, 2);
-        let mut hdr = Vec::new();
-        encode_string_field(&mut hdr, 1, "type");
-        encode_string_field(&mut hdr, 2, "card");
-        encode_bytes_field(&mut bytes, 5, &hdr);
-        encode_string_field(&mut bytes, 6, "json");
-        encode_string_field(&mut bytes, 7, "event");
-        encode_bytes_field(&mut bytes, 8, b"{}");
-        encode_string_field(&mut bytes, 9, "log-new-9");
+        let bytes = pbbp2::encode(
+            &Routing {
+                seq_id: 99,
+                log_id: 5,
+                service: 12,
+                method: 2,
+                payload_encoding: Some("json".to_string()),
+                payload_type: Some("event".to_string()),
+                log_id_new: Some("log-new-9".to_string()),
+            },
+            &[("type", "card")],
+            b"{}",
+        );
 
-        let request = parse_frame(&bytes).unwrap();
-        let resp = build_response_frame(&request, None).expect("response builds");
+        let request = Frame::decode(&bytes).unwrap();
+        let resp = build_response_frame(&request, None);
 
-        let parsed = parse_frame(&resp).expect("response parses");
-        assert_eq!(parsed.seq_id, 99);
-        assert_eq!(parsed.log_id, 5);
-        assert_eq!(parsed.service, 12);
-        assert_eq!(parsed.method, 2);
-        assert_eq!(parsed.log_id_new.as_deref(), Some("log-new-9"));
+        let parsed = Frame::decode(&resp).expect("response parses");
+        assert_eq!(parsed.routing.seq_id, 99);
+        assert_eq!(parsed.routing.log_id, 5);
+        assert_eq!(parsed.routing.service, 12);
+        assert_eq!(parsed.routing.method, 2);
+        assert_eq!(parsed.routing.log_id_new.as_deref(), Some("log-new-9"));
         // payload is a JSON string {"code":200,"headers":null,"data":"<b64>"}
         let payload_str = String::from_utf8_lossy(&parsed.payload);
         let v: serde_json::Value = serde_json::from_str(&payload_str).unwrap();
@@ -1058,17 +1065,18 @@ mod tests {
     fn card_response_includes_toast_and_2_0_card() {
         use base64::Engine;
 
-        let mut bytes = Vec::new();
-        encode_varint_field(&mut bytes, 1, 1);
-        encode_varint_field(&mut bytes, 3, 12);
-        encode_varint_field(&mut bytes, 4, 2);
-        let mut hdr = Vec::new();
-        encode_string_field(&mut hdr, 1, "type");
-        encode_string_field(&mut hdr, 2, "card");
-        encode_bytes_field(&mut bytes, 5, &hdr);
-        encode_bytes_field(&mut bytes, 8, b"{}");
+        let bytes = pbbp2::encode(
+            &Routing {
+                seq_id: 1,
+                service: 12,
+                method: 2,
+                ..Routing::default()
+            },
+            &[("type", "card")],
+            b"{}",
+        );
 
-        let request = parse_frame(&bytes).unwrap();
+        let request = Frame::decode(&bytes).unwrap();
         let result = crate::bridge::handler::CardActionResult {
             card: Some(serde_json::json!({
                 "schema": "2.0",
@@ -1077,9 +1085,9 @@ mod tests {
             })),
             toast: Some("已允许本次执行".to_string()),
         };
-        let resp = build_response_frame(&request, Some(&result)).expect("response builds");
+        let resp = build_response_frame(&request, Some(&result));
 
-        let parsed = parse_frame(&resp).expect("response parses");
+        let parsed = Frame::decode(&resp).expect("response parses");
         let payload_str = String::from_utf8_lossy(&parsed.payload);
         let v: serde_json::Value = serde_json::from_str(&payload_str).unwrap();
         let data_b64 = v["data"].as_str().unwrap();
@@ -1105,27 +1113,24 @@ mod tests {
     /// re-delivers events it never sees an ack for, then stops pushing.
     #[test]
     fn event_ack_frame_has_code_200_and_null_data() {
-        let mut bytes = Vec::new();
-        encode_varint_field(&mut bytes, 1, 7);
-        encode_varint_field(&mut bytes, 2, 3);
-        encode_varint_field(&mut bytes, 3, 12);
-        encode_varint_field(&mut bytes, 4, 1);
-        let mut hdr = Vec::new();
-        encode_string_field(&mut hdr, 1, "type");
-        encode_string_field(&mut hdr, 2, "event");
-        encode_bytes_field(&mut bytes, 5, &hdr);
-        encode_bytes_field(
-            &mut bytes,
-            8,
+        let bytes = pbbp2::encode(
+            &Routing {
+                seq_id: 7,
+                log_id: 3,
+                service: 12,
+                method: 1,
+                ..Routing::default()
+            },
+            &[("type", "event")],
             br#"{"header":{"event_type":"im.message.receive_v1"}}"#,
         );
 
-        let request = parse_frame(&bytes).unwrap();
-        let ack = build_event_ack_frame(&request).expect("ack builds");
+        let request = Frame::decode(&bytes).unwrap();
+        let ack = build_event_ack_frame(&request);
 
-        let parsed = parse_frame(&ack).expect("ack parses");
-        assert_eq!(parsed.seq_id, 7);
-        assert_eq!(parsed.service, 12);
+        let parsed = Frame::decode(&ack).expect("ack parses");
+        assert_eq!(parsed.routing.seq_id, 7);
+        assert_eq!(parsed.routing.service, 12);
         // payload must be {"code":200,"headers":null,"data":null}
         let payload_str = String::from_utf8_lossy(&parsed.payload);
         let v: serde_json::Value = serde_json::from_str(&payload_str).unwrap();
@@ -1265,17 +1270,25 @@ mod tests {
 
 /// Build a frame whose payload is the given JSON, typed "event".
 #[cfg(test)]
-fn event_frame(payload: &[u8]) -> ParsedFrame {
-    let mut bytes = Vec::new();
-    encode_varint_field(&mut bytes, 1, 1);
-    encode_varint_field(&mut bytes, 3, 1);
-    encode_varint_field(&mut bytes, 4, 1);
-    let mut hdr = Vec::new();
-    encode_string_field(&mut hdr, 1, "type");
-    encode_string_field(&mut hdr, 2, "event");
-    encode_bytes_field(&mut bytes, 5, &hdr);
-    encode_bytes_field(&mut bytes, 8, payload);
-    parse_frame(&bytes).expect("frame parses")
+fn event_frame(payload: &[u8]) -> Frame {
+    let bytes = pbbp2::encode(
+        &Routing {
+            seq_id: 1,
+            service: 1,
+            method: 1,
+            ..Routing::default()
+        },
+        &[("type", "event")],
+        payload,
+    );
+    Frame::decode(&bytes).expect("frame parses")
+}
+
+/// Build a header-only frame of the given `type` (control / unknown frames).
+#[cfg(test)]
+fn header_frame(kind: &str) -> Frame {
+    let bytes = pbbp2::encode(&Routing::default(), &[("type", kind)], b"");
+    Frame::decode(&bytes).expect("frame parses")
 }
 
 #[cfg(test)]
@@ -1290,34 +1303,14 @@ fn receive_payload(event_id: &str, create_time_ms: i64) -> Vec<u8> {
 #[test]
 fn process_frame_routes_ping_and_unknown() {
     // ping → Pong.
-    let frame = ParsedFrame {
-        seq_id: 1,
-        log_id: 0,
-        service: 1,
-        method: 1,
-        headers: HashMap::from([("type".to_string(), "ping".to_string())]),
-        payload_encoding: None,
-        payload_type: None,
-        payload: Vec::new(),
-        log_id_new: None,
-    };
+    let frame = header_frame("ping");
     assert!(matches!(
         process_frame(&frame, &mut DedupeSet::new(10)),
         FrameAction::Pong
     ));
 
     // Unknown type → None (no ack, no dispatch).
-    let frame = ParsedFrame {
-        seq_id: 1,
-        log_id: 0,
-        service: 1,
-        method: 1,
-        headers: HashMap::from([("type".to_string(), "card".to_string())]),
-        payload_encoding: None,
-        payload_type: None,
-        payload: Vec::new(),
-        log_id_new: None,
-    };
+    let frame = header_frame("card");
     assert!(matches!(
         process_frame(&frame, &mut DedupeSet::new(10)),
         FrameAction::None
