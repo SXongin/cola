@@ -32,11 +32,12 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Validate semver tag (bash)
         if: runner.os != 'Windows'
         run: |
@@ -69,13 +70,13 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/cola.exe" "dist/cola-${env:GITHUB_REF_NAME}-${{ matrix.target }}.exe"
           Compress-Archive -Path "dist/cola-${env:GITHUB_REF_NAME}-${{ matrix.target }}.exe" -DestinationPath "dist/cola-${env:GITHUB_REF_NAME}-${{ matrix.target }}.zip" -Force
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cola-${{ matrix.target }}
           path: dist/
           if-no-files-found: error
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             dist/*.tar.gz
@@ -85,9 +86,11 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --workspace --locked
 
   publish:
@@ -96,9 +99,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      attestations: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           merge-multiple: true
@@ -120,14 +124,32 @@ jobs:
           cd dist
           sha256sum *.tar.gz *.zip > SHA256SUMS
           cat SHA256SUMS
+      - name: Collect provenance bundles
+        # The published release assets are cola's self-update channel; attach
+        # the already-generated attestation bundles as *.intoto.jsonl so they
+        # are verifiable offline (and visible to Scorecard's Signed-Releases
+        # check, which ignores the GitHub attestation store).
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd dist
+          mkdir -p provenance
+          for artifact in *.tar.gz *.zip; do
+            gh attestation download "$artifact" --repo "$GITHUB_REPOSITORY"
+            for bundle in sha256*; do
+              mv "$bundle" "provenance/$artifact.intoto.jsonl"
+            done
+          done
       - name: Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           generate_release_notes: true
           files: |
             dist/*.tar.gz
             dist/*.zip
             dist/SHA256SUMS
+            dist/provenance/*.intoto.jsonl
 
   # Deliberately runs AFTER the GitHub Release (ADR-0030): the release assets
   # are the self-update channel and must appear atomically, while a crates.io
@@ -142,11 +164,13 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
       - name: Authenticate with crates.io
         id: auth
-        uses: rust-lang/crates-io-auth-action@v1
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
       - name: Publish to crates.io
         run: cargo publish --locked
         env:
