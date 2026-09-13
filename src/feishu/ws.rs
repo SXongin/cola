@@ -1131,6 +1131,28 @@ mod transport_tests {
         ))
     }
 
+    /// The two fake servers wired into one another, plus the client and WS
+    /// state the transport tests drive. `_http` must outlive the test: dropping
+    /// it aborts its accept task, and the dial-in fetches its token first.
+    struct TestRig {
+        _http: TestHttpServer,
+        ws: TestWsServer,
+        feishu: Arc<dyn Platform>,
+        state: Arc<WsState>,
+    }
+
+    async fn rig() -> TestRig {
+        let http = TestHttpServer::start().await;
+        let ws = TestWsServer::start().await;
+        http.route("POST", "/callback/ws/endpoint", 200, ws_endpoint_route(&ws.url()));
+        TestRig {
+            feishu: test_client(http.base_url()),
+            state: Arc::new(WsState::new()),
+            _http: http,
+            ws,
+        }
+    }
+
     /// Encode a "type: event" frame holding `payload`, the way Feishu sends one.
     fn event_bytes(payload: &[u8]) -> Vec<u8> {
         pbbp2::encode(
@@ -1178,28 +1200,18 @@ mod transport_tests {
 
     #[tokio::test]
     async fn transport_answers_heartbeats_acks_and_dispatches() {
-        let http = TestHttpServer::start().await;
-        let ws_server = TestWsServer::start().await;
-        http.route(
-            "POST",
-            "/callback/ws/endpoint",
-            200,
-            ws_endpoint_route(&ws_server.url()),
-        );
-
+        let rig = rig().await;
         let recorder = Arc::new(RecordingSink::default());
         let sink: Arc<dyn EventSink> = recorder.clone();
-        let state = Arc::new(WsState::new());
-        let feishu = test_client(http.base_url());
 
         let listener = tokio::spawn({
             let sink = Arc::clone(&sink);
-            let feishu = Arc::clone(&feishu);
-            let state = Arc::clone(&state);
+            let feishu = Arc::clone(&rig.feishu);
+            let state = Arc::clone(&rig.state);
             async move { connect_and_listen(&sink, &feishu, &state).await }
         });
 
-        let mut socket = ws_server.accept().await;
+        let mut socket = rig.ws.accept().await;
 
         // The server's protocol heartbeat ping must be answered with a pong.
         socket.send_binary(pbbp2::ping()).await;
@@ -1238,6 +1250,12 @@ mod transport_tests {
             Frame::decode(&socket.next_binary(Duration::from_secs(5)).await).expect("card response decodes");
         let resp_json: serde_json::Value = serde_json::from_slice(&resp.payload).unwrap();
         assert_eq!(resp_json["code"], 200);
+        assert_eq!(
+            resp.routing.seq_id, 42,
+            "the card response must echo the request routing"
+        );
+        assert_eq!(resp.routing.service, 1);
+        assert_eq!(resp.routing.method, 1);
         let data = base64::engine::general_purpose::STANDARD
             .decode(resp_json["data"].as_str().expect("data is base64"))
             .expect("data decodes");
@@ -1257,38 +1275,42 @@ mod transport_tests {
 
     #[tokio::test]
     async fn event_loop_reconnects_after_the_server_drops_the_connection() {
-        let http = TestHttpServer::start().await;
-        let ws_server = TestWsServer::start().await;
-        http.route(
-            "POST",
-            "/callback/ws/endpoint",
-            200,
-            ws_endpoint_route(&ws_server.url()),
-        );
-
-        let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::default());
-        let state = Arc::new(WsState::new());
-        let feishu = test_client(http.base_url());
+        let rig = rig().await;
+        let recorder = Arc::new(RecordingSink::default());
+        let sink: Arc<dyn EventSink> = recorder.clone();
 
         let reconnect = tokio::spawn({
             let sink = Arc::clone(&sink);
-            let feishu = Arc::clone(&feishu);
-            let state = Arc::clone(&state);
+            let feishu = Arc::clone(&rig.feishu);
+            let state = Arc::clone(&rig.state);
             async move { event_loop(&sink, &feishu, &state).await }
         });
 
         // First connection: drop it like a server restart would.
-        let mut first = ws_server.accept().await;
+        let mut first = rig.ws.accept().await;
         first.close().await;
 
         // event_loop must dial again (backoff ~1s) and the new socket must be
-        // fully functional.
-        let mut second = tokio::time::timeout(Duration::from_secs(10), ws_server.accept())
+        // fully operational, not merely connected.
+        let mut second = tokio::time::timeout(Duration::from_secs(10), rig.ws.accept())
             .await
             .expect("event_loop did not reconnect");
         second.send_binary(pbbp2::ping()).await;
         let pong = Frame::decode(&second.next_binary(Duration::from_secs(5)).await).expect("pong decodes");
         assert_eq!(pong.headers.get("type").map(String::as_str), Some("pong"));
+
+        // An event on the reconnected socket is acked and dispatched too.
+        second
+            .send_binary(event_bytes(&receive_payload(
+                "e_reconnect",
+                chrono::Utc::now().timestamp_millis(),
+            )))
+            .await;
+        let ack = Frame::decode(&second.next_binary(Duration::from_secs(5)).await).expect("ack decodes");
+        let ack_json: serde_json::Value = serde_json::from_slice(&ack.payload).unwrap();
+        assert_eq!(ack_json["code"], 200);
+        wait_for_texts(&recorder, 1).await;
+        assert_eq!(recorder.texts.lock().await[0], "hi");
 
         reconnect.abort();
     }
