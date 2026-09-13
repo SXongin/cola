@@ -1,6 +1,12 @@
 # cola
 
 [![CI](https://github.com/SXongin/cola/actions/workflows/ci.yml/badge.svg)](https://github.com/SXongin/cola/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/SXongin/cola/actions/workflows/codeql.yml/badge.svg)](https://github.com/SXongin/cola/actions/workflows/codeql.yml)
+[![Codecov](https://codecov.io/gh/SXongin/cola/graph/badge.svg?branch=main)](https://codecov.io/gh/SXongin/cola)
+[![crates.io](https://img.shields.io/crates/v/colark.svg)](https://crates.io/crates/colark)
+[![Downloads](https://img.shields.io/crates/d/colark.svg)](https://crates.io/crates/colark)
+[![Release](https://img.shields.io/github/v/release/SXongin/cola.svg)](https://github.com/SXongin/cola/releases/latest)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A bridge bot that brings the [OpenCode](https://opencode.ai) AI coding experience
 into [Feishu](https://www.feishu.cn). You chat with the bot in Feishu; cola maps

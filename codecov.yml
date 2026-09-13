@@ -1,0 +1,25 @@
+# Codecov configuration — https://docs.codecov.com/docs/codecovyml-reference
+#
+# The `coverage` job in .github/workflows/ci.yml uploads the lcov report that
+# these settings apply to.
+coverage:
+  status:
+    project:
+      default:
+        # Stay within 1% of main's coverage; the PR comment shows the delta.
+        target: auto
+        threshold: 1%
+    patch:
+      default:
+        # New/changed lines should be about as covered as the project.
+        target: auto
+        threshold: 1%
+
+comment:
+  layout: "reach, diff, flags, files"
+  # Only comment when the PR actually moves coverage.
+  require_changes: true
+
+# Build tooling, not shipped code.
+ignore:
+  - "xtask/**"
