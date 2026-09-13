@@ -9,6 +9,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   fmt:
     name: Format
@@ -22,10 +25,9 @@ jobs:
       - run: cargo fmt --all -- --check
 
   check:
-    # Full gates (clippy + test + release build) on the primary platform; they
-    # share one cargo cache so dependencies compile once instead of once per
-    # gate. A separate clippy/test/build job per OS serialized the gates on the
-    # critical path and made warm runs slower.
+    # Clippy + release build on the primary platform; they share one cargo
+    # cache so dependencies compile once instead of once per gate. The tests
+    # run instrumented in the coverage job, so they are not repeated here.
     name: Check
     runs-on: ubuntu-latest
     steps:
@@ -36,10 +38,35 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Test
-        run: cargo test --workspace --locked
       - name: Build (release)
         run: cargo build --release --locked
+
+  coverage:
+    # Primary-platform test gate and coverage source: runs the workspace tests
+    # under LLVM instrumentation, then uploads lcov to Codecov, which posts the
+    # per-PR coverage comment and the project/patch status checks.
+    #
+    # One-time setup: sign in at https://codecov.io with GitHub, add this
+    # repository, install the Codecov GitHub App, and set the upload token as
+    # the CODECOV_TOKEN repository secret. Until then the upload fails softly
+    # (fail_ci_if_error: false) and CI stays green.
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Test (instrumented, lcov)
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
 
   test:
     # Compile + test only on the other platforms: catches platform quirks
