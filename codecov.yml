@@ -23,3 +23,8 @@ comment:
 # Build tooling, not shipped code.
 ignore:
   - "xtask/**"
+  # Test support files (`src/bridge/tests/**` is already excluded by
+  # cargo-llvm-cov's `tests/` default). In-file `#[cfg(test)]` modules still
+  # count; excluding those needs nightly `#[coverage(off)]`.
+  - "src/test_*.rs"
+  - "src/bridge/test_support.rs"
