@@ -15,7 +15,7 @@ use crate::bridge::core::SharedCore;
 use crate::bridge::display::{dir_basename, id_tail, model_display};
 use crate::config::{SessionEntry, ThreadKey};
 use crate::error::BridgeError;
-use crate::opencode::SessionListInfo;
+use crate::opencode::types::SessionListInfo;
 
 /// What kind of topic to open: one around a brand-new session (`/topic`, the
 /// `/dir` card's 建话题 op) or one around an EXISTING server session

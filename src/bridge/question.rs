@@ -8,7 +8,7 @@ use crate::opencode;
 /// be mutated in lockstep — a missed map used to be a silent bug.
 pub struct QuestionState {
     /// The full request, kept so its card can be rebuilt with partial answers.
-    request: opencode::client::QuestionRequest,
+    request: opencode::types::QuestionRequest,
     /// Owning directory, recorded where the poll loop knows it. The question
     /// card's `name` no longer carries the directory (Feishu caps `name` at
     /// 100 chars), so a value-less form-submit callback re-resolves it here
@@ -26,7 +26,7 @@ pub struct QuestionState {
 }
 
 impl QuestionState {
-    pub(crate) fn new(request: opencode::client::QuestionRequest, dir: String) -> Self {
+    pub(crate) fn new(request: opencode::types::QuestionRequest, dir: String) -> Self {
         let slots = vec![None; request.questions.len()];
         Self {
             request,
@@ -39,7 +39,7 @@ impl QuestionState {
     /// Update the remembered request/dir in place, keeping recorded answers and
     /// toggles: a re-armed follow or a re-claim must not wipe what the user
     /// already selected.
-    pub(crate) fn refresh(&mut self, request: &opencode::client::QuestionRequest, dir: &str) {
+    pub(crate) fn refresh(&mut self, request: &opencode::types::QuestionRequest, dir: &str) {
         self.request = request.clone();
         self.dir = dir.to_string();
         self.answers.resize(request.questions.len(), None);
@@ -47,7 +47,7 @@ impl QuestionState {
     }
 
     /// The full request, for rebuilding its card with partial answers.
-    pub(crate) fn request(&self) -> &opencode::client::QuestionRequest {
+    pub(crate) fn request(&self) -> &opencode::types::QuestionRequest {
         &self.request
     }
 
@@ -220,7 +220,7 @@ pub(crate) fn stale_question_card(inline: bool) -> CardActionResult {
 /// mislabeled "AI 的问题是：<answer>"). Empty answer slots (skipped via
 /// submit/skip) render as 未作答.
 pub(crate) fn qa_completion_body(
-    questions: &[crate::opencode::client::QuestionInfo],
+    questions: &[crate::opencode::types::QuestionInfo],
     answers: &[Vec<String>],
 ) -> String {
     let mut lines: Vec<String> = Vec::new();
@@ -249,7 +249,7 @@ mod tests {
         let questions = multi
             .iter()
             .enumerate()
-            .map(|(i, m)| crate::opencode::client::QuestionInfo {
+            .map(|(i, m)| crate::opencode::types::QuestionInfo {
                 question: format!("q{i}"),
                 header: String::new(),
                 options: vec![],
@@ -258,7 +258,7 @@ mod tests {
             })
             .collect();
         QuestionState::new(
-            crate::opencode::client::QuestionRequest {
+            crate::opencode::types::QuestionRequest {
                 id: "q1".into(),
                 session_id: "ses_1".into(),
                 questions,

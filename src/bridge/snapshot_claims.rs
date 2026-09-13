@@ -296,7 +296,7 @@ mod tests {
     use crate::opencode;
 
     fn perm(request_id: &str) -> PendingRequest {
-        PendingRequest::Permission(opencode::client::PermissionRequest {
+        PendingRequest::Permission(opencode::types::PermissionRequest {
             request_id: request_id.into(),
             session_id: Some("ses_1".into()),
             permission: Some("bash".into()),

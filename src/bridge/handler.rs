@@ -27,11 +27,11 @@ const GROUP_LOBBY_GUIDANCE: &str = "\
 /// are not persisted on the accumulator) and sends text alone.
 pub(crate) fn image_inputs(
     images: &[crate::feishu::client::ImageAttachment],
-) -> Vec<opencode::client::ImageInput> {
+) -> Vec<opencode::types::ImageInput> {
     use base64::Engine;
     images
         .iter()
-        .map(|img| opencode::client::ImageInput {
+        .map(|img| opencode::types::ImageInput {
             mime: img.mime.clone(),
             data_base64: base64::engine::general_purpose::STANDARD.encode(&img.data),
         })
@@ -446,7 +446,7 @@ impl App {
                 let image_inputs = image_inputs(&images);
                 // Each supplement is its own logical user message: fresh
                 // cola-authored id (ADR-0026), never reused.
-                let cola_msg_id = crate::opencode::client::cola_message_id();
+                let cola_msg_id = crate::opencode::parsing::cola_message_id();
                 match self
                     .opencode
                     .prompt_async(
@@ -820,7 +820,7 @@ impl App {
         &self,
         core: &Arc<SharedCore>,
         thread_key: &ThreadKey,
-        target: &crate::opencode::SessionListInfo,
+        target: &crate::opencode::types::SessionListInfo,
         open_message_id: Option<String>,
     ) -> CardActionResult {
         let mapped_to_this_thread = {
@@ -891,7 +891,7 @@ impl App {
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
         thread_key: &ThreadKey,
-        target: &crate::opencode::SessionListInfo,
+        target: &crate::opencode::types::SessionListInfo,
         open_message_id: &str,
         keyword: &str,
         scope: crate::bridge::command::SwitchScope,
@@ -1135,7 +1135,7 @@ impl App {
             let cards = if picked == crate::feishu::card::PICKER_BACK_TO_PROVIDERS {
                 crate::feishu::card::build_model_provider_cards(&thread_key, &providers)
             } else {
-                let models: Vec<crate::opencode::client::ModelOption> = providers
+                let models: Vec<crate::opencode::types::ModelOption> = providers
                     .iter()
                     .find(|p| p.provider == picked)
                     .map(|p| p.models.clone())
@@ -1146,7 +1146,7 @@ impl App {
         }
 
         // Level 2: a concrete model — record the override.
-        if crate::opencode::client::parse_model(&picked).is_none() {
+        if crate::opencode::parsing::parse_model(&picked).is_none() {
             return Some(CardActionResult {
                 card: None,
                 toast: Some("模型格式应为 <provider>/<model>".to_string()),

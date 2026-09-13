@@ -22,7 +22,7 @@ pub(crate) fn dir_basename(dir: &str) -> String {
 
 /// A session's display title, falling back to the id-tail when the title is a
 /// meaningless default (`New session - ...`, `sess-<uuid>`, etc.).
-pub(crate) fn title_or_id_tail(s: &crate::opencode::SessionListInfo) -> String {
+pub(crate) fn title_or_id_tail(s: &crate::opencode::types::SessionListInfo) -> String {
     let cleaned = crate::feishu::card::clean_session_label(&s.title);
     if cleaned.is_empty() {
         id_tail(&s.id)

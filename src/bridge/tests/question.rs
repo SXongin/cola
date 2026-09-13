@@ -1,14 +1,14 @@
 use crate::bridge::test_support::*;
 
 /// A minimal one-question request for the state-lifecycle tests (#130).
-fn question_request(id: &str) -> opencode::client::QuestionRequest {
-    opencode::client::QuestionRequest {
+fn question_request(id: &str) -> opencode::types::QuestionRequest {
+    opencode::types::QuestionRequest {
         id: id.into(),
         session_id: "ses_1".into(),
-        questions: vec![opencode::client::QuestionInfo {
+        questions: vec![opencode::types::QuestionInfo {
             question: "选择目录".into(),
             header: "目录".into(),
-            options: vec![opencode::client::QuestionOption {
+            options: vec![opencode::types::QuestionOption {
                 label: "/a".into(),
                 description: String::new(),
             }],
@@ -46,13 +46,13 @@ async fn question_poller_recovers_when_a_list_call_hangs() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.questions = vec![opencode::client::QuestionRequest {
+    backend.questions = vec![opencode::types::QuestionRequest {
         id: "que_hung".into(),
         session_id: "ses_test".into(),
-        questions: vec![opencode::client::QuestionInfo {
+        questions: vec![opencode::types::QuestionInfo {
             question: "继续吗？".into(),
             header: "下一步".into(),
-            options: vec![opencode::client::QuestionOption {
+            options: vec![opencode::types::QuestionOption {
                 label: "继续".into(),
                 description: String::new(),
             }],
@@ -125,18 +125,18 @@ async fn question_card_action_posts_answer_back() {
     // The poll loop has surfaced a pending question request.
     app.question
         .remember_question(
-            &opencode::client::QuestionRequest {
+            &opencode::types::QuestionRequest {
                 id: "que_1".into(),
                 session_id: "ses_1".into(),
-                questions: vec![opencode::client::QuestionInfo {
+                questions: vec![opencode::types::QuestionInfo {
                     question: "选择目录".into(),
                     header: "目录".into(),
                     options: vec![
-                        opencode::client::QuestionOption {
+                        opencode::types::QuestionOption {
                             label: "/a".into(),
                             description: String::new(),
                         },
-                        opencode::client::QuestionOption {
+                        opencode::types::QuestionOption {
                             label: "/b".into(),
                             description: String::new(),
                         },
@@ -203,19 +203,19 @@ async fn completing_last_question_replaces_card_with_full_qa_summary() {
 
     app.question
         .remember_question(
-            &opencode::client::QuestionRequest {
+            &opencode::types::QuestionRequest {
                 id: "que_1".into(),
                 session_id: "ses_1".into(),
                 questions: vec![
-                    opencode::client::QuestionInfo {
+                    opencode::types::QuestionInfo {
                         question: "问题甲".into(),
                         header: String::new(),
                         options: vec![
-                            opencode::client::QuestionOption {
+                            opencode::types::QuestionOption {
                                 label: "/a1".into(),
                                 description: String::new(),
                             },
-                            opencode::client::QuestionOption {
+                            opencode::types::QuestionOption {
                                 label: "/a2".into(),
                                 description: String::new(),
                             },
@@ -223,15 +223,15 @@ async fn completing_last_question_replaces_card_with_full_qa_summary() {
                         multiple: None,
                         custom: None,
                     },
-                    opencode::client::QuestionInfo {
+                    opencode::types::QuestionInfo {
                         question: "问题乙".into(),
                         header: String::new(),
                         options: vec![
-                            opencode::client::QuestionOption {
+                            opencode::types::QuestionOption {
                                 label: "/b1".into(),
                                 description: String::new(),
                             },
-                            opencode::client::QuestionOption {
+                            opencode::types::QuestionOption {
                                 label: "/b2".into(),
                                 description: String::new(),
                             },
@@ -357,13 +357,13 @@ async fn double_click_on_same_request_replies_once() {
     // A pending single-question request (the same one the card was built for).
     app.question
         .remember_question(
-            &opencode::client::QuestionRequest {
+            &opencode::types::QuestionRequest {
                 id: "que_1".into(),
                 session_id: "ses_1".into(),
-                questions: vec![opencode::client::QuestionInfo {
+                questions: vec![opencode::types::QuestionInfo {
                     question: "选择目录".into(),
                     header: "目录".into(),
-                    options: vec![opencode::client::QuestionOption {
+                    options: vec![opencode::types::QuestionOption {
                         label: "/a".into(),
                         description: String::new(),
                     }],
@@ -419,13 +419,13 @@ async fn question_reply_404_renders_neutral_already_handled() {
 
     app.question
         .remember_question(
-            &opencode::client::QuestionRequest {
+            &opencode::types::QuestionRequest {
                 id: "que_1".into(),
                 session_id: "ses_1".into(),
-                questions: vec![opencode::client::QuestionInfo {
+                questions: vec![opencode::types::QuestionInfo {
                     question: "选择目录".into(),
                     header: "目录".into(),
-                    options: vec![opencode::client::QuestionOption {
+                    options: vec![opencode::types::QuestionOption {
                         label: "/a".into(),
                         description: String::new(),
                     }],
@@ -467,20 +467,20 @@ async fn question_with_multiple_parts_waits_for_all_answers() {
 
     let mk_questions = || {
         vec![
-            opencode::client::QuestionInfo {
+            opencode::types::QuestionInfo {
                 question: "选择目录".into(),
                 header: "目录".into(),
-                options: vec![opencode::client::QuestionOption {
+                options: vec![opencode::types::QuestionOption {
                     label: "/a".into(),
                     description: String::new(),
                 }],
                 multiple: None,
                 custom: None,
             },
-            opencode::client::QuestionInfo {
+            opencode::types::QuestionInfo {
                 question: "选择分支".into(),
                 header: "分支".into(),
-                options: vec![opencode::client::QuestionOption {
+                options: vec![opencode::types::QuestionOption {
                     label: "main".into(),
                     description: String::new(),
                 }],
@@ -491,7 +491,7 @@ async fn question_with_multiple_parts_waits_for_all_answers() {
     };
     app.question
         .remember_question(
-            &opencode::client::QuestionRequest {
+            &opencode::types::QuestionRequest {
                 id: "que_2".into(),
                 session_id: "ses_1".into(),
                 questions: mk_questions(),
@@ -553,22 +553,22 @@ async fn multi_select_question_toggles_until_submit() {
 
     app.question
         .remember_question(
-            &opencode::client::QuestionRequest {
+            &opencode::types::QuestionRequest {
                 id: "que_multi".into(),
                 session_id: "ses_1".into(),
-                questions: vec![opencode::client::QuestionInfo {
+                questions: vec![opencode::types::QuestionInfo {
                     question: "选择水果".into(),
                     header: "水果".into(),
                     options: vec![
-                        opencode::client::QuestionOption {
+                        opencode::types::QuestionOption {
                             label: "苹果".into(),
                             description: String::new(),
                         },
-                        opencode::client::QuestionOption {
+                        opencode::types::QuestionOption {
                             label: "香蕉".into(),
                             description: String::new(),
                         },
-                        opencode::client::QuestionOption {
+                        opencode::types::QuestionOption {
                             label: "橙子".into(),
                             description: String::new(),
                         },
@@ -654,13 +654,13 @@ async fn multi_select_can_submit_empty_selection() {
 
     app.question
         .remember_question(
-            &opencode::client::QuestionRequest {
+            &opencode::types::QuestionRequest {
                 id: "que_empty".into(),
                 session_id: "ses_1".into(),
-                questions: vec![opencode::client::QuestionInfo {
+                questions: vec![opencode::types::QuestionInfo {
                     question: "选择水果".into(),
                     header: "水果".into(),
-                    options: vec![opencode::client::QuestionOption {
+                    options: vec![opencode::types::QuestionOption {
                         label: "苹果".into(),
                         description: String::new(),
                     }],
@@ -734,24 +734,24 @@ async fn stale_confirm_on_done_multi_select_is_a_no_op() {
 
     app.question
         .remember_question(
-            &opencode::client::QuestionRequest {
+            &opencode::types::QuestionRequest {
                 id: "que_stale".into(),
                 session_id: "ses_1".into(),
                 questions: vec![
-                    opencode::client::QuestionInfo {
+                    opencode::types::QuestionInfo {
                         question: "选择目录".into(),
                         header: "目录".into(),
-                        options: vec![opencode::client::QuestionOption {
+                        options: vec![opencode::types::QuestionOption {
                             label: "/a".into(),
                             description: String::new(),
                         }],
                         multiple: None,
                         custom: None,
                     },
-                    opencode::client::QuestionInfo {
+                    opencode::types::QuestionInfo {
                         question: "选择水果".into(),
                         header: "水果".into(),
-                        options: vec![opencode::client::QuestionOption {
+                        options: vec![opencode::types::QuestionOption {
                             label: "苹果".into(),
                             description: String::new(),
                         }],
@@ -835,24 +835,24 @@ async fn mixed_single_and_multi_question_waits_for_all_confirmed() {
 
     app.question
         .remember_question(
-            &opencode::client::QuestionRequest {
+            &opencode::types::QuestionRequest {
                 id: "que_mix".into(),
                 session_id: "ses_1".into(),
                 questions: vec![
-                    opencode::client::QuestionInfo {
+                    opencode::types::QuestionInfo {
                         question: "选择目录".into(),
                         header: "目录".into(),
-                        options: vec![opencode::client::QuestionOption {
+                        options: vec![opencode::types::QuestionOption {
                             label: "/a".into(),
                             description: String::new(),
                         }],
                         multiple: None,
                         custom: None,
                     },
-                    opencode::client::QuestionInfo {
+                    opencode::types::QuestionInfo {
                         question: "选择水果".into(),
                         header: "水果".into(),
-                        options: vec![opencode::client::QuestionOption {
+                        options: vec![opencode::types::QuestionOption {
                             label: "苹果".into(),
                             description: String::new(),
                         }],
@@ -946,13 +946,13 @@ async fn multi_select_custom_answer_appends_dedupes_and_removes() {
 
     app.question
         .remember_question(
-            &opencode::client::QuestionRequest {
+            &opencode::types::QuestionRequest {
                 id: "que_custom".into(),
                 session_id: "ses_1".into(),
-                questions: vec![opencode::client::QuestionInfo {
+                questions: vec![opencode::types::QuestionInfo {
                     question: "选择水果".into(),
                     header: "水果".into(),
-                    options: vec![opencode::client::QuestionOption {
+                    options: vec![opencode::types::QuestionOption {
                         label: "苹果".into(),
                         description: String::new(),
                     }],
@@ -1039,24 +1039,24 @@ async fn inline_question_answered_on_streaming_card() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
-    mock.questions = vec![opencode::client::QuestionRequest {
+    mock.questions = vec![opencode::types::QuestionRequest {
         id: "que_inline".into(),
         session_id: "ses_test".into(),
         questions: vec![
-            opencode::client::QuestionInfo {
+            opencode::types::QuestionInfo {
                 question: "选目录".into(),
                 header: "目录".into(),
-                options: vec![opencode::client::QuestionOption {
+                options: vec![opencode::types::QuestionOption {
                     label: "/a".into(),
                     description: String::new(),
                 }],
                 multiple: None,
                 custom: None,
             },
-            opencode::client::QuestionInfo {
+            opencode::types::QuestionInfo {
                 question: "选分支".into(),
                 header: "分支".into(),
-                options: vec![opencode::client::QuestionOption {
+                options: vec![opencode::types::QuestionOption {
                     label: "main".into(),
                     description: String::new(),
                 }],
@@ -1247,18 +1247,18 @@ async fn sweep_keeps_partial_multi_select_toggles() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let multi = opencode::client::QuestionRequest {
+    let multi = opencode::types::QuestionRequest {
         id: "que_multi".into(),
         session_id: "ses_1".into(),
-        questions: vec![opencode::client::QuestionInfo {
+        questions: vec![opencode::types::QuestionInfo {
             question: "选择水果".into(),
             header: "水果".into(),
             options: vec![
-                opencode::client::QuestionOption {
+                opencode::types::QuestionOption {
                     label: "苹果".into(),
                     description: String::new(),
                 },
-                opencode::client::QuestionOption {
+                opencode::types::QuestionOption {
                     label: "香蕉".into(),
                     description: String::new(),
                 },

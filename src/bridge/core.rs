@@ -13,7 +13,7 @@ use crate::opencode;
 #[derive(Clone)]
 pub struct SessionListCache {
     pub fetched_at: std::time::Instant,
-    pub sessions: Vec<opencode::client::SessionListInfo>,
+    pub sessions: Vec<opencode::types::SessionListInfo>,
 }
 
 impl SessionListCache {
@@ -179,13 +179,13 @@ impl SharedCore {
     /// persisted "provider/model" string. `None` when the session has no
     /// override (the client then falls back to the configured default model, or
     /// the server's own default if none is configured).
-    pub async fn session_model_override(&self, session_id: &str) -> Option<opencode::client::ModelInfo> {
+    pub async fn session_model_override(&self, session_id: &str) -> Option<opencode::types::ModelInfo> {
         self.sessions
             .lock()
             .await
             .entry_for_session(session_id)
             .and_then(|e| e.model.as_deref())
-            .and_then(opencode::client::parse_model)
+            .and_then(opencode::parsing::parse_model)
     }
 
     /// The per-session `/think` variant override (from the persisted
@@ -256,7 +256,7 @@ impl SharedCore {
         model_spec: &str,
     ) -> Option<String> {
         if let Some(v) = entry.variant.clone()
-            && let Some(m) = crate::opencode::client::parse_model(model_spec)
+            && let Some(m) = crate::opencode::parsing::parse_model(model_spec)
             && let Some(variants) = self.model_variants(&m.provider_id, &m.id).await
             && !variants.iter().any(|x| x == &v)
         {
@@ -279,7 +279,9 @@ impl SharedCore {
     /// The current `GET /session` snapshot, fetching (and caching for 30 s) when
     /// missing or stale. Used by `/list`, `/switch` and `/attach` so rapid
     /// reuse stays off the wire.
-    pub(crate) async fn cached_session_list(&self) -> crate::error::Result<Vec<opencode::SessionListInfo>> {
+    pub(crate) async fn cached_session_list(
+        &self,
+    ) -> crate::error::Result<Vec<opencode::types::SessionListInfo>> {
         let now = std::time::Instant::now();
         {
             let cache = self.session_list_cache.lock().await;

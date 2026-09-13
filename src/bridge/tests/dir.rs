@@ -137,7 +137,7 @@ async fn dir_card_data_dedupes_sorts_and_filters() {
     let mut child = list_session("ses_child", "子任务", "/work/a", 999);
     child.parent_id = Some("ses_root".into());
     let mut archived = list_session("ses_arch", "归档", "/work/arch", 888);
-    archived.time = Some(opencode::client::SessionTime {
+    archived.time = Some(opencode::types::SessionTime {
         created: 1,
         updated: 888,
         archived: Some(1),

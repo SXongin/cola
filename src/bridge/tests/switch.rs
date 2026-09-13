@@ -63,7 +63,7 @@ async fn list_filters_by_keyword_and_hides_children() {
     backend.session_list = vec![
         list_session("ses_alpha01", "重写登录模块", "/work/auth", 100),
         list_session("ses_beta02", "修 bug", "/work/cola", 300),
-        opencode::client::SessionListInfo {
+        opencode::types::SessionListInfo {
             parent_id: Some("ses_alpha01".into()),
             ..list_session("ses_child09", "Child session - x", "/work/auth", 400)
         },
@@ -543,7 +543,7 @@ async fn switch_reeswitch_snapshots_on_busy_status() {
     let mut backend = MockBackend::new(realistic_parts());
     backend
         .session_statuses
-        .insert("ses_own1".into(), Some(opencode::client::SessionStatus::Busy));
+        .insert("ses_own1".into(), Some(opencode::types::SessionStatus::Busy));
     // Cola-authored newest alone is NOT enough to suppress a busy session.
     backend
         .cola_user_messages
@@ -583,7 +583,7 @@ async fn switch_reeswitch_snapshots_on_pending_permission() {
     backend
         .cola_user_messages
         .insert("ses_own1".into(), "上次的问题".into());
-    backend.permissions = vec![opencode::client::PermissionRequest {
+    backend.permissions = vec![opencode::types::PermissionRequest {
         request_id: "req_own".into(),
         session_id: Some("ses_own1".into()),
         permission: Some("bash".into()),

@@ -17,7 +17,7 @@ pub struct SnapshotData {
     /// The server's run state for the session at activation time. `None` when
     /// the status read failed or returned an unrecognised type — the chip is
     /// omitted rather than guessed (ADR-0028).
-    pub status: Option<opencode::SessionStatus>,
+    pub status: Option<opencode::types::SessionStatus>,
     /// Pending permission/question requests whose `sessionID` is the adopted
     /// session (never another session's in the same directory, and never a
     /// sub-task child's — ADR-0028 keeps those on today's standalone flow).
@@ -97,12 +97,12 @@ pub struct TailEntry {
 /// suppresses — first-time adoption always emits.
 pub fn should_emit_snapshot(
     already_mapped_to_this_thread: bool,
-    status: Option<opencode::SessionStatus>,
+    status: Option<opencode::types::SessionStatus>,
     has_pending: bool,
     newest_user_is_cola_authored: bool,
 ) -> bool {
     let suppressed = already_mapped_to_this_thread
-        && status == Some(opencode::SessionStatus::Idle)
+        && status == Some(opencode::types::SessionStatus::Idle)
         && !has_pending
         && newest_user_is_cola_authored;
     !suppressed
@@ -162,7 +162,7 @@ pub(crate) async fn gather_snapshot(
     };
     let newest_user_epoch = newest_user_message(&messages).map(|(created, _)| created);
     let newest_user_is_cola_authored = newest_user_message(&messages)
-        .map(|(_, id)| opencode::client::is_cola_message_id(id))
+        .map(|(_, id)| opencode::parsing::is_cola_message_id(id))
         .unwrap_or(false);
     let tail = transcript_tail(&messages);
 
@@ -187,7 +187,7 @@ pub(crate) async fn gather_snapshot(
 pub(crate) async fn snapshot_card_for(
     core: &Arc<SharedCore>,
     verb: &str,
-    info: &crate::opencode::SessionListInfo,
+    info: &crate::opencode::types::SessionListInfo,
 ) -> (serde_json::Value, SnapshotData) {
     let data = gather_snapshot(&core.opencode, &info.id, &info.directory).await;
     snapshot_card_from_data(core, verb, &info.title, data).await
@@ -211,7 +211,7 @@ pub(crate) async fn snapshot_card_from_data(
 /// The newest user message (by created time), if any — `(created, id)`. A
 /// session with no user message has no newest; the caller decides the meaning
 /// (cola authorship for suppression, an epoch for the busy-adopt follow).
-fn newest_user_message(messages: &[opencode::client::SessionMessage]) -> Option<(i64, &str)> {
+fn newest_user_message(messages: &[opencode::types::SessionMessage]) -> Option<(i64, &str)> {
     messages
         .iter()
         .filter(|m| m.info.role.as_deref() == Some("user"))
@@ -224,7 +224,7 @@ fn newest_user_message(messages: &[opencode::client::SessionMessage]) -> Option<
 /// one `text` part with non-empty content; reasoning/tool/step parts are inner
 /// monologue, not conversation, and are excluded. Messages without a created
 /// time cannot be ordered and are dropped.
-pub(crate) fn transcript_tail(messages: &[opencode::client::SessionMessage]) -> Vec<TailEntry> {
+pub(crate) fn transcript_tail(messages: &[opencode::types::SessionMessage]) -> Vec<TailEntry> {
     const TAIL_LIMIT: usize = 4;
     let mut out: Vec<TailEntry> = messages
         .iter()
@@ -267,7 +267,7 @@ fn text_parts_only(parts: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::opencode::client::{MessageInfo, MessageTime, SessionMessage};
+    use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
 
     fn msg(id: &str, role: &str, created: i64, parts: serde_json::Value) -> SessionMessage {
         SessionMessage {
@@ -314,9 +314,9 @@ mod tests {
         // idle + no pending + cola-authored newest (ADR-0028): a first adoption
         // always snapshots, and an unknown status is never treated as idle.
         let statuses = [
-            ("idle", Some(opencode::SessionStatus::Idle)),
-            ("busy", Some(opencode::SessionStatus::Busy)),
-            ("retry", Some(opencode::SessionStatus::Retry)),
+            ("idle", Some(opencode::types::SessionStatus::Idle)),
+            ("busy", Some(opencode::types::SessionStatus::Busy)),
+            ("retry", Some(opencode::types::SessionStatus::Retry)),
             ("unknown", None),
         ];
         for (sname, status) in statuses {
@@ -399,7 +399,7 @@ mod tests {
         ];
         let (created, id) = newest_user_message(&messages).unwrap();
         assert_eq!(created, 2000);
-        assert!(opencode::client::is_cola_message_id(id));
+        assert!(opencode::parsing::is_cola_message_id(id));
 
         // An external user message newer than cola's is NOT cola-authored.
         let messages = vec![
@@ -408,7 +408,7 @@ mod tests {
         ];
         let (created, id) = newest_user_message(&messages).unwrap();
         assert_eq!(created, 2000);
-        assert!(!opencode::client::is_cola_message_id(id));
+        assert!(!opencode::parsing::is_cola_message_id(id));
 
         // No user messages → None (no newest, no epoch).
         let messages = vec![msg("a", "assistant", 1000, text("回答"))];
@@ -423,11 +423,11 @@ mod tests {
     #[tokio::test]
     async fn gather_filters_pending_to_the_adopted_session_and_reads_status() {
         use crate::bridge::test_support::MockBackend;
-        use crate::opencode::client::{PermissionRequest, QuestionInfo, QuestionRequest};
+        use crate::opencode::types::{PermissionRequest, QuestionInfo, QuestionRequest};
 
         let mut mock = MockBackend::new(text("你好"));
         mock.session_statuses
-            .insert("ses_adopted".into(), Some(opencode::SessionStatus::Busy));
+            .insert("ses_adopted".into(), Some(opencode::types::SessionStatus::Busy));
         // A permission and a question for the ADOPTED session, plus one of each
         // for a sibling session in the SAME directory — only the former belong
         // on the snapshot.
@@ -470,7 +470,7 @@ mod tests {
         let backend: Arc<dyn opencode::Backend> = Arc::new(mock);
         let snap = gather_snapshot(&backend, "ses_adopted", "/work/proj").await;
 
-        assert_eq!(snap.status, Some(opencode::SessionStatus::Busy));
+        assert_eq!(snap.status, Some(opencode::types::SessionStatus::Busy));
         assert!(snap.has_pending());
         let ids: Vec<_> = snap.pending.iter().map(|p| p.id().to_string()).collect();
         assert_eq!(
@@ -511,6 +511,6 @@ mod tests {
         let mock = MockBackend::new(text("你好"));
         let backend: Arc<dyn opencode::Backend> = Arc::new(mock);
         let snap = gather_snapshot(&backend, "ses_adopted", "/work/proj").await;
-        assert_eq!(snap.status, Some(opencode::SessionStatus::Idle));
+        assert_eq!(snap.status, Some(opencode::types::SessionStatus::Idle));
     }
 }

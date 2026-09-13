@@ -27,14 +27,14 @@ pub(crate) const WAITING_CHIP: &str = "⏳ 等待你的确认";
 /// 等待你的确认 > 运行中 > 需要重试 > 空闲; a busy session carries one hint
 /// phrase). `None` when there is no status to report — the chip is omitted
 /// rather than guessed.
-fn status_chip(has_pending: bool, status: Option<opencode::SessionStatus>) -> Option<String> {
+fn status_chip(has_pending: bool, status: Option<opencode::types::SessionStatus>) -> Option<String> {
     if has_pending {
         return Some(WAITING_CHIP.to_string());
     }
     match status {
-        Some(opencode::SessionStatus::Busy) => Some(format!("{BUSY_CHIP}\n{BUSY_HINT}")),
-        Some(opencode::SessionStatus::Retry) => Some(RETRY_CHIP.to_string()),
-        Some(opencode::SessionStatus::Idle) => Some(IDLE_CHIP.to_string()),
+        Some(opencode::types::SessionStatus::Busy) => Some(format!("{BUSY_CHIP}\n{BUSY_HINT}")),
+        Some(opencode::types::SessionStatus::Retry) => Some(RETRY_CHIP.to_string()),
+        Some(opencode::types::SessionStatus::Idle) => Some(IDLE_CHIP.to_string()),
         None => None,
     }
 }
@@ -42,7 +42,7 @@ fn status_chip(has_pending: bool, status: Option<opencode::SessionStatus>) -> Op
 /// Build the status chip as a body element, if the precedence says one shows.
 fn status_chip_element(
     has_pending: bool,
-    status: Option<opencode::SessionStatus>,
+    status: Option<opencode::types::SessionStatus>,
 ) -> Option<serde_json::Value> {
     status_chip(has_pending, status).map(|content| json!({ "tag": "markdown", "content": content }))
 }
@@ -223,7 +223,7 @@ mod tests {
     use super::*;
     use crate::bridge::request::PendingRequest;
     use crate::bridge::snapshot::SnapshotData;
-    use crate::opencode::client::{PermissionRequest, QuestionInfo, QuestionOption, QuestionRequest};
+    use crate::opencode::types::{PermissionRequest, QuestionInfo, QuestionOption, QuestionRequest};
 
     fn permission(req_id: &str, session_id: &str, action: &str) -> PermissionRequest {
         PermissionRequest {
@@ -260,7 +260,7 @@ mod tests {
     }
 
     fn data(
-        status: Option<opencode::SessionStatus>,
+        status: Option<opencode::types::SessionStatus>,
         pending: Vec<PendingRequest>,
         tail: Vec<TailEntry>,
     ) -> SnapshotData {
@@ -289,7 +289,7 @@ mod tests {
 
     #[test]
     fn header_has_verb_and_title() {
-        let d = data(Some(opencode::SessionStatus::Idle), vec![], vec![]);
+        let d = data(Some(opencode::types::SessionStatus::Idle), vec![], vec![]);
         let card = build_snapshot_card("接管", "重写登录模块", &d);
         let h = card["header"]["title"]["content"].as_str().unwrap();
         assert_eq!(h, "已接管 重写登录模块", "header: {card}");
@@ -300,31 +300,31 @@ mod tests {
     fn status_chip_precedence_matrix() {
         // Pending beats every run state.
         assert_eq!(
-            status_chip(true, Some(opencode::SessionStatus::Busy)).as_deref(),
+            status_chip(true, Some(opencode::types::SessionStatus::Busy)).as_deref(),
             Some(WAITING_CHIP)
         );
         assert_eq!(
-            status_chip(true, Some(opencode::SessionStatus::Retry)).as_deref(),
+            status_chip(true, Some(opencode::types::SessionStatus::Retry)).as_deref(),
             Some(WAITING_CHIP)
         );
         assert_eq!(
-            status_chip(true, Some(opencode::SessionStatus::Idle)).as_deref(),
+            status_chip(true, Some(opencode::types::SessionStatus::Idle)).as_deref(),
             Some(WAITING_CHIP)
         );
         assert_eq!(status_chip(true, None).as_deref(), Some(WAITING_CHIP));
 
         // No pending: the server state decides.
         assert!(
-            status_chip(false, Some(opencode::SessionStatus::Busy))
+            status_chip(false, Some(opencode::types::SessionStatus::Busy))
                 .unwrap()
                 .contains(BUSY_CHIP)
         );
         assert_eq!(
-            status_chip(false, Some(opencode::SessionStatus::Retry)).as_deref(),
+            status_chip(false, Some(opencode::types::SessionStatus::Retry)).as_deref(),
             Some(RETRY_CHIP)
         );
         assert_eq!(
-            status_chip(false, Some(opencode::SessionStatus::Idle)).as_deref(),
+            status_chip(false, Some(opencode::types::SessionStatus::Idle)).as_deref(),
             Some(IDLE_CHIP)
         );
         // Unknown status and nothing pending → no chip, never guessed.
@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn busy_chip_carries_one_hint() {
-        let d = data(Some(opencode::SessionStatus::Busy), vec![], vec![]);
+        let d = data(Some(opencode::types::SessionStatus::Busy), vec![], vec![]);
         let card = build_snapshot_card("接管", "t", &d);
         let body = elements(&card)[0]["content"].as_str().unwrap();
         assert!(body.contains(BUSY_CHIP));
@@ -357,7 +357,7 @@ mod tests {
     #[test]
     fn pending_permission_block_reuses_buttons() {
         let d = data(
-            Some(opencode::SessionStatus::Idle),
+            Some(opencode::types::SessionStatus::Idle),
             vec![PendingRequest::Permission(permission(
                 "req_1",
                 "ses_adopted",
@@ -386,7 +386,7 @@ mod tests {
     #[test]
     fn pending_question_block_reuses_question_elements() {
         let d = data(
-            Some(opencode::SessionStatus::Idle),
+            Some(opencode::types::SessionStatus::Idle),
             vec![PendingRequest::Question(question("q_1", "ses_adopted"))],
             vec![],
         );
@@ -400,7 +400,7 @@ mod tests {
     #[test]
     fn no_pending_block_renders_for_a_different_session() {
         let d = data(
-            Some(opencode::SessionStatus::Idle),
+            Some(opencode::types::SessionStatus::Idle),
             vec![
                 PendingRequest::Permission(permission("req_own", "ses_adopted", "bash")),
                 PendingRequest::Permission(permission("req_other", "ses_sibling", "bash")),
@@ -420,13 +420,13 @@ mod tests {
     #[test]
     fn empty_and_full_tail() {
         // Empty tail → no 最近对话 section at all.
-        let empty = data(Some(opencode::SessionStatus::Idle), vec![], vec![]);
+        let empty = data(Some(opencode::types::SessionStatus::Idle), vec![], vec![]);
         let card = build_snapshot_card("接管", "t", &empty);
         assert!(!card.to_string().contains("最近对话"));
 
         // Full tail (4) → four role-marked folded panels + the header.
         let full = data(
-            Some(opencode::SessionStatus::Idle),
+            Some(opencode::types::SessionStatus::Idle),
             vec![],
             vec![
                 tail("user", 1000, "问题一"),
@@ -481,7 +481,7 @@ mod tests {
             ),
         ));
         let d = data(
-            Some(opencode::SessionStatus::Busy),
+            Some(opencode::types::SessionStatus::Busy),
             vec![
                 PendingRequest::Permission(permission("req_1", "ses_adopted", "bash")),
                 PendingRequest::Question(question("q_1", "ses_adopted")),
