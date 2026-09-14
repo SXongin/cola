@@ -100,7 +100,18 @@ On Windows there is no `nohup` — run `start /b cola`, or use
 
 cola attaches to an already-running `opencode serve` on the shared store
 (so sessions stay shared with OpenChamber / the CLI), and lazily starts its own
-when none is running. DM the bot `/help` to get started.
+when none is running.
+
+### 5. Claim the bot
+
+cola is **private by default**: a fresh (or upgraded) instance starts
+*unclaimed* and refuses everyone. On startup it prints a one-time **claim
+code** to the log (`~/.cola/cola.log`); DM the bot `/claim <code>` from your
+own Feishu account to become its Host. After that only you can use it.
+
+The code rotates on every restart, is never written to disk, and the claim
+itself is one-time — restarts and upgrades never ask again. DM the bot `/help`
+to get started after claiming.
 
 ## Docs
 
