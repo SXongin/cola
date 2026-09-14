@@ -853,7 +853,7 @@ async fn switch_card_scope_toggle_shows_whole_store() {
         "thread_id": "chat_1",
     });
     let result = app
-        .handle_card_action(value)
+        .host_action(value)
         .await
         .expect("scope toggle should return a card");
     let card = result.card.expect("toggle rebuilds the card");
@@ -931,7 +931,7 @@ async fn switch_card_adopt_action_maps_session() {
         "session_id": "ses_alpha01",
     });
     let result = app
-        .handle_card_action(value)
+        .host_action(value)
         .await
         .expect("switch adopt should return a result");
     let card = result.card.clone().expect("adopt returns the patched card");
@@ -1001,7 +1001,7 @@ async fn switch_card_adopt_occupied_offers_force_confirm() {
         "session_id": "ses_owned",
         "open_message_id": "om_switch_card",
     });
-    let result = app.handle_card_action(value).await.expect("adopt result");
+    let result = app.host_action(value).await.expect("adopt result");
     let card = result
         .card
         .clone()
@@ -1064,7 +1064,7 @@ async fn switch_card_force_adopt_steals_owned_session() {
         "thread_id": "chat_1",
         "session_id": "ses_owned",
     });
-    let result = app.handle_card_action(value).await.expect("force_adopt result");
+    let result = app.host_action(value).await.expect("force_adopt result");
     let card = result.card.clone().expect("force_adopt returns the snapshot");
     assert!(
         card.to_string().contains("已接管 被占用的会话"),
@@ -1098,7 +1098,7 @@ async fn switch_card_back_rebuilds_list() {
         "thread_id": "chat_1",
         "scope": "all",
     });
-    let result = app.handle_card_action(value).await.expect("back result");
+    let result = app.host_action(value).await.expect("back result");
     let card = result.card.expect("back rebuilds the list card");
     let card_str = card.to_string();
     assert!(card_str.contains("会话管理"), "list header: {card_str}");
@@ -1161,7 +1161,7 @@ async fn switch_card_switch_on_mapped_session_patches_to_snapshot() {
         "session_id": "ses_own1",
     });
     let result = app
-        .handle_card_action(value)
+        .host_action(value)
         .await
         .expect("switch on a mapped row should return a result");
     let card = result.card.expect("mapped re-switch patches the card");
@@ -1244,7 +1244,7 @@ async fn switch_card_switch_suppressed_patches_to_compact_state() {
         "session_id": "ses_own1",
     });
     let result = app
-        .handle_card_action(value)
+        .host_action(value)
         .await
         .expect("suppressed switch should return a result");
     let card = result.card.expect("suppressed 切换 still patches the card");
@@ -1286,7 +1286,7 @@ async fn switch_card_adopt_in_topic_persists_anchor() {
         "open_message_id": "om_switch_card",
     });
     let result = app
-        .handle_card_action(value)
+        .host_action(value)
         .await
         .expect("topic adopt should return a result");
     let card = result.card.expect("adopt patches the card in place");
@@ -1343,7 +1343,7 @@ async fn switch_card_new_action_creates_session_in_current_project() {
         "thread_id": "chat_1",
     });
     let result = app
-        .handle_card_action(value)
+        .host_action(value)
         .await
         .expect("switch new should return a result");
     assert!(result.card.is_some(), "new returns a refreshed card");

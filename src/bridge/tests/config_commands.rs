@@ -90,10 +90,7 @@ async fn model_card_button_records_override() {
         "thread_id": "chat_1",
         "value": "opencode",
     });
-    let step1 = app
-        .handle_card_action(provider)
-        .await
-        .expect("provider card action");
+    let step1 = app.host_action(provider).await.expect("provider card action");
     let step1_card = step1.card.expect("provider click swaps in the model picker");
     let text1 = step1_card.to_string();
     assert!(
@@ -110,7 +107,7 @@ async fn model_card_button_records_override() {
         "thread_id": "chat_1",
         "value": "opencode/deepseek-v4-flash",
     });
-    let step2 = app.handle_card_action(model).await.expect("model card action");
+    let step2 = app.host_action(model).await.expect("model card action");
     assert!(step2.card.is_none(), "selection is toast-only");
     let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
     assert_eq!(entry.model.as_deref(), Some("opencode/deepseek-v4-flash"));
@@ -142,7 +139,7 @@ async fn model_picker_back_button_returns_to_providers() {
         "thread_id": "chat_1",
         "value": "__providers__",
     });
-    let result = app.handle_card_action(value).await.expect("back action");
+    let result = app.host_action(value).await.expect("back action");
     let card = result.card.expect("back returns a card");
     let text = card.to_string();
     assert!(text.contains("opencode") && text.contains("openrouter"), "{text}");
@@ -241,7 +238,7 @@ async fn agent_card_picker_and_button() {
         "value": "default",
     });
     let result = app
-        .handle_card_action(literal_default)
+        .host_action(literal_default)
         .await
         .expect("agent literal-default action");
     assert!(result.card.is_some(), "refreshed card returned");
@@ -255,7 +252,7 @@ async fn agent_card_picker_and_button() {
         "thread_id": "chat_1",
         "value": "build",
     });
-    let result = app.handle_card_action(value).await.expect("agent card action");
+    let result = app.host_action(value).await.expect("agent card action");
     assert!(result.card.is_some(), "refreshed card returned");
     let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
     assert_eq!(entry.agent.as_deref(), Some("build"));
@@ -267,7 +264,7 @@ async fn agent_card_picker_and_button() {
         "thread_id": "chat_1",
         "value": "",
     });
-    app.handle_card_action(clear).await.expect("agent clear action");
+    app.host_action(clear).await.expect("agent clear action");
     assert!(
         app.sessions
             .lock()
@@ -397,10 +394,7 @@ async fn autoaccept_card_toggles_flag() {
         "thread_id": "chat_1",
         "value": "on",
     });
-    let result = app
-        .handle_card_action(value)
-        .await
-        .expect("autoaccept card action");
+    let result = app.host_action(value).await.expect("autoaccept card action");
     assert!(result.card.is_some(), "refreshed card returned");
     let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
     assert!(entry.auto_accept, "flag should flip on");
@@ -1075,7 +1069,7 @@ async fn think_card_button_records_variant() {
         "thread_id": "chat_1",
         "value": "high",
     });
-    let result = app.handle_card_action(value).await.expect("think card action");
+    let result = app.host_action(value).await.expect("think card action");
     assert!(result.card.is_some(), "refreshed card returned");
     let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
     assert_eq!(entry.variant.as_deref(), Some("high"));
@@ -1089,7 +1083,7 @@ async fn think_card_button_records_variant() {
         "thread_id": "chat_1",
         "value": "default",
     });
-    app.handle_card_action(literal_default)
+    app.host_action(literal_default)
         .await
         .expect("think literal-default action");
     assert_eq!(
@@ -1110,7 +1104,7 @@ async fn think_card_button_records_variant() {
         "thread_id": "chat_1",
         "value": "",
     });
-    app.handle_card_action(clear).await.expect("think clear action");
+    app.host_action(clear).await.expect("think clear action");
     assert!(
         app.sessions
             .lock()

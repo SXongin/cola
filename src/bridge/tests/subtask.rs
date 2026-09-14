@@ -97,7 +97,7 @@ async fn subtask_permission_routes_to_mapped_parent_and_reply_carries_directory(
     value["reply"] = serde_json::json!("once");
     value["perm_label"] = serde_json::json!("✅ 已允许一次");
     value["perm_color"] = serde_json::json!("green");
-    let result = app.handle_card_action(value).await;
+    let result = app.host_action(value).await;
     assert!(result.is_some(), "reply should succeed for subtask session");
     assert!(
         result.unwrap().card.is_none(),
