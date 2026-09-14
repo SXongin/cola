@@ -379,6 +379,18 @@ fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Value> {
     if let Some(open_message_id) = open_message_id {
         val["open_message_id"] = serde_json::Value::String(open_message_id.to_string());
     }
+    // The clicking user's identity (ADR-0035): the bridge gates every card
+    // action on it, so thread it into the value. The callback carries it on
+    // `event.operator.open_id`; a payload without one stays identity-less and
+    // the gate refuses it (fail closed).
+    let operator_open_id = v
+        .get("event")
+        .and_then(|e| e.get("operator"))
+        .and_then(|o| o.get("open_id"))
+        .and_then(|m| m.as_str());
+    if let Some(open_id) = operator_open_id {
+        val["operator_open_id"] = serde_json::Value::String(open_id.to_string());
+    }
     Some(val)
 }
 
@@ -1031,6 +1043,47 @@ fn card_action_carries_open_message_id_from_context() {
         FrameAction::CardAction(v) => {
             assert_eq!(v["op"], "topic_adopt");
             assert_eq!(v["open_message_id"], "om_switch_card");
+        }
+        other => panic!("expected CardAction, got {:?}", std::mem::discriminant(&other)),
+    }
+}
+
+/// A real-shaped `card.action.trigger` callback carries the clicking user on
+/// `event.operator.open_id`. The bridge gates every card action on that
+/// identity (ADR-0035), so extraction must thread it into the value as
+/// `operator_open_id`.
+#[test]
+fn card_action_carries_operator_open_id() {
+    let payload = br#"{
+            "schema": "2.0",
+            "header": {
+                "event_id": "e_card",
+                "event_type": "card.action.trigger",
+                "create_time": "1609295409000",
+                "token": "t",
+                "app_id": "cli_1",
+                "tenant_key": "tk"
+            },
+            "event": {
+                "operator": {
+                    "tenant_key": "tk",
+                    "user_id": "u_1",
+                    "open_id": "ou_alice",
+                    "union_id": "on_1"
+                },
+                "token": "card_token",
+                "action": {
+                    "tag": "button",
+                    "value": { "action": "perm", "reply": "once", "request_id": "per_1", "session_id": "ses_1" }
+                },
+                "context": { "open_message_id": "om_card_1", "open_chat_id": "oc_1" }
+            }
+        }"#;
+    let frame = event_frame(payload);
+    match process_frame(&frame, &mut DedupeSet::new(10)) {
+        FrameAction::CardAction(v) => {
+            assert_eq!(v["operator_open_id"], "ou_alice");
+            assert_eq!(v["request_id"], "per_1");
         }
         other => panic!("expected CardAction, got {:?}", std::mem::discriminant(&other)),
     }
