@@ -1,8 +1,9 @@
 # OpenCode reviews every non-draft PR from this repository on the two axes from
 # CONTRIBUTING.md "Reviewing" and approves it when the review finds nothing
-# blocking. That approval is the review gate ADR-0034 describes; it replaces
-# CodeRabbit, whose automatic reviews never fire on public repositories under
-# ten stars.
+# blocking. That approval is the automated non-author review the `main: review`
+# ruleset needs. It runs alongside CodeRabbit while #163 decides the handover;
+# deleting `.coderabbit.yaml` and amending ADR-0034/CONTRIBUTING.md is the
+# second half of that issue.
 #
 # Requires the repository setting Actions -> General -> "Allow GitHub Actions
 # to create and approve pull requests". `require_last_push_approval` on the
@@ -24,12 +25,13 @@ permissions:
 jobs:
   review:
     # Fork PRs never see secrets, so the model would have no API key to run
-    # with. Dependabot PRs stay in-repo and read OPENCODE_API_KEY from the
-    # Dependabot secret store under the same name. Drafts wait for
-    # ready_for_review.
+    # with. Dependabot PRs are skipped too: `opencode github run` asserts the
+    # triggering actor is a collaborator, and a bot actor 404s that check, so
+    # the run would fail before reviewing. Drafts wait for ready_for_review.
     if: >-
       github.event.pull_request.draft == false &&
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -44,14 +46,18 @@ jobs:
 
       # anomalyco/opencode/github installs the CLI from releases/latest at run
       # time, so pinning that action would not pin the code that actually runs.
-      # Installing a fixed release here does. The archive has no published
-      # checksum, so the version in the URL is the pin; bump it deliberately.
+      # Installing a fixed release here does. The archive has no checksum file,
+      # so the SHA256 below (the asset's digest from the release metadata) is
+      # the integrity pin; version, URL, and digest move together.
       - name: Install opencode 1.18.31
+        env:
+          SHA256: b283e8dbe9e6fc224bb4b79992ce3bd2174b8b7b0c3e7d1b4e6024a1d11edc84
         run: |
           set -euo pipefail
           curl -fsSL \
             "https://github.com/anomalyco/opencode/releases/download/v1.18.31/opencode-linux-x64-baseline.tar.gz" \
             -o "$RUNNER_TEMP/opencode.tar.gz"
+          echo "$SHA256  $RUNNER_TEMP/opencode.tar.gz" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/bin"
           tar -xzf "$RUNNER_TEMP/opencode.tar.gz" -C "$RUNNER_TEMP/bin"
           chmod 755 "$RUNNER_TEMP/bin/opencode"
