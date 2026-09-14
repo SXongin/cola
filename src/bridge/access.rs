@@ -110,7 +110,7 @@ impl Access {
         let claim_code = (!list.is_claimed()).then(generate_claim_code);
         let access = Self { list, claim_code };
         if let Some(code) = access.claim_code() {
-            tracing::warn!("cola 尚未认领 —— 认领码: {code}（在飞书私聊中发送 /claim {code} 成为宿主）");
+            tracing::warn!("cola 尚未认领 —— 认领码: {code}（在飞书私聊中发送 /claim {code} 成为机主）");
         }
         access
     }

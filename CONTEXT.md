@@ -16,7 +16,7 @@ _Avoid_: Client, frontend, channel
 An AI code agent provider (e.g. OpenCode). Handles session management, prompt execution, and event streaming.
 _Avoid_: Engine, model, provider
 
-**Host** (宿主):
+**Host** (机主):
 The person who runs cola on their own machine and owns what it operates on — the OpenCode server, the Shared Store, and the filesystem. In the personal-machine model the Host is the single admitted Principal and the only one permitted to act at all.
 _Avoid_: Operator (ambiguous — code and docs use it for whoever drives a session), owner (in code that word means the Chat/Topic a Session is mapped to, ADR-0007)
 

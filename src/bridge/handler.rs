@@ -391,9 +391,9 @@ impl App {
                 );
                 let text = match reason {
                     DenyReason::Unclaimed => {
-                        "此 cola 尚未认领。请让宿主查看启动日志中的认领码，并在私聊中发送 /claim <认领码>。"
+                        "此 cola 尚未认领。请让机主查看启动日志中的认领码，并在私聊中发送 /claim <认领码>。"
                     }
-                    DenyReason::NotHost => "此 cola 已设为私有，仅限宿主使用。",
+                    DenyReason::NotHost => "此 cola 已设为私有，仅限机主使用。",
                 };
                 let _ = self.feishu.reply_text(&msg.message_id, text).await;
                 true

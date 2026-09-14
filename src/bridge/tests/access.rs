@@ -131,7 +131,7 @@ async fn non_host_is_refused_after_claim() {
 
     let texts = platform.texts().await;
     assert!(
-        texts.iter().any(|t| t.contains("仅限宿主使用")),
+        texts.iter().any(|t| t.contains("仅限机主使用")),
         "expected the private-bot refusal, got: {texts:?}"
     );
     assert!(
@@ -162,7 +162,7 @@ async fn identity_less_message_is_refused() {
 
     let texts = platform.texts().await;
     assert!(
-        texts.iter().any(|t| t.contains("仅限宿主使用")),
+        texts.iter().any(|t| t.contains("仅限机主使用")),
         "expected the private-bot refusal, got: {texts:?}"
     );
     assert!(prompts.lock().await.is_empty());
