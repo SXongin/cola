@@ -309,7 +309,7 @@ async fn group_completion_sends_notice_to_requester() {
         "group".into(),
         None,
         "hi".into(),
-        Some("ou_requester".into()),
+        Some(TEST_HOST.into()),
     ))
     .await;
 
@@ -330,7 +330,7 @@ async fn group_completion_sends_notice_to_requester() {
         notices,
         vec![(
             "msg_1".to_string(),
-            "ou_requester".to_string(),
+            TEST_HOST.to_string(),
             "✅ 已完成。".to_string()
         )]
     );
@@ -342,8 +342,7 @@ async fn group_completion_at_mentions_requester_when_name_resolvable() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut rp = RecordingPlatform::new();
-    rp.user_names
-        .insert("ou_requester".to_string(), "李明".to_string());
+    rp.user_names.insert(TEST_HOST.to_string(), "李明".to_string());
     let platform = Arc::new(rp);
     let app = Arc::new(
         App::new(
@@ -360,7 +359,7 @@ async fn group_completion_at_mentions_requester_when_name_resolvable() {
         "group".into(),
         None,
         "hi".into(),
-        Some("ou_requester".into()),
+        Some(TEST_HOST.into()),
     ))
     .await;
 
@@ -381,7 +380,7 @@ async fn group_completion_at_mentions_requester_when_name_resolvable() {
         notices,
         vec![(
             "msg_1".to_string(),
-            "ou_requester".to_string(),
+            TEST_HOST.to_string(),
             Some("李明".to_string()),
             "✅ 已完成。".to_string()
         )]
@@ -401,7 +400,7 @@ async fn p2p_prompt_sends_no_completion_notice() {
         "p2p".into(),
         None,
         "hi".into(),
-        Some("ou_user".into()),
+        Some(TEST_HOST.into()),
     ))
     .await;
 

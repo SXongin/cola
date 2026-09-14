@@ -62,7 +62,7 @@ async fn reply_injects_quoted_parent_text() {
         parent_id: Some("om_parent".into()),
         text: "还是不行".into(),
         images: vec![],
-        requester_open_id: None,
+        requester_open_id: Some(TEST_HOST.into()),
     })
     .await;
 
@@ -103,7 +103,7 @@ async fn reply_to_image_downloads_quoted_image() {
         parent_id: Some("om_img_parent".into()),
         text: "把这里放大看看".into(),
         images: vec![],
-        requester_open_id: None,
+        requester_open_id: Some(TEST_HOST.into()),
     })
     .await;
 
@@ -133,7 +133,7 @@ async fn image_message_attaches_image_and_placeholder() {
             mime: "image/png".into(),
             data: vec![1, 2, 3],
         }],
-        requester_open_id: None,
+        requester_open_id: Some(TEST_HOST.into()),
     })
     .await;
 
@@ -161,7 +161,7 @@ async fn reply_degrades_when_quote_fetch_fails() {
         parent_id: Some("om_missing".into()),
         text: "hi".into(),
         images: vec![],
-        requester_open_id: None,
+        requester_open_id: Some(TEST_HOST.into()),
     })
     .await;
 

@@ -1,3 +1,4 @@
+pub mod access;
 pub mod command;
 pub mod core;
 pub mod discovery;
