@@ -3,6 +3,7 @@
 //! build_app / incoming / seed_session / ...) lives in
 //! [`crate::bridge::test_support`].
 
+pub(crate) mod access;
 pub(crate) mod config_commands;
 pub(crate) mod dir;
 pub(crate) mod external;

@@ -211,7 +211,7 @@ async fn topic_cover_card_updated_with_auto_title_after_turn() {
         parent_id: None,
         text: "继续".into(),
         images: vec![],
-        requester_open_id: None,
+        requester_open_id: Some(TEST_HOST.into()),
     })
     .await;
 
@@ -1354,7 +1354,7 @@ async fn topic_plain_reply_skips_own_root_and_seed_injection() {
             parent_id: Some(pid.into()),
             text: "普通回复".into(),
             images: vec![],
-            requester_open_id: None,
+            requester_open_id: Some(TEST_HOST.into()),
         })
         .await;
         assert_eq!(
@@ -1408,7 +1408,7 @@ async fn topic_explicit_quote_of_real_message_still_injects() {
         parent_id: Some("om_real_quote".into()),
         text: "继续".into(),
         images: vec![],
-        requester_open_id: None,
+        requester_open_id: Some(TEST_HOST.into()),
     })
     .await;
 
@@ -1463,7 +1463,7 @@ async fn manual_topic_plain_reply_injects_user_root() {
         parent_id: Some("om_user_root".into()),
         text: "继续".into(),
         images: vec![],
-        requester_open_id: None,
+        requester_open_id: Some(TEST_HOST.into()),
     })
     .await;
 

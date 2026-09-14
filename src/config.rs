@@ -116,6 +116,10 @@ pub struct FeishuConfig {
 pub struct BridgeConfig {
     #[serde(default = "default_session_file")]
     pub session_file: PathBuf,
+    /// The Access List file (ADR-0035). A missing or unreadable file means the
+    /// bot is unclaimed: only the Claim is served until a Host is recorded.
+    #[serde(default = "default_access_file")]
+    pub access_file: PathBuf,
     /// Default directory for new sessions. When unset, falls back to the
     /// process working directory. `/dir` overrides per session.
     #[serde(default)]
@@ -135,6 +139,7 @@ impl Default for BridgeConfig {
     fn default() -> Self {
         Self {
             session_file: default_session_file(),
+            access_file: default_access_file(),
             work_dir: None,
             group_completion_notice: default_group_completion_notice(),
             log_days: default_log_days(),
@@ -155,6 +160,13 @@ fn default_session_file() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".cola")
         .join("sessions.json")
+}
+
+fn default_access_file() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".cola")
+        .join("access.json")
 }
 
 /// A key that uniquely identifies a session context on the Feishu side.

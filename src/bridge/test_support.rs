@@ -964,8 +964,12 @@ impl opencode::Backend for MockBackend {
     }
 }
 
+/// The test Host every `test_config` app is claimed for (ADR-0035). Messages
+/// built with [`incoming`] and no explicit requester act as this Principal.
+pub(crate) const TEST_HOST: &str = "ou_test_host";
+
 pub fn test_config(session_file: &std::path::Path) -> crate::config::Config {
-    crate::config::Config {
+    let cfg = crate::config::Config {
         opencode: crate::config::OpenCodeConfig {
             url: Some("http://localhost:1".into()),
             model: Some("test/model".into()),
@@ -977,11 +981,24 @@ pub fn test_config(session_file: &std::path::Path) -> crate::config::Config {
         },
         bridge: crate::config::BridgeConfig {
             session_file: session_file.to_path_buf(),
+            access_file: session_file.with_file_name("access.json"),
             work_dir: None,
             group_completion_notice: true,
             log_days: 14,
         },
-    }
+    };
+    // A test config comes claimed for TEST_HOST: the suite's apps are ready to
+    // use. The gate tests build an unclaimed config explicitly.
+    let mut access = crate::bridge::access::AccessList::load(&cfg.bridge.access_file);
+    access.claim(TEST_HOST).unwrap();
+    cfg
+}
+
+/// A config whose Access List does not exist — the bot is unclaimed.
+pub fn test_config_unclaimed(session_file: &std::path::Path) -> crate::config::Config {
+    let mut cfg = test_config(session_file);
+    cfg.bridge.access_file = session_file.with_file_name("access-unclaimed.json");
+    cfg
 }
 
 /// The parts a real assistant turn produces: reasoning → tool → text.
@@ -1028,6 +1045,9 @@ pub(crate) async fn build_app(
 }
 
 /// Build a plain text `IncomingMessage` for tests (no parent, no images).
+/// `None` means "no explicit requester": the message acts as [`TEST_HOST`],
+/// the Principal every `test_config` app admits. Use [`incoming_anonymous`]
+/// for an identity-less payload.
 pub(crate) fn incoming(
     message_id: String,
     chat_id: String,
@@ -1044,7 +1064,27 @@ pub(crate) fn incoming(
         parent_id: None,
         text,
         images: vec![],
-        requester_open_id: requester,
+        requester_open_id: Some(requester.unwrap_or_else(|| TEST_HOST.to_string())),
+    }
+}
+
+/// A plain text message with NO sender identity — the gate must fail closed.
+pub(crate) fn incoming_anonymous(
+    message_id: String,
+    chat_id: String,
+    chat_type: String,
+    thread_id: Option<String>,
+    text: String,
+) -> crate::bridge::IncomingMessage {
+    crate::bridge::IncomingMessage {
+        message_id,
+        chat_id,
+        chat_type,
+        thread_id,
+        parent_id: None,
+        text,
+        images: vec![],
+        requester_open_id: None,
     }
 }
 

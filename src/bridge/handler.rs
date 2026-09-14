@@ -1,6 +1,7 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
+use crate::bridge::access::{Access, Decision, DenyReason};
 use crate::bridge::command;
 use crate::bridge::core::SharedCore;
 use crate::bridge::turn::PromptContext;
@@ -44,6 +45,9 @@ pub(crate) fn image_inputs(
 /// etc. without threading a separate handle.
 pub struct App {
     pub(crate) core: Arc<SharedCore>,
+    /// The Host gate (ADR-0035): every inbound message and card action is
+    /// authorized against the Access List before cola acts.
+    pub(crate) access: tokio::sync::Mutex<Access>,
     /// Weak self-reference, set once inside `run` (which holds the Arc). Lets
     /// the `EventSink` trait impl (which only has `&self`) recover a
     /// `&Arc<App>` to hand to the inherent methods. `Weak` so it never keeps
@@ -144,9 +148,11 @@ impl App {
         feishu: Arc<dyn feishu::Platform>,
     ) -> anyhow::Result<Self> {
         let core = Arc::new(SharedCore::new(&cfg, opencode, feishu)?);
+        let access = tokio::sync::Mutex::new(Access::new(cfg.bridge.access_file.clone()));
         Ok(Self {
             self_weak: std::sync::OnceLock::new(),
             core,
+            access,
         })
     }
 
@@ -302,6 +308,9 @@ impl App {
     }
 
     pub async fn handle_message(self: &Arc<Self>, msg: crate::bridge::IncomingMessage) {
+        if self.gate_message(&msg).await {
+            return;
+        }
         let kind = ConversationKind::classify(&msg.chat_type, msg.thread_id.as_deref());
         let thread_key = kind.thread_key(&msg.chat_id, msg.thread_id.as_deref());
         if let Some(cmd) = command::parse_command(&msg.text) {
@@ -332,6 +341,63 @@ impl App {
         }
         if let Err(e) = self.handle_prompt(thread_key, msg, kind).await {
             tracing::error!("Prompt: {}", e);
+        }
+    }
+
+    /// The Access gate (ADR-0035): authorize the message's Principal before
+    /// any command, session, or prompt handling. Returns true when the message
+    /// was fully handled here — a Claim, an acknowledgement, or a refusal.
+    async fn gate_message(&self, msg: &crate::bridge::IncomingMessage) -> bool {
+        let decision = {
+            let access = self.access.lock().await;
+            access.decide(
+                msg.requester_open_id.as_deref(),
+                msg.chat_type == "p2p",
+                &msg.text,
+            )
+        };
+        match decision {
+            Decision::Allow => false,
+            Decision::Claim => {
+                // `decide` returns Claim only for a resolved Principal.
+                let principal = msg.requester_open_id.clone().unwrap_or_default();
+                let result = self.access.lock().await.claim(&principal);
+                let text = match result {
+                    Ok(true) => {
+                        tracing::info!("claimed by {principal}");
+                        "✅ 认领成功，此 cola 现在仅你可用。"
+                    }
+                    Ok(false) => "此 cola 已被认领。",
+                    Err(e) => {
+                        tracing::error!("claim failed: {e}");
+                        "认领失败，请查看日志后重试。"
+                    }
+                };
+                let _ = self.feishu.reply_text(&msg.message_id, text).await;
+                true
+            }
+            Decision::AlreadyClaimed => {
+                let _ = self
+                    .feishu
+                    .reply_text(&msg.message_id, "此 cola 已被认领。")
+                    .await;
+                true
+            }
+            Decision::Deny(reason) => {
+                tracing::info!(
+                    "refused {} message from {:?} ({reason:?})",
+                    msg.chat_type,
+                    msg.requester_open_id
+                );
+                let text = match reason {
+                    DenyReason::Unclaimed => {
+                        "此 cola 尚未认领。请让宿主查看启动日志中的认领码，并在私聊中发送 /claim <认领码>。"
+                    }
+                    DenyReason::NotHost => "此 cola 已设为私有，仅限宿主使用。",
+                };
+                let _ = self.feishu.reply_text(&msg.message_id, text).await;
+                true
+            }
         }
     }
 
