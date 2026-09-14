@@ -16,6 +16,22 @@ _Avoid_: Client, frontend, channel
 An AI code agent provider (e.g. OpenCode). Handles session management, prompt execution, and event streaming.
 _Avoid_: Engine, model, provider
 
+**Host** (宿主):
+The person who runs cola on their own machine and owns what it operates on — the OpenCode server, the Shared Store, and the filesystem. In the personal-machine model the Host is the single admitted Principal and the only one permitted to act at all.
+_Avoid_: Operator (ambiguous — code and docs use it for whoever drives a session), owner (in code that word means the Chat/Topic a Session is mapped to, ADR-0007)
+
+**Principal**:
+The identity cola resolves for an inbound action — a message or a card click — so authorization can be decided. A Feishu user, keyed by app-scoped `open_id` (the same field on message events and card callbacks). Distinct from ownership: a Principal acts, a Chat/Topic maps Sessions.
+_Avoid_: Actor, account, role (a role is a capability set assigned to a Principal, not the identity)
+
+**Access List** (访问名单):
+cola's persisted, machine-local record of admitted Principals, consulted for every inbound message and card action before cola acts. In the personal-machine model it holds exactly one entry, the Host. Distinct from a Feishu chat's member list, which says who can read messages, not who may operate the machine.
+_Avoid_: Allowlist, whitelist (both imply names without roles), ACL (implementation jargon)
+
+**Claim** (认领):
+The one-time act that names the Host on an unclaimed cola: the p2p sender of `/claim <code>` — where the code is printed at startup and never persisted — becomes the Host and is written to the Access List. Until claimed, every other action is refused; a successful Claim survives upgrades.
+_Avoid_: Setup, login, pairing
+
 **Shared Store**:
 The default OpenCode data directory (`~/.local/share/opencode`; `$XDG_DATA_HOME` when set) that every client — cola, OpenChamber, the CLI — reads and writes. The single source of truth for sessions; cola's "one server" invariant is about who serves this store.
 _Avoid_: Database, data dir, state directory
@@ -191,6 +207,8 @@ _Avoid_: Notification, message, signal
 ## Relationships
 
 - A **Bot** contains one **Platform** and one or more **Backend** adapters
+- Every inbound message or card action carries exactly one **Principal** (its sender or clicking user), authorized against the **Access List** before cola acts
+- The first successful **Claim** writes the **Host** into the **Access List**; every other Principal is refused
 - A **Chat** contains many **Topics**; a **Chat** may hold several **Sessions** directly (lobby), while a **Topic** holds exactly one **Session**
 - A **Chat** or **Topic** has one **Session Mapping**: the set of **Session**s it has activated, with exactly one of them its **Active Session**
 - A **Topic** is created around its **Topic Root** and, when cola opens it, is anchored on its **Topic Anchor**; a cola-created **Topic Root** is a **Topic Cover Card**
