@@ -49,22 +49,24 @@ impl AccessList {
     }
 
     /// Claim the bot for `open_id` and persist. One-time: returns `false` and
-    /// changes nothing when a Host is already recorded.
+    /// changes nothing when a Host is already recorded. The record is written
+    /// before the in-memory state flips, so a failed write leaves the list
+    /// unclaimed rather than in-memory-claimed with nothing on disk.
     pub fn claim(&mut self, open_id: &str) -> crate::error::Result<bool> {
         if self.host.is_some() {
             return Ok(false);
         }
+        self.persist(Some(open_id))?;
         self.host = Some(open_id.to_string());
-        self.write_to_disk()?;
         Ok(true)
     }
 
-    fn write_to_disk(&self) -> crate::error::Result<()> {
+    fn persist(&self, host: Option<&str>) -> crate::error::Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let data = serde_json::to_string_pretty(&AccessFile {
-            host: self.host.clone(),
+            host: host.map(str::to_string),
         })?;
         std::fs::write(&self.path, data)?;
         Ok(())
@@ -219,6 +221,17 @@ mod tests {
         let list = AccessList::load(&path);
         assert!(!list.is_claimed());
         assert_eq!(list.host(), None);
+    }
+
+    #[test]
+    fn failed_persist_leaves_the_list_unclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        // The parent path is a file, so creating the parent directory fails.
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, "x").unwrap();
+        let mut list = AccessList::load(&blocker.join("access.json"));
+        assert!(list.claim("ou_alice").is_err());
+        assert!(!list.is_claimed(), "a failed write must not claim in memory");
     }
 
     #[test]
