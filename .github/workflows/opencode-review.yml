@@ -1,0 +1,115 @@
+# OpenCode reviews every non-draft PR from this repository on the two axes from
+# CONTRIBUTING.md "Reviewing" and approves it when the review finds nothing
+# blocking. That approval is the review gate ADR-0034 describes; it replaces
+# CodeRabbit, whose automatic reviews never fire on public repositories under
+# ten stars.
+#
+# Requires the repository setting Actions -> General -> "Allow GitHub Actions
+# to create and approve pull requests". `require_last_push_approval` on the
+# `main: review` ruleset means every synchronize must approve the newest
+# commit; the last step skips the approval when the PR head moved mid-run.
+name: opencode review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    # Fork PRs never see secrets, so the model would have no API key to run
+    # with. Dependabot PRs stay in-repo and read OPENCODE_API_KEY from the
+    # Dependabot secret store under the same name. Drafts wait for
+    # ready_for_review.
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # anomalyco/opencode/github installs the CLI from releases/latest at run
+      # time, so pinning that action would not pin the code that actually runs.
+      # Installing a fixed release here does. The archive has no published
+      # checksum, so the version in the URL is the pin; bump it deliberately.
+      - name: Install opencode 1.18.31
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            "https://github.com/anomalyco/opencode/releases/download/v1.18.31/opencode-linux-x64-baseline.tar.gz" \
+            -o "$RUNNER_TEMP/opencode.tar.gz"
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/opencode.tar.gz" -C "$RUNNER_TEMP/bin"
+          chmod 755 "$RUNNER_TEMP/bin/opencode"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Review
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          MODEL: opencode-go/deepseek-v4.1-flash
+          USE_GITHUB_TOKEN: "true"
+          PROMPT: |
+            Review this pull request on the two axes from CONTRIBUTING.md's
+            "Reviewing" section: Spec (does the diff implement what the
+            originating issue or spec asked for?) and Standards
+            (CODING_STANDARDS.md and repo conventions). The PR body should
+            link its issue; read it. Cite explicitly any place where the diff
+            contradicts an existing ADR in docs/adr/.
+
+            Rules:
+            - Read-only: do not edit, create, or delete any file, and do not
+              push. The runner fails if the worktree is dirty.
+            - You may use `gh` and `git` to read the PR, its diff, and the
+              issue it closes, but do not post reviews, comments, or labels
+              yourself; the workflow posts this response and approves when
+              the verdict below is PASS.
+            - A missing or failed part of the review is a blocking finding.
+
+            Finish with exactly one final line, with nothing after it:
+            OPENCODE_REVIEW_VERDICT: PASS
+              when the review is complete and nothing blocks merging;
+            OPENCODE_REVIEW_VERDICT: FAIL
+              when anything blocks merging or you could not complete the
+              review.
+        run: opencode github run
+
+      # The review's response is posted as a PR comment; read the verdict back
+      # so a missing or failed review can never approve. A FAIL stays silent on
+      # purpose: GitHub Actions bots may not request changes, because they
+      # cannot dismiss their own review and would lock the PR.
+      - name: Approve when the verdict is clean
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REVIEWED_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          head=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
+          if [ "$head" != "$REVIEWED_SHA" ]; then
+            echo "PR head moved from $REVIEWED_SHA to $head; the run for it decides."
+            exit 0
+          fi
+          verdict=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments?per_page=100" --paginate \
+            --jq '[.[] | select(.user.login == "github-actions[bot]" or .user.login == "github-actions")] | last | (.body // "")' \
+            | grep -o 'OPENCODE_REVIEW_VERDICT: [A-Z]*' | tail -n 1 || true)
+          if [ "$verdict" != "OPENCODE_REVIEW_VERDICT: PASS" ]; then
+            echo "Verdict: ${verdict:-none}; not approving."
+            exit 0
+          fi
+          gh pr review "$PR" --approve \
+            --body "Automated review found no blocking findings."
