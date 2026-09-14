@@ -123,6 +123,17 @@ fn reject_nested_topic(thread_key: &ThreadKey) -> Option<CardActionResult> {
     })
 }
 
+/// The user-facing refusal for a denied action (ADR-0035), shared by the
+/// message gate and the card-click gate so their copy cannot drift.
+fn denial_text(reason: &DenyReason) -> &'static str {
+    match reason {
+        DenyReason::Unclaimed => {
+            "此 cola 尚未认领。请让机主查看启动日志中的认领码，并在私聊中发送 /claim <认领码>。"
+        }
+        DenyReason::NotHost => "此 cola 已设为私有，仅限机主使用。",
+    }
+}
+
 /// A display label for the Chat/Topic that owns a session, for the force-confirm
 /// card: the chat's display name (falling back to its id), with `（话题）` when
 /// the owner is a Topic rather than the Chat lobby. Vocabulary per CONTEXT.md —
@@ -389,16 +400,41 @@ impl App {
                     msg.chat_type,
                     msg.requester_open_id
                 );
-                let text = match reason {
-                    DenyReason::Unclaimed => {
-                        "此 cola 尚未认领。请让机主查看启动日志中的认领码，并在私聊中发送 /claim <认领码>。"
-                    }
-                    DenyReason::NotHost => "此 cola 已设为私有，仅限机主使用。",
-                };
-                let _ = self.feishu.reply_text(&msg.message_id, text).await;
+                let _ = self
+                    .feishu
+                    .reply_text(&msg.message_id, denial_text(&reason))
+                    .await;
                 true
             }
         }
+    }
+
+    /// The Access gate for card clicks (ADR-0035): only the Host may act on a
+    /// card button. Returns the refusal result when the click must not act;
+    /// `None` means it may proceed. Unlike a message, a click carries no
+    /// command text and no chat, so it can never Claim — for an unclaimed cola
+    /// the outcome is the same refusal a message would get.
+    async fn gate_card_action(&self, value: &serde_json::Value) -> Option<CardActionResult> {
+        let principal = value.get("operator_open_id").and_then(|v| v.as_str());
+        let decision = {
+            let access = self.access.lock().await;
+            access.decide(principal, false, "")
+        };
+        let reason = match decision {
+            Decision::Allow => return None,
+            Decision::Deny(reason) => reason,
+            // Unreachable by construction (no text → no Claim), but a click
+            // must fail closed if the gate ever returns a claim outcome.
+            Decision::Claim | Decision::AlreadyClaimed => {
+                tracing::warn!("card action decided a claim — refusing");
+                DenyReason::NotHost
+            }
+        };
+        tracing::info!("refused card action from {principal:?} ({reason:?})");
+        Some(CardActionResult {
+            card: None,
+            toast: Some(denial_text(&reason).to_string()),
+        })
     }
 
     pub(crate) async fn handle_prompt(
@@ -621,6 +657,9 @@ impl App {
     /// caller can send it back in the ack, plus an optional Toast for instant
     /// client feedback. Dispatches to the flow that owns the action tag.
     pub async fn handle_card_action(self: &Arc<Self>, value: serde_json::Value) -> Option<CardActionResult> {
+        if let Some(refusal) = self.gate_card_action(&value).await {
+            return Some(refusal);
+        }
         let action = value.get("action").and_then(|v| v.as_str()).unwrap_or("");
         match action {
             "perm" => self.permission.handle_card_action(&self.core, &value).await,
