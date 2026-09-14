@@ -210,7 +210,7 @@ telling you where to put one and exits.
 
 A fresh or upgraded cola starts **unclaimed**: it refuses every message. The
 startup log prints a one-time **claim code** (8 characters, no ambiguous
-glyphs); name the Host by sending it from a **private chat** with the bot:
+glyphs); name the Host（机主）by sending it from a **private chat** with the bot:
 
     /claim <code>
 
