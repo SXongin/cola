@@ -242,7 +242,7 @@ async fn error_card_retry_reuses_card_and_reruns_prompt() {
 
     // User clicks the retry button.
     let retry = app
-        .handle_card_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
+        .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
         .await;
     assert!(retry.is_some(), "retry ack card expected");
     assert_eq!(retry.unwrap().toast.as_deref(), Some("正在重试..."));

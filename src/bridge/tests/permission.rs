@@ -83,7 +83,7 @@ async fn permission_poller_sends_card_and_card_action_replies() {
         "perm_color": "green",
         "perm_body": "bash",
     });
-    let result = app.handle_card_action(value).await;
+    let result = app.host_action(value).await;
     assert!(result.is_some());
     let result = result.unwrap();
     assert!(
@@ -168,7 +168,7 @@ async fn inline_permission_click_flushes_the_card_immediately() {
         .count();
 
     let result = app
-        .handle_card_action(serde_json::json!({
+        .host_action(serde_json::json!({
             "action": "perm",
             "reply": "once",
             "session_id": "ses_test",
@@ -232,11 +232,11 @@ async fn concurrent_permission_clicks_reply_once() {
     let a = {
         let app = app.clone();
         let value = value.clone();
-        tokio::spawn(async move { app.handle_card_action(value).await })
+        tokio::spawn(async move { app.host_action(value).await })
     };
     let b = {
         let app = app.clone();
-        tokio::spawn(async move { app.handle_card_action(value).await })
+        tokio::spawn(async move { app.host_action(value).await })
     };
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     drop(guard);
@@ -272,7 +272,7 @@ async fn permission_reply_404_renders_neutral_already_handled() {
         "perm_color": "green",
         "perm_body": "bash",
     });
-    let result = app.handle_card_action(value).await.expect("a result card");
+    let result = app.host_action(value).await.expect("a result card");
     let card = result.card.expect("standalone card").to_string();
     assert!(card.contains("已处理"), "neutral card expected: {}", card);
     assert!(
@@ -312,10 +312,7 @@ async fn permission_reply_failure_rolls_back_so_retry_replies() {
         "perm_color": "green",
         "perm_body": "bash",
     });
-    let first = app
-        .handle_card_action(value.clone())
-        .await
-        .expect("a result card");
+    let first = app.host_action(value.clone()).await.expect("a result card");
     let first_card = first.card.expect("standalone card").to_string();
     assert!(
         first_card.contains("处理失败"),
@@ -323,7 +320,7 @@ async fn permission_reply_failure_rolls_back_so_retry_replies() {
         first_card
     );
 
-    let second = app.handle_card_action(value).await.expect("a result card");
+    let second = app.host_action(value).await.expect("a result card");
     assert!(
         second.card.is_some(),
         "retry must be handled, not silently dropped"
@@ -363,11 +360,11 @@ async fn second_permission_click_reserves_the_first_result() {
         })
     };
     let first = app
-        .handle_card_action(value_for("once", "✅ 已允许一次"))
+        .host_action(value_for("once", "✅ 已允许一次"))
         .await
         .expect("a result card");
     let second = app
-        .handle_card_action(value_for("always", "✅ 已允许（总是）"))
+        .host_action(value_for("always", "✅ 已允许（总是）"))
         .await
         .expect("a result card");
 
@@ -543,7 +540,7 @@ async fn autoaccept_toggle_on_permission_card_flips_flag_and_approves() {
         "perm_color": "blue",
         "perm_body": "bash",
     });
-    let result = app.handle_card_action(value).await.expect("toggle result");
+    let result = app.host_action(value).await.expect("toggle result");
     assert!(
         result.card.is_none(),
         "inline toggle must not replace the streaming card"

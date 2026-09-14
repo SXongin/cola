@@ -91,7 +91,7 @@ async fn snapshot_block_answer_patches_snapshot() {
         "perm_body": "bash",
     });
     let result = app
-        .handle_card_action(value)
+        .host_action(value)
         .await
         .expect("claimed block click returns a result");
     let card = result.card.expect("the ack patches the snapshot");
@@ -428,7 +428,7 @@ async fn snapshot_question_block_answers_and_patches() {
         })
     };
     let result = app
-        .handle_card_action(value(0, "rust"))
+        .host_action(value(0, "rust"))
         .await
         .expect("option click returns a result");
     let card = result.card.expect("snapshot re-rendered");
@@ -445,7 +445,7 @@ async fn snapshot_question_block_answers_and_patches() {
 
     // Last question answered → the request submits and the block drops.
     let result = app
-        .handle_card_action(value(1, "axum"))
+        .host_action(value(1, "axum"))
         .await
         .expect("final click returns a result");
     let card = result.card.expect("snapshot re-rendered");
@@ -622,7 +622,7 @@ async fn busy_follow_permission_approved_resumes() {
         "perm_body": "bash",
     });
     let result = app
-        .handle_card_action(value)
+        .host_action(value)
         .await
         .expect("permission click returns a result");
     assert!(
@@ -855,7 +855,7 @@ async fn busy_follow_question_block_resolves() {
         "answer": "rust",
     });
     let result = app
-        .handle_card_action(value)
+        .host_action(value)
         .await
         .expect("question click returns a result");
     assert_eq!(result.toast.as_deref(), Some("已回答"));

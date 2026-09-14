@@ -1088,6 +1088,28 @@ pub(crate) fn incoming_anonymous(
     }
 }
 
+/// Dispatch a card action as the Host (ADR-0035). A real click carries the
+/// clicking user's `open_id` on the value (the platform threads it in) and the
+/// bridge's gate refuses a click without one, so tests that mean "the Host
+/// clicked this" go through this helper instead of `App::handle_card_action`.
+#[async_trait::async_trait]
+pub(crate) trait HostCardAction {
+    async fn host_action(&self, value: serde_json::Value)
+    -> Option<crate::bridge::handler::CardActionResult>;
+}
+
+#[async_trait::async_trait]
+impl HostCardAction for Arc<App> {
+    async fn host_action(
+        &self,
+        value: serde_json::Value,
+    ) -> Option<crate::bridge::handler::CardActionResult> {
+        let mut value = value;
+        value["operator_open_id"] = serde_json::Value::String(TEST_HOST.to_string());
+        self.handle_card_action(value).await
+    }
+}
+
 /// Create a temp work dir, set it as the process cwd (sessions are created
 /// in cwd, and tests must never operate in the cola repo) and return it.
 /// The returned TempDir must stay alive for the test's duration.

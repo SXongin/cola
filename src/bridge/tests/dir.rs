@@ -180,7 +180,7 @@ async fn dir_card_pick_creates_session_and_refreshes_card() {
         "directory": "/work/b",
     });
     let result = app
-        .handle_card_action(value)
+        .host_action(value)
         .await
         .expect("dir pick should return a result");
     assert!(result.card.is_some(), "dir pick refreshes the card");
@@ -241,7 +241,7 @@ async fn dir_card_pick_current_directory_toasts_only() {
         "directory": "/work/a",
     });
     let result = app
-        .handle_card_action(value)
+        .host_action(value)
         .await
         .expect("dir pick should return a result");
     assert!(result.card.is_some(), "card still refreshes");
@@ -280,7 +280,7 @@ async fn dir_card_topic_creates_topic_with_new_session() {
         "open_message_id": "om_dir_card",
     });
     let result = app
-        .handle_card_action(value)
+        .host_action(value)
         .await
         .expect("dir topic should return a result");
     assert!(result.card.is_some(), "dir topic refreshes the card");
@@ -379,7 +379,7 @@ async fn dir_card_topic_on_current_directory_opens_topic() {
         "open_message_id": "om_dir_card",
     });
     let result = app
-        .handle_card_action(value)
+        .host_action(value)
         .await
         .expect("dir topic should return a result");
     assert!(
@@ -423,7 +423,7 @@ async fn dir_card_topic_rejects_inside_topic() {
         "open_message_id": "om_dir_card",
     });
     let result = app
-        .handle_card_action(value)
+        .host_action(value)
         .await
         .expect("dir topic should return a result");
     assert_eq!(result.card, None, "no card refresh on rejection");
@@ -453,7 +453,7 @@ async fn dir_card_topic_missing_open_message_id() {
         "directory": "/work/b",
     });
     let result = app
-        .handle_card_action(value)
+        .host_action(value)
         .await
         .expect("dir topic should return a result");
     assert_eq!(result.card, None);
@@ -491,7 +491,7 @@ async fn dir_card_topic_no_thread_id_degrades_with_guidance() {
         "open_message_id": "om_dir_card",
     });
     let result = app
-        .handle_card_action(value)
+        .host_action(value)
         .await
         .expect("dir topic should return a result");
     assert_eq!(result.card, None);
@@ -528,7 +528,7 @@ async fn dir_card_topic_rejects_after_topic_bound_via_pick() {
         "thread_id": "omt_t_1",
         "directory": "/work/a",
     });
-    app.handle_card_action(pick_value)
+    app.host_action(pick_value)
         .await
         .expect("pick should bind the topic");
     assert!(
@@ -547,7 +547,7 @@ async fn dir_card_topic_rejects_after_topic_bound_via_pick() {
         "open_message_id": "om_dir_card",
     });
     let result = app
-        .handle_card_action(topic_value)
+        .host_action(topic_value)
         .await
         .expect("dir topic should return a result");
     assert_eq!(result.card, None, "no card refresh on rejection");

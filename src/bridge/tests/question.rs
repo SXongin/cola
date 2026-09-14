@@ -174,7 +174,7 @@ async fn question_card_action_posts_answer_back() {
         "question_index": 0,
         "answer": "/a",
     });
-    let result = app.handle_card_action(value).await;
+    let result = app.host_action(value).await;
     assert!(result.is_some());
     assert!(
         result
@@ -273,7 +273,7 @@ async fn completing_last_question_replaces_card_with_full_qa_summary() {
 
     // Answering only the first question returns the card with the first
     // question collapsed (已选) and the second still open.
-    let first = app.handle_card_action(value_for(0, "/a1")).await.unwrap();
+    let first = app.host_action(value_for(0, "/a1")).await.unwrap();
     let first_card = first.card.unwrap().to_string();
     assert!(
         first_card.contains("问题乙"),
@@ -283,7 +283,7 @@ async fn completing_last_question_replaces_card_with_full_qa_summary() {
     // Answering the LAST question submits once and replaces the card with a
     // summary of EVERY question and answer — not a card that only echoes
     // the last answer under a bogus "AI 的问题是" label.
-    let done = app.handle_card_action(value_for(1, "/b1")).await.unwrap();
+    let done = app.host_action(value_for(1, "/b1")).await.unwrap();
     let done_card = done.card.unwrap().to_string();
     assert!(
         done_card.contains("问题甲"),
@@ -327,7 +327,7 @@ async fn question_card_action_rejects() {
         "session_id": "ses_1",
         "directory": "/work",
     });
-    let result = app.handle_card_action(value).await;
+    let result = app.host_action(value).await;
     assert!(result.is_some());
     assert!(
         result
@@ -389,10 +389,10 @@ async fn double_click_on_same_request_replies_once() {
     // replaces the buttons) must NOT re-reply — same request, one answer —
     // and must re-serve the first click's completion card, not a generic
     // ack.
-    let first = app.handle_card_action(value.clone()).await;
+    let first = app.host_action(value.clone()).await;
     assert!(first.is_some());
     let first = first.unwrap();
-    let second = app.handle_card_action(value).await;
+    let second = app.host_action(value).await;
     assert!(second.is_some(), "second click still gets the result card");
     assert_eq!(
         first.card,
@@ -446,7 +446,7 @@ async fn question_reply_404_renders_neutral_already_handled() {
         "question_index": 0,
         "answer": "/a",
     });
-    let result = app.handle_card_action(value).await.expect("a result card");
+    let result = app.host_action(value).await.expect("a result card");
     let card = result.card.expect("standalone card").to_string();
     assert!(card.contains("已处理"), "neutral card expected: {}", card);
     assert!(
@@ -513,7 +513,7 @@ async fn question_with_multiple_parts_waits_for_all_answers() {
     };
 
     // Answer the FIRST question only: must NOT submit (the second is open).
-    let first = app.handle_card_action(value(0, "/a")).await;
+    let first = app.host_action(value(0, "/a")).await;
     assert!(first.is_some());
     let first = first.unwrap();
     assert_eq!(first.toast.as_deref(), Some("已记录答案，还有 1 题未答"));
@@ -529,7 +529,7 @@ async fn question_with_multiple_parts_waits_for_all_answers() {
     assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
 
     // Answer the SECOND question: now everything is answered → submits.
-    let second = app.handle_card_action(value(1, "main")).await;
+    let second = app.host_action(value(1, "main")).await;
     assert!(second.is_some());
     assert_eq!(second.unwrap().toast.as_deref(), Some("已回答"));
     let calls = backend.reply_question_calls.lock().await.clone();
@@ -594,7 +594,7 @@ async fn multi_select_question_toggles_until_submit() {
     };
 
     // Click 苹果 → NOT submitted (multi-select toggles, never auto-submits).
-    let r1 = app.handle_card_action(value("苹果")).await.expect("result");
+    let r1 = app.host_action(value("苹果")).await.expect("result");
     assert_eq!(r1.toast.as_deref(), Some("已添加选项"));
     let c1 = r1.card.as_ref().expect("re-rendered card").to_string();
     assert!(c1.contains("已选：苹果"), "marker missing: {}", c1);
@@ -609,13 +609,13 @@ async fn multi_select_question_toggles_until_submit() {
     assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
 
     // Click 香蕉 → accumulates a second label.
-    let r2 = app.handle_card_action(value("香蕉")).await.expect("result");
+    let r2 = app.host_action(value("香蕉")).await.expect("result");
     let c2 = r2.card.as_ref().expect("re-rendered card").to_string();
     assert!(c2.contains("已选：苹果、香蕉"), "accumulate failed: {}", c2);
     assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
 
     // Click 苹果 again → toggles it OFF, only 香蕉 remains.
-    let r3 = app.handle_card_action(value("苹果")).await.expect("result");
+    let r3 = app.host_action(value("苹果")).await.expect("result");
     assert_eq!(r3.toast.as_deref(), Some("已移除选项"));
     let c3 = r3.card.as_ref().expect("re-rendered card").to_string();
     assert!(c3.contains("已选：香蕉"), "toggle off failed: {}", c3);
@@ -625,7 +625,7 @@ async fn multi_select_question_toggles_until_submit() {
     // 确定该题 → commits the toggled set; the single question is answered so
     // the request auto-submits with the accumulated set.
     let confirm = app
-        .handle_card_action(serde_json::json!({
+        .host_action(serde_json::json!({
             "action": "question",
             "reply": "confirm",
             "request_id": "que_multi",
@@ -673,7 +673,7 @@ async fn multi_select_can_submit_empty_selection() {
         .await;
 
     // Toggle 苹果 on, then off → back to an open question with NO selection.
-    app.handle_card_action(serde_json::json!({
+    app.host_action(serde_json::json!({
         "action": "question",
         "reply": "answer",
         "request_id": "que_empty",
@@ -684,7 +684,7 @@ async fn multi_select_can_submit_empty_selection() {
     }))
     .await;
     let r2 = app
-        .handle_card_action(serde_json::json!({
+        .host_action(serde_json::json!({
             "action": "question",
             "reply": "answer",
             "request_id": "que_empty",
@@ -704,7 +704,7 @@ async fn multi_select_can_submit_empty_selection() {
 
     // Confirming with nothing selected replies with an empty set.
     let confirm = app
-        .handle_card_action(serde_json::json!({
+        .host_action(serde_json::json!({
             "action": "question",
             "reply": "confirm",
             "request_id": "que_empty",
@@ -776,7 +776,7 @@ async fn stale_confirm_on_done_multi_select_is_a_no_op() {
     };
 
     // Toggle 苹果 on Q1 then confirm it → Q1 locked, Q0 still open.
-    app.handle_card_action(serde_json::json!({
+    app.host_action(serde_json::json!({
         "action": "question",
         "reply": "answer",
         "request_id": "que_stale",
@@ -786,12 +786,12 @@ async fn stale_confirm_on_done_multi_select_is_a_no_op() {
         "answer": "苹果",
     }))
     .await;
-    let r1 = app.handle_card_action(confirm(1)).await.expect("result");
+    let r1 = app.host_action(confirm(1)).await.expect("result");
     assert_eq!(r1.toast.as_deref(), Some("已确定该题，还有 1 题未答"));
     assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
 
     // A stale second confirm on Q1 must NOT wipe 苹果 with an empty set.
-    let r2 = app.handle_card_action(confirm(1)).await.expect("result");
+    let r2 = app.host_action(confirm(1)).await.expect("result");
     assert_eq!(r2.toast.as_deref(), Some("已确定该题，还有 1 题未答"));
     let c2 = r2.card.as_ref().expect("re-rendered card").to_string();
     assert!(
@@ -803,7 +803,7 @@ async fn stale_confirm_on_done_multi_select_is_a_no_op() {
 
     // Answer Q0 → both done → submits with 苹果 intact.
     let ans = app
-        .handle_card_action(serde_json::json!({
+        .host_action(serde_json::json!({
             "action": "question",
             "reply": "answer",
             "request_id": "que_stale",
@@ -878,19 +878,19 @@ async fn mixed_single_and_multi_question_waits_for_all_confirmed() {
     };
 
     // Answer the single-select (Q0) → Q1 still open, NO auto-submit yet.
-    let r0 = app.handle_card_action(answer(0, "/a")).await.expect("result");
+    let r0 = app.host_action(answer(0, "/a")).await.expect("result");
     assert_eq!(r0.toast.as_deref(), Some("已记录答案，还有 1 题未答"));
     assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
 
     // Toggle a multi-select option (Q1) → still no submit (not confirmed).
-    let r1 = app.handle_card_action(answer(1, "苹果")).await.expect("result");
+    let r1 = app.host_action(answer(1, "苹果")).await.expect("result");
     assert_eq!(r1.toast.as_deref(), Some("已添加选项"));
     assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
 
     // Type a custom answer into the multi-select (reply "custom") → the
     // label is appended to the toggles, still no submit.
     let r2 = app
-        .handle_card_action(serde_json::json!({
+        .host_action(serde_json::json!({
             "action": "question",
             "reply": "custom",
             "request_id": "que_mix",
@@ -909,7 +909,7 @@ async fn mixed_single_and_multi_question_waits_for_all_confirmed() {
 
     // Confirm Q1 → both questions done → auto-submits with both answers.
     let confirm = app
-        .handle_card_action(serde_json::json!({
+        .host_action(serde_json::json!({
             "action": "question",
             "reply": "confirm",
             "request_id": "que_mix",
@@ -977,10 +977,7 @@ async fn multi_select_custom_answer_appends_dedupes_and_removes() {
     };
 
     // Append raw text: the newline stays inside the single entry (no split).
-    let r1 = app
-        .handle_card_action(custom("自定\n答案"))
-        .await
-        .expect("result");
+    let r1 = app.host_action(custom("自定\n答案")).await.expect("result");
     assert_eq!(r1.toast.as_deref(), Some("已添加自定义答案"));
     let c1 = r1.card.as_ref().expect("re-rendered card").to_string();
     assert!(c1.contains("已选：自定"), "custom not in selection: {}", c1);
@@ -998,15 +995,12 @@ async fn multi_select_custom_answer_appends_dedupes_and_removes() {
     );
 
     // Re-submitting the same text is deduped, with its own toast.
-    let r2 = app
-        .handle_card_action(custom("自定\n答案"))
-        .await
-        .expect("result");
+    let r2 = app.host_action(custom("自定\n答案")).await.expect("result");
     assert_eq!(r2.toast.as_deref(), Some("该选项已在已选中"));
 
     // Clicking the chip (reply "answer" with the raw text) removes it.
     let r3 = app
-        .handle_card_action(serde_json::json!({
+        .host_action(serde_json::json!({
             "action": "question",
             "reply": "answer",
             "request_id": "que_custom",
@@ -1022,7 +1016,7 @@ async fn multi_select_custom_answer_appends_dedupes_and_removes() {
     assert!(!c3.contains("已选：自定"), "custom kept after removal: {}", c3);
 
     // A blank submission only hints and changes nothing.
-    let r4 = app.handle_card_action(custom("")).await.expect("result");
+    let r4 = app.host_action(custom("")).await.expect("result");
     assert_eq!(r4.toast.as_deref(), Some("请输入自定义答案"));
     assert!(r4.card.is_none());
     assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
@@ -1117,7 +1111,7 @@ async fn inline_question_answered_on_streaming_card() {
         "question_index": 0,
         "answer": "/a",
     });
-    let r1 = app.handle_card_action(value).await.expect("result");
+    let r1 = app.host_action(value).await.expect("result");
     assert_eq!(r1.toast.as_deref(), Some("已记录答案，还有 1 题未答"));
     // The returned card is the RE-RENDERED streaming card (markers in the
     // callback response — the reliable card-update mechanism). Feishu's
@@ -1152,7 +1146,7 @@ async fn inline_question_answered_on_streaming_card() {
         "question_index": 1,
         "answer": "main",
     });
-    let r2 = app.handle_card_action(value).await.expect("result");
+    let r2 = app.host_action(value).await.expect("result");
     assert_eq!(r2.toast.as_deref(), Some("已回答"));
     assert!(r2.card.is_none(), "inline final answer must not replace the card");
     let calls = backend.reply_question_calls.lock().await.clone();
@@ -1329,7 +1323,7 @@ async fn sweep_keeps_partial_multi_select_toggles() {
     };
 
     let toggled = app
-        .handle_card_action(value("answer", "苹果"))
+        .host_action(value("answer", "苹果"))
         .await
         .expect("toggle result");
     assert!(
@@ -1341,7 +1335,7 @@ async fn sweep_keeps_partial_multi_select_toggles() {
     app.question.sweep(&app.core, &mut seen).await;
 
     // The live selection survived: confirming locks it and submits with it.
-    app.handle_card_action(value("confirm", ""))
+    app.host_action(value("confirm", ""))
         .await
         .expect("confirm result");
     let calls = backend.reply_question_calls.lock().await.clone();
@@ -1383,7 +1377,7 @@ async fn vanished_directory_is_no_longer_treated_as_known() {
     );
 
     let result = app
-        .handle_card_action(serde_json::json!({
+        .host_action(serde_json::json!({
             "action": "question",
             "reply": "answer",
             "request_id": "que_1",
@@ -1445,10 +1439,7 @@ async fn late_inline_click_is_cardless_and_classified() {
     };
 
     // Known directory, state gone → neutral toast, no card replacement.
-    let neutral = app
-        .handle_card_action(value("que_1", "/work"))
-        .await
-        .expect("result");
+    let neutral = app.host_action(value("que_1", "/work")).await.expect("result");
     assert!(
         neutral.card.is_none(),
         "an inline answer must not replace the streaming card"
@@ -1456,10 +1447,7 @@ async fn late_inline_click_is_cardless_and_classified() {
     assert_eq!(neutral.toast.as_deref(), Some("该问题已处理"));
 
     // Unknown directory → truthful stale toast, still card-less.
-    let stale = app
-        .handle_card_action(value("que_1", "/other"))
-        .await
-        .expect("result");
+    let stale = app.host_action(value("que_1", "/other")).await.expect("result");
     assert!(
         stale.card.is_none(),
         "an inline answer must not replace the streaming card"
@@ -1491,7 +1479,7 @@ async fn late_click_on_pruned_request_is_neutral_and_stateless() {
     assert!(!app.question.has_question("que_1").await);
 
     let result = app
-        .handle_card_action(serde_json::json!({
+        .host_action(serde_json::json!({
             "action": "question",
             "reply": "answer",
             "request_id": "que_1",
@@ -1546,7 +1534,7 @@ async fn late_click_without_directory_knowledge_is_truthful_not_handled() {
 
     for directory in [Some("/work"), None] {
         let result = app
-            .handle_card_action(value(directory))
+            .host_action(value(directory))
             .await
             .expect("a late click must get a result, never a silent no-op");
         let card = result.card.expect("standalone card").to_string();
@@ -1597,7 +1585,7 @@ async fn gated_submit_leaves_no_claim_and_preserves_replays() {
     };
 
     // Gated: no state, unknown directory — no reply, no state revived.
-    app.handle_card_action(value("que_submit", "submit"))
+    app.host_action(value("que_submit", "submit"))
         .await
         .expect("gated submit still answers");
     assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
@@ -1608,20 +1596,20 @@ async fn gated_submit_leaves_no_claim_and_preserves_replays() {
         .remember_question(&question_request("que_submit"), "/work")
         .await;
     let first = app
-        .handle_card_action(value("que_submit", "submit"))
+        .host_action(value("que_submit", "submit"))
         .await
         .expect("submit result");
     assert_eq!(backend.reply_question_calls.lock().await.len(), 1);
     // A fast re-click re-serves the winning result, never a second reply.
     let second = app
-        .handle_card_action(value("que_submit", "submit"))
+        .host_action(value("que_submit", "submit"))
         .await
         .expect("replay result");
     assert_eq!(first.card, second.card, "double click replays the first result");
     assert_eq!(backend.reply_question_calls.lock().await.len(), 1);
 
     // Same composition for reject.
-    app.handle_card_action(value("que_reject", "reject"))
+    app.host_action(value("que_reject", "reject"))
         .await
         .expect("gated reject still answers");
     assert_eq!(backend.reply_question_calls.lock().await.len(), 1);
@@ -1629,12 +1617,12 @@ async fn gated_submit_leaves_no_claim_and_preserves_replays() {
         .remember_question(&question_request("que_reject"), "/work")
         .await;
     let first = app
-        .handle_card_action(value("que_reject", "reject"))
+        .host_action(value("que_reject", "reject"))
         .await
         .expect("reject result");
     assert_eq!(backend.reply_question_calls.lock().await.len(), 2);
     let second = app
-        .handle_card_action(value("que_reject", "reject"))
+        .host_action(value("que_reject", "reject"))
         .await
         .expect("replay result");
     assert_eq!(first.card, second.card, "double click replays the first result");

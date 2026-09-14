@@ -913,7 +913,7 @@ async fn switch_card_topic_adopt_action_creates_topic() {
         "open_message_id": "om_switch_card",
     });
     let result = app
-        .handle_card_action(value)
+        .host_action(value)
         .await
         .expect("topic_adopt should return a result");
     assert!(result.card.is_some(), "topic_adopt refreshes the card");
@@ -981,7 +981,7 @@ async fn switch_card_topic_adopt_occupied_offers_force_confirm() {
         "open_message_id": "om_switch_card",
     });
     let result = app
-        .handle_card_action(value)
+        .host_action(value)
         .await
         .expect("topic_adopt should return a result");
     let card = result
@@ -1051,7 +1051,7 @@ async fn switch_card_force_topic_adopt_steals_owned_session() {
         "open_message_id": "om_switch_card",
     });
     let result = app
-        .handle_card_action(value)
+        .host_action(value)
         .await
         .expect("force_topic_adopt should return a result");
     assert!(result.card.is_some(), "force_topic_adopt refreshes the card");
@@ -1116,7 +1116,7 @@ async fn switch_card_force_topic_adopt_failure_keeps_old_owner() {
         "open_message_id": "om_switch_card",
     });
     let result = app
-        .handle_card_action(value)
+        .host_action(value)
         .await
         .expect("force_topic_adopt should return a result");
     assert!(
@@ -1154,7 +1154,7 @@ async fn switch_card_topic_adopt_missing_open_message_id() {
         "session_id": "ses_alpha01",
     });
     let result = app
-        .handle_card_action(value)
+        .host_action(value)
         .await
         .expect("topic_adopt should return a result");
     assert_eq!(result.card, None, "no card refresh on failure");
@@ -1191,7 +1191,7 @@ async fn switch_card_topic_adopt_rejects_inside_topic() {
         "open_message_id": "om_switch_card",
     });
     let result = app
-        .handle_card_action(value)
+        .host_action(value)
         .await
         .expect("topic_adopt should return a result");
     assert_eq!(result.card, None, "no card refresh on rejection");
