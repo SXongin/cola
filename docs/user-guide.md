@@ -176,12 +176,16 @@ start_server = "auto"            # auto (default) | never | eager
 ```toml
 [bridge]
 # session_file = "~/.cola/sessions.json"
+# access_file = "~/.cola/access.json"
 # work_dir = "/path/to/a/project"
 # group_completion_notice = true
 # log_days = 14
 ```
 
 - **`session_file`** — where the thread↔session mapping is persisted.
+- **`access_file`** — where the Access List (the Host, ADR-0035) is persisted.
+  A missing file means the bot is unclaimed and refuses every message until
+  `/claim`.
 - **`work_dir`** — default directory for new sessions when a conversation has no
   active session (fresh chat, or after `/switch forget`). Defaults to the process
   cwd. `/new` inherits the active session's directory; `/dir` overrides per
@@ -201,6 +205,23 @@ cola attaches to an already-running OpenCode server automatically; with the
 default `auto` policy it starts its own server on demand, so no manual
 `opencode serve` is needed. If no config file exists yet, cola prints a hint
 telling you where to put one and exits.
+
+## Claim (private by default)
+
+A fresh or upgraded cola starts **unclaimed**: it refuses every message. The
+startup log prints a one-time **claim code** (8 characters, no ambiguous
+glyphs); name the Host by sending it from a **private chat** with the bot:
+
+    /claim <code>
+
+- Look for `认领码` in the log (`~/.cola/cola.log`, or the terminal when it is
+  attached). The code rotates on every restart and is never written to disk.
+- A group `/claim` is refused — claiming is a private act.
+- After a successful claim only the Host may use the bot; everyone else gets a
+  short refusal. The Host's `open_id` is stored in the Access List
+  (`[bridge] access_file`), so restarts and upgrades never re-claim.
+- Rebuilding the Feishu app changes every user's `open_id`: delete the Access
+  List file and claim again with the new code.
 
 ## Autostart
 
@@ -278,6 +299,7 @@ detailed help for any of these.
 | Command | What it does |
 | --- | --- |
 | `/dir <path> [name]` | Switch to a project: open a NEW session rooted at `<path>` |
+| `/claim <code>` | Claim this cola as Host (private chat only; code from the startup log) |
 | `/dir` | Recent Directories card: pick a folder and switch there, or open it as a fresh topic (每行「建话题」= `/topic <dir>` 的免打字版) |
 | `/switch` | Session card: browse / search / adopt / new |
 | `/switch <kw>` | Switch to a session by name/dir/id (adopts foreign ones) |
@@ -312,6 +334,11 @@ Notes:
   bound a session can use them to bind its single session.
 
 ## FAQ / troubleshooting
+
+**After upgrading, the bot refuses everything.** A fresh or upgraded cola
+starts unclaimed (ADR-0035). Find the claim code in the startup log (`认领码`)
+and send `/claim <code>` from your private chat — once. See
+[Claim](#claim-private-by-default).
 
 **The bot never sees my group messages.** Two things gate this. First, Feishu only
 pushes group messages that @-mention the bot — a server-side app setting, not
