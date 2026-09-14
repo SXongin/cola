@@ -297,3 +297,124 @@ async fn claim_survives_a_restart() {
         "the Host from the persisted list must be admitted"
     );
 }
+
+/// The permission click every card-action gate test sends: the highest-stakes
+/// button in cola (it runs tools on the machine), so "no action" is observable
+/// on the backend's `reply_permission` record.
+fn permission_click() -> serde_json::Value {
+    serde_json::json!({
+        "action": "perm",
+        "reply": "once",
+        "session_id": "ses_1",
+        "request_id": "per_1",
+        "perm_label": "✅ 已允许一次",
+        "perm_color": "green",
+        "perm_body": "bash",
+    })
+}
+
+/// Once claimed, a click from anyone but the Host is refused: the ack carries
+/// a refusal Toast and nothing reaches the backend.
+#[tokio::test]
+async fn non_host_card_action_is_refused() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let replies = backend.reply_permission_calls.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_1", "/work").await;
+
+    let mut value = permission_click();
+    value["operator_open_id"] = serde_json::json!("ou_mallory");
+    let result = app.handle_card_action(value).await.expect("a refusal result");
+
+    assert!(result.card.is_none(), "a refusal must not update the card");
+    assert!(
+        result.toast.clone().unwrap_or_default().contains("仅限机主使用"),
+        "expected the private-bot refusal, got: {:?}",
+        result.toast
+    );
+    assert!(
+        replies.lock().await.is_empty(),
+        "a stranger's click must not reach the backend"
+    );
+}
+
+/// A click with no resolvable operator identity fails closed.
+#[tokio::test]
+async fn identity_less_card_action_is_refused() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let replies = backend.reply_permission_calls.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_1", "/work").await;
+
+    let result = app
+        .handle_card_action(permission_click())
+        .await
+        .expect("a refusal result");
+
+    assert!(result.card.is_none(), "a refusal must not update the card");
+    assert!(
+        result.toast.clone().unwrap_or_default().contains("仅限机主使用"),
+        "expected the private-bot refusal, got: {:?}",
+        result.toast
+    );
+    assert!(
+        replies.lock().await.is_empty(),
+        "an identity-less click must not reach the backend"
+    );
+}
+
+/// While unclaimed, every card click is refused the same way — even one that
+/// would be the Host's after a Claim.
+#[tokio::test]
+async fn unclaimed_bot_refuses_card_actions() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config_unclaimed(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let replies = backend.reply_permission_calls.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_1", "/work").await;
+
+    let mut value = permission_click();
+    value["operator_open_id"] = serde_json::json!(TEST_HOST);
+    let result = app.handle_card_action(value).await.expect("a refusal result");
+
+    assert!(result.card.is_none(), "a refusal must not update the card");
+    assert!(
+        result.toast.clone().unwrap_or_default().contains("尚未认领"),
+        "expected the unclaimed refusal, got: {:?}",
+        result.toast
+    );
+    assert!(
+        replies.lock().await.is_empty(),
+        "an unclaimed cola must not act on a click"
+    );
+}
+
+/// The Host's click is unchanged: it reaches the backend and returns the
+/// flow's result.
+#[tokio::test]
+async fn host_card_action_proceeds() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let replies = backend.reply_permission_calls.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_1", "/work").await;
+
+    let result = app.host_action(permission_click()).await.expect("a result card");
+
+    assert_eq!(result.toast.as_deref(), Some("已允许本次执行"));
+    assert_eq!(
+        replies.lock().await.clone(),
+        vec![("per_1".to_string(), "once".to_string())],
+        "the Host's click must reach the backend"
+    );
+}
