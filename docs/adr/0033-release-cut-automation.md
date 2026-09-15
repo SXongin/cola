@@ -54,6 +54,9 @@ cut from the manifest bump to the pushed tag, keeping every existing gate.
    crates.io after (ADR-0030), and keeps its tag-equals-manifest guard as the
    backstop for hand cuts.
 
+   > **Amended 2026-09-15**: a pre-packaging release-identity check is added;
+   > see the amendment at the end of this ADR.
+
 ## Considered options
 
 - **Tag-first: CI writes the version from the tag.** The habit from
@@ -80,3 +83,12 @@ cut from the manifest bump to the pushed tag, keeping every existing gate.
 - Hand-cutting a release remains possible but undocumented; `release.yml`'s
   tag-equals-manifest guard still catches the version half of the invariant,
   and the tag-on-`main` half is checked by the command.
+
+## Amendment (2026-09-15): the release identity is verified before packaging
+
+Issue #158's fix adds one step to `release.yml`: on each platform, the built
+binary's `--version` must equal `cola <tag>` before an archive is packaged.
+It is a second guard over the same ADR-0027 identity contract decision 4 cites
+— `build.rs` had silently left `COLA_RELEASE` unset, so 0.8.0–0.8.3 shipped
+`-dev` binaries. Decision 4's "unchanged" describes the shape of the cut, not
+a freeze on adding read-only checks to it.
