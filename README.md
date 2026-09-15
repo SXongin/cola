@@ -39,14 +39,17 @@ own binary in place, which a root-owned path like `/usr/local/bin` would block:
   `PATH` (via the Environment Variables dialog), then reopen the terminal.
   `AppData\Local` is user-writable and not roamed, unlike `AppData\Roaming`.
 
-Or install from [crates.io](https://crates.io/crates/colark) (any platform with a
-Rust toolchain, edition 2024): `cargo install colark`. The binary is still named
-`cola`. Updates follow the install channel: a `cargo install` (or
+Or install from [crates.io](https://crates.io/crates/colark) with a Rust
+toolchain (edition 2024): `cargo install colark`. Source builds need a C
+compiler and linker (the TLS stack builds AWS-LC); on Windows, NASM as well (or
+set `AWS_LC_SYS_PREBUILT_NASM=1`). No system OpenSSL is required. The binary is
+still named `cola`. Updates follow the install channel: a `cargo install` (or
 `cargo binstall colark`) binary is updated with cargo, while an archive install
 uses cola's own updater (`/update`, `cola update`).
 
-Or build from source (Rust toolchain, edition 2024): `cargo build --release`.
-The [user guide](docs/user-guide.md#install) explains each choice in detail.
+Or build from source (same prerequisites as `cargo install`):
+`cargo build --release`. The [user guide](docs/user-guide.md#install) explains
+each choice in detail.
 
 You also need an `opencode` binary on `PATH` (see <https://opencode.ai>); cola
 starts and manages its own server, but the binary must be runnable.
