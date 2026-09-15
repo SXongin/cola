@@ -71,15 +71,37 @@ jobs:
           USE_GITHUB_TOKEN: "true"
           # `opencode github run` never answers permission asks, so any request
           # that would prompt hangs the job until the timeout. Deny edits, and
-          # deny bash except read-only gh/git (upstream's own review workflow
-          # posture, plus an explicit `gh pr review` denial so the approval
-          # stays with the step below); allow the asks a review must not trip:
+          # deny bash except the read-only verbs a review needs (upstream's own
+          # review workflow posture, plus an explicit `gh pr review` denial so
+          # the approval stays with the step below — anything else, `gh api`
+          # included, stays denied); allow the asks a review must not trip:
           # paths outside the checkout and .env reads (the runner holds no
           # .env secrets).
           OPENCODE_PERMISSION: |
             {
               "edit": "deny",
-              "bash": {"*": "deny", "git *": "allow", "gh *": "allow", "gh pr review*": "deny"},
+              "bash": {
+                "*": "deny",
+                "git diff*": "allow",
+                "git show*": "allow",
+                "git log*": "allow",
+                "git status*": "allow",
+                "git blame*": "allow",
+                "git grep*": "allow",
+                "git rev-parse*": "allow",
+                "git ls-files*": "allow",
+                "git ls-tree*": "allow",
+                "git cat-file*": "allow",
+                "gh pr view*": "allow",
+                "gh pr diff*": "allow",
+                "gh pr list*": "allow",
+                "gh issue view*": "allow",
+                "gh issue list*": "allow",
+                "gh search*": "allow",
+                "gh release view*": "allow",
+                "gh repo view*": "allow",
+                "gh pr review*": "deny"
+              },
               "external_directory": "allow",
               "read": {"*.env": "allow", "*.env.*": "allow"}
             }
@@ -94,14 +116,16 @@ jobs:
             Rules:
             - Read-only: editing tools are disabled and any unpushed change
               would fail the run. Do not try to write.
-            - Shell access is limited to read-only `git` and `gh` commands
-              (for example `gh pr diff`, `gh issue view`); everything else is
-              denied. Do not post reviews, comments, or labels yourself; the
-              workflow posts this response and approves when the verdict below
-              is PASS.
+            - Shell access is limited to read-only commands: `git
+              diff/show/log/status/blame/grep/ls-files` and `gh pr view`,
+              `gh pr diff`, `gh issue view`, `gh search`. Everything else,
+              `gh api` included, is denied. Do not post reviews, comments, or
+              labels yourself; the workflow posts this response and approves
+              when the verdict below is PASS.
             - A missing or failed part of the review is a blocking finding.
 
-            Finish with exactly one final line, with nothing after it:
+            Finish with exactly one final line, on its own line and with
+            nothing after it — no punctuation, no code fence:
             OPENCODE_REVIEW_VERDICT: PASS
               when the review is complete and nothing blocks merging;
             OPENCODE_REVIEW_VERDICT: FAIL
@@ -125,12 +149,20 @@ jobs:
             echo "PR head moved from $REVIEWED_SHA to $head; the run for it decides."
             exit 0
           fi
+          # Only a verdict on its own final line counts; the handler appends a
+          # session footer after the model's response, so scan for the last
+          # line-final marker instead of a substring. Nothing found means no
+          # approval.
           verdict=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments?per_page=100" --paginate \
             --jq '[.[] | select(.user.login == "github-actions[bot]" or .user.login == "github-actions")] | last | (.body // "")' \
-            | grep -o 'OPENCODE_REVIEW_VERDICT: [A-Z]*' | tail -n 1 || true)
-          if [ "$verdict" != "OPENCODE_REVIEW_VERDICT: PASS" ]; then
+            | sed -nE 's/.*OPENCODE_REVIEW_VERDICT: (PASS|FAIL)[[:space:]]*$/\1/p' | tail -n 1 || true)
+          if [ "$verdict" != "PASS" ]; then
             echo "Verdict: ${verdict:-none}; not approving."
             exit 0
           fi
-          gh pr review "$PR" --approve \
-            --body "Automated review found no blocking findings."
+          # Pin the approval to the reviewed commit, so a push racing this call
+          # cannot land an approval on a commit no review has seen.
+          gh api -X POST "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" \
+            -f event=APPROVE \
+            -f commit_id="$REVIEWED_SHA" \
+            -f body="Automated review found no blocking findings."
