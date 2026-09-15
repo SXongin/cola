@@ -200,27 +200,23 @@ impl SnapshotClaims {
             }
         }
         // Build each receipt from the host's adopt-time request BEFORE the
-        // claim (and with it the request lookup) is dropped.
-        let receipts: Vec<(String, String)> = resolved
-            .iter()
-            .filter_map(|id| {
-                self.claims.get(id).map(|(message_id, _)| {
-                    let line = self
-                        .hosts
-                        .get(message_id)
-                        .and_then(|host| host.data.pending.iter().find(|r| r.id() == id))
-                        .map(crate::bridge::request::snapshot_handled_elsewhere_receipt)
-                        .unwrap_or_default();
-                    (message_id.clone(), line)
-                })
-            })
-            .collect();
-        for (message_id, line) in receipts {
-            if line.is_empty() {
+        // claim (and with it the request lookup) is dropped. Iterating the
+        // host's pendings — the order the blocks rendered in — keeps several
+        // resolutions in one sweep a deterministic receipt order (the claim
+        // map's own iteration order is not).
+        for message_id in &affected {
+            let Some(host) = self.hosts.get(message_id) else {
                 continue;
-            }
-            if let Some(host) = self.hosts.get_mut(&message_id) {
-                host.receipts.push(line);
+            };
+            let lines: Vec<String> = host
+                .data
+                .pending
+                .iter()
+                .filter(|req| resolved.iter().any(|id| id == req.id()))
+                .map(crate::bridge::request::snapshot_handled_elsewhere_receipt)
+                .collect();
+            if let Some(host) = self.hosts.get_mut(message_id) {
+                host.receipts.extend(lines);
             }
         }
         for id in &resolved {
@@ -356,6 +352,18 @@ mod tests {
         }
     }
 
+    /// Like [`data_with`], but each permission gets its own pattern — receipts
+    /// name their target, so the rendered order is observable.
+    fn data_with_patterns(ids: &[(&str, &str)]) -> SnapshotData {
+        let mut data = data_with(&ids.iter().map(|(id, _)| *id).collect::<Vec<_>>());
+        for (req, (_, pattern)) in data.pending.iter_mut().zip(ids) {
+            if let PendingRequest::Permission(p) = req {
+                p.patterns = vec![pattern.to_string()];
+            }
+        }
+        data
+    }
+
     fn empty_state() -> SnapshotQuestionState {
         SnapshotQuestionState::new()
     }
@@ -434,6 +442,25 @@ mod tests {
             !claims.is_tombstoned("p3"),
             "host gone → nothing can re-render, tombstone pruned"
         );
+    }
+
+    /// #175: one sweep resolving several claims leaves their receipts in the
+    /// order the blocks rendered in — never the claim map's iteration order.
+    #[test]
+    fn drop_vanished_keeps_receipts_in_block_order() {
+        let mut claims = SnapshotClaims::default();
+        claims.claim(
+            "mid_1",
+            "接管",
+            "title",
+            &data_with_patterns(&[("p1", "first"), ("p2", "second")]),
+        );
+        let dropped = claims.drop_vanished(ClaimKind::Permission, &HashSet::new(), &HashSet::new());
+        assert_eq!(dropped.len(), 1);
+        let card = dropped[0].1.to_string();
+        let first = card.find("`first`").expect("first receipt present");
+        let second = card.find("`second`").expect("second receipt present");
+        assert!(first < second, "receipts follow the block order: {card}");
     }
 
     /// #144: a claim hosted from a directory whose list call failed must
