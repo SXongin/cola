@@ -4,6 +4,7 @@
 //! [`crate::bridge::test_support`].
 
 pub(crate) mod access;
+pub(crate) mod card_handles;
 pub(crate) mod config_commands;
 pub(crate) mod dir;
 pub(crate) mod external;
