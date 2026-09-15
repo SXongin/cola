@@ -832,3 +832,94 @@ async fn external_reply_render_times_out_and_finalizes_partial_content() {
         done_header
     );
 }
+
+/// The user's external message stays ABOVE the streamed reply even though the
+/// reply's parts carry server times (the preview is keyed just before the
+/// turn's epoch): keying the whole timeline by part time must not reorder the
+/// synthetic preview against the in-flight turn (regression guard for the
+/// external-reply card composition, ADR-0028).
+#[tokio::test]
+async fn external_reply_keeps_the_user_message_above_it() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.external_user_message = Some("OpenChamber 里发的消息".to_string());
+    // The external message was posted half a minute ago; the reply's parts
+    // carry real server times after it but well before cola renders them.
+    mock.external_user_created.lock().unwrap().replace(now - 30_000);
+    mock.external_reply_parts = Some(serde_json::json!([
+        { "type": "step-start", "snapshot": "x" },
+        { "type": "reasoning", "text": "我来看看目录。",
+          "time": { "start": now - 20_000, "end": now - 19_000 } },
+        { "type": "text", "text": "目录里有 src。",
+          "time": { "start": now - 18_000, "end": now - 17_000 } },
+        { "type": "step-finish", "reason": "stop" },
+    ]));
+    let reply_ready = mock.external_reply_ready.clone();
+    let (app, platform) = build_app(cfg, mock).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
+            session_id: "ses_ext".into(),
+            directory: dir.path().to_string_lossy().to_string(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+    // The watermark sits before the external message, so it is "new".
+    app.external
+        .last_user_msg_epoch
+        .lock()
+        .await
+        .insert("ses_ext".into(), now - 60_000);
+    app.external
+        .poll_interval_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            let _ = app.external.poll_loop(&app.core).await;
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    reply_ready.store(true, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
+    let calls = platform.calls.lock().await.clone();
+    let card = calls
+        .iter()
+        .rev()
+        .find_map(|c| match c {
+            PlatformCall::UpdateMessage { card, .. } => Some(card.clone()),
+            _ => None,
+        })
+        .expect("the notification card must be updated in place");
+    let elements = card["body"]["elements"].as_array().expect("elements");
+    let index_of = |needle: &str| {
+        elements
+            .iter()
+            .position(|e| {
+                e["content"].as_str().is_some_and(|c| c.contains(needle))
+                    || e["header"]["title"]["content"]
+                        .as_str()
+                        .is_some_and(|t| t.contains(needle))
+            })
+            .unwrap_or_else(|| panic!("{} not on the card: {}", needle, card))
+    };
+    let user_message = index_of("OpenChamber 里发的消息");
+    let reasoning = index_of("推理过程");
+    let reply = index_of("目录里有 src。");
+    assert!(
+        user_message < reasoning && reasoning < reply,
+        "the user's message must stay above the streamed reply: {}",
+        card
+    );
+}

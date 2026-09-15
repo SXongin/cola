@@ -276,8 +276,10 @@ impl ExternalFlow {
             .and_then(|e| e.variant.clone());
         // Keep the external message visible: the notification card is updated in
         // place, so its preview would otherwise vanish when the reply renders.
+        // Keyed just before the turn's own epoch so the reply's parts — whose
+        // server times are at or after it — always insert BELOW the preview.
         if !preview.is_empty() {
-            acc.push_text(&format!("👤 {}", preview));
+            acc.push_text_at(epoch_ms - 1, &format!("👤 {}", preview));
         }
         {
             let mut cards = core.cards.lock().await;
@@ -416,7 +418,7 @@ impl ExternalFlow {
                 static_text.push_str(&format!("\n{role} {text}"));
             }
         }
-        acc.push_text(&static_text);
+        acc.push_text_at(epoch_ms - 1, &static_text);
         // The adopt-time pending blocks ride as inline sections: the poll's
         // inline dedupe (push_inline sees them already present) prevents a
         // duplicate, and clicking one takes the normal inline path — resolved

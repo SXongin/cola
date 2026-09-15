@@ -450,14 +450,23 @@ impl StreamAccumulator {
     /// deliver parts out of order (a panel whose content lands after later
     /// parts), so appending would put it after content that follows it — the
     /// ordering bug that moved a gated command below its receipt. Equal keys
-    /// keep insertion order. A key behind the live slice clamps to its start:
-    /// the finalized card that owned that position is already sent, and the top
-    /// of the live card is the closest honest place left.
+    /// keep insertion order.
+    ///
+    /// A key behind the live slice inserts at its start: the finalized card
+    /// that owned that position is already sent, and the top of the live card
+    /// is the closest honest place left. Both the index AND the key clamp then
+    /// (to the live slice's first key), so the timeline stays sorted and key
+    /// lookups stay sound.
     fn insert_kind(&mut self, key: i64, kind: TimelineKind) {
-        let idx = self
-            .timeline
-            .partition_point(|item| item.key <= key)
-            .max(self.render_from);
+        let idx = self.timeline.partition_point(|item| item.key <= key);
+        let (idx, key) = if idx < self.render_from {
+            (
+                self.render_from,
+                self.timeline.get(self.render_from).map_or(key, |i| i.key),
+            )
+        } else {
+            (idx, key)
+        };
         self.timeline.insert(idx, TimelineItem { key, kind });
         self.last_key = self.last_key.max(key);
     }
@@ -487,7 +496,9 @@ impl StreamAccumulator {
     /// consecutive text chunks so the card doesn't produce one element each).
     /// Text is chunked so no single timeline item exceeds `MAX_CARD_TEXT_CHARS`
     /// — the card splitter can then break a long answer across cards at item
-    /// boundaries instead of truncating it.
+    /// boundaries instead of truncating it. Production renders go through
+    /// [`Self::push_text_at`]; this convenience form is test-only.
+    #[cfg(test)]
     pub fn push_text(&mut self, chunk: &str) {
         let key = self.next_order();
         self.push_text_at(key, chunk);
