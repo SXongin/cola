@@ -380,13 +380,27 @@ impl StreamAccumulator {
         }
     }
 
-    /// Keep the blocks `keep` accepts — a kind's sweep strips only its own
-    /// kind's vanished blocks (see `RequestKind::retain_inline`). Returns how
-    /// many blocks were removed.
-    pub fn retain_interactions(&mut self, keep: impl Fn(&InteractionBlock) -> bool) -> usize {
-        let before = self.interactions.len();
-        self.interactions.retain(keep);
-        before - self.interactions.len()
+    /// Resolve every live block `vanished` accepts into its Interaction Receipt
+    /// — a kind's sweep passes only its own kind's vanished blocks (see
+    /// `RequestKind::resolve_vanished_inline`), so the receipt is written at
+    /// the resolution moment and the tombstone keeps a racing poll from
+    /// re-surfacing the block. Returns how many blocks were resolved; the
+    /// caller repaints each affected card (ADR-0038, rule 5).
+    pub fn resolve_vanished(
+        &mut self,
+        vanished: impl Fn(&InteractionBlock) -> bool,
+        line: impl Fn(&InteractionBlock) -> String,
+    ) -> usize {
+        let ids: Vec<String> = self
+            .interactions
+            .iter()
+            .filter(|b| b.is_live() && vanished(b))
+            .map(|b| b.request_id().to_string())
+            .collect();
+        for id in &ids {
+            self.resolve_interaction(id, &line);
+        }
+        ids.len()
     }
 
     /// The live permission blocks, in render order. Currently test-only: the

@@ -23,6 +23,10 @@ struct ClaimedSnapshot {
     verb: String,
     title: String,
     data: SnapshotData,
+    /// Interaction Receipt lines for claims resolved by another client
+    /// (#175): rendered under the still-live blocks, so a resolved block
+    /// leaves a visible residue instead of silently vanishing.
+    receipts: Vec<String>,
 }
 
 /// The ADR-0028 claim registry: which snapshot card hosts which adopt-time
@@ -93,6 +97,7 @@ impl SnapshotClaims {
                 verb: verb.to_string(),
                 title: title.to_string(),
                 data: data.clone(),
+                receipts: Vec::new(),
             });
         for req in &data.pending {
             let kind = req.claim_kind();
@@ -129,6 +134,7 @@ impl SnapshotClaims {
             &host.title,
             &data,
             question_state,
+            &host.receipts,
         ))
     }
 
@@ -158,10 +164,11 @@ impl SnapshotClaims {
     /// Drop the claims of `kind` whose request left the pending list (resolved
     /// by another client, or already dropped by a button click), tombstone
     /// them, and re-render each affected host ONCE without the resolved
-    /// blocks. A claim hosted from a directory whose list call failed is kept:
-    /// that directory said nothing, so its request may still be pending
-    /// (#130, #144). Returns `(message_id, card)` for the caller to patch;
-    /// never marks the snapshot stale — that patch targets standalone cards.
+    /// blocks — each leaves its Interaction Receipt (#175, ADR-0038 rule 4). A
+    /// claim hosted from a directory whose list call failed is kept: that
+    /// directory said nothing, so its request may still be pending (#130,
+    /// #144). Returns `(message_id, card)` for the caller to patch; never
+    /// marks the snapshot stale — that patch targets standalone cards.
     pub fn drop_vanished(
         &mut self,
         kind: ClaimKind,
@@ -190,6 +197,30 @@ impl SnapshotClaims {
                 && !affected.contains(message_id)
             {
                 affected.push(message_id.clone());
+            }
+        }
+        // Build each receipt from the host's adopt-time request BEFORE the
+        // claim (and with it the request lookup) is dropped.
+        let receipts: Vec<(String, String)> = resolved
+            .iter()
+            .filter_map(|id| {
+                self.claims.get(id).map(|(message_id, _)| {
+                    let line = self
+                        .hosts
+                        .get(message_id)
+                        .and_then(|host| host.data.pending.iter().find(|r| r.id() == id))
+                        .map(crate::bridge::request::snapshot_handled_elsewhere_receipt)
+                        .unwrap_or_default();
+                    (message_id.clone(), line)
+                })
+            })
+            .collect();
+        for (message_id, line) in receipts {
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(host) = self.hosts.get_mut(&message_id) {
+                host.receipts.push(line);
             }
         }
         for id in &resolved {
@@ -380,6 +411,14 @@ mod tests {
         let dropped = claims.drop_vanished(ClaimKind::Permission, &pending, &HashSet::new());
         assert_eq!(dropped.len(), 1, "only the affected host is rebuilt");
         assert_eq!(dropped[0].0, "mid_1");
+        assert!(
+            dropped[0]
+                .1
+                .to_string()
+                .contains("⏱ 已由其他客户端处理：⚡ 执行 Shell 命令 `ls`"),
+            "the resolved claim leaves its Interaction Receipt (#175): {}",
+            dropped[0].1
+        );
         assert!(!claims.contains("p1"));
         assert!(claims.is_tombstoned("p1"));
         assert!(claims.contains("p2"), "still-pending claim kept");
