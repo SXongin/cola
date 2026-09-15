@@ -42,6 +42,28 @@ pub struct PendingQuestion {
     pub done: Vec<bool>,
 }
 
+/// One entry in a card's interaction section: a live permission or question
+/// block. The section has ONE representation (this list on the accumulator),
+/// ONE render point (`build_card_inner`) and ONE mutation API (the
+/// `*_interaction` methods on [`StreamAccumulator`]) — every update — add,
+/// state change, resolve — goes through that seam, so what the card renders
+/// cannot drift from the accumulator's in-flight state (ADR-0038).
+#[derive(Debug, Clone)]
+pub enum InteractionBlock {
+    Permission(PendingPermission),
+    Question(PendingQuestion),
+}
+
+impl InteractionBlock {
+    /// The request this block belongs to (unique across kinds).
+    pub fn request_id(&self) -> &str {
+        match self {
+            InteractionBlock::Permission(p) => &p.request_id,
+            InteractionBlock::Question(q) => &q.request_id,
+        }
+    }
+}
+
 /// One live card per session: the streaming accumulator plus the card identity
 /// chain — the current live card's message id, updated in place by
 /// `flush_card` (including continuation cards). Replaces the two per-session
@@ -100,10 +122,9 @@ pub struct StreamAccumulator {
     /// Text chunks and tool markers in the order they happened — the card is
     /// built from this, so message ↔ tool interleaving is preserved.
     pub timeline: Vec<TimelineItem>,
-    /// Permission requests surfaced inline on this turn's card.
-    pub pending_permissions: Vec<PendingPermission>,
-    /// Question requests surfaced inline on this turn's card.
-    pub pending_questions: Vec<PendingQuestion>,
+    /// The card's interaction section: the live permission/question blocks
+    /// (and, later, their Interaction Receipts) in render order.
+    pub interactions: Vec<InteractionBlock>,
     /// Timeline index the CURRENT card starts rendering from. When a card fills
     /// up (Feishu component limit) it is finalized with a "to be continued"
     /// marker and `render_from` advances — a fresh continuation card renders the
@@ -246,12 +267,100 @@ impl StreamAccumulator {
         }
     }
 
+    /// Add an interaction block to the card's tail unless a block for the same
+    /// request is already present (the poll loop and the adopt-time snapshot
+    /// both feed blocks in). Returns whether it was added.
+    pub fn add_interaction(&mut self, block: InteractionBlock) -> bool {
+        if self.interaction(block.request_id()).is_some() {
+            return false;
+        }
+        self.interactions.push(block);
+        true
+    }
+
+    /// The block for `request_id`, if the card carries one.
+    pub fn interaction(&self, request_id: &str) -> Option<&InteractionBlock> {
+        self.interactions.iter().find(|b| b.request_id() == request_id)
+    }
+
+    /// Replace a question block's display state (the live 已选/✅ markers) in
+    /// place. Returns false when the card has no question block for the
+    /// request.
+    pub fn update_question_state(
+        &mut self,
+        request_id: &str,
+        answers: &[Option<Vec<String>>],
+        done: &[bool],
+    ) -> bool {
+        match self
+            .interactions
+            .iter_mut()
+            .find(|b| b.request_id() == request_id)
+        {
+            Some(InteractionBlock::Question(q)) => {
+                q.answers = answers.to_vec();
+                q.done = done.to_vec();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Remove the block for `request_id`. Returns whether one was removed.
+    pub fn remove_interaction(&mut self, request_id: &str) -> bool {
+        let before = self.interactions.len();
+        self.interactions.retain(|b| b.request_id() != request_id);
+        self.interactions.len() != before
+    }
+
+    /// Keep the blocks `keep` accepts — a kind's sweep strips only its own
+    /// kind's vanished blocks (see `RequestKind::retain_inline`). Returns how
+    /// many blocks were removed.
+    pub fn retain_interactions(&mut self, keep: impl Fn(&InteractionBlock) -> bool) -> usize {
+        let before = self.interactions.len();
+        self.interactions.retain(keep);
+        before - self.interactions.len()
+    }
+
+    /// The live permission blocks, in render order. Currently test-only: the
+    /// production paths mutate through the seam, and later tickets that need
+    /// the view drop the `cfg` (ADR-0038 follow-ups).
+    #[cfg(test)]
+    pub fn live_permissions(&self) -> Vec<PendingPermission> {
+        self.interactions
+            .iter()
+            .filter_map(|b| match b {
+                InteractionBlock::Permission(p) => Some(p.clone()),
+                InteractionBlock::Question(_) => None,
+            })
+            .collect()
+    }
+
+    /// The live question blocks, in render order. Test-only like
+    /// [`Self::live_permissions`].
+    #[cfg(test)]
+    pub fn live_questions(&self) -> Vec<PendingQuestion> {
+        self.interactions
+            .iter()
+            .filter_map(|b| match b {
+                InteractionBlock::Question(q) => Some(q.clone()),
+                InteractionBlock::Permission(_) => None,
+            })
+            .collect()
+    }
+
+    /// Whether the card carries any block awaiting the operator — drives the
+    /// header's awaiting-action state.
+    pub fn has_live_interactions(&self) -> bool {
+        !self.interactions.is_empty()
+    }
+
     /// Progress inputs for the header (ADR-0014): waiting flag, phase timer,
     /// and reasoning length. Elapsed is whole seconds so the header signature
     /// changes at most once per second — the flush throttle.
     pub fn header_progress(&self) -> crate::feishu::card::HeaderProgress {
         crate::feishu::card::HeaderProgress {
-            waiting: !self.pending_permissions.is_empty() || !self.pending_questions.is_empty(),
+            waiting: self.has_live_interactions(),
             elapsed: self.phase_started_at.map(|t| t.elapsed().as_secs()),
             reasoning_chars: self.reasoning.chars().count(),
         }
@@ -470,30 +579,35 @@ impl StreamAccumulator {
         }
 
         if include_tail {
-            // Inline permission requests: the whole turn lives on one card, so a
-            // pending permission renders as a section with its buttons right here.
-            for p in &self.pending_permissions {
-                builder = builder.with_text(&format!("🔐 **权限请求**\n{}", p.body));
-                for btn in crate::feishu::card::question::permission_buttons(
-                    &p.session_id,
-                    &p.request_id,
-                    &p.body,
-                    &p.directory,
-                ) {
-                    builder = builder.with_element(btn);
-                }
-            }
-            // Inline question requests (with their current display answers).
-            for q in &self.pending_questions {
-                for el in crate::feishu::card::question::question_elements(
-                    &q.request_id,
-                    &q.session_id,
-                    &q.questions,
-                    &q.directory,
-                    &q.answers,
-                    &q.done,
-                ) {
-                    builder = builder.with_element(el);
+            // The card's interaction section: the ONE render point for its
+            // blocks, in accumulated order. A permission renders its buttons
+            // right here (the whole turn lives on one card); a question renders
+            // its current display answers.
+            for block in &self.interactions {
+                match block {
+                    InteractionBlock::Permission(p) => {
+                        builder = builder.with_text(&format!("🔐 **权限请求**\n{}", p.body));
+                        for btn in crate::feishu::card::question::permission_buttons(
+                            &p.session_id,
+                            &p.request_id,
+                            &p.body,
+                            &p.directory,
+                        ) {
+                            builder = builder.with_element(btn);
+                        }
+                    }
+                    InteractionBlock::Question(q) => {
+                        for el in crate::feishu::card::question::question_elements(
+                            &q.request_id,
+                            &q.session_id,
+                            &q.questions,
+                            &q.directory,
+                            &q.answers,
+                            &q.done,
+                        ) {
+                            builder = builder.with_element(el);
+                        }
+                    }
                 }
             }
 
@@ -1157,12 +1271,12 @@ mod tests {
             "reasoning phase in sig: {}",
             acc.header_sig()
         );
-        acc.pending_permissions.push(PendingPermission {
+        acc.add_interaction(InteractionBlock::Permission(PendingPermission {
             session_id: "s".into(),
             request_id: "p".into(),
             body: "bash".into(),
             directory: "/w".into(),
-        });
+        }));
         assert!(
             acc.header_sig()
                 .contains(crate::feishu::card::AWAITING_ACTION_TITLE),

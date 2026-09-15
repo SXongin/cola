@@ -11,7 +11,7 @@ use crate::bridge::question::{
     MultiOutcome, QuestionState, action_toast, qa_completion_body, question_replay_card, stale_question_card,
 };
 use crate::bridge::snapshot_claims::ClaimKind;
-use crate::bridge::streaming::StreamAccumulator;
+use crate::bridge::streaming::{InteractionBlock, PendingPermission, PendingQuestion, StreamAccumulator};
 use crate::opencode;
 
 /// A pending request surfaced by a poll loop before it becomes a card. Carries
@@ -177,21 +177,12 @@ impl RequestKind for PermissionKind {
         };
         let body = describe_permission(p);
         let sid = p.session_id.clone().unwrap_or_default();
-        if acc
-            .pending_permissions
-            .iter()
-            .any(|pp| pp.request_id == p.request_id)
-        {
-            return false;
-        }
-        acc.pending_permissions
-            .push(crate::bridge::streaming::PendingPermission {
-                session_id: sid,
-                request_id: p.request_id.clone(),
-                body,
-                directory: dir.to_string(),
-            });
-        true
+        acc.add_interaction(InteractionBlock::Permission(PendingPermission {
+            session_id: sid,
+            request_id: p.request_id.clone(),
+            body,
+            directory: dir.to_string(),
+        }))
     }
 
     fn build_card(&self, req: &PendingRequest, dir: &str) -> serde_json::Value {
@@ -220,8 +211,13 @@ impl RequestKind for PermissionKind {
         pending: &std::collections::HashSet<String>,
         failed_dirs: &std::collections::HashSet<String>,
     ) {
-        acc.pending_permissions
-            .retain(|p| pending.contains(&p.request_id) || failed_dirs.contains(&p.directory));
+        acc.retain_interactions(|block| match block {
+            InteractionBlock::Permission(p) => {
+                pending.contains(&p.request_id) || failed_dirs.contains(&p.directory)
+            }
+            // Another kind's block is not this sweep's to judge.
+            InteractionBlock::Question(_) => true,
+        });
     }
 
     fn claim_kind(&self) -> ClaimKind {
@@ -416,19 +412,14 @@ impl RequestKind for QuestionKind {
         let PendingRequest::Question(q) = req else {
             return false;
         };
-        if acc.pending_questions.iter().any(|pq| pq.request_id == q.id) {
-            return false;
-        }
-        acc.pending_questions
-            .push(crate::bridge::streaming::PendingQuestion {
-                request_id: q.id.clone(),
-                session_id: q.session_id.clone(),
-                questions: q.questions.clone(),
-                directory: dir.to_string(),
-                answers: vec![None; q.questions.len()],
-                done: vec![false; q.questions.len()],
-            });
-        true
+        acc.add_interaction(InteractionBlock::Question(PendingQuestion {
+            request_id: q.id.clone(),
+            session_id: q.session_id.clone(),
+            questions: q.questions.clone(),
+            directory: dir.to_string(),
+            answers: vec![None; q.questions.len()],
+            done: vec![false; q.questions.len()],
+        }))
     }
 
     fn build_card(&self, req: &PendingRequest, dir: &str) -> serde_json::Value {
@@ -458,8 +449,13 @@ impl RequestKind for QuestionKind {
         pending: &std::collections::HashSet<String>,
         failed_dirs: &std::collections::HashSet<String>,
     ) {
-        acc.pending_questions
-            .retain(|q| pending.contains(&q.request_id) || failed_dirs.contains(&q.directory));
+        acc.retain_interactions(|block| match block {
+            InteractionBlock::Question(q) => {
+                pending.contains(&q.request_id) || failed_dirs.contains(&q.directory)
+            }
+            // Another kind's block is not this sweep's to judge.
+            InteractionBlock::Permission(_) => true,
+        });
     }
 
     fn claim_kind(&self) -> ClaimKind {
@@ -587,20 +583,14 @@ impl RequestKind for QuestionKind {
                 };
                 // Keep the inline card's display answers and done flags in sync.
                 if inline
-                    && let Some(pq) = core
+                    && let Some(acc) = core
                         .cards
                         .lock()
                         .await
                         .get_mut(host.as_deref().unwrap_or(session_id))
                         .map(|c| &mut c.acc)
-                        .and_then(|acc| {
-                            acc.pending_questions
-                                .iter_mut()
-                                .find(|pq| pq.request_id == req_id)
-                        })
                 {
-                    pq.answers = display.clone();
-                    pq.done = done.clone();
+                    acc.update_question_state(req_id, &display, &done);
                 }
                 if answered_count == n {
                     // All questions answered → claim the request and submit.
@@ -644,7 +634,7 @@ impl RequestKind for QuestionKind {
                             .get_mut(host.as_deref().unwrap_or(session_id))
                             .map(|c| &mut c.acc)
                     {
-                        acc.pending_questions.retain(|pq| pq.request_id != req_id);
+                        acc.remove_interaction(req_id);
                     }
                     let mut r = result_card("✅ 已回答", "green", &qa_completion_body(&questions, &answers));
                     if inline {
@@ -776,7 +766,7 @@ impl RequestKind for QuestionKind {
                         .get_mut(host.as_deref().unwrap_or(session_id))
                         .map(|c| &mut c.acc)
                 {
-                    acc.pending_questions.retain(|pq| pq.request_id != req_id);
+                    acc.remove_interaction(req_id);
                 }
                 let mut r = result_card("✅ 已回答", "green", &qa_completion_body(&questions, &answers));
                 if inline {
@@ -843,7 +833,7 @@ impl RequestKind for QuestionKind {
                         .get_mut(host.as_deref().unwrap_or(session_id))
                         .map(|c| &mut c.acc)
                 {
-                    acc.pending_questions.retain(|pq| pq.request_id != req_id);
+                    acc.remove_interaction(req_id);
                 }
                 let mut r = result_card("🚫 已拒绝回答", "red", "已拒绝回答 AI 的问题。");
                 if inline {
@@ -1516,9 +1506,10 @@ async fn drop_surfaced(flow: &RequestFlow, core: &Arc<SharedCore>, host: &Option
     if let Some(host) = host
         && let Some(acc) = core.cards.lock().await.get_mut(host).map(|c| &mut c.acc)
     {
-        let before = acc.pending_permissions.len();
-        acc.pending_permissions.retain(|p| !ids.contains(&p.request_id));
-        dropped_inline = acc.pending_permissions.len() != before;
+        dropped_inline = acc.retain_interactions(|block| match block {
+            InteractionBlock::Permission(p) => !ids.contains(&p.request_id),
+            InteractionBlock::Question(_) => true,
+        }) > 0;
     }
     if dropped_inline {
         // `dropped_inline` implies `host` is Some; the fallback is unused.

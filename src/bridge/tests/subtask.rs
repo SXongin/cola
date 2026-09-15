@@ -56,8 +56,7 @@ async fn subtask_permission_routes_to_mapped_parent_and_reply_carries_directory(
         .get(&parent_id)
         .expect("parent accumulator exists")
         .acc
-        .pending_permissions
-        .clone();
+        .live_permissions();
     assert_eq!(
         perm_inline.len(),
         1,
@@ -110,7 +109,7 @@ async fn subtask_permission_routes_to_mapped_parent_and_reply_carries_directory(
             .get(&parent_id)
             .unwrap()
             .acc
-            .pending_permissions
+            .live_permissions()
             .is_empty(),
         "inline permission section should be removed after answering"
     );

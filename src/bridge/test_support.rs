@@ -1329,10 +1329,11 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
 /// Whether any card's accumulator still carries an inline section for `id`
 /// (either kind) — the #144 rig's surface probe.
 async fn inline_surface_live(app: &Arc<App>, id: &str) -> bool {
-    app.cards.lock().await.values().any(|c| {
-        c.acc.pending_permissions.iter().any(|p| p.request_id == id)
-            || c.acc.pending_questions.iter().any(|q| q.request_id == id)
-    })
+    app.cards
+        .lock()
+        .await
+        .values()
+        .any(|c| c.acc.interaction(id).is_some())
 }
 
 // ===== Session discovery & adoption (ADR-0008) =====
