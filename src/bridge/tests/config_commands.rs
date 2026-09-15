@@ -2,7 +2,9 @@ use crate::bridge::command::*;
 use crate::bridge::test_support::*;
 
 /// `/model` (no args) sends the provider-picker card (step 1 of the
-/// two-level flow): one button per provider, not per model.
+/// two-level flow): one button per provider, not per model — and the intro
+/// names the CURRENT effective model (here the session's own override, with
+/// its `/think` variant), so the user sees what a pick would replace.
 #[tokio::test]
 async fn model_no_arg_sends_picker_card() {
     let _wd = test_work_dir();
@@ -17,11 +19,27 @@ async fn model_no_arg_sends_picker_card() {
         ],
     }];
     let (app, platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: key.clone(),
+            session_id: "ses_test".into(),
+            directory: "/tmp/aa".into(),
+            agent: None,
+            model: Some("opencode/deepseek-v4-flash".into()),
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: Some("low".into()),
+        },
+    )
+    .await;
 
     crate::bridge::command::handle_command(
         &app.core,
         Command::ModelCard,
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+        key,
         "msg_model_card",
         crate::config::ConversationKind::P2p,
     )
@@ -40,10 +58,133 @@ async fn model_no_arg_sends_picker_card() {
     let text = card.to_string();
     assert!(text.contains("选择模型"), "header: {text}");
     assert!(text.contains("选择 provider"), "intro: {text}");
+    assert!(
+        text.contains("当前模型") && text.contains("opencode/deepseek-v4-flash@low"),
+        "current model line: {text}"
+    );
     assert!(text.contains("\"value\":\"opencode\""), "provider button: {text}");
     assert!(
-        !text.contains("deepseek-v4-flash"),
-        "step 1 must not show models: {text}"
+        !text.contains("\"value\":\"opencode/deepseek-v4-flash\""),
+        "step 1 must not show models as options: {text}"
+    );
+}
+
+/// With no `/model` override, the current-model line falls back to cola's
+/// configured default (`[opencode] model`).
+#[tokio::test]
+async fn model_card_falls_back_to_the_configured_default_model() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.provider_models = vec![crate::opencode::types::ProviderModels {
+        provider: "opencode".into(),
+        models: vec![model_option("gpt-4o", &[])],
+    }];
+    backend.default_model = Some(crate::opencode::types::ModelInfo {
+        id: "gpt-4o".into(),
+        provider_id: "opencode".into(),
+        variant: None,
+    });
+    let (app, platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: key.clone(),
+            session_id: "ses_test".into(),
+            directory: "/tmp/aa".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    crate::bridge::command::handle_command(
+        &app.core,
+        Command::ModelCard,
+        key,
+        "msg_model_card",
+        crate::config::ConversationKind::P2p,
+    )
+    .await
+    .unwrap();
+    let text = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .find_map(|c| match c {
+            PlatformCall::ReplyCard { card, .. } => Some(card.to_string()),
+            _ => None,
+        })
+        .expect("a model card should be sent");
+    assert!(
+        text.contains("当前模型") && text.contains("`opencode/gpt-4o`"),
+        "configured default shown: {text}"
+    );
+}
+
+/// With neither an override nor a configured default, the current-model line
+/// falls back to the model the server recorded on the session.
+#[tokio::test]
+async fn model_card_falls_back_to_the_server_recorded_model() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.provider_models = vec![crate::opencode::types::ProviderModels {
+        provider: "opencode".into(),
+        models: vec![model_option("gpt-4o", &[])],
+    }];
+    backend.session_model = Some(crate::opencode::types::SessionModel {
+        provider_id: "opencode".into(),
+        id: "gpt-4o".into(),
+    });
+    let (app, platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: key.clone(),
+            session_id: "ses_test".into(),
+            directory: "/tmp/aa".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    crate::bridge::command::handle_command(
+        &app.core,
+        Command::ModelCard,
+        key,
+        "msg_model_card",
+        crate::config::ConversationKind::P2p,
+    )
+    .await
+    .unwrap();
+    let text = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .find_map(|c| match c {
+            PlatformCall::ReplyCard { card, .. } => Some(card.to_string()),
+            _ => None,
+        })
+        .expect("a model card should be sent");
+    assert!(
+        text.contains("当前模型") && text.contains("`opencode/gpt-4o`"),
+        "server-recorded model shown: {text}"
     );
 }
 
@@ -114,7 +255,8 @@ async fn model_card_button_records_override() {
 }
 
 /// The model picker's back button (level `provider`, `__providers__`)
-/// returns to the full provider list.
+/// returns to the full provider list, now carrying the session's current
+/// model line.
 #[tokio::test]
 async fn model_picker_back_button_returns_to_providers() {
     let _wd = test_work_dir();
@@ -132,6 +274,22 @@ async fn model_picker_back_button_returns_to_providers() {
         },
     ];
     let (app, _platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: key.clone(),
+            session_id: "ses_test".into(),
+            directory: "/tmp/aa".into(),
+            agent: None,
+            model: Some("openrouter/gpt-4o".into()),
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
     let value = serde_json::json!({
         "action": "model",
         "level": "provider",
@@ -143,6 +301,10 @@ async fn model_picker_back_button_returns_to_providers() {
     let card = result.card.expect("back returns a card");
     let text = card.to_string();
     assert!(text.contains("opencode") && text.contains("openrouter"), "{text}");
+    assert!(
+        text.contains("当前模型") && text.contains("openrouter/gpt-4o"),
+        "rebuilt provider list carries the current model: {text}"
+    );
     assert!(
         !text.contains("deepseek-v4-flash"),
         "provider list, not models: {text}"

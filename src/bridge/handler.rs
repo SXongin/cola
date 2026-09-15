@@ -1238,7 +1238,12 @@ impl App {
         {
             let providers = core.opencode.list_models().await;
             let cards = if picked == crate::feishu::card::picker::PICKER_BACK_TO_PROVIDERS {
-                crate::feishu::card::picker::build_model_provider_cards(&thread_key, &providers)
+                let current = crate::bridge::command::current_model_label(core, &thread_key).await;
+                crate::feishu::card::picker::build_model_provider_cards(
+                    &thread_key,
+                    &providers,
+                    current.as_deref(),
+                )
             } else {
                 let models: Vec<crate::opencode::types::ModelOption> = providers
                     .iter()

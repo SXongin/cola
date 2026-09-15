@@ -1268,18 +1268,38 @@ async fn send_agent_card(
 
 /// Send the `/model` provider-picker cards (ADR-0012, issue 05): step 1 of a
 /// two-level provider → model flow, chunked so any provider count stays under
-/// Feishu's card limits.
+/// Feishu's card limits. The intro carries the CURRENT model
+/// ([`current_model_label`]) so the user sees what a pick would replace.
 async fn send_model_card(
     core: &Arc<SharedCore>,
     thread_key: &ThreadKey,
     message_id: &str,
 ) -> crate::error::Result<()> {
+    let current = current_model_label(core, thread_key).await;
     let providers = core.opencode.list_models().await;
-    let cards = crate::feishu::card::picker::build_model_provider_cards(thread_key, &providers);
+    let cards =
+        crate::feishu::card::picker::build_model_provider_cards(thread_key, &providers, current.as_deref());
     for card in cards {
         core.feishu.reply_card(message_id, &card).await?;
     }
     Ok(())
+}
+
+/// The current model label the `/model` picker renders: `provider/model` from
+/// the effective-model ladder (session override → configured default →
+/// server-recorded), plus `@variant` when the session set a `/think` level.
+/// `None` when the thread has no session or no rung resolves — the picker then
+/// omits its current-model line. Shared by the text send path and the card-ack
+/// rebuild so both show one source of truth.
+pub(crate) async fn current_model_label(core: &Arc<SharedCore>, thread_key: &ThreadKey) -> Option<String> {
+    let entry = core.sessions.lock().await.get_active(thread_key).cloned()?;
+    let (provider, model) = core.effective_model(&entry.session_id).await?;
+    let variant = entry
+        .variant
+        .as_deref()
+        .map(|v| format!("@{v}"))
+        .unwrap_or_default();
+    Some(format!("{provider}/{model}{variant}"))
 }
 
 /// Resolve what the `/think` card should show for a thread's active session:
