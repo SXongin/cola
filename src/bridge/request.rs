@@ -181,6 +181,7 @@ impl RequestKind for PermissionKind {
             session_id: sid,
             request_id: p.request_id.clone(),
             body,
+            target: permission_target(p),
             directory: dir.to_string(),
         }))
     }
@@ -270,7 +271,7 @@ impl RequestKind for PermissionKind {
                 // re-renders without them synchronously — the poller would
                 // otherwise leave them lingering until the next poll notices
                 // the requests vanished (ADR-0038, rule 4).
-                resolve_surfaced(flow, core, host, &approved, AUTOACCEPT_RECEIPT).await;
+                resolve_surfaced(flow, core, host, &approved, autoaccept_receipt).await;
                 tracing::info!(
                     "Auto-Accept enabled via permission card on session {} (approved {})",
                     session_id,
@@ -317,13 +318,9 @@ impl RequestKind for PermissionKind {
                 // survives later flushes) and the ack below carries the
                 // clicked card's updated JSON — no PATCH race, no dependence
                 // on which card is current.
-                resolve_surfaced(
-                    flow,
-                    core,
-                    host,
-                    &[req_id.to_string()],
-                    &permission_receipt(reply),
-                )
+                resolve_surfaced(flow, core, host, &[req_id.to_string()], |block| {
+                    permission_receipt(block, reply)
+                })
                 .await;
             }
             // 404: the permission is already resolved — by another client,
@@ -332,7 +329,7 @@ impl RequestKind for PermissionKind {
             // show the neutral handled card.
             Err(e) if e.is_not_found() => {
                 tracing::info!("Permission already resolved: {}", e);
-                resolve_surfaced(flow, core, host, &[req_id.to_string()], HANDLED_ELSEWHERE_RECEIPT).await;
+                resolve_surfaced(flow, core, host, &[req_id.to_string()], handled_elsewhere_receipt).await;
                 let mut r = already_handled_result(self.label(), inline, "该权限已处理");
                 if inline {
                     r.card = ack_inline_card(core, host, session_id).await;
@@ -393,55 +390,156 @@ async fn should_auto_accept(core: &Arc<SharedCore>, session_id: &str, directory:
     .unwrap_or(false)
 }
 
-/// Receipt left when a click discovers the request was already resolved by
-/// another client (a 404 reply): neutral — never claims cola decided. The
-/// sweep adopts the same line for a block resolved remotely (#175).
-const HANDLED_ELSEWHERE_RECEIPT: &str = "⏱ 已由其他客户端处理";
+/// Prefix of the receipt left when a click discovers the request was already
+/// resolved by another client (a 404 reply): neutral — never claims cola
+/// decided. The sweep adopts the same line for a block resolved remotely
+/// (#175).
+const HANDLED_ELSEWHERE_PREFIX: &str = "⏱ 已由其他客户端处理";
 
-/// Receipt for the Auto-Accept toggle: every block it approves picks it up.
-const AUTOACCEPT_RECEIPT: &str = "🔄 已开启自动授权";
+/// Receipt prefix for the Auto-Accept toggle: every block it approves picks
+/// it up.
+const AUTOACCEPT_PREFIX: &str = "🔄 已开启自动授权";
 
-/// Receipt for a denied permission or a rejected question.
-const DENIED_RECEIPT: &str = "🚫 已拒绝";
+/// Receipt prefix for a denied permission or a rejected question.
+const DENIED_PREFIX: &str = "🚫 已拒绝";
 
-/// Cap for a Interaction Receipt's answer list: a receipt is a one-line
-/// residue, not a report.
+/// Cap for an Interaction Receipt line: a receipt is a one-line residue, not
+/// a report.
 const RECEIPT_MAX_CHARS: usize = 120;
 
-/// The Interaction Receipt for a permission decision (ADR-0038, rule 4): one
-/// markdown line in place of the block, no controls, so a late click on a
-/// stale card can never be ambiguous. Derived from cola's own reply mode,
-/// never from the click payload — a malformed callback must not be able to
-/// write arbitrary markdown onto the card. Permission decisions carry the
-/// local decision time.
-fn permission_receipt(reply: &str) -> String {
-    let time = chrono::Local::now().format("%H:%M");
-    match reply {
-        "once" => format!("✅ 已允许一次 · {time}"),
-        "always" => format!("✅ 已始终允许 · {time}"),
-        _ => DENIED_RECEIPT.to_string(),
+/// Compose one receipt line: `prefix：detail`, clipped to stay a residue. A
+/// block with no derivable detail (should not happen for a live block) keeps
+/// the bare prefix.
+fn receipt_line(prefix: &str, detail: &str) -> String {
+    if detail.is_empty() {
+        prefix.to_string()
+    } else {
+        truncate(&format!("{prefix}：{detail}"), RECEIPT_MAX_CHARS)
     }
 }
 
-/// The Interaction Receipt for a resolved question: `✅ 已回答：/a、main` — the
-/// answers in one line (skipped slots read 未作答), clipped to stay a residue.
-fn question_receipt(answers: &[Vec<String>]) -> String {
-    let parts: Vec<String> = answers
-        .iter()
-        .map(|a| {
-            if a.is_empty() {
-                "（未作答）".to_string()
+/// The target a receipt names — what the block was about. Derived from the
+/// accumulator's own block, never from the click payload: a malformed
+/// callback must not be able to write arbitrary markdown onto the card.
+/// Permissions carry their compact target (action + first pattern / edited
+/// file); questions carry their headers (or a clipped question text).
+fn receipt_target(block: &InteractionBlock) -> String {
+    match block {
+        InteractionBlock::Permission(p) => p.target.clone(),
+        InteractionBlock::Question(q) => truncate(
+            &q.questions
+                .iter()
+                .map(|qi| {
+                    if qi.header.is_empty() {
+                        truncate(&qi.question, 24)
+                    } else {
+                        qi.header.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("、"),
+            60,
+        ),
+        InteractionBlock::Receipt(_) => String::new(),
+    }
+}
+
+/// The Interaction Receipt for a permission decision (ADR-0038, rule 4):
+/// `✅ 已允许一次：⚡ 执行 Shell 命令 \`ls -la\` · 14:03`. The target comes from
+/// the block being resolved, so the residue always names what it resolved;
+/// permission decisions carry the local decision time.
+fn permission_receipt(block: &InteractionBlock, reply: &str) -> String {
+    let target = receipt_target(block);
+    let line = match reply {
+        once @ ("once" | "always") => {
+            let prefix = if once == "once" {
+                "✅ 已允许一次"
             } else {
-                a.join("、")
+                "✅ 已始终允许"
+            };
+            let time = chrono::Local::now().format("%H:%M");
+            if target.is_empty() {
+                format!("{prefix} · {time}")
+            } else {
+                format!("{prefix}：{target} · {time}")
+            }
+        }
+        _ => return receipt_line(DENIED_PREFIX, &target),
+    };
+    truncate(&line, RECEIPT_MAX_CHARS)
+}
+
+/// The Interaction Receipt for a resolved question:
+/// `✅ 已回答：目录 /a、分支 main` — each question's header (or a clipped
+/// question text) with the answers chosen for it; a skipped slot reads
+/// 未作答. `answers[i]` is the selection submitted for question `i`.
+fn question_receipt(block: &InteractionBlock, answers: &[Vec<String>]) -> String {
+    let InteractionBlock::Question(q) = block else {
+        return "✅ 已回答".to_string();
+    };
+    let parts: Vec<String> = q
+        .questions
+        .iter()
+        .enumerate()
+        .map(|(i, qi)| {
+            let label = if qi.header.is_empty() {
+                truncate(&qi.question, 24)
+            } else {
+                truncate(&qi.header, 24)
+            };
+            match answers.get(i).filter(|a| !a.is_empty()) {
+                Some(a) => format!("{label} {}", a.join("、")),
+                None => format!("{label} （未作答）"),
             }
         })
         .collect();
-    let body = if parts.is_empty() {
-        "已提交".to_string()
-    } else {
-        parts.join("、")
-    };
-    format!("✅ 已回答：{}", truncate(&body, RECEIPT_MAX_CHARS))
+    if parts.is_empty() {
+        return "✅ 已回答".to_string();
+    }
+    truncate(&format!("✅ 已回答：{}", parts.join("、")), RECEIPT_MAX_CHARS)
+}
+
+/// Receipt for the Auto-Accept toggle — names the target of each block it
+/// resolved (it can resolve several at once).
+fn autoaccept_receipt(block: &InteractionBlock) -> String {
+    receipt_line(AUTOACCEPT_PREFIX, &receipt_target(block))
+}
+
+/// Receipt for a block a click found already resolved elsewhere.
+fn handled_elsewhere_receipt(block: &InteractionBlock) -> String {
+    receipt_line(HANDLED_ELSEWHERE_PREFIX, &receipt_target(block))
+}
+
+/// Receipt for a denied permission or a rejected question.
+fn denied_receipt(block: &InteractionBlock) -> String {
+    receipt_line(DENIED_PREFIX, &receipt_target(block))
+}
+
+/// Compact one-line target for a permission's receipt: the action plus the
+/// first pattern (or the edited file for edit/patch) — what the decision was
+/// about, for when the anchor alone cannot say (poll race, sub-task child,
+/// several blocks at once). Backticks in a pattern are flattened so the
+/// markdown element cannot be broken by server-provided content.
+pub(crate) fn permission_target(p: &opencode::types::PermissionRequest) -> String {
+    let action = p.permission.as_deref().unwrap_or("?");
+    let (emoji, label) = describe_action(action);
+    let object = p
+        .patterns
+        .first()
+        .map(|s| s.trim().replace('`', "'"))
+        .filter(|s| !s.is_empty())
+        .map(|s| truncate(&s, 60))
+        .or_else(|| {
+            p.metadata
+                .as_ref()
+                .and_then(|m| m.get("filepath"))
+                .and_then(|v| v.as_str())
+                .map(|f| truncate(f, 60))
+        });
+    match object {
+        Some(object) => format!("{emoji} {label} `{object}`"),
+        None => format!("{emoji} {label}"),
+    }
 }
 
 /// The question kind: remembers the full request (via the flow, to rebuild
@@ -701,8 +799,10 @@ impl RequestKind for QuestionKind {
                         answers
                     );
                     if inline {
-                        resolve_inline_block(core, host, session_id, req_id, &question_receipt(&answers))
-                            .await;
+                        resolve_inline_block(core, host, session_id, req_id, |block| {
+                            question_receipt(block, &answers)
+                        })
+                        .await;
                     }
                     let mut r = result_card("✅ 已回答", "green", &qa_completion_body(&questions, &answers));
                     r.toast = Some("已回答".to_string());
@@ -800,7 +900,10 @@ impl RequestKind for QuestionKind {
                     answers
                 );
                 if inline {
-                    resolve_inline_block(core, host, session_id, req_id, &question_receipt(&answers)).await;
+                    resolve_inline_block(core, host, session_id, req_id, |block| {
+                        question_receipt(block, &answers)
+                    })
+                    .await;
                 }
                 let mut r = result_card("✅ 已回答", "green", &qa_completion_body(&questions, &answers));
                 r.toast = Some("已提交".to_string());
@@ -859,7 +962,7 @@ impl RequestKind for QuestionKind {
                 }
                 tracing::info!("Question rejected: {}", req_id);
                 if inline {
-                    resolve_inline_block(core, host, session_id, req_id, DENIED_RECEIPT).await;
+                    resolve_inline_block(core, host, session_id, req_id, denied_receipt).await;
                 }
                 let mut r = result_card("🚫 已拒绝回答", "red", "已拒绝回答 AI 的问题。");
                 r.toast = Some("已拒绝回答".to_string());
@@ -1498,7 +1601,7 @@ async fn settle_question_reply(
                 // The click found the request gone: leave the neutral
                 // "handled elsewhere" receipt on the clicked card, carried in
                 // the ack like any other resolution (ADR-0038, rules 3+4).
-                resolve_inline_block(core, host, session_id, req_id, HANDLED_ELSEWHERE_RECEIPT).await;
+                resolve_inline_block(core, host, session_id, req_id, handled_elsewhere_receipt).await;
             }
             let mut r = already_handled_result(kind, inline, "该问题已处理");
             if inline {
@@ -1522,18 +1625,21 @@ async fn settle_question_reply(
 /// Resolve surfaced cards for a set of answered request ids: remove the ids
 /// from the flow's `sent_cards` (so the poller doesn't keep delivering their
 /// standalone cards) and replace each of their inline blocks on the host card
-/// with `line`, the Interaction Receipt (ADR-0038, rule 4). A single request
-/// passes one id; the Auto-Accept toggle passes every id it approved so all
-/// inline blocks re-render as receipts at once.
+/// with its Interaction Receipt (ADR-0038, rule 4). A single request passes
+/// one id; the Auto-Accept toggle passes every id it approved so all inline
+/// blocks re-render as receipts at once.
 ///
-/// The receipt is written into the accumulator, never only into an ack/PATCH
-/// payload: the next flush (new part, header tick, split) re-renders it.
+/// `line` derives the receipt from the block being resolved (so the residue
+/// names the target it actually resolved, and a toggle can name each block
+/// differently). The receipt is written into the accumulator, never only into
+/// an ack/PATCH payload: the next flush (new part, header tick, split)
+/// re-renders it at its anchor.
 async fn resolve_surfaced(
     flow: &RequestFlow,
     core: &Arc<SharedCore>,
     host: &Option<String>,
     ids: &[String],
-    line: &str,
+    line: impl Fn(&InteractionBlock) -> String,
 ) {
     {
         let mut sent = flow.sent_cards.lock().await;
@@ -1545,7 +1651,7 @@ async fn resolve_surfaced(
     let mut cards = core.cards.lock().await;
     if let Some(acc) = cards.get_mut(host).map(|c| &mut c.acc) {
         for id in ids {
-            acc.resolve_interaction(id, line.to_string());
+            acc.resolve_interaction(id, &line);
         }
     }
 }
@@ -1558,7 +1664,7 @@ async fn resolve_inline_block(
     host: &Option<String>,
     session_id: &str,
     req_id: &str,
-    line: &str,
+    line: impl FnOnce(&InteractionBlock) -> String,
 ) {
     if let Some(acc) = core
         .cards
@@ -1567,7 +1673,7 @@ async fn resolve_inline_block(
         .get_mut(host.as_deref().unwrap_or(session_id))
         .map(|c| &mut c.acc)
     {
-        acc.resolve_interaction(req_id, line.to_string());
+        acc.resolve_interaction(req_id, line);
     }
 }
 

@@ -1154,7 +1154,11 @@ async fn inline_question_answered_on_streaming_card() {
         .as_ref()
         .expect("inline final answer must carry the updated card in the ack")
         .to_string();
-    assert!(ack.contains("✅ 已回答：/a、main"), "receipt missing: {}", ack);
+    assert!(
+        ack.contains("✅ 已回答：目录 /a、分支 main"),
+        "receipt missing: {}",
+        ack
+    );
     assert!(
         !ack.contains("无法回答") && !ack.contains("已选："),
         "the resolved block (and its controls) must be gone: {}",
@@ -1765,7 +1769,7 @@ async fn inline_question_submit_and_reject_leave_receipts() {
         .expect("submit must carry the updated card in the ack")
         .to_string();
     assert!(
-        ack.contains("✅ 已回答：/a、（未作答）"),
+        ack.contains("✅ 已回答：目录 /a、分支 （未作答）"),
         "submit receipt missing: {}",
         ack
     );
@@ -1793,7 +1797,11 @@ async fn inline_question_submit_and_reject_leave_receipts() {
         .as_ref()
         .expect("reject must carry the updated card in the ack")
         .to_string();
-    assert!(ack.contains("🚫 已拒绝"), "reject receipt missing: {}", ack);
+    assert!(
+        ack.contains("🚫 已拒绝：下一步"),
+        "reject receipt missing: {}",
+        ack
+    );
     assert!(
         !ack.contains("\"request_id\":\"que_reject\"") && !ack.contains("继续吗？"),
         "the rejected block (and its controls) is gone: {}",
@@ -1803,8 +1811,12 @@ async fn inline_question_submit_and_reject_leave_receipts() {
     let acc = app.cards.lock().await.get("ses_test").unwrap().acc.clone();
     assert!(acc.live_questions().is_empty());
     let rendered = acc.build_card().to_string();
-    assert!(rendered.contains("✅ 已回答：/a、（未作答）"), "{}", rendered);
-    assert!(rendered.contains("🚫 已拒绝"), "{}", rendered);
+    assert!(
+        rendered.contains("✅ 已回答：目录 /a、分支 （未作答）"),
+        "{}",
+        rendered
+    );
+    assert!(rendered.contains("🚫 已拒绝：下一步"), "{}", rendered);
 
     let calls = backend.reply_question_calls.lock().await.clone();
     assert_eq!(calls.len(), 2, "one submit + one reject: {:?}", calls);
@@ -1879,7 +1891,7 @@ async fn inline_question_click_after_remote_resolution_gets_receipt() {
         .expect("the ack must carry the clicked card")
         .to_string();
     assert!(
-        ack.contains("⏱ 已由其他客户端处理"),
+        ack.contains("⏱ 已由其他客户端处理：目录"),
         "neutral receipt missing: {}",
         ack
     );
