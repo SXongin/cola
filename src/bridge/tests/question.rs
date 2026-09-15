@@ -100,7 +100,7 @@ async fn question_poller_recovers_when_a_list_call_hangs() {
             .lock()
             .await
             .get("ses_test")
-            .map(|c| c.acc.pending_questions.iter().any(|q| q.request_id == "que_hung"))
+            .map(|c| c.acc.interaction("que_hung").is_some())
             .unwrap_or(false);
         if surfaced {
             break;
@@ -1097,8 +1097,7 @@ async fn inline_question_answered_on_streaming_card() {
         .get("ses_test")
         .unwrap()
         .acc
-        .pending_questions
-        .clone();
+        .live_questions();
     assert_eq!(pending.len(), 1, "question should be inlined");
     assert_eq!(pending[0].request_id, "que_inline");
 
@@ -1132,8 +1131,7 @@ async fn inline_question_answered_on_streaming_card() {
         .get("ses_test")
         .unwrap()
         .acc
-        .pending_questions
-        .clone();
+        .live_questions();
     assert_eq!(pending[0].answers[0], Some(vec!["/a".to_string()]));
     assert_eq!(pending[0].answers[1], None);
 
@@ -1159,7 +1157,7 @@ async fn inline_question_answered_on_streaming_card() {
             .get("ses_test")
             .unwrap()
             .acc
-            .pending_questions
+            .live_questions()
             .is_empty()
     );
 }
@@ -1248,16 +1246,16 @@ async fn failed_directory_list_keeps_question_surfaces() {
     seed_work_dir(&app).await;
 
     let mut inline_acc = crate::bridge::streaming::StreamAccumulator::new("test");
-    inline_acc
-        .pending_questions
-        .push(crate::bridge::streaming::PendingQuestion {
+    inline_acc.add_interaction(crate::bridge::streaming::InteractionBlock::Question(
+        crate::bridge::streaming::PendingQuestion {
             request_id: "que_inline".into(),
             session_id: "ses_1".into(),
             questions: vec![],
             directory: "/work".into(),
             answers: vec![],
             done: vec![],
-        });
+        },
+    ));
     assert_failed_dir_keeps_surfaces(
         &app,
         &app.question,

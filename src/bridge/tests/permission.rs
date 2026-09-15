@@ -49,8 +49,7 @@ async fn permission_poller_sends_card_and_card_action_replies() {
         .get("ses_test")
         .expect("accumulator exists")
         .acc
-        .pending_permissions
-        .clone();
+        .live_permissions();
     assert_eq!(perm_inline.len(), 1, "permission should be inlined");
     assert_eq!(perm_inline[0].request_id, "per_1");
     // The streaming card itself renders the inline permission section.
@@ -100,7 +99,7 @@ async fn permission_poller_sends_card_and_card_action_replies() {
             .get("ses_test")
             .unwrap()
             .acc
-            .pending_permissions
+            .live_permissions()
             .is_empty()
     );
 }
@@ -154,7 +153,7 @@ async fn inline_permission_click_flushes_the_card_immediately() {
             .get("ses_test")
             .unwrap()
             .acc
-            .pending_permissions
+            .live_permissions()
             .is_empty(),
         "permission should be inlined on the streaming card"
     );
@@ -434,12 +433,7 @@ async fn permission_poller_recovers_when_a_list_call_hangs() {
             .lock()
             .await
             .get("ses_test")
-            .map(|c| {
-                c.acc
-                    .pending_permissions
-                    .iter()
-                    .any(|p| p.request_id == "per_hung")
-            })
+            .map(|c| c.acc.interaction("per_hung").is_some())
             .unwrap_or(false);
         if surfaced {
             break;
@@ -517,7 +511,7 @@ async fn autoaccept_toggle_on_permission_card_flips_flag_and_approves() {
             .get("ses_test")
             .unwrap()
             .acc
-            .pending_permissions
+            .live_permissions()
             .len(),
         2
     );
@@ -574,7 +568,7 @@ async fn autoaccept_toggle_on_permission_card_flips_flag_and_approves() {
             .get("ses_test")
             .unwrap()
             .acc
-            .pending_permissions
+            .live_permissions()
             .is_empty(),
         "ALL inline sections removed after the toggle, not just the clicked one"
     );
@@ -834,14 +828,14 @@ async fn failed_directory_list_keeps_permission_surfaces() {
     seed_session(&app, "ses_1", "/work").await;
 
     let mut inline_acc = crate::bridge::streaming::StreamAccumulator::new("test");
-    inline_acc
-        .pending_permissions
-        .push(crate::bridge::streaming::PendingPermission {
+    inline_acc.add_interaction(crate::bridge::streaming::InteractionBlock::Permission(
+        crate::bridge::streaming::PendingPermission {
             session_id: "ses_1".into(),
             request_id: "per_inline".into(),
             body: "bash ls -la".into(),
             directory: "/work".into(),
-        });
+        },
+    ));
     assert_failed_dir_keeps_surfaces(
         &app,
         &app.permission,

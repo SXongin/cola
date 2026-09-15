@@ -424,24 +424,26 @@ impl ExternalFlow {
         for req in &data.pending {
             match req {
                 crate::bridge::request::PendingRequest::Permission(p) => {
-                    acc.pending_permissions
-                        .push(crate::bridge::streaming::PendingPermission {
+                    acc.add_interaction(crate::bridge::streaming::InteractionBlock::Permission(
+                        crate::bridge::streaming::PendingPermission {
                             session_id: session_id.to_string(),
                             request_id: p.request_id.clone(),
                             body: crate::bridge::request::describe_permission(p),
                             directory: data.directory.clone(),
-                        });
+                        },
+                    ));
                 }
                 crate::bridge::request::PendingRequest::Question(q) => {
-                    acc.pending_questions
-                        .push(crate::bridge::streaming::PendingQuestion {
+                    acc.add_interaction(crate::bridge::streaming::InteractionBlock::Question(
+                        crate::bridge::streaming::PendingQuestion {
                             request_id: q.id.clone(),
                             session_id: q.session_id.clone(),
                             questions: q.questions.clone(),
                             directory: data.directory.clone(),
                             answers: vec![None; q.questions.len()],
                             done: vec![false; q.questions.len()],
-                        });
+                        },
+                    ));
                     // Remember the full question request (like the static
                     // claim path): the poll loop never sees follow-hosted
                     // requests, so `prepare()` never runs for them and the

@@ -606,7 +606,7 @@ async fn busy_follow_permission_approved_resumes() {
         .get("ses_alpha01")
         .cloned()
         .expect("follow armed");
-    assert_eq!(acc.acc.pending_permissions.len(), 1);
+    assert_eq!(acc.acc.live_permissions().len(), 1);
     assert!(app.core.snapshot_claims.lock().await.claim_count() == 0);
 
     // Approve the block from the snapshot: the normal inline path replies
@@ -638,7 +638,7 @@ async fn busy_follow_permission_approved_resumes() {
             .get("ses_alpha01")
             .unwrap()
             .acc
-            .pending_permissions
+            .live_permissions()
             .is_empty(),
         "the approved section is stripped from the follow card"
     );
@@ -840,7 +840,7 @@ async fn busy_follow_question_block_resolves() {
         .get("ses_alpha01")
         .cloned()
         .expect("follow armed");
-    assert_eq!(acc.acc.pending_questions.len(), 1);
+    assert_eq!(acc.acc.live_questions().len(), 1);
     assert!(app.core.question.has_question("q_1").await);
 
     // Click an option: the single question is answered → the request
@@ -867,7 +867,7 @@ async fn busy_follow_question_block_resolves() {
             .get("ses_alpha01")
             .unwrap()
             .acc
-            .pending_questions
+            .live_questions()
             .is_empty(),
         "the answered question block is stripped from the follow card"
     );
