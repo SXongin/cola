@@ -157,7 +157,7 @@ A pending **Permission** or **Question** rendered inline inside another card —
 _Avoid_: Pending section, inline card, request block
 
 **Interaction Receipt** (回执):
-The one-line record left in place of an **Interaction Block** once its **Permission**/**Question** is resolved — by this Chat/Topic, by another client, or by Auto-Accept — stating what was decided (allowed/denied/answered/handled elsewhere). Contrast a block that simply vanishes, which leaves history unreadable and a stale click ambiguous. Distinct from a **Cargo Receipt** (cargo's install bookkeeping).
+The one-line record left in place of an **Interaction Block** once its **Permission**/**Question** is resolved — by this Chat/Topic, by another client, or by Auto-Accept — stating what was decided (allowed/denied/answered/handled elsewhere) and about what (its target: the command, file, or question). It renders anchored at the timeline position where its block was surfaced, so it stays with the content it belongs to instead of sinking with the card's tail. Contrast a block that simply vanishes, which leaves history unreadable and a stale click ambiguous. Distinct from a **Cargo Receipt** (cargo's install bookkeeping).
 _Avoid_: Result line, status card, stale marker
 
 **Quoted Context**:
