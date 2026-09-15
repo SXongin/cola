@@ -62,7 +62,7 @@ fn stamp_build_identity() {
     }
     declare_refs_changed(&git_dir.join("refs"));
 
-    let tag = git(&manifest_dir, &["describe", "--tags", "--exact-match", "HEAD"]);
+    let tag = git_value(&manifest_dir, &["describe", "--tags", "--exact-match", "HEAD"]);
     // Clean means `git status --porcelain` succeeded with empty output; a git
     // failure (None — not a repo) is neither clean nor dirty.
     let porcelain = git(&manifest_dir, &["status", "--porcelain"]);
@@ -82,10 +82,10 @@ fn stamp_build_identity() {
     }
 
     // Dev build: stamp what we can show (branch, short sha, dirty).
-    if let Some(branch) = git(&manifest_dir, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+    if let Some(branch) = git_value(&manifest_dir, &["rev-parse", "--abbrev-ref", "HEAD"]) {
         println!("cargo:rustc-env=COLA_GIT_BRANCH={branch}");
     }
-    if let Some(sha) = git(&manifest_dir, &["rev-parse", "--short", "HEAD"]) {
+    if let Some(sha) = git_value(&manifest_dir, &["rev-parse", "--short", "HEAD"]) {
         println!("cargo:rustc-env=COLA_GIT_SHA={sha}");
     }
     if porcelain.as_deref().is_some_and(|out| !out.is_empty()) {
@@ -110,7 +110,9 @@ fn declare_refs_changed(dir: &Path) {
 }
 
 /// Run a git command in `manifest_dir`; trimmed stdout on success, None when
-/// git is unavailable, the command fails, or the output is empty.
+/// git is unavailable or the command fails. Success with empty stdout is a
+/// real result (e.g. a clean `git status --porcelain`), so it returns
+/// `Some("")` — callers that need a value filter it themselves.
 fn git(manifest_dir: &str, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
         .args(["-C", manifest_dir])
@@ -120,6 +122,11 @@ fn git(manifest_dir: &str, args: &[&str]) -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!text.is_empty()).then_some(text)
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// A [`git`] result that must carry a value: a successful-but-empty stdout is
+/// dropped, for the provenance fields that are only meaningful when non-empty.
+fn git_value(manifest_dir: &str, args: &[&str]) -> Option<String> {
+    git(manifest_dir, args).filter(|out| !out.is_empty())
 }
