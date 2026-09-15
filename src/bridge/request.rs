@@ -523,19 +523,26 @@ fn denied_receipt(block: &InteractionBlock) -> String {
 pub(crate) fn permission_target(p: &opencode::types::PermissionRequest) -> String {
     let action = p.permission.as_deref().unwrap_or("?");
     let (emoji, label) = describe_action(action);
-    let object = p
+    let pattern = p
         .patterns
         .first()
         .map(|s| s.trim().replace('`', "'"))
         .filter(|s| !s.is_empty())
-        .map(|s| truncate(&s, 60))
-        .or_else(|| {
-            p.metadata
-                .as_ref()
-                .and_then(|m| m.get("filepath"))
-                .and_then(|v| v.as_str())
-                .map(|f| truncate(f, 60))
-        });
+        .map(|s| truncate(&s, 60));
+    let file = p
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("filepath"))
+        .and_then(|v| v.as_str())
+        .filter(|f| !f.is_empty())
+        .map(|f| truncate(f, 60));
+    // An edit/patch is about the file (the body shows its diff); every other
+    // action is about its first pattern.
+    let object = if matches!(action, "edit" | "patch" | "apply_patch") {
+        file.or(pattern)
+    } else {
+        pattern.or(file)
+    };
     match object {
         Some(object) => format!("{emoji} {label} `{object}`"),
         None => format!("{emoji} {label}"),
