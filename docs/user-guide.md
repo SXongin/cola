@@ -73,9 +73,9 @@ self-update — see [Self-update](#self-update).
 **Other platforms.** There is no prebuilt asset for Linux aarch64 or Intel
 macOS; a GitHub-channel self-update reports "no asset for this platform"
 instead of failing (cargo installs are unaffected — they update through
-crates.io). Build from source (Rust toolchain, edition 2024):
-`cargo build --release`; `cargo install --path .` also places the binary in a
-user-writable directory.
+crates.io). Build from source (same prerequisites as the crates.io install
+above): `cargo build --release`; `cargo install --path .` also places the
+binary in a user-writable directory.
 
 Also make sure an `opencode` binary is on `PATH` — cola discovers and spawns it.
 The autostart launcher snapshots your `PATH` at `cola autostart enable` time, so
