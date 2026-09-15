@@ -1,9 +1,8 @@
 # OpenCode reviews every non-draft PR from this repository on the two axes from
 # CONTRIBUTING.md "Reviewing" and approves it when the review finds nothing
 # blocking. That approval is the automated non-author review the `main: review`
-# ruleset needs. It runs alongside CodeRabbit while #163 decides the handover;
-# deleting `.coderabbit.yaml` and amending ADR-0034/CONTRIBUTING.md is the
-# second half of that issue.
+# ruleset needs (ADR-0034 item 6); it replaced CodeRabbit, whose automatic
+# reviews skip public repositories under ten stars.
 #
 # Requires the repository setting Actions -> General -> "Allow GitHub Actions
 # to create and approve pull requests". `require_last_push_approval` on the
