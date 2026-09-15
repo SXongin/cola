@@ -97,11 +97,13 @@ async fn subtask_permission_routes_to_mapped_parent_and_reply_carries_directory(
     value["perm_label"] = serde_json::json!("✅ 已允许一次");
     value["perm_color"] = serde_json::json!("green");
     let result = app.host_action(value).await;
-    assert!(result.is_some(), "reply should succeed for subtask session");
-    assert!(
-        result.unwrap().card.is_none(),
-        "inline answer must not replace the streaming card"
-    );
+    let result = result.expect("reply should succeed for subtask session");
+    let ack = result
+        .card
+        .as_ref()
+        .expect("inline click must carry the parent card in the ack")
+        .to_string();
+    assert!(ack.contains("✅ 已允许一次 · "), "receipt missing: {}", ack);
     assert!(
         app.cards
             .lock()
@@ -111,7 +113,7 @@ async fn subtask_permission_routes_to_mapped_parent_and_reply_carries_directory(
             .acc
             .live_permissions()
             .is_empty(),
-        "inline permission section should be removed after answering"
+        "inline permission section is resolved after answering"
     );
 }
 

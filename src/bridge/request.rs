@@ -215,8 +215,8 @@ impl RequestKind for PermissionKind {
             InteractionBlock::Permission(p) => {
                 pending.contains(&p.request_id) || failed_dirs.contains(&p.directory)
             }
-            // Another kind's block is not this sweep's to judge.
-            InteractionBlock::Question(_) => true,
+            // Another kind's block (or a receipt) is not this sweep's to judge.
+            _ => true,
         });
     }
 
@@ -259,12 +259,18 @@ impl RequestKind for PermissionKind {
                     .unwrap_or_default(),
             };
             if flow.try_mark_answered(core, req_id).await {
-                let approved = core.set_auto_accept(session_id, &dir, true).await;
-                // Drop every inline section the toggle just approved (not just
-                // the clicked one) so the streaming card re-renders without
-                // them synchronously — the poller would otherwise leave them
-                // lingering until the next poll notices the requests vanished.
-                drop_surfaced(flow, core, host, &approved).await;
+                let mut approved = core.set_auto_accept(session_id, &dir, true).await;
+                // The clicked request is always resolved by the toggle, even
+                // if the backend list raced past it.
+                if !approved.iter().any(|id| id == req_id) {
+                    approved.push(req_id.to_string());
+                }
+                // Every block the toggle resolves (not just the clicked one)
+                // becomes its Interaction Receipt so the streaming card
+                // re-renders without them synchronously — the poller would
+                // otherwise leave them lingering until the next poll notices
+                // the requests vanished (ADR-0038, rule 4).
+                resolve_surfaced(flow, core, host, &approved, AUTOACCEPT_RECEIPT).await;
                 tracing::info!(
                     "Auto-Accept enabled via permission card on session {} (approved {})",
                     session_id,
@@ -272,10 +278,10 @@ impl RequestKind for PermissionKind {
                 );
             }
             let mut r = result_card("✅ 已开启自动授权", "blue", "该会话后续权限请求将自动批准。");
-            if inline {
-                r.card = None;
-            }
             r.toast = Some("已开启自动授权".to_string());
+            if inline {
+                r.card = ack_inline_card(core, host, session_id).await;
+            }
             // Re-served verbatim to a losing double-click.
             flow.remember_answered_result(req_id, &r).await;
             return Some(r);
@@ -306,16 +312,31 @@ impl RequestKind for PermissionKind {
         match reply_result {
             Ok(()) => {
                 tracing::info!("Permission reply sent: {} session={}", reply, req_id);
-                drop_surfaced(flow, core, host, &[req_id.to_string()]).await;
+                // ADR-0038 rules 3+4: the clicked block becomes its
+                // Interaction Receipt (rendered from the accumulator, so it
+                // survives later flushes) and the ack below carries the
+                // clicked card's updated JSON — no PATCH race, no dependence
+                // on which card is current.
+                resolve_surfaced(
+                    flow,
+                    core,
+                    host,
+                    &[req_id.to_string()],
+                    &permission_receipt(reply),
+                )
+                .await;
             }
             // 404: the permission is already resolved — by another client,
             // or by a click replayed after a restart cleared the in-memory
-            // guard. Benign: keep the claim, drop its surfaced section, and
+            // guard. Benign: keep the claim, leave the neutral receipt, and
             // show the neutral handled card.
             Err(e) if e.is_not_found() => {
                 tracing::info!("Permission already resolved: {}", e);
-                drop_surfaced(flow, core, host, &[req_id.to_string()]).await;
-                let r = already_handled_result(self.label(), inline, "该权限已处理");
+                resolve_surfaced(flow, core, host, &[req_id.to_string()], HANDLED_ELSEWHERE_RECEIPT).await;
+                let mut r = already_handled_result(self.label(), inline, "该权限已处理");
+                if inline {
+                    r.card = ack_inline_card(core, host, session_id).await;
+                }
                 flow.remember_answered_result(req_id, &r).await;
                 return Some(r);
             }
@@ -344,10 +365,10 @@ impl RequestKind for PermissionKind {
             perm_body.to_string()
         };
         let mut r = result_card(label, perm_color, &body);
-        if inline {
-            r.card = None;
-        }
         r.toast = Some(toast);
+        if inline {
+            r.card = ack_inline_card(core, host, session_id).await;
+        }
         flow.remember_answered_result(req_id, &r).await;
         Some(r)
     }
@@ -370,6 +391,57 @@ async fn should_auto_accept(core: &Arc<SharedCore>, session_id: &str, directory:
     })
     .await
     .unwrap_or(false)
+}
+
+/// Receipt left when a click discovers the request was already resolved by
+/// another client (a 404 reply): neutral — never claims cola decided. The
+/// sweep adopts the same line for a block resolved remotely (#175).
+const HANDLED_ELSEWHERE_RECEIPT: &str = "⏱ 已由其他客户端处理";
+
+/// Receipt for the Auto-Accept toggle: every block it approves picks it up.
+const AUTOACCEPT_RECEIPT: &str = "🔄 已开启自动授权";
+
+/// Receipt for a denied permission or a rejected question.
+const DENIED_RECEIPT: &str = "🚫 已拒绝";
+
+/// Cap for a Interaction Receipt's answer list: a receipt is a one-line
+/// residue, not a report.
+const RECEIPT_MAX_CHARS: usize = 120;
+
+/// The Interaction Receipt for a permission decision (ADR-0038, rule 4): one
+/// markdown line in place of the block, no controls, so a late click on a
+/// stale card can never be ambiguous. Derived from cola's own reply mode,
+/// never from the click payload — a malformed callback must not be able to
+/// write arbitrary markdown onto the card. Permission decisions carry the
+/// local decision time.
+fn permission_receipt(reply: &str) -> String {
+    let time = chrono::Local::now().format("%H:%M");
+    match reply {
+        "once" => format!("✅ 已允许一次 · {time}"),
+        "always" => format!("✅ 已始终允许 · {time}"),
+        _ => DENIED_RECEIPT.to_string(),
+    }
+}
+
+/// The Interaction Receipt for a resolved question: `✅ 已回答：/a、main` — the
+/// answers in one line (skipped slots read 未作答), clipped to stay a residue.
+fn question_receipt(answers: &[Vec<String>]) -> String {
+    let parts: Vec<String> = answers
+        .iter()
+        .map(|a| {
+            if a.is_empty() {
+                "（未作答）".to_string()
+            } else {
+                a.join("、")
+            }
+        })
+        .collect();
+    let body = if parts.is_empty() {
+        "已提交".to_string()
+    } else {
+        parts.join("、")
+    };
+    format!("✅ 已回答：{}", truncate(&body, RECEIPT_MAX_CHARS))
 }
 
 /// The question kind: remembers the full request (via the flow, to rebuild
@@ -453,8 +525,8 @@ impl RequestKind for QuestionKind {
             InteractionBlock::Question(q) => {
                 pending.contains(&q.request_id) || failed_dirs.contains(&q.directory)
             }
-            // Another kind's block is not this sweep's to judge.
-            InteractionBlock::Permission(_) => true,
+            // Another kind's block (or a receipt) is not this sweep's to judge.
+            _ => true,
         });
     }
 
@@ -615,6 +687,8 @@ impl RequestKind for QuestionKind {
                         self.label(),
                         reply_question_scoped(core, req_id, Some(&answers), directory).await,
                         inline,
+                        host,
+                        session_id,
                     )
                     .await
                     {
@@ -626,63 +700,28 @@ impl RequestKind for QuestionKind {
                         value.get("session_id").and_then(|v| v.as_str()).unwrap_or(""),
                         answers
                     );
-                    if inline
-                        && let Some(acc) = core
-                            .cards
-                            .lock()
-                            .await
-                            .get_mut(host.as_deref().unwrap_or(session_id))
-                            .map(|c| &mut c.acc)
-                    {
-                        acc.remove_interaction(req_id);
+                    if inline {
+                        resolve_inline_block(core, host, session_id, req_id, &question_receipt(&answers))
+                            .await;
                     }
                     let mut r = result_card("✅ 已回答", "green", &qa_completion_body(&questions, &answers));
-                    if inline {
-                        r.card = None;
-                    }
                     r.toast = Some("已回答".to_string());
                     if inline {
-                        flush_inline_card(core, host, session_id).await;
+                        r.card = ack_inline_card(core, host, session_id).await;
                     }
                     // Re-served verbatim to a losing double-click.
                     flow.remember_answered_result(req_id, &r).await;
                     Some(r)
                 } else if inline {
-                    // Inline: the streaming card re-renders with the updated
-                    // display state. Return the re-rendered card IN the
-                    // callback response so Feishu updates the CLICKED card in
-                    // place — the same mechanism standalone question cards use,
-                    // and the only one that reliably refreshes the body after an
-                    // interaction. A separate PATCH around the callback leaves
-                    // the card on its pre-answer state (the markers/已选 never
-                    // become visible), while a PATCH before the click did add the
-                    // buttons.
-                    let mut r = CardActionResult {
-                        card: None,
-                        toast: None,
+                    // Inline: the ack carries the clicked card with the updated
+                    // display state (已选/✅ markers) — the mechanism that
+                    // reliably refreshes the clicked card after a callback; a
+                    // PATCH around the callback leaves it on its pre-answer
+                    // state.
+                    let r = CardActionResult {
+                        card: ack_inline_card(core, host, session_id).await,
+                        toast: Some(action_toast(reply, n - answered_count, outcome)),
                     };
-                    r.toast = Some(action_toast(reply, n - answered_count, outcome));
-                    // Build on a CLONE so a card-component-limit split can't
-                    // advance the live accumulator's `render_from` from inside
-                    // the click handler (flush_card owns that flow). Only take
-                    // the card when it fits without splitting; otherwise fall
-                    // back to the PATCH re-render, which finalizes the card and
-                    // sends the continuation card.
-                    let rebuilt = {
-                        let mut cards = core.cards.lock().await;
-                        cards.get_mut(host.as_deref().unwrap_or(session_id)).map(|c| {
-                            let mut probe = c.acc.clone();
-                            probe.build_card_with_split()
-                        })
-                    };
-                    match rebuilt {
-                        Some((card, false)) => r.card = Some(card),
-                        _ => {
-                            // Split needed, or no live accumulator (the turn
-                            // ended between the click and now): PATCH re-render.
-                            flush_inline_card(core, host, session_id).await;
-                        }
-                    }
                     Some(r)
                 } else {
                     // Still questions left: return an updated card that shows the
@@ -747,6 +786,8 @@ impl RequestKind for QuestionKind {
                     self.label(),
                     reply_question_scoped(core, req_id, Some(&answers), directory).await,
                     inline,
+                    host,
+                    session_id,
                 )
                 .await
                 {
@@ -758,23 +799,13 @@ impl RequestKind for QuestionKind {
                     value.get("session_id").and_then(|v| v.as_str()).unwrap_or(""),
                     answers
                 );
-                if inline
-                    && let Some(acc) = core
-                        .cards
-                        .lock()
-                        .await
-                        .get_mut(host.as_deref().unwrap_or(session_id))
-                        .map(|c| &mut c.acc)
-                {
-                    acc.remove_interaction(req_id);
+                if inline {
+                    resolve_inline_block(core, host, session_id, req_id, &question_receipt(&answers)).await;
                 }
                 let mut r = result_card("✅ 已回答", "green", &qa_completion_body(&questions, &answers));
-                if inline {
-                    r.card = None;
-                }
                 r.toast = Some("已提交".to_string());
                 if inline {
-                    flush_inline_card(core, host, session_id).await;
+                    r.card = ack_inline_card(core, host, session_id).await;
                 }
                 // Re-served verbatim to a losing double-click.
                 flow.remember_answered_result(req_id, &r).await;
@@ -819,29 +850,21 @@ impl RequestKind for QuestionKind {
                     self.label(),
                     reply_question_scoped(core, req_id, None, directory).await,
                     inline,
+                    host,
+                    session_id,
                 )
                 .await
                 {
                     return Some(r);
                 }
                 tracing::info!("Question rejected: {}", req_id);
-                if inline
-                    && let Some(acc) = core
-                        .cards
-                        .lock()
-                        .await
-                        .get_mut(host.as_deref().unwrap_or(session_id))
-                        .map(|c| &mut c.acc)
-                {
-                    acc.remove_interaction(req_id);
+                if inline {
+                    resolve_inline_block(core, host, session_id, req_id, DENIED_RECEIPT).await;
                 }
                 let mut r = result_card("🚫 已拒绝回答", "red", "已拒绝回答 AI 的问题。");
-                if inline {
-                    r.card = None;
-                }
                 r.toast = Some("已拒绝回答".to_string());
                 if inline {
-                    flush_inline_card(core, host, session_id).await;
+                    r.card = ack_inline_card(core, host, session_id).await;
                 }
                 // Re-served verbatim to a losing double-click.
                 flow.remember_answered_result(req_id, &r).await;
@@ -1450,6 +1473,7 @@ fn already_handled_result(kind: &str, inline: bool, toast: &str) -> CardActionRe
 ///   losing click re-serves it) and return it.
 /// - other: genuine failure — keep the state, roll the claim back for a retry,
 ///   and return the failure card.
+#[allow(clippy::too_many_arguments)] // the click context is what the helper settles
 async fn settle_question_reply(
     flow: &RequestFlow,
     core: &Arc<SharedCore>,
@@ -1457,6 +1481,8 @@ async fn settle_question_reply(
     kind: &str,
     result: crate::error::Result<()>,
     inline: bool,
+    host: &Option<String>,
+    session_id: &str,
 ) -> Option<CardActionResult> {
     match result {
         Ok(()) => {
@@ -1468,7 +1494,16 @@ async fn settle_question_reply(
             tracing::info!("Question already resolved: {}", e);
             flow.remove_question(req_id).await;
             flow.sent_cards.lock().await.remove(req_id);
-            let r = already_handled_result(kind, inline, "该问题已处理");
+            if inline {
+                // The click found the request gone: leave the neutral
+                // "handled elsewhere" receipt on the clicked card, carried in
+                // the ack like any other resolution (ADR-0038, rules 3+4).
+                resolve_inline_block(core, host, session_id, req_id, HANDLED_ELSEWHERE_RECEIPT).await;
+            }
+            let mut r = already_handled_result(kind, inline, "该问题已处理");
+            if inline {
+                r.card = ack_inline_card(core, host, session_id).await;
+            }
             flow.remember_answered_result(req_id, &r).await;
             Some(r)
         }
@@ -1484,43 +1519,100 @@ async fn settle_question_reply(
     }
 }
 
-/// Drop surfaced cards for a set of answered request ids: remove the ids from
-/// the flow's `sent_cards` (so the poller doesn't keep delivering their cards)
-/// and strip their sections from the host streaming card's inline accumulator.
-/// A single request passes one id; the Auto-Accept toggle passes every id it
-/// approved so all inline sections re-render away at once.
+/// Resolve surfaced cards for a set of answered request ids: remove the ids
+/// from the flow's `sent_cards` (so the poller doesn't keep delivering their
+/// standalone cards) and replace each of their inline blocks on the host card
+/// with `line`, the Interaction Receipt (ADR-0038, rule 4). A single request
+/// passes one id; the Auto-Accept toggle passes every id it approved so all
+/// inline blocks re-render as receipts at once.
 ///
-/// When an inline section was actually stripped, the host card is re-rendered
-/// immediately: a permission-blocked prompt produces no new parts, so the
-/// render poll would otherwise leave the resolved section (and its still-live
-/// buttons) on the Feishu card until the AI resumes — or forever, if the turn
-/// was stopped. Same reason the question paths flush explicitly.
-async fn drop_surfaced(flow: &RequestFlow, core: &Arc<SharedCore>, host: &Option<String>, ids: &[String]) {
+/// The receipt is written into the accumulator, never only into an ack/PATCH
+/// payload: the next flush (new part, header tick, split) re-renders it.
+async fn resolve_surfaced(
+    flow: &RequestFlow,
+    core: &Arc<SharedCore>,
+    host: &Option<String>,
+    ids: &[String],
+    line: &str,
+) {
     {
         let mut sent = flow.sent_cards.lock().await;
         for id in ids {
             sent.remove(id);
         }
     }
-    let mut dropped_inline = false;
-    if let Some(host) = host
-        && let Some(acc) = core.cards.lock().await.get_mut(host).map(|c| &mut c.acc)
-    {
-        dropped_inline = acc.retain_interactions(|block| match block {
-            InteractionBlock::Permission(p) => !ids.contains(&p.request_id),
-            InteractionBlock::Question(_) => true,
-        }) > 0;
-    }
-    if dropped_inline {
-        // `dropped_inline` implies `host` is Some; the fallback is unused.
-        flush_inline_card(core, host, host.as_deref().unwrap_or_default()).await;
+    let Some(host) = host else { return };
+    let mut cards = core.cards.lock().await;
+    if let Some(acc) = cards.get_mut(host).map(|c| &mut c.acc) {
+        for id in ids {
+            acc.resolve_interaction(id, line.to_string());
+        }
     }
 }
 
-/// Re-render the live streaming card so inline question state (✅/已选, removed
-/// buttons) shows immediately. A question-blocked prompt produces no new parts,
-/// so without an explicit flush the render poll never fires until the AI
-/// resumes — the card would stay frozen on the pre-answer state.
+/// Resolve ONE inline block on the host card into its Interaction Receipt.
+/// No-op when the card does not carry the block (the kind's sweep reconciles
+/// what a click could not reach).
+async fn resolve_inline_block(
+    core: &Arc<SharedCore>,
+    host: &Option<String>,
+    session_id: &str,
+    req_id: &str,
+    line: &str,
+) {
+    if let Some(acc) = core
+        .cards
+        .lock()
+        .await
+        .get_mut(host.as_deref().unwrap_or(session_id))
+        .map(|c| &mut c.acc)
+    {
+        acc.resolve_interaction(req_id, line.to_string());
+    }
+}
+
+/// The clicked card's updated JSON, built from a CLONE of the host accumulator
+/// — a split probe that cannot advance the live `render_from` from inside a
+/// click handler (`flush_card` owns that flow). `None` when the card needs a
+/// split or no accumulator exists; the caller falls back to the PATCH flush.
+async fn inline_ack_card(
+    core: &Arc<SharedCore>,
+    host: &Option<String>,
+    session_id: &str,
+) -> Option<serde_json::Value> {
+    let mut cards = core.cards.lock().await;
+    cards
+        .get_mut(host.as_deref().unwrap_or(session_id))
+        .map(|c| {
+            let mut probe = c.acc.clone();
+            probe.build_card_with_split()
+        })
+        .and_then(|(card, full)| (!full).then_some(card))
+}
+
+/// Deliver the clicked card's updated card in the callback ack (ADR-0038,
+/// rule 3): the host accumulator was already mutated through the seam, so the
+/// ack carries the receipt / partial state atomically — no PATCH race and no
+/// dependence on which card is current. Falls back to the PATCH flush when the
+/// card needs a split or the accumulator is gone (the turn ended between the
+/// click and now).
+async fn ack_inline_card(
+    core: &Arc<SharedCore>,
+    host: &Option<String>,
+    session_id: &str,
+) -> Option<serde_json::Value> {
+    let card = inline_ack_card(core, host, session_id).await;
+    if card.is_none() {
+        flush_inline_card(core, host, session_id).await;
+    }
+    card
+}
+
+/// Re-render the live streaming card so inline interaction state (✅/已选,
+/// receipts, removed buttons) shows immediately. An interaction-blocked prompt
+/// produces no new parts, so without an explicit flush the render poll never
+/// fires until the AI resumes — the card would stay frozen on the pre-answer
+/// state. Same reason the question paths flush explicitly.
 async fn flush_inline_card(core: &Arc<SharedCore>, host: &Option<String>, session_id: &str) {
     crate::bridge::render::flush_card(core, host.as_deref().unwrap_or(session_id)).await;
 }

@@ -1162,6 +1162,22 @@ pub(crate) async fn final_card(platform: &RecordingPlatform) -> serde_json::Valu
         .expect("the final card must be updated in place")
 }
 
+/// The most recent card the platform saw, whether updated in place or sent as
+/// a split's continuation card.
+pub(crate) async fn latest_card(platform: &RecordingPlatform) -> serde_json::Value {
+    let calls = platform.calls.lock().await;
+    calls
+        .iter()
+        .rev()
+        .find_map(|c| match c {
+            PlatformCall::UpdateMessage { card, .. } | PlatformCall::ReplyCard { card, .. } => {
+                Some(card.clone())
+            }
+            _ => None,
+        })
+        .expect("a card must have been sent")
+}
+
 /// Map `entry` as its thread's active session and persist the store — the
 /// setup tests need instead of reaching into `app.sessions` directly.
 pub(crate) async fn seed_entry(app: &Arc<App>, entry: crate::config::SessionEntry) {
