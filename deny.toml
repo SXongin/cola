@@ -10,6 +10,12 @@ unmaintained = "workspace"
 
 [bans]
 multiple-versions = "warn"
+# Source installs (`cargo install colark`) must not need system OpenSSL: the
+# HTTP and WebSocket stacks use rustls. If a new dependency drags OpenSSL back
+# into the graph, fail the audit instead of shipping a build that needs libssl.
+deny = [
+  { name = "openssl-sys", reason = "rustls is the TLS stack; system OpenSSL must stay optional" },
+]
 
 [licenses]
 allow = [
