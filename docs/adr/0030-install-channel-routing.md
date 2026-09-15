@@ -9,6 +9,10 @@ installed version, and kept receiving versions a crates.io yank no longer
 offered. We decided the install channel decides the update path: a
 cargo-tracked binary is updated with cargo, everything else keeps self-update.
 
+> **Extended by ADR-0037**: `[package.metadata.binstall]` makes
+> `cargo binstall colark` install the release archives, so a binstall install
+> gets a CI-built binary and this ADR's cargo routing applies unchanged.
+
 ## Decision
 
 1. **Cargo-tracked ⇒ cargo updates it.** Before replacing a binary, `/update`

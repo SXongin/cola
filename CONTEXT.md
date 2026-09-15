@@ -172,9 +172,13 @@ _Avoid_: Version, build number (unqualified — they blur the comparison source 
 The identity baked into a cola binary at build time describing where it came from. An exact, clean release-tag checkout shows the bare **Release Version**; a crates.io package build (no `.git`, but `.cargo_vcs_info.json`) is also a release identity, marked `(crates.io)` (ADR-0030); every other build — a branch, a dirty tree, or a source tree with no git — is a dev build and shows `-dev` plus the branch/short-sha it was built from, with ⚠ when that tree was Dirty. Determines whether a binary is a release or a dev build (ADR-0027).
 _Avoid_: Version, build info, source marker
 
+**Distribution Channel** (分发渠道):
+A publishing-side channel through which cola builds are made available: GitHub Releases (release archives with `SHA256SUMS` and build-provenance attestations) and crates.io (source packages for `cargo install` / `cargo binstall`). Distinct from the **Install Channel**, which records where a given machine's binary actually came from; only the Install Channel decides the **Update Channel** (ADR-0030).
+_Avoid_: Publishing channel, release channel
+
 **Install Channel**:
 How a cola binary got onto the machine: a GitHub Release archive, crates.io (`cargo install`/`cargo binstall`), or a source build. Decides the **Update Channel** (ADR-0030).
-_Avoid_: Install method, distribution channel (that is the publishing side)
+_Avoid_: Install method, distribution channel (that is the named **Distribution Channel**, the publishing side)
 
 **Update Channel**:
 Where a running binary takes its updates from: GitHub Releases self-update for binaries cargo does not track; crates.io (via the cargo commands) for a binary with a **Cargo Receipt**. Set by the **Install Channel**, never mixed (ADR-0030).
@@ -219,6 +223,7 @@ _Avoid_: Notification, message, signal
 - A prompt's **Quoted Context** and **Image Attachment**s enrich the **Session** the reply belongs to
 - A **Command** is parsed by the **Bridge** from message text before routing to the **Backend**
 - Every **Cola-Authored Message** carries a `msg_cola_` id chosen by the **Bridge**; external-message sync treats only user messages newer than the **Sync Watermark** that are NOT **Cola-Authored Message**s as **External Message**s
+- A **Distribution Channel** publishes builds; a machine's **Install Channel** records which one it got them from
 - A **Cargo Receipt** for the running binary flips its **Update Channel** from GitHub Releases to crates.io; the **Install Channel** decides, never the other way around (ADR-0030)
 
 ## Example dialogue
