@@ -42,16 +42,29 @@ pub struct PendingQuestion {
     pub done: Vec<bool>,
 }
 
+/// The Interaction Receipt (ADR-0038) a resolved block leaves in its place:
+/// one markdown line, no controls, so a late click on a stale card can never
+/// be ambiguous. Rendered from the accumulator, so it survives every later
+/// flush (new part, header tick, split).
+#[derive(Debug, Clone)]
+pub struct InteractionReceipt {
+    pub request_id: String,
+    /// The receipt line, markdown only (e.g. `✅ 已允许一次 · 14:03`).
+    pub line: String,
+}
+
 /// One entry in a card's interaction section: a live permission or question
-/// block. The section has ONE representation (this list on the accumulator),
-/// ONE render point (`build_card_inner`) and ONE mutation API (the
-/// `*_interaction` methods on [`StreamAccumulator`]) — every update — add,
-/// state change, resolve — goes through that seam, so what the card renders
-/// cannot drift from the accumulator's in-flight state (ADR-0038).
+/// block, or the receipt left in its slot once resolved. The section has ONE
+/// representation (this list on the accumulator), ONE render point
+/// (`build_card_inner`) and ONE mutation API (the `*_interaction` methods on
+/// [`StreamAccumulator`]) — every update — add, state change, resolve — goes
+/// through that seam, so what the card renders cannot drift from the
+/// accumulator's in-flight state (ADR-0038).
 #[derive(Debug, Clone)]
 pub enum InteractionBlock {
     Permission(PendingPermission),
     Question(PendingQuestion),
+    Receipt(InteractionReceipt),
 }
 
 impl InteractionBlock {
@@ -60,7 +73,13 @@ impl InteractionBlock {
         match self {
             InteractionBlock::Permission(p) => &p.request_id,
             InteractionBlock::Question(q) => &q.request_id,
+            InteractionBlock::Receipt(r) => &r.request_id,
         }
+    }
+
+    /// Whether the block still awaits the operator (a receipt is settled).
+    pub fn is_live(&self) -> bool {
+        !matches!(self, InteractionBlock::Receipt(_))
     }
 }
 
@@ -283,6 +302,27 @@ impl StreamAccumulator {
         self.interactions.iter().find(|b| b.request_id() == request_id)
     }
 
+    /// Replace the live block for `request_id` with its Interaction Receipt,
+    /// in place: the receipt occupies the block's slot, and every later flush
+    /// re-renders it from here (ADR-0038, rule 4). Returns false when no live
+    /// block matched (already resolved, or never on this card).
+    pub fn resolve_interaction(&mut self, request_id: &str, line: String) -> bool {
+        match self
+            .interactions
+            .iter_mut()
+            .find(|b| b.request_id() == request_id && b.is_live())
+        {
+            Some(slot) => {
+                *slot = InteractionBlock::Receipt(InteractionReceipt {
+                    request_id: request_id.to_string(),
+                    line,
+                });
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Replace a question block's display state (the live 已选/✅ markers) in
     /// place. Returns false when the card has no question block for the
     /// request.
@@ -306,13 +346,6 @@ impl StreamAccumulator {
         }
     }
 
-    /// Remove the block for `request_id`. Returns whether one was removed.
-    pub fn remove_interaction(&mut self, request_id: &str) -> bool {
-        let before = self.interactions.len();
-        self.interactions.retain(|b| b.request_id() != request_id);
-        self.interactions.len() != before
-    }
-
     /// Keep the blocks `keep` accepts — a kind's sweep strips only its own
     /// kind's vanished blocks (see `RequestKind::retain_inline`). Returns how
     /// many blocks were removed.
@@ -331,7 +364,7 @@ impl StreamAccumulator {
             .iter()
             .filter_map(|b| match b {
                 InteractionBlock::Permission(p) => Some(p.clone()),
-                InteractionBlock::Question(_) => None,
+                _ => None,
             })
             .collect()
     }
@@ -344,15 +377,15 @@ impl StreamAccumulator {
             .iter()
             .filter_map(|b| match b {
                 InteractionBlock::Question(q) => Some(q.clone()),
-                InteractionBlock::Permission(_) => None,
+                _ => None,
             })
             .collect()
     }
 
     /// Whether the card carries any block awaiting the operator — drives the
-    /// header's awaiting-action state.
+    /// header's awaiting-action state. A receipt no longer awaits anything.
     pub fn has_live_interactions(&self) -> bool {
-        !self.interactions.is_empty()
+        self.interactions.iter().any(InteractionBlock::is_live)
     }
 
     /// Progress inputs for the header (ADR-0014): waiting flag, phase timer,
@@ -607,6 +640,11 @@ impl StreamAccumulator {
                         ) {
                             builder = builder.with_element(el);
                         }
+                    }
+                    // A resolved block's residue: one receipt line, no
+                    // controls (ADR-0038, rule 4).
+                    InteractionBlock::Receipt(r) => {
+                        builder = builder.with_text(&r.line);
                     }
                 }
             }

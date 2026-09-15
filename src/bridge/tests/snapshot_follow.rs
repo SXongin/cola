@@ -625,9 +625,16 @@ async fn busy_follow_permission_approved_resumes() {
         .host_action(value)
         .await
         .expect("permission click returns a result");
+    let ack = result
+        .card
+        .as_ref()
+        .expect("inline click must carry the updated follow card in the ack")
+        .to_string();
+    assert!(ack.contains("✅ 已允许一次 · "), "receipt missing: {}", ack);
     assert!(
-        result.card.is_none(),
-        "inline answer must not replace the follow card"
+        !ack.contains("🔐 **权限请求**"),
+        "the approved block must be gone: {}",
+        ack
     );
     assert_eq!(result.toast.as_deref(), Some("已允许本次执行"));
     assert!(
@@ -640,7 +647,7 @@ async fn busy_follow_permission_approved_resumes() {
             .acc
             .live_permissions()
             .is_empty(),
-        "the approved section is stripped from the follow card"
+        "the approved section is no longer live on the follow card"
     );
 
     // The resumed turn streams into the SAME snapshot message and finishes.

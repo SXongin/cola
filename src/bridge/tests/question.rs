@@ -1146,7 +1146,20 @@ async fn inline_question_answered_on_streaming_card() {
     });
     let r2 = app.host_action(value).await.expect("result");
     assert_eq!(r2.toast.as_deref(), Some("已回答"));
-    assert!(r2.card.is_none(), "inline final answer must not replace the card");
+    // The ack carries the clicked card with the resolved block replaced by
+    // its Interaction Receipt (ADR-0038) — the final answer is as instant as
+    // the partial ones.
+    let ack = r2
+        .card
+        .as_ref()
+        .expect("inline final answer must carry the updated card in the ack")
+        .to_string();
+    assert!(ack.contains("✅ 已回答：/a、main"), "receipt missing: {}", ack);
+    assert!(
+        !ack.contains("无法回答") && !ack.contains("已选："),
+        "the resolved block (and its controls) must be gone: {}",
+        ack
+    );
     let calls = backend.reply_question_calls.lock().await.clone();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].1, vec![vec!["/a".to_string()], vec!["main".to_string()]]);
@@ -1625,4 +1638,264 @@ async fn gated_submit_leaves_no_claim_and_preserves_replays() {
         .expect("replay result");
     assert_eq!(first.card, second.card, "double click replays the first result");
     assert_eq!(backend.reply_question_calls.lock().await.len(), 2);
+}
+
+// ===== Interaction Receipts (ADR-0038) =====
+
+/// Final submit ("跳过剩余") and reject both replace the inline block with
+/// their Interaction Receipt in the same ack — the click's OWN card, updated
+/// atomically, not a PATCH behind a toast.
+#[tokio::test]
+async fn inline_question_submit_and_reject_leave_receipts() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.questions = vec![
+        opencode::types::QuestionRequest {
+            id: "que_submit".into(),
+            session_id: "ses_test".into(),
+            questions: vec![
+                opencode::types::QuestionInfo {
+                    question: "选目录".into(),
+                    header: "目录".into(),
+                    options: vec![opencode::types::QuestionOption {
+                        label: "/a".into(),
+                        description: String::new(),
+                    }],
+                    multiple: None,
+                    custom: None,
+                },
+                opencode::types::QuestionInfo {
+                    question: "选分支".into(),
+                    header: "分支".into(),
+                    options: vec![opencode::types::QuestionOption {
+                        label: "main".into(),
+                        description: String::new(),
+                    }],
+                    multiple: None,
+                    custom: None,
+                },
+            ],
+        },
+        opencode::types::QuestionRequest {
+            id: "que_reject".into(),
+            session_id: "ses_test".into(),
+            questions: vec![opencode::types::QuestionInfo {
+                question: "继续吗？".into(),
+                header: "下一步".into(),
+                options: vec![opencode::types::QuestionOption {
+                    label: "继续".into(),
+                    description: String::new(),
+                }],
+                multiple: None,
+                custom: None,
+            }],
+        },
+    ];
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
+    app.handle_message(incoming(
+        "msg_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.question
+                .poll_interval_ms
+                .store(50, std::sync::atomic::Ordering::Relaxed);
+            let _ = app.question.poll_loop(&app.core).await;
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        app.cards
+            .lock()
+            .await
+            .get("ses_test")
+            .unwrap()
+            .acc
+            .live_questions()
+            .len(),
+        2,
+        "both questions inlined"
+    );
+
+    // Partially answer que_submit, then submit ("跳过剩余").
+    let partial = app
+        .host_action(serde_json::json!({
+            "action": "question",
+            "reply": "answer",
+            "request_id": "que_submit",
+            "session_id": "ses_test",
+            "question_index": 0,
+            "answer": "/a",
+        }))
+        .await
+        .expect("a card-action result");
+    assert!(
+        partial
+            .card
+            .as_ref()
+            .expect("partial answers carry the card")
+            .to_string()
+            .contains("已选：/a"),
+        "partial markers must stay live"
+    );
+    let submitted = app
+        .host_action(serde_json::json!({
+            "action": "question",
+            "reply": "submit",
+            "request_id": "que_submit",
+            "session_id": "ses_test",
+        }))
+        .await
+        .expect("a card-action result");
+    assert_eq!(submitted.toast.as_deref(), Some("已提交"));
+    let ack = submitted
+        .card
+        .as_ref()
+        .expect("submit must carry the updated card in the ack")
+        .to_string();
+    assert!(
+        ack.contains("✅ 已回答：/a、（未作答）"),
+        "submit receipt missing: {}",
+        ack
+    );
+    assert!(
+        !ack.contains("\"request_id\":\"que_submit\"") && !ack.contains("已选："),
+        "the submitted block (and its controls) is gone: {}",
+        ack
+    );
+    // The other request's block is still live.
+    assert!(ack.contains("继续吗？"), "que_reject must stay: {}", ack);
+
+    // Reject the other request: a second receipt, no live block left.
+    let rejected = app
+        .host_action(serde_json::json!({
+            "action": "question",
+            "reply": "reject",
+            "request_id": "que_reject",
+            "session_id": "ses_test",
+        }))
+        .await
+        .expect("a card-action result");
+    assert_eq!(rejected.toast.as_deref(), Some("已拒绝回答"));
+    let ack = rejected
+        .card
+        .as_ref()
+        .expect("reject must carry the updated card in the ack")
+        .to_string();
+    assert!(ack.contains("🚫 已拒绝"), "reject receipt missing: {}", ack);
+    assert!(
+        !ack.contains("\"request_id\":\"que_reject\"") && !ack.contains("继续吗？"),
+        "the rejected block (and its controls) is gone: {}",
+        ack
+    );
+    // Both receipts are rendered from the accumulator.
+    let acc = app.cards.lock().await.get("ses_test").unwrap().acc.clone();
+    assert!(acc.live_questions().is_empty());
+    let rendered = acc.build_card().to_string();
+    assert!(rendered.contains("✅ 已回答：/a、（未作答）"), "{}", rendered);
+    assert!(rendered.contains("🚫 已拒绝"), "{}", rendered);
+
+    let calls = backend.reply_question_calls.lock().await.clone();
+    assert_eq!(calls.len(), 2, "one submit + one reject: {:?}", calls);
+    assert_eq!(
+        calls[0].1,
+        vec![vec!["/a".to_string()], Vec::<String>::new()],
+        "submit carries the answered slots and the skipped one empty"
+    );
+}
+
+/// A click that finds the question already resolved by another client gets the
+/// neutral "handled elsewhere" receipt on the clicked card, carried in the
+/// same ack.
+#[tokio::test]
+async fn inline_question_click_after_remote_resolution_gets_receipt() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.questions = vec![opencode::types::QuestionRequest {
+        id: "que_gone".into(),
+        session_id: "ses_test".into(),
+        questions: vec![opencode::types::QuestionInfo {
+            question: "选目录".into(),
+            header: "目录".into(),
+            options: vec![opencode::types::QuestionOption {
+                label: "/a".into(),
+                description: String::new(),
+            }],
+            multiple: None,
+            custom: None,
+        }],
+    }];
+    backend.reply_question_not_found = true;
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
+    app.handle_message(incoming(
+        "msg_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.question
+                .poll_interval_ms
+                .store(50, std::sync::atomic::Ordering::Relaxed);
+            let _ = app.question.poll_loop(&app.core).await;
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "question",
+            "reply": "answer",
+            "request_id": "que_gone",
+            "session_id": "ses_test",
+            "question_index": 0,
+            "answer": "/a",
+        }))
+        .await
+        .expect("a card-action result");
+    assert_eq!(result.toast.as_deref(), Some("该问题已处理"));
+    let ack = result
+        .card
+        .expect("the ack must carry the clicked card")
+        .to_string();
+    assert!(
+        ack.contains("⏱ 已由其他客户端处理"),
+        "neutral receipt missing: {}",
+        ack
+    );
+    assert!(
+        !ack.contains("无法回答"),
+        "the resolved block must be gone: {}",
+        ack
+    );
+    assert!(
+        app.cards
+            .lock()
+            .await
+            .get("ses_test")
+            .unwrap()
+            .acc
+            .live_questions()
+            .is_empty()
+    );
 }

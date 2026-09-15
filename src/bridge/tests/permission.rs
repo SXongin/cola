@@ -72,7 +72,8 @@ async fn permission_poller_sends_card_and_card_action_replies() {
     );
 
     // Simulate the user clicking "允许一次" — answered inline, so the ack
-    // carries a toast but must NOT replace the streaming card.
+    // carries the CLICKED card with the block replaced by an Interaction
+    // Receipt (ADR-0038), not a replacement card.
     let value = serde_json::json!({
         "action": "perm",
         "reply": "once",
@@ -85,13 +86,20 @@ async fn permission_poller_sends_card_and_card_action_replies() {
     let result = app.host_action(value).await;
     assert!(result.is_some());
     let result = result.unwrap();
+    let ack = result
+        .card
+        .as_ref()
+        .expect("inline click must carry the updated card in the ack")
+        .to_string();
+    assert!(ack.contains("✅ 已允许一次 · "), "receipt missing: {}", ack);
     assert!(
-        result.card.is_none(),
-        "inline answer must not replace the streaming card"
+        !ack.contains("🔐 **权限请求**") && !ack.contains("始终允许"),
+        "the resolved block (and its controls) must be gone: {}",
+        ack
     );
     // A toast gives the client instant feedback on the button press.
     assert_eq!(result.toast.as_deref(), Some("已允许本次执行"));
-    // The inline section is removed from the accumulator.
+    // The block is resolved in the accumulator too: not live, receipt kept.
     assert!(
         app.cards
             .lock()
@@ -104,14 +112,13 @@ async fn permission_poller_sends_card_and_card_action_replies() {
     );
 }
 
-/// Resolving an INLINE permission must re-render the host streaming card
-/// right away. A permission-blocked prompt produces no new parts, so
-/// without an explicit flush the render poll leaves the resolved section —
-/// and its live buttons — on the Feishu card until the AI resumes, or
-/// forever if the turn was stopped (the "card stuck" report). The question
-/// path already flushes; this covers permissions.
+/// Resolving an INLINE permission updates the clicked card ATOMICALLY in the
+/// callback ack (ADR-0038, rule 3): the block becomes an Interaction Receipt
+/// on the returned card, so there is no toast-then-PATCH lag and no
+/// dependence on which card is current. No separate PATCH is needed — that
+/// disappearance path is gone for inline clicks.
 #[tokio::test]
-async fn inline_permission_click_flushes_the_card_immediately() {
+async fn inline_permission_click_carries_the_receipt_in_the_ack() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -177,26 +184,29 @@ async fn inline_permission_click_flushes_the_card_immediately() {
             "perm_body": "bash",
         }))
         .await;
-    assert!(result.is_some());
-
-    let calls = platform.calls.lock().await.clone();
-    let new_updates: Vec<_> = calls
-        .iter()
-        .filter_map(|c| match c {
-            PlatformCall::UpdateMessage { card, .. } => Some(card.clone()),
-            _ => None,
-        })
-        .skip(updates_before)
-        .collect();
+    let ack = result
+        .expect("a card-action result")
+        .card
+        .expect("the ack must carry the clicked card")
+        .to_string();
+    assert!(ack.contains("✅ 已允许一次 · "), "receipt missing: {}", ack);
     assert!(
-        !new_updates.is_empty(),
-        "resolving an inline permission must flush the card immediately"
+        !ack.contains("🔐 **权限请求**") && !ack.contains("始终允许"),
+        "the block (and its controls) must be replaced by the receipt: {}",
+        ack
     );
-    let last = new_updates.last().unwrap().to_string();
-    assert!(
-        !last.contains("权限请求") && !last.contains("允许一次"),
-        "the resolved inline section must be gone from the re-rendered card: {}",
-        last
+
+    // The ack IS the update: no PATCH raced behind it.
+    let calls = platform.calls.lock().await.clone();
+    let new_updates = calls
+        .iter()
+        .filter(|c| matches!(c, PlatformCall::UpdateMessage { .. }))
+        .skip(updates_before)
+        .count();
+    assert_eq!(
+        new_updates, 0,
+        "the ack carries the card; no separate PATCH may fire: {:?}",
+        calls
     );
 }
 
@@ -535,11 +545,24 @@ async fn autoaccept_toggle_on_permission_card_flips_flag_and_approves() {
         "perm_body": "bash",
     });
     let result = app.host_action(value).await.expect("toggle result");
-    assert!(
-        result.card.is_none(),
-        "inline toggle must not replace the streaming card"
-    );
+    let ack = result
+        .card
+        .as_ref()
+        .expect("inline toggle must carry the updated card in the ack")
+        .to_string();
     assert_eq!(result.toast.as_deref(), Some("已开启自动授权"));
+    // EVERY block the toggle resolved left its receipt, in the same ack.
+    assert_eq!(
+        ack.matches("🔄 已开启自动授权").count(),
+        2,
+        "one receipt per resolved block: {}",
+        ack
+    );
+    assert!(
+        !ack.contains("🔐 **权限请求**"),
+        "no block may survive the toggle: {}",
+        ack
+    );
 
     // Both pending permissions approved with "once"; flag flipped.
     let mut calls = perm_calls.lock().await.clone();
@@ -927,5 +950,257 @@ async fn separate_permission_card_sent_into_topic_for_topic_session() {
             .iter()
             .any(|c| matches!(c, PlatformCall::SendCard { receive_id, .. } if receive_id == "chat_1")),
         "permission card must NOT go to the chat top level: {calls:?}"
+    );
+}
+
+// ===== Interaction Receipts (ADR-0038) =====
+
+fn perm_req(id: &str, session: &str, pattern: &str) -> opencode::types::PermissionRequest {
+    opencode::types::PermissionRequest {
+        request_id: id.into(),
+        session_id: Some(session.into()),
+        permission: Some("bash".into()),
+        patterns: vec![pattern.into()],
+        metadata: None,
+        always: Vec::new(),
+    }
+}
+
+/// Click a permission button as the Host and return the ack card's text.
+async fn click_perm(app: &Arc<App>, reply: &str, req: &str, label: &str) -> String {
+    let value = serde_json::json!({
+        "action": "perm",
+        "reply": reply,
+        "session_id": "ses_test",
+        "request_id": req,
+        "perm_label": label,
+        "perm_color": "green",
+        "perm_body": "bash",
+    });
+    app.host_action(value)
+        .await
+        .expect("a card-action result")
+        .card
+        .expect("an inline click must carry the updated card in the ack")
+        .to_string()
+}
+
+/// Every permission decision — allow once, allow always, deny — replaces the
+/// clicked block with its own Interaction Receipt and carries the updated card
+/// in the ack; the accumulator keeps the receipts (ADR-0038, rules 3+4).
+#[tokio::test]
+async fn permission_click_variants_leave_their_receipts() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.permissions = vec![
+        perm_req("per_once", "ses_test", "ls -la"),
+        perm_req("per_always", "ses_test", "cargo build"),
+        perm_req("per_deny", "ses_test", "rm -rf target"),
+    ];
+    let perm_calls = backend.reply_permission_calls.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    app.handle_message(incoming(
+        "msg_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.permission
+                .poll_interval_ms
+                .store(50, std::sync::atomic::Ordering::Relaxed);
+            let _ = app.permission.poll_loop(&app.core).await;
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        app.cards
+            .lock()
+            .await
+            .get("ses_test")
+            .unwrap()
+            .acc
+            .live_permissions()
+            .len(),
+        3,
+        "all three permissions inlined"
+    );
+
+    let ack = click_perm(&app, "once", "per_once", "✅ 已允许一次").await;
+    assert!(ack.contains("✅ 已允许一次 · "), "once receipt: {}", ack);
+    // The click resolves only its own block; the others stay live.
+    assert!(ack.contains("🔐 **权限请求**"), "other blocks stay: {}", ack);
+
+    let ack = click_perm(&app, "always", "per_always", "✅ 已始终允许").await;
+    assert!(ack.contains("✅ 已始终允许 · "), "always receipt: {}", ack);
+
+    let ack = click_perm(&app, "reject", "per_deny", "🚫 已拒绝").await;
+    assert!(ack.contains("🚫 已拒绝"), "deny receipt: {}", ack);
+    assert!(
+        !ack.contains("🔐 **权限请求**"),
+        "every block is resolved: {}",
+        ack
+    );
+
+    // The accumulator is the render source of truth: no live block, three
+    // receipts.
+    let acc = app.cards.lock().await.get("ses_test").unwrap().acc.clone();
+    assert!(acc.live_permissions().is_empty());
+    let rendered = acc.build_card().to_string();
+    assert_eq!(rendered.matches("已允许一次 · ").count(), 1, "{}", rendered);
+    assert!(rendered.contains("✅ 已始终允许 · "), "{}", rendered);
+    assert!(rendered.contains("🚫 已拒绝"), "{}", rendered);
+
+    let calls = perm_calls.lock().await.clone();
+    assert_eq!(calls.len(), 3, "each click replied once: {:?}", calls);
+}
+
+/// A receipt is rendered from the accumulator, so it survives every later
+/// flush — a new part arriving and a card split that moves the tail onto a
+/// continuation card (ADR-0038).
+#[tokio::test]
+async fn interaction_receipt_survives_later_flushes() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.permissions = vec![perm_req("per_1", "ses_test", "ls -la")];
+    let (app, platform) = build_app(cfg, backend).await;
+    app.handle_message(incoming(
+        "msg_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.permission
+                .poll_interval_ms
+                .store(50, std::sync::atomic::Ordering::Relaxed);
+            let _ = app.permission.poll_loop(&app.core).await;
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let ack = click_perm(&app, "once", "per_1", "✅ 已允许一次").await;
+    assert!(ack.contains("✅ 已允许一次 · "), "receipt missing: {}", ack);
+
+    // A new part arrives: the flush re-renders the receipt from the
+    // accumulator (the render source of truth), not just into the ack.
+    {
+        let mut cards = app.cards.lock().await;
+        cards.get_mut("ses_test").unwrap().acc.push_text("新的进展。");
+    }
+    crate::bridge::render::flush_card(&app.core, "ses_test").await;
+    let flushed = latest_card(&platform).await.to_string();
+    assert!(
+        flushed.contains("✅ 已允许一次 · "),
+        "receipt dropped by a later flush: {}",
+        flushed
+    );
+    assert!(
+        !flushed.contains("🔐 **权限请求**"),
+        "the block must not come back: {}",
+        flushed
+    );
+
+    // Force a split: the receipt follows the tail onto the continuation card
+    // (the new live card), still rendered from the accumulator.
+    {
+        let mut cards = app.cards.lock().await;
+        cards
+            .get_mut("ses_test")
+            .unwrap()
+            .acc
+            .push_text(&"很长的回答。".repeat(2000));
+    }
+    crate::bridge::render::flush_card(&app.core, "ses_test").await;
+    let continuation = latest_card(&platform).await.to_string();
+    assert!(
+        continuation.contains("✅ 已允许一次 · "),
+        "receipt dropped by the split continuation: {}",
+        continuation
+    );
+}
+
+/// A click that finds the request already resolved by another client still
+/// updates the clicked card — with the neutral "handled elsewhere" receipt —
+/// delivered in the same ack (ADR-0038, rule 4).
+#[tokio::test]
+async fn inline_permission_click_after_remote_resolution_gets_receipt() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.permissions = vec![perm_req("per_1", "ses_test", "ls -la")];
+    backend.reply_permission_not_found = true;
+    let (app, _platform) = build_app(cfg, backend).await;
+    app.handle_message(incoming(
+        "msg_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.permission
+                .poll_interval_ms
+                .store(50, std::sync::atomic::Ordering::Relaxed);
+            let _ = app.permission.poll_loop(&app.core).await;
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "perm",
+            "reply": "once",
+            "session_id": "ses_test",
+            "request_id": "per_1",
+            "perm_label": "✅ 已允许一次",
+            "perm_color": "green",
+            "perm_body": "bash",
+        }))
+        .await
+        .expect("a card-action result");
+    assert_eq!(result.toast.as_deref(), Some("该权限已处理"));
+    let ack = result
+        .card
+        .expect("the ack must carry the clicked card")
+        .to_string();
+    assert!(
+        ack.contains("⏱ 已由其他客户端处理"),
+        "neutral receipt missing: {}",
+        ack
+    );
+    assert!(
+        !ack.contains("🔐 **权限请求**"),
+        "the resolved block must be gone: {}",
+        ack
+    );
+    assert!(
+        app.cards
+            .lock()
+            .await
+            .get("ses_test")
+            .unwrap()
+            .acc
+            .live_permissions()
+            .is_empty()
     );
 }
