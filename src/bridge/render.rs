@@ -375,6 +375,12 @@ pub(crate) fn render_new_turn_parts(
 const MAX_CARD_CHAIN: usize = 8;
 
 pub(crate) async fn flush_card(core: &Arc<SharedCore>, session_id: &str) {
+    // Is the accumulator's current card still the live (growing) card? It is
+    // until the first split finalizes it. Every card after that was sent as a
+    // FINALIZED slice (its build was already over the budget) and must never be
+    // overwritten: an update with the next slice would drop the content — and
+    // the Interaction Receipts — that card carries.
+    let mut live = true;
     for _ in 0..MAX_CARD_CHAIN {
         let (card, full) = {
             let mut cards = core.cards.lock().await;
@@ -388,21 +394,24 @@ pub(crate) async fn flush_card(core: &Arc<SharedCore>, session_id: &str) {
             cards.get(session_id).and_then(|c| c.card_message_id.clone())
         };
         let Some(card_id) = card_id else { return };
-        if !full {
+
+        if live {
+            // The live card takes the slice in place: either it still fits
+            // (plain update) or this flush finalizes it with the "to be
+            // continued" marker.
             if let Err(e) = core.feishu.update_message(&card_id, &card).await {
                 tracing::warn!("Card update failed: {}", e);
             }
-            return;
+            if !full {
+                return;
+            }
+            live = false;
+            continue;
         }
 
-        // The card hit the component limit: finalize it with a "to be
-        // continued" marker, then send a FRESH continuation card that takes over
-        // subsequent updates. `build_card_with_split` already advanced
-        // `render_from` past the split point, so the continuation holds only the
-        // remaining content — nothing is lost.
-        if let Err(e) = core.feishu.update_message(&card_id, &card).await {
-            tracing::warn!("Card split update failed: {}", e);
-        }
+        // A finalized slice needs its own card; `build_card_with_split` already
+        // advanced `render_from` past the split point, so each continuation
+        // holds exactly the slice it was built from — nothing is lost.
         let reply_to = {
             let cards = core.cards.lock().await;
             cards
@@ -410,22 +419,16 @@ pub(crate) async fn flush_card(core: &Arc<SharedCore>, session_id: &str) {
                 .and_then(|c| c.acc.reply_to_message_id.clone())
         };
         let Some(reply_to) = reply_to else { return };
-        let (cont_card, cont_full) = {
-            let mut cards = core.cards.lock().await;
-            cards
-                .get_mut(session_id)
-                .map(|c| c.acc.build_card_with_split())
-                .unwrap_or((serde_json::json!({}), false))
-        };
-        match core.feishu.reply_card(&reply_to, &cont_card).await {
+        match core.feishu.reply_card(&reply_to, &card).await {
             Ok(new_id) => {
                 if let Some(card) = core.cards.lock().await.get_mut(session_id) {
                     card.card_message_id = Some(new_id);
                 }
-                if !cont_full {
+                if !full {
                     return;
                 }
-                // The continuation is itself over the limit → loop and split again.
+                // The continuation is itself over the limit → loop for the
+                // next slice's card.
             }
             Err(e) => {
                 tracing::warn!("Card continuation send failed: {}", e);

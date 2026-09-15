@@ -91,7 +91,11 @@ async fn permission_poller_sends_card_and_card_action_replies() {
         .as_ref()
         .expect("inline click must carry the updated card in the ack")
         .to_string();
-    assert!(ack.contains("✅ 已允许一次 · "), "receipt missing: {}", ack);
+    assert!(
+        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la` · "),
+        "receipt missing: {}",
+        ack
+    );
     assert!(
         !ack.contains("🔐 **权限请求**") && !ack.contains("始终允许"),
         "the resolved block (and its controls) must be gone: {}",
@@ -189,7 +193,11 @@ async fn inline_permission_click_carries_the_receipt_in_the_ack() {
         .card
         .expect("the ack must carry the clicked card")
         .to_string();
-    assert!(ack.contains("✅ 已允许一次 · "), "receipt missing: {}", ack);
+    assert!(
+        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la` · "),
+        "receipt missing: {}",
+        ack
+    );
     assert!(
         !ack.contains("🔐 **权限请求**") && !ack.contains("始终允许"),
         "the block (and its controls) must be replaced by the receipt: {}",
@@ -856,6 +864,7 @@ async fn failed_directory_list_keeps_permission_surfaces() {
             session_id: "ses_1".into(),
             request_id: "per_inline".into(),
             body: "bash ls -la".into(),
+            target: "⚡ 执行 Shell 命令 `ls -la`".into(),
             directory: "/work".into(),
         },
     ));
@@ -1034,15 +1043,27 @@ async fn permission_click_variants_leave_their_receipts() {
     );
 
     let ack = click_perm(&app, "once", "per_once", "✅ 已允许一次").await;
-    assert!(ack.contains("✅ 已允许一次 · "), "once receipt: {}", ack);
+    assert!(
+        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la` · "),
+        "once receipt: {}",
+        ack
+    );
     // The click resolves only its own block; the others stay live.
     assert!(ack.contains("🔐 **权限请求**"), "other blocks stay: {}", ack);
 
     let ack = click_perm(&app, "always", "per_always", "✅ 已始终允许").await;
-    assert!(ack.contains("✅ 已始终允许 · "), "always receipt: {}", ack);
+    assert!(
+        ack.contains("✅ 已始终允许：⚡ 执行 Shell 命令 `cargo build` · "),
+        "always receipt: {}",
+        ack
+    );
 
     let ack = click_perm(&app, "reject", "per_deny", "🚫 已拒绝").await;
-    assert!(ack.contains("🚫 已拒绝"), "deny receipt: {}", ack);
+    assert!(
+        ack.contains("🚫 已拒绝：⚡ 执行 Shell 命令 `rm -rf target`"),
+        "deny receipt: {}",
+        ack
+    );
     assert!(
         !ack.contains("🔐 **权限请求**"),
         "every block is resolved: {}",
@@ -1054,58 +1075,76 @@ async fn permission_click_variants_leave_their_receipts() {
     let acc = app.cards.lock().await.get("ses_test").unwrap().acc.clone();
     assert!(acc.live_permissions().is_empty());
     let rendered = acc.build_card().to_string();
-    assert_eq!(rendered.matches("已允许一次 · ").count(), 1, "{}", rendered);
-    assert!(rendered.contains("✅ 已始终允许 · "), "{}", rendered);
-    assert!(rendered.contains("🚫 已拒绝"), "{}", rendered);
+    assert_eq!(rendered.matches("已允许一次：").count(), 1, "{}", rendered);
+    assert!(
+        rendered.contains("✅ 已始终允许：⚡ 执行 Shell 命令 `cargo build` · "),
+        "{}",
+        rendered
+    );
+    assert!(
+        rendered.contains("🚫 已拒绝：⚡ 执行 Shell 命令 `rm -rf target`"),
+        "{}",
+        rendered
+    );
 
     let calls = perm_calls.lock().await.clone();
     assert_eq!(calls.len(), 3, "each click replied once: {:?}", calls);
 }
 
 /// A receipt is rendered from the accumulator, so it survives every later
-/// flush — a new part arriving and a card split that moves the tail onto a
-/// continuation card (ADR-0038).
+/// flush — a new part arriving, and a split (ADR-0038). It belongs to the card
+/// that owns its anchor: exactly one card of the chain carries it.
 #[tokio::test]
 async fn interaction_receipt_survives_later_flushes() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![perm_req("per_1", "ses_test", "ls -la")];
-    let (app, platform) = build_app(cfg, backend).await;
-    app.handle_message(incoming(
-        "msg_1".into(),
-        "chat_1".into(),
-        "p2p".into(),
-        None,
-        "hi".into(),
-        None,
-    ))
-    .await;
-    tokio::spawn({
-        let app = app.clone();
-        async move {
-            app.permission
-                .poll_interval_ms
-                .store(50, std::sync::atomic::Ordering::Relaxed);
-            let _ = app.permission.poll_loop(&app.core).await;
-        }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+
+    // A live card with two transcript items and an inlined permission (the
+    // poll loop is what inlines in production; seeding it keeps this test
+    // deterministic — no background render poll splitting underneath us).
+    let mut acc = crate::bridge::streaming::StreamAccumulator::new("test");
+    acc.reply_to_message_id = Some("msg_1".into());
+    acc.push_reasoning("用户想让我分析目录。");
+    acc.push_text("当前目录有 src/ 和 Cargo.toml。");
+    acc.add_interaction(crate::bridge::streaming::InteractionBlock::Permission(
+        crate::bridge::streaming::PendingPermission {
+            session_id: "ses_test".into(),
+            request_id: "per_1".into(),
+            body: "bash ls -la".into(),
+            target: "⚡ 执行 Shell 命令 `ls -la`".into(),
+            directory: "/work".into(),
+        },
+    ));
+    app.cards.lock().await.insert(
+        "ses_test".to_string(),
+        crate::bridge::streaming::CardSession::new(acc, Some("msg_live".into())),
+    );
 
     let ack = click_perm(&app, "once", "per_1", "✅ 已允许一次").await;
-    assert!(ack.contains("✅ 已允许一次 · "), "receipt missing: {}", ack);
+    assert!(
+        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la` · "),
+        "receipt missing: {}",
+        ack
+    );
 
     // A new part arrives: the flush re-renders the receipt from the
     // accumulator (the render source of truth), not just into the ack.
-    {
-        let mut cards = app.cards.lock().await;
-        cards.get_mut("ses_test").unwrap().acc.push_text("新的进展。");
-    }
+    app.cards
+        .lock()
+        .await
+        .get_mut("ses_test")
+        .unwrap()
+        .acc
+        .push_text("新的进展。");
     crate::bridge::render::flush_card(&app.core, "ses_test").await;
     let flushed = latest_card(&platform).await.to_string();
     assert!(
-        flushed.contains("✅ 已允许一次 · "),
+        flushed.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la` · "),
         "receipt dropped by a later flush: {}",
         flushed
     );
@@ -1115,22 +1154,39 @@ async fn interaction_receipt_survives_later_flushes() {
         flushed
     );
 
-    // Force a split: the receipt follows the tail onto the continuation card
-    // (the new live card), still rendered from the accumulator.
-    {
-        let mut cards = app.cards.lock().await;
-        cards
-            .get_mut("ses_test")
-            .unwrap()
-            .acc
-            .push_text(&"很长的回答。".repeat(2000));
-    }
+    // Force a multi-card split: the receipt is anchored in the transcript, so
+    // exactly one card of the chain carries it — and the split loop must not
+    // overwrite that card with a later slice.
+    app.cards
+        .lock()
+        .await
+        .get_mut("ses_test")
+        .unwrap()
+        .acc
+        .push_text(&"很长的回答。".repeat(2000));
     crate::bridge::render::flush_card(&app.core, "ses_test").await;
-    let continuation = latest_card(&platform).await.to_string();
+    let calls = platform.calls.lock().await.clone();
     assert!(
-        continuation.contains("✅ 已允许一次 · "),
-        "receipt dropped by the split continuation: {}",
-        continuation
+        calls.iter().any(|c| matches!(
+            c,
+            PlatformCall::UpdateMessage { card, .. } | PlatformCall::ReplyCard { card, .. }
+                if card.to_string().contains("已允许一次")
+        )),
+        "the receipt must survive the split on the card that owns its anchor: {:?}",
+        calls
+    );
+
+    // Regression for the split-loop overwrite this test caught: a finalized
+    // continuation card carries its own slice (and could carry a receipt) and
+    // must never be patched again — the mock's continuation id is "msg_reply".
+    let continuation_updates = calls
+        .iter()
+        .filter(|c| matches!(c, PlatformCall::UpdateMessage { message_id, .. } if message_id == "msg_reply"))
+        .count();
+    assert_eq!(
+        continuation_updates, 0,
+        "a finalized continuation must never be overwritten: {:?}",
+        calls
     );
 }
 
@@ -1184,7 +1240,7 @@ async fn inline_permission_click_after_remote_resolution_gets_receipt() {
         .expect("the ack must carry the clicked card")
         .to_string();
     assert!(
-        ack.contains("⏱ 已由其他客户端处理"),
+        ack.contains("⏱ 已由其他客户端处理：⚡ 执行 Shell 命令 `ls -la`"),
         "neutral receipt missing: {}",
         ack
     );
@@ -1228,6 +1284,7 @@ async fn permission_click_at_the_split_limit_falls_back_to_the_flushed_receipt()
             session_id: "ses_1".into(),
             request_id: "per_1".into(),
             body: "bash ls -la".into(),
+            target: "⚡ 执行 Shell 命令 `ls -la`".into(),
             directory: "/work".into(),
         },
     ));
@@ -1257,17 +1314,24 @@ async fn permission_click_at_the_split_limit_falls_back_to_the_flushed_receipt()
         "an over-budget card degrades to the PATCH flush, not an oversized ack"
     );
 
-    // The fallback flushed: the continuation card (the new live card) still
-    // carries the receipt, rendered from the accumulator.
-    let continuation = latest_card(&platform).await.to_string();
+    // The fallback flushed: the block was surfaced at the top of the
+    // over-budget timeline, so the receipt is anchored there — the finalized
+    // (clicked) card carries it, and the continuation does not duplicate it.
+    let finalized = final_card(&platform).await.to_string();
     assert!(
-        continuation.contains("✅ 已允许一次 · "),
-        "the receipt must ride the continuation: {}",
-        continuation
+        finalized.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la` · "),
+        "the receipt must stay on the card that owns its anchor: {}",
+        finalized
     );
     assert!(
-        !continuation.contains("🔐 **权限请求**"),
+        !finalized.contains("🔐 **权限请求**"),
         "the resolved block must not come back: {}",
+        finalized
+    );
+    let continuation = latest_card(&platform).await.to_string();
+    assert!(
+        !continuation.contains("已允许一次"),
+        "a receipt must render once, on the card that owns its anchor: {}",
         continuation
     );
     assert!(
@@ -1279,5 +1343,77 @@ async fn permission_click_at_the_split_limit_falls_back_to_the_flushed_receipt()
             .acc
             .live_permissions()
             .is_empty()
+    );
+}
+
+/// A receipt anchors at the transcript position its block was surfaced at: it
+/// renders below the content that preceded the interaction and above content
+/// streamed after it — not at the bottom of the card with the tail (ADR-0038,
+/// rule 4).
+#[tokio::test]
+async fn interaction_receipt_renders_at_the_interaction_position() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+
+    // 第一段 → a reasoning panel → [permission],
+    let mut acc = crate::bridge::streaming::StreamAccumulator::new("test");
+    acc.reply_to_message_id = Some("msg_1".into());
+    acc.push_text("第一段。");
+    acc.push_reasoning("正在思考。");
+    acc.add_interaction(crate::bridge::streaming::InteractionBlock::Permission(
+        crate::bridge::streaming::PendingPermission {
+            session_id: "ses_test".into(),
+            request_id: "per_1".into(),
+            body: "bash ls -la".into(),
+            target: "⚡ 执行 Shell 命令 `ls -la`".into(),
+            directory: "/work".into(),
+        },
+    ));
+    app.cards.lock().await.insert(
+        "ses_test".to_string(),
+        crate::bridge::streaming::CardSession::new(acc, Some("msg_live".into())),
+    );
+
+    let ack = click_perm(&app, "once", "per_1", "✅ 已允许一次").await;
+    assert!(
+        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la` · "),
+        "receipt missing: {}",
+        ack
+    );
+
+    // ... then the AI keeps streaming: 第二段 must land BELOW the receipt.
+    app.cards
+        .lock()
+        .await
+        .get_mut("ses_test")
+        .unwrap()
+        .acc
+        .push_text("第二段。");
+    crate::bridge::render::flush_card(&app.core, "ses_test").await;
+
+    let card = final_card(&platform).await;
+    let elements = card["body"]["elements"].as_array().expect("elements");
+    let index_of = |needle: &str| {
+        elements
+            .iter()
+            .position(|e| {
+                e["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains(needle))
+            })
+            .unwrap_or_else(|| panic!("{} not on the card: {}", needle, card))
+    };
+    let first = index_of("第一段。");
+    let receipt = index_of("已允许一次");
+    let second = index_of("第二段。");
+    assert!(
+        first < receipt && receipt < second,
+        "the receipt must sit between 第一段 and 第二段: {}",
+        card
     );
 }

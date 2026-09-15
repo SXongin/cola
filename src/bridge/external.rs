@@ -429,6 +429,7 @@ impl ExternalFlow {
                             session_id: session_id.to_string(),
                             request_id: p.request_id.clone(),
                             body: crate::bridge::request::describe_permission(p),
+                            target: crate::bridge::request::permission_target(p),
                             directory: data.directory.clone(),
                         },
                     ));

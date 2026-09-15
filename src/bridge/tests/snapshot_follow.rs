@@ -630,7 +630,11 @@ async fn busy_follow_permission_approved_resumes() {
         .as_ref()
         .expect("inline click must carry the updated follow card in the ack")
         .to_string();
-    assert!(ack.contains("✅ 已允许一次 · "), "receipt missing: {}", ack);
+    assert!(
+        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la` · "),
+        "receipt missing: {}",
+        ack
+    );
     assert!(
         !ack.contains("🔐 **权限请求**"),
         "the approved block must be gone: {}",
