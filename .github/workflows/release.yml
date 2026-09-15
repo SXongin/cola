@@ -56,6 +56,23 @@ jobs:
           }
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Verify release identity
+        # The packaged binary must identify as this release (ADR-0027); a build
+        # script that misreads the git tree ships `-dev` binaries, so fail the
+        # platform job before packaging instead of publishing a mislabeled asset.
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/cola"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            binary="$binary.exe"
+          fi
+          expected="cola ${GITHUB_REF_NAME}"
+          actual="$("$binary" --version)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "::error::Release binary reports '$actual', expected '$expected'"
+            exit 1
+          fi
       - name: Package (tar)
         if: matrix.archive == 'tar'
         shell: bash
