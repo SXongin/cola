@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::bridge::core::SharedCore;
+use crate::bridge::core::{SESSION_INFO_TIMEOUT, SharedCore};
 use crate::bridge::streaming::StreamAccumulator;
 
 /// The session/thread name shown as the card subtitle, formatted as
@@ -10,12 +10,6 @@ use crate::bridge::streaming::StreamAccumulator;
 /// still has the default `New session - ...` title (or the title is empty),
 /// the id-tail alone identifies the session; the current prompt is never
 /// echoed (the reply context already shows it).
-/// Bound on the server-side session-title fetch. A freshly spawned Owned
-/// Server (Lazy Start) can swallow the first requests in its startup window,
-/// and a hung session_info must degrade the subtitle — not hang the whole
-/// turn (the Lazy Start silent-hang incident).
-const SESSION_INFO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-
 pub(crate) async fn session_subtitle(
     core: &SharedCore,
     thread_key: &crate::config::ThreadKey,

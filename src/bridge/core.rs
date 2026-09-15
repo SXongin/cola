@@ -32,6 +32,14 @@ pub struct CoverTitle {
     pub model: Option<String>,
 }
 
+/// Bound on a server-side session-info fetch (`GET /session/{id}`) — the
+/// prompt subtitle's title read and the effective-model ladder's
+/// server-recorded rung both go through it. A freshly spawned Owned Server
+/// (Lazy Start) can swallow the first requests in its startup window, and a
+/// hung fetch must degrade that one field — not hang the whole turn or the
+/// `/think`/`/model` cards (the Lazy Start silent-hang incident).
+pub(crate) const SESSION_INFO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// State shared across every flow: the session map, the per-session live cards
 /// ([`CardSession`] — accumulator + card identity in one place), the two
 /// request flows (permission/question pollers + card actions, on the core so
@@ -202,8 +210,9 @@ impl SharedCore {
     /// The model the NEXT turn will actually run, resolved session override →
     /// configured default → server-recorded session model (`GET /session/{id}`).
     /// `None` only when every rung fails (no override, no config, server
-    /// unreachable) — the `/think` card then tells the user to `/model` first.
-    /// Returns `(provider, model)`.
+    /// unreachable) — the `/think` card then tells the user to `/model` first,
+    /// and the `/model` picker omits its current-model line. Returns
+    /// `(provider, model)`.
     pub async fn effective_model(&self, session_id: &str) -> Option<(String, String)> {
         // 1. The session's own `/model` override.
         if let Some(m) = self.session_model_override(session_id).await {
@@ -213,7 +222,9 @@ impl SharedCore {
         if let Some(m) = self.opencode.configured_default_model() {
             return Some((m.provider_id, m.id));
         }
-        // 3. What the server actually recorded for the session.
+        // 3. What the server actually recorded for the session. Bounded: a
+        //    hung server degrades the ladder (no current-model line / a
+        //    `/think` "pick a model" prompt), never the card send.
         let directory = self
             .sessions
             .lock()
@@ -221,7 +232,11 @@ impl SharedCore {
             .entry_for_session(session_id)
             .map(|e| e.directory.clone());
         if let Some(dir) = directory
-            && let Ok(info) = self.opencode.session_info(session_id, Some(&dir)).await
+            && let Ok(Ok(info)) = tokio::time::timeout(
+                SESSION_INFO_TIMEOUT,
+                self.opencode.session_info(session_id, Some(&dir)),
+            )
+            .await
             && let Some(m) = info.model
         {
             return Some((m.provider_id, m.id));
