@@ -11,7 +11,7 @@ use std::sync::Arc;
 /// the parts interleaved.
 #[derive(Debug, Clone)]
 pub struct TimelineItem {
-    pub at: i64,
+    pub key: i64,
     pub kind: TimelineKind,
 }
 
@@ -23,7 +23,7 @@ pub enum TimelineKind {
     Tool(String),
     /// A resolved interaction block's Interaction Receipt (ADR-0038, rule 4):
     /// one markdown line keyed by the moment it was resolved, so it sits below
-    /// everything that was on the card when the operator clicked and above
+    /// everything that was on the card when the Host clicked and above
     /// everything resolved afterwards.
     Receipt(String),
 }
@@ -88,7 +88,7 @@ impl InteractionBlock {
         }
     }
 
-    /// Whether the block still awaits the operator (a receipt is settled).
+    /// Whether the block still awaits the Host (a receipt is settled).
     pub fn is_live(&self) -> bool {
         !matches!(self, InteractionBlock::Receipt(_))
     }
@@ -156,6 +156,9 @@ pub struct StreamAccumulator {
     /// Fallback key source for pushes without a server part time
     /// ([`Self::next_order`]).
     order_seq: i64,
+    /// Highest key inserted so far — keeps [`Self::next_order`] ahead of the
+    /// timeline even when a server clock runs ahead of cola's.
+    last_key: i64,
     /// The card's interaction section: the live permission/question blocks
     /// (rendered in the tail) and the tombstones of resolved ones (their
     /// receipt is a timeline entry).
@@ -345,11 +348,11 @@ impl StreamAccumulator {
         };
         let text = line(&self.interactions[idx]);
         // `next_order` is the resolution moment with a monotonic guard: never
-        // before the wall clock, never behind anything already pushed in this
-        // accumulator — so a click's receipt always follows the content the
-        // operator was looking at, even within the same millisecond.
-        let at = self.next_order();
-        self.insert_kind(at, TimelineKind::Receipt(text));
+        // before the wall clock, never behind anything already on the card —
+        // so a click's receipt always follows the content the Host was looking
+        // at, even within the same millisecond.
+        let key = self.next_order();
+        self.insert_kind(key, TimelineKind::Receipt(text));
         self.interactions[idx] = InteractionBlock::Receipt(request_id.to_string());
         true
     }
@@ -450,23 +453,34 @@ impl StreamAccumulator {
     /// keep insertion order. A key behind the live slice clamps to its start:
     /// the finalized card that owned that position is already sent, and the top
     /// of the live card is the closest honest place left.
-    fn insert_kind(&mut self, at: i64, kind: TimelineKind) {
+    fn insert_kind(&mut self, key: i64, kind: TimelineKind) {
         let idx = self
             .timeline
-            .partition_point(|item| item.at <= at)
+            .partition_point(|item| item.key <= key)
             .max(self.render_from);
-        self.timeline.insert(idx, TimelineItem { at, kind });
+        self.timeline.insert(idx, TimelineItem { key, kind });
+        self.last_key = self.last_key.max(key);
     }
 
-    /// Key for a push with no server part time (tests, synthetic content):
-    /// strictly increasing and never behind the wall clock, so it keeps call
-    /// order and stays after anything already resolved.
+    /// Key for a push with no server part time (tests, synthetic content), and
+    /// for an Interaction Receipt's resolution moment: strictly increasing,
+    /// never before the wall clock, and never behind a key already inserted —
+    /// so it keeps call order and stays after everything already on the card
+    /// even under clock skew between cola and the server.
     pub fn next_order(&mut self) -> i64 {
         self.order_seq = self
             .order_seq
             .saturating_add(1)
+            .max(self.last_key.saturating_add(1))
             .max(chrono::Utc::now().timestamp_millis());
         self.order_seq
+    }
+
+    /// The timeline index of the entry keyed `key`, if one exists (equal keys
+    /// are contiguous, so the predecessor of the insertion point is it).
+    fn item_with_key(&self, key: i64) -> Option<usize> {
+        let idx = self.timeline.partition_point(|item| item.key <= key);
+        (idx > 0 && self.timeline.get(idx - 1).is_some_and(|i| i.key == key)).then(|| idx - 1)
     }
 
     /// Append a text chunk, keeping it in the chronological timeline (merging
@@ -475,38 +489,39 @@ impl StreamAccumulator {
     /// — the card splitter can then break a long answer across cards at item
     /// boundaries instead of truncating it.
     pub fn push_text(&mut self, chunk: &str) {
-        let at = self.next_order();
-        self.push_text_at(at, chunk);
+        let key = self.next_order();
+        self.push_text_at(key, chunk);
     }
 
-    /// [`Self::push_text`] for a chunk from the part that started at `at`:
-    /// text merges only into its own part's item (same key), so a late part
-    /// cannot be absorbed into a neighbour that merely looked adjacent.
-    pub fn push_text_at(&mut self, at: i64, chunk: &str) {
+    /// [`Self::push_text`] for a chunk from the part keyed `key`: text merges
+    /// only into its own part's entry (same key), so a late part cannot be
+    /// absorbed into a neighbour that merely looked adjacent.
+    pub fn push_text_at(&mut self, key: i64, chunk: &str) {
         self.text.push_str(chunk);
         let max = crate::feishu::card::MAX_CARD_TEXT_CHARS;
         let mut remaining = chunk;
         while !remaining.is_empty() {
-            let space = match self.timeline.last() {
+            let space = match self.item_with_key(key).and_then(|i| self.timeline.get(i)) {
                 Some(TimelineItem {
-                    at: last_at,
                     kind: TimelineKind::Text(last),
-                }) if *last_at == at => max.saturating_sub(last.chars().count()),
+                    ..
+                }) => max.saturating_sub(last.chars().count()),
                 _ => 0,
             };
             if space == 0 {
                 let take: String = remaining.chars().take(max).collect();
-                self.insert_kind(at, TimelineKind::Text(take.clone()));
+                self.insert_kind(key, TimelineKind::Text(take.clone()));
                 remaining = &remaining[take.len()..];
                 continue;
             }
             let take: String = remaining.chars().take(space).collect();
-            match self.timeline.last_mut() {
+            let idx = self.item_with_key(key).expect("space came from it");
+            match self.timeline.get_mut(idx) {
                 Some(TimelineItem {
                     kind: TimelineKind::Text(last),
                     ..
                 }) => last.push_str(&take),
-                _ => self.insert_kind(at, TimelineKind::Text(take.clone())),
+                _ => self.insert_kind(key, TimelineKind::Text(take.clone())),
             }
             remaining = &remaining[take.len()..];
         }
@@ -514,37 +529,42 @@ impl StreamAccumulator {
 
     /// Append a reasoning chunk, keeping it in the chronological timeline
     /// (chunks of the same part merge into one panel; a part keyed apart is
-    /// its own panel).
+    /// its own panel). Production renders go through [`Self::push_reasoning_at`];
+    /// this convenience form is for tests and synthetic content.
+    #[cfg(test)]
     pub fn push_reasoning(&mut self, chunk: &str) {
-        let at = self.next_order();
-        self.push_reasoning_at(at, chunk);
+        let key = self.next_order();
+        self.push_reasoning_at(key, chunk);
     }
 
-    /// [`Self::push_reasoning`] for a reasoning part that started at `at`.
-    pub fn push_reasoning_at(&mut self, at: i64, chunk: &str) {
+    /// [`Self::push_reasoning`] for a reasoning part keyed `key`.
+    pub fn push_reasoning_at(&mut self, key: i64, chunk: &str) {
         self.reasoning.push_str(chunk);
-        match self.timeline.last_mut() {
+        let idx = self.item_with_key(key);
+        match idx.and_then(|i| self.timeline.get_mut(i)) {
             Some(TimelineItem {
-                at: last_at,
                 kind: TimelineKind::Reasoning(last),
-            }) if *last_at == at => last.push_str(chunk),
-            _ => self.insert_kind(at, TimelineKind::Reasoning(chunk.to_string())),
+                ..
+            }) => last.push_str(chunk),
+            _ => self.insert_kind(key, TimelineKind::Reasoning(chunk.to_string())),
         }
     }
 
     /// Insert/update a tool panel; the timeline gets a marker only on the FIRST
-    /// appearance (state updates re-render in place).
+    /// appearance (state updates re-render in place). Production renders go
+    /// through [`Self::push_tool_at`]; this convenience form is test-only.
+    #[cfg(test)]
     pub fn push_tool(&mut self, call_id: &str, panel: ToolPanel) {
-        let at = self.next_order();
-        self.push_tool_at(at, call_id, panel);
+        let key = self.next_order();
+        self.push_tool_at(key, call_id, panel);
     }
 
-    /// [`Self::push_tool`] for a tool part that started at `at`.
-    pub fn push_tool_at(&mut self, at: i64, call_id: &str, panel: ToolPanel) {
+    /// [`Self::push_tool`] for a tool part keyed `key`.
+    pub fn push_tool_at(&mut self, key: i64, call_id: &str, panel: ToolPanel) {
         let is_new = !self.tools.contains_key(call_id);
         self.tools.insert(call_id.to_string(), panel);
         if is_new {
-            self.insert_kind(at, TimelineKind::Tool(call_id.to_string()));
+            self.insert_kind(key, TimelineKind::Tool(call_id.to_string()));
         }
         // A running-tool phase starts/exits here (running → completed), so the
         // header timer must follow even though card_state stays Streaming.

@@ -517,9 +517,10 @@ fn denied_receipt(block: &InteractionBlock) -> String {
 
 /// Compact one-line target for a permission's receipt: the action plus the
 /// first pattern (or the edited file for edit/patch) — what the decision was
-/// about, for when the position alone cannot say (poll race, sub-task child,
-/// several blocks at once). Backticks in a pattern are flattened so the
-/// markdown element cannot be broken by server-provided content.
+/// about, for when the position alone cannot say (a sub-task child's block has
+/// no command panel on the parent card; a toggle resolves several at once).
+/// Backticks in a pattern are flattened so the markdown element cannot be
+/// broken by server-provided content.
 pub(crate) fn permission_target(p: &opencode::types::PermissionRequest) -> String {
     let action = p.permission.as_deref().unwrap_or("?");
     let (emoji, label) = describe_action(action);
