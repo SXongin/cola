@@ -148,6 +148,18 @@ _Avoid_: Briefing, takeover summary, handoff card
 A Feishu interactive message card. Evolves through states (loading → reasoning → running → streaming → done), uses collapsible panels for secondary content, and shows progress in its header (phase timer, silence, reasoning length) so a slow turn is distinguishable from a dead one — including a "等待你的授权/回答" state while a permission or question is pending.
 _Avoid_: Widget, component, bubble
 
+**Card Chain**:
+The one or more **Card**s a single **Turn** renders into when its content exceeds what one Feishu card may hold: the filled card is finalized with a 部分完成，继续中 header and a continuation card takes over. Only the newest card of the chain keeps receiving updates; an **Interaction Block** rides that newest card.
+_Avoid_: Split card, multi-card turn, card pagination
+
+**Interaction Block** (交互块):
+A pending **Permission** or **Question** rendered inline inside another card — a **Turn**'s card tail, or a **Session Snapshot**'s pending section — carrying its prompt, controls and answer state, as opposed to a standalone request card. It follows the newest card of its **Turn**'s **Card Chain** (including when a new **Turn** replaces the accumulator) and is updated in place on whichever card currently shows it.
+_Avoid_: Pending section, inline card, request block
+
+**Interaction Receipt** (回执):
+The one-line record left in place of an **Interaction Block** once its **Permission**/**Question** is resolved — by this Chat/Topic, by another client, or by Auto-Accept — stating what was decided (allowed/denied/answered/handled elsewhere). Contrast a block that simply vanishes, which leaves history unreadable and a stale click ambiguous. Distinct from a **Cargo Receipt** (cargo's install bookkeeping).
+_Avoid_: Result line, status card, stale marker
+
 **Quoted Context**:
 The parent message's content (text + attached images) that a reply answers, fetched from the platform and prepended to the prompt. Makes the reply relationship explicit and covers parents missing from session history (lobby-switch, compaction). Distinct from the user's own message text, which is the prompt's primary content. Never applied to the topic's own Topic Root or Topic Anchor — they are creation boilerplate, not genuine quotes (ADR-0023).
 _Avoid_: Quote, reference, reply context
@@ -217,6 +229,7 @@ _Avoid_: Notification, message, signal
 - A **Chat** or **Topic** has one **Session Mapping**: the set of **Session**s it has activated, with exactly one of them its **Active Session**
 - A **Topic** is created around its **Topic Root** and, when cola opens it, is anchored on its **Topic Anchor**; a cola-created **Topic Root** is a **Topic Cover Card**
 - A **Session** contains many **Turns** and has one **Project** and one optional **Agent**
+- A **Turn** renders into a **Card Chain**; a pending **Permission**/**Question** rides its newest card as an **Interaction Block**, and resolving one leaves an **Interaction Receipt**
 - A **Session** receives many **Permissions** and **Questions**
 - A **Session Snapshot** reports the state of one **Session** (its last **Turn**'s completion, pending **Permissions**/**Questions**, recent messages) to the **Chat**/**Topic** that activated it
 - The **Bridge** receives **Events** from a **Backend** and renders them as **Card** updates on the **Platform**
