@@ -1371,10 +1371,9 @@ async fn permission_click_at_the_split_limit_falls_back_to_the_flushed_receipt()
     );
 }
 
-/// A receipt anchors at the transcript position its block was surfaced at: it
-/// renders below the content that preceded the interaction and above content
-/// streamed after it — not at the bottom of the card with the tail (ADR-0038,
-/// rule 4).
+/// A receipt is keyed at the moment of resolution: it renders below the content
+/// that preceded the click and above content streamed after it — not at the
+/// bottom of the card with the tail (ADR-0038, rule 4).
 #[tokio::test]
 async fn interaction_receipt_renders_at_the_interaction_position() {
     let _wd = test_work_dir();
