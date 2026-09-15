@@ -336,7 +336,9 @@ Notes:
 
 - `/agent`, `/model`, `/think`, `/autoaccept` are **per-session** overrides sent
   with the next message and persisted across restarts. `/model`'s value must
-  exist on the server cola attaches to.
+  exist on the server cola attaches to. Bare `/model` opens the provider → model
+  picker, whose intro shows the model the next message will actually run
+  (session override, else `[opencode] model`, else what the server recorded).
 - `/restart-opencode` leaves a server launched by another tool alone — it only
   restarts a server cola started itself.
 - Topic rule: inside a topic already bound to a session, `/switch`, `/new` and

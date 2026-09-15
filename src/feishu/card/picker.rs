@@ -168,10 +168,13 @@ pub fn build_agent_card(
 /// The flow is therefore two-step: pick a provider here, then one of its
 /// models ([`build_model_picker_cards`]); every card is chunked to stay under
 /// the card budgets, and any model stays selectable via the
-/// `/model <provider/model>` text form.
+/// `/model <provider/model>` text form. `current` is the model the next turn
+/// will run (session override → configured default → server-recorded) — shown
+/// so the user can see what a pick would replace.
 pub fn build_model_provider_cards(
     thread_key: &crate::config::ThreadKey,
     providers: &[crate::opencode::types::ProviderModels],
+    current: Option<&str>,
 ) -> Vec<serde_json::Value> {
     let options: Vec<(String, String)> = providers
         .iter()
@@ -180,7 +183,7 @@ pub fn build_model_provider_cards(
     if options.is_empty() {
         return vec![picker_card(
             "🎯 选择模型",
-            "_(没有可用模型)_",
+            &format!("{}_(没有可用模型)_", current_model_line(current)),
             thread_key,
             "model",
             Some(PickerLevel::Provider),
@@ -191,7 +194,11 @@ pub fn build_model_provider_cards(
     }
     chunk_picker_cards(
         "🎯 选择模型",
-        &format!("**选择 provider**（共 {} 个）：", options.len()),
+        &format!(
+            "{}**选择 provider**（共 {} 个）：",
+            current_model_line(current),
+            options.len()
+        ),
         thread_key,
         "model",
         Some(PickerLevel::Provider),
@@ -199,6 +206,16 @@ pub fn build_model_provider_cards(
         None,
         &options,
     )
+}
+
+/// The leading "current model" line shared by the `/model` picker cards.
+/// `current` is the caller's display label (`provider/model@variant`); empty
+/// when there is no session or no rung of the effective-model ladder resolves
+/// — the card then shows only its "选择 …" intro, exactly as before.
+fn current_model_line(current: Option<&str>) -> String {
+    current
+        .map(|c| format!("**当前模型**：`{c}`\n"))
+        .unwrap_or_default()
 }
 
 /// The `/model` picker, step 2: one card page per set of `provider/model`
@@ -372,7 +389,7 @@ mod tests {
                 }],
             })
             .collect();
-        let cards = build_model_provider_cards(&key, &providers);
+        let cards = build_model_provider_cards(&key, &providers, None);
         assert!(cards.len() > 1, "huge provider list must split: {}", cards.len());
         let mut total_buttons = 0;
         for card in &cards {
@@ -432,13 +449,20 @@ mod tests {
         }
     }
 
-    /// An empty provider list degrades to a single "no models" card, not zero.
+    /// An empty provider list degrades to a single "no models" card, not zero;
+    /// a resolvable current model still renders its line on top.
     #[test]
     fn provider_cards_degrade_to_empty_intro() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let cards = build_model_provider_cards(&key, &[]);
+        let cards = build_model_provider_cards(&key, &[], Some("opencode-go/deepseek-v4-flash@low"));
         assert_eq!(cards.len(), 1);
-        assert!(cards[0].to_string().contains("没有可用模型"));
+        let text = cards[0].to_string();
+        assert!(text.contains("没有可用模型"), "degrade intro: {text}");
+        assert!(text.contains("当前模型"), "current label: {text}");
+        assert!(
+            text.contains("opencode-go/deepseek-v4-flash@low"),
+            "current model: {text}"
+        );
     }
 
     /// The `/think` card lists the current model, its declared variants, and a
