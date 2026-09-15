@@ -197,23 +197,19 @@ fn part_time(part: &serde_json::Value) -> Option<i64> {
 }
 
 fn render_part(acc: &mut StreamAccumulator, part: &serde_json::Value) {
-    let at = part_time(part);
+    // The part's position key: its server-side start time, or a monotonic
+    // fallback that preserves call order (test fixtures, older payloads).
+    let key = part_time(part).unwrap_or_else(|| acc.next_order());
     match part.get("type").and_then(|t| t.as_str()) {
         Some("text") => {
             if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                match at {
-                    Some(at) => acc.push_text_at(at, t),
-                    None => acc.push_text(t),
-                }
+                acc.push_text_at(key, t);
             }
             acc.card_state = crate::feishu::card::CardState::Streaming;
         }
         Some("reasoning") => {
             if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                match at {
-                    Some(at) => acc.push_reasoning_at(at, t),
-                    None => acc.push_reasoning(t),
-                }
+                acc.push_reasoning_at(key, t);
             }
             acc.card_state = crate::feishu::card::CardState::Reasoning;
         }
@@ -247,10 +243,7 @@ fn render_part(acc: &mut StreamAccumulator, part: &serde_json::Value) {
                 input,
                 output,
             };
-            match at {
-                Some(at) => acc.push_tool_at(at, &call_id, panel),
-                None => acc.push_tool(&call_id, panel),
-            }
+            acc.push_tool_at(key, &call_id, panel);
             if status == "running" {
                 acc.card_state = crate::feishu::card::CardState::Streaming;
             }
