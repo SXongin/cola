@@ -21,6 +21,21 @@ categories = ["command-line-utilities", "development-tools"]
 name = "cola"
 path = "src/main.rs"
 
+# cargo-binstall support (ADR-0037): binstall's default pkg-url guesses the
+# asset name from the crate name (`colark-...`) while releases ship
+# `cola-<version>-<target>`; the binary name is hardcoded because `{ bin }` is
+# only renderable in bin-dir, not in pkg-url. quick-install serves third-party
+# builds, so it is disabled; `compile` remains the fallback for targets without
+# an asset (Linux aarch64, Intel macOS).
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/{ version }/cola-{ version }-{ target }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+disabled-strategies = ["quick-install"]
+
+[package.metadata.binstall.overrides.'cfg(target_os = "windows")']
+pkg-fmt = "zip"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.13", features = ["json", "stream", "query"] }
