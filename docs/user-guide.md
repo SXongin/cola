@@ -61,14 +61,19 @@ is the convention per-user apps use. Extract `cola.exe`, add the directory to
 your user `PATH` (Settings → System → About → Advanced system settings →
 Environment Variables), and reopen the terminal.
 
-**crates.io.** With a Rust toolchain you can install from
-[crates.io](https://crates.io/crates/colark): `cargo install colark` (the
-binary is named `cola`). Source builds need a C compiler and linker — the TLS
-stack builds AWS-LC — and on Windows also NASM (or set
-`AWS_LC_SYS_PREBUILT_NASM=1`); no system OpenSSL is required. On a minimal Linux
-image, install `ca-certificates` so the Feishu WebSocket handshake can verify
-the server. A cargo-installed binary is updated with cargo, not by cola's
-self-update — see [Self-update](#self-update).
+**crates.io.** With Rust tooling you can install from
+[crates.io](https://crates.io/crates/colark): `cargo binstall colark` (needs
+[cargo-binstall](https://github.com/cargo-bins/cargo-binstall)) downloads the
+prebuilt release binary for your platform — no compile — while
+`cargo install colark` builds from source. The binary is named `cola` either
+way. Source builds need a C compiler and linker — the TLS stack builds AWS-LC —
+and on Windows also NASM (or set `AWS_LC_SYS_PREBUILT_NASM=1`); no system
+OpenSSL is required. On a minimal Linux image, install `ca-certificates` so the
+Feishu WebSocket handshake can verify the server. On a platform with no
+prebuilt asset (Linux aarch64, Intel macOS) binstall falls back to compiling
+from source; `cargo install colark` gets there directly. A cargo-tracked binary
+(a binstall install writes cargo's receipt too) is updated with cargo, not by
+cola's self-update — see [Self-update](#self-update).
 
 **Other platforms.** There is no prebuilt asset for Linux aarch64 or Intel
 macOS; a GitHub-channel self-update reports "no asset for this platform"
@@ -288,10 +293,11 @@ was installed through.
   hands back to `Restart=on-failure`; elsewhere cola re-execs itself.
 - **cargo installs** (`cargo install colark` / `cargo binstall colark`): cola
   detects cargo's install receipt and replaces nothing. It checks the crates.io
-  version and replies with the command to run: `cargo install colark`, or
-  `cargo binstall colark` for a binstall install; add `--force` if cargo
-  answers "already installed". Updating through cargo keeps its install
-  bookkeeping (`cargo install --list`, cargo-update) truthful.
+  version and replies with the command to run: `cargo install colark` — which
+  compiles from source — or `cargo binstall colark`, which downloads the
+  prebuilt release asset; add `--force` if cargo answers "already installed".
+  Updating through cargo keeps its install bookkeeping (`cargo install --list`,
+  cargo-update) truthful.
 - Platforms without a prebuilt binary (e.g. Linux aarch64) report that instead
   of failing.
 
