@@ -9,7 +9,7 @@
 # to create and approve pull requests". `require_last_push_approval` on the
 # `main: review` ruleset means every synchronize must approve the newest
 # commit; the last step skips the approval when the PR head moved mid-run.
-name: opencode review
+name: OpenCode Review
 
 on:
   pull_request:
@@ -70,13 +70,15 @@ jobs:
           MODEL: opencode-go/deepseek-v4.1-flash
           USE_GITHUB_TOKEN: "true"
           # `opencode github run` never answers permission asks, so any request
-          # that would prompt hangs the job until the timeout. Deny bash except
-          # read-only gh/git (upstream's own review workflow posture, plus an
-          # explicit `gh pr review` denial so only the step below approves),
-          # and allow the asks a review must not trip: paths outside the
-          # checkout and .env reads (the runner holds no .env secrets).
+          # that would prompt hangs the job until the timeout. Deny edits, and
+          # deny bash except read-only gh/git (upstream's own review workflow
+          # posture, plus an explicit `gh pr review` denial so the approval
+          # stays with the step below); allow the asks a review must not trip:
+          # paths outside the checkout and .env reads (the runner holds no
+          # .env secrets).
           OPENCODE_PERMISSION: |
             {
+              "edit": "deny",
               "bash": {"*": "deny", "git *": "allow", "gh *": "allow", "gh pr review*": "deny"},
               "external_directory": "allow",
               "read": {"*.env": "allow", "*.env.*": "allow"}
@@ -90,8 +92,8 @@ jobs:
             contradicts an existing ADR in docs/adr/.
 
             Rules:
-            - Read-only: do not edit, create, or delete any file, and do not
-              push. The runner fails if the worktree is dirty.
+            - Read-only: editing tools are disabled and any unpushed change
+              would fail the run. Do not try to write.
             - Shell access is limited to read-only `git` and `gh` commands
               (for example `gh pr diff`, `gh issue view`); everything else is
               denied. Do not post reviews, comments, or labels yourself; the
