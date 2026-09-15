@@ -1,4 +1,5 @@
 pub mod access;
+pub mod card_handles;
 pub mod command;
 pub mod core;
 pub mod discovery;

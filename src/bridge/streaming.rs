@@ -28,6 +28,27 @@ pub enum TimelineKind {
     Receipt(String),
 }
 
+/// The body-element range one live interaction block occupies on a built card.
+/// Recorded at render time so the card handle can resolve or refresh the block
+/// in place on the cached JSON, long after the accumulator that rendered it is
+/// gone (ADR-0038, rule 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockSpan {
+    pub request_id: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// A card as built for one message: the JSON, whether the timeline had to
+/// split (the caller then sends a continuation), and the element ranges of the
+/// live interaction blocks this card renders — empty on finalized slices, whose
+/// tail belongs to the newest card.
+pub struct BuiltCard {
+    pub card: serde_json::Value,
+    pub full: bool,
+    pub spans: Vec<BlockSpan>,
+}
+
 /// A permission request surfaced inline on the streaming card (instead of a
 /// separate card), so the whole turn lives on ONE card.
 #[derive(Debug, Clone)]
@@ -103,6 +124,49 @@ impl InteractionBlock {
             InteractionBlock::Receipt(_) => "",
         }
     }
+
+    /// The session that owns the block's request (a sub-task child carries its
+    /// own id). Empty for a receipt tombstone.
+    pub fn session_id(&self) -> &str {
+        match self {
+            InteractionBlock::Permission(p) => &p.session_id,
+            InteractionBlock::Question(q) => &q.session_id,
+            InteractionBlock::Receipt(_) => "",
+        }
+    }
+
+    /// The compact one-line target an Interaction Receipt names for this block
+    /// (ADR-0038, rule 4): permissions carry their action + first pattern /
+    /// edited file (computed at inline time), questions their headers (or a
+    /// clipped question text). Derived from the block itself, never from a
+    /// click payload, so a malformed callback cannot write arbitrary markdown
+    /// onto a card.
+    pub fn receipt_target(&self) -> String {
+        match self {
+            InteractionBlock::Permission(p) => p.target.clone(),
+            InteractionBlock::Question(q) => question_target(&q.questions),
+            InteractionBlock::Receipt(_) => String::new(),
+        }
+    }
+}
+
+/// Compact one-line target for a question's receipt: each question's header
+/// (or a clipped question text), joined, clipped to stay a residue.
+pub(crate) fn question_target(questions: &[crate::opencode::types::QuestionInfo]) -> String {
+    crate::feishu::card::truncate_md(
+        &questions
+            .iter()
+            .map(|qi| {
+                if qi.header.is_empty() {
+                    crate::feishu::card::truncate_md(&qi.question, 24)
+                } else {
+                    qi.header.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("、"),
+        60,
+    )
 }
 
 /// One live card per session: the streaming accumulator plus the card identity
@@ -611,27 +675,47 @@ impl StreamAccumulator {
     /// timeline with the tail sections (inline interactions, buttons, footer).
     #[cfg(test)]
     pub fn build_card(&self) -> serde_json::Value {
-        self.build_card_inner(0, self.timeline.len(), true, None)
+        self.build_card_inner(0, self.timeline.len(), true, None).0
     }
 
     /// Build the card from `render_from` onward, splitting when the estimated
-    /// component count would exceed Feishu's card limit. Returns `(card, full)`:
-    /// when `full`, the card is finalized with the "部分完成，继续中…" header
-    /// state and `render_from` has advanced past the split point — the caller
-    /// then sends a fresh continuation card. When not full, the card includes
-    /// the tail sections and is the turn's final visible card.
-    pub fn build_card_with_split(&mut self) -> (serde_json::Value, bool) {
+    /// component count would exceed Feishu's card limit. When `full`, the card
+    /// is finalized with the "部分完成，继续中…" header state and `render_from`
+    /// has advanced past the split point — the caller then sends a fresh
+    /// continuation card. When not full, the card includes the tail sections
+    /// and is the turn's final visible card. The spans name each live
+    /// interaction block's element range, for the card handle (ADR-0038,
+    /// rule 2).
+    pub fn build_card_with_info(&mut self) -> BuiltCard {
         let split = self.estimate_split_index(self.render_from);
         let full = split < self.timeline.len();
         let state = if full { Some(CardState::Continued) } else { None };
-        let card = self.build_card_inner(self.render_from, split, !full, state);
+        let (card, spans) = self.build_card_inner(self.render_from, split, !full, state);
         // Advance `render_from` ONLY on an actual split: while the card still
         // fits, subsequent flushes must re-render from the SAME start so the
         // content accumulates instead of only showing the latest delta.
         if full {
             self.render_from = split;
         }
-        (card, full)
+        BuiltCard { card, full, spans }
+    }
+
+    /// [`Self::build_card_with_info`] for callers that don't need the block
+    /// spans (the click ack's split probe, tests).
+    pub fn build_card_with_split(&mut self) -> (serde_json::Value, bool) {
+        let built = self.build_card_with_info();
+        (built.card, built.full)
+    }
+
+    /// The request ids of every block the accumulator still awaits. A block
+    /// resident here is the accumulator's own render source — the sweep
+    /// resolves it through the timeline, not through the card handle.
+    pub fn live_request_ids(&self) -> Vec<&str> {
+        self.interactions
+            .iter()
+            .filter(|b| b.is_live())
+            .map(InteractionBlock::request_id)
+            .collect()
     }
 
     /// First timeline index whose items would push the estimated component
@@ -704,14 +788,16 @@ impl StreamAccumulator {
     /// Assemble the card JSON for `timeline[start..end]`. `include_tail` adds
     /// the non-timeline sections (inline permission/question, error, retry
     /// button, context-ratio footer) — only the turn's final card should carry
-    /// them. `state_override` forces the header state (e.g. "部分完成" on split cards).
+    /// them. `state_override` forces the header state (e.g. "部分完成" on split
+    /// cards). Returns the card and the element range of every live block the
+    /// tail rendered (empty without a tail).
     fn build_card_inner(
         &self,
         start: usize,
         end: usize,
         include_tail: bool,
         state_override: Option<CardState>,
-    ) -> serde_json::Value {
+    ) -> (serde_json::Value, Vec<BlockSpan>) {
         let state = state_override.unwrap_or_else(|| self.card_state.clone());
         let mut builder = CardBuilder::new()
             .with_state(state)
@@ -767,14 +853,17 @@ impl StreamAccumulator {
             builder = builder.with_text(&pending);
         }
 
+        let mut spans: Vec<BlockSpan> = Vec::new();
         if include_tail {
             // The card's tail: the live interaction blocks, in accumulated
             // order. A permission renders its buttons right here (the whole
             // turn lives on one card); a question renders its current display
             // answers. Resolved blocks are timeline receipts above, not here —
             // their entry is only a tombstone that keeps a racing poll from
-            // re-surfacing the request.
+            // re-surfacing the request. Each live block's element range is
+            // recorded for the card handle.
             for block in &self.interactions {
+                let start = builder.body_len();
                 match block {
                     InteractionBlock::Permission(p) => {
                         builder = builder.with_text(&format!("🔐 **权限请求**\n{}", p.body));
@@ -799,8 +888,13 @@ impl StreamAccumulator {
                             builder = builder.with_element(el);
                         }
                     }
-                    InteractionBlock::Receipt(_) => {}
+                    InteractionBlock::Receipt(_) => continue,
                 }
+                spans.push(BlockSpan {
+                    request_id: block.request_id().to_string(),
+                    start,
+                    end: builder.body_len(),
+                });
             }
 
             if let Some(ref err) = self.error {
@@ -872,7 +966,7 @@ impl StreamAccumulator {
             builder = builder.with_footer(&footer_parts.join(" · "));
         }
 
-        builder.build()
+        (builder.build(), spans)
     }
 }
 
@@ -1051,6 +1145,7 @@ mod tests {
 
         let mid = acc
             .build_card_inner(0, acc.timeline.len(), false, None)
+            .0
             .to_string();
         assert!(mid.contains("📁 cola · feat/x ⚠"), "mid missing: {}", mid);
         assert!(

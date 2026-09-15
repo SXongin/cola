@@ -158,6 +158,13 @@ impl CardBuilder {
         self
     }
 
+    /// How many body elements have been pushed so far — the streaming card
+    /// records each interaction block's element range with it (ADR-0038, rule
+    /// 2), so a cached card can be edited in place later.
+    pub(crate) fn body_len(&self) -> usize {
+        self.body.len()
+    }
+
     /// Build the Feishu card JSON payload (v2 schema).
     pub fn build(&self) -> serde_json::Value {
         let mut elements = self.body.clone();

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::bridge::card_handles::RenderedBlock;
 use crate::bridge::core::{SESSION_INFO_TIMEOUT, SharedCore};
 use crate::bridge::streaming::StreamAccumulator;
 
@@ -394,12 +395,22 @@ pub(crate) async fn flush_card(core: &Arc<SharedCore>, session_id: &str) {
     // the Interaction Receipts — that card carries.
     let mut card_is_live = true;
     for _ in 0..MAX_CARD_CHAIN {
-        let (card, full) = {
+        let (built, rendered) = {
             let mut cards = core.cards.lock().await;
-            match cards.get_mut(session_id) {
-                Some(card) => card.acc.build_card_with_split(),
-                None => return,
-            }
+            let Some(card) = cards.get_mut(session_id) else {
+                return;
+            };
+            let built = card.acc.build_card_with_info();
+            let rendered = built
+                .spans
+                .iter()
+                .filter_map(|span| {
+                    card.acc
+                        .interaction(&span.request_id)
+                        .and_then(|block| RenderedBlock::of(span, block))
+                })
+                .collect();
+            (built, rendered)
         };
         let card_id = {
             let cards = core.cards.lock().await;
@@ -411,17 +422,24 @@ pub(crate) async fn flush_card(core: &Arc<SharedCore>, session_id: &str) {
             // The live card takes the slice in place: either it still fits
             // (plain update) or this flush finalizes it with the "to be
             // continued" marker.
-            if let Err(e) = core.feishu.update_message(&card_id, &card).await {
+            if let Err(e) = core.feishu.update_message(&card_id, &built.card).await {
                 tracing::warn!("Card update failed: {}", e);
             }
-            if !full {
+            // Record what this card now renders: the live blocks (or none, when
+            // the update finalized the card without its tail — the continuation
+            // below then takes them over).
+            core.card_handles
+                .lock()
+                .await
+                .record(&card_id, &built.card, rendered);
+            if !built.full {
                 return;
             }
             card_is_live = false;
             continue;
         }
 
-        // A finalized slice needs its own card; `build_card_with_split` already
+        // A finalized slice needs its own card; `build_card_with_info` already
         // advanced `render_from` past the split point, so each continuation
         // holds exactly the slice it was built from — nothing is lost.
         let reply_to = {
@@ -431,12 +449,21 @@ pub(crate) async fn flush_card(core: &Arc<SharedCore>, session_id: &str) {
                 .and_then(|c| c.acc.reply_to_message_id.clone())
         };
         let Some(reply_to) = reply_to else { return };
-        match core.feishu.reply_card(&reply_to, &card).await {
+        match core.feishu.reply_card(&reply_to, &built.card).await {
             Ok(new_id) => {
-                if let Some(card) = core.cards.lock().await.get_mut(session_id) {
-                    card.card_message_id = Some(new_id);
+                {
+                    let mut cards = core.cards.lock().await;
+                    if let Some(card) = cards.get_mut(session_id) {
+                        card.card_message_id = Some(new_id.clone());
+                    }
                 }
-                if !full {
+                // The continuation takes the blocks over from the finalized
+                // slice it follows (its spans are the tail this card renders).
+                core.card_handles
+                    .lock()
+                    .await
+                    .record(&new_id, &built.card, rendered);
+                if !built.full {
                     return;
                 }
                 // The continuation is itself over the limit → loop for the
