@@ -92,6 +92,17 @@ impl InteractionBlock {
     pub fn is_live(&self) -> bool {
         !matches!(self, InteractionBlock::Receipt(_))
     }
+
+    /// The directory that owns the block's request — the scope a sweep judges
+    /// a vanished request in. Empty for a receipt tombstone, whose request is
+    /// already settled.
+    pub fn directory(&self) -> &str {
+        match self {
+            InteractionBlock::Permission(p) => &p.directory,
+            InteractionBlock::Question(q) => &q.directory,
+            InteractionBlock::Receipt(_) => "",
+        }
+    }
 }
 
 /// One live card per session: the streaming accumulator plus the card identity

@@ -117,6 +117,26 @@ pub trait RequestKind: Send + Sync {
     ) -> Option<CardActionResult>;
 }
 
+/// The shared sweep shape for both kinds (#175): resolve every LIVE block the
+/// kind owns (`own`) whose request vanished into its
+/// `⏱ 已由其他客户端处理` Interaction Receipt. A block owned by a directory
+/// whose list call failed stays: that directory said nothing, so its request
+/// may still be pending (#130, #144). Returns how many were resolved — the
+/// sweep repaints each affected card so the receipt lands within one poll.
+fn resolve_vanished_blocks(
+    acc: &mut StreamAccumulator,
+    pending: &std::collections::HashSet<String>,
+    failed_dirs: &std::collections::HashSet<String>,
+    own: impl Fn(&InteractionBlock) -> bool,
+) -> usize {
+    acc.resolve_vanished(
+        |block| {
+            own(block) && !pending.contains(block.request_id()) && !failed_dirs.contains(block.directory())
+        },
+        handled_elsewhere_receipt,
+    )
+}
+
 /// The permission kind: `/autoaccept` sessions are answered automatically, and
 /// the card carries a friendly description of what the AI wants to do.
 pub struct PermissionKind;
@@ -214,16 +234,9 @@ impl RequestKind for PermissionKind {
         pending: &std::collections::HashSet<String>,
         failed_dirs: &std::collections::HashSet<String>,
     ) -> usize {
-        acc.resolve_vanished(
-            |block| match block {
-                InteractionBlock::Permission(p) => {
-                    !pending.contains(&p.request_id) && !failed_dirs.contains(&p.directory)
-                }
-                // Another kind's block (or a receipt) is not this sweep's to judge.
-                _ => false,
-            },
-            handled_elsewhere_receipt,
-        )
+        resolve_vanished_blocks(acc, pending, failed_dirs, |block| {
+            matches!(block, InteractionBlock::Permission(_))
+        })
     }
 
     fn claim_kind(&self) -> ClaimKind {
@@ -650,16 +663,9 @@ impl RequestKind for QuestionKind {
         pending: &std::collections::HashSet<String>,
         failed_dirs: &std::collections::HashSet<String>,
     ) -> usize {
-        acc.resolve_vanished(
-            |block| match block {
-                InteractionBlock::Question(q) => {
-                    !pending.contains(&q.request_id) && !failed_dirs.contains(&q.directory)
-                }
-                // Another kind's block (or a receipt) is not this sweep's to judge.
-                _ => false,
-            },
-            handled_elsewhere_receipt,
-        )
+        resolve_vanished_blocks(acc, pending, failed_dirs, |block| {
+            matches!(block, InteractionBlock::Question(_))
+        })
     }
 
     fn claim_kind(&self) -> ClaimKind {
