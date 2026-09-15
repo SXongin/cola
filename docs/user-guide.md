@@ -63,8 +63,12 @@ Environment Variables), and reopen the terminal.
 
 **crates.io.** With a Rust toolchain you can install from
 [crates.io](https://crates.io/crates/colark): `cargo install colark` (the
-binary is named `cola`). A cargo-installed binary is updated with cargo, not by
-cola's self-update — see [Self-update](#self-update).
+binary is named `cola`). Source builds need a C compiler and linker — the TLS
+stack builds AWS-LC — and on Windows also NASM (or set
+`AWS_LC_SYS_PREBUILT_NASM=1`); no system OpenSSL is required. On a minimal Linux
+image, install `ca-certificates` so the Feishu WebSocket handshake can verify
+the server. A cargo-installed binary is updated with cargo, not by cola's
+self-update — see [Self-update](#self-update).
 
 **Other platforms.** There is no prebuilt asset for Linux aarch64 or Intel
 macOS; a GitHub-channel self-update reports "no asset for this platform"
