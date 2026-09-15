@@ -7,7 +7,7 @@ resolver = "3"
 
 [package]
 name = "colark"
-version = "0.8.3"
+version = "0.8.4"
 edition = "2024"
 description = "A bridge bot that brings the OpenCode AI coding experience into Feishu"
 license = "MIT"
