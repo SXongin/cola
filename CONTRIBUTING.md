@@ -133,13 +133,17 @@ Reviews check two axes separately:
 Flag any place where the diff contradicts an existing ADR explicitly rather than
 silently overriding it.
 
-Every non-draft PR gets a CodeRabbit review (`.coderabbit.yaml`, ADR-0034).
-Public repositories under 10 stars are excluded from automatic reviews, so
-trigger it once per PR with `@coderabbitai review`. `request_changes_workflow`
-is on: CodeRabbit approves once its unresolved comments are addressed and the
-latest commit has been reviewed — that approval is what satisfies the
-`main: review` ruleset's required review for solo work. The admin bypass
-remains for emergencies; the bot can never lock the maintainer out.
+Every non-draft PR gets an OpenCode review
+(`.github/workflows/opencode-review.yml`, ADR-0034). It runs on `opened`,
+`synchronize`, `reopened` and `ready_for_review` with the OpenCode Go
+subscription, reviews the diff on the two axes above, and — when it finds
+nothing blocking — `github-actions[bot]` approves. That approval is what
+satisfies the `main: review` ruleset's required review for solo work. A
+blocking review is a comment with a `FAIL` verdict and no approval, not a
+`request-changes`: Actions bots cannot dismiss their own review and would lock
+the PR. Fork PRs are skipped (no secrets) and Dependabot PRs are skipped
+(upstream's permission check rejects bot actors). The admin bypass remains for
+emergencies; the bot can never lock the maintainer out.
 
 ## Releasing
 

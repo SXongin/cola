@@ -64,14 +64,20 @@ byproduct**. Concretely:
    bot approvals. The admin bypass still exists, so the bot can never lock the
    maintainer out.
 
+   > **Amended 2026-09-15**: the gate is now the OpenCode review workflow; see
+   > the amendment at the end of this ADR.
+
 **Explicit no-s.** We are not pursuing the CII Best Practices badge (hours of
 self-attestation for at most +0.2), multi-organization `Contributors` (not
 something a project can honestly fix), human `Code-Review` before a second
 maintainer exists, or paid review tools. We also do not chase 9/10 with
 settings that misrepresent how the project is maintained. Expected trajectory:
-6 → ~8 once the changes and the two auto-healing checks land (9 if CodeRabbit
-approvals and the fuzz target are counted); 10 is unreachable for a
-single-person, single-organization project without gaming the checks.
+6 → ~8 once the changes and the two auto-healing checks land (the published
+result on 2026-09-14 was 7.5, with `Maintained` still 0 until the repository
+turns 90 days old); 10 is unreachable for a single-person, single-organization
+project without gaming the checks. The review-gate approval does count toward
+`Code-Review` today, but only because that check's implementation does not
+filter bot reviewers — see the 2026-09-15 amendment.
 
 ## Consequences
 
@@ -82,8 +88,56 @@ single-person, single-organization project without gaming the checks.
 - The provenance attachment depends on the attestation store read permission
   (`attestations: read`) and `gh attestation download` naming bundles by digest;
   the release workflow renames them per artifact.
-- CodeRabbit is a new third-party app with repository read access and an
-  approval voice; removing it later reverts this ADR's review decision but not
-  the other five.
+- CodeRabbit was removed on 2026-09-15 (see the amendment). Its repository read
+  access and approval voice are replaced by the OpenCode review workflow, which
+  holds `pull-requests: write` and an API key shared with local development.
 - The Scorecard number will be lower than its theoretical maximum by design.
   Do not "fix" the remaining zeros without revisiting this ADR.
+
+## Amendment (2026-09-15): the OpenCode review workflow replaces CodeRabbit
+
+The gate in item 6 is now `.github/workflows/opencode-review.yml` (PR #164,
+issue #163):
+
+- It reviews every non-draft in-repo PR on `opened`, `synchronize`, `reopened`
+  and `ready_for_review` with the OpenCode Go subscription and, on a clean
+  review, approves through `github-actions[bot]` — same approval, no manual
+  trigger.
+- The approval is deterministic: the model ends its PR comment with a
+  `PASS`/`FAIL` verdict line, and a separate step approves only on `PASS`, only
+  for the reviewed commit. A failed, missing or malformed review never approves.
+- The CLI is installed from a version-pinned release tarball and verified
+  against its SHA-256 digest (the composite action installs `releases/latest`,
+  so pinning the action would not pin the executed code), and the model runs
+  sandboxed: edits denied, bash limited to read-only `git`/`gh` verbs, and
+  `gh pr review` denied so the approval stays with the workflow's own step.
+- Fork PRs are skipped (they never see secrets). Dependabot PRs are skipped
+  too: `opencode github run` asserts the triggering actor is a collaborator,
+  and a bot actor fails that check before the model runs.
+
+Why CodeRabbit went away:
+
+- Its automatic reviews skip public repositories under 10 stars, so every PR
+  needed a manual `@coderabbitai review`.
+- Its free tier rate limits reviews (observed: `Next included review available
+  in 15 minutes` on PR #162), and a rate-limited attempt still consumes the
+  PR's slot.
+- Its `request_changes_workflow` veto blocked merges after the new gate had
+  approved (PR #164: `CHANGES_REQUESTED` at 01:34 and 01:45 against an approval
+  at 02:10, unblocked only when it re-reviewed at 02:18 — ~44 minutes of
+  waiting), and with `require_last_push_approval` every push makes both bots
+  re-review.
+
+Two Scorecard facts recorded while doing this:
+
+- `Code-Review` counts a bot approval because the check's implementation
+  (`probes/codeApproved`) filters only *bot-authored changesets*, never bot
+  reviewers, despite its documentation saying bot reviews do not count. The
+  published v5.5.0 result already shows this: 3/11 approved changesets with
+  CodeRabbit as the only non-author approver in the repository's history. Treat
+  that score as fragile: if the implementation ever matches the docs, the check
+  returns to 0.
+- Merged Dependabot changesets that never receive an approval count against
+  `Code-Review` (approved bot changesets are skipped entirely), so skipping
+  Dependabot PRs in the gate has a small score cost. Worth revisiting only if
+  the score matters more than the automation.
