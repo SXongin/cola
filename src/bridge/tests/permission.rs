@@ -1204,3 +1204,80 @@ async fn inline_permission_click_after_remote_resolution_gets_receipt() {
             .is_empty()
     );
 }
+
+/// A click whose card is over the split budget cannot ride the ack (Feishu
+/// would reject the oversized card): the fallback flush finalizes the card and
+/// sends the continuation, and the receipt rides the continuation — still
+/// rendered from the accumulator, never lost.
+#[tokio::test]
+async fn permission_click_at_the_split_limit_falls_back_to_the_flushed_receipt() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_1", "/work").await;
+
+    // A live card carrying the block and a timeline already past the split
+    // budget (a poll rendered parts, then the click raced the next flush).
+    let mut acc = crate::bridge::streaming::StreamAccumulator::new("test");
+    acc.reply_to_message_id = Some("msg_1".into());
+    acc.add_interaction(crate::bridge::streaming::InteractionBlock::Permission(
+        crate::bridge::streaming::PendingPermission {
+            session_id: "ses_1".into(),
+            request_id: "per_1".into(),
+            body: "bash ls -la".into(),
+            directory: "/work".into(),
+        },
+    ));
+    acc.push_text(&"很长的回答。".repeat(2000));
+    {
+        let mut cards = app.cards.lock().await;
+        cards.insert(
+            "ses_1".to_string(),
+            crate::bridge::streaming::CardSession::new(acc, Some("msg_live".into())),
+        );
+    }
+
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "perm",
+            "reply": "once",
+            "session_id": "ses_1",
+            "request_id": "per_1",
+            "perm_label": "✅ 已允许一次",
+            "perm_color": "green",
+            "perm_body": "bash",
+        }))
+        .await
+        .expect("a card-action result");
+    assert!(
+        result.card.is_none(),
+        "an over-budget card degrades to the PATCH flush, not an oversized ack"
+    );
+
+    // The fallback flushed: the continuation card (the new live card) still
+    // carries the receipt, rendered from the accumulator.
+    let continuation = latest_card(&platform).await.to_string();
+    assert!(
+        continuation.contains("✅ 已允许一次 · "),
+        "the receipt must ride the continuation: {}",
+        continuation
+    );
+    assert!(
+        !continuation.contains("🔐 **权限请求**"),
+        "the resolved block must not come back: {}",
+        continuation
+    );
+    assert!(
+        app.cards
+            .lock()
+            .await
+            .get("ses_1")
+            .unwrap()
+            .acc
+            .live_permissions()
+            .is_empty()
+    );
+}
