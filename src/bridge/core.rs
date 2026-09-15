@@ -51,6 +51,12 @@ pub struct SharedCore {
     pub sessions: Arc<Mutex<SessionStore>>,
     /// session_id → the session's one live card (accumulator + card id chain).
     pub cards: Arc<Mutex<HashMap<String, crate::bridge::streaming::CardSession>>>,
+    /// The card handles (ADR-0038, rule 2): `request_id → message_id` plus, for
+    /// every card that shows a live interaction block, the card JSON as last
+    /// rendered. Lets any card showing a block be repainted — a click's ack, a
+    /// remote resolution, a sweep strip — whether or not it is still the
+    /// accumulator's current card.
+    pub card_handles: Arc<Mutex<crate::bridge::card_handles::CardHandles>>,
     /// Permission flow: owns `sent_cards`, polls pending requests, auto-accepts
     /// for `/autoaccept` sessions, and handles the "perm" card action.
     pub permission: crate::bridge::request::RequestFlow,
@@ -114,6 +120,7 @@ impl SharedCore {
         Ok(Self {
             sessions: Arc::new(Mutex::new(session_store)),
             cards: Arc::new(Mutex::new(HashMap::new())),
+            card_handles: Arc::new(Mutex::new(crate::bridge::card_handles::CardHandles::default())),
             permission: crate::bridge::request::RequestFlow::new(Box::new(
                 crate::bridge::request::PermissionKind,
             )),

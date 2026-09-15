@@ -102,7 +102,11 @@ pub trait RequestKind: Send + Sync {
     /// poll sweep only drops claims of its own kind.
     fn claim_kind(&self) -> ClaimKind;
 
-    /// Handle a card action click on this kind's card.
+    /// Handle a card action click on this kind's card. `clicked` is the message
+    /// id the click landed on (`open_message_id`), so the ack can update THAT
+    /// card through its handle even when it is no longer the accumulator's
+    /// current card (ADR-0038, rule 3).
+    #[allow(clippy::too_many_arguments)] // the click context is the trait's whole point
     async fn handle_action(
         &self,
         flow: &RequestFlow,
@@ -114,6 +118,7 @@ pub trait RequestKind: Send + Sync {
         directory: Option<&str>,
         inline: bool,
         host: &Option<String>,
+        clicked: Option<&str>,
     ) -> Option<CardActionResult>;
 }
 
@@ -133,7 +138,7 @@ fn resolve_vanished_blocks(
         |block| {
             own(block) && !pending.contains(block.request_id()) && !failed_dirs.contains(block.directory())
         },
-        handled_elsewhere_receipt,
+        |block| handled_elsewhere_receipt(&block.receipt_target()),
     )
 }
 
@@ -254,6 +259,7 @@ impl RequestKind for PermissionKind {
         directory: Option<&str>,
         inline: bool,
         host: &Option<String>,
+        clicked: Option<&str>,
     ) -> Option<CardActionResult> {
         let perm_label = value.get("perm_label").and_then(|v| v.as_str()).unwrap_or("");
         let perm_color = value
@@ -277,6 +283,7 @@ impl RequestKind for PermissionKind {
                     .directory_for_session(session_id)
                     .unwrap_or_default(),
             };
+            let mut cached = None;
             if flow.try_mark_answered(core, req_id).await {
                 let mut approved = core.set_auto_accept(session_id, &dir, true).await;
                 // The clicked request is always resolved by the toggle, even
@@ -289,7 +296,10 @@ impl RequestKind for PermissionKind {
                 // re-renders without them synchronously — the poller would
                 // otherwise leave them lingering until the next poll notices
                 // the requests vanished (ADR-0038, rule 4).
-                resolve_surfaced(flow, core, host, &approved, autoaccept_receipt).await;
+                cached = resolve_blocks(flow, core, host, session_id, clicked, &approved, |target| {
+                    autoaccept_receipt(target)
+                })
+                .await;
                 tracing::info!(
                     "Auto-Accept enabled via permission card on session {} (approved {})",
                     session_id,
@@ -298,9 +308,7 @@ impl RequestKind for PermissionKind {
             }
             let mut r = result_card("✅ 已开启自动授权", "blue", "该会话后续权限请求将自动批准。");
             r.toast = Some("已开启自动授权".to_string());
-            if inline {
-                r.card = ack_inline_card(core, host, session_id).await;
-            }
+            settle_ack(core, host, session_id, inline, cached, &mut r).await;
             // Re-served verbatim to a losing double-click.
             flow.remember_answered_result(req_id, &r).await;
             return Some(r);
@@ -328,7 +336,7 @@ impl RequestKind for PermissionKind {
                 "permission card carries no directory".into(),
             )),
         };
-        match reply_result {
+        let cached = match reply_result {
             Ok(()) => {
                 tracing::info!("Permission reply sent: {} session={}", reply, req_id);
                 // ADR-0038 rules 3+4: the clicked block becomes its
@@ -336,10 +344,16 @@ impl RequestKind for PermissionKind {
                 // survives later flushes) and the ack below carries the
                 // clicked card's updated JSON — no PATCH race, no dependence
                 // on which card is current.
-                resolve_surfaced(flow, core, host, &[req_id.to_string()], |block| {
-                    permission_receipt(block, reply)
-                })
-                .await;
+                resolve_blocks(
+                    flow,
+                    core,
+                    host,
+                    session_id,
+                    clicked,
+                    &[req_id.to_string()],
+                    |target| permission_receipt(target, reply),
+                )
+                .await
             }
             // 404: the permission is already resolved — by another client,
             // or by a click replayed after a restart cleared the in-memory
@@ -347,11 +361,18 @@ impl RequestKind for PermissionKind {
             // show the neutral handled card.
             Err(e) if e.is_not_found() => {
                 tracing::info!("Permission already resolved: {}", e);
-                resolve_surfaced(flow, core, host, &[req_id.to_string()], handled_elsewhere_receipt).await;
+                let cached = resolve_blocks(
+                    flow,
+                    core,
+                    host,
+                    session_id,
+                    clicked,
+                    &[req_id.to_string()],
+                    handled_elsewhere_receipt,
+                )
+                .await;
                 let mut r = already_handled_result(self.label(), inline, "该权限已处理");
-                if inline {
-                    r.card = ack_inline_card(core, host, session_id).await;
-                }
+                settle_ack(core, host, session_id, inline, cached, &mut r).await;
                 flow.remember_answered_result(req_id, &r).await;
                 return Some(r);
             }
@@ -366,7 +387,7 @@ impl RequestKind for PermissionKind {
                     "处理失败，请重试",
                 ));
             }
-        }
+        };
         // Result card: shows the decision, no buttons.
         let label = if !perm_label.is_empty() { perm_label } else { reply };
         let toast = match reply {
@@ -381,9 +402,7 @@ impl RequestKind for PermissionKind {
         };
         let mut r = result_card(label, perm_color, &body);
         r.toast = Some(toast);
-        if inline {
-            r.card = ack_inline_card(core, host, session_id).await;
-        }
+        settle_ack(core, host, session_id, inline, cached, &mut r).await;
         flow.remember_answered_result(req_id, &r).await;
         Some(r)
     }
@@ -436,38 +455,6 @@ fn receipt_line(prefix: &str, detail: &str) -> String {
     }
 }
 
-/// The target a receipt names — what the block was about. Derived from the
-/// accumulator's own block, never from the click payload: a malformed
-/// callback must not be able to write arbitrary markdown onto the card.
-/// Permissions carry their compact target (action + first pattern / edited
-/// file); questions carry their headers (or a clipped question text).
-fn receipt_target(block: &InteractionBlock) -> String {
-    match block {
-        InteractionBlock::Permission(p) => p.target.clone(),
-        InteractionBlock::Question(q) => question_target(&q.questions),
-        InteractionBlock::Receipt(_) => String::new(),
-    }
-}
-
-/// Compact one-line target for a question's receipt: each question's header
-/// (or a clipped question text), joined, clipped to stay a residue.
-fn question_target(questions: &[opencode::types::QuestionInfo]) -> String {
-    truncate(
-        &questions
-            .iter()
-            .map(|qi| {
-                if qi.header.is_empty() {
-                    truncate(&qi.question, 24)
-                } else {
-                    qi.header.clone()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("、"),
-        60,
-    )
-}
-
 /// The Interaction Receipt for a Session Snapshot's claimed block resolved by
 /// another client (#175, ADR-0038 rule 4): the same neutral line an inline
 /// block leaves, derived from the adopt-time request — a snapshot keeps no
@@ -475,7 +462,7 @@ fn question_target(questions: &[opencode::types::QuestionInfo]) -> String {
 pub(crate) fn snapshot_handled_elsewhere_receipt(req: &PendingRequest) -> String {
     let target = match req {
         PendingRequest::Permission(p) => permission_target(p),
-        PendingRequest::Question(q) => question_target(&q.questions),
+        PendingRequest::Question(q) => crate::bridge::streaming::question_target(&q.questions),
     };
     receipt_line(HANDLED_ELSEWHERE_PREFIX, &target)
 }
@@ -484,8 +471,7 @@ pub(crate) fn snapshot_handled_elsewhere_receipt(req: &PendingRequest) -> String
 /// `✅ 已允许一次：⚡ 执行 Shell 命令 \`ls -la\` · 14:03`. The target comes from
 /// the block being resolved, so the residue always names what it resolved;
 /// permission decisions carry the local decision time.
-fn permission_receipt(block: &InteractionBlock, reply: &str) -> String {
-    let target = receipt_target(block);
+fn permission_receipt(target: &str, reply: &str) -> String {
     let line = match reply {
         once @ ("once" | "always") => {
             let prefix = if once == "once" {
@@ -500,7 +486,7 @@ fn permission_receipt(block: &InteractionBlock, reply: &str) -> String {
                 format!("{prefix}：{target} · {time}")
             }
         }
-        _ => return receipt_line(DENIED_PREFIX, &target),
+        _ => return receipt_line(DENIED_PREFIX, target),
     };
     truncate(&line, RECEIPT_MAX_CHARS)
 }
@@ -509,12 +495,8 @@ fn permission_receipt(block: &InteractionBlock, reply: &str) -> String {
 /// `✅ 已回答：目录 /a、分支 main` — each question's header (or a clipped
 /// question text) with the answers chosen for it; a skipped slot reads
 /// 未作答. `answers[i]` is the selection submitted for question `i`.
-fn question_receipt(block: &InteractionBlock, answers: &[Vec<String>]) -> String {
-    let InteractionBlock::Question(q) = block else {
-        return "✅ 已回答".to_string();
-    };
-    let parts: Vec<String> = q
-        .questions
+fn question_receipt(questions: &[opencode::types::QuestionInfo], answers: &[Vec<String>]) -> String {
+    let parts: Vec<String> = questions
         .iter()
         .enumerate()
         .map(|(i, qi)| {
@@ -537,18 +519,18 @@ fn question_receipt(block: &InteractionBlock, answers: &[Vec<String>]) -> String
 
 /// Receipt for the Auto-Accept toggle — names the target of each block it
 /// resolved (it can resolve several at once).
-fn autoaccept_receipt(block: &InteractionBlock) -> String {
-    receipt_line(AUTOACCEPT_PREFIX, &receipt_target(block))
+fn autoaccept_receipt(target: &str) -> String {
+    receipt_line(AUTOACCEPT_PREFIX, target)
 }
 
 /// Receipt for a block a click found already resolved elsewhere.
-fn handled_elsewhere_receipt(block: &InteractionBlock) -> String {
-    receipt_line(HANDLED_ELSEWHERE_PREFIX, &receipt_target(block))
+pub(crate) fn handled_elsewhere_receipt(target: &str) -> String {
+    receipt_line(HANDLED_ELSEWHERE_PREFIX, target)
 }
 
 /// Receipt for a denied permission or a rejected question.
-fn denied_receipt(block: &InteractionBlock) -> String {
-    receipt_line(DENIED_PREFIX, &receipt_target(block))
+fn denied_receipt(target: &str) -> String {
+    receipt_line(DENIED_PREFIX, target)
 }
 
 /// Compact one-line target for a permission's receipt: the action plus the
@@ -683,6 +665,7 @@ impl RequestKind for QuestionKind {
         directory: Option<&str>,
         inline: bool,
         host: &Option<String>,
+        clicked: Option<&str>,
     ) -> Option<CardActionResult> {
         match reply {
             // "answer" = an option click (single-select replaces, multi-select
@@ -791,17 +774,6 @@ impl RequestKind for QuestionKind {
                 let Some((answered_count, display, done, outcome)) = mutated else {
                     return Some(flow.missing_question_result(directory, inline).await);
                 };
-                // Keep the inline card's display answers and done flags in sync.
-                if inline
-                    && let Some(acc) = core
-                        .cards
-                        .lock()
-                        .await
-                        .get_mut(host.as_deref().unwrap_or(session_id))
-                        .map(|c| &mut c.acc)
-                {
-                    acc.update_question_state(req_id, &display, &done);
-                }
                 if answered_count == n {
                     // All questions answered → claim the request and submit.
                     // The claim is atomic: a click that loses the race re-serves
@@ -827,6 +799,7 @@ impl RequestKind for QuestionKind {
                         inline,
                         host,
                         session_id,
+                        clicked,
                     )
                     .await
                     {
@@ -838,17 +811,19 @@ impl RequestKind for QuestionKind {
                         value.get("session_id").and_then(|v| v.as_str()).unwrap_or(""),
                         answers
                     );
-                    if inline {
-                        resolve_inline_block(core, host, session_id, req_id, |block| {
-                            question_receipt(block, &answers)
-                        })
-                        .await;
-                    }
+                    let cached = resolve_blocks(
+                        flow,
+                        core,
+                        host,
+                        session_id,
+                        clicked,
+                        &[req_id.to_string()],
+                        |_| question_receipt(&questions, &answers),
+                    )
+                    .await;
                     let mut r = result_card("✅ 已回答", "green", &qa_completion_body(&questions, &answers));
                     r.toast = Some("已回答".to_string());
-                    if inline {
-                        r.card = ack_inline_card(core, host, session_id).await;
-                    }
+                    settle_ack(core, host, session_id, inline, cached, &mut r).await;
                     // Re-served verbatim to a losing double-click.
                     flow.remember_answered_result(req_id, &r).await;
                     Some(r)
@@ -857,9 +832,35 @@ impl RequestKind for QuestionKind {
                     // display state (已选/✅ markers) — the mechanism that
                     // reliably refreshes the clicked card after a callback; a
                     // PATCH around the callback leaves it on its pre-answer
-                    // state.
+                    // state. The clicked card is refreshed through its handle
+                    // when one is known, so the update lands even on a card
+                    // that is no longer the accumulator's current card.
+                    let req = {
+                        let states = flow.question_state.lock().await;
+                        states.get(req_id).map(|s| s.request().clone())
+                    };
+                    let card = match req {
+                        Some(req) => {
+                            refresh_question_block(
+                                core,
+                                host,
+                                session_id,
+                                clicked,
+                                req_id,
+                                &req,
+                                directory.unwrap_or(""),
+                                &display,
+                                &done,
+                            )
+                            .await
+                        }
+                        None => None,
+                    };
                     let r = CardActionResult {
-                        card: ack_inline_card(core, host, session_id).await,
+                        card: match card {
+                            Some(card) => Some(card),
+                            None => ack_inline_card(core, host, session_id).await,
+                        },
                         toast: Some(action_toast(reply, n - answered_count, outcome)),
                     };
                     Some(r)
@@ -928,6 +929,7 @@ impl RequestKind for QuestionKind {
                     inline,
                     host,
                     session_id,
+                    clicked,
                 )
                 .await
                 {
@@ -939,17 +941,19 @@ impl RequestKind for QuestionKind {
                     value.get("session_id").and_then(|v| v.as_str()).unwrap_or(""),
                     answers
                 );
-                if inline {
-                    resolve_inline_block(core, host, session_id, req_id, |block| {
-                        question_receipt(block, &answers)
-                    })
-                    .await;
-                }
+                let cached = resolve_blocks(
+                    flow,
+                    core,
+                    host,
+                    session_id,
+                    clicked,
+                    &[req_id.to_string()],
+                    |_| question_receipt(&questions, &answers),
+                )
+                .await;
                 let mut r = result_card("✅ 已回答", "green", &qa_completion_body(&questions, &answers));
                 r.toast = Some("已提交".to_string());
-                if inline {
-                    r.card = ack_inline_card(core, host, session_id).await;
-                }
+                settle_ack(core, host, session_id, inline, cached, &mut r).await;
                 // Re-served verbatim to a losing double-click.
                 flow.remember_answered_result(req_id, &r).await;
                 Some(r)
@@ -995,20 +999,26 @@ impl RequestKind for QuestionKind {
                     inline,
                     host,
                     session_id,
+                    clicked,
                 )
                 .await
                 {
                     return Some(r);
                 }
                 tracing::info!("Question rejected: {}", req_id);
-                if inline {
-                    resolve_inline_block(core, host, session_id, req_id, denied_receipt).await;
-                }
+                let cached = resolve_blocks(
+                    flow,
+                    core,
+                    host,
+                    session_id,
+                    clicked,
+                    &[req_id.to_string()],
+                    denied_receipt,
+                )
+                .await;
                 let mut r = result_card("🚫 已拒绝回答", "red", "已拒绝回答 AI 的问题。");
                 r.toast = Some("已拒绝回答".to_string());
-                if inline {
-                    r.card = ack_inline_card(core, host, session_id).await;
-                }
+                settle_ack(core, host, session_id, inline, cached, &mut r).await;
                 // Re-served verbatim to a losing double-click.
                 flow.remember_answered_result(req_id, &r).await;
                 Some(r)
@@ -1418,6 +1428,44 @@ impl RequestFlow {
         // (resolved by another client) and was NOT answered by cola. A card
         // owned by a directory whose list failed stays live (#144).
         mark_stale_cards(core, &pending, &self.sent_cards, &failed_dirs, self.kind.label()).await;
+        // Card handles (ADR-0038, rule 2): a live block on a card whose
+        // accumulator is gone (a replaced/aborted turn) is repainted from the
+        // cached JSON — the accumulator pass below only reaches the card its
+        // own flush would repaint. `flush_owned` maps each accumulator-owned
+        // block to that card, so a block whose handle already names it is left
+        // to the flush (never resolved twice), while one whose handle names an
+        // older card still gets that stale card repainted.
+        let flush_owned: std::collections::HashMap<String, String> = {
+            let cards = core.cards.lock().await;
+            let mut owned = std::collections::HashMap::new();
+            for card in cards.values() {
+                let Some(message_id) = card.card_message_id.as_deref() else {
+                    continue;
+                };
+                for id in card.acc.live_request_ids() {
+                    owned.insert(id.to_string(), message_id.to_string());
+                }
+            }
+            owned
+        };
+        let dropped = core.card_handles.lock().await.drop_vanished(
+            self.kind.claim_kind(),
+            &pending,
+            &failed_dirs,
+            &flush_owned,
+            handled_elsewhere_receipt,
+        );
+        for (message_id, card) in dropped {
+            if let Err(e) = core.feishu.update_message(&message_id, &card).await {
+                tracing::warn!("vanished block repaint failed on {}: {}", message_id, e);
+            } else {
+                tracing::info!(
+                    "{} block repainted from its card handle: {}",
+                    self.kind.label(),
+                    message_id
+                );
+            }
+        }
         // Resolve inline blocks whose request vanished (resolved by another
         // client) into their Interaction Receipts and repaint the cards that
         // host them — the receipt lands within this sweep, with no reliance on
@@ -1510,6 +1558,10 @@ impl RequestFlow {
         let directory = directory.as_deref();
 
         let reply = value.get("reply").and_then(|v| v.as_str()).unwrap_or("reject");
+        // The card the click landed on, so its handle can update THAT card
+        // atomically in the ack (ADR-0038, rule 3) — the callback context
+        // carries it (ws.rs injects `open_message_id`).
+        let clicked = value.get("open_message_id").and_then(|v| v.as_str());
         // ADR-0028: a claimed request's block lives on a static snapshot card,
         // NOT a streaming card — its click is not "inline", and the ack must
         // patch the snapshot (block updated or dropped), never a standalone
@@ -1533,7 +1585,7 @@ impl RequestFlow {
         let mut r = self
             .kind
             .handle_action(
-                self, core, session_id, req_id, reply, value, directory, inline, &host,
+                self, core, session_id, req_id, reply, value, directory, inline, &host, clicked,
             )
             .await;
 
@@ -1639,6 +1691,7 @@ async fn settle_question_reply(
     inline: bool,
     host: &Option<String>,
     session_id: &str,
+    clicked: Option<&str>,
 ) -> Option<CardActionResult> {
     match result {
         Ok(()) => {
@@ -1650,16 +1703,21 @@ async fn settle_question_reply(
             tracing::info!("Question already resolved: {}", e);
             flow.remove_question(req_id).await;
             flow.sent_cards.lock().await.remove(req_id);
-            if inline {
-                // The click found the request gone: leave the neutral
-                // "handled elsewhere" receipt on the clicked card, carried in
-                // the ack like any other resolution (ADR-0038, rules 3+4).
-                resolve_inline_block(core, host, session_id, req_id, handled_elsewhere_receipt).await;
-            }
+            // The click found the request gone: leave the neutral "handled
+            // elsewhere" receipt on the clicked card, carried in the ack like
+            // any other resolution (ADR-0038, rules 3+4).
+            let cached = resolve_blocks(
+                flow,
+                core,
+                host,
+                session_id,
+                clicked,
+                &[req_id.to_string()],
+                handled_elsewhere_receipt,
+            )
+            .await;
             let mut r = already_handled_result(kind, inline, "该问题已处理");
-            if inline {
-                r.card = ack_inline_card(core, host, session_id).await;
-            }
+            settle_ack(core, host, session_id, inline, cached, &mut r).await;
             flow.remember_answered_result(req_id, &r).await;
             Some(r)
         }
@@ -1675,50 +1733,132 @@ async fn settle_question_reply(
     }
 }
 
-/// Resolve surfaced cards for a set of answered request ids: remove the ids
-/// from the flow's `sent_cards` (so the poller doesn't keep delivering their
-/// standalone cards) and replace each of their inline blocks on the host card
-/// with its Interaction Receipt (ADR-0038, rule 4). A single request passes
-/// one id; the Auto-Accept toggle passes every id it approved so all inline
-/// blocks re-render as receipts at once.
+/// Resolve a set of answered request ids on EVERY surface that renders their
+/// blocks (ADR-0038, rule 2) — the one mutation seam, so the accumulator and
+/// the card handles cannot drift:
 ///
-/// `line` derives the receipt from the block being resolved (so the residue
-/// names the target it actually resolved, and a toggle can name each block
-/// differently). The receipt is written into the accumulator's timeline, never
-/// only into an ack/PATCH payload: the next flush (new part, header tick,
-/// split) re-renders it in its transcript position.
-async fn resolve_surfaced(
+/// 1. `sent_cards` forgets them (the poller stops delivering standalone cards).
+/// 2. The host accumulator that still carries a block resolves it into its
+///    timeline receipt; the next flush (new part, header tick, split)
+///    re-renders it in its transcript position.
+/// 3. Every card handle that renders one of them gets its cached JSON edited
+///    in place — the clicked card's edit becomes the callback ack, and another
+///    card's edit is patched eagerly. The registry entry is then dropped, so a
+///    resolved block never lingers.
+///
+/// `line` derives the receipt text from the block's receipt target, so the
+/// residue always names what it resolved (and the Auto-Accept toggle, which
+/// passes every id it approved, can name each block differently). Returns the
+/// clicked card's edited JSON, when the click landed on a card carrying one of
+/// the blocks.
+async fn resolve_blocks(
     flow: &RequestFlow,
     core: &Arc<SharedCore>,
     host: &Option<String>,
+    session_id: &str,
+    clicked: Option<&str>,
     ids: &[String],
-    line: impl Fn(&InteractionBlock) -> String,
-) {
+    line: impl Fn(&str) -> String,
+) -> Option<serde_json::Value> {
     {
         let mut sent = flow.sent_cards.lock().await;
         for id in ids {
             sent.remove(id);
         }
     }
-    let Some(host) = host else { return };
-    let mut cards = core.cards.lock().await;
-    if let Some(acc) = cards.get_mut(host).map(|c| &mut c.acc) {
-        for id in ids {
-            acc.resolve_interaction(id, &line);
+    // 1. The accumulator that still carries a block is the render source: a
+    //    receipt must live in its timeline, or the next flush re-adds the
+    //    block to the card the ack just cleaned.
+    {
+        let mut cards = core.cards.lock().await;
+        if let Some(acc) = cards
+            .get_mut(host.as_deref().unwrap_or(session_id))
+            .map(|c| &mut c.acc)
+        {
+            for id in ids {
+                if acc.interaction(id).is_some_and(InteractionBlock::is_live) {
+                    acc.resolve_interaction(id, |block| line(&block.receipt_target()));
+                }
+            }
         }
     }
+    // 2. The card handles: every card that rendered one of the blocks is
+    //    edited from its cache. The clicked card's edit is the ack; any other
+    //    card's edit is patched so its controls do not linger.
+    let mut ack = None;
+    let mut patches: Vec<(String, serde_json::Value)> = Vec::new();
+    {
+        let mut handles = core.card_handles.lock().await;
+        for id in ids {
+            if let Some(clicked_id) = clicked {
+                let line_for = handles.target_of(id).map(&line);
+                // The clicked card carried the block: its edited JSON is the
+                // atomic callback ack (ADR-0038, rule 3).
+                if let Some(card) = line_for
+                    .as_deref()
+                    .and_then(|text| handles.resolve_on(clicked_id, id, text))
+                {
+                    ack = Some(card);
+                }
+                // The registered card is a different one (the block moved, or
+                // the click landed on a stale copy): repaint it so its controls
+                // do not linger.
+                if let Some(registered) = handles.message_of(id).map(str::to_string)
+                    && registered != clicked_id
+                    && let Some(text) = line_for.as_deref()
+                    && let Some(card) = handles.resolve_on(&registered, id, text)
+                {
+                    crate::bridge::card_handles::merge_patch(&mut patches, registered, card);
+                }
+            }
+            handles.forget(id);
+        }
+    }
+    for (message_id, card) in patches {
+        if let Err(e) = core.feishu.update_message(&message_id, &card).await {
+            tracing::warn!("resolved block repaint failed on {}: {}", message_id, e);
+        }
+    }
+    ack
 }
 
-/// Resolve ONE inline block on the host card into its Interaction Receipt.
-/// No-op when the card does not carry the block (the kind's sweep reconciles
-/// what a click could not reach).
-async fn resolve_inline_block(
+/// Settle the callback ack for a click (ADR-0038, rule 3): a card-handle edit
+/// (the clicked card's cached JSON, updated through the seam) wins; otherwise
+/// an inline click re-renders the accumulator's current card and a standalone
+/// click keeps its result card.
+async fn settle_ack(
     core: &Arc<SharedCore>,
     host: &Option<String>,
     session_id: &str,
-    req_id: &str,
-    line: impl FnOnce(&InteractionBlock) -> String,
+    inline: bool,
+    cached: Option<serde_json::Value>,
+    result: &mut CardActionResult,
 ) {
+    if let Some(card) = cached {
+        result.card = Some(card);
+    } else if inline {
+        result.card = ack_inline_card(core, host, session_id).await;
+    }
+}
+
+/// Keep a live question block's display state in step everywhere it renders
+/// (ADR-0038, rule 2): the accumulator's section — the render source every
+/// later flush re-renders the markers from — and, through its handle, the
+/// clicked card's cached JSON, whose refreshed copy is the callback ack. One
+/// seam, so the two cannot drift. Returns the refreshed clicked card when a
+/// handle carries the block.
+#[allow(clippy::too_many_arguments)] // the display state is what the seam keeps in step
+async fn refresh_question_block(
+    core: &Arc<SharedCore>,
+    host: &Option<String>,
+    session_id: &str,
+    clicked: Option<&str>,
+    req_id: &str,
+    request: &opencode::types::QuestionRequest,
+    directory: &str,
+    display: &[Option<Vec<String>>],
+    done: &[bool],
+) -> Option<serde_json::Value> {
     if let Some(acc) = core
         .cards
         .lock()
@@ -1726,8 +1866,21 @@ async fn resolve_inline_block(
         .get_mut(host.as_deref().unwrap_or(session_id))
         .map(|c| &mut c.acc)
     {
-        acc.resolve_interaction(req_id, line);
+        acc.update_question_state(req_id, display, done);
     }
+    let message_id = clicked?;
+    let elements = crate::feishu::card::question::question_elements(
+        req_id,
+        &request.session_id,
+        &request.questions,
+        directory,
+        display,
+        done,
+    );
+    core.card_handles
+        .lock()
+        .await
+        .refresh_on(message_id, req_id, elements)
 }
 
 /// The clicked card's updated JSON, built from a CLONE of the host accumulator
