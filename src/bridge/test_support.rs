@@ -1320,6 +1320,10 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
         "a successful list must still drop the gone inline section"
     );
     assert!(
+        inline_handled_elsewhere_receipt_present(app).await,
+        "a successful list must leave the gone inline block's receipt (#175)"
+    );
+    assert!(
         !app.core.snapshot_claims.lock().await.contains(&claim_id),
         "a successful list must still drop the gone claim"
     );
@@ -1342,14 +1346,30 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
     );
 }
 
-/// Whether any card's accumulator still carries an inline section for `id`
-/// (either kind) — the #144 rig's surface probe.
+/// Whether any card's accumulator still carries a LIVE inline section for `id`
+/// (either kind) — the #144 rig's surface probe. A resolved block left its
+/// receipt tombstone in the section, which is not live (ADR-0038).
 async fn inline_surface_live(app: &Arc<App>, id: &str) -> bool {
     app.cards
         .lock()
         .await
         .values()
-        .any(|c| c.acc.interaction(id).is_some())
+        .any(|c| c.acc.interaction(id).is_some_and(|b| b.is_live()))
+}
+
+/// #175: whether any card's accumulator carries an Interaction Receipt left by
+/// a sweep over a vanished inline block — the #144 rig proves it lands once a
+/// SUCCESSFUL list resolves the block.
+async fn inline_handled_elsewhere_receipt_present(app: &Arc<App>) -> bool {
+    app.cards.lock().await.values().any(|c| {
+        c.acc.timeline.iter().any(|item| {
+            matches!(
+                &item.kind,
+                crate::bridge::streaming::TimelineKind::Receipt(text)
+                    if text.starts_with("⏱ 已由其他客户端处理")
+            )
+        })
+    })
 }
 
 // ===== Session discovery & adoption (ADR-0008) =====

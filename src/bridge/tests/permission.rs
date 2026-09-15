@@ -1274,6 +1274,107 @@ async fn inline_permission_click_after_remote_resolution_gets_receipt() {
     );
 }
 
+/// Seed the state the permission poller leaves behind (#175): one session
+/// whose live card carries an inline permission block. The tests drive the
+/// sweep by hand, so no background poll or render tick can repaint underneath
+/// them — the sweep alone must put the receipt on the card.
+async fn seed_inline_permission_card(app: &Arc<App>, session_id: &str, request_id: &str) {
+    let mut acc = crate::bridge::streaming::StreamAccumulator::new("test");
+    acc.reply_to_message_id = Some("msg_trigger".into());
+    acc.add_interaction(crate::bridge::streaming::InteractionBlock::Permission(
+        crate::bridge::streaming::PendingPermission {
+            session_id: session_id.into(),
+            request_id: request_id.into(),
+            body: "bash ls -la".into(),
+            target: "⚡ 执行 Shell 命令 `ls -la`".into(),
+            directory: "/work".into(),
+        },
+    ));
+    app.cards.lock().await.insert(
+        session_id.to_string(),
+        crate::bridge::streaming::CardSession::new(acc, Some("msg_live".into())),
+    );
+}
+
+/// #175: drive one sweep over a session whose block vanished (resolved by
+/// another client) and assert the hosting card was repainted with the neutral
+/// receipt — the render poll is never spawned, so the sweep is the only thing
+/// that can have done it.
+async fn sweep_and_assert_receipt_on_the_card(app: &Arc<App>, platform: &Arc<RecordingPlatform>) {
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.core, &mut seen).await;
+
+    let calls = platform.calls.lock().await.clone();
+    let patched = calls
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::UpdateMessage { message_id, card } if message_id == "msg_live" => {
+                Some(card.to_string())
+            }
+            _ => None,
+        })
+        .next_back()
+        .expect("the sweep itself must repaint the hosting card");
+    assert!(
+        patched.contains("⏱ 已由其他客户端处理：⚡ 执行 Shell 命令 `ls -la`"),
+        "the receipt must be on the repainted card: {patched}"
+    );
+    assert!(
+        !patched.contains("🔐 **权限请求**"),
+        "the live block must be gone from the card: {patched}"
+    );
+    assert!(
+        app.cards
+            .lock()
+            .await
+            .get("ses_1")
+            .unwrap()
+            .acc
+            .live_permissions()
+            .is_empty(),
+        "the accumulator must not keep the block live"
+    );
+}
+
+/// #175: a request resolved by another client (OpenChamber, CLI) becomes its
+/// Interaction Receipt on the live turn's card within ONE sweep — no reliance
+/// on the ~1.5 s render tick.
+#[tokio::test]
+async fn sweep_repaints_a_live_turn_card_when_the_request_resolves_elsewhere() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    // The server no longer lists the request: another client resolved it.
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    seed_session(&app, "ses_1", "/work").await;
+    seed_inline_permission_card(&app, "ses_1", "per_1").await;
+
+    sweep_and_assert_receipt_on_the_card(&app, &platform).await;
+}
+
+/// #175: a FINISHED turn's card gets the same receipt within one sweep — the
+/// render poll stopped ticking, so only the sweep can repaint it. This is the
+/// "the block lingers forever" case.
+#[tokio::test]
+async fn sweep_repaints_a_finished_turns_card_when_the_request_resolves_elsewhere() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    seed_session(&app, "ses_1", "/work").await;
+    seed_inline_permission_card(&app, "ses_1", "per_1").await;
+    {
+        // The turn ended: the poll loop is gone and the card shows its final
+        // state. Nothing except the request sweep can still touch it.
+        let mut cards = app.cards.lock().await;
+        let acc = &mut cards.get_mut("ses_1").unwrap().acc;
+        acc.card_state = crate::feishu::card::CardState::Done;
+        acc.current_phase = None;
+    }
+
+    sweep_and_assert_receipt_on_the_card(&app, &platform).await;
+}
+
 /// A click whose card is over the split budget cannot ride the ack (Feishu
 /// would reject the oversized card): the fallback flush finalizes the card and
 /// sends the continuation, and the receipt rides the continuation — still

@@ -159,17 +159,21 @@ pub(crate) fn display_title(title: &str, session_id: &str) -> String {
 /// constructible builders so a later ticket can drop a resolved claim
 /// (05) or stream a busy follow (06) into the same card.
 pub fn build_snapshot_card(verb: &str, title: &str, data: &SnapshotData) -> serde_json::Value {
-    build_snapshot_card_with_state(verb, title, data, &SnapshotQuestionState::new())
+    build_snapshot_card_with_state(verb, title, data, &SnapshotQuestionState::new(), &[])
 }
 
 /// [`build_snapshot_card`] with live question state: after an interaction on a
 /// claimed question block, the rebuild passes the flow's current answers/done
 /// flags so the embedded block mirrors the standalone question card.
+/// `receipts` are Interaction Receipt lines for claimed blocks resolved by
+/// another client (#175, ADR-0038 rule 4): one markdown line each, rendered
+/// under the live blocks so a resolved block leaves a visible residue.
 pub fn build_snapshot_card_with_state(
     verb: &str,
     title: &str,
     data: &SnapshotData,
     question_state: &SnapshotQuestionState,
+    receipts: &[String],
 ) -> serde_json::Value {
     let verb = verb.strip_prefix("已").unwrap_or(verb);
     let title = display_title(title, &data.session_id);
@@ -194,7 +198,10 @@ pub fn build_snapshot_card_with_state(
         }
         elements.extend(pending_block_elements(req, &data.directory, question_state));
     }
-    if !pending.is_empty() && !data.tail.is_empty() {
+    for line in receipts {
+        elements.push(json!({ "tag": "markdown", "content": line }));
+    }
+    if (!pending.is_empty() || !receipts.is_empty()) && !data.tail.is_empty() {
         elements.push(json!({ "tag": "hr" }));
     }
     elements.extend(tail_panels(&data.tail));

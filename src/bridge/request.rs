@@ -86,15 +86,17 @@ pub trait RequestKind: Send + Sync {
     /// another client).
     fn summary(&self, req: &PendingRequest) -> String;
 
-    /// Drop inline sections whose request vanished (answered elsewhere). An
-    /// item owned by a directory whose list call failed is kept: unknown must
-    /// never be read as resolved (#130, #144).
-    fn retain_inline(
+    /// Resolve the kind's own inline blocks whose request vanished (resolved
+    /// by another client) into their Interaction Receipts; an item owned by a
+    /// directory whose list call failed stays live: unknown must never be read
+    /// as resolved (#130, #144). Returns how many blocks were resolved — the
+    /// sweep repaints each affected card so the receipt lands within one poll.
+    fn resolve_vanished_inline(
         &self,
         acc: &mut StreamAccumulator,
         pending: &std::collections::HashSet<String>,
         failed_dirs: &std::collections::HashSet<String>,
-    );
+    ) -> usize;
 
     /// The snapshot-claim kind of this flow's requests (ADR-0028): each flow's
     /// poll sweep only drops claims of its own kind.
@@ -206,19 +208,22 @@ impl RequestKind for PermissionKind {
         }
     }
 
-    fn retain_inline(
+    fn resolve_vanished_inline(
         &self,
         acc: &mut StreamAccumulator,
         pending: &std::collections::HashSet<String>,
         failed_dirs: &std::collections::HashSet<String>,
-    ) {
-        acc.retain_interactions(|block| match block {
-            InteractionBlock::Permission(p) => {
-                pending.contains(&p.request_id) || failed_dirs.contains(&p.directory)
-            }
-            // Another kind's block (or a receipt) is not this sweep's to judge.
-            _ => true,
-        });
+    ) -> usize {
+        acc.resolve_vanished(
+            |block| match block {
+                InteractionBlock::Permission(p) => {
+                    !pending.contains(&p.request_id) && !failed_dirs.contains(&p.directory)
+                }
+                // Another kind's block (or a receipt) is not this sweep's to judge.
+                _ => false,
+            },
+            handled_elsewhere_receipt,
+        )
     }
 
     fn claim_kind(&self) -> ClaimKind {
@@ -426,22 +431,40 @@ fn receipt_line(prefix: &str, detail: &str) -> String {
 fn receipt_target(block: &InteractionBlock) -> String {
     match block {
         InteractionBlock::Permission(p) => p.target.clone(),
-        InteractionBlock::Question(q) => truncate(
-            &q.questions
-                .iter()
-                .map(|qi| {
-                    if qi.header.is_empty() {
-                        truncate(&qi.question, 24)
-                    } else {
-                        qi.header.clone()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("、"),
-            60,
-        ),
+        InteractionBlock::Question(q) => question_target(&q.questions),
         InteractionBlock::Receipt(_) => String::new(),
     }
+}
+
+/// Compact one-line target for a question's receipt: each question's header
+/// (or a clipped question text), joined, clipped to stay a residue.
+fn question_target(questions: &[opencode::types::QuestionInfo]) -> String {
+    truncate(
+        &questions
+            .iter()
+            .map(|qi| {
+                if qi.header.is_empty() {
+                    truncate(&qi.question, 24)
+                } else {
+                    qi.header.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("、"),
+        60,
+    )
+}
+
+/// The Interaction Receipt for a Session Snapshot's claimed block resolved by
+/// another client (#175, ADR-0038 rule 4): the same neutral line an inline
+/// block leaves, derived from the adopt-time request — a snapshot keeps no
+/// `InteractionBlock` to read the target from.
+pub(crate) fn snapshot_handled_elsewhere_receipt(req: &PendingRequest) -> String {
+    let target = match req {
+        PendingRequest::Permission(p) => permission_target(p),
+        PendingRequest::Question(q) => question_target(&q.questions),
+    };
+    receipt_line(HANDLED_ELSEWHERE_PREFIX, &target)
 }
 
 /// The Interaction Receipt for a permission decision (ADR-0038, rule 4):
@@ -621,19 +644,22 @@ impl RequestKind for QuestionKind {
         }
     }
 
-    fn retain_inline(
+    fn resolve_vanished_inline(
         &self,
         acc: &mut StreamAccumulator,
         pending: &std::collections::HashSet<String>,
         failed_dirs: &std::collections::HashSet<String>,
-    ) {
-        acc.retain_interactions(|block| match block {
-            InteractionBlock::Question(q) => {
-                pending.contains(&q.request_id) || failed_dirs.contains(&q.directory)
-            }
-            // Another kind's block (or a receipt) is not this sweep's to judge.
-            _ => true,
-        });
+    ) -> usize {
+        acc.resolve_vanished(
+            |block| match block {
+                InteractionBlock::Question(q) => {
+                    !pending.contains(&q.request_id) && !failed_dirs.contains(&q.directory)
+                }
+                // Another kind's block (or a receipt) is not this sweep's to judge.
+                _ => false,
+            },
+            handled_elsewhere_receipt,
+        )
     }
 
     fn claim_kind(&self) -> ClaimKind {
@@ -1386,14 +1412,27 @@ impl RequestFlow {
         // (resolved by another client) and was NOT answered by cola. A card
         // owned by a directory whose list failed stays live (#144).
         mark_stale_cards(core, &pending, &self.sent_cards, &failed_dirs, self.kind.label()).await;
-        // Drop inline sections whose request vanished (answered elsewhere) —
-        // the streaming card re-renders without them. Sections owned by a
+        // Resolve inline blocks whose request vanished (resolved by another
+        // client) into their Interaction Receipts and repaint the cards that
+        // host them — the receipt lands within this sweep, with no reliance on
+        // the render tick (which stops when a turn ends). Blocks owned by a
         // failed directory stay (#144).
-        {
+        let repaint: Vec<String> = {
             let mut cards = core.cards.lock().await;
-            for card in cards.values_mut() {
-                self.kind.retain_inline(&mut card.acc, &pending, &failed_dirs);
+            let mut affected = Vec::new();
+            for (session_id, card) in cards.iter_mut() {
+                if self
+                    .kind
+                    .resolve_vanished_inline(&mut card.acc, &pending, &failed_dirs)
+                    > 0
+                {
+                    affected.push(session_id.clone());
+                }
             }
+            affected
+        };
+        for session_id in &repaint {
+            crate::bridge::render::flush_card(core, session_id).await;
         }
         // ADR-0028: a claimed request that left the pending list was
         // resolved — by the snapshot's own buttons (the click handler

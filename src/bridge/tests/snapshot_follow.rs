@@ -116,10 +116,11 @@ async fn snapshot_block_answer_patches_snapshot() {
 }
 
 /// Resolving a claimed request from ANOTHER client drops the block from
-/// the snapshot (patched in place) — and never marks the snapshot itself
-/// stale, since stale is for standalone cards (ADR-0028).
+/// the snapshot and leaves its Interaction Receipt (patched in place) — and
+/// never marks the snapshot itself stale, since stale is for standalone cards
+/// (ADR-0028, ADR-0038 rule 4, #175).
 #[tokio::test]
-async fn snapshot_block_drops_when_resolved_elsewhere() {
+async fn snapshot_block_resolved_elsewhere_leaves_a_receipt() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -173,6 +174,10 @@ async fn snapshot_block_drops_when_resolved_elsewhere() {
         "snapshot kept, not marked stale: {patched}"
     );
     assert!(!patched.contains("权限请求"), "block dropped: {patched}");
+    assert!(
+        patched.contains("⏱ 已由其他客户端处理：⚡ 执行 Shell 命令 `ls -la`"),
+        "the resolved claim leaves its Interaction Receipt: {patched}"
+    );
     assert!(!patched.contains("已处理"), "no stale marker: {patched}");
     assert!(
         !app.core.snapshot_claims.lock().await.contains("per_1"),
