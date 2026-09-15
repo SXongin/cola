@@ -517,7 +517,7 @@ fn denied_receipt(block: &InteractionBlock) -> String {
 
 /// Compact one-line target for a permission's receipt: the action plus the
 /// first pattern (or the edited file for edit/patch) — what the decision was
-/// about, for when the anchor alone cannot say (poll race, sub-task child,
+/// about, for when the position alone cannot say (poll race, sub-task child,
 /// several blocks at once). Backticks in a pattern are flattened so the
 /// markdown element cannot be broken by server-provided content.
 pub(crate) fn permission_target(p: &opencode::types::PermissionRequest) -> String {
@@ -1638,9 +1638,9 @@ async fn settle_question_reply(
 ///
 /// `line` derives the receipt from the block being resolved (so the residue
 /// names the target it actually resolved, and a toggle can name each block
-/// differently). The receipt is written into the accumulator, never only into
-/// an ack/PATCH payload: the next flush (new part, header tick, split)
-/// re-renders it at its anchor.
+/// differently). The receipt is written into the accumulator's timeline, never
+/// only into an ack/PATCH payload: the next flush (new part, header tick,
+/// split) re-renders it in its transcript position.
 async fn resolve_surfaced(
     flow: &RequestFlow,
     core: &Arc<SharedCore>,

@@ -1327,25 +1327,37 @@ async fn permission_click_at_the_split_limit_falls_back_to_the_flushed_receipt()
         "an over-budget card degrades to the PATCH flush, not an oversized ack"
     );
 
-    // The fallback flushed: the block was surfaced at the top of the
-    // over-budget timeline, so the receipt is anchored there — the finalized
-    // (clicked) card carries it, and the continuation does not duplicate it.
-    let finalized = final_card(&platform).await.to_string();
-    assert!(
-        finalized.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la` · "),
-        "the receipt must stay on the card that owns its anchor: {}",
-        finalized
-    );
-    assert!(
-        !finalized.contains("🔐 **权限请求**"),
-        "the resolved block must not come back: {}",
-        finalized
-    );
+    // The fallback flushed: the receipt is keyed at the click, which came
+    // after the timeline content, so it rides after it — one card carries it,
+    // and the resolved block does not come back.
     let continuation = latest_card(&platform).await.to_string();
     assert!(
-        !continuation.contains("已允许一次"),
-        "a receipt must render once, on the card that owns its anchor: {}",
+        continuation.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la` · "),
+        "the receipt must survive the split: {}",
         continuation
+    );
+    assert!(
+        !continuation.contains("🔐 **权限请求**"),
+        "the resolved block must not come back: {}",
+        continuation
+    );
+    let all_cards: Vec<String> = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::UpdateMessage { card, .. } | PlatformCall::ReplyCard { card, .. } => {
+                Some(card.to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        all_cards.iter().filter(|c| c.contains("已允许一次")).count(),
+        1,
+        "the receipt must render exactly once across the chain: {:?}",
+        all_cards
     );
     assert!(
         app.cards
@@ -1443,6 +1455,100 @@ async fn interaction_receipt_renders_at_the_interaction_position() {
     assert!(
         first < receipt_a && receipt_a < receipt_b && receipt_b < second,
         "receipts must anchor in interaction order, between 第一段 and 第二段: {}",
+        card
+    );
+}
+
+/// A part the render poll delivers LATE — the server wrote it before the click,
+/// but cola only renders it afterwards — still lands ABOVE the receipt: the
+/// timeline is ordered by each part's own start time, not by when cola
+/// rendered it. This is the "bash and the thinking ran behind the receipt"
+/// report (ADR-0038, rule 4).
+#[tokio::test]
+async fn late_rendered_command_lands_above_the_receipt() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+
+    // The request poll surfaces the permission before ANY of the turn's parts
+    // have been rendered (the race that put receipts above their command).
+    let mut acc = crate::bridge::streaming::StreamAccumulator::new("test");
+    acc.reply_to_message_id = Some("msg_1".into());
+    acc.add_interaction(crate::bridge::streaming::InteractionBlock::Permission(
+        crate::bridge::streaming::PendingPermission {
+            session_id: "ses_test".into(),
+            request_id: "per_1".into(),
+            body: "bash ls -la".into(),
+            target: "⚡ 执行 Shell 命令 `ls -la`".into(),
+            directory: "/work".into(),
+        },
+    ));
+    app.cards.lock().await.insert(
+        "ses_test".to_string(),
+        crate::bridge::streaming::CardSession::new(acc, Some("msg_live".into())),
+    );
+
+    // The operator clicks Allow; the receipt is keyed at this moment.
+    let clicked_at = chrono::Utc::now().timestamp_millis();
+    let ack = click_perm(&app, "once", "per_1", "✅ 已允许一次").await;
+    assert!(
+        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la` · "),
+        "receipt missing: {}",
+        ack
+    );
+
+    // The render poll then catches up with the parts the server had already
+    // written BEFORE the click: the reasoning behind the command, and the
+    // command's own panel.
+    app.cards
+        .lock()
+        .await
+        .get_mut("ses_test")
+        .unwrap()
+        .acc
+        .push_reasoning_at(clicked_at - 300, "先看一下目录里有什么。");
+    app.cards
+        .lock()
+        .await
+        .get_mut("ses_test")
+        .unwrap()
+        .acc
+        .push_tool_at(
+            clicked_at - 200,
+            "call_1",
+            crate::feishu::card::tool_render::ToolPanel {
+                name: "bash".into(),
+                status: "running".into(),
+                input: Some(serde_json::json!({ "command": "ls -la" })),
+                output: None,
+            },
+        );
+    crate::bridge::render::flush_card(&app.core, "ses_test").await;
+
+    let card = final_card(&platform).await;
+    let elements = card["body"]["elements"].as_array().expect("elements");
+    let index_of = |needle: &str| {
+        elements
+            .iter()
+            .position(|e| {
+                e["content"].as_str().is_some_and(|c| c.contains(needle))
+                    || e["header"]["title"]["content"]
+                        .as_str()
+                        .is_some_and(|t| t.contains(needle))
+            })
+            .unwrap_or_else(|| panic!("{} not on the card: {}", needle, card))
+    };
+    let reasoning = index_of("推理过程");
+    let command = index_of("bash");
+    let receipt = index_of("已允许一次");
+    assert!(
+        reasoning < command && command < receipt,
+        "parts written before the click must stay above the receipt even when \
+         rendered late: {}",
         card
     );
 }

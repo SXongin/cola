@@ -185,17 +185,35 @@ fn edit_tool_output(part: &serde_json::Value, status: &str) -> Option<String> {
 
 /// Render canonical message parts (from `POST /session/{id}/message` response)
 /// into the accumulator so the card shows the assistant's final result.
+/// The server-side start time (epoch ms) of the part — its timeline key.
+/// Text/reasoning carry it at `/time/start`; a tool's state carries it at
+/// `/state/time/start`. Step/patch parts have none (they render nothing), and
+/// older payloads / test fixtures may omit it: the caller then falls back to a
+/// monotonic key, preserving call order.
+fn part_time(part: &serde_json::Value) -> Option<i64> {
+    part.pointer("/time/start")
+        .or_else(|| part.pointer("/state/time/start"))
+        .and_then(|v| v.as_i64())
+}
+
 fn render_part(acc: &mut StreamAccumulator, part: &serde_json::Value) {
+    let at = part_time(part);
     match part.get("type").and_then(|t| t.as_str()) {
         Some("text") => {
             if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                acc.push_text(t);
+                match at {
+                    Some(at) => acc.push_text_at(at, t),
+                    None => acc.push_text(t),
+                }
             }
             acc.card_state = crate::feishu::card::CardState::Streaming;
         }
         Some("reasoning") => {
             if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                acc.push_reasoning(t);
+                match at {
+                    Some(at) => acc.push_reasoning_at(at, t),
+                    None => acc.push_reasoning(t),
+                }
             }
             acc.card_state = crate::feishu::card::CardState::Reasoning;
         }
@@ -223,15 +241,16 @@ fn render_part(acc: &mut StreamAccumulator, part: &serde_json::Value) {
             } else {
                 extract_tool_output(part, status)
             };
-            acc.push_tool(
-                &call_id,
-                crate::feishu::card::tool_render::ToolPanel {
-                    name: name.to_string(),
-                    status: status.to_string(),
-                    input,
-                    output,
-                },
-            );
+            let panel = crate::feishu::card::tool_render::ToolPanel {
+                name: name.to_string(),
+                status: status.to_string(),
+                input,
+                output,
+            };
+            match at {
+                Some(at) => acc.push_tool_at(at, &call_id, panel),
+                None => acc.push_tool(&call_id, panel),
+            }
             if status == "running" {
                 acc.card_state = crate::feishu::card::CardState::Streaming;
             }

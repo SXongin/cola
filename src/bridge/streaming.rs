@@ -5,14 +5,27 @@ use crate::feishu::card::tool_render::ToolPanel;
 use indexmap::IndexMap;
 use std::sync::Arc;
 
-/// One entry on a turn's chronological timeline. The card renders text,
-/// reasoning and tool panels in this order, matching how OpenChamber shows them
-/// interleaved.
+/// One entry on a turn's chronological timeline: a rendered item plus the
+/// server-side start time (epoch ms) of the part it came from — its **key**.
+/// The card renders the timeline in key order, matching how OpenChamber shows
+/// the parts interleaved.
 #[derive(Debug, Clone)]
-pub enum TimelineItem {
+pub struct TimelineItem {
+    pub at: i64,
+    pub kind: TimelineKind,
+}
+
+/// What a timeline entry renders.
+#[derive(Debug, Clone)]
+pub enum TimelineKind {
     Text(String),
     Reasoning(String),
     Tool(String),
+    /// A resolved interaction block's Interaction Receipt (ADR-0038, rule 4):
+    /// one markdown line keyed by the moment it was resolved, so it sits below
+    /// everything that was on the card when the operator clicked and above
+    /// everything resolved afterwards.
+    Receipt(String),
 }
 
 /// A permission request surfaced inline on the streaming card (instead of a
@@ -25,7 +38,7 @@ pub struct PendingPermission {
     pub body: String,
     /// Compact one-line form of the same request (action + first pattern /
     /// edited file) for the Interaction Receipt — receipts name their target
-    /// even where the anchor cannot (ADR-0038).
+    /// even where the position cannot (ADR-0038).
     pub target: String,
     pub directory: String,
 }
@@ -47,42 +60,22 @@ pub struct PendingQuestion {
     pub done: Vec<bool>,
 }
 
-/// The Interaction Receipt (ADR-0038) a resolved block leaves in its place:
-/// one markdown line naming the decision and its target, no controls, so a
-/// late click on a stale card can never be ambiguous. Rendered from the
-/// accumulator at its anchor, so it survives every later flush (new part,
-/// header tick, split).
-#[derive(Debug, Clone)]
-pub struct InteractionReceipt {
-    pub request_id: String,
-    /// The receipt line, markdown only (e.g.
-    /// `✅ 已允许一次：⚡ 执行 Shell 命令 \`ls -la\` · 14:03`).
-    pub line: String,
-}
-
 /// One entry in a card's interaction section: a live permission or question
-/// block, or the receipt left in its slot once resolved, plus the transcript
-/// position the block was surfaced at. The section has ONE representation
-/// (this list on the accumulator), ONE render point (`build_card_inner`) and
-/// ONE mutation API (the `*_interaction` methods on [`StreamAccumulator`]) —
-/// every update — add, state change, resolve — goes through that seam, so what
-/// the card renders cannot drift from the accumulator's in-flight state
-/// (ADR-0038).
-#[derive(Debug, Clone)]
-pub struct Interaction {
-    pub block: InteractionBlock,
-    /// The timeline length when the block was surfaced: the transcript
-    /// position its receipt renders at, so the residue stays with the content
-    /// it belongs to instead of sinking with the card's tail. Live blocks keep
-    /// rendering in the tail (ADR-0038, rule 4).
-    pub anchor: usize,
-}
-
+/// block, or the tombstone of the receipt left once resolved. The section has
+/// ONE representation (this list), ONE mutation API (the `*_interaction`
+/// methods on [`StreamAccumulator`]) and one render point for live blocks
+/// (`build_card_inner`'s tail): every update — add, state change, resolve —
+/// goes through that seam, so what the card renders cannot drift from the
+/// accumulator's in-flight state (ADR-0038).
 #[derive(Debug, Clone)]
 pub enum InteractionBlock {
     Permission(PendingPermission),
     Question(PendingQuestion),
-    Receipt(InteractionReceipt),
+    /// Tombstone for a resolved request (its id): the section keeps it so a
+    /// racing poll cannot re-surface the block, while the rendered line lives
+    /// in the timeline ([`TimelineKind::Receipt`]) — the one render source
+    /// (ADR-0038, rule 4).
+    Receipt(String),
 }
 
 impl InteractionBlock {
@@ -91,7 +84,7 @@ impl InteractionBlock {
         match self {
             InteractionBlock::Permission(p) => &p.request_id,
             InteractionBlock::Question(q) => &q.request_id,
-            InteractionBlock::Receipt(r) => &r.request_id,
+            InteractionBlock::Receipt(request_id) => request_id,
         }
     }
 
@@ -156,13 +149,17 @@ pub struct StreamAccumulator {
     pub reasoning: String,
     /// Tool panels keyed by call ID (current state; `timeline` keeps order).
     pub tools: IndexMap<String, ToolPanel>,
-    /// Text chunks and tool markers in the order they happened — the card is
-    /// built from this, so message ↔ tool interleaving is preserved.
+    /// Text, reasoning, tool and receipt entries ordered by their key (the
+    /// server-side part start time) — the card is built from this, so message ↔
+    /// tool interleaving is preserved even when a part renders late.
     pub timeline: Vec<TimelineItem>,
-    /// The card's interaction section: the live permission/question blocks and
-    /// their Interaction Receipts, in render order, each anchored to the
-    /// transcript position it was surfaced at.
-    pub interactions: Vec<Interaction>,
+    /// Fallback key source for pushes without a server part time
+    /// ([`Self::next_order`]).
+    order_seq: i64,
+    /// The card's interaction section: the live permission/question blocks
+    /// (rendered in the tail) and the tombstones of resolved ones (their
+    /// receipt is a timeline entry).
+    pub interactions: Vec<InteractionBlock>,
     /// Timeline index the CURRENT card starts rendering from. When a card fills
     /// up (Feishu component limit) it is finalized with a "to be continued"
     /// marker and `render_from` advances — a fresh continuation card renders the
@@ -307,61 +304,54 @@ impl StreamAccumulator {
 
     /// Add an interaction block to the card unless a block for the same
     /// request is already present (the poll loop and the adopt-time snapshot
-    /// both feed blocks in), anchored at the current end of the transcript —
-    /// where its receipt will render once resolved. Returns whether it was
-    /// added.
+    /// both feed blocks in). Live blocks render in the card's tail; resolving
+    /// one inserts its receipt into the timeline. Returns whether it was added.
     pub fn add_interaction(&mut self, block: InteractionBlock) -> bool {
         if self.interaction(block.request_id()).is_some() {
             return false;
         }
-        self.interactions.push(Interaction {
-            block,
-            anchor: self.timeline.len(),
-        });
+        self.interactions.push(block);
         true
     }
 
     /// The block for `request_id`, if the card carries one.
     pub fn interaction(&self, request_id: &str) -> Option<&InteractionBlock> {
-        self.interactions
-            .iter()
-            .find(|e| e.block.request_id() == request_id)
-            .map(|e| &e.block)
+        self.interactions.iter().find(|b| b.request_id() == request_id)
     }
 
-    /// Replace the live block for `request_id` with its Interaction Receipt,
-    /// in place: the receipt keeps the block's slot and anchor, and every later
-    /// flush re-renders it from here (ADR-0038, rule 4). `line` derives the
-    /// receipt text from the block being resolved, so the residue always names
-    /// the target it actually resolved. Returns false when no live block
-    /// matched (already resolved, or never on this card).
+    /// Resolve the live block for `request_id` (ADR-0038, rule 4): the block's
+    /// entry becomes a tombstone for dedupe, and its Interaction Receipt is
+    /// inserted into the timeline, keyed at the RESOLUTION moment — not at the
+    /// moment the block surfaced. The request poll can put a block on the card
+    /// before the render poll has rendered the command and reasoning it belongs
+    /// to, so a surfacing-time position would sit above its own request;
+    /// resolution time is what the operator saw when they clicked, and the
+    /// keyed timeline puts anything the server ordered before that click above
+    /// the receipt no matter when it rendered. `line` derives the receipt text
+    /// from the block being resolved, so the residue always names the target it
+    /// actually resolved. Returns false when no live block matched (already
+    /// resolved, or never on this card).
     pub fn resolve_interaction(
         &mut self,
         request_id: &str,
         line: impl FnOnce(&InteractionBlock) -> String,
     ) -> bool {
-        match self
+        let Some(idx) = self
             .interactions
-            .iter_mut()
-            .find(|e| e.block.request_id() == request_id && e.block.is_live())
-        {
-            Some(slot) => {
-                let text = line(&slot.block);
-                // A block that outlived an earlier split has its anchor behind
-                // the live slice: the finalized card was already sent without
-                // this receipt, so clamp it to the live slice's start — it
-                // renders at the top of the current card instead of being lost.
-                // A receipt that existed before a later split keeps its anchor
-                // and renders on (or already rendered on) the card that owns it.
-                slot.anchor = slot.anchor.max(self.render_from);
-                slot.block = InteractionBlock::Receipt(InteractionReceipt {
-                    request_id: request_id.to_string(),
-                    line: text,
-                });
-                true
-            }
-            None => false,
-        }
+            .iter()
+            .position(|b| b.request_id() == request_id && b.is_live())
+        else {
+            return false;
+        };
+        let text = line(&self.interactions[idx]);
+        // `next_order` is the resolution moment with a monotonic guard: never
+        // before the wall clock, never behind anything already pushed in this
+        // accumulator — so a click's receipt always follows the content the
+        // operator was looking at, even within the same millisecond.
+        let at = self.next_order();
+        self.insert_kind(at, TimelineKind::Receipt(text));
+        self.interactions[idx] = InteractionBlock::Receipt(request_id.to_string());
+        true
     }
 
     /// Replace a question block's display state (the live 已选/✅ markers) in
@@ -376,8 +366,7 @@ impl StreamAccumulator {
         match self
             .interactions
             .iter_mut()
-            .find(|e| e.block.request_id() == request_id)
-            .map(|e| &mut e.block)
+            .find(|b| b.request_id() == request_id)
         {
             Some(InteractionBlock::Question(q)) => {
                 q.answers = answers.to_vec();
@@ -393,7 +382,7 @@ impl StreamAccumulator {
     /// many blocks were removed.
     pub fn retain_interactions(&mut self, keep: impl Fn(&InteractionBlock) -> bool) -> usize {
         let before = self.interactions.len();
-        self.interactions.retain(|e| keep(&e.block));
+        self.interactions.retain(keep);
         before - self.interactions.len()
     }
 
@@ -404,7 +393,7 @@ impl StreamAccumulator {
     pub fn live_permissions(&self) -> Vec<PendingPermission> {
         self.interactions
             .iter()
-            .filter_map(|e| match &e.block {
+            .filter_map(|b| match b {
                 InteractionBlock::Permission(p) => Some(p.clone()),
                 _ => None,
             })
@@ -417,7 +406,7 @@ impl StreamAccumulator {
     pub fn live_questions(&self) -> Vec<PendingQuestion> {
         self.interactions
             .iter()
-            .filter_map(|e| match &e.block {
+            .filter_map(|b| match b {
                 InteractionBlock::Question(q) => Some(q.clone()),
                 _ => None,
             })
@@ -427,7 +416,7 @@ impl StreamAccumulator {
     /// Whether the card carries any block awaiting the operator — drives the
     /// header's awaiting-action state. A receipt no longer awaits anything.
     pub fn has_live_interactions(&self) -> bool {
-        self.interactions.iter().any(|e| e.block.is_live())
+        self.interactions.iter().any(InteractionBlock::is_live)
     }
 
     /// Progress inputs for the header (ADR-0014): waiting flag, phase timer,
@@ -453,52 +442,109 @@ impl StreamAccumulator {
         format!("{}|{}", title, template)
     }
 
+    /// Insert a timeline entry at its key's position: after every entry whose
+    /// part started no later, before the ones that started later. The poll can
+    /// deliver parts out of order (a panel whose content lands after later
+    /// parts), so appending would put it after content that follows it — the
+    /// ordering bug that moved a gated command below its receipt. Equal keys
+    /// keep insertion order. A key behind the live slice clamps to its start:
+    /// the finalized card that owned that position is already sent, and the top
+    /// of the live card is the closest honest place left.
+    fn insert_kind(&mut self, at: i64, kind: TimelineKind) {
+        let idx = self
+            .timeline
+            .partition_point(|item| item.at <= at)
+            .max(self.render_from);
+        self.timeline.insert(idx, TimelineItem { at, kind });
+    }
+
+    /// Key for a push with no server part time (tests, synthetic content):
+    /// strictly increasing and never behind the wall clock, so it keeps call
+    /// order and stays after anything already resolved.
+    pub fn next_order(&mut self) -> i64 {
+        self.order_seq = self
+            .order_seq
+            .saturating_add(1)
+            .max(chrono::Utc::now().timestamp_millis());
+        self.order_seq
+    }
+
     /// Append a text chunk, keeping it in the chronological timeline (merging
     /// consecutive text chunks so the card doesn't produce one element each).
     /// Text is chunked so no single timeline item exceeds `MAX_CARD_TEXT_CHARS`
     /// — the card splitter can then break a long answer across cards at item
     /// boundaries instead of truncating it.
     pub fn push_text(&mut self, chunk: &str) {
+        let at = self.next_order();
+        self.push_text_at(at, chunk);
+    }
+
+    /// [`Self::push_text`] for a chunk from the part that started at `at`:
+    /// text merges only into its own part's item (same key), so a late part
+    /// cannot be absorbed into a neighbour that merely looked adjacent.
+    pub fn push_text_at(&mut self, at: i64, chunk: &str) {
         self.text.push_str(chunk);
         let max = crate::feishu::card::MAX_CARD_TEXT_CHARS;
         let mut remaining = chunk;
         while !remaining.is_empty() {
-            let space = match self.timeline.last_mut() {
-                Some(TimelineItem::Text(last)) => max.saturating_sub(last.chars().count()),
+            let space = match self.timeline.last() {
+                Some(TimelineItem {
+                    at: last_at,
+                    kind: TimelineKind::Text(last),
+                }) if *last_at == at => max.saturating_sub(last.chars().count()),
                 _ => 0,
             };
             if space == 0 {
                 let take: String = remaining.chars().take(max).collect();
-                self.timeline.push(TimelineItem::Text(take.clone()));
+                self.insert_kind(at, TimelineKind::Text(take.clone()));
                 remaining = &remaining[take.len()..];
                 continue;
             }
             let take: String = remaining.chars().take(space).collect();
             match self.timeline.last_mut() {
-                Some(TimelineItem::Text(last)) => last.push_str(&take),
-                _ => self.timeline.push(TimelineItem::Text(take.clone())),
+                Some(TimelineItem {
+                    kind: TimelineKind::Text(last),
+                    ..
+                }) => last.push_str(&take),
+                _ => self.insert_kind(at, TimelineKind::Text(take.clone())),
             }
             remaining = &remaining[take.len()..];
         }
     }
 
     /// Append a reasoning chunk, keeping it in the chronological timeline
-    /// (consecutive chunks merge into one panel).
+    /// (chunks of the same part merge into one panel; a part keyed apart is
+    /// its own panel).
     pub fn push_reasoning(&mut self, chunk: &str) {
+        let at = self.next_order();
+        self.push_reasoning_at(at, chunk);
+    }
+
+    /// [`Self::push_reasoning`] for a reasoning part that started at `at`.
+    pub fn push_reasoning_at(&mut self, at: i64, chunk: &str) {
         self.reasoning.push_str(chunk);
         match self.timeline.last_mut() {
-            Some(TimelineItem::Reasoning(last)) => last.push_str(chunk),
-            _ => self.timeline.push(TimelineItem::Reasoning(chunk.to_string())),
+            Some(TimelineItem {
+                at: last_at,
+                kind: TimelineKind::Reasoning(last),
+            }) if *last_at == at => last.push_str(chunk),
+            _ => self.insert_kind(at, TimelineKind::Reasoning(chunk.to_string())),
         }
     }
 
     /// Insert/update a tool panel; the timeline gets a marker only on the FIRST
     /// appearance (state updates re-render in place).
     pub fn push_tool(&mut self, call_id: &str, panel: ToolPanel) {
+        let at = self.next_order();
+        self.push_tool_at(at, call_id, panel);
+    }
+
+    /// [`Self::push_tool`] for a tool part that started at `at`.
+    pub fn push_tool_at(&mut self, at: i64, call_id: &str, panel: ToolPanel) {
         let is_new = !self.tools.contains_key(call_id);
         self.tools.insert(call_id.to_string(), panel);
         if is_new {
-            self.timeline.push(TimelineItem::Tool(call_id.to_string()));
+            self.insert_kind(at, TimelineKind::Tool(call_id.to_string()));
         }
         // A running-tool phase starts/exits here (running → completed), so the
         // header timer must follow even though card_state stays Streaming.
@@ -551,22 +597,10 @@ impl StreamAccumulator {
         let mut comps = 0usize;
         let mut size = 0usize;
         let mut card_text = 0usize;
-        // Interaction Receipts render inline at their anchor (rule 4) and count
-        // against the budget like any other element. Receipts landing past the
-        // split point over-count slightly here — a safe direction (the card
-        // finalizes a touch earlier).
-        for entry in &self.interactions {
-            if let InteractionBlock::Receipt(r) = &entry.block
-                && entry.anchor >= start
-            {
-                comps += 1;
-                size += r.line.len() + 40;
-            }
-        }
         for (i, item) in self.timeline.iter().enumerate().skip(start) {
-            let (c, s, t) = match item {
-                TimelineItem::Reasoning(r) => (4, 300 + first_n_bytes(r, 800), 0),
-                TimelineItem::Tool(call_id) => {
+            let (c, s, t) = match &item.kind {
+                TimelineKind::Reasoning(r) => (4, 300 + first_n_bytes(r, 800), 0),
+                TimelineKind::Tool(call_id) => {
                     let panel_size = self.tools.get(call_id).map(|p| {
                         let input = p
                             .input
@@ -590,11 +624,13 @@ impl StreamAccumulator {
                 // accumulates across items and splits at the boundary. The
                 // component estimate mirrors `with_text`, which splits each
                 // element at MAX_ELEMENT_TEXT_CHARS.
-                TimelineItem::Text(t) => {
+                TimelineKind::Text(t) => {
                     let chars = t.chars().count();
                     let elements = chars.div_ceil(crate::feishu::card::MAX_ELEMENT_TEXT_CHARS);
                     (elements, t.len() + 40, chars)
                 }
+                // A receipt is one small markdown line.
+                TimelineKind::Receipt(line) => (1, line.len() + 40, 0),
             };
             comps += c;
             size += s;
@@ -629,48 +665,16 @@ impl StreamAccumulator {
         // goes in the subtitle and the question is NOT echoed again.
         builder = builder.with_subtitle(&self.title);
 
-        // Render reasoning, text and tool panels in CHRONOLOGICAL order
-        // (interleaved), like OpenChamber shows them. Text is chunked at push
-        // time and bounded per card by `estimate_split_index`, so everything in
-        // [start..end) renders in full — no preview truncation, no separate
-        // plain-text message.
-        // Interaction Receipts render at their anchor — the transcript
-        // position their block was surfaced at — so the residue stays with the
-        // content it belongs to instead of sinking with the card's tail; only
-        // live blocks stay in the tail (ADR-0038, rule 4). `include_tail` marks
-        // the live card, where a receipt anchored exactly at the end renders
-        // after the last item; on a finalized (split) card that receipt belongs
-        // to the continuation. Receipts anchored before this slice already
-        // rendered on a previous card (`resolve_interaction` clamps post-split
-        // resolutions forward), so they are skipped rather than duplicated.
-        let mut receipts: Vec<(usize, &str)> = self
-            .interactions
-            .iter()
-            .filter_map(|e| match &e.block {
-                InteractionBlock::Receipt(r)
-                    if e.anchor >= start && (e.anchor < end || (include_tail && e.anchor == end)) =>
-                {
-                    Some((e.anchor, r.line.as_str()))
-                }
-                _ => None,
-            })
-            .collect();
-        receipts.sort_by_key(|(anchor, _)| *anchor);
-        let mut receipts = receipts.into_iter().peekable();
-
+        // Render text, reasoning, tool panels and receipts in the timeline's
+        // key order (interleaved), like OpenChamber shows the parts. Text is
+        // chunked at push time and bounded per card by `estimate_split_index`,
+        // so everything in [start..end) renders in full — no preview
+        // truncation, no separate plain-text message.
         let mut pending = String::new();
         let mut saw_content = false;
-        for (i, item) in self.timeline.iter().enumerate().take(end).skip(start) {
-            while receipts.peek().is_some_and(|(anchor, _)| *anchor <= i) {
-                let (_, line) = receipts.next().expect("peeked above");
-                if !pending.is_empty() {
-                    builder = builder.with_text(&pending);
-                    pending.clear();
-                }
-                builder = builder.with_text(line);
-            }
-            match item {
-                TimelineItem::Reasoning(r) => {
+        for item in self.timeline.iter().take(end).skip(start) {
+            match &item.kind {
+                TimelineKind::Reasoning(r) => {
                     if !pending.is_empty() {
                         builder = builder.with_text(&pending);
                         pending.clear();
@@ -678,11 +682,11 @@ impl StreamAccumulator {
                     builder = builder.with_reasoning(r);
                     saw_content = true;
                 }
-                TimelineItem::Text(t) => {
+                TimelineKind::Text(t) => {
                     pending.push_str(t);
                     saw_content = true;
                 }
-                TimelineItem::Tool(call_id) => {
+                TimelineKind::Tool(call_id) => {
                     if !pending.is_empty() {
                         builder = builder.with_text(&pending);
                         pending.clear();
@@ -691,25 +695,31 @@ impl StreamAccumulator {
                         builder = builder.with_tool(panel.clone());
                     }
                 }
+                // A resolved block's residue: one receipt line, no controls,
+                // in the transcript position it was resolved at (ADR-0038,
+                // rule 4).
+                TimelineKind::Receipt(line) => {
+                    if !pending.is_empty() {
+                        builder = builder.with_text(&pending);
+                        pending.clear();
+                    }
+                    builder = builder.with_text(line);
+                }
             }
         }
         if !pending.is_empty() {
             builder = builder.with_text(&pending);
-        }
-        // Receipts anchored at the end of the transcript (surfaced after the
-        // last item) follow it — still above the live blocks in the tail.
-        for (_, line) in receipts {
-            builder = builder.with_text(line);
         }
 
         if include_tail {
             // The card's tail: the live interaction blocks, in accumulated
             // order. A permission renders its buttons right here (the whole
             // turn lives on one card); a question renders its current display
-            // answers. Resolved blocks render as receipts at their anchor
-            // above, not here.
-            for entry in &self.interactions {
-                match &entry.block {
+            // answers. Resolved blocks are timeline receipts above, not here —
+            // their entry is only a tombstone that keeps a racing poll from
+            // re-surfacing the request.
+            for block in &self.interactions {
+                match block {
                     InteractionBlock::Permission(p) => {
                         builder = builder.with_text(&format!("🔐 **权限请求**\n{}", p.body));
                         for btn in crate::feishu::card::question::permission_buttons(
@@ -733,8 +743,6 @@ impl StreamAccumulator {
                             builder = builder.with_element(el);
                         }
                     }
-                    // A receipt is transcript content: it rendered at its
-                    // anchor above.
                     InteractionBlock::Receipt(_) => {}
                 }
             }
@@ -1234,8 +1242,8 @@ mod tests {
         let text_items: Vec<&String> = acc
             .timeline
             .iter()
-            .filter_map(|item| match item {
-                TimelineItem::Text(t) => Some(t),
+            .filter_map(|item| match &item.kind {
+                TimelineKind::Text(t) => Some(t),
                 _ => None,
             })
             .collect();
