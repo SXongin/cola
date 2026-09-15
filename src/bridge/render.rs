@@ -380,7 +380,7 @@ pub(crate) async fn flush_card(core: &Arc<SharedCore>, session_id: &str) {
     // FINALIZED slice (its build was already over the budget) and must never be
     // overwritten: an update with the next slice would drop the content — and
     // the Interaction Receipts — that card carries.
-    let mut live = true;
+    let mut card_is_live = true;
     for _ in 0..MAX_CARD_CHAIN {
         let (card, full) = {
             let mut cards = core.cards.lock().await;
@@ -395,7 +395,7 @@ pub(crate) async fn flush_card(core: &Arc<SharedCore>, session_id: &str) {
         };
         let Some(card_id) = card_id else { return };
 
-        if live {
+        if card_is_live {
             // The live card takes the slice in place: either it still fits
             // (plain update) or this flush finalizes it with the "to be
             // continued" marker.
@@ -405,7 +405,7 @@ pub(crate) async fn flush_card(core: &Arc<SharedCore>, session_id: &str) {
             if !full {
                 return;
             }
-            live = false;
+            card_is_live = false;
             continue;
         }
 

@@ -490,8 +490,10 @@ async fn autoaccept_toggle_on_permission_card_flips_flag_and_approves() {
             request_id: "per_aa_other".into(),
             session_id: Some("ses_test".into()),
             permission: Some("edit".into()),
-            patterns: vec!["src/main.rs".into()],
-            metadata: None,
+            // An edit is about its file: the receipt must name the filepath,
+            // not the looser pattern.
+            patterns: vec!["*.rs".into()],
+            metadata: Some(serde_json::json!({ "filepath": "src/main.rs" })),
             always: Vec::new(),
         },
     ];
@@ -559,11 +561,22 @@ async fn autoaccept_toggle_on_permission_card_flips_flag_and_approves() {
         .expect("inline toggle must carry the updated card in the ack")
         .to_string();
     assert_eq!(result.toast.as_deref(), Some("已开启自动授权"));
-    // EVERY block the toggle resolved left its receipt, in the same ack.
+    // EVERY block the toggle resolved left its receipt, in the same ack, and
+    // each names its own target.
     assert_eq!(
         ack.matches("🔄 已开启自动授权").count(),
         2,
         "one receipt per resolved block: {}",
+        ack
+    );
+    assert!(
+        ack.contains("🔄 已开启自动授权：⚡ 执行 Shell 命令 `ls -la`"),
+        "the toggled permission names its target: {}",
+        ack
+    );
+    assert!(
+        ack.contains("🔄 已开启自动授权：✏️ 编辑文件 `src/main.rs`"),
+        "the other approved permission names its own target: {}",
         ack
     );
     assert!(
@@ -1360,17 +1373,26 @@ async fn interaction_receipt_renders_at_the_interaction_position() {
     let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
     seed_session(&app, "ses_test", "/work").await;
 
-    // 第一段 → a reasoning panel → [permission],
+    // 第一段 → [permission A] → a reasoning panel → [permission B]
     let mut acc = crate::bridge::streaming::StreamAccumulator::new("test");
     acc.reply_to_message_id = Some("msg_1".into());
     acc.push_text("第一段。");
-    acc.push_reasoning("正在思考。");
     acc.add_interaction(crate::bridge::streaming::InteractionBlock::Permission(
         crate::bridge::streaming::PendingPermission {
             session_id: "ses_test".into(),
             request_id: "per_1".into(),
             body: "bash ls -la".into(),
             target: "⚡ 执行 Shell 命令 `ls -la`".into(),
+            directory: "/work".into(),
+        },
+    ));
+    acc.push_reasoning("正在思考。");
+    acc.add_interaction(crate::bridge::streaming::InteractionBlock::Permission(
+        crate::bridge::streaming::PendingPermission {
+            session_id: "ses_test".into(),
+            request_id: "per_2".into(),
+            body: "bash cargo build".into(),
+            target: "⚡ 执行 Shell 命令 `cargo build`".into(),
             directory: "/work".into(),
         },
     ));
@@ -1385,8 +1407,14 @@ async fn interaction_receipt_renders_at_the_interaction_position() {
         "receipt missing: {}",
         ack
     );
+    let ack = click_perm(&app, "reject", "per_2", "🚫 已拒绝").await;
+    assert!(
+        ack.contains("🚫 已拒绝：⚡ 执行 Shell 命令 `cargo build`"),
+        "receipt missing: {}",
+        ack
+    );
 
-    // ... then the AI keeps streaming: 第二段 must land BELOW the receipt.
+    // ... then the AI keeps streaming: 第二段 must land BELOW both receipts.
     app.cards
         .lock()
         .await
@@ -1409,11 +1437,12 @@ async fn interaction_receipt_renders_at_the_interaction_position() {
             .unwrap_or_else(|| panic!("{} not on the card: {}", needle, card))
     };
     let first = index_of("第一段。");
-    let receipt = index_of("已允许一次");
+    let receipt_a = index_of("已允许一次");
+    let receipt_b = index_of("已拒绝");
     let second = index_of("第二段。");
     assert!(
-        first < receipt && receipt < second,
-        "the receipt must sit between 第一段 and 第二段: {}",
+        first < receipt_a && receipt_a < receipt_b && receipt_b < second,
+        "receipts must anchor in interaction order, between 第一段 and 第二段: {}",
         card
     );
 }
