@@ -115,12 +115,12 @@ jobs:
             Rules:
             - Read-only: editing tools are disabled and any unpushed change
               would fail the run. Do not try to write.
-            - Shell access is limited to read-only commands: `git
-              diff/show/log/status/blame/grep/ls-files` and `gh pr view`,
-              `gh pr diff`, `gh issue view`, `gh search`. Everything else,
-              `gh api` included, is denied. Do not post reviews, comments, or
-              labels yourself; the workflow posts this response and approves
-              when the verdict below is PASS.
+            - Shell access is limited to the read-only `git`/`gh` commands in
+              this workflow's `OPENCODE_PERMISSION` allowlist (you can read it
+              in the checkout). Everything else - `gh api`, `gh pr review`,
+              any write - is denied. Do not post reviews, comments, or labels
+              yourself; the workflow posts this response and approves when the
+              verdict below is PASS.
             - A missing or failed part of the review is a blocking finding.
 
             Finish with exactly one final line, on its own line and with
