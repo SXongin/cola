@@ -817,3 +817,71 @@ async fn short_answer_stays_in_card_no_extra_message() {
         calls
     );
 }
+
+/// #183: every panel is stamped with its part's own server start time (local
+/// `HH:MM`) and the card header carries the turn's date (`MM-DD`). The epochs
+/// are constructed from local wall times, so the expected strings hold in any
+/// test-machine timezone — and the turn crossing midnight proves the header
+/// date is the turn's, not the render moment's.
+#[test]
+fn panel_times_and_header_date_come_from_part_epochs() {
+    use crate::bridge::render::render_parts;
+    use crate::bridge::streaming::StreamAccumulator;
+    use crate::feishu::card::CardState;
+    use crate::feishu::card::test_local_ms;
+
+    let submit = test_local_ms(2026, 9, 16, 23, 58);
+    let reasoning_at = test_local_ms(2026, 9, 17, 0, 3);
+    let tool_start = test_local_ms(2026, 9, 17, 0, 5);
+    let tool_end = test_local_ms(2026, 9, 17, 0, 7);
+
+    let mut acc = StreamAccumulator::new("proj");
+    acc.submit_epoch_ms = Some(submit);
+    render_parts(
+        &mut acc,
+        &serde_json::json!([
+            { "type": "reasoning", "text": "thinking",
+              "time": { "start": reasoning_at, "end": reasoning_at + 1_000 } },
+            { "type": "tool", "tool": "bash", "callID": "call_1",
+              "state": { "status": "running", "input": { "command": "sleep 2" },
+                         "time": { "start": tool_start } } },
+        ]),
+    );
+    let running = acc.build_card().to_string();
+    assert!(
+        running.contains("💭 推理过程 · 00:03"),
+        "reasoning time missing: {running}"
+    );
+    assert!(
+        running.contains("⏳ bash · 00:05"),
+        "running tool time missing: {running}"
+    );
+
+    // Completing the tool re-renders the panel in place: its start time must
+    // stay, not slide to the completion moment.
+    render_parts(
+        &mut acc,
+        &serde_json::json!([
+            { "type": "tool", "tool": "bash", "callID": "call_1",
+              "state": { "status": "completed", "input": { "command": "sleep 2" },
+                         "output": "done",
+                         "time": { "start": tool_start, "end": tool_end } } },
+        ]),
+    );
+    acc.card_state = CardState::Done;
+    let done = acc.build_card();
+    let text = done.to_string();
+    assert!(
+        text.contains("✅ bash · 00:05"),
+        "start time lost on completion: {text}"
+    );
+    assert!(
+        !text.contains("00:07"),
+        "completion time leaked into the panel: {text}"
+    );
+    assert_eq!(
+        done["header"]["subtitle"]["content"].as_str().unwrap(),
+        "proj · 09-16",
+        "the header must carry the turn's date, not the parts'"
+    );
+}

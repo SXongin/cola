@@ -804,8 +804,13 @@ impl StreamAccumulator {
             .with_progress(self.header_progress());
 
         // The card is a reply to the user's message, so the session/thread name
-        // goes in the subtitle and the question is NOT echoed again.
+        // goes in the subtitle and the question is NOT echoed again. The date
+        // anchor comes from the turn's submit epoch (#183) — not "now" — so
+        // every flush of this card and its split continuations keeps it.
         builder = builder.with_subtitle(&self.title);
+        if let Some(date) = self.submit_epoch_ms.and_then(crate::feishu::card::fmt_local_date) {
+            builder = builder.with_date(&date);
+        }
 
         // Render text, reasoning, tool panels and receipts in the timeline's
         // key order (interleaved), like OpenChamber shows the parts. Text is
@@ -821,7 +826,7 @@ impl StreamAccumulator {
                         builder = builder.with_text(&pending);
                         pending.clear();
                     }
-                    builder = builder.with_reasoning(r);
+                    builder = builder.with_reasoning_at(r, item.key);
                     saw_content = true;
                 }
                 TimelineKind::Text(t) => {
@@ -834,7 +839,7 @@ impl StreamAccumulator {
                         pending.clear();
                     }
                     if let Some(panel) = self.tools.get(call_id) {
-                        builder = builder.with_tool(panel.clone());
+                        builder = builder.with_tool_at(panel.clone(), item.key);
                     }
                 }
                 // A resolved block's residue: one receipt line, no controls,

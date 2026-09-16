@@ -142,6 +142,38 @@ pub fn clean_session_label(name: &str) -> String {
     }
 }
 
+/// `HH:MM` in the machine's local time for an epoch-millisecond instant — the
+/// panel header suffix (#183) and the permission receipt's clock (ADR-0038
+/// rule 4) read the same format. `None` for a value outside chrono's
+/// representable range (never a real part key), so callers can skip the suffix.
+pub(crate) fn fmt_local_time(epoch_ms: i64) -> Option<String> {
+    format_local(epoch_ms, "%H:%M")
+}
+
+/// `MM-DD` in the machine's local time — the card header's date anchor
+/// (#183), taken from the turn's submit epoch so it is stable across flushes.
+pub(crate) fn fmt_local_date(epoch_ms: i64) -> Option<String> {
+    format_local(epoch_ms, "%m-%d")
+}
+
+fn format_local(epoch_ms: i64, fmt: &str) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(epoch_ms)
+        .map(|at| at.with_timezone(&chrono::Local).format(fmt).to_string())
+}
+
+/// Build an epoch-millisecond instant from a local wall time, so tests can
+/// assert `HH:MM` / `MM-DD` strings that hold in any machine timezone.
+#[cfg(test)]
+pub(crate) fn test_local_ms(y: i32, m: u32, d: u32, h: u32, min: u32) -> i64 {
+    use chrono::TimeZone;
+
+    chrono::Local
+        .with_ymd_and_hms(y, m, d, h, min, 0)
+        .single()
+        .expect("unambiguous local time")
+        .timestamp_millis()
+}
+
 /// Clip `text` to at most `max_len` characters, appending a "…" marker when it
 /// was cut. Character-counted so CJK content (3 bytes/char) is truncated at the
 /// same visual length as ASCII instead of at a byte budget.
@@ -156,6 +188,20 @@ pub(crate) fn truncate_md(text: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #183: both panel headers and the card header date read the same local
+    /// clock through these helpers. The expected strings are built from a local
+    /// wall time, so they hold on any test-machine timezone.
+    #[test]
+    fn local_time_helpers_format_the_machine_zone() {
+        let at = test_local_ms(2026, 9, 16, 14, 3);
+        assert_eq!(fmt_local_time(at).as_deref(), Some("14:03"));
+        assert_eq!(fmt_local_date(at).as_deref(), Some("09-16"));
+        // Unrepresentable epochs (never a real server key) format to nothing
+        // instead of panicking.
+        assert_eq!(fmt_local_time(i64::MAX), None);
+        assert_eq!(fmt_local_date(i64::MIN), None);
+    }
 
     #[test]
     fn clean_session_label_handles_uuid_and_mentions() {
