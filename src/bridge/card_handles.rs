@@ -350,6 +350,21 @@ mod tests {
             .collect()
     }
 
+    /// Every cached copy of a block is discoverable, not just the one the
+    /// registry currently names — a re-host can leave an older copy behind.
+    #[test]
+    fn cards_rendering_names_every_cached_copy() {
+        let mut handles = CardHandles::default();
+        let c = card(vec![text("body"), text("button")]);
+        handles.record("om_old", &c, vec![block("p1", 0, 2, ClaimKind::Permission)]);
+        handles.record("om_new", &c, vec![block("p1", 0, 2, ClaimKind::Permission)]);
+
+        let mut found = handles.cards_rendering("p1");
+        found.sort();
+        assert_eq!(found, vec!["om_new", "om_old"]);
+        assert!(handles.cards_rendering("p_other").is_empty());
+    }
+
     /// Resolving one block replaces exactly its elements and shifts the blocks
     /// after it, so their spans keep naming the same elements.
     #[test]

@@ -653,7 +653,11 @@ async fn autoaccept_command_leaves_the_mode_receipt_on_the_card() {
     {
         let stale_card = serde_json::json!({
             "schema": "2.0",
-            "body": { "elements": [ { "tag": "markdown", "content": "旧卡片" } ] },
+            "body": { "elements": [
+                { "tag": "markdown", "content": "🔐 **权限请求**" },
+                { "tag": "button", "text": { "tag": "plain_text", "content": "✅ 允许一次" },
+                  "type": "primary", "value": { "action": "perm", "request_id": "per_1" } },
+            ] },
         });
         let mut handles = app.card_handles.lock().await;
         handles.record(
@@ -662,7 +666,7 @@ async fn autoaccept_command_leaves_the_mode_receipt_on_the_card() {
             vec![crate::bridge::card_handles::RenderedBlock {
                 request_id: "per_1".into(),
                 start: 0,
-                end: 1,
+                end: 2,
                 kind: crate::bridge::snapshot_claims::ClaimKind::Permission,
                 session_id: "ses_1".into(),
                 directory: "/work".into(),
@@ -722,8 +726,8 @@ async fn autoaccept_command_leaves_the_mode_receipt_on_the_card() {
             .is_empty(),
         "the accumulator must not keep the block live"
     );
-    // An older copy of the same block (a re-host leaves one behind) must be
-    // repainted too — nothing else would.
+    // The stale copy gets the mode receipt without a header restamp (it may
+    // belong to an older turn; only the registered card is restamped).
     let stale = platform
         .calls
         .lock()
@@ -738,7 +742,9 @@ async fn autoaccept_command_leaves_the_mode_receipt_on_the_card() {
         })
         .expect("the stale copy of the block must be repainted too");
     assert!(
-        stale.contains("后续权限请求将自动批准") && !stale.contains("🔐 **权限请求**"),
+        stale.contains("后续权限请求将自动批准")
+            && !stale.contains("🔐 **权限请求**")
+            && !stale.contains("✅ 允许一次"),
         "the stale copy gets the mode receipt, not the live block: {stale}"
     );
 
@@ -754,6 +760,70 @@ async fn autoaccept_command_leaves_the_mode_receipt_on_the_card() {
         .filter(|c| matches!(c, PlatformCall::UpdateMessage { message_id, .. } if message_id == &card_id))
         .count();
     assert_eq!(after, patches.len(), "the sweep must not repaint again");
+}
+
+/// A standalone permission card (no accumulator, no card handle) must keep its
+/// `sent_cards` entry when `/autoaccept on` approves it: clearing it would
+/// strand the card's live buttons. `mark_stale_cards` owns that lifecycle and
+/// repaints it, as ADR-0038 rule 6 says.
+#[tokio::test]
+async fn autoaccept_command_keeps_the_standalone_card_for_the_sweep() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.permissions = vec![perm_request("per_1", "ses_1", "ls -la")];
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_1", "/work").await;
+    // The poller surfaced this one as a standalone card (no live turn).
+    app.permission.sent_cards.lock().await.insert(
+        "per_1".into(),
+        crate::bridge::request::SentCard {
+            message_id: "om_sent".into(),
+            summary: "bash ls -la".into(),
+            directory: "/work".into(),
+        },
+    );
+
+    crate::bridge::command::handle_command(
+        &app.core,
+        Command::AutoAccept(crate::bridge::command::AutoAcceptAction::Set(true)),
+        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+        "msg_cmd",
+        crate::config::ConversationKind::P2p,
+    )
+    .await
+    .unwrap();
+
+    // Approved server-side, but this seam has nothing inline to settle: the
+    // entry survives so the sweep can repaint the card.
+    assert!(
+        app.permission.sent_cards.lock().await.contains_key("per_1"),
+        "a standalone card's entry must survive the command"
+    );
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.core, &mut seen).await;
+    let stale = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .find_map(|c| match c {
+            PlatformCall::UpdateMessage { message_id, card } if message_id == "om_sent" => {
+                Some(card.to_string())
+            }
+            _ => None,
+        })
+        .expect("the sweep marks the standalone card handled");
+    assert!(
+        stale.contains("已处理"),
+        "standalone card shows as handled: {stale}"
+    );
+    assert!(
+        !app.permission.sent_cards.lock().await.contains_key("per_1"),
+        "the sweep owns the standalone entry"
+    );
 }
 
 #[tokio::test]
