@@ -1871,22 +1871,27 @@ async fn resolve_blocks(
     //    also changes the HEADER (the "等待你的授权/回答" override lifts), so
     //    the post-resolution header is captured here and restamped onto every
     //    card this resolution edits — otherwise a click leaves the clicked
-    //    card titled "waiting" until the next render-poll flush (~2 s). The
-    //    restamp cannot overwrite a newer card's header: a flush that ran
-    //    after this resolution rebuilt the card without this block's span, so
-    //    `resolve_on` finds nothing and the ack falls back to a fresh rebuild.
+    //    card titled "waiting" until the next render-poll flush (~2 s).
+    //    Only an accumulator that ACTUALLY resolved one of the blocks may
+    //    restamp: a card whose own turn is gone (its block lives only in the
+    //    handle cache) has no header source, and wearing another turn's live
+    //    header would be a lie. The restamp also cannot overwrite a newer
+    //    card's header: a flush that ran after this resolution rebuilt the
+    //    card without this block's span, so `resolve_on` finds nothing and
+    //    the ack falls back to a fresh rebuild.
     let post_resolution_header = {
         let mut cards = core.cards.lock().await;
         if let Some(acc) = cards
             .get_mut(host.as_deref().unwrap_or(session_id))
             .map(|c| &mut c.acc)
         {
+            let mut resolved_here = false;
             for id in ids {
-                if acc.interaction(id).is_some_and(InteractionBlock::is_live) {
-                    acc.resolve_interaction(id, |block| line(&block.receipt_target()));
+                if acc.resolve_interaction(id, |block| line(&block.receipt_target())) {
+                    resolved_here = true;
                 }
             }
-            Some(acc.header_title_and_template())
+            resolved_here.then(|| acc.header_title_and_template())
         } else {
             None
         }

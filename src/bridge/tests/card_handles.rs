@@ -253,6 +253,13 @@ async fn click_updates_a_non_current_card_through_its_handle() {
     );
     assert!(ack.contains("旧回合的推理。"), "the ack is the OLD card: {ack}");
     assert!(!ack.contains("新回合"), "never the new accumulator's card: {ack}");
+    // The restamp is gated on the accumulator actually resolving a block: the
+    // new turn never carried this one, so its live header must not leak onto
+    // the old card.
+    assert!(
+        !ack.contains("思考中"),
+        "the old card must not wear the NEW turn's live header: {ack}"
+    );
     assert_eq!(
         patches_of(&platform, "om_old").await,
         patches_before,
