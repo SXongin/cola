@@ -405,6 +405,13 @@ impl StreamAccumulator {
         self.interactions.iter().find(|b| b.request_id() == request_id)
     }
 
+    /// The index of the live block `request_id` names, if it is still there.
+    fn live_index(&self, request_id: &str) -> Option<usize> {
+        self.interactions
+            .iter()
+            .position(|b| b.request_id() == request_id && b.is_live())
+    }
+
     /// Resolve the live block for `request_id` (ADR-0038, rule 4): the block's
     /// entry becomes a tombstone for dedupe, and its Interaction Receipt is
     /// inserted into the timeline, keyed at the RESOLUTION moment — not at the
@@ -417,13 +424,6 @@ impl StreamAccumulator {
     /// from the block being resolved, so the residue always names the target it
     /// actually resolved. Returns false when no live block matched (already
     /// resolved, or never on this card).
-    /// The index of the live block `request_id` names, if it is still there.
-    fn live_index(&self, request_id: &str) -> Option<usize> {
-        self.interactions
-            .iter()
-            .position(|b| b.request_id() == request_id && b.is_live())
-    }
-
     pub fn resolve_interaction(
         &mut self,
         request_id: &str,
