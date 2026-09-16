@@ -1867,8 +1867,15 @@ async fn resolve_blocks(
     }
     // 1. The accumulator that still carries a block is the render source: a
     //    receipt must live in its timeline, or the next flush re-adds the
-    //    block to the card the ack just cleaned.
-    {
+    //    block to the card the ack just cleaned. Resolving the last live block
+    //    also changes the HEADER (the "等待你的授权/回答" override lifts), so
+    //    the post-resolution header is captured here and restamped onto every
+    //    card this resolution edits — otherwise a click leaves the clicked
+    //    card titled "waiting" until the next render-poll flush (~2 s). The
+    //    restamp cannot overwrite a newer card's header: a flush that ran
+    //    after this resolution rebuilt the card without this block's span, so
+    //    `resolve_on` finds nothing and the ack falls back to a fresh rebuild.
+    let post_resolution_header = {
         let mut cards = core.cards.lock().await;
         if let Some(acc) = cards
             .get_mut(host.as_deref().unwrap_or(session_id))
@@ -1879,8 +1886,11 @@ async fn resolve_blocks(
                     acc.resolve_interaction(id, |block| line(&block.receipt_target()));
                 }
             }
+            Some(acc.header_title_and_template())
+        } else {
+            None
         }
-    }
+    };
     // 2. The card handles: every card that rendered one of the blocks is
     //    edited from its cache. The clicked card's edit is the ack; any other
     //    card's edit is patched so its controls do not linger.
@@ -1897,7 +1907,7 @@ async fn resolve_blocks(
                     .as_deref()
                     .and_then(|text| handles.resolve_on(clicked_id, id, text))
                 {
-                    ack = Some(card);
+                    ack = Some(restamped_header(card, post_resolution_header.as_ref()));
                 }
                 // The registered card is a different one (the block moved, or
                 // the click landed on a stale copy): repaint it so its controls
@@ -1907,7 +1917,11 @@ async fn resolve_blocks(
                     && let Some(text) = line_for.as_deref()
                     && let Some(card) = handles.resolve_on(&registered, id, text)
                 {
-                    crate::bridge::card_handles::merge_patch(&mut patches, registered, card);
+                    crate::bridge::card_handles::merge_patch(
+                        &mut patches,
+                        registered,
+                        restamped_header(card, post_resolution_header.as_ref()),
+                    );
                 }
             }
             handles.forget(id);
@@ -1919,6 +1933,27 @@ async fn resolve_blocks(
         }
     }
     ack
+}
+
+/// Restamp an edited card's header title and template from the accumulator's
+/// post-resolution state, keeping the header's subtitle (the session/date
+/// line) untouched. The cached card's own header was captured while the block
+/// was still live, so without this a click would leave "等待你的授权/回答"
+/// showing until the next render-poll flush.
+fn restamped_header(
+    mut card: serde_json::Value,
+    header: Option<&(String, &'static str)>,
+) -> serde_json::Value {
+    if let Some((title, template)) = header
+        && let Some(h) = card.get_mut("header").and_then(|h| h.as_object_mut())
+    {
+        h.insert(
+            "title".to_string(),
+            serde_json::json!({ "tag": "plain_text", "content": title }),
+        );
+        h.insert("template".to_string(), serde_json::json!(template));
+    }
+    card
 }
 
 /// Settle the callback ack for a click (ADR-0038, rule 3): a card-handle edit
