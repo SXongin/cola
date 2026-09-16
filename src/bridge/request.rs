@@ -74,9 +74,17 @@ pub trait RequestKind: Send + Sync {
         dir: &str,
     ) -> bool;
 
-    /// Push the request onto a host streaming card's inline section. Returns
-    /// true when it was pushed (dedup already applied by the caller).
-    fn push_inline(&self, acc: &mut StreamAccumulator, req: &PendingRequest, dir: &str) -> bool;
+    /// Build the interaction block this flow renders for `req`. Permissions
+    /// rebuild deterministically from the request; questions restore their
+    /// remembered partial state (已选 / finalized slots), so a block that moves
+    /// onto a new turn's card keeps what the Host already answered (ADR-0038,
+    /// rule 1). `None` when the request does not belong to this kind.
+    async fn interaction_block(
+        &self,
+        flow: &RequestFlow,
+        req: &PendingRequest,
+        dir: &str,
+    ) -> Option<InteractionBlock>;
 
     /// Build the standalone interactive card (used when no streaming card hosts
     /// the request inline).
@@ -198,16 +206,19 @@ impl RequestKind for PermissionKind {
         true
     }
 
-    fn push_inline(&self, acc: &mut StreamAccumulator, req: &PendingRequest, dir: &str) -> bool {
+    async fn interaction_block(
+        &self,
+        _flow: &RequestFlow,
+        req: &PendingRequest,
+        dir: &str,
+    ) -> Option<InteractionBlock> {
         let PendingRequest::Permission(p) = req else {
-            return false;
+            return None;
         };
-        let body = describe_permission(p);
-        let sid = p.session_id.clone().unwrap_or_default();
-        acc.add_interaction(InteractionBlock::Permission(PendingPermission {
-            session_id: sid,
+        Some(InteractionBlock::Permission(PendingPermission {
+            session_id: p.session_id.clone().unwrap_or_default(),
             request_id: p.request_id.clone(),
-            body,
+            body: describe_permission(p),
             target: permission_target(p),
             directory: dir.to_string(),
         }))
@@ -604,17 +615,31 @@ impl RequestKind for QuestionKind {
         false
     }
 
-    fn push_inline(&self, acc: &mut StreamAccumulator, req: &PendingRequest, dir: &str) -> bool {
+    async fn interaction_block(
+        &self,
+        flow: &RequestFlow,
+        req: &PendingRequest,
+        dir: &str,
+    ) -> Option<InteractionBlock> {
         let PendingRequest::Question(q) = req else {
-            return false;
+            return None;
         };
-        acc.add_interaction(InteractionBlock::Question(PendingQuestion {
+        // Restore what the Host already answered: a re-hosted question keeps
+        // its 已选 markers and finalized slots (ADR-0038, rule 1).
+        let (answers, done) = match flow.question_state.lock().await.get(&q.id) {
+            Some(state) => {
+                let (_, display, done) = state.merge();
+                (display, done)
+            }
+            None => (vec![None; q.questions.len()], vec![false; q.questions.len()]),
+        };
+        Some(InteractionBlock::Question(PendingQuestion {
             request_id: q.id.clone(),
             session_id: q.session_id.clone(),
             questions: q.questions.clone(),
             directory: dir.to_string(),
-            answers: vec![None; q.questions.len()],
-            done: vec![false; q.questions.len()],
+            answers,
+            done,
         }))
     }
 
@@ -1339,6 +1364,11 @@ impl RequestFlow {
                             continue;
                         }
                         if seen.contains(req.id()) {
+                            // Already surfaced: if it outlived the turn that
+                            // hosted it, re-host it onto the session's current
+                            // card so the live controls follow the newest card
+                            // (ADR-0038, rule 1).
+                            self.rehost_block(core, req, dir).await;
                             continue;
                         }
                         seen.insert(req.id().to_string());
@@ -1361,17 +1391,23 @@ impl RequestFlow {
                         // there is no active card (e.g. external turns or
                         // restarts).
                         if let Some(host) = inline_host_session(core, req.session_id(), Some(dir)).await {
-                            let mut cards = core.cards.lock().await;
-                            if let Some(acc) = cards.get_mut(&host).map(|c| &mut c.acc)
-                                && self.kind.push_inline(acc, req, dir)
-                            {
+                            let Some(block) = self.kind.interaction_block(self, req, dir).await else {
+                                continue;
+                            };
+                            let pushed = {
+                                let mut cards = core.cards.lock().await;
+                                cards
+                                    .get_mut(&host)
+                                    .map(|c| c.acc.add_interaction(block))
+                                    .unwrap_or(false)
+                            };
+                            if pushed {
                                 tracing::info!(
                                     "{} {} inlined on session {} card",
                                     self.kind.label(),
                                     req.id(),
                                     host
                                 );
-                                drop(cards);
                                 // Flush so the inline section appears NOW — the
                                 // render loop only flushes on new parts, and a
                                 // blocked prompt produces none.
@@ -1527,6 +1563,67 @@ impl RequestFlow {
             .lock()
             .await
             .retain(|id, state| pending.contains(id) || failed_dirs.contains(state.dir()));
+    }
+
+    /// Re-host a still-pending inline block onto the session's current card
+    /// (ADR-0038, rule 1): a request that outlived the turn which surfaced it
+    /// follows the newest card, and the card that used to show it is repainted
+    /// without the controls — so a live block lives on exactly one card. Called
+    /// from the sweep for requests already in `seen` (the poller would
+    /// otherwise never touch them again).
+    async fn rehost_block(&self, core: &Arc<SharedCore>, req: &PendingRequest, dir: &str) {
+        let id = req.id();
+        // Only a block the flush recorded (an inline card) follows the card:
+        // a standalone card and a snapshot claim keep their lifecycles
+        // (ADR-0038, rule 6).
+        let Some(old_message) = core.card_handles.lock().await.message_of(id).map(str::to_string) else {
+            return;
+        };
+        let Some(host) = inline_host_session(core, req.session_id(), Some(dir)).await else {
+            return;
+        };
+        {
+            let cards = core.cards.lock().await;
+            let Some(card) = cards.get(&host) else { return };
+            // The accumulator still carries the block (its own flush owns the
+            // current card), or the handle already names that card: nothing to
+            // move.
+            if card.acc.interaction(id).is_some()
+                || card.card_message_id.as_deref() == Some(old_message.as_str())
+            {
+                return;
+            }
+        }
+        let Some(block) = self.kind.interaction_block(self, req, dir).await else {
+            return;
+        };
+        let pushed = {
+            let mut cards = core.cards.lock().await;
+            cards
+                .get_mut(&host)
+                .map(|c| c.acc.add_interaction(block))
+                .unwrap_or(false)
+        };
+        if !pushed {
+            return;
+        }
+        // Flush first: the current card renders the block and the handle moves
+        // with it.
+        crate::bridge::render::flush_card(core, &host).await;
+        tracing::info!(
+            "{} {} re-hosted on session {} card (old {})",
+            self.kind.label(),
+            id,
+            host,
+            old_message
+        );
+        // Then strip the old card's copy through its handle. The block moved,
+        // not resolved: no receipt — the controls simply leave that card.
+        if let Some(card) = core.card_handles.lock().await.remove_on(&old_message, id)
+            && let Err(e) = core.feishu.update_message(&old_message, &card).await
+        {
+            tracing::warn!("re-host old-card repaint failed on {}: {}", old_message, e);
+        }
     }
 
     /// Handle a card action on this kind's card: answer / submit / reject. The
