@@ -1936,7 +1936,14 @@ pub(crate) async fn resolve_blocks(
     ids: &[String],
     residue: Residue<'_>,
 ) -> Option<serde_json::Value> {
-    {
+    // A click settles the standalone surface too, so its `sent_cards` entry
+    // goes. A COMMAND does not: an id with no inline block and no card handle
+    // is a standalone card, and clearing its entry here would strand its live
+    // buttons — `mark_stale_cards` repaints standalone cards and owns that
+    // lifecycle (ADR-0038, rule 6). Mixed surfaces (standalone copy + inline
+    // block) keep their entry; the sweep marks the standalone copy while this
+    // seam settles the inline one.
+    if matches!(origin, Origin::Click { .. }) {
         let mut sent = flow.sent_cards.lock().await;
         for id in ids {
             sent.remove(id);
@@ -2027,16 +2034,25 @@ pub(crate) async fn resolve_blocks(
                 Origin::Click { clicked: None } => {}
                 // No callback (a command resolved the block): every card that
                 // still renders it is patched — the registered one and any
-                // older copy a re-host left behind.
+                // older copy a re-host left behind. Only the registered card
+                // (the accumulator's current card) gets the header restamp:
+                // an older copy may belong to a previous turn, and wearing
+                // another turn's live header would be a lie.
                 Origin::Command => {
                     for card_id in handles.cards_rendering(id) {
+                        let registered = handles.message_of(id) == Some(card_id.as_str());
+                        let header = if registered {
+                            post_resolution_header.as_ref()
+                        } else {
+                            None
+                        };
                         repaint_card(
                             &mut handles,
                             &card_id,
                             id,
                             &residue,
                             &mut stamped_cards,
-                            post_resolution_header.as_ref(),
+                            header,
                             &mut patches,
                         );
                     }
