@@ -561,22 +561,24 @@ async fn autoaccept_toggle_on_permission_card_flips_flag_and_approves() {
         .expect("inline toggle must carry the updated card in the ack")
         .to_string();
     assert_eq!(result.toast.as_deref(), Some("已开启自动授权"));
-    // EVERY block the toggle resolved left its receipt, in the same ack, and
-    // each names its own target.
+    // ONE receipt for the whole mode change, in the same ack — not one per
+    // approved request: naming a command made the line read as "only this
+    // command is now auto-approved".
     assert_eq!(
         ack.matches("🔄 已开启自动授权").count(),
-        2,
-        "one receipt per resolved block: {}",
+        1,
+        "one receipt for the toggle, not one per block: {}",
         ack
     );
     assert!(
-        ack.contains("🔄 已开启自动授权：⚡ 执行 Shell 命令 `ls -la`"),
-        "the toggled permission names its target: {}",
+        ack.contains("🔄 已开启自动授权：后续权限请求将自动批准"),
+        "the receipt explains the MODE change: {}",
         ack
     );
     assert!(
-        ack.contains("🔄 已开启自动授权：✏️ 编辑文件 `src/main.rs`"),
-        "the other approved permission names its own target: {}",
+        !ack.contains("🔄 已开启自动授权：⚡ 执行 Shell 命令 `ls -la`")
+            && !ack.contains("🔄 已开启自动授权：✏️ 编辑文件 `src/main.rs`"),
+        "the receipt must not name the requests it approved: {}",
         ack
     );
     assert!(
