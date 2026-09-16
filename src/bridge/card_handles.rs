@@ -120,6 +120,17 @@ impl CardHandles {
         self.blocks.get(request_id).map(|h| h.target.as_str())
     }
 
+    /// Every cached card that still renders `request_id`'s block: the
+    /// registered one, plus any older copy the registry no longer points at
+    /// (a re-host leaves one behind until its own edit).
+    pub fn cards_rendering(&self, request_id: &str) -> Vec<String> {
+        self.cards
+            .iter()
+            .filter(|(_, card)| card.spans.iter().any(|s| s.request_id == request_id))
+            .map(|(message_id, _)| message_id.clone())
+            .collect()
+    }
+
     /// Drop a block's registry entry: it resolved, so nothing renders its
     /// controls anymore. Idempotent; the cached card stays until its last live
     /// block leaves (through `record` or an edit).

@@ -626,6 +626,136 @@ async fn autoaccept_toggle_on_permission_card_flips_flag_and_approves() {
     );
 }
 
+/// `/autoaccept on` (the command, not the card button) leaves the SAME mode
+/// receipt on the live card. Without it the sweep resolves the blocks cola
+/// itself just approved as `⏱ 已由其他客户端处理` — a lie (#193 follow-up).
+#[tokio::test]
+async fn autoaccept_command_leaves_the_mode_receipt_on_the_card() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.permissions = vec![perm_request("per_1", "ses_1", "ls -la")];
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_1", "/work").await;
+    seed_inline_permission_card(&app, "ses_1", "per_1").await;
+    // Render once so the block is on the card AND its handle is registered.
+    crate::bridge::render::flush_card(&app.core, "ses_1").await;
+    let card_id = app
+        .card_handles
+        .lock()
+        .await
+        .message_of("per_1")
+        .expect("the flush registers the card that renders the block")
+        .to_string();
+    // An older copy of the same block (a re-host leaves one behind): the
+    // command path must repaint it too — nothing else would.
+    {
+        let stale_card = serde_json::json!({
+            "schema": "2.0",
+            "body": { "elements": [ { "tag": "markdown", "content": "旧卡片" } ] },
+        });
+        let mut handles = app.card_handles.lock().await;
+        handles.record(
+            "msg_stale",
+            &stale_card,
+            vec![crate::bridge::card_handles::RenderedBlock {
+                request_id: "per_1".into(),
+                start: 0,
+                end: 1,
+                kind: crate::bridge::snapshot_claims::ClaimKind::Permission,
+                session_id: "ses_1".into(),
+                directory: "/work".into(),
+                target: "⚡ 执行 Shell 命令 `ls -la`".into(),
+            }],
+        );
+    }
+
+    crate::bridge::command::handle_command(
+        &app.core,
+        Command::AutoAccept(crate::bridge::command::AutoAcceptAction::Set(true)),
+        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+        "msg_cmd",
+        crate::config::ConversationKind::P2p,
+    )
+    .await
+    .unwrap();
+
+    let patches: Vec<String> = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::UpdateMessage { message_id, card } if message_id == &card_id => {
+                Some(card.to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    let repaint = patches.last().expect("the command must patch the card");
+    assert_eq!(
+        repaint.matches("🔄 已开启自动授权").count(),
+        1,
+        "one mode receipt: {repaint}"
+    );
+    assert!(
+        repaint.contains("后续权限请求将自动批准"),
+        "the receipt explains the MODE change: {repaint}"
+    );
+    assert!(
+        !repaint.contains("⏱ 已由其他客户端处理"),
+        "cola approved it itself — never 'handled elsewhere': {repaint}"
+    );
+    assert!(
+        !repaint.contains("🔐 **权限请求**"),
+        "the approved block must be gone: {repaint}"
+    );
+    assert!(
+        app.cards
+            .lock()
+            .await
+            .get("ses_1")
+            .unwrap()
+            .acc
+            .live_permissions()
+            .is_empty(),
+        "the accumulator must not keep the block live"
+    );
+    // An older copy of the same block (a re-host leaves one behind) must be
+    // repainted too — nothing else would.
+    let stale = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .rev()
+        .find_map(|c| match c {
+            PlatformCall::UpdateMessage { message_id, card } if message_id == "msg_stale" => {
+                Some(card.to_string())
+            }
+            _ => None,
+        })
+        .expect("the stale copy of the block must be repainted too");
+    assert!(
+        stale.contains("后续权限请求将自动批准") && !stale.contains("🔐 **权限请求**"),
+        "the stale copy gets the mode receipt, not the live block: {stale}"
+    );
+
+    // The sweep after the command finds nothing left to resolve: no second
+    // receipt may appear on the card.
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.core, &mut seen).await;
+    let after = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter(|c| matches!(c, PlatformCall::UpdateMessage { message_id, .. } if message_id == &card_id))
+        .count();
+    assert_eq!(after, patches.len(), "the sweep must not repaint again");
+}
+
 #[tokio::test]
 async fn auto_accept_session_answers_permission_without_card() {
     let _wd = test_work_dir();
