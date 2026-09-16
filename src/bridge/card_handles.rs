@@ -138,22 +138,7 @@ impl CardHandles {
         request_id: &str,
         line: &str,
     ) -> Option<serde_json::Value> {
-        let mut card = self.cards.remove(message_id)?;
-        let Some(idx) = card.spans.iter().position(|s| s.request_id == request_id) else {
-            self.cards.insert(message_id.to_string(), card);
-            return None;
-        };
-        let span = card.spans.remove(idx);
-        // A failed edit means the cached JSON is not the shape the renderer
-        // wrote: drop the unusable handle (the caller falls back).
-        if !replace_elements(&mut card, &span, vec![receipt_element(line)]) {
-            return None;
-        }
-        let edited = card.card.clone();
-        if !card.spans.is_empty() {
-            self.cards.insert(message_id.to_string(), card);
-        }
-        Some(edited)
+        self.edit_on(message_id, request_id, vec![receipt_element(line)], false)
     }
 
     /// Replace a live block's elements on the cached card `message_id` with
@@ -165,6 +150,31 @@ impl CardHandles {
         request_id: &str,
         elements: Vec<serde_json::Value>,
     ) -> Option<serde_json::Value> {
+        self.edit_on(message_id, request_id, elements, true)
+    }
+
+    /// Remove a live block's elements from the cached card `message_id` — the
+    /// cross-turn re-host (ADR-0038, rule 1): the block moved to a newer card,
+    /// so the old card is repainted without it and no receipt is left behind.
+    /// Does NOT touch the registry (the flush that re-hosted owns the entry
+    /// now). `None` when that card does not render the block.
+    pub fn remove_on(&mut self, message_id: &str, request_id: &str) -> Option<serde_json::Value> {
+        self.edit_on(message_id, request_id, Vec::new(), false)
+    }
+
+    /// Apply `elements` in place of `request_id`'s span on the cached card. A
+    /// failed edit means the cached JSON is not the shape the renderer wrote:
+    /// drop the unusable handle (the caller falls back). `keep_span` re-anchors
+    /// the same block over the replacement (a state refresh); otherwise the
+    /// block leaves the card, releasing the cache once it held the last live
+    /// block.
+    fn edit_on(
+        &mut self,
+        message_id: &str,
+        request_id: &str,
+        elements: Vec<serde_json::Value>,
+        keep_span: bool,
+    ) -> Option<serde_json::Value> {
         let mut card = self.cards.remove(message_id)?;
         let Some(idx) = card.spans.iter().position(|s| s.request_id == request_id) else {
             self.cards.insert(message_id.to_string(), card);
@@ -175,13 +185,17 @@ impl CardHandles {
         if !replace_elements(&mut card, &span, elements) {
             return None;
         }
-        card.spans.push(BlockSpan {
-            request_id: request_id.to_string(),
-            start: span.start,
-            end: new_end,
-        });
+        if keep_span {
+            card.spans.push(BlockSpan {
+                request_id: request_id.to_string(),
+                start: span.start,
+                end: new_end,
+            });
+        }
         let edited = card.card.clone();
-        self.cards.insert(message_id.to_string(), card);
+        if !card.spans.is_empty() {
+            self.cards.insert(message_id.to_string(), card);
+        }
         Some(edited)
     }
 

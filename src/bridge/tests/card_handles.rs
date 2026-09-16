@@ -63,8 +63,10 @@ fn question_request(request_id: &str, session_id: &str) -> crate::opencode::type
 /// Seed the old turn's card and let one sweep inline `per_old` onto it — the
 /// poller path, so the card handle records the block. Then replace the
 /// accumulator, as a new turn does: the block survives only on the OLD card
-/// and in its handle.
-async fn seed_old_turn_card_with_permission(app: &Arc<App>) {
+/// and in its handle. Returns the `seen` set that sweep used, so a caller can
+/// run the NEXT sweep with the poll loop's memory intact (a fresh set would
+/// surface the request as new instead of re-hosting it).
+async fn seed_old_turn_card_with_permission(app: &Arc<App>) -> std::collections::HashSet<String> {
     let mut old = StreamAccumulator::new("旧回合");
     old.card_state = CardState::Done;
     old.push_text("旧回合的推理。");
@@ -81,6 +83,7 @@ async fn seed_old_turn_card_with_permission(app: &Arc<App>) {
         "ses_old".into(),
         CardSession::new(StreamAccumulator::new("新回合"), Some("om_new".into())),
     );
+    seen
 }
 
 /// How many times the platform patched `message_id` in place.
@@ -92,6 +95,24 @@ async fn patches_of(platform: &RecordingPlatform, message_id: &str) -> usize {
         .iter()
         .filter(|c| matches!(c, PlatformCall::UpdateMessage { message_id: mid, .. } if mid == message_id))
         .count()
+}
+
+/// The latest card the platform sent to `message_id`, as a string.
+async fn last_card_of(platform: &RecordingPlatform, message_id: &str) -> String {
+    platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .rev()
+        .find_map(|c| match c {
+            PlatformCall::UpdateMessage {
+                message_id: mid,
+                card,
+            } if mid == message_id => Some(card.to_string()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no update for {message_id}"))
 }
 
 /// The click's ack card as a string.
@@ -468,6 +489,190 @@ async fn partial_question_answer_refreshes_the_clicked_card() {
     assert!(
         !ack2.contains("无法回答") && !ack2.contains("已选："),
         "the resolved block (and its controls) must be gone: {ack2}"
+    );
+    let handles = app.card_handles.lock().await;
+    assert_eq!(handles.live_count(), 0, "no orphaned live block after a resolve");
+    assert_eq!(handles.cached_count(), 0);
+    assert_eq!(backend.reply_question_calls.lock().await.len(), 1);
+}
+
+/// #177 (ADR-0038, rule 1): a still-pending request that outlived its turn
+/// re-hosts onto the session's current card on the next sweep — the new card
+/// carries its controls, the old card is repainted without them, and the block
+/// stays answerable on the new card. No duplicate: the controls render on
+/// exactly one card.
+#[tokio::test]
+async fn sweep_rehosts_a_pending_block_onto_the_new_turn_card() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.permissions = vec![perm_request("per_old", "ses_old", "ls -la")];
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_old", "/work").await;
+
+    // The old turn's card carries the block; a new turn then replaced the
+    // accumulator. The poll loop has already seen the request.
+    let mut seen = seed_old_turn_card_with_permission(&app).await;
+    assert_eq!(
+        app.card_handles.lock().await.message_of("per_old"),
+        Some("om_old"),
+        "precondition: the old card carries the block before the re-host"
+    );
+
+    app.permission.sweep(&app.core, &mut seen).await;
+
+    assert_eq!(
+        app.card_handles.lock().await.message_of("per_old"),
+        Some("om_new"),
+        "the handle follows the new turn's card"
+    );
+    let new_card = last_card_of(&platform, "om_new").await;
+    assert!(
+        new_card.contains("🔐 **权限请求**") && new_card.contains("允许一次"),
+        "the new card carries the controls: {new_card}"
+    );
+    assert!(
+        new_card.contains("新回合"),
+        "it is the new turn's card: {new_card}"
+    );
+    let old_card = last_card_of(&platform, "om_old").await;
+    assert!(
+        !old_card.contains("🔐 **权限请求**"),
+        "the old card lost the controls: {old_card}"
+    );
+    assert!(
+        old_card.contains("旧回合的推理。"),
+        "the old card keeps its streamed content: {old_card}"
+    );
+    assert!(
+        !old_card.contains("已允许") && !old_card.contains("已由其他客户端处理"),
+        "a moved block leaves no receipt: {old_card}"
+    );
+
+    // Answerable on the new card: the click replies and settles the handles.
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "perm",
+            "reply": "once",
+            "session_id": "ses_old",
+            "directory": "/work",
+            "request_id": "per_old",
+            "open_message_id": "om_new",
+            "perm_label": "✅ 已允许一次",
+            "perm_color": "green",
+            "perm_body": "bash",
+        }))
+        .await
+        .expect("a card-action result");
+    assert!(
+        ack_text(&result).contains("✅ 已允许一次"),
+        "the re-hosted block resolves from the new card"
+    );
+    let handles = app.card_handles.lock().await;
+    assert_eq!(handles.live_count(), 0, "no orphaned live block after a resolve");
+    assert_eq!(handles.cached_count(), 0);
+    assert_eq!(backend.reply_permission_calls.lock().await.len(), 1);
+}
+
+/// #177: re-hosting preserves a question's partial answers — the new turn's
+/// card shows the same 已选 markers, the old card loses the controls, and the
+/// remaining question stays answerable on the new card.
+#[tokio::test]
+async fn rehost_preserves_a_questions_partial_answers() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    let request = question_request("que_old", "ses_q");
+    backend.questions = vec![request.clone()];
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_q", "/work").await;
+
+    // The old turn's card carries the question block; the Host answers 目录
+    // only (the block stays live with its 已选 marker), then a new turn
+    // replaces the accumulator.
+    let mut old = StreamAccumulator::new("旧问题回合");
+    old.card_state = CardState::Done;
+    old.push_text("旧问题回合的内容。");
+    old.reply_to_message_id = Some("msg_1".into());
+    old.add_interaction(question_block("que_old", "ses_q", "/work"));
+    app.cards
+        .lock()
+        .await
+        .insert("ses_q".into(), CardSession::new(old, Some("om_q".into())));
+    crate::bridge::render::flush_card(&app.core, "ses_q").await;
+    app.question.remember_question(&request, "/work").await;
+    let r1 = app
+        .host_action(serde_json::json!({
+            "action": "question",
+            "reply": "answer",
+            "request_id": "que_old",
+            "session_id": "ses_q",
+            "directory": "/work",
+            "question_index": 0,
+            "answer": "/a",
+            "open_message_id": "om_q",
+        }))
+        .await
+        .expect("a card-action result");
+    assert!(ack_text(&r1).contains("已选：/a"), "partial answer recorded");
+    app.cards.lock().await.insert(
+        "ses_q".into(),
+        CardSession::new(StreamAccumulator::new("新回合"), Some("om_new".into())),
+    );
+
+    // The poll loop has seen the request: the sweep re-hosts instead of
+    // surfacing it anew.
+    let mut seen: std::collections::HashSet<String> = ["que_old".to_string()].into_iter().collect();
+    app.question.sweep(&app.core, &mut seen).await;
+
+    assert_eq!(
+        app.card_handles.lock().await.message_of("que_old"),
+        Some("om_new"),
+        "the handle follows the new turn's card"
+    );
+    let new_card = last_card_of(&platform, "om_new").await;
+    assert!(
+        new_card.contains("已选：/a"),
+        "the partial answer survives the move: {new_card}"
+    );
+    assert!(
+        new_card.contains("选分支"),
+        "the still-open question moved too: {new_card}"
+    );
+    let old_card = last_card_of(&platform, "om_q").await;
+    assert!(
+        !old_card.contains("已选：/a") && !old_card.contains("选目录"),
+        "the old card lost the controls: {old_card}"
+    );
+    assert!(
+        old_card.contains("旧问题回合的内容。"),
+        "the old card keeps its streamed content: {old_card}"
+    );
+
+    // The remaining question stays answerable on the new card.
+    let r2 = app
+        .host_action(serde_json::json!({
+            "action": "question",
+            "reply": "answer",
+            "request_id": "que_old",
+            "session_id": "ses_q",
+            "directory": "/work",
+            "question_index": 1,
+            "answer": "main",
+            "open_message_id": "om_new",
+        }))
+        .await
+        .expect("a card-action result");
+    assert!(
+        ack_text(&r2).contains("✅ 已回答：目录 /a、分支 main"),
+        "the receipt names both answers: {}",
+        ack_text(&r2)
     );
     let handles = app.card_handles.lock().await;
     assert_eq!(handles.live_count(), 0, "no orphaned live block after a resolve");

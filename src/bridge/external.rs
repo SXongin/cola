@@ -420,9 +420,9 @@ impl ExternalFlow {
         }
         acc.push_text_at(epoch_ms - 1, &static_text);
         // The adopt-time pending blocks ride as inline sections: the poll's
-        // inline dedupe (push_inline sees them already present) prevents a
-        // duplicate, and clicking one takes the normal inline path — resolved
-        // sections are stripped and the run resumes into the same card.
+        // inline dedupe (the block is already present on the accumulator)
+        // prevents a duplicate, and clicking one takes the normal inline path —
+        // resolved sections are stripped and the run resumes into the same card.
         for req in &data.pending {
             match req {
                 crate::bridge::request::PendingRequest::Permission(p) => {
