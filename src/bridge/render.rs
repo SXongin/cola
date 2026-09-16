@@ -186,11 +186,12 @@ fn edit_tool_output(part: &serde_json::Value, status: &str) -> Option<String> {
 
 /// Render canonical message parts (from `POST /session/{id}/message` response)
 /// into the accumulator so the card shows the assistant's final result.
-/// The server-side start time (epoch ms) of the part — its timeline key.
-/// Text/reasoning carry it at `/time/start`; a tool's state carries it at
-/// `/state/time/start`. Step/patch parts have none (they render nothing), and
-/// older payloads / test fixtures may omit it: the caller then falls back to a
-/// monotonic key, preserving call order.
+/// The server-side start time (epoch ms) of the part — its timeline key, and
+/// the only clock the card may show. Text/reasoning carry it at
+/// `/time/start`; a tool's state carries it at `/state/time/start`.
+/// Step/patch parts have none (they render nothing), and older payloads / test
+/// fixtures may omit it: the part is then keyed by a monotonic fallback
+/// (call order) and shows no clock.
 fn part_time(part: &serde_json::Value) -> Option<i64> {
     part.pointer("/time/start")
         .or_else(|| part.pointer("/state/time/start"))
@@ -198,19 +199,19 @@ fn part_time(part: &serde_json::Value) -> Option<i64> {
 }
 
 fn render_part(acc: &mut StreamAccumulator, part: &serde_json::Value) {
-    // The part's position key: its server-side start time, or a monotonic
-    // fallback that preserves call order (test fixtures, older payloads).
-    let key = part_time(part).unwrap_or_else(|| acc.next_order());
+    // The part's server start time, if the payload carries one: it both places
+    // the item on the timeline and stamps a panel header.
+    let at = part_time(part);
     match part.get("type").and_then(|t| t.as_str()) {
         Some("text") => {
             if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                acc.push_text_at(key, t);
+                acc.push_text_at(at, t);
             }
             acc.card_state = crate::feishu::card::CardState::Streaming;
         }
         Some("reasoning") => {
             if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                acc.push_reasoning_at(key, t);
+                acc.push_reasoning_at(at, t);
             }
             acc.card_state = crate::feishu::card::CardState::Reasoning;
         }
@@ -244,7 +245,7 @@ fn render_part(acc: &mut StreamAccumulator, part: &serde_json::Value) {
                 input,
                 output,
             };
-            acc.push_tool_at(key, &call_id, panel);
+            acc.push_tool_at(at, &call_id, panel);
             if status == "running" {
                 acc.card_state = crate::feishu::card::CardState::Streaming;
             }
@@ -352,6 +353,17 @@ pub(crate) fn render_new_turn_parts(
 ) -> bool {
     let mut rendered_any = false;
     for m in msgs {
+        // The header date's anchor (#183 follow-up): the SERVER's own time for
+        // the user message cola sent this turn. Captured on the first poll that
+        // sees it, so the card's date never reads cola's clock. External
+        // renderers arm with the server time directly instead.
+        if acc.turn_started_ms.is_none()
+            && m.info.role.as_deref() == Some("user")
+            && acc.cola_message_id.as_deref() == Some(m.info.id.as_str())
+            && let Some(t) = m.info.time.as_ref()
+        {
+            acc.turn_started_ms = Some(t.created);
+        }
         let is_assistant = m.info.role.as_deref() == Some("assistant");
         let in_turn = m
             .info
@@ -716,6 +728,71 @@ mod tests {
         assert!(!acc.reasoning.contains("old reasoning"));
 
         assert!(!render_new_turn_parts(&mut acc, &msgs, epoch));
+    }
+
+    /// The header date reads the SERVER's time for the turn's user message
+    /// (#183 follow-up): captured on the first poll that sees it, so cola's
+    /// own clock never reaches the card.
+    #[test]
+    fn turn_started_ms_captures_the_user_message_server_time() {
+        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.submit_epoch_ms = Some(9999);
+        acc.cola_message_id = Some("msg_cola_1".into());
+        let msgs = vec![SessionMessage {
+            info: MessageInfo {
+                id: "msg_cola_1".into(),
+                role: Some("user".into()),
+                parent_id: None,
+                time: Some(MessageTime { created: 1234 }),
+                model_id: None,
+                provider_id: None,
+                tokens: None,
+            },
+            parts: serde_json::json!([{ "type": "text", "text": "你好" }]),
+        }];
+
+        assert!(!render_new_turn_parts(&mut acc, &msgs, 9999));
+        assert_eq!(acc.turn_started_ms, Some(1234));
+    }
+
+    /// #183 follow-up: only parts with a server time show one. A part whose
+    /// payload carries no `time` (a pending tool) is placed by a fallback key
+    /// and shows no clock — rendering cola's moment there would put cola's
+    /// clock in the same costume as the server's. When the running state later
+    /// arrives with the server's start time, the panel gains it without moving.
+    #[test]
+    fn part_without_server_time_shows_no_clock_until_the_server_stamps_it() {
+        let at = crate::feishu::card::test_local_ms(2026, 9, 17, 0, 5);
+        let mut acc = StreamAccumulator::new("proj");
+        render_parts(
+            &mut acc,
+            &serde_json::json!([
+                { "type": "reasoning", "text": "thinking", "time": { "start": at } },
+                { "type": "tool", "tool": "bash", "callID": "call_1",
+                  "state": { "status": "pending" } },
+            ]),
+        );
+        let card = acc.build_card().to_string();
+        assert!(card.contains("💭 推理过程 · 00:05"), "{card}");
+        assert!(
+            card.contains("⏳ bash") && !card.contains("⏳ bash ·"),
+            "a pending tool must show no clock: {card}"
+        );
+
+        // The server stamps the call as it starts running: the same panel
+        // shows the start time from now on.
+        render_parts(
+            &mut acc,
+            &serde_json::json!([
+                { "type": "tool", "tool": "bash", "callID": "call_1",
+                  "state": { "status": "running", "input": { "command": "sleep 2" },
+                             "time": { "start": at } } },
+            ]),
+        );
+        let card = acc.build_card().to_string();
+        assert!(card.contains("⏳ bash · 00:05"), "{card}");
     }
 
     #[test]

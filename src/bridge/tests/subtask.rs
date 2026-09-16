@@ -104,7 +104,7 @@ async fn subtask_permission_routes_to_mapped_parent_and_reply_carries_directory(
         .expect("inline click must carry the parent card in the ack")
         .to_string();
     assert!(
-        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `git status` · "),
+        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `git status`"),
         "receipt missing: {}",
         ack
     );

@@ -92,7 +92,7 @@ async fn permission_poller_sends_card_and_card_action_replies() {
         .expect("inline click must carry the updated card in the ack")
         .to_string();
     assert!(
-        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la` · "),
+        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la`"),
         "receipt missing: {}",
         ack
     );
@@ -194,7 +194,7 @@ async fn inline_permission_click_carries_the_receipt_in_the_ack() {
         .expect("the ack must carry the clicked card")
         .to_string();
     assert!(
-        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la` · "),
+        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la`"),
         "receipt missing: {}",
         ack
     );
@@ -1057,7 +1057,7 @@ async fn permission_click_variants_leave_their_receipts() {
 
     let ack = click_perm(&app, "once", "per_once", "✅ 已允许一次").await;
     assert!(
-        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la` · "),
+        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la`"),
         "once receipt: {}",
         ack
     );
@@ -1066,7 +1066,7 @@ async fn permission_click_variants_leave_their_receipts() {
 
     let ack = click_perm(&app, "always", "per_always", "✅ 已始终允许").await;
     assert!(
-        ack.contains("✅ 已始终允许：⚡ 执行 Shell 命令 `cargo build` · "),
+        ack.contains("✅ 已始终允许：⚡ 执行 Shell 命令 `cargo build`"),
         "always receipt: {}",
         ack
     );
@@ -1090,7 +1090,7 @@ async fn permission_click_variants_leave_their_receipts() {
     let rendered = acc.build_card().to_string();
     assert_eq!(rendered.matches("已允许一次：").count(), 1, "{}", rendered);
     assert!(
-        rendered.contains("✅ 已始终允许：⚡ 执行 Shell 命令 `cargo build` · "),
+        rendered.contains("✅ 已始终允许：⚡ 执行 Shell 命令 `cargo build`"),
         "{}",
         rendered
     );
@@ -1140,7 +1140,7 @@ async fn interaction_receipt_survives_later_flushes() {
 
     let ack = click_perm(&app, "once", "per_1", "✅ 已允许一次").await;
     assert!(
-        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la` · "),
+        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la`"),
         "receipt missing: {}",
         ack
     );
@@ -1157,7 +1157,7 @@ async fn interaction_receipt_survives_later_flushes() {
     crate::bridge::render::flush_card(&app.core, "ses_test").await;
     let flushed = latest_card(&platform).await.to_string();
     assert!(
-        flushed.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la` · "),
+        flushed.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la`"),
         "receipt dropped by a later flush: {}",
         flushed
     );
@@ -1433,7 +1433,7 @@ async fn permission_click_at_the_split_limit_falls_back_to_the_flushed_receipt()
     // and the resolved block does not come back.
     let continuation = latest_card(&platform).await.to_string();
     assert!(
-        continuation.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la` · "),
+        continuation.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la`"),
         "the receipt must survive the split: {}",
         continuation
     );
@@ -1515,7 +1515,7 @@ async fn interaction_receipt_renders_at_the_interaction_position() {
 
     let ack = click_perm(&app, "once", "per_1", "✅ 已允许一次").await;
     assert!(
-        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la` · "),
+        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la`"),
         "receipt missing: {}",
         ack
     );
@@ -1596,7 +1596,7 @@ async fn late_rendered_command_lands_above_the_receipt() {
     let clicked_at = chrono::Utc::now().timestamp_millis();
     let ack = click_perm(&app, "once", "per_1", "✅ 已允许一次").await;
     assert!(
-        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la` · "),
+        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la`"),
         "receipt missing: {}",
         ack
     );
@@ -1610,7 +1610,7 @@ async fn late_rendered_command_lands_above_the_receipt() {
         .get_mut("ses_test")
         .unwrap()
         .acc
-        .push_reasoning_at(clicked_at - 300, "先看一下目录里有什么。");
+        .push_reasoning_at(Some(clicked_at - 300), "先看一下目录里有什么。");
     app.cards
         .lock()
         .await
@@ -1618,7 +1618,7 @@ async fn late_rendered_command_lands_above_the_receipt() {
         .unwrap()
         .acc
         .push_tool_at(
-            clicked_at - 200,
+            Some(clicked_at - 200),
             "call_1",
             crate::feishu::card::tool_render::ToolPanel {
                 name: "bash".into(),

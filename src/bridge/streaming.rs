@@ -8,10 +8,13 @@ use std::sync::Arc;
 /// One entry on a turn's chronological timeline: a rendered item plus the
 /// server-side start time (epoch ms) of the part it came from — its **key**.
 /// The card renders the timeline in key order, matching how OpenChamber shows
-/// the parts interleaved.
+/// the parts interleaved. `shown_at` is the same server time when the part
+/// truly has one, or `None` when the key is a synthetic ordering device — the
+/// card only ever shows server clocks (#183 follow-up).
 #[derive(Debug, Clone)]
 pub struct TimelineItem {
     pub key: i64,
+    pub shown_at: Option<i64>,
     pub kind: TimelineKind,
 }
 
@@ -295,9 +298,14 @@ pub struct StreamAccumulator {
     /// callID → state signature for tool panels (status + output length); a tool
     /// is re-rendered when its signature changes.
     pub rendered_tool_states: std::collections::HashMap<String, String>,
-    /// Epoch (ms) when this turn's prompt was submitted. Parts written at or
-    /// after this time belong to this turn.
+    /// Epoch (ms) when this turn's prompt was submitted, on COLA's clock —
+    /// the conservative filter for "parts written at or after this time".
     pub submit_epoch_ms: Option<i64>,
+    /// The turn's start on the SERVER's clock, captured from the user message
+    /// the server stored (external renders arm with it directly). The card
+    /// header's date anchor: only server times reach the card, so the date can
+    /// never disagree with the panels (#183 follow-up).
+    pub turn_started_ms: Option<i64>,
     /// ADR-0014: progress/liveness signals for the header.
     /// The active header phase; None when the turn is not actively working
     /// (Done/Error/Continued show no timer).
@@ -425,9 +433,11 @@ impl StreamAccumulator {
         // `next_order` is the resolution moment with a monotonic guard: never
         // before the wall clock, never behind anything already on the card —
         // so a click's receipt always follows the content the Host was looking
-        // at, even within the same millisecond.
+        // at, even within the same millisecond. The key orders only: a receipt
+        // resolves in cola's world, where no server time exists, and it shows
+        // no clock rather than putting cola's in the panels' costume.
         let key = self.next_order();
-        self.insert_kind(key, TimelineKind::Receipt(text));
+        self.insert_kind(key, None, TimelineKind::Receipt(text));
         self.interactions[idx] = InteractionBlock::Receipt(request_id.to_string());
         true
     }
@@ -545,8 +555,10 @@ impl StreamAccumulator {
     /// that owned that position is already sent, and the top of the live card
     /// is the closest honest place left. Both the index AND the key clamp then
     /// (to the live slice's first key), so the timeline stays sorted and key
-    /// lookups stay sound.
-    fn insert_kind(&mut self, key: i64, kind: TimelineKind) {
+    /// lookups stay sound. `shown_at` records the part's server start time
+    /// (or `None` for a synthetic key) as the instant a panel header may
+    /// display.
+    fn insert_kind(&mut self, key: i64, shown_at: Option<i64>, kind: TimelineKind) {
         let idx = self.timeline.partition_point(|item| item.key <= key);
         let (idx, key) = if idx < self.render_from {
             (
@@ -556,7 +568,7 @@ impl StreamAccumulator {
         } else {
             (idx, key)
         };
-        self.timeline.insert(idx, TimelineItem { key, kind });
+        self.timeline.insert(idx, TimelineItem { key, shown_at, kind });
         self.last_key = self.last_key.max(key);
     }
 
@@ -586,17 +598,19 @@ impl StreamAccumulator {
     /// Text is chunked so no single timeline item exceeds `MAX_CARD_TEXT_CHARS`
     /// — the card splitter can then break a long answer across cards at item
     /// boundaries instead of truncating it. Production renders go through
-    /// [`Self::push_text_at`]; this convenience form is test-only.
+    /// [`Self::push_text_at`] for chunks with no server part time; this
+    /// convenience form is test-only.
     #[cfg(test)]
     pub fn push_text(&mut self, chunk: &str) {
-        let key = self.next_order();
-        self.push_text_at(key, chunk);
+        self.push_text_at(None, chunk);
     }
 
-    /// [`Self::push_text`] for a chunk from the part keyed `key`: text merges
-    /// only into its own part's entry (same key), so a late part cannot be
-    /// absorbed into a neighbour that merely looked adjacent.
-    pub fn push_text_at(&mut self, key: i64, chunk: &str) {
+    /// [`Self::push_text`] for a chunk from the part that started at `at_ms`
+    /// (the server's `time.start`), which also places it on the timeline.
+    /// `None` for a payload with no server time: the item is then keyed by a
+    /// monotonic fallback (call order) and shows no clock.
+    pub fn push_text_at(&mut self, at_ms: Option<i64>, chunk: &str) {
+        let key = at_ms.unwrap_or_else(|| self.next_order());
         self.text.push_str(chunk);
         let max = crate::feishu::card::MAX_CARD_TEXT_CHARS;
         let mut remaining = chunk;
@@ -610,7 +624,7 @@ impl StreamAccumulator {
             };
             if space == 0 {
                 let take: String = remaining.chars().take(max).collect();
-                self.insert_kind(key, TimelineKind::Text(take.clone()));
+                self.insert_kind(key, at_ms, TimelineKind::Text(take.clone()));
                 remaining = &remaining[take.len()..];
                 continue;
             }
@@ -621,7 +635,7 @@ impl StreamAccumulator {
                     kind: TimelineKind::Text(last),
                     ..
                 }) => last.push_str(&take),
-                _ => self.insert_kind(key, TimelineKind::Text(take.clone())),
+                _ => self.insert_kind(key, at_ms, TimelineKind::Text(take.clone())),
             }
             remaining = &remaining[take.len()..];
         }
@@ -633,12 +647,14 @@ impl StreamAccumulator {
     /// this convenience form is for tests and synthetic content.
     #[cfg(test)]
     pub fn push_reasoning(&mut self, chunk: &str) {
-        let key = self.next_order();
-        self.push_reasoning_at(key, chunk);
+        self.push_reasoning_at(None, chunk);
     }
 
-    /// [`Self::push_reasoning`] for a reasoning part keyed `key`.
-    pub fn push_reasoning_at(&mut self, key: i64, chunk: &str) {
+    /// [`Self::push_reasoning`] for a reasoning part that started at `at_ms`
+    /// (the server's `time.start`); `None` keys it by fallback and shows no
+    /// clock.
+    pub fn push_reasoning_at(&mut self, at_ms: Option<i64>, chunk: &str) {
+        let key = at_ms.unwrap_or_else(|| self.next_order());
         self.reasoning.push_str(chunk);
         let idx = self.item_with_key(key);
         match idx.and_then(|i| self.timeline.get_mut(i)) {
@@ -646,7 +662,7 @@ impl StreamAccumulator {
                 kind: TimelineKind::Reasoning(last),
                 ..
             }) => last.push_str(chunk),
-            _ => self.insert_kind(key, TimelineKind::Reasoning(chunk.to_string())),
+            _ => self.insert_kind(key, at_ms, TimelineKind::Reasoning(chunk.to_string())),
         }
     }
 
@@ -655,16 +671,27 @@ impl StreamAccumulator {
     /// through [`Self::push_tool_at`]; this convenience form is test-only.
     #[cfg(test)]
     pub fn push_tool(&mut self, call_id: &str, panel: ToolPanel) {
-        let key = self.next_order();
-        self.push_tool_at(key, call_id, panel);
+        self.push_tool_at(None, call_id, panel);
     }
 
-    /// [`Self::push_tool`] for a tool part keyed `key`.
-    pub fn push_tool_at(&mut self, key: i64, call_id: &str, panel: ToolPanel) {
+    /// [`Self::push_tool`] for a tool part that started at `at_ms` (the
+    /// server's `state.time.start`). A tool first seen before the server
+    /// stamped it (a pending part, no time) gains its start time on the later
+    /// update without moving its key; a part with no server time keeps showing
+    /// no clock.
+    pub fn push_tool_at(&mut self, at_ms: Option<i64>, call_id: &str, panel: ToolPanel) {
         let is_new = !self.tools.contains_key(call_id);
         self.tools.insert(call_id.to_string(), panel);
         if is_new {
-            self.insert_kind(key, TimelineKind::Tool(call_id.to_string()));
+            let key = at_ms.unwrap_or_else(|| self.next_order());
+            self.insert_kind(key, at_ms, TimelineKind::Tool(call_id.to_string()));
+        } else if at_ms.is_some()
+            && let Some(item) = self
+                .timeline
+                .iter_mut()
+                .find(|i| matches!(&i.kind, TimelineKind::Tool(id) if id == call_id))
+        {
+            item.shown_at = item.shown_at.or(at_ms);
         }
         // A running-tool phase starts/exits here (running → completed), so the
         // header timer must follow even though card_state stays Streaming.
@@ -805,10 +832,10 @@ impl StreamAccumulator {
 
         // The card is a reply to the user's message, so the session/thread name
         // goes in the subtitle and the question is NOT echoed again. The date
-        // anchor comes from the turn's submit epoch (#183) — not "now" — so
-        // every flush of this card and its split continuations keeps it.
+        // anchor is the turn's SERVER time (#183 follow-up) — never cola's —
+        // so it can't disagree with the panels and stays stable across flushes.
         builder = builder.with_subtitle(&self.title);
-        if let Some(date) = self.submit_epoch_ms.and_then(crate::feishu::card::fmt_local_date) {
+        if let Some(date) = self.turn_started_ms.and_then(crate::feishu::card::fmt_local_date) {
             builder = builder.with_date(&date);
         }
 
@@ -826,7 +853,7 @@ impl StreamAccumulator {
                         builder = builder.with_text(&pending);
                         pending.clear();
                     }
-                    builder = builder.with_reasoning_at(r, item.key);
+                    builder = builder.with_reasoning_at(r, item.shown_at);
                     saw_content = true;
                 }
                 TimelineKind::Text(t) => {
@@ -839,7 +866,7 @@ impl StreamAccumulator {
                         pending.clear();
                     }
                     if let Some(panel) = self.tools.get(call_id) {
-                        builder = builder.with_tool_at(panel.clone(), item.key);
+                        builder = builder.with_tool_at(panel.clone(), item.shown_at);
                     }
                 }
                 // A resolved block's residue: one receipt line, no controls,
