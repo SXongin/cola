@@ -479,9 +479,12 @@ pub(crate) fn snapshot_handled_elsewhere_receipt(req: &PendingRequest) -> String
 }
 
 /// The Interaction Receipt for a permission decision (ADR-0038, rule 4):
-/// `✅ 已允许一次：⚡ 执行 Shell 命令 \`ls -la\` · 14:03`. The target comes from
-/// the block being resolved, so the residue always names what it resolved;
-/// permission decisions carry the local decision time.
+/// `✅ 已允许一次：⚡ 执行 Shell 命令 \`ls -la\``. The target comes from the
+/// block being resolved, so the residue always names what it resolved. It
+/// carries no clock: the decision happens in cola's world, and a cola time in
+/// the same `· HH:MM` costume as the server-stamped panels would mix two
+/// clocks on one card (#183 follow-up). Its timeline position already places
+/// it between what the Host could see and what followed.
 fn permission_receipt(target: &str, reply: &str) -> String {
     let line = match reply {
         once @ ("once" | "always") => {
@@ -490,14 +493,10 @@ fn permission_receipt(target: &str, reply: &str) -> String {
             } else {
                 "✅ 已始终允许"
             };
-            // Same local `HH:MM` the panel headers show (#183): one format,
-            // one clock. `now` is always representable.
-            let time = crate::feishu::card::fmt_local_time(chrono::Local::now().timestamp_millis())
-                .unwrap_or_default();
             if target.is_empty() {
-                format!("{prefix} · {time}")
+                prefix.to_string()
             } else {
-                format!("{prefix}：{target} · {time}")
+                format!("{prefix}：{target}")
             }
         }
         _ => return receipt_line(DENIED_PREFIX, target),

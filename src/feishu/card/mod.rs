@@ -151,7 +151,8 @@ pub(crate) fn fmt_local_time(epoch_ms: i64) -> Option<String> {
 }
 
 /// `MM-DD` in the machine's local time — the card header's date anchor
-/// (#183), taken from the turn's submit epoch so it is stable across flushes.
+/// (#183), taken from the turn's SERVER time so it is stable across flushes
+/// and can't disagree with the panels.
 pub(crate) fn fmt_local_date(epoch_ms: i64) -> Option<String> {
     format_local(epoch_ms, "%m-%d")
 }

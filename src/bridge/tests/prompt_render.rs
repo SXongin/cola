@@ -822,7 +822,9 @@ async fn short_answer_stays_in_card_no_extra_message() {
 /// `HH:MM`) and the card header carries the turn's date (`MM-DD`). The epochs
 /// are constructed from local wall times, so the expected strings hold in any
 /// test-machine timezone — and the turn crossing midnight proves the header
-/// date is the turn's, not the render moment's.
+/// date is the turn's, not the render moment's. The header date reads the
+/// SERVER anchor (`turn_started_ms`), so cola's own `submit_epoch_ms` — set
+/// here to a later day — never reaches the card.
 #[test]
 fn panel_times_and_header_date_come_from_part_epochs() {
     use crate::bridge::render::render_parts;
@@ -830,13 +832,15 @@ fn panel_times_and_header_date_come_from_part_epochs() {
     use crate::feishu::card::CardState;
     use crate::feishu::card::test_local_ms;
 
-    let submit = test_local_ms(2026, 9, 16, 23, 58);
+    let cola_now = test_local_ms(2026, 9, 18, 10, 0);
+    let turn_started = test_local_ms(2026, 9, 16, 23, 58);
     let reasoning_at = test_local_ms(2026, 9, 17, 0, 3);
     let tool_start = test_local_ms(2026, 9, 17, 0, 5);
     let tool_end = test_local_ms(2026, 9, 17, 0, 7);
 
     let mut acc = StreamAccumulator::new("proj");
-    acc.submit_epoch_ms = Some(submit);
+    acc.submit_epoch_ms = Some(cola_now);
+    acc.turn_started_ms = Some(turn_started);
     render_parts(
         &mut acc,
         &serde_json::json!([

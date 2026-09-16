@@ -29,9 +29,10 @@ impl ToolPanel {
     }
 }
 
-/// One tool panel as a folded collapsible element. `at_ms` is the timeline
-/// item's key (the part's `state.time.start`): when present, the panel header
-/// carries it as `· HH:MM` so the start time is visible while collapsed (#183).
+/// One tool panel as a folded collapsible element. `at_ms` is the part's
+/// server `state.time.start`; when present, the panel header carries it as
+/// `· HH:MM` so the start time is visible while collapsed (#183), and when
+/// absent (a payload with no server time) no clock is rendered.
 pub(super) fn tool_panel_element(tool: &ToolPanel, at_ms: Option<i64>) -> serde_json::Value {
     let mut content = String::new();
     if let Some(i) = &tool.input {
@@ -64,9 +65,8 @@ pub(super) fn tool_panel_element(tool: &ToolPanel, at_ms: Option<i64>) -> serde_
     if content.is_empty() {
         content = "_(no details)_".to_string();
     }
-    let suffix = at_ms.map(panel_time_suffix).unwrap_or_default();
     collapsible_panel(
-        &format!("{} {}{}", tool.status_icon(), tool.name, suffix),
+        &format!("{} {}{}", tool.status_icon(), tool.name, panel_time_suffix(at_ms)),
         &content,
     )
 }
@@ -384,7 +384,8 @@ mod tests {
     }
 
     /// #183: the tool panel's header shows the call's start time (`HH:MM`,
-    /// local), visible while the panel is collapsed.
+    /// local), visible while the panel is collapsed. A panel with no server
+    /// time (a pending part, a fallback key) shows no clock.
     #[test]
     fn tool_panel_header_carries_the_start_time() {
         let at = crate::feishu::card::test_local_ms(2026, 9, 16, 14, 5);
@@ -396,12 +397,22 @@ mod tests {
         };
         let card = CardBuilder::new()
             .with_state(CardState::Done)
-            .with_tool_at(tool, at)
+            .with_tool_at(tool.clone(), Some(at))
             .build();
         let elements = card["body"]["elements"].as_array().unwrap();
         assert_eq!(
             elements[0]["header"]["title"]["content"].as_str().unwrap(),
             "✅ bash · 14:05"
+        );
+
+        let untimed = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool_at(tool, None)
+            .build();
+        let elements = untimed["body"]["elements"].as_array().unwrap();
+        assert_eq!(
+            elements[0]["header"]["title"]["content"].as_str().unwrap(),
+            "✅ bash"
         );
     }
 

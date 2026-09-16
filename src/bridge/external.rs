@@ -261,6 +261,10 @@ impl ExternalFlow {
 
         let mut acc = StreamAccumulator::new(&subtitle);
         acc.submit_epoch_ms = Some(epoch_ms);
+        // The external message's server time is also the card header's date
+        // anchor (#183 follow-up): server clock, so the date matches the
+        // panels it stamps.
+        acc.turn_started_ms = Some(epoch_ms);
         acc.session_id = Some(session_id.to_string());
         acc.reply_to_message_id = Some(card_id.to_string());
         acc.attach_work_context(&session_dir).await;
@@ -279,7 +283,7 @@ impl ExternalFlow {
         // Keyed just before the turn's own epoch so the reply's parts — whose
         // server times are at or after it — always insert BELOW the preview.
         if !preview.is_empty() {
-            acc.push_text_at(epoch_ms - 1, &format!("👤 {}", preview));
+            acc.push_text_at(Some(epoch_ms - 1), &format!("👤 {}", preview));
         }
         {
             let mut cards = core.cards.lock().await;
@@ -383,6 +387,9 @@ impl ExternalFlow {
         };
         let mut acc = StreamAccumulator::new("");
         acc.submit_epoch_ms = Some(epoch_ms);
+        // The adopted turn's user message is the server-time anchor for the
+        // header date (#183 follow-up).
+        acc.turn_started_ms = Some(epoch_ms);
         acc.session_id = Some(session_id.to_string());
         acc.reply_to_message_id = Some(card_id.to_string());
         acc.attach_work_context(&session_dir).await;
@@ -418,7 +425,7 @@ impl ExternalFlow {
                 static_text.push_str(&format!("\n{role} {text}"));
             }
         }
-        acc.push_text_at(epoch_ms - 1, &static_text);
+        acc.push_text_at(Some(epoch_ms - 1), &static_text);
         // The adopt-time pending blocks ride as inline sections: the poll's
         // inline dedupe (the block is already present on the accumulator)
         // prevents a duplicate, and clicking one takes the normal inline path —

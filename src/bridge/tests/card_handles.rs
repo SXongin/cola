@@ -173,7 +173,7 @@ async fn click_with_open_message_id_acks_the_cached_card() {
         .expect("a card-action result");
     let ack = ack_text(&result);
     assert!(
-        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la` · "),
+        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la`"),
         "receipt missing: {ack}"
     );
     assert!(
@@ -232,7 +232,7 @@ async fn click_updates_a_non_current_card_through_its_handle() {
         .expect("a card-action result");
     let ack = ack_text(&result);
     assert!(
-        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la` · "),
+        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la`"),
         "receipt missing: {ack}"
     );
     assert!(
