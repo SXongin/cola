@@ -2,7 +2,10 @@ use serde_json::json;
 
 use super::MAX_ELEMENT_TEXT_CHARS;
 use super::tool_render::{ToolPanel, tool_panel_element};
-use super::{AWAITING_ACTION_TITLE, CardActionButton, CardState, HeaderProgress, chunk_text, truncate_md};
+use super::{
+    AWAITING_ACTION_TITLE, CardActionButton, CardState, HeaderProgress, chunk_text, fmt_local_time,
+    truncate_md,
+};
 
 /// Format a duration in seconds for the header's live timer (ADR-0014):
 /// `42s`, `1m23s`, `2h5m`, `3d4h`. Whole seconds, so a header signature built
@@ -39,6 +42,9 @@ pub struct CardBuilder {
     body: Vec<serde_json::Value>,
     footer: Option<String>,
     subtitle: Option<String>,
+    /// The card's date anchor (`MM-DD`, from the turn's submit epoch), joined
+    /// to the subtitle so a card spanning midnight stays readable (#183).
+    date: Option<String>,
     /// JSON 2.0 buttons shown only on the Error card (e.g. a retry action).
     error_buttons: Vec<CardActionButton>,
     /// Progress/liveness inputs for the header (ADR-0014): the waiting flag,
@@ -82,6 +88,7 @@ impl CardBuilder {
             body: Vec::new(),
             footer: None,
             subtitle: None,
+            date: None,
             error_buttons: Vec::new(),
             progress: HeaderProgress::default(),
         }
@@ -108,6 +115,18 @@ impl CardBuilder {
         self
     }
 
+    /// The card's date anchor (`MM-DD`, from the turn's submit time): appended
+    /// to the subtitle so a card that lives across midnight stays readable
+    /// (#183). It comes from the turn epoch — not "now" — so every flush of
+    /// the card (and its split continuations) keeps the same date. Empty
+    /// dates are ignored.
+    pub fn with_date(mut self, date: &str) -> Self {
+        if !date.is_empty() {
+            self.date = Some(date.to_string());
+        }
+        self
+    }
+
     /// Buttons shown on the Error card (rendered only in that state).
     pub fn with_error_buttons(mut self, buttons: Vec<CardActionButton>) -> Self {
         self.error_buttons = buttons;
@@ -129,6 +148,22 @@ impl CardBuilder {
         self
     }
 
+    /// A reasoning panel with its part's start time (`HH:MM`, local) in the
+    /// panel header (#183), so the time is visible while collapsed. `at_ms` is
+    /// the timeline item's key — the part's server `time.start`.
+    pub fn with_reasoning_at(mut self, reasoning: &str, at_ms: i64) -> Self {
+        if !reasoning.is_empty() {
+            self.body.push(collapsible_panel(
+                &format!("💭 推理过程{}", panel_time_suffix(at_ms)),
+                &truncate_md(reasoning, 800),
+            ));
+        }
+        self
+    }
+
+    /// [`Self::with_reasoning_at`] for synthetic content with no part time —
+    /// tests only, mirroring the accumulator's unkeyed push forms.
+    #[cfg(test)]
     pub fn with_reasoning(mut self, reasoning: &str) -> Self {
         if !reasoning.is_empty() {
             self.body
@@ -137,12 +172,25 @@ impl CardBuilder {
         self
     }
 
-    pub fn with_tool(mut self, tool: ToolPanel) -> Self {
+    /// A tool panel with the call's start time (`HH:MM`, local) in its header
+    /// (#183). `at_ms` is the timeline item's key — the part's
+    /// `state.time.start` — so a running → completed update keeps the start
+    /// time (the item is keyed once, on first appearance).
+    pub fn with_tool_at(mut self, tool: ToolPanel, at_ms: i64) -> Self {
         let panel = tool.clone();
         self.tools.push(tool);
         // All tools are shown; the streaming card splits into continuation
         // cards when the component estimate exceeds the Feishu limit.
-        self.body.push(tool_panel_element(&panel));
+        self.body.push(tool_panel_element(&panel, Some(at_ms)));
+        self
+    }
+
+    /// [`Self::with_tool_at`] for panels with no part time — tests only.
+    #[cfg(test)]
+    pub fn with_tool(mut self, tool: ToolPanel) -> Self {
+        let panel = tool.clone();
+        self.tools.push(tool);
+        self.body.push(tool_panel_element(&panel, None));
         self
     }
 
@@ -193,7 +241,12 @@ impl CardBuilder {
             "title": { "tag": "plain_text", "content": header_title },
             "template": template
         });
-        if let Some(ref subtitle) = self.subtitle {
+        if let Some(subtitle) = match (self.subtitle.as_deref(), self.date.as_deref()) {
+            (Some(title), Some(date)) => Some(format!("{title} · {date}")),
+            (Some(title), None) => Some(title.to_string()),
+            (None, Some(date)) => Some(date.to_string()),
+            (None, None) => None,
+        } {
             header["subtitle"] = serde_json::json!({
                 "tag": "plain_text",
                 "content": subtitle
@@ -253,6 +306,14 @@ pub(crate) fn header_title_and_template(
 /// Build a collapsible panel (v2), folded by default.
 pub(super) fn collapsible_panel(title: &str, content: &str) -> serde_json::Value {
     collapsible_panel_chunks(title, &[content.to_string()])
+}
+
+/// The `· HH:MM` suffix a panel header shows for its part's start time
+/// (#183); empty when the instant is unrepresentable (never a real key).
+pub(super) fn panel_time_suffix(at_ms: i64) -> String {
+    fmt_local_time(at_ms)
+        .map(|t| format!(" · {t}"))
+        .unwrap_or_default()
 }
 
 /// Build a collapsible panel (v2) holding several markdown chunks, folded by
@@ -515,6 +576,43 @@ mod tests {
         // No "问:" body element (the reply context already shows the question).
         let text = card.to_string();
         assert!(!text.contains("**问**"), "question echoed: {}", text);
+    }
+
+    /// #183: the panel header carries its part's start time (`HH:MM`, local),
+    /// so the time stays visible while the panel is collapsed.
+    #[test]
+    fn reasoning_panel_header_carries_the_start_time() {
+        let at = crate::feishu::card::test_local_ms(2026, 9, 16, 14, 3);
+        let card = CardBuilder::new()
+            .with_state(CardState::Reasoning)
+            .with_reasoning_at("Let me analyze this code...", at)
+            .build();
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert_eq!(
+            elements[0]["header"]["title"]["content"].as_str().unwrap(),
+            "💭 推理过程 · 14:03"
+        );
+    }
+
+    /// #183: the header's date anchor comes from the turn epoch, not "now", so
+    /// it stays stable across flushes.
+    #[test]
+    fn header_date_joins_the_subtitle() {
+        let card = CardBuilder::new()
+            .with_state(CardState::Streaming)
+            .with_subtitle("proj-lib")
+            .with_date("09-16")
+            .build();
+        assert_eq!(
+            card["header"]["subtitle"]["content"].as_str().unwrap(),
+            "proj-lib · 09-16"
+        );
+        // A card with no subtitle still carries the date.
+        let bare = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_date("09-16")
+            .build();
+        assert_eq!(bare["header"]["subtitle"]["content"].as_str().unwrap(), "09-16");
     }
 
     #[test]

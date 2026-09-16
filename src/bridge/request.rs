@@ -490,7 +490,10 @@ fn permission_receipt(target: &str, reply: &str) -> String {
             } else {
                 "✅ 已始终允许"
             };
-            let time = chrono::Local::now().format("%H:%M");
+            // Same local `HH:MM` the panel headers show (#183): one format,
+            // one clock. `now` is always representable.
+            let time = crate::feishu::card::fmt_local_time(chrono::Local::now().timestamp_millis())
+                .unwrap_or_default();
             if target.is_empty() {
                 format!("{prefix} · {time}")
             } else {
