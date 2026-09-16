@@ -417,16 +417,19 @@ impl StreamAccumulator {
     /// from the block being resolved, so the residue always names the target it
     /// actually resolved. Returns false when no live block matched (already
     /// resolved, or never on this card).
+    /// The index of the live block `request_id` names, if it is still there.
+    fn live_index(&self, request_id: &str) -> Option<usize> {
+        self.interactions
+            .iter()
+            .position(|b| b.request_id() == request_id && b.is_live())
+    }
+
     pub fn resolve_interaction(
         &mut self,
         request_id: &str,
         line: impl FnOnce(&InteractionBlock) -> String,
     ) -> bool {
-        let Some(idx) = self
-            .interactions
-            .iter()
-            .position(|b| b.request_id() == request_id && b.is_live())
-        else {
+        let Some(idx) = self.live_index(request_id) else {
             return false;
         };
         let text = line(&self.interactions[idx]);
@@ -440,6 +443,26 @@ impl StreamAccumulator {
         self.insert_kind(key, None, TimelineKind::Receipt(text));
         self.interactions[idx] = InteractionBlock::Receipt(request_id.to_string());
         true
+    }
+
+    /// Resolve a live block WITHOUT a timeline receipt of its own: a mode change
+    /// (the Auto-Accept toggle) resolves several blocks at once and leaves ONE
+    /// receipt covering them all, so the others only need their tombstone.
+    /// Returns false when no live block matched (already resolved, or never on
+    /// this card).
+    pub fn dismiss_interaction(&mut self, request_id: &str) -> bool {
+        let Some(idx) = self.live_index(request_id) else {
+            return false;
+        };
+        self.interactions[idx] = InteractionBlock::Receipt(request_id.to_string());
+        true
+    }
+
+    /// Append one Interaction Receipt keyed at the resolution moment — the
+    /// single residue a mode change leaves for every block it resolved.
+    pub fn push_receipt(&mut self, text: &str) {
+        let key = self.next_order();
+        self.insert_kind(key, None, TimelineKind::Receipt(text.to_string()));
     }
 
     /// Replace a question block's display state (the live 已选/✅ markers) in

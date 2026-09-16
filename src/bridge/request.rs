@@ -307,9 +307,15 @@ impl RequestKind for PermissionKind {
                 // re-renders without them synchronously — the poller would
                 // otherwise leave them lingering until the next poll notices
                 // the requests vanished (ADR-0038, rule 4).
-                cached = resolve_blocks(flow, core, host, session_id, clicked, &approved, |target| {
-                    autoaccept_receipt(target)
-                })
+                cached = resolve_blocks(
+                    flow,
+                    core,
+                    host,
+                    session_id,
+                    clicked,
+                    &approved,
+                    Residue::Single(AUTOACCEPT_RECEIPT),
+                )
                 .await;
                 tracing::info!(
                     "Auto-Accept enabled via permission card on session {} (approved {})",
@@ -362,7 +368,7 @@ impl RequestKind for PermissionKind {
                     session_id,
                     clicked,
                     &[req_id.to_string()],
-                    |target| permission_receipt(target, reply),
+                    Residue::PerBlock(&|target| permission_receipt(target, reply)),
                 )
                 .await
             }
@@ -379,7 +385,7 @@ impl RequestKind for PermissionKind {
                     session_id,
                     clicked,
                     &[req_id.to_string()],
-                    handled_elsewhere_receipt,
+                    Residue::PerBlock(&handled_elsewhere_receipt),
                 )
                 .await;
                 let mut r = already_handled_result(self.label(), inline, "该权限已处理");
@@ -444,9 +450,11 @@ async fn should_auto_accept(core: &Arc<SharedCore>, session_id: &str, directory:
 /// (#175).
 const HANDLED_ELSEWHERE_PREFIX: &str = "⏱ 已由其他客户端处理";
 
-/// Receipt prefix for the Auto-Accept toggle: every block it approves picks
-/// it up.
-const AUTOACCEPT_PREFIX: &str = "🔄 已开启自动授权";
+/// Receipt for the Auto-Accept toggle: it names the MODE change, never the
+/// requests it resolved — naming a command made the line read as "only this
+/// command is now auto-approved". One per toggle, however many pending blocks
+/// it swallowed (the blocks are dismissed without lines of their own).
+const AUTOACCEPT_RECEIPT: &str = "🔄 已开启自动授权：后续权限请求将自动批准";
 
 /// Receipt prefix for a denied permission or a rejected question.
 const DENIED_PREFIX: &str = "🚫 已拒绝";
@@ -528,12 +536,6 @@ fn question_receipt(questions: &[opencode::types::QuestionInfo], answers: &[Vec<
         return "✅ 已回答".to_string();
     }
     truncate(&format!("✅ 已回答：{}", parts.join("、")), RECEIPT_MAX_CHARS)
-}
-
-/// Receipt for the Auto-Accept toggle — names the target of each block it
-/// resolved (it can resolve several at once).
-fn autoaccept_receipt(target: &str) -> String {
-    receipt_line(AUTOACCEPT_PREFIX, target)
 }
 
 /// Receipt for a block a click found already resolved elsewhere.
@@ -845,7 +847,7 @@ impl RequestKind for QuestionKind {
                         session_id,
                         clicked,
                         &[req_id.to_string()],
-                        |_| question_receipt(&questions, &answers),
+                        Residue::PerBlock(&|_| question_receipt(&questions, &answers)),
                     )
                     .await;
                     let mut r = result_card("✅ 已回答", "green", &qa_completion_body(&questions, &answers));
@@ -975,7 +977,7 @@ impl RequestKind for QuestionKind {
                     session_id,
                     clicked,
                     &[req_id.to_string()],
-                    |_| question_receipt(&questions, &answers),
+                    Residue::PerBlock(&|_| question_receipt(&questions, &answers)),
                 )
                 .await;
                 let mut r = result_card("✅ 已回答", "green", &qa_completion_body(&questions, &answers));
@@ -1040,7 +1042,7 @@ impl RequestKind for QuestionKind {
                     session_id,
                     clicked,
                     &[req_id.to_string()],
-                    denied_receipt,
+                    Residue::PerBlock(&denied_receipt),
                 )
                 .await;
                 let mut r = result_card("🚫 已拒绝回答", "red", "已拒绝回答 AI 的问题。");
@@ -1812,7 +1814,7 @@ async fn settle_question_reply(
                 session_id,
                 clicked,
                 &[req_id.to_string()],
-                handled_elsewhere_receipt,
+                Residue::PerBlock(&handled_elsewhere_receipt),
             )
             .await;
             let mut r = already_handled_result(kind, inline, "该问题已处理");
@@ -1832,6 +1834,47 @@ async fn settle_question_reply(
     }
 }
 
+/// How a resolution leaves its residue on the card and in the timeline
+/// (ADR-0038, rule 4).
+enum Residue<'a> {
+    /// One receipt per resolved block, naming that block's own target — a
+    /// click on the block's own controls.
+    PerBlock(&'a (dyn Fn(&str) -> String + Send + Sync)),
+    /// ONE receipt for the whole resolution: a mode change resolves every
+    /// pending block at once and reports the mode, not the requests it
+    /// swallowed. The rest are dismissed without lines of their own, so a card
+    /// never carries the same line twice.
+    Single(&'a str),
+}
+
+/// Apply one block's residue to the cached card `card_id`: a per-block receipt
+/// line, or — for a mode change — the single mode line on the first block that
+/// card renders and a plain removal for the rest. `stamped_cards` remembers which
+/// cards already carry the mode line. `None` when that card does not render the
+/// block.
+fn residue_edit(
+    handles: &mut crate::bridge::card_handles::CardHandles,
+    card_id: &str,
+    request_id: &str,
+    residue: &Residue<'_>,
+    stamped_cards: &mut std::collections::HashSet<String>,
+) -> Option<serde_json::Value> {
+    match residue {
+        Residue::PerBlock(line) => {
+            let text = handles.target_of(request_id).map(line)?;
+            handles.resolve_on(card_id, request_id, &text)
+        }
+        Residue::Single(text) => {
+            if stamped_cards.contains(card_id) {
+                return handles.remove_on(card_id, request_id);
+            }
+            let card = handles.resolve_on(card_id, request_id, text)?;
+            stamped_cards.insert(card_id.to_string());
+            Some(card)
+        }
+    }
+}
+
 /// Resolve a set of answered request ids on EVERY surface that renders their
 /// blocks (ADR-0038, rule 2) — the one mutation seam, so the accumulator and
 /// the card handles cannot drift:
@@ -1845,11 +1888,10 @@ async fn settle_question_reply(
 ///    card's edit is patched eagerly. The registry entry is then dropped, so a
 ///    resolved block never lingers.
 ///
-/// `line` derives the receipt text from the block's receipt target, so the
-/// residue always names what it resolved (and the Auto-Accept toggle, which
-/// passes every id it approved, can name each block differently). Returns the
-/// clicked card's edited JSON, when the click landed on a card carrying one of
-/// the blocks.
+/// `residue` decides what each block leaves behind (ADR-0038, rule 4): a
+/// receipt naming its own target, or — for a mode change like the Auto-Accept
+/// toggle — one receipt for the whole resolution. Returns the clicked card's
+/// edited JSON, when the click landed on a card carrying one of the blocks.
 async fn resolve_blocks(
     flow: &RequestFlow,
     core: &Arc<SharedCore>,
@@ -1857,7 +1899,7 @@ async fn resolve_blocks(
     session_id: &str,
     clicked: Option<&str>,
     ids: &[String],
-    line: impl Fn(&str) -> String,
+    residue: Residue<'_>,
 ) -> Option<serde_json::Value> {
     {
         let mut sent = flow.sent_cards.lock().await;
@@ -1887,9 +1929,19 @@ async fn resolve_blocks(
         {
             let mut resolved_here = false;
             for id in ids {
-                if acc.resolve_interaction(id, |block| line(&block.receipt_target())) {
-                    resolved_here = true;
-                }
+                let resolved = match &residue {
+                    Residue::PerBlock(line) => {
+                        acc.resolve_interaction(id, |block| line(&block.receipt_target()))
+                    }
+                    Residue::Single(_) => acc.dismiss_interaction(id),
+                };
+                resolved_here |= resolved;
+            }
+            // A mode change leaves ONE line for every block it resolved.
+            if let Residue::Single(text) = &residue
+                && resolved_here
+            {
+                acc.push_receipt(text);
             }
             resolved_here.then(|| acc.header_title_and_template())
         } else {
@@ -1901,17 +1953,16 @@ async fn resolve_blocks(
     //    card's edit is patched so its controls do not linger.
     let mut ack = None;
     let mut patches: Vec<(String, serde_json::Value)> = Vec::new();
+    // Cards that already carry a mode line; their remaining blocks are removed
+    // without one (see `residue_edit`).
+    let mut stamped_cards: std::collections::HashSet<String> = std::collections::HashSet::new();
     {
         let mut handles = core.card_handles.lock().await;
         for id in ids {
             if let Some(clicked_id) = clicked {
-                let line_for = handles.target_of(id).map(&line);
                 // The clicked card carried the block: its edited JSON is the
                 // atomic callback ack (ADR-0038, rule 3).
-                if let Some(card) = line_for
-                    .as_deref()
-                    .and_then(|text| handles.resolve_on(clicked_id, id, text))
-                {
+                if let Some(card) = residue_edit(&mut handles, clicked_id, id, &residue, &mut stamped_cards) {
                     ack = Some(restamped_header(card, post_resolution_header.as_ref()));
                 }
                 // The registered card is a different one (the block moved, or
@@ -1919,8 +1970,8 @@ async fn resolve_blocks(
                 // do not linger.
                 if let Some(registered) = handles.message_of(id).map(str::to_string)
                     && registered != clicked_id
-                    && let Some(text) = line_for.as_deref()
-                    && let Some(card) = handles.resolve_on(&registered, id, text)
+                    && let Some(card) =
+                        residue_edit(&mut handles, &registered, id, &residue, &mut stamped_cards)
                 {
                     crate::bridge::card_handles::merge_patch(
                         &mut patches,
