@@ -532,15 +532,24 @@ impl StreamAccumulator {
         }
     }
 
-    /// The card header's signature (title + template), compared across polls
-    /// to decide whether the header changed enough to re-flush (ADR-0014).
-    pub fn header_sig(&self) -> String {
+    /// The header (title, template) this accumulator's card should show: the
+    /// state label, the waiting override, the phase timer and the running-tool
+    /// hint. Exposed so a click's ack can restamp a card's header in the same
+    /// response — resolving the last live block must clear
+    /// "等待你的授权/回答" immediately, not a poll later.
+    pub fn header_title_and_template(&self) -> (String, &'static str) {
         let running = self.tools.values().find(|t| t.status == "running");
-        let (title, template) = crate::feishu::card::shell::header_title_and_template(
+        crate::feishu::card::shell::header_title_and_template(
             &self.card_state,
             running,
             &self.header_progress(),
-        );
+        )
+    }
+
+    /// The card header's signature (title + template), compared across polls
+    /// to decide whether the header changed enough to re-flush (ADR-0014).
+    pub fn header_sig(&self) -> String {
+        let (title, template) = self.header_title_and_template();
         format!("{}|{}", title, template)
     }
 

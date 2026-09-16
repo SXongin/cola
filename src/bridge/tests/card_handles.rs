@@ -184,6 +184,18 @@ async fn click_with_open_message_id_acks_the_cached_card() {
         ack.contains("回合的内容。"),
         "the ack is the clicked card's own JSON: {ack}"
     );
+    // Resolving the last live block must clear the waiting header in the ack
+    // itself — the cached card's header was captured while the block was
+    // still live, and leaving it to the next render-poll flush left the card
+    // visibly "still waiting" for ~2 s after the click.
+    assert!(
+        !ack.contains("等待你的授权/回答"),
+        "the ack must clear the waiting header: {ack}"
+    );
+    assert!(
+        ack.contains("✅ 完成"),
+        "the ack header must show the accumulator's post-resolution state: {ack}"
+    );
     assert_eq!(
         patches_of(&platform, "om_live").await,
         patches_before,
