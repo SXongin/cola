@@ -312,7 +312,7 @@ impl RequestKind for PermissionKind {
                     core,
                     host,
                     session_id,
-                    clicked,
+                    Origin::Click { clicked },
                     &approved,
                     Residue::Single(AUTOACCEPT_RECEIPT),
                 )
@@ -366,7 +366,7 @@ impl RequestKind for PermissionKind {
                     core,
                     host,
                     session_id,
-                    clicked,
+                    Origin::Click { clicked },
                     &[req_id.to_string()],
                     Residue::PerBlock(&|target| permission_receipt(target, reply)),
                 )
@@ -383,7 +383,7 @@ impl RequestKind for PermissionKind {
                     core,
                     host,
                     session_id,
-                    clicked,
+                    Origin::Click { clicked },
                     &[req_id.to_string()],
                     Residue::PerBlock(&handled_elsewhere_receipt),
                 )
@@ -453,8 +453,9 @@ const HANDLED_ELSEWHERE_PREFIX: &str = "⏱ 已由其他客户端处理";
 /// Receipt for the Auto-Accept toggle: it names the MODE change, never the
 /// requests it resolved — naming a command made the line read as "only this
 /// command is now auto-approved". One per toggle, however many pending blocks
-/// it swallowed (the blocks are dismissed without lines of their own).
-const AUTOACCEPT_RECEIPT: &str = "🔄 已开启自动授权：后续权限请求将自动批准";
+/// it swallowed (the blocks are dismissed without lines of their own). Shared
+/// by the card button and the `/autoaccept on` command.
+pub(crate) const AUTOACCEPT_RECEIPT: &str = "🔄 已开启自动授权：后续权限请求将自动批准";
 
 /// Receipt prefix for a denied permission or a rejected question.
 const DENIED_PREFIX: &str = "🚫 已拒绝";
@@ -845,7 +846,7 @@ impl RequestKind for QuestionKind {
                         core,
                         host,
                         session_id,
-                        clicked,
+                        Origin::Click { clicked },
                         &[req_id.to_string()],
                         Residue::PerBlock(&|_| question_receipt(&questions, &answers)),
                     )
@@ -975,7 +976,7 @@ impl RequestKind for QuestionKind {
                     core,
                     host,
                     session_id,
-                    clicked,
+                    Origin::Click { clicked },
                     &[req_id.to_string()],
                     Residue::PerBlock(&|_| question_receipt(&questions, &answers)),
                 )
@@ -1040,7 +1041,7 @@ impl RequestKind for QuestionKind {
                     core,
                     host,
                     session_id,
-                    clicked,
+                    Origin::Click { clicked },
                     &[req_id.to_string()],
                     Residue::PerBlock(&denied_receipt),
                 )
@@ -1812,7 +1813,7 @@ async fn settle_question_reply(
                 core,
                 host,
                 session_id,
-                clicked,
+                Origin::Click { clicked },
                 &[req_id.to_string()],
                 Residue::PerBlock(&handled_elsewhere_receipt),
             )
@@ -1834,9 +1835,23 @@ async fn settle_question_reply(
     }
 }
 
+/// Where a resolution came from — decides how its cards are settled.
+pub(crate) enum Origin<'a> {
+    /// A card callback: `clicked` is the message id the callback carried (the
+    /// card the Host actually clicked, when the platform supplies it). That
+    /// card's edited JSON is the atomic ack (ADR-0038, rule 3), and a
+    /// DIFFERENT registered card is patched. Without an id the ack is rebuilt
+    /// from the accumulator and NO card is patched — the ack IS the update, so
+    /// no PATCH may race behind it.
+    Click { clicked: Option<&'a str> },
+    /// No callback at all (a command, e.g. `/autoaccept on`): every card that
+    /// renders a block is patched eagerly.
+    Command,
+}
+
 /// How a resolution leaves its residue on the card and in the timeline
 /// (ADR-0038, rule 4).
-enum Residue<'a> {
+pub(crate) enum Residue<'a> {
     /// One receipt per resolved block, naming that block's own target — a
     /// click on the block's own controls.
     PerBlock(&'a (dyn Fn(&str) -> String + Send + Sync)),
@@ -1875,6 +1890,27 @@ fn residue_edit(
     }
 }
 
+/// Apply one block's residue to the cached card `card_id` and stack the
+/// repainted card into `patches` (one PATCH per card), restamping its header
+/// from the accumulator's post-resolution state.
+fn repaint_card(
+    handles: &mut crate::bridge::card_handles::CardHandles,
+    card_id: &str,
+    request_id: &str,
+    residue: &Residue<'_>,
+    stamped_cards: &mut std::collections::HashSet<String>,
+    header: Option<&(String, &'static str)>,
+    patches: &mut Vec<(String, serde_json::Value)>,
+) {
+    if let Some(card) = residue_edit(handles, card_id, request_id, residue, stamped_cards) {
+        crate::bridge::card_handles::merge_patch(
+            patches,
+            card_id.to_string(),
+            restamped_header(card, header),
+        );
+    }
+}
+
 /// Resolve a set of answered request ids on EVERY surface that renders their
 /// blocks (ADR-0038, rule 2) — the one mutation seam, so the accumulator and
 /// the card handles cannot drift:
@@ -1888,16 +1924,15 @@ fn residue_edit(
 ///    card's edit is patched eagerly. The registry entry is then dropped, so a
 ///    resolved block never lingers.
 ///
-/// `residue` decides what each block leaves behind (ADR-0038, rule 4): a
-/// receipt naming its own target, or — for a mode change like the Auto-Accept
-/// toggle — one receipt for the whole resolution. Returns the clicked card's
-/// edited JSON, when the click landed on a card carrying one of the blocks.
-async fn resolve_blocks(
+/// `origin` decides how the cards are settled and `residue` what each block
+/// leaves behind (ADR-0038, rules 3+4). Returns the clicked card's edited
+/// JSON, when the click landed on a card carrying one of the blocks.
+pub(crate) async fn resolve_blocks(
     flow: &RequestFlow,
     core: &Arc<SharedCore>,
     host: &Option<String>,
     session_id: &str,
-    clicked: Option<&str>,
+    origin: Origin<'_>,
     ids: &[String],
     residue: Residue<'_>,
 ) -> Option<serde_json::Value> {
@@ -1959,25 +1994,52 @@ async fn resolve_blocks(
     {
         let mut handles = core.card_handles.lock().await;
         for id in ids {
-            if let Some(clicked_id) = clicked {
-                // The clicked card carried the block: its edited JSON is the
-                // atomic callback ack (ADR-0038, rule 3).
-                if let Some(card) = residue_edit(&mut handles, clicked_id, id, &residue, &mut stamped_cards) {
-                    ack = Some(restamped_header(card, post_resolution_header.as_ref()));
+            match origin {
+                Origin::Click {
+                    clicked: Some(clicked_id),
+                } => {
+                    // The clicked card carried the block: its edited JSON is
+                    // the atomic callback ack (ADR-0038, rule 3).
+                    if let Some(card) =
+                        residue_edit(&mut handles, clicked_id, id, &residue, &mut stamped_cards)
+                    {
+                        ack = Some(restamped_header(card, post_resolution_header.as_ref()));
+                    }
+                    // The registered card is a different one (the block moved,
+                    // or the click landed on a stale copy): repaint it so its
+                    // controls do not linger.
+                    if let Some(registered) = handles.message_of(id).map(str::to_string)
+                        && registered != clicked_id
+                    {
+                        repaint_card(
+                            &mut handles,
+                            &registered,
+                            id,
+                            &residue,
+                            &mut stamped_cards,
+                            post_resolution_header.as_ref(),
+                            &mut patches,
+                        );
+                    }
                 }
-                // The registered card is a different one (the block moved, or
-                // the click landed on a stale copy): repaint it so its controls
-                // do not linger.
-                if let Some(registered) = handles.message_of(id).map(str::to_string)
-                    && registered != clicked_id
-                    && let Some(card) =
-                        residue_edit(&mut handles, &registered, id, &residue, &mut stamped_cards)
-                {
-                    crate::bridge::card_handles::merge_patch(
-                        &mut patches,
-                        registered,
-                        restamped_header(card, post_resolution_header.as_ref()),
-                    );
+                // A callback with no card id: the ack is rebuilt from the
+                // accumulator, so no card may be patched behind it.
+                Origin::Click { clicked: None } => {}
+                // No callback (a command resolved the block): every card that
+                // still renders it is patched — the registered one and any
+                // older copy a re-host left behind.
+                Origin::Command => {
+                    for card_id in handles.cards_rendering(id) {
+                        repaint_card(
+                            &mut handles,
+                            &card_id,
+                            id,
+                            &residue,
+                            &mut stamped_cards,
+                            post_resolution_header.as_ref(),
+                            &mut patches,
+                        );
+                    }
                 }
             }
             handles.forget(id);

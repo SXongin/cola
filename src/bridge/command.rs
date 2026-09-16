@@ -682,24 +682,40 @@ pub(crate) async fn handle_command(
                     return Ok(());
                 }
                 crate::bridge::command::AutoAcceptAction::Set(on) => {
-                    let approved = if on {
-                        if let Some(e) = &entry {
-                            core.approve_pending_for_session(&e.session_id, &e.directory)
-                                .await
-                                .len()
-                        } else {
-                            0
+                    let mut approved = Vec::new();
+                    if on && let Some(e) = &entry {
+                        approved = core
+                            .approve_pending_for_session(&e.session_id, &e.directory)
+                            .await;
+                        if !approved.is_empty() {
+                            // The same residue the card toggle leaves: ONE mode
+                            // receipt and the approved blocks dismissed. Without
+                            // this the sweep would resolve them as
+                            // `⏱ 已由其他客户端处理` — a lie, cola itself
+                            // approved them (#193 follow-up). No clicked card,
+                            // so `resolve_blocks` patches every card that
+                            // renders one of the blocks.
+                            crate::bridge::request::resolve_blocks(
+                                &core.permission,
+                                core,
+                                &Some(e.session_id.clone()),
+                                &e.session_id,
+                                crate::bridge::request::Origin::Command,
+                                &approved,
+                                crate::bridge::request::Residue::Single(
+                                    crate::bridge::request::AUTOACCEPT_RECEIPT,
+                                ),
+                            )
+                            .await;
                         }
-                    } else {
-                        0
-                    };
+                    }
                     if let Some(e) = entry {
                         core.update_session(&e.session_id, |entry| entry.auto_accept = on)
                             .await?;
                     }
                     let state = if on { "开" } else { "关" };
-                    let extra = if on && approved > 0 {
-                        format!("（已自动批准 {} 条待处理请求）", approved)
+                    let extra = if on && !approved.is_empty() {
+                        format!("（已自动批准 {} 条待处理请求）", approved.len())
                     } else {
                         String::new()
                     };
