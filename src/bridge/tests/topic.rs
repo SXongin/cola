@@ -1,15 +1,18 @@
 use crate::bridge::command::*;
 use crate::bridge::test_support::*;
 
-/// by a new session rooted at <dir>, maps the returned thread_id to that
-/// session, and leaves the lobby conversation untouched.
+/// `/topic <dir> [name]` opens the topic around a **Pending Session**
+/// (ADR-0041): NO server session is created, the cover card leads with the
+/// pending state (「下一条消息创建」 instead of a session line), and the pending
+/// carries the directory, the creation title and the topic's root/anchor.
 #[tokio::test]
-async fn topic_command_creates_topic_mapped_to_new_session() {
+async fn topic_command_opens_a_pending_topic() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend.session_id = "ses_topic".into();
+    let created = backend.created_session_dirs.clone();
     let title_calls = backend.update_title_calls.clone();
     let (app, platform) = build_app(cfg, backend).await;
     let proj = tempfile::tempdir().unwrap();
@@ -28,9 +31,18 @@ async fn topic_command_creates_topic_mapped_to_new_session() {
     .await
     .unwrap();
 
+    assert!(
+        created.lock().await.is_empty(),
+        "a pending topic creates no server session"
+    );
+    assert!(
+        title_calls.lock().await.is_empty(),
+        "no title exists to PATCH before materialisation"
+    );
+
     // The topic is created via a cover card sent to the chat's top level,
-    // then reply_in_thread on THAT card: the cover becomes the thread root,
-    // so the chat-list topic entry shows the session brief permanently
+    // then reply_in_thread on THAT card seeds the topic: the cover becomes the
+    // thread root, so the chat-list topic entry shows the brief permanently
     // (ADR-0023). On the mock the cover send returns "msg_sent".
     let calls = platform.calls.lock().await.clone();
     assert!(
@@ -45,8 +57,8 @@ async fn topic_command_creates_topic_mapped_to_new_session() {
             .any(|c| matches!(c, PlatformCall::ReplyInThread { message_id, .. } if message_id == "msg_sent")),
         "expected reply_in_thread on the cover card, got {calls:?}"
     );
-    // The cover card carries the session brief; the in-topic seed is only a
-    // short hint (the brief lives on the root card at the top of the thread).
+    // The pending cover advertises the creation timing (ADR-0041) and never
+    // the 会话 noun, which stays reserved for a real Session.
     let cover = platform
         .sent_cards()
         .await
@@ -55,8 +67,12 @@ async fn topic_command_creates_topic_mapped_to_new_session() {
         .map(|c| c.to_string())
         .expect("cover card JSON");
     assert!(
-        cover.contains("💬 `api-refactor`") && cover.contains("会话 `topic`"),
-        "cover card should lead with the title and session, got: {cover}"
+        cover.contains("💬 `api-refactor`") && cover.contains("下一条消息创建"),
+        "pending cover should lead with the title and the creation verb, got: {cover}"
+    );
+    assert!(
+        !cover.contains("会话 `"),
+        "a pending cover must not render a session line: {cover}"
     );
     let seed = calls
         .iter()
@@ -67,43 +83,32 @@ async fn topic_command_creates_topic_mapped_to_new_session() {
         .expect("reply_in_thread seed text");
     assert_eq!(seed, "请在本话题内回复，即可和这个会话对话。");
 
-    // The created topic's thread_id is mapped to the new session.
+    // The pending carries the directory, the creation title and the topic's
+    // root/anchor — the topic key has NO active session.
     let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
-    let entry = app
-        .sessions
-        .lock()
-        .await
-        .get_active(&topic_key)
-        .cloned()
-        .expect("topic thread_id should map to the new session");
-    assert_eq!(entry.session_id, "ses_topic");
-    // normalize_directory canonicalizes the project path (resolving
-    // /private/var on macOS and \\?\ / 8.3 short names on Windows), so
-    // compare against the canonicalized form — not the raw tempdir path.
+    let store = app.sessions.lock().await;
+    assert!(
+        store.get_active(&topic_key).is_none(),
+        "a pending topic has no active session"
+    );
+    let pending = store.pending_for(&topic_key).cloned().expect("pending recorded");
     assert_eq!(
-        entry.directory,
+        pending.directory,
         std::fs::canonicalize(proj.path()).unwrap().to_string_lossy()
     );
-    // The named `/topic` PATCHed the server title (ADR-0007).
-    assert_eq!(
-        title_calls.lock().await.as_slice(),
-        &[("ses_topic".to_string(), "api-refactor".to_string())]
-    );
-    // The topic anchor is the confirmation message INSIDE the topic; future
-    // sent cards reply to it so they stay in the topic.
-    assert_eq!(entry.topic_anchor.as_deref(), Some("msg_topic_reply"));
-    // The thread root is the cover card (ADR-0023): the injection guard
-    // excludes it from Quoted Context, and the post-turn hook patches it
-    // when the server auto-generates a title.
-    assert_eq!(entry.topic_root.as_deref(), Some("msg_sent"));
-    // The cover title is recorded so the post-turn hook can sync it.
-    assert_eq!(
-        app.core.cover_titles.lock().await.get("ses_topic").cloned(),
-        Some(crate::bridge::core::CoverTitle {
-            title: "api-refactor".to_string(),
-            model: None
-        })
-    );
+    assert_eq!(pending.title.as_deref(), Some("api-refactor"));
+    assert_eq!(pending.topic_anchor.as_deref(), Some("msg_topic_reply"));
+    assert_eq!(pending.topic_root.as_deref(), Some("msg_sent"));
+    drop(store);
+
+    // The cover title is recorded under the pending's own key (no session id
+    // exists yet) and flagged pending, so the first sync re-renders the full
+    // brief after materialisation.
+    let covers = app.core.cover_titles.lock().await.clone();
+    assert_eq!(covers.len(), 1, "one pending cover record: {covers:?}");
+    let recorded = covers.values().next().unwrap();
+    assert_eq!(recorded.title, "api-refactor");
+    assert!(recorded.pending, "the record must be flagged pending");
 
     // The lobby conversation still maps to nothing new (no session was
     // created for the lobby itself).
@@ -111,10 +116,442 @@ async fn topic_command_creates_topic_mapped_to_new_session() {
     assert!(app.sessions.lock().await.get_active(&lobby_key).is_none());
 }
 
+/// ADR-0041: the topic's first non-command message materialises the pending —
+/// the session is created in the pending's directory, PATCHed with its title
+/// and mapped to the topic with `topic_root`/`topic_anchor` intact; the cover
+/// card is patched from the pending state to the full brief even though the
+/// displayed title matches the pending's.
+#[tokio::test]
+async fn first_message_in_pending_topic_materialises_and_completes_the_cover() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.session_id = "ses_topic".into();
+    let created = backend.created_session_dirs.clone();
+    let title_calls = backend.update_title_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    let proj = tempfile::tempdir().unwrap();
+    let proj_dir = std::fs::canonicalize(proj.path())
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    crate::bridge::command::handle_command(
+        &app.core,
+        Command::Topic {
+            directory: Some(proj_dir.clone()),
+            name: Some("api-refactor".into()),
+        },
+        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+        "msg_topic",
+        crate::config::ConversationKind::P2p,
+    )
+    .await
+    .unwrap();
+
+    app.handle_message(crate::bridge::IncomingMessage {
+        message_id: "msg_in_topic".into(),
+        chat_id: "chat_1".into(),
+        chat_type: "p2p".into(),
+        thread_id: Some("omt_created_topic".into()),
+        parent_id: None,
+        text: "帮我看看这个目录".into(),
+        images: vec![],
+        requester_open_id: Some(TEST_HOST.into()),
+    })
+    .await;
+
+    assert_eq!(
+        *created.lock().await,
+        vec![Some(proj_dir.clone())],
+        "the first message creates the session in the pending's directory"
+    );
+    assert_eq!(
+        *title_calls.lock().await,
+        vec![("ses_topic".to_string(), "api-refactor".to_string())],
+        "the pending title is PATCHed at materialisation"
+    );
+    let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
+    let store = app.sessions.lock().await;
+    assert!(store.pending_for(&topic_key).is_none(), "the pending is resolved");
+    let entry = store.get_active(&topic_key).cloned().expect("session mapped");
+    drop(store);
+    assert_eq!(entry.session_id, "ses_topic");
+    assert_eq!(entry.directory, proj_dir);
+    assert_eq!(
+        entry.topic_anchor.as_deref(),
+        Some("msg_topic_reply"),
+        "the topic anchor survives materialisation"
+    );
+    assert_eq!(
+        entry.topic_root.as_deref(),
+        Some("msg_sent"),
+        "the topic root survives materialisation"
+    );
+
+    // The cover was patched in place from the pending text to the full brief:
+    // the server title and the session id line.
+    let calls = platform.calls.lock().await.clone();
+    let patched = calls
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::UpdateMessage { message_id, card } if message_id == "msg_sent" => {
+                Some(card.to_string())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !patched.is_empty(),
+        "the cover must be patched after materialisation, got {calls:?}"
+    );
+    let last = patched.last().unwrap();
+    assert!(
+        last.contains("api-refactor") && last.contains("会话 `") && last.contains("topic"),
+        "the completed cover shows the title and the session id: {last}"
+    );
+    assert!(
+        !last.contains("下一条消息创建"),
+        "the pending verb is gone once a real session exists: {last}"
+    );
+    assert_eq!(
+        app.core
+            .cover_titles
+            .lock()
+            .await
+            .get("ses_topic")
+            .cloned()
+            .map(|c| (c.title, c.pending)),
+        Some(("api-refactor".to_string(), false)),
+        "the cover record moved onto the session and settled"
+    );
+}
+
+/// ADR-0041: `/name` on a pending topic re-renders the cover card immediately
+/// (no server session exists to sync from yet) and records the creation title
+/// the pending will apply at materialisation.
+#[tokio::test]
+async fn name_on_a_pending_topic_patches_the_cover() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.session_id = "ses_topic".into();
+    let title_calls = backend.update_title_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    let proj = tempfile::tempdir().unwrap();
+    let proj_dir = proj.path().to_string_lossy().to_string();
+
+    crate::bridge::command::handle_command(
+        &app.core,
+        Command::Topic {
+            directory: Some(proj_dir),
+            name: None,
+        },
+        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+        "msg_topic",
+        crate::config::ConversationKind::P2p,
+    )
+    .await
+    .unwrap();
+    let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
+
+    crate::bridge::command::handle_command(
+        &app.core,
+        Command::Name("api-refactor".into()),
+        topic_key.clone(),
+        "msg_name",
+        crate::config::ConversationKind::Topic,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        title_calls.lock().await.is_empty(),
+        "nothing is PATCHed before the session exists"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&topic_key)
+            .and_then(|p| p.title.clone()),
+        Some("api-refactor".to_string())
+    );
+    let calls = platform.calls.lock().await.clone();
+    let patched = calls
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::UpdateMessage { message_id, card } if message_id == "msg_sent" => {
+                Some(card.to_string())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !patched.is_empty(),
+        "the pending cover must be patched right away, got {calls:?}"
+    );
+    assert!(
+        patched.last().unwrap().contains("api-refactor")
+            && patched.last().unwrap().contains("下一条消息创建"),
+        "the pending cover shows the new title: {:?}",
+        patched.last()
+    );
+    assert_eq!(
+        app.core
+            .cover_titles
+            .lock()
+            .await
+            .values()
+            .next()
+            .map(|c| c.title.clone()),
+        Some("api-refactor".to_string()),
+        "the pending cover record follows the rename"
+    );
+}
+
+/// ADR-0041: `/switch <id>` inside a pending topic re-points the topic to the
+/// session (the topic gate treats a pending as unbound), drops the pending and
+/// completes the cover with the adopted session's brief.
+#[tokio::test]
+async fn switch_inside_pending_topic_repoints_and_clears_the_pending() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.session_id = "ses_topic".into();
+    backend.session_list = vec![list_session("ses_old", "旧会话", "/work/proj", 100)];
+    backend
+        .session_titles
+        .lock()
+        .unwrap()
+        .insert("ses_old".into(), "旧会话".into());
+    let created = backend.created_session_dirs.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    let proj = tempfile::tempdir().unwrap();
+    let proj_dir = proj.path().to_string_lossy().to_string();
+
+    crate::bridge::command::handle_command(
+        &app.core,
+        Command::Topic {
+            directory: Some(proj_dir),
+            name: None,
+        },
+        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+        "msg_topic",
+        crate::config::ConversationKind::P2p,
+    )
+    .await
+    .unwrap();
+    let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
+    assert!(app.sessions.lock().await.pending_for(&topic_key).is_some());
+
+    crate::bridge::command::handle_command(
+        &app.core,
+        Command::Switch(SwitchAction::Match("ses_old".into())),
+        topic_key.clone(),
+        "msg_switch",
+        crate::config::ConversationKind::Topic,
+    )
+    .await
+    .unwrap();
+
+    let store = app.sessions.lock().await;
+    assert!(
+        store.pending_for(&topic_key).is_none(),
+        "the switch drops the pending"
+    );
+    let entry = store
+        .get_active(&topic_key)
+        .expect("the topic now owns the session");
+    assert_eq!(entry.session_id, "ses_old");
+    assert_eq!(
+        entry.topic_root.as_deref(),
+        Some("msg_sent"),
+        "the topic root survives the in-place re-point"
+    );
+    drop(store);
+    assert!(
+        created.lock().await.is_empty(),
+        "re-pointing creates no new session"
+    );
+
+    // The cover left the pending state: the adopted session's brief replaces
+    // 「下一条消息创建」.
+    let calls = platform.calls.lock().await.clone();
+    let patched = calls
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::UpdateMessage { message_id, card } if message_id == "msg_sent" => {
+                Some(card.to_string())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !patched.is_empty(),
+        "the cover must be completed on the re-point, got {calls:?}"
+    );
+    assert!(
+        patched.last().unwrap().contains("旧会话") && patched.last().unwrap().contains("会话 `"),
+        "the cover shows the adopted session: {:?}",
+        patched.last()
+    );
+    assert!(
+        !patched.last().unwrap().contains("下一条消息创建"),
+        "the pending verb is gone: {:?}",
+        patched.last()
+    );
+}
+
+/// ADR-0041: replacing a pending topic's intent (`/dir` inside it) keeps the
+/// topic's root/anchor, so the materialised session still routes fallback
+/// cards into the topic and still suppresses its own creation messages.
+#[tokio::test]
+async fn dir_inside_pending_topic_keeps_the_topic_anchors() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.session_id = "ses_topic".into();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let first_dir = std::fs::canonicalize(first.path())
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let second_dir = std::fs::canonicalize(second.path())
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    crate::bridge::command::handle_command(
+        &app.core,
+        Command::Topic {
+            directory: Some(first_dir),
+            name: None,
+        },
+        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+        "msg_topic",
+        crate::config::ConversationKind::P2p,
+    )
+    .await
+    .unwrap();
+    let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
+
+    // Correct the pending's directory in place; the topic binding survives.
+    crate::bridge::command::handle_command(
+        &app.core,
+        Command::Dir(second_dir.clone()),
+        topic_key.clone(),
+        "msg_dir",
+        crate::config::ConversationKind::Topic,
+    )
+    .await
+    .unwrap();
+    {
+        let store = app.sessions.lock().await;
+        let pending = store.pending_for(&topic_key).expect("pending replaced");
+        assert_eq!(pending.directory, second_dir);
+        assert_eq!(pending.topic_anchor.as_deref(), Some("msg_topic_reply"));
+        assert_eq!(pending.topic_root.as_deref(), Some("msg_sent"));
+    }
+
+    app.handle_message(crate::bridge::IncomingMessage {
+        message_id: "msg_in_topic".into(),
+        chat_id: "chat_1".into(),
+        chat_type: "p2p".into(),
+        thread_id: Some("omt_created_topic".into()),
+        parent_id: None,
+        text: "hi".into(),
+        images: vec![],
+        requester_open_id: Some(TEST_HOST.into()),
+    })
+    .await;
+
+    let entry = app
+        .sessions
+        .lock()
+        .await
+        .get_active(&topic_key)
+        .cloned()
+        .expect("the corrected pending materialises");
+    assert_eq!(entry.directory, second_dir);
+    assert_eq!(entry.topic_anchor.as_deref(), Some("msg_topic_reply"));
+    assert_eq!(entry.topic_root.as_deref(), Some("msg_sent"));
+}
+
+/// ADR-0041: `parent_is_topic_creation` is pending-aware — before the session
+/// exists, a reply to the topic's cover (root) or seed (anchor) must not be
+/// injected as Quoted Context.
+#[tokio::test]
+async fn pending_topic_plain_reply_skips_own_root_and_seed_injection() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.session_id = "ses_topic".into();
+    let prompt_calls = backend.prompt_calls.clone();
+    let platform = RecordingPlatform::new();
+    for (id, text) in [
+        ("msg_sent", "💬 `proj`\n下一条消息创建"),
+        ("msg_topic_reply", "请在本话题内回复，即可和这个会话对话。"),
+    ] {
+        platform.quoted_messages.lock().unwrap().insert(
+            id.into(),
+            crate::feishu::client::FeishuMessage {
+                msg_type: "text".into(),
+                content: format!(r#"{{"text":"{text}"}}"#),
+                mentions: vec![],
+            },
+        );
+    }
+    let app = Arc::new(App::new(cfg, Arc::new(backend), Arc::new(platform)).unwrap());
+    let proj = tempfile::tempdir().unwrap();
+    let proj_dir = proj.path().to_string_lossy().to_string();
+
+    crate::bridge::command::handle_command(
+        &app.core,
+        Command::Topic {
+            directory: Some(proj_dir),
+            name: None,
+        },
+        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+        "msg_topic",
+        crate::config::ConversationKind::P2p,
+    )
+    .await
+    .unwrap();
+
+    for pid in ["msg_sent", "msg_topic_reply"] {
+        prompt_calls.lock().await.clear();
+        app.handle_message(crate::bridge::IncomingMessage {
+            message_id: format!("msg_{pid}"),
+            chat_id: "chat_1".into(),
+            chat_type: "p2p".into(),
+            thread_id: Some("omt_created_topic".into()),
+            parent_id: Some(pid.into()),
+            text: "普通回复".into(),
+            images: vec![],
+            requester_open_id: Some(TEST_HOST.into()),
+        })
+        .await;
+        assert_eq!(
+            *prompt_calls.lock().await,
+            vec!["普通回复".to_string()],
+            "parent {pid} is the pending topic's own creation message — must not be injected"
+        );
+    }
+}
+
 /// ADR-0023: when the cover card cannot be sent, the thread anchors on the
 /// user's command message instead — the old behavior — and no cover title
 /// is recorded (so the post-turn hook never tries to patch the user's
-/// message, which Feishu would reject).
+/// message, which Feishu would reject). The pending still carries the topic's
+/// root/anchor so materialisation keeps the guards working (ADR-0041).
 #[tokio::test]
 async fn topic_cover_send_failure_falls_back_to_command_root() {
     let _wd = test_work_dir();
@@ -126,11 +563,6 @@ async fn topic_cover_send_failure_falls_back_to_command_root() {
     let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
     let proj = tempfile::tempdir().unwrap();
     let proj_dir = proj.path().to_string_lossy().to_string();
-
-    // A stale cover-title entry may already exist (e.g. the session was
-    // previously adopted into a cover-rooted topic); the fallback must drop
-    // it so the post-turn hook never patches the user's command message.
-    seed_cover_title(&app, "ses_test", "旧封面").await;
 
     crate::bridge::command::handle_command(
         &app.core,
@@ -154,14 +586,16 @@ async fn topic_cover_send_failure_falls_back_to_command_root() {
     );
 
     let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
-    let entry = app
-        .sessions
-        .lock()
-        .await
-        .get_active(&topic_key)
-        .cloned()
-        .expect("topic thread_id should map to the new session");
-    assert_eq!(entry.topic_root.as_deref(), Some("msg_topic"));
+    let store = app.sessions.lock().await;
+    assert!(store.get_active(&topic_key).is_none());
+    let pending = store.pending_for(&topic_key).cloned().expect("pending recorded");
+    assert_eq!(
+        pending.topic_root.as_deref(),
+        Some("msg_topic"),
+        "the fallback root is the user's command message"
+    );
+    assert_eq!(pending.topic_anchor.as_deref(), Some("msg_topic_reply"));
+    drop(store);
     assert!(
         app.core.cover_titles.lock().await.is_empty(),
         "no cover title may survive without a cover card"
@@ -238,7 +672,8 @@ async fn topic_cover_card_updated_with_auto_title_after_turn() {
         app.core.cover_titles.lock().await.get("ses_t1").cloned(),
         Some(crate::bridge::core::CoverTitle {
             title: "修复登录 bug".to_string(),
-            model: None
+            model: None,
+            pending: false,
         })
     );
 }
@@ -295,22 +730,19 @@ async fn topic_command_bare_inherits_current_project_directory() {
         "expected a reply_in_thread on the cover card, got {calls:?}"
     );
 
-    // The topic session lives in the inherited project directory.
+    // The topic's Pending Session lives in the inherited project directory.
     let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
-    let entry = app
-        .sessions
-        .lock()
-        .await
-        .get_active(&topic_key)
+    let store = app.sessions.lock().await;
+    let pending = store
+        .pending_for(&topic_key)
         .cloned()
-        .expect("bare /topic should map the created topic to its session");
-    assert_eq!(entry.session_id, "ses_topic");
+        .expect("bare /topic should record a pending for the created topic");
     assert_eq!(
-        entry.directory,
+        pending.directory,
         std::fs::canonicalize(proj.path()).unwrap().to_string_lossy(),
         "bare /topic must inherit the active session's directory"
     );
-    assert_eq!(entry.topic_anchor.as_deref(), Some("msg_topic_reply"));
+    assert_eq!(pending.topic_anchor.as_deref(), Some("msg_topic_reply"));
 }
 
 /// A message sent INSIDE the created topic routes to the topic's session,
@@ -1470,5 +1902,90 @@ async fn manual_topic_plain_reply_injects_user_root() {
     assert_eq!(
         *prompt_calls.lock().await,
         vec!["[引用消息]:\n用户的主题消息\n\n继续".to_string()]
+    );
+}
+
+/// ADR-0041: the switch card's row-adopt op inside a pending topic re-points
+/// the topic in place — the card path of `/switch <id>` — carrying the topic
+/// root onto the adopted entry and completing the cover.
+#[tokio::test]
+async fn switch_card_adopt_inside_pending_topic_repoints_in_place() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.session_id = "ses_topic".into();
+    backend.session_list = vec![list_session("ses_old", "旧会话", "/work/proj", 100)];
+    backend
+        .session_titles
+        .lock()
+        .unwrap()
+        .insert("ses_old".into(), "旧会话".into());
+    let (app, platform) = build_app(cfg, backend).await;
+    let proj = tempfile::tempdir().unwrap();
+    let proj_dir = proj.path().to_string_lossy().to_string();
+
+    crate::bridge::command::handle_command(
+        &app.core,
+        Command::Topic {
+            directory: Some(proj_dir),
+            name: None,
+        },
+        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+        "msg_topic",
+        crate::config::ConversationKind::P2p,
+    )
+    .await
+    .unwrap();
+
+    let value = serde_json::json!({
+        "action": "switch",
+        "op": "adopt",
+        "chat_id": "chat_1",
+        "thread_id": "omt_created_topic",
+        "session_id": "ses_old",
+        "open_message_id": "om_switch_card",
+    });
+    let result = app
+        .host_action(value)
+        .await
+        .expect("card adopt should return a result");
+    assert!(result.card.is_some(), "the snapshot patches the card");
+
+    let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
+    let store = app.sessions.lock().await;
+    assert!(
+        store.pending_for(&topic_key).is_none(),
+        "the card adopt drops the pending"
+    );
+    let entry = store
+        .get_active(&topic_key)
+        .expect("the topic now owns the session");
+    assert_eq!(entry.session_id, "ses_old");
+    assert_eq!(
+        entry.topic_root.as_deref(),
+        Some("msg_sent"),
+        "the topic root survives the card re-point"
+    );
+    drop(store);
+
+    let calls = platform.calls.lock().await.clone();
+    let patched = calls
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::UpdateMessage { message_id, card } if message_id == "msg_sent" => {
+                Some(card.to_string())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !patched.is_empty(),
+        "the cover must be completed on the card re-point, got {calls:?}"
+    );
+    assert!(
+        patched.last().unwrap().contains("旧会话"),
+        "the cover shows the adopted session: {:?}",
+        patched.last()
     );
 }

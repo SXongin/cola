@@ -1,9 +1,10 @@
 //! The topic-opening transaction (ADR-0023, ADR-0028).
 //!
-//! Opening a topic is a protocol of five steps — create the session (or adopt
-//! an existing one), send the Topic Cover Card and anchor the thread on it
-//! (falling back to the command/card message when the cover cannot be sent),
-//! seed the topic's first in-topic message, write the Session Mapping, and
+//! Opening a topic is a protocol of five steps — pick the session side (a
+//! Pending Session for `/topic`, an existing one for `/topic --adopt`), send
+//! the Topic Cover Card and anchor the thread on it (falling back to the
+//! command/card message when the cover cannot be sent), seed the topic's first
+//! in-topic message, write the Session Mapping (or the Pending Session) and
 //! record the cover title. This module owns the whole protocol so the callers
 //! (`/topic`, `/topic --adopt`, the `/dir` card's 建话题 op and the switch
 //! card's 建话题接管 op) only choose a [`TopicOpening`] and render the
@@ -13,6 +14,7 @@ use std::sync::Arc;
 
 use crate::bridge::core::SharedCore;
 use crate::bridge::display::{dir_basename, id_tail, model_display};
+use crate::bridge::session::PendingEntry;
 use crate::config::{SessionEntry, ThreadKey};
 use crate::error::BridgeError;
 use crate::opencode::types::SessionListInfo;
@@ -21,10 +23,11 @@ use crate::opencode::types::SessionListInfo;
 /// `/dir` card's 建话题 op) or one around an EXISTING server session
 /// (`/topic --adopt`, the switch card's 建话题接管 op, ADR-0016).
 pub(crate) enum TopicOpening {
-    /// Create a session in `directory`, PATCH `name` as the title when given
-    /// (ADR-0007 creation title policy), and open the topic around it. The
-    /// cover shows `name` or the directory basename until the server
-    /// auto-generates a real title.
+    /// Record a Pending Session in `directory`, PATCH `name` as the title when
+    /// given (ADR-0007 creation title policy), and open the topic around it —
+    /// no server session is created here (ADR-0041): the topic's first prompt
+    /// materialises it. The cover shows `name` or the directory basename until
+    /// the server auto-generates a real title.
     Fresh { directory: String, name: Option<String> },
     /// Open the topic around an existing session (ADR-0016): the Session
     /// Snapshot card (ADR-0028) becomes the topic's first in-topic message
@@ -32,11 +35,14 @@ pub(crate) enum TopicOpening {
     Adopt { info: SessionListInfo },
 }
 
-/// The opened topic: the session it belongs to and the new Feishu `thread_id`.
-/// The thread root and in-topic anchor (ADR-0023) are written to the Session
-/// Mapping by the transaction, not returned — no caller needs to re-place them.
+/// The opened topic: the session it belongs to (if any) and the new Feishu
+/// `thread_id`. A fresh `/topic` leaves a Pending Session, so its session id is
+/// `None` until the topic's first prompt materialises one (ADR-0041). The
+/// thread root and in-topic anchor (ADR-0023) are written to the Session
+/// Mapping (or the pending) by the transaction, not returned — no caller needs
+/// to re-place them.
 pub(crate) struct OpenedTopic {
-    pub session_id: String,
+    pub session_id: Option<String>,
     pub thread_id: String,
 }
 
@@ -52,44 +58,36 @@ pub(crate) enum OpenTopicError {
     Failed(#[from] BridgeError),
 }
 
-/// Open a topic — the whole transaction. Fresh: create the session (with an
-/// optional title PATCH), build the cover brief, send the cover card to the
-/// chat's top level and anchor the thread on it, falling back to
-/// `fallback_root` (the user's command message or the card's own message) when
-/// the cover send fails (ADR-0023); seed the first in-topic message, map the
-/// session to the new topic's `ThreadKey`, and record the cover title. Adopt:
-/// additionally gather the Session Snapshot BEFORE the mapping write (so the
-/// card reflects the session's pre-adoption state) and claim its embedded
-/// pendings against the in-topic snapshot after the send (ADR-0028).
+/// Open a topic — the whole transaction. Fresh: record a Pending Session
+/// carrying `directory`, the optional creation title and the topic's
+/// root/anchor (ADR-0041; no server session exists yet), build the pending
+/// cover brief, send the cover card to the chat's top level and anchor the
+/// thread on it, falling back to `fallback_root` (the user's command message
+/// or the card's own message) when the cover send fails (ADR-0023); seed the
+/// first in-topic message and record the cover title. Adopt: additionally
+/// gather the Session Snapshot BEFORE the mapping write (so the card reflects
+/// the session's pre-adoption state), map the session to the new topic's
+/// `ThreadKey`, and claim its embedded pendings against the in-topic snapshot
+/// after the send (ADR-0028).
 pub(crate) async fn open_topic(
     core: &Arc<SharedCore>,
     chat_id: &str,
     fallback_root: &str,
     opening: TopicOpening,
 ) -> Result<OpenedTopic, OpenTopicError> {
-    // Step one: the session side. Fresh creates the session here (so no caller
-    // can forget it), Adopt gathers the snapshot while the mapping is still
-    // unwritten.
+    // Step one: the session side. Fresh records a Pending Session here (so no
+    // caller can forget the ADR-0041 rule that nothing is created yet); Adopt
+    // gathers the snapshot while the mapping is still unwritten.
     let parts = match opening {
         TopicOpening::Fresh { directory, name } => {
-            let session = core
-                .opencode
-                .create_session(&core.opencode.new_session_input(Some(&directory)))
-                .await?;
-            // Creation title policy (ADR-0007): a named `/topic` PATCHes the
-            // title; without a name the server default is left for
-            // auto-generation. The display name only drives the cover text.
-            if let Some(n) = &name {
-                core.opencode.update_session_title(&session.id, n).await?;
-            }
-            let display_title = name.unwrap_or_else(|| dir_basename(&directory));
+            let display_title = name.clone().unwrap_or_else(|| dir_basename(&directory));
             OpeningParts {
-                session_id: session.id,
                 directory,
                 display_title,
                 agent: None,
                 model: None,
                 seed: TopicSeed::ReplyHint,
+                side: OpeningSide::Pending { title: name },
                 snapshot_claim: None,
             }
         }
@@ -102,12 +100,12 @@ pub(crate) async fn open_topic(
             // claimable ones (the session's own, not already surfaced).
             let (card, data) = crate::bridge::snapshot::snapshot_card_for(core, "接管", &info).await;
             OpeningParts {
-                session_id: info.id,
                 directory: info.directory,
                 display_title: info.title.clone(),
                 agent: info.agent,
                 model: model_display(info.model.as_ref()),
                 seed: TopicSeed::Snapshot(card),
+                side: OpeningSide::Adopt { session_id: info.id },
                 snapshot_claim: Some(SnapshotClaim {
                     title: info.title,
                     data,
@@ -116,40 +114,74 @@ pub(crate) async fn open_topic(
         }
     };
 
-    // Step two: the shared cover/anchor/mapping tail. The fallback ladder
-    // lives in `open_cover_topic`, so every surface gets it.
-    let cover_text = topic_cover_text(
-        &parts.display_title,
-        &parts.directory,
-        &parts.session_id,
-        parts.agent.as_deref(),
-        parts.model.as_deref(),
-    )
-    .await;
+    // Step two: the shared cover/anchor/write tail. The fallback ladder lives
+    // in `open_cover_topic`, so every surface gets it. The cover differs by
+    // side: a pending topic has no session line yet (ADR-0041).
+    let cover_text = match &parts.side {
+        OpeningSide::Pending { .. } => pending_topic_cover_text(&parts.display_title, &parts.directory).await,
+        OpeningSide::Adopt { session_id } => {
+            topic_cover_text(
+                &parts.display_title,
+                &parts.directory,
+                session_id,
+                parts.agent.as_deref(),
+                parts.model.as_deref(),
+            )
+            .await
+        }
+    };
     let (anchor, thread_id, topic_root, cover_id) =
         open_cover_topic(core, chat_id, fallback_root, &cover_text, parts.seed).await?;
     let Some(thread_id) = thread_id else {
         tracing::warn!(
-            "topic: no thread_id returned in chat {} for session {}; not mapping session",
-            chat_id,
-            parts.session_id
+            "topic: no thread_id returned in chat {}; not recording the opening",
+            chat_id
         );
         return Err(OpenTopicError::NoThreadId);
     };
     let topic_key = ThreadKey::new(chat_id.to_string(), thread_id.clone());
-    let mut entry = SessionEntry::new(topic_key, parts.session_id.clone(), parts.directory);
-    entry.agent = parts.agent;
-    entry.topic_anchor = Some(anchor.clone());
-    entry.topic_root = Some(topic_root);
-    core.activate_session(entry).await?;
-    record_cover_title(
-        core,
-        &parts.session_id,
-        &parts.display_title,
-        parts.model,
-        cover_id.is_some(),
-    )
-    .await;
+    let session_id = match parts.side {
+        OpeningSide::Pending { title } => {
+            // ADR-0041: no backend session yet — the topic's first prompt
+            // creates it in this directory, applies the title and moves the
+            // overrides onto the SessionEntry.
+            let mut pending = PendingEntry::new(topic_key.clone(), parts.directory);
+            pending.title = title;
+            pending.topic_anchor = Some(anchor.clone());
+            pending.topic_root = Some(topic_root);
+            core.set_pending_session(pending).await?;
+            // The cover record must survive until materialisation; keyed by the
+            // pending's thread (it has no session id yet) and flagged pending so
+            // the first successful sync re-renders the full brief.
+            record_cover_title(
+                core,
+                &pending_cover_key(&topic_key),
+                &parts.display_title,
+                None,
+                cover_id.is_some(),
+                true,
+            )
+            .await;
+            None
+        }
+        OpeningSide::Adopt { session_id } => {
+            let mut entry = SessionEntry::new(topic_key, session_id.clone(), parts.directory);
+            entry.agent = parts.agent;
+            entry.topic_anchor = Some(anchor.clone());
+            entry.topic_root = Some(topic_root);
+            core.activate_session(entry).await?;
+            record_cover_title(
+                core,
+                &session_id,
+                &parts.display_title,
+                parts.model,
+                cover_id.is_some(),
+                false,
+            )
+            .await;
+            Some(session_id)
+        }
+    };
     // ADR-0028: claim the snapshot's embedded pendings against the in-topic
     // snapshot message (the topic's first message + anchor) so the poll loop
     // never duplicates them. Not reached when the topic could not be opened
@@ -159,25 +191,31 @@ pub(crate) async fn open_topic(
             .await;
     }
     Ok(OpenedTopic {
-        session_id: parts.session_id,
+        session_id,
         thread_id,
     })
 }
 
 /// The session-side facts the opening tail needs, assembled by each
-/// [`TopicOpening`] arm so the cover/anchor/mapping sequence itself exists
-/// once.
+/// [`TopicOpening`] arm so the cover/anchor/write sequence itself exists once.
 struct OpeningParts {
-    session_id: String,
     directory: String,
     display_title: String,
     agent: Option<String>,
     model: Option<String>,
     seed: TopicSeed,
+    side: OpeningSide,
     /// ADR-0028: the adopt snapshot's title and claimable data, settled
     /// against the in-topic seed after the mapping write. `None` for fresh
     /// sessions.
     snapshot_claim: Option<SnapshotClaim>,
+}
+
+/// Which of the two ADR-0041 session sides this opening writes: a Pending
+/// Session (fresh `/topic`) or a real Session Mapping (adopt).
+enum OpeningSide {
+    Pending { title: Option<String> },
+    Adopt { session_id: String },
 }
 
 /// The snapshot claim (ADR-0028) an adopted topic settles after its in-topic
@@ -189,15 +227,17 @@ struct SnapshotClaim {
 }
 
 /// The reply hint seeded as a fresh topic's first in-topic message
-/// (ADR-0023): it tells the user where to reply. Fresh-session topics
-/// (`/topic`, the `/dir` card's 建话题 op) seed with this text; adopted
-/// sessions seed with their Session Snapshot card instead (ADR-0028).
+/// (ADR-0023): it tells the user where to reply. Pending-session topics
+/// (`/topic`, the `/dir` card's 建话题 op — the session is created by the
+/// topic's first prompt, ADR-0041) seed with this text; adopted sessions seed
+/// with their Session Snapshot card instead (ADR-0028).
 const TOPIC_REPLY_HINT: &str = "请在本话题内回复，即可和这个会话对话。";
 
 /// What a newly created topic's FIRST in-topic message carries. That message
 /// is also the persisted `topic_anchor` (fallback-card routing, ADR-0006).
 enum TopicSeed {
-    /// The reply hint text — fresh sessions created around a new session.
+    /// The reply hint text — fresh (`/topic`) topics, pending or already
+    /// materialised.
     ReplyHint,
     /// The adopted session's Session Snapshot card (ADR-0028) — `/topic
     /// --adopt` and the switch card's 建话题接管 op.
@@ -219,17 +259,34 @@ async fn topic_cover_text(
     agent: Option<&str>,
     model: Option<&str>,
 ) -> String {
-    let git = crate::git::read_state(dir).await;
-    let mut s = format!("💬 `{title}`\n`{}`", dir_basename(dir));
-    if let Some(branch) = git.branch.as_deref() {
-        s.push_str(&format!(" · `{branch}`{}", if git.dirty { " ⚠" } else { "" }));
-    }
+    let mut s = topic_cover_head(title, dir).await;
     s.push_str(&format!("\n会话 `{}` · `{dir}`", id_tail(session_id)));
     if let Some(agent) = agent {
         s.push_str(&format!(" · agent `{agent}`"));
     }
     if let Some(model) = model {
         s.push_str(&format!(" · 模型 `{model}`"));
+    }
+    s
+}
+
+/// The pending variant of [`topic_cover_text`] (ADR-0041): no session exists
+/// yet, so the session line is replaced by the creation verb and the directory
+/// — 「会话」 stays reserved for a real Session. After materialisation the
+/// title-sync hook rebuilds the card as the full brief.
+async fn pending_topic_cover_text(title: &str, dir: &str) -> String {
+    let mut s = topic_cover_head(title, dir).await;
+    s.push_str(&format!("\n下一条消息创建 · `{dir}`"));
+    s
+}
+
+/// The two cover cards' shared first lines (ADR-0023): the title and the
+/// project + git state.
+async fn topic_cover_head(title: &str, dir: &str) -> String {
+    let git = crate::git::read_state(dir).await;
+    let mut s = format!("💬 `{title}`\n`{}`", dir_basename(dir));
+    if let Some(branch) = git.branch.as_deref() {
+        s.push_str(&format!(" · `{branch}`{}", if git.dirty { " ⚠" } else { "" }));
     }
     s
 }
@@ -276,10 +333,12 @@ async fn open_cover_topic(
 /// topic cover card, rebuild the card in place. The cover card is the thread
 /// root, so this is what the chat-list topic entry displays — the patch keeps
 /// the entry current after the first auto-generated title (post-turn hook) or
-/// an immediate `/name`. The recorded title lives only in memory: after a
-/// restart the next completed turn re-syncs the card once (same content,
-/// harmless). Best effort; failures only log. Only cover-rooted topics are
-/// patched — command-rooted fallback topics record nothing, so they
+/// an immediate `/name`. A record still flagged `pending` (ADR-0041: the card
+/// was written while the session did not exist, so it shows 「下一条消息创建」)
+/// is re-rendered even when the title matches. The recorded title lives only in
+/// memory: after a restart the next completed turn re-syncs the card once (same
+/// content, harmless). Best effort; failures only log. Only cover-rooted topics
+/// are patched — command-rooted fallback topics record nothing, so they
 /// short-circuit.
 ///
 /// Returns `true` when the card is settled (nothing more to do: no cover
@@ -311,14 +370,15 @@ pub(crate) async fn sync_topic_cover_title(core: &Arc<SharedCore>, session_id: &
     // Never patch a default title over the recorded one: the server's initial
     // `New session - <ts>` (or empty) would otherwise replace the meaningful
     // creation title (e.g. the directory name) the moment the auto-title has
-    // not (yet) been generated.
+    // not (yet) been generated. The pending flag does not lift this rule — a
+    // pending cover waits for a real title too.
     let Some(title) = info
         .title
         .filter(|t| !t.is_empty() && !crate::feishu::card::clean_session_label(t).is_empty())
     else {
         return false;
     };
-    if title == recorded.title {
+    if title == recorded.title && !recorded.pending {
         return true;
     }
     let text = topic_cover_text(
@@ -338,6 +398,7 @@ pub(crate) async fn sync_topic_cover_title(core: &Arc<SharedCore>, session_id: &
                 crate::bridge::core::CoverTitle {
                     title,
                     model: recorded.model,
+                    pending: false,
                 },
             );
             true
@@ -400,24 +461,92 @@ pub(crate) fn spawn_cover_title_retry_at(
 /// hook can sync the server title onto the card. Only cover-rooted topics are
 /// patchable (Feishu updates only the app's own cards) — when no cover card
 /// was sent, any stale entry is dropped so nothing is ever patched onto a
-/// user message.
+/// user message. `key` is the session id, or [`pending_cover_key`] while the
+/// topic's session is still pending (ADR-0041).
 async fn record_cover_title(
     core: &Arc<SharedCore>,
-    session_id: &str,
+    key: &str,
     title: &str,
     model: Option<String>,
     cover_sent: bool,
+    pending: bool,
 ) {
     let mut covers = core.cover_titles.lock().await;
     if cover_sent {
         covers.insert(
-            session_id.to_string(),
+            key.to_string(),
             crate::bridge::core::CoverTitle {
                 title: title.to_string(),
                 model,
+                pending,
             },
         );
     } else {
-        covers.remove(session_id);
+        covers.remove(key);
+    }
+}
+
+/// The cover-title cache key for a topic whose session is still pending
+/// (ADR-0041): there is no session id yet, so the record rides the topic's
+/// ThreadKey until materialisation or adoption claims it for a real session.
+fn pending_cover_key(key: &ThreadKey) -> String {
+    format!("pending:{}:{}", key.chat_id, key.thread_id)
+}
+
+/// ADR-0041 + ADR-0023: move a pending topic's cover record onto the real
+/// session that replaced it and re-render the cover at once. The cover still
+/// shows 「下一条消息创建」, so the first successful re-render replaces it with
+/// the full brief; when the server title is not yet available, the post-turn
+/// retry ladder finishes the job. No-op for topics without a sent cover card
+/// (fallback-rooted: nothing was recorded) and for non-topic pendings.
+pub(crate) async fn claim_pending_cover(core: &Arc<SharedCore>, key: &ThreadKey, session_id: &str) {
+    let claimed = {
+        let mut covers = core.cover_titles.lock().await;
+        if let Some(cover) = covers.remove(&pending_cover_key(key)) {
+            covers.insert(session_id.to_string(), cover);
+            true
+        } else {
+            false
+        }
+    };
+    if claimed {
+        sync_topic_cover_title(core, session_id).await;
+    }
+}
+
+/// ADR-0041 + ADR-0023: `/name` on a pending topic re-renders its cover card
+/// immediately — no server session exists yet, so the title-sync path cannot
+/// run. The recorded title follows so the post-materialisation re-render
+/// compares against what the card shows. A fallback-rooted topic (cover send
+/// failed) recorded nothing and is left alone: its root is the user's command
+/// message and cannot be patched.
+pub(crate) async fn rename_pending_cover(core: &Arc<SharedCore>, key: &ThreadKey, title: &str) {
+    let pending_root = {
+        let store = core.sessions.lock().await;
+        store
+            .pending_for(key)
+            .map(|p| (p.topic_root.clone(), p.directory.clone()))
+    };
+    let Some((Some(root_id), directory)) = pending_root else {
+        return;
+    };
+    let cache_key = pending_cover_key(key);
+    if !core.cover_titles.lock().await.contains_key(&cache_key) {
+        return;
+    }
+    let text = pending_topic_cover_text(title, &directory).await;
+    let card = crate::feishu::client::markdown_card(&text);
+    match core.feishu.update_message(&root_id, &card).await {
+        Ok(()) => {
+            if let Some(cover) = core.cover_titles.lock().await.get_mut(&cache_key) {
+                cover.title = title.to_string();
+            }
+            tracing::info!(
+                "pending topic cover retitled to {:?} for {}",
+                title,
+                key.thread_id
+            );
+        }
+        Err(e) => tracing::warn!("pending topic cover retitle failed for {}: {}", key.thread_id, e),
     }
 }

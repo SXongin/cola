@@ -495,17 +495,20 @@ impl App {
         // thread root (the user's `/topic` command, `topic_root`) and the seed
         // card (`topic_anchor`). Feishu reports a plain topic reply's parent_id
         // pointing at the root, so without this guard every prompt in a
-        // cola-created topic would carry boilerplate. Manually-created topics
-        // leave both `None`, so their user-typed root still injects.
+        // cola-created topic would carry boilerplate. A topic whose session is
+        // still pending (`get_active` is `None`, ADR-0041) carries the same
+        // anchors on its PendingEntry, so check there too. Manually-created
+        // topics leave both `None`, so their user-typed root still injects.
         let parent_is_topic_creation = match parent_id.as_deref() {
-            Some(pid) => self
-                .sessions
-                .lock()
-                .await
-                .get_active(&thread_key)
-                .is_some_and(|e| {
-                    e.topic_root.as_deref() == Some(pid) || e.topic_anchor.as_deref() == Some(pid)
-                }),
+            Some(pid) => {
+                let store = self.sessions.lock().await;
+                match store.pending_for(&thread_key) {
+                    Some(p) => p.topic_root.as_deref() == Some(pid) || p.topic_anchor.as_deref() == Some(pid),
+                    None => store.get_active(&thread_key).is_some_and(|e| {
+                        e.topic_root.as_deref() == Some(pid) || e.topic_anchor.as_deref() == Some(pid)
+                    }),
+                }
+            }
             None => false,
         };
         if let Some(pid) = parent_id.as_deref().filter(|_| !parent_is_topic_creation) {
@@ -694,9 +697,15 @@ impl App {
                 .await;
         }
         let entry = pending.into_entry(session.id.clone());
+        let thread_key = entry.thread_key.clone();
         // The core wrapper (not the raw store) so the session-list cache is
         // invalidated: `/list`/`/switch` must see the just-created session.
         self.activate_session(entry).await?;
+        // ADR-0041 + ADR-0023: a pending topic's cover still says
+        // 「下一条消息创建」. Move its record onto the new session and re-render
+        // now — a real Session exists, so the brief (title/id) belongs on the
+        // card. No-op for lobby pendings and fallback-rooted topics.
+        crate::bridge::topic::claim_pending_cover(&self.core, &thread_key, &session.id).await;
         Ok(session.id)
     }
 
@@ -1018,7 +1027,14 @@ impl App {
         // In a topic the patched card lives INSIDE it, so persist its own
         // message id as the fallback-card anchor (same anchor semantics as the
         // text in-topic adopt, ADR-0028): later permission/question cards reply
-        // to it and stay in the topic.
+        // to it and stay in the topic. When the topic's session was still
+        // pending (ADR-0041), carry its cover root too so the quote-injection
+        // guard keeps excluding the topic's own root and the cover record can
+        // be claimed for the adopted session.
+        let pending_topic_root = {
+            let store = core.sessions.lock().await;
+            store.pending_for(thread_key).and_then(|p| p.topic_root.clone())
+        };
         let topic_anchor = if thread_key.thread_id != thread_key.chat_id {
             open_message_id.clone()
         } else {
@@ -1028,9 +1044,11 @@ impl App {
             crate::config::SessionEntry::new(thread_key.clone(), target.id.clone(), target.directory.clone());
         entry.agent = target.agent.clone();
         entry.topic_anchor = topic_anchor;
+        entry.topic_root = pending_topic_root;
         if let Err(e) = core.activate_session(entry).await {
             tracing::warn!("switch card adopt: persist failed: {}", e);
         }
+        crate::bridge::topic::claim_pending_cover(core, thread_key, &target.id).await;
         if let (Some(message_id), Some(data)) = (&open_message_id, &claim_data) {
             crate::bridge::external::settle_snapshot_after_send(core, message_id, verb, &target.title, data)
                 .await;
@@ -1188,7 +1206,7 @@ impl App {
                 {
                     Ok(_opened) => Some(CardActionResult {
                         card: Some(self.build_dir_card_for(core, &thread_key).await),
-                        toast: Some(format!("已建话题并新建会话（{display}）")),
+                        toast: Some(format!("已建话题（{display}）——下一条消息创建会话")),
                     }),
                     Err(crate::bridge::topic::OpenTopicError::NoThreadId) => Some(CardActionResult {
                         card: None,
