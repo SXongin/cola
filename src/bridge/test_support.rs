@@ -46,6 +46,20 @@ pub enum PlatformCall {
     },
 }
 
+/// A one-shot gate on one platform call, so a test can freeze a card write
+/// mid-send and interleave another writer (the concurrency races ADR-0038's
+/// "one writer per card" invariant depends on).
+pub struct CallGate {
+    /// `"update"` (= `update_message`) or `"reply"` (= `reply_card`).
+    pub method: &'static str,
+    /// The message the gated call targets (`message_id` / `reply_to`).
+    pub target: String,
+    /// Signalled when the gated call has been entered (the caller is parked).
+    pub entered: Arc<tokio::sync::Notify>,
+    /// The parked call proceeds once this is signalled.
+    pub release: Arc<tokio::sync::Notify>,
+}
+
 /// Records every card cola would send, instead of posting to Feishu.
 pub struct RecordingPlatform {
     pub calls: Arc<tokio::sync::Mutex<Vec<PlatformCall>>>,
@@ -65,6 +79,9 @@ pub struct RecordingPlatform {
     /// the default text parent). Lets tests script quote-injection cases.
     pub quoted_messages:
         std::sync::Mutex<std::collections::HashMap<String, crate::feishu::client::FeishuMessage>>,
+    /// One-shot mid-send pause installed by a concurrency test (absent in
+    /// every other test). Taken by the first matching call.
+    pub pause_call: std::sync::Mutex<Option<CallGate>>,
 }
 
 impl RecordingPlatform {
@@ -77,6 +94,35 @@ impl RecordingPlatform {
             fail_reply_card: false,
             reply_in_thread_thread_id: Some("omt_created_topic".into()),
             quoted_messages: std::sync::Mutex::new(std::collections::HashMap::new()),
+            pause_call: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Park the first `method` call targeting `target` until `release`, after
+    /// signalling `entered`. Returns `(entered, release)` for the test to
+    /// await and trigger.
+    pub fn pause(
+        &self,
+        method: &'static str,
+        target: &str,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.pause_call.lock().unwrap() = Some(CallGate {
+            method,
+            target: target.to_string(),
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        (entered, release)
+    }
+
+    /// Take the installed gate when this call matches it.
+    fn take_gate(&self, method: &str, target: &str) -> Option<CallGate> {
+        let mut slot = self.pause_call.lock().unwrap();
+        match slot.as_ref() {
+            Some(gate) if gate.method == method && gate.target == target => slot.take(),
+            _ => None,
         }
     }
 
@@ -148,6 +194,12 @@ impl RecordingPlatform {
     }
 }
 
+/// Park on `gate` until the test releases it.
+async fn wait_gate(gate: CallGate) {
+    gate.entered.notify_one();
+    gate.release.notified().await;
+}
+
 /// Walk a card and collect every button's `value` payload (buttons nest in
 /// column sets and action blocks, so the walk is recursive).
 fn collect_button_values(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
@@ -183,6 +235,9 @@ impl feishu::Platform for RecordingPlatform {
                 "simulated reply_card failure".into(),
             ));
         }
+        if let Some(gate) = self.take_gate("reply", reply_to) {
+            wait_gate(gate).await;
+        }
         self.calls.lock().await.push(PlatformCall::ReplyCard {
             reply_to: reply_to.into(),
             card: card.clone(),
@@ -209,6 +264,9 @@ impl feishu::Platform for RecordingPlatform {
     }
 
     async fn update_message(&self, message_id: &str, card: &serde_json::Value) -> crate::error::Result<()> {
+        if let Some(gate) = self.take_gate("update", message_id) {
+            wait_gate(gate).await;
+        }
         self.calls.lock().await.push(PlatformCall::UpdateMessage {
             message_id: message_id.into(),
             card: card.clone(),

@@ -216,15 +216,19 @@ impl CardHandles {
     /// to them: an accumulator's own flush repaints the card its
     /// `card_message_id` names (passed in `flush_owned`, `request_id → card`),
     /// and a directory whose list call failed said nothing, so its request may
-    /// still be pending (#130, #144). A block the accumulator owns but whose
-    /// handle points at a DIFFERENT, older card is not skipped: that stale card
-    /// shows the block too and must be repainted (ADR-0038, rule 2). Returns
-    /// `(message_id, card)` per affected card for the caller to patch.
+    /// still be pending (#130, #144). A block cola itself is answering
+    /// (`answered`) is also left to its settlement — cola's disappearance from
+    /// the pending list is not "another client handled it". A block the
+    /// accumulator owns but whose handle points at a DIFFERENT, older card is
+    /// not skipped: that stale card shows the block too and must be repainted
+    /// (ADR-0038, rule 2). Returns `(message_id, card)` per affected card for
+    /// the caller to patch.
     pub fn drop_vanished(
         &mut self,
         kind: ClaimKind,
         pending: &HashSet<String>,
         failed_dirs: &HashSet<String>,
+        claimed: &HashSet<String>,
         flush_owned: &HashMap<String, String>,
         line: impl Fn(&str) -> String,
     ) -> Vec<(String, serde_json::Value)> {
@@ -234,6 +238,7 @@ impl CardHandles {
             .filter(|(id, h)| {
                 h.kind == kind
                     && !pending.contains(*id)
+                    && !claimed.contains(*id)
                     && !failed_dirs.contains(&h.directory)
                     && flush_owned.get(*id) != Some(&h.message_id)
             })
@@ -454,11 +459,19 @@ mod tests {
 
     /// The sweep's registry pass resolves only blocks that are gone AND
     /// outside a failed directory AND not already owned by the flush that will
-    /// repaint them, and only its own kind.
+    /// repaint them AND not claimed by cola's own settlement, and only its own
+    /// kind.
     #[test]
-    fn drop_vanished_skips_owned_pending_and_failed_blocks() {
+    fn drop_vanished_skips_owned_pending_failed_and_claimed_blocks() {
         let mut handles = CardHandles::default();
-        let c = card(vec![text("a"), text("b"), text("c"), text("d"), text("e")]);
+        let c = card(vec![
+            text("a"),
+            text("b"),
+            text("c"),
+            text("d"),
+            text("e"),
+            text("f"),
+        ]);
         let mut failed = block("p_failed", 1, 2, ClaimKind::Permission);
         failed.directory = "/failed".into();
         let mut stale = block("p_stale", 2, 3, ClaimKind::Permission);
@@ -472,6 +485,7 @@ mod tests {
                 stale,
                 block("q_other", 3, 4, ClaimKind::Question),
                 block("p_pending", 4, 5, ClaimKind::Permission),
+                block("p_claimed", 5, 6, ClaimKind::Permission),
             ],
         );
         // The accumulator owns p_stale, but its flush repaints `om_other`, not
@@ -484,21 +498,26 @@ mod tests {
 
         let pending: HashSet<String> = ["p_pending".to_string()].into();
         let failed_dirs: HashSet<String> = ["/failed".to_string()].into();
+        let claimed: HashSet<String> = ["p_claimed".to_string()].into();
         let flush_owned: HashMap<String, String> = [
             ("p_owned".to_string(), "om_other".to_string()),
             ("p_stale".to_string(), "om_other".to_string()),
         ]
         .into();
-        let dropped =
-            handles.drop_vanished(ClaimKind::Permission, &pending, &failed_dirs, &flush_owned, |t| {
-                format!("⏱ {t}")
-            });
+        let dropped = handles.drop_vanished(
+            ClaimKind::Permission,
+            &pending,
+            &failed_dirs,
+            &claimed,
+            &flush_owned,
+            |t| format!("⏱ {t}"),
+        );
 
         assert_eq!(dropped.len(), 1, "only the stale card is repainted once");
         assert_eq!(dropped[0].0, "om_1");
         assert_eq!(
             contents(&dropped[0].1),
-            vec!["⏱ target-p_gone", "b", "⏱ target-p_stale", "d", "e"],
+            vec!["⏱ target-p_gone", "b", "⏱ target-p_stale", "d", "e", "f"],
             "the gone block AND the owned-but-stale block resolved on this card"
         );
         assert_eq!(handles.message_of("p_gone"), None);
@@ -511,6 +530,10 @@ mod tests {
         assert!(handles.message_of("p_failed").is_some());
         assert!(handles.message_of("q_other").is_some());
         assert!(handles.message_of("p_pending").is_some());
+        assert!(
+            handles.message_of("p_claimed").is_some(),
+            "cola's own in-flight settlement owns this block, not the sweep"
+        );
     }
 
     #[test]
