@@ -66,7 +66,7 @@ The snapshot never: injects a prompt or any write into the session, spends token
 - **Suppression is a heuristic**: "newest user message is cola-authored ⟹ recent life visible here" (a session maps to at most one thread). A `--force`-stolen session whose last cola-authored messages came from the previous thread could be wrongly suppressed; rare, and the user can re-invoke `/switch`. Losing the tail there is acceptable.
 - `GET /session/status` reflects the attached server instance only — consistent with the one-server Shared Store invariant (ADR-0005, ADR-0013). After a server restart an in-flight run is lost anyway, so `idle` is the correct post-restart answer.
 - Patching the switch-card into a snapshot discards the session list; accepted — the action is complete.
-- The busy-follow's accumulator composition with claimed pending blocks needs implementation care in `request.rs`/`render.rs` (a blocked external run approved from the snapshot then streams the rest); verify against `retain_inline` and the `submit_epoch_ms` replacement guard.
+- The busy-follow's accumulator composition with claimed pending blocks needs implementation care in `request.rs`/`render.rs` (a blocked external run approved from the snapshot then streams the rest); verify against `retain_inline` and the `turn_started_ms` replacement guard.
 - **Child-session (sub-task) pending permissions keep today's standalone delivery** via the parent-chain walk (pitfall #11); the snapshot embeds only same-session requests. Surfacing a descendant's blockers on the parent's snapshot is possible future work.
 - The tail window (four messages) and suppression heuristic may need tuning from real use; both are presentation-level constants, not protocol.
 

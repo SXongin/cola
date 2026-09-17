@@ -522,7 +522,7 @@ async fn busy_adopt_streams_turn_into_snapshot() {
         .cloned()
         .expect("follow armed a host accumulator");
     assert_eq!(acc.card_message_id.as_deref(), Some("msg_reply"));
-    assert!(acc.acc.submit_epoch_ms.is_some(), "turn epoch set");
+    assert!(acc.acc.turn_started_ms.is_some(), "turn anchor set");
     assert!(
         app.core.snapshot_claims.lock().await.claim_count() == 0,
         "busy follow hosts its blocks inline, not claimed"
@@ -929,7 +929,7 @@ async fn user_prompt_during_follow_takes_over() {
         .cloned()
         .expect("follow armed")
         .acc
-        .submit_epoch_ms;
+        .turn_started_ms;
 
     // The user prompts cola in the thread.
     app.handle_message(incoming(
@@ -951,7 +951,7 @@ async fn user_prompt_during_follow_takes_over() {
         .cloned()
         .expect("the prompt inserted its own accumulator")
         .acc
-        .submit_epoch_ms;
+        .turn_started_ms;
     assert_ne!(new_epoch, follow_epoch, "the follow accumulator was replaced");
     let calls = platform.calls.lock().await.clone();
     assert!(
