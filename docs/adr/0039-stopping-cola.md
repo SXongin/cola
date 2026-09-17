@@ -63,3 +63,22 @@ stops the running instance, and `autostart disable` means stop + unregister.
   "running" under this definition, so `cola stop` reports 未运行 without
   cleaning it up. systemd's start limit bounds the Linux case; on macOS a
   manual `launchctl bootout` bounds it.
+
+## Update (2026-09-17)
+
+`autostart disable`'s stop half missed supervised instances that never take the
+Singleton Lock. The lock is acquired after config/log setup, so a unit that is
+still activating — or crash-looping — has no lock holder; `stop_running_cola`
+treated that as 未运行 and returned before its Supervisor branch, and the
+platform `disable` only unregisters (`systemctl --user disable` does not stop
+an active unit). The instance then kept running, and a later `autostart enable`
+repointed ExecStart at the new binary, silently leaving the old instance alive.
+
+`autostart disable` now asks the registered Supervisor to stop the unit when it
+is active and no live lock holder exists (`stop_supervised_without_holder`, via
+`supervisor_is_active`). The widened scope is bounded by the Supervisor's own
+state — `systemctl --user is-active` / `launchctl print` — so an inactive or
+unloaded unit is never poked. `cola stop` keeps the lock-holder definition, so
+the crash-loop limitation above still applies to it. A declined stop is
+unaffected: the prompt only appears for a live lock holder, and declining still
+leaves the instance running.
