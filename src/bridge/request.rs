@@ -106,7 +106,7 @@ pub trait RequestKind: Send + Sync {
         acc: &mut StreamAccumulator,
         pending: &std::collections::HashSet<String>,
         failed_dirs: &std::collections::HashSet<String>,
-        claimed: &std::collections::HashSet<String>,
+        cola_claimed: &std::collections::HashSet<String>,
     ) -> usize;
 
     /// The snapshot-claim kind of this flow's requests (ADR-0028): each flow's
@@ -146,14 +146,14 @@ fn resolve_vanished_blocks(
     acc: &mut StreamAccumulator,
     pending: &std::collections::HashSet<String>,
     failed_dirs: &std::collections::HashSet<String>,
-    claimed: &std::collections::HashSet<String>,
+    cola_claimed: &std::collections::HashSet<String>,
     own: impl Fn(&InteractionBlock) -> bool,
 ) -> usize {
     acc.resolve_vanished(
         |block| {
             own(block)
                 && !pending.contains(block.request_id())
-                && !claimed.contains(block.request_id())
+                && !cola_claimed.contains(block.request_id())
                 && !failed_dirs.contains(block.directory())
         },
         |block| handled_elsewhere_receipt(&block.receipt_target()),
@@ -259,9 +259,9 @@ impl RequestKind for PermissionKind {
         acc: &mut StreamAccumulator,
         pending: &std::collections::HashSet<String>,
         failed_dirs: &std::collections::HashSet<String>,
-        claimed: &std::collections::HashSet<String>,
+        cola_claimed: &std::collections::HashSet<String>,
     ) -> usize {
-        resolve_vanished_blocks(acc, pending, failed_dirs, claimed, |block| {
+        resolve_vanished_blocks(acc, pending, failed_dirs, cola_claimed, |block| {
             matches!(block, InteractionBlock::Permission(_))
         })
     }
@@ -685,9 +685,9 @@ impl RequestKind for QuestionKind {
         acc: &mut StreamAccumulator,
         pending: &std::collections::HashSet<String>,
         failed_dirs: &std::collections::HashSet<String>,
-        claimed: &std::collections::HashSet<String>,
+        cola_claimed: &std::collections::HashSet<String>,
     ) -> usize {
-        resolve_vanished_blocks(acc, pending, failed_dirs, claimed, |block| {
+        resolve_vanished_blocks(acc, pending, failed_dirs, cola_claimed, |block| {
             matches!(block, InteractionBlock::Question(_))
         })
     }
@@ -1576,8 +1576,7 @@ impl RequestFlow {
         // writing the true receipt, so the sweep must not read their
         // disappearance from the pending list as another client's work.
         // Snapshot once — every pass below must judge the same moment.
-        let mut claimed = core.answered_requests.lock().await.clone();
-        claimed.extend(core.settling_requests.lock().await.iter().cloned());
+        let cola_claimed = core.claimed_requests().await;
         // Card handles (ADR-0038, rule 2): a live block on a card whose
         // accumulator is gone (a replaced/aborted turn) is repainted from the
         // cached JSON — the accumulator pass below only reaches the card its
@@ -1602,7 +1601,7 @@ impl RequestFlow {
             self.kind.claim_kind(),
             &pending,
             &failed_dirs,
-            &claimed,
+            &cola_claimed,
             &flush_owned,
             handled_elsewhere_receipt,
         );
@@ -1628,7 +1627,7 @@ impl RequestFlow {
             for (session_id, card) in cards.iter_mut() {
                 if self
                     .kind
-                    .resolve_vanished_inline(&mut card.acc, &pending, &failed_dirs, &claimed)
+                    .resolve_vanished_inline(&mut card.acc, &pending, &failed_dirs, &cola_claimed)
                     > 0
                 {
                     affected.push(session_id.clone());

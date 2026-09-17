@@ -40,6 +40,12 @@ pub struct CoverTitle {
 /// `/think`/`/model` cards (the Lazy Start silent-hang incident).
 pub(crate) const SESSION_INFO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// How long a settlement claim may sit before it is treated as abandoned (see
+/// `SharedCore::claimed_requests`). A live settlement renders its receipt within
+/// one Feishu round trip; the bound only ever fires when the task that took the
+/// claim was cancelled.
+pub(crate) const SETTLING_CLAIM_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// State shared across every flow: the session map, the per-session live cards
 /// ([`CardSession`] — accumulator + card identity in one place), the two
 /// request flows (permission/question pollers + card actions, on the core so
@@ -85,10 +91,14 @@ pub struct SharedCore {
     /// not rendered yet. While an id sits here its disappearance from the
     /// pending list is cola's own doing, so the sweep's vanished passes must
     /// not read it as another client's resolution (`resolve_blocks` clears the
-    /// mark once it settled). Kept apart from `answered_requests`: that one
+    /// claim once it settled). Kept apart from `answered_requests`: that one
     /// makes `mark_stale_cards` skip a card, and a standalone card approved by
     /// `/autoaccept on` still needs the sweep to repaint its buttons away.
-    pub settling_requests: Arc<Mutex<HashSet<String>>>,
+    /// Each entry carries its claim time; a claim older than
+    /// [`SETTLING_CLAIM_TTL`] is abandoned (the settlement task was cancelled
+    /// between the approval and the receipt) and `claimed_requests` drops it,
+    /// so the sweep can finish the request instead of suppressing it forever.
+    pub settling_requests: Arc<Mutex<HashMap<String, std::time::Instant>>>,
     /// Session ids with a prompt currently in flight (serializes prompts per
     /// session so concurrent messages don't clobber each other's cards).
     pub inflight: Arc<Mutex<HashSet<String>>>,
@@ -150,7 +160,7 @@ impl SharedCore {
                 crate::bridge::snapshot_claims::SnapshotClaims::default(),
             )),
             answered_requests: Arc::new(Mutex::new(HashSet::new())),
-            settling_requests: Arc::new(Mutex::new(HashSet::new())),
+            settling_requests: Arc::new(Mutex::new(HashMap::new())),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             cover_titles: Arc::new(Mutex::new(HashMap::new())),
             work_dir: cfg
@@ -180,6 +190,22 @@ impl SharedCore {
             .entry(session_id.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    /// The requests cola itself is answering or has answered — `answered_requests`
+    /// plus the live `settling_requests` claims. The sweep's vanished passes
+    /// take one snapshot of this per pass: a request that disappeared from the
+    /// pending list because cola handled it must never be read as another
+    /// client's resolution. A settlement claim older than
+    /// [`SETTLING_CLAIM_TTL`] is dropped here: its task died before rendering
+    /// the receipt, and suppressing the request forever would strand its card.
+    pub(crate) async fn claimed_requests(&self) -> HashSet<String> {
+        let mut claimed = self.answered_requests.lock().await.clone();
+        let mut settling = self.settling_requests.lock().await;
+        let now = std::time::Instant::now();
+        settling.retain(|_, at| now.duration_since(*at) < SETTLING_CLAIM_TTL);
+        claimed.extend(settling.keys().cloned());
+        claimed
     }
 
     /// The directory a brand-new session starts in: `[bridge] work_dir` when
@@ -469,7 +495,12 @@ impl SharedCore {
             // `⏱ 已由其他客户端处理` on the card — the lie the Host saw when
             // enabling auto-accept. `resolve_blocks` clears the claim once the
             // true receipt rendered; a failed reply releases it right here.
-            let claimed_here = self.settling_requests.lock().await.insert(p.request_id.clone());
+            let claimed_here = self
+                .settling_requests
+                .lock()
+                .await
+                .insert(p.request_id.clone(), std::time::Instant::now())
+                .is_none();
             match self
                 .opencode
                 .clone()
@@ -560,6 +591,36 @@ mod tests {
         assert!(app.remove_session("ses_x").await.unwrap().is_some());
         app.cached_session_list().await.unwrap();
         assert_eq!(sessions_fetches.load(Ordering::SeqCst), 3, "remove invalidates");
+    }
+
+    /// A settlement claim older than the TTL is abandoned: the sweep must not
+    /// keep suppressing a request whose settlement task was cancelled between
+    /// the reply and the receipt.
+    #[tokio::test]
+    async fn claimed_requests_drops_an_abandoned_settlement_claim() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+        let stale = std::time::Instant::now()
+            .checked_sub(SETTLING_CLAIM_TTL + std::time::Duration::from_secs(1))
+            .unwrap();
+        app.settling_requests.lock().await.insert("per_old".into(), stale);
+        let claimed = app.claimed_requests().await;
+
+        assert!(!claimed.contains("per_old"));
+        assert!(
+            app.settling_requests.lock().await.is_empty(),
+            "the abandoned claim is pruned, not re-read"
+        );
+
+        // A fresh claim is honoured.
+        app.settling_requests
+            .lock()
+            .await
+            .insert("per_new".into(), std::time::Instant::now());
+        assert!(app.claimed_requests().await.contains("per_new"));
     }
 
     /// The override write path must not silently switch the Active Session:
