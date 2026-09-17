@@ -37,9 +37,9 @@ tap-to-answer cards.
   store as OpenChamber and the CLI, so sessions started anywhere can be adopted
   (`/switch`, with a snapshot of what's pending) and messages sent from another
   client are surfaced back into Feishu.
-- **A topic per task.** `/topic <dir>` opens a Feishu topic bound to one session
-  in that project, with a cover card that keeps the title, project, branch and
-  model visible and up to date.
+- **A topic per task.** `/topic <dir>` opens a Feishu topic whose first message
+  creates the session in that project, with a cover card that keeps the title,
+  project, branch and model visible and up to date.
 - **Steer without restarting.** `/model`, `/agent`, `/think` and `/autoaccept`
   are per-session overrides applied to the next message.
 - **Private by default.** A fresh cola refuses everyone until you claim it with

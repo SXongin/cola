@@ -286,7 +286,7 @@ pub fn help_text() -> String {
 `/switch <id> [--force]` · Take over a session by id/title
 `/switch forget` · Un-map this chat's session (server session stays)
 `/new [name]` · Declare a new session in the current project (created by the next message; no session → default dir)
-`/topic [dir] [name]` · Create a new Feishu topic + session in <dir> (bare `/topic` uses the current project)
+`/topic [dir] [name]` · Create a new Feishu topic in <dir>; the topic's first message creates the session (bare `/topic` uses the current project)
 `/topic --adopt <kw> [--force]` · Open a topic around an existing session
 `/name <name>` · Rename current session (server-side)
 `/stop` · Interrupt execution
@@ -328,7 +328,7 @@ pub fn command_help(name: &str) -> Option<String> {
             "/new [name]\nDeclare a new session in the current project (the active session's directory, or the pending's when one is already declared); with neither, the default directory (`work_dir` or cwd). Nothing is created yet: the conversation's next non-command message creates the session and maps it here, so a mistaken `/new` can be corrected with another `/new`, `/dir`, `/switch` or `/topic` and leaves no session behind. The optional name becomes the created session's server title.\nExample: `/new api-refactor`"
         }
         "topic" => {
-            "/topic [dir] [name]\nCreate a real Feishu topic backed by a new session. The topic is UI-separated from the current conversation, so you can switch between topics in the Feishu client. Reply inside the created topic to talk to that session.\n- `/topic` (no args) — new session in the CURRENT PROJECT (the active session's directory, like `/new`; falls back to the default directory when the conversation has no session)\n- `/topic <dir>` — new session rooted at <dir>\n- `/topic <dir> <name>` — also name the session\nExample: `/topic /root/proj/lib api-refactor`\n\n/topic --adopt <keyword> [--force]\nOpen a topic around an EXISTING session instead of creating a new one. Resolution: exact id → unique id-prefix (the short hash shown on the card works too) → unique title substring (the whole remaining arg is the keyword, so multi-word titles match). Child (sub-task) sessions are rejected. If the session belongs to another chat, reject unless `--force` (which steals the mapping). No argument pops the session card — each row's 建话题接管 button does the same, and an occupied session offers a 强制建话题接管 confirmation.\nExample: `/topic --adopt 重写登录模块`"
+            "/topic [dir] [name]\nCreate a real Feishu topic for a new session. The topic is UI-separated from the current conversation, so you can switch between topics in the Feishu client. Opening the topic creates NO session yet: the topic's first non-command message creates the session in the chosen directory and maps it here, so a mistaken `/topic` leaves nothing in the shared store — correct it in place with `/switch <id>` (or `/dir`/`/new`) inside the topic.\n- `/topic` (no args) — new session in the CURRENT PROJECT (the active session's directory, like `/new`; falls back to the default directory when the conversation has no session)\n- `/topic <dir>` — new session rooted at <dir>\n- `/topic <dir> <name>` — also name the session\nExample: `/topic /root/proj/lib api-refactor`\n\n/topic --adopt <keyword> [--force]\nOpen a topic around an EXISTING session instead of creating a new one. Resolution: exact id → unique id-prefix (the short hash shown on the card works too) → unique title substring (the whole remaining arg is the keyword, so multi-word titles match). Child (sub-task) sessions are rejected. If the session belongs to another chat, reject unless `--force` (which steals the mapping). No argument pops the session card — each row's 建话题接管 button does the same, and an occupied session offers a 强制建话题接管 confirmation.\nExample: `/topic --adopt 重写登录模块`"
         }
         "name" => {
             "/name <name>\nRename the current session server-side (visible to every client sharing the store).\nExample: `/name frontend`"
@@ -585,9 +585,10 @@ pub(crate) async fn handle_command(
                 }
                 None => core.current_project_directory(&thread_key).await,
             };
-            // Open the topic in one transaction: session creation, cover card
-            // (ADR-0023), in-topic seed and Session Mapping all live in
-            // `bridge::topic`.
+            // Open the topic in one transaction (ADR-0041): the cover card
+            // (ADR-0023), in-topic seed and Pending Session all live in
+            // `bridge::topic`; no server session is created here — the topic's
+            // first non-command message materialises the pending.
             match crate::bridge::topic::open_topic(
                 core,
                 &thread_key.chat_id,
@@ -601,9 +602,8 @@ pub(crate) async fn handle_command(
             {
                 Ok(opened) => {
                     tracing::info!(
-                        "topic: created topic {} for session {} in chat {}",
+                        "topic: opened topic {} with a pending session in chat {}",
                         opened.thread_id,
-                        opened.session_id,
                         thread_key.chat_id
                     );
                 }
@@ -646,6 +646,10 @@ pub(crate) async fn handle_command(
                 .update_pending(&thread_key, |p| p.title = Some(name.clone()))
                 .await?
             {
+                // ADR-0023 + ADR-0041: on a pending topic the cover card is
+                // patched now — no server session exists to sync from yet. The
+                // created session gets this title at materialisation.
+                crate::bridge::topic::rename_pending_cover(core, &thread_key, &name).await;
                 core.feishu
                     .reply_text(
                         message_id,
@@ -1790,7 +1794,7 @@ async fn handle_topic_adopt(
             tracing::info!(
                 "topic-adopt: created topic {} for adopted session {} in chat {}",
                 opened.thread_id,
-                opened.session_id,
+                opened.session_id.as_deref().unwrap_or("?"),
                 thread_key.chat_id
             );
             Ok(())
@@ -1899,10 +1903,20 @@ async fn adopt_session(
     } else {
         None
     };
+    // ADR-0041: when this topic's session was still pending (the `/switch <id>`
+    // recovery path for a mistaken `/topic`), carry its cover root onto the
+    // adopted entry — the quote-injection guard and the cover record must not
+    // be lost with the pending.
+    let pending_topic_root = {
+        let store = core.sessions.lock().await;
+        store.pending_for(thread_key).and_then(|p| p.topic_root.clone())
+    };
     let mut entry = SessionEntry::new(thread_key.clone(), info.id.clone(), info.directory.clone());
     entry.agent = info.agent.clone();
     entry.topic_anchor = anchor.clone();
+    entry.topic_root = pending_topic_root;
     core.activate_session(entry).await?;
+    crate::bridge::topic::claim_pending_cover(core, thread_key, &info.id).await;
     // In a topic the snapshot was already sent inside it (the in-thread send
     // above); don't reply twice.
     if kind != ConversationKind::Topic {

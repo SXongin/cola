@@ -1313,6 +1313,7 @@ pub(crate) async fn seed_cover_title(app: &Arc<App>, session_id: &str, title: &s
         crate::bridge::core::CoverTitle {
             title: title.into(),
             model: None,
+            pending: false,
         },
     );
 }

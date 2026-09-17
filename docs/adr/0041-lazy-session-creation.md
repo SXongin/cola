@@ -10,7 +10,7 @@ Every session-selection command today creates a real backend Session immediately
 - Other clients already cover cleanup of what does exist: OpenChamber's session retention (`useSessionAutoCleanup`: delete or archive by age, keeping the recent 5 and the current session) and `opencode session delete`.
 - Server facts: session ids are server-generated — `Session.CreateInput` has no `id` field, so a client cannot pre-name a session; a prompt to a missing session 404s; there is no create-and-prompt endpoint; archiving is `PATCH` with `time.archived`, deletion `DELETE /session/{id}`.
 - ADR-0013 already made the Owned Server lazy (spawned at the moment a prompt needs it). This ADR applies the same principle one level up.
-- **Amends six existing ADRs** (each now carries an `Amended by ADR-0041` banner): ADR-0006 (`/topic` no longer creates the session at command time), ADR-0007 (`/new <name>`'s title PATCH happens at materialisation), ADR-0012 (project derivation is pending-first), ADR-0017 (`/new` no longer promotes a session to active), ADR-0022 (switch-card scope falls back to the pending directory; 会话 stays reserved for real Sessions), ADR-0025 (建话题 writes a pending). Everything else in those ADRs stands.
+- **Amends seven existing ADRs** (each now carries an `Amended by ADR-0041` banner): ADR-0006 (`/topic` no longer creates the session at command time), ADR-0007 (`/new <name>`'s title PATCH happens at materialisation), ADR-0012 (project derivation is pending-first), ADR-0016 (plain `/topic` opens around a pending; `--adopt` unchanged), ADR-0017 (`/new` no longer promotes a session to active), ADR-0022 (switch-card scope falls back to the pending directory; 会话 stays reserved for real Sessions), ADR-0025 (建话题 writes a pending). Everything else in those ADRs stands.
 
 ## Decision
 
@@ -64,7 +64,7 @@ Every session-selection command today creates a real backend Session immediately
 
 - The `sessions.json` format change must be loaded defensively; the current loader (`src/bridge/session.rs:12-23`) silently falls back to empty on any parse error.
 - Every consumer of "the current session" must read through the pending-aware accessors (message path, `current_project_directory`, switch/dir card current, external sync's active computation, `/name` target, `/autoaccept` status). A missed consumer is a bug where the pending is invisible to that path.
-- The cover card's 「待创建」 state is a visible, if brief, degradation: the session id appears only after the first prompt.
+- The cover card's 「下一条消息创建」 state is a visible, if brief, degradation: the session id appears only after the first prompt.
 - `/new` followed by the first prompt still issues create-then-prompt; the total work is unchanged from today's first message, but both calls now land at prompt time — with Lazy Start, that prompt may also wait for the server spawn (see #99).
 - Whether `/switch list` should show the pending as a row is a presentation question, not required for correctness.
 

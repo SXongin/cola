@@ -268,18 +268,20 @@ async fn dir_card_pick_current_directory_toasts_only() {
     assert_eq!(entry.directory, "/work/a");
 }
 
-/// The `/dir` Recent Directories card's "建话题" op (ADR-0025) wraps a NEW
-/// session in a brand-new topic — the card equivalent of `/topic <dir>`:
-/// cover card at the chat's top level, thread anchored on it, the new
-/// session mapped to the new topic key, the lobby untouched.
+/// The `/dir` Recent Directories card's "建话题" op (ADR-0025) opens a
+/// brand-new topic around a Pending Session (ADR-0041) — the card equivalent
+/// of `/topic <dir>`: cover card at the chat's top level showing the creation
+/// timing, thread anchored on it, the pending mapped to the new topic key,
+/// the lobby untouched, and NO server session created.
 #[tokio::test]
-async fn dir_card_topic_creates_topic_with_new_session() {
+async fn dir_card_topic_opens_a_pending_topic() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend.session_id = "ses_dir".into();
     backend.session_list = vec![list_session("ses_b", "项目B", "/work/b", 200)];
+    let created = backend.created_session_dirs.clone();
     let (app, platform) = build_app(cfg, backend).await;
 
     let value = serde_json::json!({
@@ -297,17 +299,21 @@ async fn dir_card_topic_creates_topic_with_new_session() {
     assert!(result.card.is_some(), "dir topic refreshes the card");
     let toast = result.toast.clone().unwrap_or_default();
     assert!(
-        toast.contains("已建话题") && toast.contains("b"),
-        "dir topic toasts the created topic: {toast:?}"
+        toast.contains("已建话题") && toast.contains("下一条消息"),
+        "dir topic toasts the pending timing: {toast:?}"
     );
     assert!(
         result.card.unwrap().to_string().contains("建话题"),
         "refreshed card keeps the 建话题 rows"
     );
+    assert!(
+        created.lock().await.is_empty(),
+        "建话题 creates no server session"
+    );
 
-    // The topic pipeline is /topic's (ADR-0023): a cover card leading with
-    // the directory basename as the display title goes to the chat's top
-    // level, then reply_in_thread on THAT card seeds the topic.
+    // The topic pipeline is /topic's (ADR-0023): a pending cover card leading
+    // with the directory basename goes to the chat's top level, then
+    // reply_in_thread on THAT card seeds the topic.
     let calls = platform.calls.lock().await.clone();
     let cover = calls
         .iter()
@@ -317,8 +323,8 @@ async fn dir_card_topic_creates_topic_with_new_session() {
         })
         .expect("cover card sent to the chat");
     assert!(
-        cover.contains("💬 `b`") && cover.contains("`/work/b`"),
-        "cover leads with the directory basename, got: {cover}"
+        cover.contains("💬 `b`") && cover.contains("下一条消息创建"),
+        "pending cover leads with the directory basename and the creation verb, got: {cover}"
     );
     assert!(
         calls
@@ -327,25 +333,29 @@ async fn dir_card_topic_creates_topic_with_new_session() {
         "reply_in_thread anchors on the cover card, got {calls:?}"
     );
 
-    // The new topic owns the NEW session; the lobby stays untouched.
+    // The new topic's Pending Session carries the picked directory; the lobby
+    // stays untouched.
     let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
-    let entry = app
-        .sessions
-        .lock()
-        .await
-        .get_active(&topic_key)
+    let store = app.sessions.lock().await;
+    assert!(store.get_active(&topic_key).is_none());
+    let pending = store
+        .pending_for(&topic_key)
         .cloned()
-        .expect("dir topic maps the new session to the new topic");
-    assert_eq!(entry.session_id, "ses_dir");
-    assert_eq!(entry.directory, "/work/b");
-    assert_eq!(entry.topic_anchor.as_deref(), Some("msg_topic_reply"));
-    assert_eq!(entry.topic_root.as_deref(), Some("msg_sent"));
+        .expect("dir topic records a pending on the new topic");
+    drop(store);
+    assert_eq!(pending.directory, "/work/b");
+    assert_eq!(pending.topic_anchor.as_deref(), Some("msg_topic_reply"));
+    assert_eq!(pending.topic_root.as_deref(), Some("msg_sent"));
     assert_eq!(
-        app.core.cover_titles.lock().await.get("ses_dir").cloned(),
-        Some(crate::bridge::core::CoverTitle {
-            title: "b".into(),
-            model: None
-        })
+        app.core
+            .cover_titles
+            .lock()
+            .await
+            .values()
+            .next()
+            .map(|c| (c.title.clone(), c.pending)),
+        Some(("b".to_string(), true)),
+        "the pending cover is recorded under the pending key"
     );
     let lobby_key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     assert!(
@@ -400,8 +410,8 @@ async fn dir_card_topic_on_current_directory_opens_topic() {
     );
     let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
     assert!(
-        app.sessions.lock().await.get_active(&topic_key).is_some(),
-        "current-dir 建话题 must map the fresh topic"
+        app.sessions.lock().await.pending_for(&topic_key).is_some(),
+        "current-dir 建话题 must record the fresh topic's pending"
     );
     // The lobby's own session is unchanged (no re-rooting happened).
     assert_eq!(

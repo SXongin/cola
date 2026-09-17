@@ -30,6 +30,12 @@ impl SessionListCache {
 pub struct CoverTitle {
     pub title: String,
     pub model: Option<String>,
+    /// The cover was recorded while the topic's session was still a Pending
+    /// Session (ADR-0041), so it still says 「下一条消息创建」. The first sync
+    /// after materialisation must re-render the full brief even when the title
+    /// matches (the pending title and the server title can be identical, e.g.
+    /// `/topic <dir> <name>`).
+    pub pending: bool,
 }
 
 /// Bound on a server-side session-info fetch (`GET /session/{id}`) — the
@@ -408,7 +414,11 @@ impl SharedCore {
     /// Declare (or replace) a Pending Session rooted at an explicit
     /// `directory` (ADR-0041) — the shape `/dir`, its card pick and the other
     /// explicit-directory forms share. Returns the declared pending, whose
-    /// directory the confirmation names.
+    /// directory the confirmation names. Replacing a topic's pending keeps its
+    /// `topic_root`/`topic_anchor` (ADR-0023): they are properties of the
+    /// Feishu topic, not of the abandoned directory intent, so a corrected
+    /// pending still routes fallback cards into the topic and still suppresses
+    /// the topic's own creation messages from Quoted Context.
     pub(crate) async fn declare_pending(
         &self,
         thread_key: &ThreadKey,
@@ -417,6 +427,13 @@ impl SharedCore {
     ) -> crate::error::Result<PendingEntry> {
         let mut pending = PendingEntry::new(thread_key.clone(), directory);
         pending.title = title;
+        {
+            let store = self.sessions.lock().await;
+            if let Some(replaced) = store.pending_for(thread_key) {
+                pending.topic_anchor = replaced.topic_anchor.clone();
+                pending.topic_root = replaced.topic_root.clone();
+            }
+        }
         self.set_pending_session(pending.clone()).await?;
         Ok(pending)
     }

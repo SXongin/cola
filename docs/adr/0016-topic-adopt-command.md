@@ -3,6 +3,12 @@
 How a user opens a topic whose backing session already exists, instead of
 creating a fresh session and only later switching it.
 
+> **Amended by ADR-0041**: the plain `/topic` form no longer creates its session
+> at command time — it opens around a Pending Session whose first prompt is
+> materialised, so a mistaken `/topic` can be re-pointed in place with
+> `/switch <id>` inside the topic. `/topic --adopt` is unchanged: its session
+> already exists, so the mapping write stays at command time.
+
 ## Context
 
 `/topic <dir> [name]` (ADR-0006) always creates a **new** OpenCode session. The

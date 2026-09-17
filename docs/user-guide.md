@@ -341,7 +341,7 @@ detailed help for any of these.
 | `/switch <id> [--force]` | Take over a session by id/title |
 | `/switch forget` | Un-map this chat's session (the server session stays) |
 | `/new [name]` | Declare a new session in the current project — created by the next message (no session → default dir) |
-| `/topic [dir] [name]` | Create a new Feishu topic + session in `<dir>` (bare `/topic` uses the current project) |
+| `/topic [dir] [name]` | Open a new Feishu topic in `<dir>`; its first message creates the session (bare `/topic` uses the current project) |
 | `/topic --adopt <kw> [--force]` | Open a topic around an existing session |
 | `/name <name>` | Rename current session (server-side, visible to all clients) |
 | `/stop` | Interrupt execution |
@@ -358,11 +358,14 @@ detailed help for any of these.
 
 Notes:
 
-- `/new` and `/dir` only **declare** the session — the conversation's next
-  non-command message creates it in the chosen directory and maps it here, so a
-  mistaken `/new` or `/dir` can be corrected with another `/new`, `/dir`,
-  `/switch` or `/topic` before then without leaving a session in the shared
-  store. The `/dir` card's pick follows the same timing.
+- `/new`, `/dir` and `/topic` only **declare** the session — the conversation's
+  next non-command message creates it in the chosen directory and maps it here,
+  so a mistaken `/new`, `/dir` or `/topic` can be corrected with another `/new`,
+  `/dir`, `/switch` or `/topic` before then without leaving a session in the
+  shared store. Inside a topic that is still waiting for its first message,
+  `/switch <id>` re-points the topic at an existing session instead. The `/dir`
+  card's pick and 建话题 follow the same timing (建话题's cover card shows
+  「下一条消息创建」 until then).
 - `/agent`, `/model`, `/think`, `/autoaccept` are **per-session** overrides sent
   with the next message and persisted across restarts. `/model`'s value must
   exist on the server cola attaches to. Bare `/model` opens the provider → model
@@ -372,7 +375,8 @@ Notes:
   restarts a server cola started itself.
 - Topic rule: inside a topic already bound to a session, `/switch`, `/new` and
   `/dir` are rejected — go back to the main conversation. A topic that has never
-  bound a session can use them to bind its single session.
+  bound a session (including a `/topic`-opened topic still waiting for its first
+  message) can use them to bind its single session.
 
 ## FAQ / troubleshooting
 
