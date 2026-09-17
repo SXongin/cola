@@ -47,15 +47,22 @@ pub(super) fn tool_panel_element(tool: &ToolPanel, at_ms: Option<i64>) -> serde_
     }
     if let Some(ref o) = tool.output {
         let (header, lang, body) = format_tool_output(&tool.name, o);
-        content.push_str("**Output**\n");
+        // The Output marker owns its own paragraph: without the blank line any
+        // following line that Feishu reads as a block start that cannot
+        // interrupt a paragraph (a Setext underline, an indented line) makes
+        // the marker a lazy continuation — and a Setext underline even turns
+        // the whole run above it, marker included, into one heading
+        // (`## Output99- …`), glued together.
+        content.push_str("**Output**\n\n");
         if let Some(h) = &header {
             content.push_str(&format!("{}\n\n", h));
         }
         let body = truncate_md(&body, TOOL_OUTPUT_MAX_CHARS);
         // File content (read) and edit hunks render as a fenced code block, as
-        // does anything with long lines: Feishu markdown wraps plain text but
-        // not code blocks, so long file/command output stays on one visual line
-        // instead of folding.
+        // does anything with long lines or a line Feishu would read as a Setext
+        // underline: Feishu markdown wraps plain text but not code blocks, and
+        // a Setext underline merges the lines above it — so both cases stay on
+        // one visual line per source line inside a fence.
         if tool.name == "read" || tool.name == "edit" || needs_code_block(&body) {
             content.push_str(&fenced_code(&body, lang));
         } else {
@@ -225,10 +232,23 @@ fn code_lang_for_path(path: &str) -> Option<&'static str> {
     })
 }
 
-/// Whether `text` contains a line long enough that Feishu's markdown would wrap
-/// it — the case where a fenced code block (which does NOT wrap) is the fix.
+/// Whether `text` needs a fenced code block: a line long enough that Feishu's
+/// markdown would wrap it, or a line Feishu reads as a Setext heading
+/// underline. The underline makes the parser fold every line above it — with
+/// their soft breaks gone — into one heading (`rg`'s `--` group separators did
+/// exactly that to a bash panel), so the output is shown literally inside a
+/// fence instead.
 fn needs_code_block(text: &str) -> bool {
-    text.lines().any(|l| l.chars().count() > 100)
+    text.lines()
+        .any(|l| l.chars().count() > 100 || is_setext_underline(l))
+}
+
+/// A line Feishu's markdown parser reads as a Setext heading underline: one or
+/// more `=` or `-` and nothing else (CommonMark allows up to three leading
+/// spaces and trailing whitespace).
+fn is_setext_underline(line: &str) -> bool {
+    let t = line.trim();
+    !t.is_empty() && (t.chars().all(|c| c == '-') || t.chars().all(|c| c == '='))
 }
 
 /// Render a tool's input JSON as human-readable markdown, keyed on the tool
@@ -538,7 +558,7 @@ Index: src/main.rs
             "file in input: {}",
             md
         );
-        assert!(md.contains("**Output**\n+1 −1"), "count header: {}", md);
+        assert!(md.contains("**Output**\n\n+1 −1"), "count header: {}", md);
         // Hunks render inside a fenced code block (monospace, no wrapping).
         assert!(md.contains("```\n@@ -1,4 +1,4 @@"), "fenced hunk: {}", md);
         assert!(md.contains("-fn main() {}"), "removed line: {}", md);
@@ -665,6 +685,83 @@ Index: /a/lua.lua
             .build();
         let text = card.to_string();
         assert!(!text.contains("```"), "short output must not be fenced: {}", text);
+    }
+
+    /// Regression: a plain output containing `--` — `rg`'s group separator —
+    /// was parsed by Feishu as a Setext heading underline, which folded every
+    /// line above it, `**Output**` included, into one glued heading
+    /// (`## Output99- …`): the marker must own a paragraph, and the body must
+    /// be fenced so the underline stays literal.
+    #[test]
+    fn setext_underline_in_output_is_fenced_and_marker_separated() {
+        let out = "99-    /// stays live: unknown must never be read\n\
+                   100-    /// as resolved (#130, #144).\n\
+                   --\n\
+                   244-        }\n\
+                   245-    }";
+        let tool = ToolPanel {
+            name: "bash".into(),
+            status: "completed".into(),
+            input: Some(json!({"command": "rg -n \"x\" -B3 -A 25 src/a.rs | head -80"})),
+            output: Some(out.into()),
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        let md = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .expect("panel markdown content");
+        assert!(
+            md.contains("**Output**\n\n```\n"),
+            "the marker must own a paragraph and the body be fenced: {md}"
+        );
+        assert!(
+            !md.contains("**Output**99-"),
+            "the marker must not be swallowed by the output: {md}"
+        );
+        assert!(
+            md.contains("\n--\n"),
+            "the separator stays a literal line inside the fence: {md}"
+        );
+    }
+
+    /// The marker's blank line also protects a body Feishu would otherwise read
+    /// as a lazy continuation of the marker paragraph (an indented first line,
+    /// which cannot interrupt a paragraph).
+    #[test]
+    fn output_marker_separated_from_an_indented_first_line() {
+        let tool = ToolPanel {
+            name: "bash".into(),
+            status: "completed".into(),
+            input: None,
+            output: Some("    Checking colark v0.8.4\n    Finished dev profile".into()),
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        let md = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .expect("panel markdown content");
+        assert!(
+            md.contains("**Output**\n\n    Checking colark"),
+            "the marker must stay on its own line: {md}"
+        );
+    }
+
+    #[test]
+    fn needs_code_block_flags_long_lines_and_setext_underlines() {
+        assert!(needs_code_block(&"a".repeat(101)), "long line wraps");
+        assert!(!needs_code_block("all tests passed"));
+        // `rg` group separators, `===`/`-` underlines: each folds the lines
+        // above it into a heading, so they force a fence.
+        assert!(needs_code_block("a\n--\nb"));
+        assert!(needs_code_block("a\n=====\nb"));
+        assert!(needs_code_block("a\n-\nb"));
+        // Markdown that only looks like an underline is left alone.
+        assert!(!needs_code_block("- item\n- item"));
+        assert!(!needs_code_block("|---|---|"));
     }
 
     #[test]
