@@ -10,6 +10,7 @@ pub(crate) mod dir;
 pub(crate) mod external;
 pub(crate) mod leftovers;
 pub(crate) mod misc;
+pub(crate) mod pending;
 pub(crate) mod permission;
 pub(crate) mod prompt_render;
 pub(crate) mod question;

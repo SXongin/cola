@@ -1105,12 +1105,9 @@ pub(crate) async fn switch_card_data(
     Option<String>,
 ) {
     let sessions = core.cached_session_list().await.unwrap_or_default();
-    let current_dir = core
-        .sessions
-        .lock()
-        .await
-        .get_active(thread_key)
-        .map(|e| e.directory.clone());
+    // Pending-first (ADR-0041): a declared Pending Session defines the current
+    // directory even though `get_active` is `None` for the thread.
+    let current_dir = core.sessions.lock().await.current_directory(thread_key);
     // Directory scope only holds when there IS a current directory; a fresh
     // conversation (no active session) falls back to the whole store.
     let scope = if scope == SwitchScope::Directory && current_dir.is_some() {
@@ -1201,12 +1198,8 @@ pub(crate) async fn dir_card_data(
     }
     by_dir.sort_by_key(|(_, updated)| std::cmp::Reverse(*updated));
     let dirs: Vec<String> = by_dir.into_iter().map(|(d, _)| d).collect();
-    let current_dir = core
-        .sessions
-        .lock()
-        .await
-        .get_active(thread_key)
-        .map(|e| e.directory.clone());
+    // Pending-first (ADR-0041): `get_active` is `None` while a pending exists.
+    let current_dir = core.sessions.lock().await.current_directory(thread_key);
     (dirs, current_dir)
 }
 
