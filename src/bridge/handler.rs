@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::bridge::access::{Access, Decision, DenyReason};
 use crate::bridge::command;
 use crate::bridge::core::SharedCore;
+use crate::bridge::session::PendingEntry;
 use crate::bridge::turn::PromptContext;
 use crate::config::{Config, ConversationKind, SessionEntry, ThreadKey};
 use crate::feishu;
@@ -524,7 +525,9 @@ impl App {
             }
         }
 
-        let (session_id, created) = self.get_or_create_session(&thread_key, &text).await?;
+        let (session_id, created) = self
+            .get_or_create_session(&thread_key, &text, &message_id)
+            .await?;
 
         // First message on a group's top level created a lobby session: reply
         // once with guidance so the user knows each topic isolates a session.
@@ -616,15 +619,78 @@ impl App {
         &self,
         thread_key: &ThreadKey,
         text: &str,
+        message_id: &str,
     ) -> crate::error::Result<(String, bool)> {
         if let Some(id) = self.get_session_id(thread_key).await {
             return Ok((id, false));
+        }
+        // Lazy Session Creation (ADR-0041): a declared Pending Session
+        // materialises here, on the conversation's first non-command message.
+        // `created` stays false — an explicit `/new` already told the user this
+        // would happen, so the group-lobby guidance (which belongs to the
+        // silent auto-create) must not fire.
+        let pending = self.sessions.lock().await.pending_for(thread_key).cloned();
+        if let Some(pending) = pending {
+            let directory = pending.directory.clone();
+            return match self.materialise_pending(thread_key, pending).await {
+                Ok(id) => Ok((id, false)),
+                Err(e) => {
+                    // A create failure leaves the pending intact: surface the
+                    // error here and let the next message retry.
+                    let _ = self
+                        .feishu
+                        .reply_text(
+                            message_id,
+                            &format!(
+                                "⚠️ 创建会话失败（目录 `{}`）：{}\n下一条消息会再试一次。",
+                                directory, e
+                            ),
+                        )
+                        .await;
+                    Err(e)
+                }
+            };
         }
         let directory = self.default_session_directory();
         let id = self
             .create_fresh_session(thread_key, text, directory, None, None)
             .await?;
         Ok((id, true))
+    }
+
+    /// Create the real session a Pending Session declared, apply its creation
+    /// title and per-session overrides, then activate it and clear the pending
+    /// in ONE store write (ADR-0041). A failed create returns the error with
+    /// the pending intact, so the next message retries.
+    async fn materialise_pending(
+        &self,
+        thread_key: &ThreadKey,
+        pending: PendingEntry,
+    ) -> crate::error::Result<String> {
+        let session = self
+            .opencode
+            .create_session(&self.opencode.new_session_input(Some(&pending.directory)))
+            .await?;
+        // Creation title policy (ADR-0007): `/new <name>` PATCHes the title.
+        // A failed PATCH must not orphan the created session (a retry would
+        // create a second one), so it degrades to the server-generated title.
+        if let Some(title) = &pending.title
+            && let Err(e) = self.opencode.update_session_title(&session.id, title).await
+        {
+            tracing::warn!(
+                "materialise: title patch failed for {} ({e}); keeping the server title",
+                session.id
+            );
+        }
+        let mut entry = SessionEntry::new(thread_key.clone(), session.id.clone(), pending.directory);
+        entry.agent = pending.agent;
+        entry.model = pending.model;
+        entry.variant = pending.variant;
+        entry.auto_accept = pending.auto_accept;
+        entry.topic_anchor = pending.topic_anchor;
+        entry.topic_root = pending.topic_root;
+        self.sessions.lock().await.activate(entry)?;
+        Ok(session.id)
     }
 
     /// Create a brand-new session on the current server and make it the active
@@ -786,32 +852,17 @@ impl App {
                 toast: None,
             }),
             "new" => {
-                // Fresh session in the current project (equivalent to `/new`).
+                // Lazy Session Creation (ADR-0041): the card form of `/new` —
+                // declare a Pending Session; the first message materialises it.
                 let directory = core.current_project_directory(&thread_key).await;
-                match core
-                    .opencode
-                    .create_session(&core.opencode.new_session_input(Some(&directory)))
-                    .await
-                {
-                    Ok(session) => {
-                        let entry = crate::config::SessionEntry::new(
-                            thread_key.clone(),
-                            session.id.clone(),
-                            directory,
-                        );
-                        if let Err(e) = core.activate_session(entry).await {
-                            tracing::warn!("switch card new: persist failed: {}", e);
-                        }
-                        Some(CardActionResult {
-                            card: Some(self.build_switch_card_for(core, &thread_key, "", scope).await),
-                            toast: Some("已新建会话".to_string()),
-                        })
-                    }
-                    Err(e) => {
-                        tracing::warn!("switch card new session failed: {}", e);
-                        None
-                    }
+                let pending = PendingEntry::new(thread_key.clone(), directory);
+                if let Err(e) = core.set_pending_session(pending).await {
+                    tracing::warn!("switch card new: persist failed: {}", e);
                 }
+                Some(CardActionResult {
+                    card: Some(self.build_switch_card_for(core, &thread_key, "", scope).await),
+                    toast: Some("下一条消息创建会话".to_string()),
+                })
             }
             "search" => {
                 // A search is an explicit refresh request: drop the session-list

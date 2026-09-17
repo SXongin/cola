@@ -923,3 +923,119 @@ async fn external_reply_keeps_the_user_message_above_it() {
         card
     );
 }
+
+/// ADR-0041 / ADR-0017 parity: while a Pending Session supersedes the active
+/// session, the external poller stops following the old session and drops its
+/// Sync Watermark. Switching back re-baselines silently — the external message
+/// received while the pending was declared is marked read, never replayed.
+/// This is exactly the eager `/new` behaviour before Lazy Session Creation.
+#[tokio::test]
+async fn new_pending_stops_syncing_and_switch_back_resyncs_silently() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    // An external message on the superseded session, written after /new.
+    mock.external_user_messages
+        .insert("ses_old".into(), "离开期间的外部消息".to_string());
+    // The /switch back resolves through the shared session list.
+    mock.session_list = vec![list_session("ses_old", "旧会话", "/work/proj", 100)];
+    let (app, platform) = build_app(cfg, mock).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key.clone(), "ses_old", "/work/proj"),
+    )
+    .await;
+    // A watermark from before /new: the poller must drop it while the pending
+    // supersedes the session.
+    app.external
+        .last_user_msg_epoch
+        .lock()
+        .await
+        .insert("ses_old".into(), chrono::Utc::now().timestamp_millis());
+
+    crate::bridge::command::handle_command(
+        &app.core,
+        crate::bridge::command::Command::New(None),
+        key.clone(),
+        "msg_new",
+        crate::config::ConversationKind::P2p,
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.sessions.lock().await.get_active(&key).is_none(),
+        "the pending means no active session"
+    );
+
+    app.external
+        .poll_interval_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            let _ = app.external.poll_loop(&app.core).await;
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // No notification for the old session, and its watermark is gone.
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        !calls.iter().any(|c| match c {
+            PlatformCall::SendCard { card, .. } | PlatformCall::ReplyCard { card, .. } => {
+                card.to_string().contains("有新消息")
+            }
+            _ => false,
+        }),
+        "the superseded session must not be notified: {calls:?}"
+    );
+    assert!(
+        !app.external
+            .last_user_msg_epoch
+            .lock()
+            .await
+            .contains_key("ses_old"),
+        "the superseded session's watermark is dropped"
+    );
+
+    // Switch back: the pending is replaced, and the first poll re-baselines
+    // silently instead of replaying the stale external message.
+    crate::bridge::command::handle_command(
+        &app.core,
+        crate::bridge::command::Command::Switch(crate::bridge::command::SwitchAction::Match(
+            "ses_old".into(),
+        )),
+        key.clone(),
+        "msg_switch",
+        crate::config::ConversationKind::P2p,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.sessions.lock().await.get_active(&key).unwrap().session_id,
+        "ses_old",
+        "switching back makes the old session active again"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        !calls.iter().any(|c| match c {
+            PlatformCall::SendCard { card, .. } | PlatformCall::ReplyCard { card, .. } => {
+                card.to_string().contains("有新消息")
+            }
+            _ => false,
+        }),
+        "the reactivated session must re-sync silently: {calls:?}"
+    );
+    assert!(
+        app.external
+            .last_user_msg_epoch
+            .lock()
+            .await
+            .contains_key("ses_old"),
+        "the reactivated session re-records its watermark"
+    );
+}

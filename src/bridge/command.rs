@@ -285,7 +285,7 @@ pub fn help_text() -> String {
 `/switch list [kw] [--all]` · List recent sessions across the store
 `/switch <id> [--force]` · Take over a session by id/title
 `/switch forget` · Un-map this chat's session (server session stays)
-`/new [name]` · New session in the current project (no session → default dir)
+`/new [name]` · Declare a new session in the current project (created by the next message; no session → default dir)
 `/topic [dir] [name]` · Create a new Feishu topic + session in <dir> (bare `/topic` uses the current project)
 `/topic --adopt <kw> [--force]` · Open a topic around an existing session
 `/name <name>` · Rename current session (server-side)
@@ -325,7 +325,7 @@ pub fn command_help(name: &str) -> Option<String> {
             "/switch forget\nUn-map this chat's session. The server session stays untouched and can be adopted again.\nExample: `/switch forget`"
         }
         "new" => {
-            "/new [name]\nCreate a fresh session in the current project (the active session's directory); with no active session, the default directory (`work_dir` or cwd). Optionally named (the name is PATCHed server-side); without a name the server generates one after the first message.\nExample: `/new api-refactor`"
+            "/new [name]\nDeclare a new session in the current project (the active session's directory, or the pending's when one is already declared); with neither, the default directory (`work_dir` or cwd). Nothing is created yet: the conversation's next non-command message creates the session and maps it here, so a mistaken `/new` can be corrected with another `/new`, `/dir`, `/switch` or `/topic` and leaves no session behind. The optional name becomes the created session's server title.\nExample: `/new api-refactor`"
         }
         "topic" => {
             "/topic [dir] [name]\nCreate a real Feishu topic backed by a new session. The topic is UI-separated from the current conversation, so you can switch between topics in the Feishu client. Reply inside the created topic to talk to that session.\n- `/topic` (no args) — new session in the CURRENT PROJECT (the active session's directory, like `/new`; falls back to the default directory when the conversation has no session)\n- `/topic <dir>` — new session rooted at <dir>\n- `/topic <dir> <name>` — also name the session\nExample: `/topic /root/proj/lib api-refactor`\n\n/topic --adopt <keyword> [--force]\nOpen a topic around an EXISTING session instead of creating a new one. Resolution: exact id → unique id-prefix (the short hash shown on the card works too) → unique title substring (the whole remaining arg is the keyword, so multi-word titles match). Child (sub-task) sessions are rejected. If the session belongs to another chat, reject unless `--force` (which steals the mapping). No argument pops the session card — each row's 建话题接管 button does the same, and an occupied session offers a 强制建话题接管 confirmation.\nExample: `/topic --adopt 重写登录模块`"
@@ -377,6 +377,7 @@ pub fn command_help(name: &str) -> Option<String> {
 
 use crate::bridge::core::SharedCore;
 use crate::bridge::display::{id_tail, title_or_id_tail};
+use crate::bridge::session::PendingEntry;
 use crate::config::{ConversationKind, SessionEntry, ThreadKey};
 use crate::feishu;
 use std::sync::Arc;
@@ -573,27 +574,25 @@ pub(crate) async fn handle_command(
             handle_switch_action(core, &thread_key, action, message_id, kind).await?;
         }
         Command::New(name) => {
-            // The current project follows the active session (ADR-0012): `/new`
-            // stays in the project the user is already working in. Only when
-            // the conversation has no session (fresh topic, after `/forget`,
-            // adopted-away) does it fall back to the default directory.
+            // The current project follows the pending, else the active session
+            // (ADR-0012): `/new` stays in the project the user is already
+            // working in. Only when the conversation has neither (fresh topic,
+            // after `/forget`, adopted-away) does it fall back to the default
+            // directory.
             let directory = core.current_project_directory(&thread_key).await;
-            let session = core
-                .opencode
-                .create_session(&core.opencode.new_session_input(Some(&directory)))
-                .await?;
-            // Creation title policy (ADR-0007): `/new <name>` PATCHes the
-            // title immediately; `/new` (no name) leaves the server default
-            // so a title is auto-generated after the first message.
-            if let Some(n) = &name {
-                core.opencode.update_session_title(&session.id, n).await?;
-            }
-            let entry = SessionEntry::new(thread_key.clone(), session.id.clone(), directory);
-            core.activate_session(entry).await?;
-            let label = name.unwrap_or_else(|| format!("sess-{}", uuid::Uuid::new_v4()));
-            core.feishu
-                .reply_text(message_id, &format!("Created \"{}\".", label))
-                .await?;
+            // Lazy Session Creation (ADR-0041): `/new` records a Pending
+            // Session instead of creating a backend session — the first
+            // non-command message materialises it. A mistaken `/new` therefore
+            // leaves nothing in the shared store. The creation-title policy
+            // (ADR-0007) applies at materialisation.
+            let mut pending = PendingEntry::new(thread_key.clone(), directory.clone());
+            pending.title = name.clone();
+            core.set_pending_session(pending).await?;
+            let reply = match &name {
+                Some(n) => format!("下一条消息将创建会话「{}」（目录 `{}`）。", n, directory),
+                None => format!("下一条消息将创建会话（目录 `{}`）。", directory),
+            };
+            core.feishu.reply_text(message_id, &reply).await?;
         }
         Command::Topic { directory, name } => {
             // Bare `/topic` (directory: None) inherits the conversation's

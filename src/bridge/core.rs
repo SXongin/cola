@@ -395,6 +395,16 @@ impl SharedCore {
         result
     }
 
+    /// Declare (or replace) the conversation's Pending Session and persist
+    /// (ADR-0041). The session-list cache is untouched: a pending is not a
+    /// server session, so `/list`/`/switch` have nothing new to show.
+    pub(crate) async fn set_pending_session(
+        &self,
+        pending: crate::bridge::session::PendingEntry,
+    ) -> crate::error::Result<()> {
+        self.sessions.lock().await.set_pending(pending)
+    }
+
     /// Mutate the mapped session in place and persist, returning the updated
     /// entry (`None` when `session_id` is not mapped). The session-list cache
     /// is untouched: per-session overrides are not server-list state.
