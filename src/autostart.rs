@@ -1,4 +1,6 @@
 //! Boot-time autostart registration: `cola autostart enable|disable|status`.
+//! `disable` also stops the running instance first (ADR-0039), through
+//! [`supervisor_stop_command`] when an Autostart registration is installed.
 //!
 //! cola is a long-lived daemon; `autostart` registers the OS launcher that
 //! starts it at boot/login. The launcher runs the `cola` binary itself (Lazy
@@ -23,8 +25,13 @@ use anyhow::Context;
 pub enum AutostartAction {
     /// Register cola to start at boot/login.
     Enable,
-    /// Remove the boot-time registration.
-    Disable,
+    /// Stop the running cola instance, then remove the boot-time registration
+    /// (ADR-0039).
+    Disable {
+        /// Skip the confirmation prompt before stopping a running instance.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
     /// Show whether cola is registered to start at boot.
     Status,
 }
@@ -32,7 +39,7 @@ pub enum AutostartAction {
 pub fn run(action: AutostartAction) -> anyhow::Result<()> {
     match action {
         AutostartAction::Enable => enable(),
-        AutostartAction::Disable => disable(),
+        AutostartAction::Disable { yes } => disable(yes),
         AutostartAction::Status => status(),
     }
 }
@@ -50,6 +57,26 @@ pub(crate) fn supervisor_restart_command() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
         macos::supervisor_restart_command()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// The command that stops a running cola through its OS supervisor, when one
+/// is registered for this platform. `None` when there is no supervisor
+/// (Windows' `Run` key only launches) or none is installed. Stop must go
+/// through the supervisor: a launchd agent with `KeepAlive` would respawn a
+/// directly-killed process (ADR-0039).
+pub(crate) fn supervisor_stop_command() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::supervisor_stop_command()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::supervisor_stop_command()
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -221,6 +248,14 @@ mod linux {
             .then(|| format!("systemctl --user restart {UNIT_NAME}"))
     }
 
+    /// The command that stops a running cola via systemd, when the user unit is
+    /// installed.
+    pub(super) fn supervisor_stop_command() -> Option<String> {
+        unit_path()
+            .exists()
+            .then(|| format!("systemctl --user stop {UNIT_NAME}"))
+    }
+
     /// Parse the executable from a systemd unit's `ExecStart=` line. The
     /// generated unit quotes paths with spaces (`systemd_quote`); an unquoted
     /// value may carry arguments, so only the first word is taken.
@@ -369,12 +404,12 @@ mod macos {
     }
 
     pub(super) fn disable() -> anyhow::Result<()> {
+        // No bootout here: stopping is the caller's job — `disable` already ran
+        // `supervisor_stop_command` (bootout) when an instance was stopped, and
+        // booting out here would kill an instance the user just declined to
+        // stop (ADR-0039). Removing the plist unregisters; in the declined (or
+        // crash-loop) case a still-loaded agent goes away at logout.
         let path = plist_path();
-        let target = format!("gui/{}/{}", uid(), LABEL);
-        let _ = std::process::Command::new("launchctl")
-            .arg("bootout")
-            .arg(&target)
-            .status();
         let _ = std::fs::remove_file(&path);
         if !path.exists() {
             println!("cola autostart disabled: {}", path.display());
@@ -409,6 +444,15 @@ mod macos {
         plist_path()
             .exists()
             .then(|| format!("launchctl kickstart -k gui/{}/{}", uid(), LABEL))
+    }
+
+    /// The command that stops a running cola via launchd, when the agent is
+    /// installed. `bootout` is what actually terminates the agent's process —
+    /// the one signal path launchd cannot respawn via `KeepAlive`.
+    pub(super) fn supervisor_stop_command() -> Option<String> {
+        plist_path()
+            .exists()
+            .then(|| format!("launchctl bootout gui/{}/{}", uid(), LABEL))
     }
 
     /// Parse the first `ProgramArguments` string (the executable) from the
@@ -526,8 +570,26 @@ fn enable() -> anyhow::Result<()> {
     platform::enable()
 }
 
-fn disable() -> anyhow::Result<()> {
-    platform::disable()
+/// `autostart disable` = stop + unregister (ADR-0039), on every platform. Stop
+/// first (the confirmation honors `assume_yes`), then remove the registration;
+/// a failed stop still unregisters — removing the registration is the
+/// command's primary act — but surfaces as a non-zero exit so scripts see the
+/// instance is still up.
+fn disable(assume_yes: bool) -> anyhow::Result<()> {
+    let stopped = crate::stop_running_cola(assume_yes);
+    platform::disable()?;
+    match stopped {
+        Ok(crate::StopOutcome::Stopped { pid }) => {
+            println!("已停止运行中的 cola (PID {pid})。");
+        }
+        // The user declined the stop but asked to unregister: honor both halves.
+        Ok(crate::StopOutcome::Declined) => {
+            println!("保留运行中的 cola 实例（自启动已注销）。");
+        }
+        Ok(crate::StopOutcome::NotRunning) => {}
+        Err(e) => anyhow::bail!("自启动已注销，但停止运行中的 cola 失败：{e}"),
+    }
+    Ok(())
 }
 
 fn status() -> anyhow::Result<()> {
