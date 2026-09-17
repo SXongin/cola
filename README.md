@@ -96,12 +96,26 @@ guide](docs/user-guide.md#configuration).
 
 ### 4. Run
 
+Register cola to start at boot/login — the recommended way:
+
 ```bash
-nohup cola >/dev/null 2>&1 &
+cola autostart enable
+cola autostart status   # confirm it is registered
 ```
 
-On Windows there is no `nohup` — run `start /b cola`, or use
-`cola autostart enable` to keep it running.
+- **Linux**: a systemd **user** unit. On a headless machine (no desktop login),
+  also run `loginctl enable-linger $USER` (printed as a hint) so it starts at
+  boot.
+- **macOS**: a LaunchAgent.
+- **Windows**: an `HKCU\...\Run` registry value.
+
+`cola autostart disable` removes the registration. Enable it **after**
+installing both cola and `opencode` — the launcher snapshots the binary path
+and your `PATH`, so re-run `enable` if you ever move either.
+
+To run in the foreground instead, just `cola` (Ctrl-C stops it). To detach it
+from the terminal: `nohup cola >/dev/null 2>&1 &` on Linux/macOS, or
+`start /b cola` on Windows.
 
 cola attaches to an already-running `opencode serve` on the shared store
 (so sessions stay shared with OpenChamber / the CLI), and lazily starts its own
