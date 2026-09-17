@@ -453,7 +453,9 @@ impl SharedCore {
 
     /// Whether `candidate` is `root` or a sub-task child reachable by walking
     /// up its parent chain (sub-task child sessions carry their own sessionID).
-    async fn session_descends_from(&self, candidate: &str, root: &str, directory: &str) -> bool {
+    /// Shared with the turn-end leftover rejection (#187), which filters the
+    /// same way when deciding whose requests a dead turn owns.
+    pub(crate) async fn session_descends_from(&self, candidate: &str, root: &str, directory: &str) -> bool {
         crate::bridge::pollers::walk_parent_chain(self, candidate, Some(directory), |current| {
             let current = current.to_string();
             async move { (current == root).then_some(true) }
