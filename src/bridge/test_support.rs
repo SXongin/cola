@@ -1262,6 +1262,16 @@ pub(crate) async fn seed_entry(app: &Arc<App>, entry: crate::config::SessionEntr
         .expect("seed_entry: persisting the seeded store failed");
 }
 
+/// Seed a Pending Session for a thread (ADR-0041): the `set_pending` write,
+/// with the same persist-failure panic policy as [`seed_entry`].
+pub(crate) async fn seed_pending(app: &Arc<App>, pending: crate::bridge::session::PendingEntry) {
+    app.sessions
+        .lock()
+        .await
+        .set_pending(pending)
+        .expect("seed_pending: persisting the seeded store failed");
+}
+
 /// Seed the cover-title cache for `session_id` (the topic cover card's title
 /// memory) — the `app.core` setup tests would otherwise do by hand.
 pub(crate) async fn seed_cover_title(app: &Arc<App>, session_id: &str, title: &str) {

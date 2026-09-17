@@ -223,17 +223,16 @@ impl SharedCore {
             })
     }
 
-    /// The conversation's current project (ADR-0012): the active session's
-    /// directory, falling back to the default directory only when the
-    /// conversation has no session. Single definition of "current project",
-    /// shared by `/new`, the bare `/topic` form, and the `/switch` card's
-    /// "new session" action.
+    /// The conversation's current project (ADR-0012): the Pending Session's
+    /// directory when one is declared, else the active session's, falling back
+    /// to the default directory only when the conversation has neither.
+    /// Single definition of "current project", shared by `/new`, the bare
+    /// `/topic` form, and the `/switch` card's "new session" action.
     pub async fn current_project_directory(&self, thread_key: &ThreadKey) -> String {
         self.sessions
             .lock()
             .await
-            .get_active(thread_key)
-            .map(|e| e.directory.clone())
+            .current_directory(thread_key)
             .filter(|d| !d.is_empty())
             .unwrap_or_else(|| self.default_session_directory())
     }

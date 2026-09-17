@@ -1,30 +1,172 @@
 use crate::config::{SessionEntry, ThreadKey};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// A conversation's declared intent to create a session (ADR-0041). It is not
+/// a Session: no backend identity, invisible to the server and every session
+/// list. The conversation's first prompt materialises it; until then it
+/// supersedes the mapped session (`get_active` returns `None`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingEntry {
+    pub thread_key: ThreadKey,
+    pub directory: String,
+    /// Title to PATCH after materialisation (`/new <name>`); `None` keeps the
+    /// server-generated title.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Per-session agent override (`/agent`), carried onto the materialised
+    /// SessionEntry.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Per-session model override ("provider/model", `/model`).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Per-session thinking level (`/think`).
+    #[serde(default)]
+    pub variant: Option<String>,
+    /// `/autoaccept` state, carried onto the materialised SessionEntry.
+    #[serde(default)]
+    pub auto_accept: bool,
+    /// For topic-backed pendings (`/topic`): the in-topic reply anchor
+    /// (ADR-0022), carried onto the materialised SessionEntry.
+    #[serde(default)]
+    pub topic_anchor: Option<String>,
+    /// For cola-created topics: the command message the topic was created
+    /// around (ADR-0023), carried onto the materialised SessionEntry.
+    #[serde(default)]
+    pub topic_root: Option<String>,
+}
+
+impl PendingEntry {
+    /// A pending with every optional field at its default.
+    #[allow(dead_code)] // ADR-0041 storage; the command tickets (#211-#214) construct it
+    pub fn new(thread_key: ThreadKey, directory: impl Into<String>) -> Self {
+        Self {
+            thread_key,
+            directory: directory.into(),
+            title: None,
+            agent: None,
+            model: None,
+            variant: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+        }
+    }
+}
+
+/// The current on-disk shape (ADR-0041). `pending` defaults so a file written
+/// by an older build (`{"entries":[…]}`) still loads.
+#[derive(Deserialize)]
+struct StoreFile {
+    #[serde(default)]
+    entries: Vec<SessionEntry>,
+    #[serde(default)]
+    pending: Vec<PendingEntry>,
+}
+
+/// Pre-ADR-0041 files are a bare `[SessionEntry]` array. Kept loadable: the
+/// old `from_str(...).unwrap_or_default()` would silently empty the whole
+/// mapping on a format change.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum LoadedStore {
+    Legacy(Vec<SessionEntry>),
+    Current(StoreFile),
+}
+
+impl LoadedStore {
+    fn into_parts(self) -> (Vec<SessionEntry>, Vec<PendingEntry>) {
+        match self {
+            LoadedStore::Legacy(entries) => (entries, Vec::new()),
+            LoadedStore::Current(file) => (file.entries, file.pending),
+        }
+    }
+}
+
 /// Manages the thread → session mapping, persisted to a JSON file.
-/// Multiple sessions can exist per thread; the first matching entry is "active".
+/// Multiple sessions can exist per thread; the first matching entry is "active"
+/// unless the thread has a Pending Session.
 pub struct SessionStore {
     path: PathBuf,
     entries: Vec<SessionEntry>,
+    /// At most one Pending Session per ThreadKey (ADR-0041).
+    pending: Vec<PendingEntry>,
 }
 
 impl SessionStore {
     pub fn new(path: PathBuf) -> crate::error::Result<Self> {
-        let entries = if path.exists() {
+        let (entries, pending) = if path.exists() {
             let data = std::fs::read_to_string(&path)?;
-            serde_json::from_str(&data).unwrap_or_default()
+            match serde_json::from_str::<LoadedStore>(&data) {
+                Ok(loaded) => loaded.into_parts(),
+                Err(err) => {
+                    tracing::warn!(
+                        "could not parse {} ({err}); starting with an empty mapping",
+                        path.display()
+                    );
+                    (Vec::new(), Vec::new())
+                }
+            }
         } else {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
-        Ok(Self { path, entries })
+        Ok(Self {
+            path,
+            entries,
+            pending,
+        })
     }
 
-    /// Get the active session for a thread (first match).
+    /// Get the active session for a thread (first match). `None` while the
+    /// thread has a Pending Session: the pending supersedes it, though the old
+    /// session stays mapped (`list_thread`) and switchable (ADR-0041).
     pub fn get_active(&self, key: &ThreadKey) -> Option<&SessionEntry> {
+        if self.pending_for(key).is_some() {
+            return None;
+        }
         self.entries.iter().find(|e| &e.thread_key == key)
+    }
+
+    /// The conversation's Pending Session, if it declared one (ADR-0041).
+    pub fn pending_for(&self, key: &ThreadKey) -> Option<&PendingEntry> {
+        self.pending.iter().find(|p| &p.thread_key == key)
+    }
+
+    /// Declare (or replace) the conversation's Pending Session and persist.
+    #[allow(dead_code)] // ADR-0041 storage; the command tickets (#211-#214) write pendings
+    pub fn set_pending(&mut self, pending: PendingEntry) -> crate::error::Result<()> {
+        self.pending.retain(|p| p.thread_key != pending.thread_key);
+        self.pending.push(pending);
+        self.write_to_disk()
+    }
+
+    /// Drop the conversation's Pending Session and persist.
+    #[allow(dead_code)] // ADR-0041 storage; the command tickets (#211-#214) clear pendings
+    pub fn clear_pending(&mut self, key: &ThreadKey) -> crate::error::Result<()> {
+        self.pending.retain(|p| &p.thread_key != key);
+        self.write_to_disk()
+    }
+
+    /// The conversation's current directory: the Pending Session's when one
+    /// exists, else the active session's. `None` when neither exists.
+    pub fn current_directory(&self, key: &ThreadKey) -> Option<String> {
+        self.pending_for(key)
+            .map(|p| p.directory.clone())
+            .or_else(|| self.get_active(key).map(|e| e.directory.clone()))
+    }
+
+    /// Materialise a pending: promote `entry` and clear the pending in ONE
+    /// store write, so a crash can never leave both a live session and its
+    /// pending declared (ADR-0041).
+    #[allow(dead_code)] // ADR-0041 storage; materialisation (#211) activates through it
+    pub fn activate_and_clear_pending(&mut self, entry: SessionEntry) -> crate::error::Result<()> {
+        self.pending.retain(|p| p.thread_key != entry.thread_key);
+        self.promote(entry);
+        self.write_to_disk()
     }
 
     /// Add or promote a session entry as the active one for its thread.
@@ -84,8 +226,10 @@ impl SessionStore {
         Ok(removed)
     }
 
-    /// Remove every session entry mapped to a thread (used by `/forget`).
+    /// Remove every session entry mapped to a thread, together with any
+    /// Pending Session (ADR-0041: forget clears both in the same write).
     fn remove_thread(&mut self, key: &ThreadKey) -> Vec<SessionEntry> {
+        self.pending.retain(|p| &p.thread_key != key);
         let removed: Vec<SessionEntry> = self
             .entries
             .iter()
@@ -150,7 +294,15 @@ impl SessionStore {
     }
 
     fn write_to_disk(&self) -> crate::error::Result<()> {
-        let data = serde_json::to_string_pretty(&self.entries)?;
+        #[derive(Serialize)]
+        struct StoreFileRef<'a> {
+            entries: &'a [SessionEntry],
+            pending: &'a [PendingEntry],
+        }
+        let data = serde_json::to_string_pretty(&StoreFileRef {
+            entries: &self.entries,
+            pending: &self.pending,
+        })?;
         std::fs::write(&self.path, data)?;
         Ok(())
     }
@@ -180,6 +332,10 @@ mod tests {
             topic_root: None,
             variant: None,
         }
+    }
+
+    fn make_pending(chat_id: &str, root_id: &str, dir: &str) -> PendingEntry {
+        PendingEntry::new(ThreadKey::new(chat_id.into(), root_id.into()), dir)
     }
 
     #[test]
@@ -429,5 +585,201 @@ mod tests {
             .activate(make_entry("chat1", "root1", "ses_fail", "/tmp/f"))
             .unwrap_err();
         assert!(matches!(err, crate::error::BridgeError::Io(_)));
+    }
+
+    #[test]
+    fn legacy_bare_array_loads() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        std::fs::write(
+            &path,
+            r#"[{
+                "thread_key": { "chat_id": "chat1", "thread_id": "root1" },
+                "session_id": "ses_old",
+                "directory": "/tmp/old",
+                "auto_accept": false
+            }]"#,
+        )
+        .unwrap();
+
+        let store = SessionStore::new(path).unwrap();
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+        assert!(store.pending.is_empty());
+        assert_eq!(store.get_active(&key).unwrap().session_id, "ses_old");
+    }
+
+    #[test]
+    fn new_format_round_trips() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+        let mut store = SessionStore::new(path.clone()).unwrap();
+        store
+            .activate(make_entry("chat1", "root1", "ses_old", "/tmp/old"))
+            .unwrap();
+        store
+            .set_pending(make_pending("chat1", "root1", "/tmp/new"))
+            .unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(value.get("entries").and_then(|v| v.as_array()).is_some());
+        assert!(value.get("pending").and_then(|v| v.as_array()).is_some());
+
+        let reloaded = SessionStore::new(path).unwrap();
+        assert_eq!(reloaded.pending_for(&key).unwrap().directory, "/tmp/new");
+        assert_eq!(reloaded.list_thread(&key).len(), 1);
+    }
+
+    #[test]
+    fn pending_survives_reload_and_supersedes_active() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+        {
+            let mut store = SessionStore::new(path.clone()).unwrap();
+            store
+                .activate(make_entry("chat1", "root1", "ses_old", "/tmp/old"))
+                .unwrap();
+            store
+                .set_pending(make_pending("chat1", "root1", "/tmp/new"))
+                .unwrap();
+
+            assert!(
+                store.get_active(&key).is_none(),
+                "a pending supersedes the active session"
+            );
+            assert_eq!(
+                store.list_thread(&key).len(),
+                1,
+                "the old session stays mapped and switchable"
+            );
+            assert_eq!(store.current_directory(&key).as_deref(), Some("/tmp/new"));
+        }
+
+        let reloaded = SessionStore::new(path).unwrap();
+        let pending = reloaded.pending_for(&key).expect("pending survives reload");
+        assert_eq!(pending.directory, "/tmp/new");
+        assert!(reloaded.get_active(&key).is_none());
+        assert_eq!(reloaded.list_thread(&key).len(), 1);
+        assert_eq!(reloaded.current_directory(&key).as_deref(), Some("/tmp/new"));
+    }
+
+    #[test]
+    fn set_pending_replaces_the_threads_pending() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+        let mut store = SessionStore::new(path).unwrap();
+
+        store
+            .set_pending(make_pending("chat1", "root1", "/tmp/a"))
+            .unwrap();
+        store
+            .set_pending(make_pending("chat1", "root1", "/tmp/b"))
+            .unwrap();
+
+        assert_eq!(store.pending.len(), 1, "at most one pending per thread");
+        assert_eq!(store.pending_for(&key).unwrap().directory, "/tmp/b");
+    }
+
+    #[test]
+    fn clear_pending_restores_active_and_persists() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+        let mut store = SessionStore::new(path.clone()).unwrap();
+        store
+            .activate(make_entry("chat1", "root1", "ses_old", "/tmp/old"))
+            .unwrap();
+        store
+            .set_pending(make_pending("chat1", "root1", "/tmp/new"))
+            .unwrap();
+
+        store.clear_pending(&key).unwrap();
+        assert!(store.pending_for(&key).is_none());
+        assert_eq!(store.get_active(&key).unwrap().session_id, "ses_old");
+
+        let reloaded = SessionStore::new(path).unwrap();
+        assert!(reloaded.pending_for(&key).is_none());
+        assert_eq!(reloaded.get_active(&key).unwrap().session_id, "ses_old");
+    }
+
+    #[test]
+    fn activate_and_clear_pending_materialises_in_one_write() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+        let mut store = SessionStore::new(path.clone()).unwrap();
+        store
+            .activate(make_entry("chat1", "root1", "ses_old", "/tmp/old"))
+            .unwrap();
+        store
+            .set_pending(make_pending("chat1", "root1", "/tmp/new"))
+            .unwrap();
+
+        store
+            .activate_and_clear_pending(make_entry("chat1", "root1", "ses_new", "/tmp/new"))
+            .unwrap();
+
+        assert!(store.pending_for(&key).is_none());
+        assert_eq!(store.get_active(&key).unwrap().session_id, "ses_new");
+        assert_eq!(
+            store.list_thread(&key).len(),
+            2,
+            "the replaced session stays mapped"
+        );
+
+        let reloaded = SessionStore::new(path).unwrap();
+        assert!(reloaded.pending_for(&key).is_none());
+        assert_eq!(reloaded.get_active(&key).unwrap().session_id, "ses_new");
+        assert_eq!(reloaded.list_thread(&key).len(), 2);
+    }
+
+    #[test]
+    fn remove_thread_persist_clears_pending() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+        let mut store = SessionStore::new(path.clone()).unwrap();
+        store
+            .activate(make_entry("chat1", "root1", "ses_old", "/tmp/old"))
+            .unwrap();
+        store
+            .set_pending(make_pending("chat1", "root1", "/tmp/new"))
+            .unwrap();
+
+        store.remove_thread_persist(&key).unwrap();
+        assert!(store.pending_for(&key).is_none());
+        assert!(store.get_active(&key).is_none());
+
+        let reloaded = SessionStore::new(path).unwrap();
+        assert!(reloaded.pending_for(&key).is_none());
+        assert!(reloaded.list_thread(&key).is_empty());
+    }
+
+    #[test]
+    fn current_directory_prefers_pending_only_for_its_thread() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path).unwrap();
+        store
+            .activate(make_entry("chat1", "root1", "ses_1", "/tmp/one"))
+            .unwrap();
+        store
+            .activate(make_entry("chat2", "root2", "ses_2", "/tmp/two"))
+            .unwrap();
+        store
+            .set_pending(make_pending("chat1", "root1", "/tmp/pending"))
+            .unwrap();
+
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+        let other = ThreadKey::new("chat2".into(), "root2".into());
+        assert_eq!(store.current_directory(&key).as_deref(), Some("/tmp/pending"));
+        assert_eq!(store.current_directory(&other).as_deref(), Some("/tmp/two"));
+        assert_eq!(
+            store.current_directory(&ThreadKey::new("chat3".into(), "root3".into())),
+            None
+        );
     }
 }
