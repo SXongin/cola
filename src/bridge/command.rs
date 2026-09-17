@@ -279,7 +279,7 @@ pub fn parse_command(text: &str) -> Option<Command> {
 pub fn help_text() -> String {
     "\
 **cola commands**
-`/dir <path> [name]` · Switch to a project + new session there
+`/dir <path> [name]` · Declare a new session in a project directory (created by the next message)
 `/switch` · Session card: browse / search / adopt / new
 `/switch <kw>` · Switch to a session by name/dir/id (adopts foreign ones)
 `/switch list [kw] [--all]` · List recent sessions across the store
@@ -310,7 +310,7 @@ pub fn help_text() -> String {
 pub fn command_help(name: &str) -> Option<String> {
     let text = match name.to_lowercase().as_str() {
         "dir" => {
-            "/dir <path> [name]\nSwitch to a project: open a NEW session rooted at <path> (create a session rooted at that directory).\n- `/dir` (no arg) — Recent Directories card: pick a recently-used folder and switch there, or open it as a fresh topic (each row's 建话题 = `/topic <dir>` without typing; only from the main conversation)\nExample: `/dir /root/proj/lib`"
+            "/dir <path> [name]\nDeclare a new session rooted at <path>: nothing is created yet — the conversation's next non-command message creates the session in that directory and maps it here, so a mistaken `/dir` can be corrected with another `/dir`, `/new`, `/switch` or `/topic` and leaves no session behind.\n- `/dir` (no arg) — Recent Directories card: pick a recently-used folder and declare it there, or open it as a fresh topic (each row's 建话题 = `/topic <dir>` without typing; only from the main conversation)\nExample: `/dir /root/proj/lib`"
         }
         "switch" => {
             "/switch [action]\nSession management card and text forms.\n- `/switch` (no arg) — interactive session card (browse / search / adopt / new)\n- `/switch <keyword>` — switch by title/directory/id; the current chat's sessions win, otherwise a unique global match is adopted. Ambiguous keywords list candidates.\n- `/switch list [keyword] [--all]` — list recent sessions across the store (up to 15)\n- `/switch <id|title> [--force]` — take over a session (exact id → id-prefix → title; the card's short hash works too; reject if owned by another chat unless `--force`, or use the card's 强制接管 button)\n- `/switch forget` — un-map this chat's session (server session stays)\nExamples: `/switch backend`, `/switch list cola`, `/switch ses_abc --force`"
@@ -534,35 +534,17 @@ pub(crate) async fn handle_command(
             else {
                 return Ok(());
             };
-            // `/dir` opens a NEW conversation rooted at `path` (matching
-            // OpenCode's per-directory sessions), not a rename of the old
-            // one. Create the session first so a failure is reported here
-            // instead of as a cryptic card error on the next message.
-            let session = match core
-                .opencode
-                .create_session(&core.opencode.new_session_input(Some(&dir_str)))
-                .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    core.feishu
-                        .reply_text(
-                            message_id,
-                            &format!("⚠️ 创建会话失败（目录 `{}`）：{}", dir_str, e),
-                        )
-                        .await?;
-                    return Ok(());
-                }
-            };
-            let entry = SessionEntry::new(thread_key.clone(), session.id.clone(), dir_str.clone());
-            core.activate_session(entry).await?;
+            // Lazy Session Creation (ADR-0041): `/dir` records a Pending
+            // Session rooted at `path` instead of creating a backend session;
+            // the conversation's first non-command message materialises it.
+            // Repeating the command (or `/new`, `/switch`, `/topic`) before
+            // that replaces the pending, so a corrected directory leaves no
+            // trace in the shared store.
+            let pending = core.declare_pending(&thread_key, dir_str, None).await?;
             core.feishu
                 .reply_text(
                     message_id,
-                    &format!(
-                        "已切换目录并新建会话（目录 `{}`）。\n后续对话都会在这个目录下进行。",
-                        dir_str
-                    ),
+                    &format!("下一条消息将在目录 `{}` 创建会话。", pending.directory),
                 )
                 .await?;
         }
@@ -2405,7 +2387,7 @@ mod tests {
     fn command_help_known_and_unknown() {
         assert!(command_help("model").unwrap().contains("/model"));
         assert!(command_help("think").unwrap().contains("/think"));
-        assert!(command_help("dir").unwrap().contains("NEW session"));
+        assert!(command_help("dir").unwrap().contains("next non-command message"));
         assert!(command_help("version").unwrap().contains("/version"));
         assert_eq!(command_help("nonexistent"), None);
     }
