@@ -245,8 +245,8 @@ _Avoid_: Notification, message, signal
 - A **Bot** contains one **Platform** and one or more **Backend** adapters
 - Every inbound message or card action carries exactly one **Principal** (its sender or clicking user), authorized against the **Access List** before cola acts
 - The first successful **Claim** writes the **Host** into the **Access List**; every other Principal is refused
-- A **Chat** contains many **Topics**; a **Chat** may hold several **Sessions** directly (lobby), while a **Topic** holds exactly one **Session**
-- A **Chat** or **Topic** has one **Session Mapping**: the set of **Session**s it has activated, with exactly one of them its **Active Session**, plus at most one **Pending Session** that materialises at the conversation's first prompt
+- A **Chat** contains many **Topics**; a **Chat** may hold several **Sessions** directly (lobby), while a **Topic** holds exactly one **Session** (or one **Pending Session** until its first prompt)
+- A **Chat** or **Topic** has one **Session Mapping**: the set of **Session**s it has activated, with at most one of them its **Active Session**, plus at most one **Pending Session** that materialises at the conversation's first prompt
 - A **Topic** is created around its **Topic Root** and, when cola opens it, is anchored on its **Topic Anchor**; a cola-created **Topic Root** is a **Topic Cover Card**
 - A **Session** contains many **Turns** and has one **Project** and one optional **Agent**
 - A **Turn** renders into a **Card Chain**; a pending **Permission**/**Question** rides its newest card as an **Interaction Block**, and resolving one leaves an **Interaction Receipt**

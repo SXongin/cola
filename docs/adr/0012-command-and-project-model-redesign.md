@@ -16,6 +16,11 @@ in the current project, `/dir` = switch project + new session); `/topic` stays
 (OpenCode has no "topic" concept, so the name collides with nothing on the
 backend).
 
+> **Amended by ADR-0041**: the conversation's current project is the Pending
+> Session's directory when one exists, otherwise the active session's
+> (pending-first); `/new` records a Pending Session instead of creating and
+> activating a session at command time.
+
 Consequences: config simplifies (`url` optional, `username`/`password` deleted,
 `work_dir` = default project), the log rotates daily (`cola-YYYY-MM-DD.log`,
 keep N days) with cross-day sessions queried by `grep session_id=... cola-*.log`,

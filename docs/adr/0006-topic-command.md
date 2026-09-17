@@ -3,6 +3,10 @@
 How a user opens a new, UI-separated conversation in a p2p chat without
 manually creating a topic.
 
+> **Amended by ADR-0041**: `/topic` no longer creates the session at `<dir>`
+> immediately — it records a Pending Session and the topic's first prompt creates
+> the session in it. The topic, cover-card, anchor and mapping flow are unchanged.
+
 ## Context
 
 cola's session model (ADR-0003) isolates sessions **by topic**: a Feishu topic

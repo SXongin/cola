@@ -5,6 +5,11 @@ shared store, and the word 「会话」 meant both the Feishu conversation and t
 OpenCode session. Users reported two problems: "why are so many sessions all
 本会话?" and "I want to see the sessions of the directory I'm working in."
 
+> **Amended by ADR-0041**: the switch card's default scope falls back to the
+> Pending Session's directory when one exists (a conversation with a pending has
+> no active session). The terminology rule stands: 会话 stays reserved for a real
+> Session, and the pending state is never labelled with the noun.
+
 ## Context
 
 - A lobby (Feishu chat top-level) maps several OpenCode sessions to one Feishu

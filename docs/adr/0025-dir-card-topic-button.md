@@ -7,6 +7,10 @@ directory wrapped in a brand-new Feishu topic — the card equivalent of
 card is only valid at chat top level; card ops get a runtime nesting guard, and
 the `/switch` card's existing 建话题接管 op is retrofitted with the same guard.
 
+> **Amended by ADR-0041**: 建话题 still opens a brand-new topic, but it now
+> records a Pending Session instead of creating the server session immediately;
+> the first message inside the topic creates it.
+
 ## Context
 
 - `/topic <dir>` already creates a new session in `<dir>` inside a new topic,
