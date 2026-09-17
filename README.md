@@ -17,6 +17,36 @@ Feishu threads to OpenCode sessions, streams the AI's reasoning/tools/answers
 onto interactive cards, and surfaces permission and question requests as
 tap-to-answer cards.
 
+<!-- TODO(screenshots): add Feishu screenshots here when ready. Suggested
+     set — a turn card mid-stream, a permission card, a question card, the
+     todo panel. Save them under docs/images/ and reference by relative path. -->
+
+## Why cola
+
+- **A coding agent in your chat app.** Drive OpenCode from Feishu — phone or
+  desktop — instead of a terminal; each Feishu thread maps to a session.
+- **One card per turn, updated live.** Reasoning, tool calls and the answer
+  stream onto a single interactive card with collapsible panels, a phase timer
+  and a live todo panel, so a slow turn never looks like a dead one.
+- **Decisions are two taps.** Permission requests render as
+  Allow / Deny / Always buttons right on the card, and questions become a
+  multi-select card that accepts custom answers.
+- **Send a screenshot.** Images in a message or a quoted reply are attached to
+  the prompt for vision-capable models.
+- **Your sessions are shared.** cola attaches to the same OpenCode server and
+  store as OpenChamber and the CLI, so sessions started anywhere can be adopted
+  (`/switch`, with a snapshot of what's pending) and messages sent from another
+  client are surfaced back into Feishu.
+- **A topic per task.** `/topic <dir>` opens a Feishu topic bound to one session
+  in that project, with a cover card that keeps the title, project, branch and
+  model visible and up to date.
+- **Steer without restarting.** `/model`, `/agent`, `/think` and `/autoaccept`
+  are per-session overrides applied to the next message.
+- **Private by default.** A fresh cola refuses everyone until you claim it with
+  a one-time code; only the Host can drive it.
+- **Set it and forget it.** Autostart at boot, a singleton lock, restart and
+  self-update — on Linux, macOS and Windows.
+
 ## Quick start
 
 ### 1. Install
