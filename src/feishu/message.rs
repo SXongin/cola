@@ -65,8 +65,17 @@ pub(crate) fn extract_image_keys(content: &str, message_type: &str) -> Vec<Strin
             .map(|k| vec![k.to_string()])
             .unwrap_or_default();
     }
+    // The client's post payload carries the SAME elements in both `content` and
+    // `content_v2` — when both are present, walk only one (v2 is canonical),
+    // otherwise every embedded image is collected twice and the prompt gets
+    // duplicate attachments. Same rule as `extract_card_text`.
+    let source = if v.get("content").is_some() && v.get("content_v2").is_some() {
+        &v["content_v2"]
+    } else {
+        &v
+    };
     let mut out = Vec::new();
-    collect_image_keys(&v, &mut out);
+    collect_image_keys(source, &mut out);
     out
 }
 
@@ -287,6 +296,20 @@ mod tests {
 
         // Unparseable content degrades to empty.
         assert!(extract_image_keys("not json", "image").is_empty());
+    }
+
+    #[test]
+    fn image_keys_post_not_duplicated_across_content_and_content_v2() {
+        // Real post payload: the same elements appear in both `content` and
+        // `content_v2`. Walking both downloads and attaches the image twice
+        // (observed live: one screenshot became two identical file parts).
+        let post = r#"{"title":"","content":[[{"tag":"img","image_key":"img_dup"}]],"content_v2":[[{"tag":"img","image_key":"img_dup"}]]}"#;
+        assert_eq!(extract_image_keys(post, "post"), vec!["img_dup"]);
+
+        // Text + two distinct images, duplicated across both fields, keeps one
+        // key per actual image.
+        let post = r#"{"title":"","content":[[{"tag":"text","text":"看图"}],[{"tag":"img","image_key":"img_a"},{"tag":"img","image_key":"img_b"}]],"content_v2":[[{"tag":"text","text":"看图"}],[{"tag":"img","image_key":"img_a"},{"tag":"img","image_key":"img_b"}]]}"#;
+        assert_eq!(extract_image_keys(post, "post"), vec!["img_a", "img_b"]);
     }
 
     #[test]
