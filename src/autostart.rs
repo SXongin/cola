@@ -86,12 +86,12 @@ pub(crate) fn supervisor_stop_command() -> Option<String> {
     }
 }
 
-/// Whether the registered supervisor currently runs the unit — active,
-/// activating, or reloading. `autostart disable` uses this to stop an instance
-/// that never took the Singleton Lock: still starting up (the lock comes after
-/// config/log setup) or crash-looping, which the lock-holder definition of
-/// "running" misses. Always `false` when no supervisor exists for this
-/// platform (ADR-0039 update).
+/// Whether the registered supervisor currently runs the unit: systemd
+/// `active`/`activating`/`reloading`, or a loaded launchd agent. `autostart
+/// disable` uses this to stop an instance that never took the Singleton Lock:
+/// still starting up (the lock comes after config/log setup) or crash-looping,
+/// which the lock-holder definition of "running" misses. Always `false` when
+/// no supervisor exists for this platform (ADR-0039 update).
 pub(crate) fn supervisor_is_active() -> bool {
     #[cfg(target_os = "linux")]
     {
