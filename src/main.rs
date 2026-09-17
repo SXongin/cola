@@ -60,6 +60,12 @@ enum Subcommand {
         #[arg(long)]
         check: bool,
     },
+    /// Stop the running cola instance (Supervisor first, then the lock holder).
+    Stop {
+        /// Skip the confirmation prompt. A non-TTY run never prompts.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
 /// The default append log file, used when `--log-file` is not given.
@@ -329,19 +335,33 @@ fn replace_instance(pid: i32) -> anyhow::Result<()> {
     anyhow::bail!("old cola instance PID {} did not exit after SIGKILL", pid)
 }
 
-/// Ask the user (on a terminal) whether to replace the running instance.
-/// Returns whether they agreed. Non-interactive startup never prompts: it uses
-/// `--replace` or fails fast.
-fn confirm_replace(pid: i32) -> anyhow::Result<bool> {
+/// Prompt on the terminal with a `[y/N]` question and parse the answer. Shared
+/// by the takeover and stop confirmations so the read/parse convention cannot
+/// drift between them.
+fn confirm(prompt: &str) -> anyhow::Result<bool> {
     use std::io::Write;
-    print!(
-        "⚠️ 另一个 cola 实例（PID {}）正在运行。是否替换它并接管？[y/N] ",
-        pid
-    );
+    print!("{prompt}");
     std::io::stdout().flush()?;
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
     Ok(parse_confirm(&line))
+}
+
+/// Ask the user (on a terminal) whether to replace the running instance.
+/// Returns whether they agreed. Non-interactive startup never prompts: it uses
+/// `--replace` or fails fast.
+fn confirm_replace(pid: i32) -> anyhow::Result<bool> {
+    confirm(&format!(
+        "⚠️ 另一个 cola 实例（PID {pid}）正在运行。是否替换它并接管？[y/N] "
+    ))
+}
+
+/// Ask the user (on a terminal) whether to stop the running instance; the
+/// prompt names the cost — a running turn's card is truncated (ADR-0039).
+fn confirm_stop(pid: i32) -> anyhow::Result<bool> {
+    confirm(&format!(
+        "⚠️ 停止运行中的 cola (PID {pid})？正在进行的对话会被截断。[y/N] "
+    ))
 }
 
 /// Whether a user-typed answer to a `[y/N]` prompt means yes. Accepts y/yes,
@@ -371,9 +391,94 @@ fn stale_lock_owner(path: &std::path::Path) -> Option<i32> {
 /// running) or "start" (nothing is running) after replacing the binary, and by
 /// `update::restart_cli` to verify a supervisor restart actually took effect.
 pub(crate) fn running_daemon_pid() -> Option<i32> {
-    let raw = std::fs::read_to_string(lock_file_path()).ok()?;
+    running_daemon_pid_at(&lock_file_path())
+}
+
+/// [`running_daemon_pid`] against an explicit lock path, so the stop decision
+/// can be tested without touching the real `~/.cola/cola.lock`.
+fn running_daemon_pid_at(lock_path: &std::path::Path) -> Option<i32> {
+    let raw = std::fs::read_to_string(lock_path).ok()?;
     let pid = raw.trim().parse::<i32>().ok()?;
     (pid_alive(pid) && is_cola_process(pid)).then_some(pid)
+}
+
+/// Outcome of `cola stop` / the stop half of `autostart disable` (ADR-0039).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopOutcome {
+    /// The running instance was stopped.
+    Stopped { pid: i32 },
+    /// No functionally-alive cola instance holds the Singleton Lock.
+    NotRunning,
+    /// The interactive user declined the confirmation.
+    Declined,
+}
+
+/// The stop decision, injectable for tests (ADR-0039): `confirm` carries the
+/// interactive answer (`None` = no prompt — non-TTY or `--yes`), `supervisor`
+/// the platform stop command when an Autostart artifact is installed.
+fn stop_running_cola_at(
+    lock_path: &std::path::Path,
+    confirm: Option<bool>,
+    supervisor: Option<&str>,
+) -> anyhow::Result<StopOutcome> {
+    let Some(pid) = running_daemon_pid_at(lock_path) else {
+        return Ok(StopOutcome::NotRunning);
+    };
+    if confirm == Some(false) {
+        return Ok(StopOutcome::Declined);
+    }
+    // Supervisor first (ADR-0039): a launchd agent with `KeepAlive` would
+    // respawn a directly-killed process, so the stop must go through it. A
+    // failing supervisor command is not fatal — the PID path below is the
+    // fallback.
+    if let Some(cmd) = supervisor
+        && let Err(e) = run_supervisor_command(cmd)
+    {
+        tracing::warn!("supervisor stop failed ({e}); falling back to PID {pid}");
+    }
+    // The supervisor may have terminated the Singleton Lock holder already;
+    // skip the signal path then (an already-dead owner makes `replace_instance`
+    // a noisy no-op).
+    if owner_functionally_alive(pid) {
+        replace_instance(pid)?;
+    }
+    Ok(StopOutcome::Stopped { pid })
+}
+
+/// Run a Supervisor stop command (`systemctl --user stop ...` /
+/// `launchctl bootout ...`) through `sh -c`, so a failure is a value the caller
+/// can fall back from instead of a hard error (ADR-0039).
+fn run_supervisor_command(cmd: &str) -> anyhow::Result<()> {
+    let status = std::process::Command::new("sh")
+        .args(["-c", cmd])
+        .status()
+        .map_err(|e| anyhow::anyhow!("cannot run `{cmd}`: {e}"))?;
+    anyhow::ensure!(status.success(), "`{cmd}` exited with {status}");
+    Ok(())
+}
+
+/// Stop the running cola instance (ADR-0039). On an interactive terminal the
+/// user confirms first unless `assume_yes`; a non-TTY run never prompts, so
+/// scripts are not blocked. The Supervisor (if registered) goes first; the
+/// Singleton Lock holder is terminated by PID afterwards.
+pub(crate) fn stop_running_cola(assume_yes: bool) -> anyhow::Result<StopOutcome> {
+    let lock = lock_file_path();
+    let confirm = running_daemon_pid_at(&lock)
+        .filter(|_| !assume_yes && std::io::stdin().is_terminal())
+        .map(confirm_stop)
+        .transpose()?;
+    stop_running_cola_at(&lock, confirm, autostart::supervisor_stop_command().as_deref())
+}
+
+/// `cola stop`: report the outcome and exit. Exit status stays 0 for a plain
+/// no-op and for a decline — only a failing stop is an error.
+fn stop_cli(assume_yes: bool) -> anyhow::Result<()> {
+    match stop_running_cola(assume_yes)? {
+        StopOutcome::Stopped { pid } => println!("cola 已停止（PID {pid}）。"),
+        StopOutcome::NotRunning => println!("cola 未运行。"),
+        StopOutcome::Declined => println!("已取消。"),
+    }
+    Ok(())
 }
 
 impl Drop for SingletonLock {
@@ -402,6 +507,11 @@ async fn main() -> anyhow::Result<()> {
     // to fix a bot whose config is broken). It prints its own progress.
     if let Some(Subcommand::Update { check }) = cli.subcommand {
         return update_cli(check).await;
+    }
+    // Stopping is config-free too: the lock path is fixed, and the command
+    // must work on a bot whose config is broken (ADR-0039).
+    if let Some(Subcommand::Stop { yes }) = cli.subcommand {
+        return stop_cli(yes);
     }
 
     // Config first: `[bridge] log_days` feeds the daily-rotating log writer.
@@ -802,5 +912,144 @@ mod tests {
         assert!(!parse_confirm("n"));
         assert!(!parse_confirm("N"));
         assert!(!parse_confirm("maybe"));
+    }
+
+    #[test]
+    fn stop_without_a_lock_is_not_running() {
+        let home = tempfile::tempdir().unwrap();
+        let lock = home.path().join("cola.lock");
+        assert_eq!(
+            stop_running_cola_at(&lock, None, None).unwrap(),
+            StopOutcome::NotRunning
+        );
+    }
+
+    /// Spawn a fake cola instance — a symlink named `cola` to the platform's
+    /// `sleep`, so `is_cola_process` accepts its argv[0] — and record its PID
+    /// in `lock` the way a real instance would. The caller must reap the child.
+    #[cfg(unix)]
+    fn spawn_fake_cola(lock: &std::path::Path) -> std::process::Child {
+        let link = lock.parent().unwrap().join("cola");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink("/bin/sleep", &link).expect("symlink sleep");
+        let child = std::process::Command::new(&link)
+            .arg("30")
+            .spawn()
+            .expect("spawn fake cola");
+        std::fs::write(lock, child.id().to_string()).unwrap();
+        // sysinfo may not have the just-spawned process in its table yet; wait
+        // until the stop path can see it, like the identity settle waits above.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while running_daemon_pid_at(lock).is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        child
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn declined_stop_leaves_the_instance_and_the_supervisor_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let lock = home.path().join("cola.lock");
+        let mut child = spawn_fake_cola(&lock);
+        let marker = home.path().join("supervisor-ran");
+        let supervisor = format!("touch {}", marker.display());
+        assert_eq!(
+            stop_running_cola_at(&lock, Some(false), Some(&supervisor)).unwrap(),
+            StopOutcome::Declined
+        );
+        assert!(
+            pid_alive(child.id() as i32),
+            "a declined stop must not kill the instance"
+        );
+        assert!(!marker.exists(), "a declined stop must not run the supervisor");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_runs_the_supervisor_and_terminates_the_holder() {
+        let home = tempfile::tempdir().unwrap();
+        let lock = home.path().join("cola.lock");
+        let mut child = spawn_fake_cola(&lock);
+        let marker = home.path().join("supervisor-ran");
+        let supervisor = format!("touch {}", marker.display());
+        assert_eq!(
+            stop_running_cola_at(&lock, None, Some(&supervisor)).unwrap(),
+            StopOutcome::Stopped {
+                pid: child.id() as i32
+            }
+        );
+        assert!(marker.exists(), "the supervisor stop command must run");
+        assert!(
+            !pid_alive(child.id() as i32),
+            "the lock holder must be terminated"
+        );
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_falls_back_to_the_pid_when_the_supervisor_command_fails() {
+        let home = tempfile::tempdir().unwrap();
+        let lock = home.path().join("cola.lock");
+        let mut child = spawn_fake_cola(&lock);
+        assert_eq!(
+            stop_running_cola_at(&lock, None, Some("false")).unwrap(),
+            StopOutcome::Stopped {
+                pid: child.id() as i32
+            }
+        );
+        assert!(
+            !pid_alive(child.id() as i32),
+            "a failed supervisor command must fall back to the PID path"
+        );
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn stop_without_a_live_holder_does_not_touch_the_supervisor() {
+        // Scope boundary (ADR-0039): "running" is the live lock holder. A
+        // supervised crash loop that never holds the lock is out of scope; the
+        // stop must not shell out to the supervisor on a bare no-op.
+        let home = tempfile::tempdir().unwrap();
+        let lock = home.path().join("cola.lock");
+        let marker = home.path().join("supervisor-ran");
+        let supervisor = format!("touch {}", marker.display());
+        assert_eq!(
+            stop_running_cola_at(&lock, None, Some(&supervisor)).unwrap(),
+            StopOutcome::NotRunning
+        );
+        assert!(!marker.exists(), "no live holder means no supervisor call");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_treats_a_non_cola_lock_owner_as_not_running() {
+        let home = tempfile::tempdir().unwrap();
+        let lock = home.path().join("cola.lock");
+        // A live `sleep` (argv[0] carries no "cola") is a stale lock PID that
+        // process reuse handed to another program, not an instance. Wait for
+        // its identity to settle (as the replace_instance test does) so the
+        // assertion tests what it means to.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id() as i32;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while is_cola_process(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!is_cola_process(pid), "sleep must not look like cola");
+        std::fs::write(&lock, pid.to_string()).unwrap();
+        assert_eq!(
+            stop_running_cola_at(&lock, None, None).unwrap(),
+            StopOutcome::NotRunning
+        );
+        assert!(pid_alive(pid), "a non-cola PID must be left alone");
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
