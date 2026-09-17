@@ -1061,10 +1061,12 @@ mod tests {
         assert!(!marker.exists(), "no live holder means no supervisor call");
     }
 
+    #[cfg(unix)]
     #[test]
     fn disable_stop_reaches_an_active_supervisor_without_a_holder() {
         // The startup/crash-loop window: a unit can be activating before it
         // ever writes the lock, so the holder gate must not suppress the stop.
+        // unix-only: `run_supervisor_command` shells out via `sh -c`.
         let home = tempfile::tempdir().unwrap();
         let lock = home.path().join("cola.lock");
         let marker = home.path().join("supervisor-ran");
@@ -1111,10 +1113,12 @@ mod tests {
         let _ = child.wait();
     }
 
+    #[cfg(unix)]
     #[test]
     fn disable_stop_surfaces_a_failing_supervisor_command() {
         // disable unregisters anyway (the caller's primary act) and reports the
         // failure with a non-zero exit; here the error must reach the caller.
+        // unix-only: `run_supervisor_command` shells out via `sh -c`.
         let home = tempfile::tempdir().unwrap();
         let lock = home.path().join("cola.lock");
         assert!(stop_supervised_without_holder_at(&lock, Some("false"), true).is_err());
