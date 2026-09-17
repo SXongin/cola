@@ -694,7 +694,9 @@ impl App {
                 .await;
         }
         let entry = pending.into_entry(session.id.clone());
-        self.sessions.lock().await.activate(entry)?;
+        // The core wrapper (not the raw store) so the session-list cache is
+        // invalidated: `/list`/`/switch` must see the just-created session.
+        self.activate_session(entry).await?;
         Ok(session.id)
     }
 

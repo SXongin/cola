@@ -526,3 +526,39 @@ async fn failed_title_patch_still_materialises_and_warns() {
     );
     assert!(store.get_active(&key()).is_some(), "the session is mapped");
 }
+
+/// Materialisation activates through the core wrapper, so the session-list
+/// cache is dropped and `/list`/`/switch` see the just-created session without
+/// waiting out the TTL.
+#[tokio::test]
+async fn materialisation_drops_the_session_list_cache() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let list_calls = backend.list_sessions_calls.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+
+    app.core.cached_session_list().await.unwrap();
+    let warm = list_calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(warm, 1, "first read fetches");
+
+    seed_pending(&app, PendingEntry::new(key(), "/work/proj")).await;
+    app.handle_message(incoming(
+        "msg_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+    assert!(app.sessions.lock().await.get_active(&key()).is_some());
+
+    app.core.cached_session_list().await.unwrap();
+    assert_eq!(
+        list_calls.load(std::sync::atomic::Ordering::SeqCst),
+        warm + 1,
+        "materialisation drops the session-list cache"
+    );
+}
