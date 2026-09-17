@@ -105,7 +105,7 @@ fn tail_panels(tail: &[TailEntry]) -> Vec<serde_json::Value> {
         return panels;
     }
     panels.push(json!({ "tag": "markdown", "content": "**最近对话**" }));
-    for entry in tail {
+    for (i, entry) in tail.iter().enumerate() {
         let (role, preview) = tail_preview(entry);
         let title = if preview.is_empty() {
             format!("{role} （空消息）")
@@ -119,10 +119,13 @@ fn tail_panels(tail: &[TailEntry]) -> Vec<serde_json::Value> {
         } else {
             chunks
         };
-        // The snapshot is a one-shot card — never re-rendered in place — so its
-        // panels need no stable element_id.
+        // The snapshot is sent once, but SnapshotClaims rebuilds it in place on
+        // a claim ack and on remote resolution — so its panels take stable ids
+        // too (the tail's order is fixed, so the entry index is stable).
         panels.push(crate::feishu::card::shell::collapsible_panel_chunks(
-            &title, &chunks, None,
+            &title,
+            &chunks,
+            Some(&format!("snap_{i}")),
         ));
     }
     panels
@@ -451,6 +454,12 @@ mod tests {
         let panels: Vec<&serde_json::Value> =
             els.iter().filter(|e| e["tag"] == "collapsible_panel").collect();
         assert_eq!(panels.len(), 4, "one folded panel per entry: {card}");
+        // Stable ids, so a claim rebuild keeps each panel's fold state.
+        let ids: Vec<&str> = panels
+            .iter()
+            .map(|p| p["element_id"].as_str().expect("panel element_id"))
+            .collect();
+        assert_eq!(ids, ["snap_0", "snap_1", "snap_2", "snap_3"], "{card}");
         let s = card.to_string();
         assert!(s.contains("👤"), "user role marked: {s}");
         assert!(s.contains("🤖"), "assistant role marked: {s}");
