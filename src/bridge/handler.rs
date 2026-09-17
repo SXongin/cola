@@ -632,7 +632,7 @@ impl App {
         let pending = self.sessions.lock().await.pending_for(thread_key).cloned();
         if let Some(pending) = pending {
             let directory = pending.directory.clone();
-            return match self.materialise_pending(thread_key, pending).await {
+            return match self.materialise_pending(pending, message_id).await {
                 Ok(id) => Ok((id, false)),
                 Err(e) => {
                     // A create failure leaves the pending intact: surface the
@@ -664,8 +664,8 @@ impl App {
     /// the pending intact, so the next message retries.
     async fn materialise_pending(
         &self,
-        thread_key: &ThreadKey,
         pending: PendingEntry,
+        message_id: &str,
     ) -> crate::error::Result<String> {
         let session = self
             .opencode
@@ -673,7 +673,8 @@ impl App {
             .await?;
         // Creation title policy (ADR-0007): `/new <name>` PATCHes the title.
         // A failed PATCH must not orphan the created session (a retry would
-        // create a second one), so it degrades to the server-generated title.
+        // create a second one), so it warns and keeps the server-generated
+        // title.
         if let Some(title) = &pending.title
             && let Err(e) = self.opencode.update_session_title(&session.id, title).await
         {
@@ -681,14 +682,18 @@ impl App {
                 "materialise: title patch failed for {} ({e}); keeping the server title",
                 session.id
             );
+            let _ = self
+                .feishu
+                .reply_text(
+                    message_id,
+                    &format!(
+                        "⚠️ 会话已创建，但标题 `{}` 设置失败：{}\n可用 `/name {}` 重试。",
+                        title, e, title
+                    ),
+                )
+                .await;
         }
-        let mut entry = SessionEntry::new(thread_key.clone(), session.id.clone(), pending.directory);
-        entry.agent = pending.agent;
-        entry.model = pending.model;
-        entry.variant = pending.variant;
-        entry.auto_accept = pending.auto_accept;
-        entry.topic_anchor = pending.topic_anchor;
-        entry.topic_root = pending.topic_root;
+        let entry = pending.into_entry(session.id.clone());
         self.sessions.lock().await.activate(entry)?;
         Ok(session.id)
     }
@@ -854,9 +859,7 @@ impl App {
             "new" => {
                 // Lazy Session Creation (ADR-0041): the card form of `/new` —
                 // declare a Pending Session; the first message materialises it.
-                let directory = core.current_project_directory(&thread_key).await;
-                let pending = PendingEntry::new(thread_key.clone(), directory);
-                if let Err(e) = core.set_pending_session(pending).await {
+                if let Err(e) = core.declare_pending_in_current_project(&thread_key, None).await {
                     tracing::warn!("switch card new: persist failed: {}", e);
                 }
                 Some(CardActionResult {
