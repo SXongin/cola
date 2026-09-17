@@ -646,19 +646,41 @@ pub(crate) async fn handle_command(
             send_switch_card(core, &thread_key, "", SwitchScope::Directory, message_id).await?;
         }
         Command::Name(name) => {
-            // `/name` PATCHes the server title (ADR-0007): the change is
-            // visible to every client sharing the store, and the `/list`
-            // cache is invalidated so the new title shows immediately.
-            // For a cover-rooted topic, patch the cover card right away too —
-            // the chat-list topic entry is its content (ADR-0023).
+            // `/name` renames the conversation's session (ADR-0007). An active
+            // session is PATCHed server-side — visible to every client, and the
+            // `/list` cache is invalidated so the new title shows immediately;
+            // for a cover-rooted topic, patch the cover card right away too
+            // (the chat-list topic entry is its content, ADR-0023). On a
+            // Pending Session (ADR-0041) there is nothing to PATCH yet: the
+            // name becomes the creation title the first message applies.
             if let Some(id) = core.get_session_id(&thread_key).await {
                 core.opencode.update_session_title(&id, &name).await?;
                 core.invalidate_session_list_cache().await;
                 crate::bridge::topic::sync_topic_cover_title(core, &id).await;
+                core.feishu
+                    .reply_text(message_id, &format!("Renamed to \"{}\".", name))
+                    .await?;
+            } else if core
+                .update_pending(&thread_key, |p| p.title = Some(name.clone()))
+                .await?
+            {
+                core.feishu
+                    .reply_text(
+                        message_id,
+                        &format!("已记下标题「{}」——下一条消息创建会话时使用。", name),
+                    )
+                    .await?;
+            } else {
+                core.feishu
+                    .reply_text(
+                        message_id,
+                        &format!(
+                            "⚠️ {}还没有会话，先用 `/new` 或 `/dir` 创建。",
+                            feishu_side_label(&thread_key)
+                        ),
+                    )
+                    .await?;
             }
-            core.feishu
-                .reply_text(message_id, &format!("Renamed to \"{}\".", name))
-                .await?;
         }
         Command::AutoAccept(action) => {
             // `Status` reports the current state; `Set(on)` switches the flag
