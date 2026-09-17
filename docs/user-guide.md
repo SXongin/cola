@@ -234,8 +234,8 @@ glyphs); name the Host（机主）by sending it from a **private chat** with the
 
 ## Autostart
 
-Register cola to start at boot/login. The launcher runs the `cola` binary itself
-(Lazy Start handles the OpenCode server), so no flags are needed:
+Register cola to start at boot/login. The started process is the `cola` binary
+itself (Lazy Start handles the OpenCode server), so no flags are needed:
 
 - **Linux**: `cola autostart enable` writes a systemd **user** unit
   (`~/.config/systemd/user/cola.service`) and enables it. Run
@@ -244,12 +244,33 @@ Register cola to start at boot/login. The launcher runs the `cola` binary itself
 - **macOS**: writes and loads a LaunchAgent (`~/Library/LaunchAgents/com.cola.bot.plist`).
 - **Windows**: writes an `HKCU\...\Run` registry value.
 
-`cola autostart disable` removes the registration; `cola autostart status` shows
-whether it is installed.
+`cola autostart disable` stops the running instance and removes the registration
+(see [Stop](#stop)); `cola autostart status` shows whether it is installed.
 
-> **Important**: `enable` snapshots the **current binary path** into the launcher
-> and your **current PATH**. Run it after installing (and before moving the
-> binary), and re-run it if you ever relocate cola or `opencode`.
+> **Important**: `enable` snapshots the **current binary path** into the
+> Autostart registration and your **current PATH**. Run it after installing (and
+> before moving the binary), and re-run it if you ever relocate cola or
+> `opencode`.
+
+## Stop
+
+`cola stop` stops the running cola instance and nothing else:
+
+- It goes through the platform **supervisor** first (systemd `stop` / launchd
+  `bootout`) when an autostart registration is installed — a LaunchAgent with
+  `KeepAlive` would otherwise respawn a directly-killed process — then falls
+  back to terminating the singleton lock's holder by PID.
+- On an interactive terminal it asks first (a running turn's card is
+  truncated); `--yes` skips the prompt, and a non-interactive run never
+  prompts, so scripts are unaffected.
+- Nothing running prints `cola 未运行` and exits 0. The OpenCode server cola
+  started is left running: it is a shared-store endpoint other clients may
+  still use.
+
+`cola autostart disable` does both — it stops the running instance, then
+removes the registration (a failed stop still unregisters, with a non-zero
+exit). `cola stop` leaves the registration alone, so the next boot starts cola
+again.
 
 ## Logs
 
