@@ -208,22 +208,16 @@ impl ExternalFlow {
         &self,
         core: &Arc<SharedCore>,
         session_id: &str,
-        epoch_ms: i64,
+        turn_anchor_ms: i64,
         card_id: &str,
         preview: &str,
     ) {
         // Guard: a renderer for THIS message is already armed (the accumulator
-        // still carries its epoch). cola's own prompts get a fresh accumulator,
-        // so a different epoch is NOT this message — a new renderer replaces the
-        // old one (whose `submit_epoch_ms` no longer matches, so it exits).
-        let already_rendering = {
-            let cards = core.cards.lock().await;
-            cards
-                .get(session_id)
-                .map(|c| c.acc.submit_epoch_ms == Some(epoch_ms))
-                .unwrap_or(false)
-        };
-        if already_rendering {
+        // still carries the message's server time as its turn anchor). cola's
+        // own prompts get a fresh accumulator, so a different anchor is NOT
+        // this message — a new renderer replaces the old one (whose
+        // `turn_started_ms` no longer matches, so it exits).
+        if armed_turn_anchor(core, session_id).await == Some(turn_anchor_ms) {
             return;
         }
         let session_dir = {
@@ -260,11 +254,11 @@ impl ExternalFlow {
         };
 
         let mut acc = StreamAccumulator::new(&subtitle);
-        acc.submit_epoch_ms = Some(epoch_ms);
-        // The external message's server time is also the card header's date
-        // anchor (#183 follow-up): server clock, so the date matches the
-        // panels it stamps.
-        acc.turn_started_ms = Some(epoch_ms);
+        // The external message's server time is the turn's anchor: header date,
+        // turn filter and renderer replacement guard all read it — one
+        // server-clock value, and cola's clock is never part of the card
+        // (#183, #190).
+        acc.turn_started_ms = Some(turn_anchor_ms);
         acc.session_id = Some(session_id.to_string());
         acc.reply_to_message_id = Some(card_id.to_string());
         acc.attach_work_context(&session_dir).await;
@@ -280,10 +274,10 @@ impl ExternalFlow {
             .and_then(|e| e.variant.clone());
         // Keep the external message visible: the notification card is updated in
         // place, so its preview would otherwise vanish when the reply renders.
-        // Keyed just before the turn's own epoch so the reply's parts — whose
+        // Keyed just before the turn's anchor so the reply's parts — whose
         // server times are at or after it — always insert BELOW the preview.
         if !preview.is_empty() {
-            acc.push_text_at(Some(epoch_ms - 1), &format!("👤 {}", preview));
+            acc.push_text_at(Some(turn_anchor_ms - 1), &format!("👤 {}", preview));
         }
         {
             let mut cards = core.cards.lock().await;
@@ -299,7 +293,7 @@ impl ExternalFlow {
         let poll_ms = self.render_poll_ms.load(std::sync::atomic::Ordering::Relaxed);
         let timeout_ms = self.render_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
         tokio::spawn(async move {
-            external_render_loop(&core, sid, epoch_ms, poll_ms, timeout_ms).await;
+            external_render_loop(&core, sid, turn_anchor_ms, poll_ms, timeout_ms).await;
         });
     }
 
@@ -337,7 +331,7 @@ impl ExternalFlow {
             );
             return false;
         }
-        let Some(epoch_ms) = data.newest_user_epoch else {
+        let Some(turn_anchor_ms) = data.newest_user_epoch else {
             tracing::warn!(
                 "snapshot follow: session {} busy but has no user message to follow",
                 session_id
@@ -357,17 +351,10 @@ impl ExternalFlow {
             return false;
         }
         // Guard: a renderer for THIS turn is already armed (the accumulator
-        // still carries its epoch). Re-point it at the new card — a re-adopt
-        // sent a fresh snapshot mid-turn — so one renderer keeps one live
-        // card, and never double-render.
-        let already_rendering = {
-            let cards = core.cards.lock().await;
-            cards
-                .get(session_id)
-                .map(|c| c.acc.submit_epoch_ms == Some(epoch_ms))
-                .unwrap_or(false)
-        };
-        if already_rendering {
+        // still carries its server-time anchor). Re-point it at the new card —
+        // a re-adopt sent a fresh snapshot mid-turn — so one renderer keeps
+        // one live card, and never double-render.
+        if armed_turn_anchor(core, session_id).await == Some(turn_anchor_ms) {
             let mut cards = core.cards.lock().await;
             if let Some(card) = cards.get_mut(session_id) {
                 card.repoint(card_id);
@@ -386,10 +373,9 @@ impl ExternalFlow {
                 .unwrap_or_default()
         };
         let mut acc = StreamAccumulator::new("");
-        acc.submit_epoch_ms = Some(epoch_ms);
         // The adopted turn's user message is the server-time anchor for the
-        // header date (#183 follow-up).
-        acc.turn_started_ms = Some(epoch_ms);
+        // header date and the turn filter (#183, #190).
+        acc.turn_started_ms = Some(turn_anchor_ms);
         acc.session_id = Some(session_id.to_string());
         acc.reply_to_message_id = Some(card_id.to_string());
         acc.attach_work_context(&session_dir).await;
@@ -425,7 +411,7 @@ impl ExternalFlow {
                 static_text.push_str(&format!("\n{role} {text}"));
             }
         }
-        acc.push_text_at(Some(epoch_ms - 1), &static_text);
+        acc.push_text_at(Some(turn_anchor_ms - 1), &static_text);
         // The adopt-time pending blocks ride as inline sections: the poll's
         // inline dedupe (the block is already present on the accumulator)
         // prevents a duplicate, and clicking one takes the normal inline path —
@@ -476,10 +462,22 @@ impl ExternalFlow {
         let poll_ms = self.render_poll_ms.load(std::sync::atomic::Ordering::Relaxed);
         let timeout_ms = self.render_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
         tokio::spawn(async move {
-            external_render_loop(&core, sid, epoch_ms, poll_ms, timeout_ms).await;
+            external_render_loop(&core, sid, turn_anchor_ms, poll_ms, timeout_ms).await;
         });
         true
     }
+}
+
+/// The turn anchor of the session's armed renderer, if one is armed: the
+/// renderer identity both external arming paths compare their own turn's
+/// server time against, so a duplicate arm is a no-op and a different turn
+/// replaces it.
+async fn armed_turn_anchor(core: &Arc<SharedCore>, session_id: &str) -> Option<i64> {
+    core.cards
+        .lock()
+        .await
+        .get(session_id)
+        .and_then(|c| c.acc.turn_started_ms)
 }
 
 /// ADR-0028: settle a snapshot card right after it was sent — arm the
@@ -516,7 +514,7 @@ pub(crate) async fn settle_snapshot_after_send(
 async fn external_render_loop(
     core: &Arc<SharedCore>,
     session_id: String,
-    epoch_ms: i64,
+    turn_anchor_ms: i64,
     poll_ms: u64,
     timeout_ms: u64,
 ) {
@@ -537,21 +535,21 @@ async fn external_render_loop(
             let cards = core.cards.lock().await;
             cards
                 .get(&session_id)
-                .map(|c| c.acc.submit_epoch_ms != Some(epoch_ms))
+                .map(|c| c.acc.turn_started_ms != Some(turn_anchor_ms))
                 .unwrap_or(true)
         };
         if replaced {
             break;
         }
         // Stream the reply's reasoning/tools/text into the notification card.
-        let Some((new_parts, _, _)) = render_and_flush(core, &session_id, epoch_ms, &msgs).await else {
+        let Some((new_parts, _, _)) = render_and_flush(core, &session_id, &msgs).await else {
             break;
         };
         if new_parts > 0 {
             tracing::info!("external render: session {} gained parts", session_id);
         }
         // The model finished answering: finalize the card, then stop.
-        if external_turn_completed(&msgs, epoch_ms) {
+        if external_turn_completed(&msgs, turn_anchor_ms) {
             finalize_done(core, &session_id).await;
             tracing::info!("external reply rendered: session {} done", session_id);
             break;
@@ -562,7 +560,7 @@ async fn external_render_loop(
             .iter()
             .filter(|m| m.info.role.as_deref() == Some("user"))
             .filter_map(|m| m.info.time.as_ref().map(|t| t.created))
-            .any(|created| created > epoch_ms);
+            .any(|created| created > turn_anchor_ms);
         if newer_turn {
             break;
         }
@@ -609,14 +607,14 @@ async fn finalize_done(core: &Arc<SharedCore>, session_id: &str) {
 /// pause to run tools. OpenCode's terminal finish reasons are "stop", "length",
 /// "content-filter", "error" and "unknown"; "tool-calls" only means the step
 /// ended to execute tools and the model will continue.
-fn external_turn_completed(msgs: &[crate::opencode::types::SessionMessage], epoch_ms: i64) -> bool {
+fn external_turn_completed(msgs: &[crate::opencode::types::SessionMessage], turn_anchor_ms: i64) -> bool {
     msgs.iter()
         .filter(|m| m.info.role.as_deref() == Some("assistant"))
         .filter(|m| {
             m.info
                 .time
                 .as_ref()
-                .map(|t| t.created >= epoch_ms)
+                .map(|t| t.created >= turn_anchor_ms)
                 .unwrap_or(false)
         })
         .flat_map(|m| m.parts.as_array().into_iter().flatten())

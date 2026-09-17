@@ -689,7 +689,7 @@ async fn external_reply_render_guard_replaces_only_newer_messages() {
     {
         let cards = app.cards.lock().await;
         let acc = &cards.get("ses_ext").expect("renderer accumulator").acc;
-        assert_eq!(acc.submit_epoch_ms, Some(1000));
+        assert_eq!(acc.turn_started_ms, Some(1000));
         assert_eq!(acc.reply_to_message_id.as_deref(), Some("n1"));
     }
     assert_eq!(
@@ -709,7 +709,7 @@ async fn external_reply_render_guard_replaces_only_newer_messages() {
     {
         let cards = app.cards.lock().await;
         let acc = &cards.get("ses_ext").expect("renderer accumulator").acc;
-        assert_eq!(acc.submit_epoch_ms, Some(1000));
+        assert_eq!(acc.turn_started_ms, Some(1000));
         assert_eq!(acc.reply_to_message_id.as_deref(), Some("n1"));
     }
     assert_eq!(
@@ -729,7 +729,7 @@ async fn external_reply_render_guard_replaces_only_newer_messages() {
     {
         let cards = app.cards.lock().await;
         let acc = &cards.get("ses_ext").expect("renderer accumulator").acc;
-        assert_eq!(acc.submit_epoch_ms, Some(2000));
+        assert_eq!(acc.turn_started_ms, Some(2000));
         assert_eq!(acc.reply_to_message_id.as_deref(), Some("n2"));
     }
     assert_eq!(

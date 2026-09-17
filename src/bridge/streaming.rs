@@ -298,13 +298,13 @@ pub struct StreamAccumulator {
     /// callID → state signature for tool panels (status + output length); a tool
     /// is re-rendered when its signature changes.
     pub rendered_tool_states: std::collections::HashMap<String, String>,
-    /// Epoch (ms) when this turn's prompt was submitted, on COLA's clock —
-    /// the conservative filter for "parts written at or after this time".
-    pub submit_epoch_ms: Option<i64>,
-    /// The turn's start on the SERVER's clock, captured from the user message
-    /// the server stored (external renders arm with it directly). The card
-    /// header's date anchor: only server times reach the card, so the date can
-    /// never disagree with the panels (#183 follow-up).
+    /// The turn's start on the SERVER's clock: the created time of the user
+    /// message this turn answers. External renders arm with it directly; a
+    /// cola-sent turn captures it from the stored user message on the first
+    /// poll it appears in (matched by `cola_message_id`, ADR-0026). It is the
+    /// turn's single anchor: the header date, the turn filter
+    /// (`created >= it`) and the renderer replacement guard all read it, so
+    /// cola's own clock is never compared against the server's (#183, #190).
     pub turn_started_ms: Option<i64>,
     /// ADR-0014: progress/liveness signals for the header.
     /// The active header phase; None when the turn is not actively working
@@ -326,7 +326,6 @@ impl StreamAccumulator {
             is_group: false,
             rendered_parts: std::collections::HashSet::new(),
             rendered_tool_states: std::collections::HashMap::new(),
-            submit_epoch_ms: None,
             // The card starts loading the moment it is created; the header
             // timer counts from here (ADR-0014).
             current_phase: Some(HeaderPhase::Loading),

@@ -46,7 +46,6 @@ pub(crate) struct Turn {
     text: String,
     cola_message_id: String,
     images: Vec<ImageAttachment>,
-    epoch_ms: i64,
     /// The variant the last attempt actually sent, captured at send time —
     /// what the Turn Footer shows.
     turn_variant: Option<String>,
@@ -133,7 +132,6 @@ impl Turn {
                 }
             },
         };
-        let epoch_ms = chrono::Utc::now().timestamp_millis();
         {
             // Fresh accumulator per prompt: reuse leaks stale text/tools from the
             // previous turn into the next card. The card's IDENTITY (the
@@ -148,7 +146,6 @@ impl Turn {
             let mut acc = StreamAccumulator::new(&subtitle);
             acc.reply_to_message_id = Some(message_id.clone());
             acc.session_id = Some(session_id.clone());
-            acc.submit_epoch_ms = Some(epoch_ms);
             // The id this turn's user message carries, so a later retry reuses
             // it (ADR-0026) — the server deduplicates by id.
             acc.cola_message_id = Some(cola_message_id.clone());
@@ -170,7 +167,6 @@ impl Turn {
             text,
             cola_message_id,
             images,
-            epoch_ms,
             turn_variant: None,
         }))
     }
@@ -179,7 +175,7 @@ impl Turn {
     /// are captured at send time (ADR-0019), and the renderer always stops
     /// before the response is returned so a retry starts its own cleanly.
     async fn attempt(&mut self, app: &Arc<App>) -> crate::error::Result<opencode::types::PromptResponse> {
-        let render = RenderPoll::spawn(app, &self.session_id, self.epoch_ms);
+        let render = RenderPoll::spawn(app, &self.session_id);
         // Capture the variant actually sent this turn AT SEND TIME, not at
         // finalization: a `/think` issued mid-generation must not retro-tag the
         // card of a turn that was sent without it (same "capture at turn start"
@@ -303,7 +299,7 @@ impl Turn {
                 if let Ok(resp) = prompt_resp {
                     let mut rendered = false;
                     if let Some(msgs) = &final_msgs {
-                        rendered = render_new_turn_parts(acc, msgs, self.epoch_ms);
+                        rendered = render_new_turn_parts(acc, msgs);
                     }
                     if !rendered {
                         render_parts(acc, &resp.parts);
@@ -463,13 +459,13 @@ struct RenderPoll {
 }
 
 impl RenderPoll {
-    fn spawn(app: &Arc<App>, session_id: &str, epoch_ms: i64) -> Self {
+    fn spawn(app: &Arc<App>, session_id: &str) -> Self {
         let done = Arc::new(AtomicBool::new(false));
         let core = Arc::clone(&app.core);
         let sid = session_id.to_string();
         let flag = Arc::clone(&done);
         let handle = tokio::spawn(async move {
-            render_poll_loop(&core, sid, epoch_ms, flag).await;
+            render_poll_loop(&core, sid, flag).await;
         });
         Self { done, handle }
     }

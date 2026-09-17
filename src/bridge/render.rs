@@ -344,32 +344,55 @@ fn render_part_once(acc: &mut StreamAccumulator, part: &serde_json::Value) -> bo
     true
 }
 
-/// Render the parts of this turn's assistant messages that haven't been
-/// rendered yet. Returns true if anything new was rendered.
-pub(crate) fn render_new_turn_parts(
-    acc: &mut StreamAccumulator,
-    msgs: &[crate::opencode::types::SessionMessage],
-    epoch_ms: i64,
-) -> bool {
-    let mut rendered_any = false;
+/// Capture the turn's SERVER-clock anchor (`turn_started_ms`) from the user
+/// message the server stored, matched by the `msg_cola_` id cola chose
+/// (ADR-0026). External renders arm with the anchor directly; this fills it in
+/// for cola's own turns on the first poll that sees the message. It must run
+/// before any filtering: the anchor alone decides which messages are this
+/// turn's, and cola's clock cannot.
+fn capture_turn_anchor(acc: &mut StreamAccumulator, msgs: &[crate::opencode::types::SessionMessage]) {
+    if acc.turn_started_ms.is_some() {
+        return;
+    }
+    let Some(cola_message_id) = acc.cola_message_id.as_deref() else {
+        return;
+    };
     for m in msgs {
-        // The header date's anchor (#183 follow-up): the SERVER's own time for
-        // the user message cola sent this turn. Captured on the first poll that
-        // sees it, so the card's date never reads cola's clock. External
-        // renderers arm with the server time directly instead.
-        if acc.turn_started_ms.is_none()
-            && m.info.role.as_deref() == Some("user")
-            && acc.cola_message_id.as_deref() == Some(m.info.id.as_str())
+        if m.info.role.as_deref() == Some("user")
+            && m.info.id == cola_message_id
             && let Some(t) = m.info.time.as_ref()
         {
             acc.turn_started_ms = Some(t.created);
+            return;
         }
+    }
+}
+
+/// Render the parts of this turn's assistant messages that haven't been
+/// rendered yet. Returns true if anything new was rendered.
+///
+/// The turn filter is anchored on `acc.turn_started_ms`, the SERVER's own time
+/// for this turn's user message (#190). Filtering against cola's submit clock
+/// instead dropped the new turn's parts when the server ran behind cola, and
+/// bled the previous turn's parts into the new card when it ran ahead. Until
+/// the anchor is observed nothing renders: with two skewed clocks there is no
+/// threshold that tells the two turns apart.
+pub(crate) fn render_new_turn_parts(
+    acc: &mut StreamAccumulator,
+    msgs: &[crate::opencode::types::SessionMessage],
+) -> bool {
+    capture_turn_anchor(acc, msgs);
+    let Some(anchor_ms) = acc.turn_started_ms else {
+        return false;
+    };
+    let mut rendered_any = false;
+    for m in msgs {
         let is_assistant = m.info.role.as_deref() == Some("assistant");
         let in_turn = m
             .info
             .time
             .as_ref()
-            .map(|t| t.created >= epoch_ms)
+            .map(|t| t.created >= anchor_ms)
             .unwrap_or(false);
         if !is_assistant || !in_turn {
             continue;
@@ -500,7 +523,6 @@ pub(crate) async fn flush_card(core: &Arc<SharedCore>, session_id: &str) {
 pub(crate) async fn render_and_flush(
     core: &Arc<SharedCore>,
     session_id: &str,
-    epoch_ms: i64,
     msgs: &[crate::opencode::types::SessionMessage],
 ) -> Option<(usize, usize, usize)> {
     // OpenCode auto-renames sessions after a turn; follow the server's live
@@ -510,7 +532,7 @@ pub(crate) async fn render_and_flush(
         let mut cards = core.cards.lock().await;
         let card = cards.get_mut(session_id)?;
         let before = card.acc.rendered_parts.len();
-        let changed = render_new_turn_parts(&mut card.acc, msgs, epoch_ms);
+        let changed = render_new_turn_parts(&mut card.acc, msgs);
         // Re-flush when the header changed even without new content: the
         // progress timer keeps ticking, so an idle turn still proves it is
         // alive (ADR-0014). Whole-second timestamps bound this to at most one
@@ -540,7 +562,6 @@ pub(crate) async fn render_and_flush(
 pub(crate) async fn render_poll_loop(
     core: &Arc<SharedCore>,
     session_id: String,
-    epoch_ms: i64,
     done: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     use std::sync::atomic::Ordering;
@@ -556,7 +577,7 @@ pub(crate) async fn render_poll_loop(
                 continue;
             }
         };
-        match render_and_flush(core, &session_id, epoch_ms, &msgs).await {
+        match render_and_flush(core, &session_id, &msgs).await {
             // Accumulator gone (turn completed and was cleaned up); keep polling
             // until the prompt returns so late parts are still caught.
             None => continue,
@@ -587,7 +608,7 @@ mod tests {
 
         let epoch = 0;
         let mut acc = StreamAccumulator::new("test");
-        acc.submit_epoch_ms = Some(epoch);
+        acc.turn_started_ms = Some(epoch);
         assert_eq!(acc.current_phase, Some(HeaderPhase::Loading));
 
         let msgs = vec![SessionMessage {
@@ -606,7 +627,7 @@ mod tests {
             ]),
         }];
 
-        assert!(render_new_turn_parts(&mut acc, &msgs, epoch));
+        assert!(render_new_turn_parts(&mut acc, &msgs));
         assert_eq!(acc.current_phase, Some(HeaderPhase::Streaming));
     }
 
@@ -670,12 +691,14 @@ mod tests {
     fn render_new_turn_parts_filters_turn_and_dedups() {
         use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
 
-        let epoch = 1000;
+        // The user message's server time is the turn anchor; the old assistant
+        // (created 100) sits before it, the current one (3000) after.
+        let anchor = 2000;
         let mut acc = StreamAccumulator::new("test");
-        acc.submit_epoch_ms = Some(epoch);
+        acc.turn_started_ms = Some(anchor);
 
         let msgs = vec![
-            // Old turn assistant message (before epoch) — skipped.
+            // Old turn assistant message (before the anchor) — skipped.
             SessionMessage {
                 info: MessageInfo {
                     id: "old".into(),
@@ -719,7 +742,7 @@ mod tests {
             },
         ];
 
-        assert!(render_new_turn_parts(&mut acc, &msgs, epoch));
+        assert!(render_new_turn_parts(&mut acc, &msgs));
         assert!(acc.reasoning.contains("Let me think"));
         assert_eq!(acc.tools.len(), 1);
         assert_eq!(acc.rendered_parts.len(), 1);
@@ -727,18 +750,18 @@ mod tests {
         assert!(!acc.text.contains("question"));
         assert!(!acc.reasoning.contains("old reasoning"));
 
-        assert!(!render_new_turn_parts(&mut acc, &msgs, epoch));
+        assert!(!render_new_turn_parts(&mut acc, &msgs));
     }
 
     /// The header date reads the SERVER's time for the turn's user message
     /// (#183 follow-up): captured on the first poll that sees it, so cola's
-    /// own clock never reaches the card.
+    /// own clock never reaches the card. The same captured anchor is #190's
+    /// turn filter, so this test also pins the capture source.
     #[test]
     fn turn_started_ms_captures_the_user_message_server_time() {
         use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
 
         let mut acc = StreamAccumulator::new("proj");
-        acc.submit_epoch_ms = Some(9999);
         acc.cola_message_id = Some("msg_cola_1".into());
         let msgs = vec![SessionMessage {
             info: MessageInfo {
@@ -753,8 +776,163 @@ mod tests {
             parts: serde_json::json!([{ "type": "text", "text": "你好" }]),
         }];
 
-        assert!(!render_new_turn_parts(&mut acc, &msgs, 9999));
+        assert!(!render_new_turn_parts(&mut acc, &msgs));
         assert_eq!(acc.turn_started_ms, Some(1234));
+    }
+
+    /// Until the server's own user message is observed there is no anchor, and
+    /// nothing renders: cola's clock is no substitute — with skewed clocks any
+    /// threshold it provides either drops the new turn or admits the old one.
+    #[test]
+    fn nothing_renders_before_the_server_anchor_is_observed() {
+        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.cola_message_id = Some("msg_cola_1".into());
+        let msgs = vec![SessionMessage {
+            info: MessageInfo {
+                id: "a1".into(),
+                role: Some("assistant".into()),
+                parent_id: Some("msg_cola_1".into()),
+                time: Some(MessageTime { created: 100 }),
+                model_id: None,
+                provider_id: None,
+                tokens: None,
+            },
+            parts: serde_json::json!([{ "type": "text", "text": "回答" }]),
+        }];
+
+        assert!(!render_new_turn_parts(&mut acc, &msgs));
+        assert_eq!(acc.turn_started_ms, None);
+        assert!(acc.text.is_empty());
+    }
+
+    /// #190: a server clock BEHIND cola's must not drop the new turn — every
+    /// part is "in the past" for cola, so the retired cola-clock filter
+    /// skipped them and the card stayed empty. The filter anchors on the
+    /// server's own user-message time instead.
+    #[test]
+    fn a_server_clock_behind_cola_does_not_drop_the_turns_parts() {
+        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
+
+        let cola_now = chrono::Utc::now().timestamp_millis();
+        let server_user = cola_now - 3_600_000; // the server is an hour behind
+        let assistant = server_user + 250;
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.cola_message_id = Some("msg_cola_1".into());
+        let msgs = vec![
+            SessionMessage {
+                info: MessageInfo {
+                    id: "msg_cola_1".into(),
+                    role: Some("user".into()),
+                    parent_id: None,
+                    time: Some(MessageTime { created: server_user }),
+                    model_id: None,
+                    provider_id: None,
+                    tokens: None,
+                },
+                parts: serde_json::json!([{ "type": "text", "text": "你好" }]),
+            },
+            SessionMessage {
+                info: MessageInfo {
+                    id: "a1".into(),
+                    role: Some("assistant".into()),
+                    parent_id: Some("msg_cola_1".into()),
+                    time: Some(MessageTime { created: assistant }),
+                    model_id: None,
+                    provider_id: None,
+                    tokens: None,
+                },
+                parts: serde_json::json!([{ "type": "text", "text": "回答" }]),
+            },
+        ];
+        assert!(
+            assistant < cola_now,
+            "fixture: the whole turn predates cola's clock"
+        );
+
+        assert!(render_new_turn_parts(&mut acc, &msgs));
+        assert_eq!(acc.turn_started_ms, Some(server_user));
+        assert!(
+            acc.text.contains("回答"),
+            "the turn's parts must render: {:?}",
+            acc.text
+        );
+    }
+
+    /// #190: a server clock AHEAD of cola's must not bleed the previous turn
+    /// into the new card. The previous assistant message is after cola's
+    /// submit clock but before this turn's user message, so only the server
+    /// anchor separates the two turns.
+    #[test]
+    fn a_server_clock_ahead_of_cola_does_not_bleed_the_previous_turn() {
+        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
+
+        let cola_now = chrono::Utc::now().timestamp_millis();
+        let previous_assistant = cola_now + 30_000; // still future to cola
+        let server_user = cola_now + 60_000; // this turn's user message
+        let assistant = server_user + 250;
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.cola_message_id = Some("msg_cola_1".into());
+        let msgs = vec![
+            SessionMessage {
+                info: MessageInfo {
+                    id: "a_old".into(),
+                    role: Some("assistant".into()),
+                    parent_id: Some("msg_cola_old".into()),
+                    time: Some(MessageTime {
+                        created: previous_assistant,
+                    }),
+                    model_id: None,
+                    provider_id: None,
+                    tokens: None,
+                },
+                parts: serde_json::json!([{ "type": "text", "text": "旧回答" }]),
+            },
+            SessionMessage {
+                info: MessageInfo {
+                    id: "msg_cola_1".into(),
+                    role: Some("user".into()),
+                    parent_id: None,
+                    time: Some(MessageTime { created: server_user }),
+                    model_id: None,
+                    provider_id: None,
+                    tokens: None,
+                },
+                parts: serde_json::json!([{ "type": "text", "text": "你好" }]),
+            },
+            SessionMessage {
+                info: MessageInfo {
+                    id: "a1".into(),
+                    role: Some("assistant".into()),
+                    parent_id: Some("msg_cola_1".into()),
+                    time: Some(MessageTime { created: assistant }),
+                    model_id: None,
+                    provider_id: None,
+                    tokens: None,
+                },
+                parts: serde_json::json!([{ "type": "text", "text": "新回答" }]),
+            },
+        ];
+        assert!(
+            previous_assistant > cola_now,
+            "fixture: the previous turn is still ahead of cola's clock"
+        );
+
+        assert!(render_new_turn_parts(&mut acc, &msgs));
+        assert_eq!(acc.turn_started_ms, Some(server_user));
+        assert!(
+            acc.text.contains("新回答"),
+            "the turn must render: {:?}",
+            acc.text
+        );
+        assert!(
+            !acc.text.contains("旧回答"),
+            "the previous turn must not bleed in: {:?}",
+            acc.text
+        );
     }
 
     /// #183 follow-up: only parts with a server time show one. A part whose
@@ -801,7 +979,7 @@ mod tests {
 
         let epoch = 0;
         let mut acc = StreamAccumulator::new("test");
-        acc.submit_epoch_ms = Some(epoch);
+        acc.turn_started_ms = Some(epoch);
 
         let msgs = |status: &str, output: &str| {
             vec![SessionMessage {
@@ -825,23 +1003,15 @@ mod tests {
         };
 
         // First render: tool running.
-        assert!(render_new_turn_parts(&mut acc, &msgs("running", ""), epoch));
+        assert!(render_new_turn_parts(&mut acc, &msgs("running", "")));
         assert_eq!(acc.tools["call_1"].status, "running");
 
         // Same part id, updated to completed — must re-render (upsert).
-        assert!(render_new_turn_parts(
-            &mut acc,
-            &msgs("completed", "src\n"),
-            epoch
-        ));
+        assert!(render_new_turn_parts(&mut acc, &msgs("completed", "src\n")));
         assert_eq!(acc.tools["call_1"].status, "completed");
 
         // No change → nothing new.
-        assert!(!render_new_turn_parts(
-            &mut acc,
-            &msgs("completed", "src\n"),
-            epoch
-        ));
+        assert!(!render_new_turn_parts(&mut acc, &msgs("completed", "src\n")));
     }
 
     #[test]
@@ -850,7 +1020,7 @@ mod tests {
 
         let epoch = 0;
         let mut acc = StreamAccumulator::new("test");
-        acc.submit_epoch_ms = Some(epoch);
+        acc.turn_started_ms = Some(epoch);
 
         let msgs = |reasoning: &str, text: &str| {
             vec![SessionMessage {
@@ -872,15 +1042,14 @@ mod tests {
 
         // Parts are written empty first, then updated with content. The empty
         // version must NOT be rendered (it would freeze the placeholder).
-        assert!(!render_new_turn_parts(&mut acc, &msgs("", ""), epoch));
+        assert!(!render_new_turn_parts(&mut acc, &msgs("", "")));
         assert_eq!(acc.reasoning, "");
         assert_eq!(acc.text, "");
 
         // Once content lands (same part ids), render it once.
         assert!(render_new_turn_parts(
             &mut acc,
-            &msgs("Let me think", "Answer here"),
-            epoch
+            &msgs("Let me think", "Answer here")
         ));
         assert!(acc.reasoning.contains("Let me think"));
         assert!(acc.text.contains("Answer here"));
@@ -888,8 +1057,7 @@ mod tests {
         // Re-fetching the same content must not duplicate.
         assert!(!render_new_turn_parts(
             &mut acc,
-            &msgs("Let me think", "Answer here"),
-            epoch
+            &msgs("Let me think", "Answer here")
         ));
         assert_eq!(acc.reasoning, "Let me think");
         assert_eq!(acc.text, "Answer here");
@@ -905,7 +1073,7 @@ mod tests {
 
         let epoch = 0;
         let mut acc = StreamAccumulator::new("test");
-        acc.submit_epoch_ms = Some(epoch);
+        acc.turn_started_ms = Some(epoch);
 
         // Realistic: no "id" on the text part.
         let msgs = || {
@@ -927,11 +1095,11 @@ mod tests {
         };
 
         // Poll loop renders the parts.
-        assert!(render_new_turn_parts(&mut acc, &msgs(), epoch));
+        assert!(render_new_turn_parts(&mut acc, &msgs()));
         assert_eq!(acc.text, "你好！很高兴认识你。");
 
         // Final render re-fetches the same messages — must NOT append again.
-        assert!(!render_new_turn_parts(&mut acc, &msgs(), epoch));
+        assert!(!render_new_turn_parts(&mut acc, &msgs()));
         assert_eq!(acc.text, "你好！很高兴认识你。");
         assert_eq!(acc.reasoning, "thinking");
     }
@@ -945,7 +1113,7 @@ mod tests {
 
         let epoch = 0;
         let mut acc = StreamAccumulator::new("test");
-        acc.submit_epoch_ms = Some(epoch);
+        acc.turn_started_ms = Some(epoch);
 
         let msgs = vec![SessionMessage {
             info: MessageInfo {
@@ -969,7 +1137,7 @@ mod tests {
             ]),
         }];
 
-        assert!(render_new_turn_parts(&mut acc, &msgs, epoch));
+        assert!(render_new_turn_parts(&mut acc, &msgs));
         let tool = acc.tools.get("call_edit").expect("tool rendered");
         assert_eq!(tool.status, "error");
         let out = tool.output.clone().unwrap_or_default();
@@ -1000,7 +1168,7 @@ mod tests {
 
         let epoch = 0;
         let mut acc = StreamAccumulator::new("test");
-        acc.submit_epoch_ms = Some(epoch);
+        acc.turn_started_ms = Some(epoch);
 
         let msgs = vec![SessionMessage {
             info: MessageInfo {
@@ -1022,7 +1190,7 @@ mod tests {
             ]),
         }];
 
-        assert!(render_new_turn_parts(&mut acc, &msgs, epoch));
+        assert!(render_new_turn_parts(&mut acc, &msgs));
         let tool = acc.tools.get("call_edit").expect("tool rendered");
         assert_eq!(tool.status, "error");
         let out = tool.output.clone().unwrap_or_default();
@@ -1044,7 +1212,7 @@ mod tests {
 
         let epoch = 0;
         let mut acc = StreamAccumulator::new("test");
-        acc.submit_epoch_ms = Some(epoch);
+        acc.turn_started_ms = Some(epoch);
 
         let msgs = |status: &str, output: &str| {
             vec![SessionMessage {
@@ -1076,8 +1244,7 @@ mod tests {
         // Completed: the diff replaces the generic success sentence.
         assert!(render_new_turn_parts(
             &mut acc,
-            &msgs("completed", "Edit applied successfully."),
-            epoch
+            &msgs("completed", "Edit applied successfully.")
         ));
         let out = acc.tools["call_edit"].output.clone().unwrap_or_default();
         assert!(out.contains("@@ -1 +1 @@"), "diff must be shown: {}", out);
@@ -1090,13 +1257,12 @@ mod tests {
         // Re-rendering the same completed part is deduped (output unchanged).
         assert!(!render_new_turn_parts(
             &mut acc,
-            &msgs("completed", "Edit applied successfully."),
-            epoch
+            &msgs("completed", "Edit applied successfully.")
         ));
 
         // A failure keeps its error text, not a diff.
         let mut acc = StreamAccumulator::new("test");
-        acc.submit_epoch_ms = Some(epoch);
+        acc.turn_started_ms = Some(epoch);
         let err_msgs = vec![SessionMessage {
             info: MessageInfo {
                 id: "a1".into(),
@@ -1117,7 +1283,7 @@ mod tests {
                 }
             }]),
         }];
-        assert!(render_new_turn_parts(&mut acc, &err_msgs, epoch));
+        assert!(render_new_turn_parts(&mut acc, &err_msgs));
         let out = acc.tools["call_edit"].output.clone().unwrap_or_default();
         assert!(out.contains("no such file"), "error text must be shown: {}", out);
         assert!(!out.contains("@@"), "no diff on a failed edit: {}", out);
@@ -1134,7 +1300,7 @@ mod tests {
 
         let epoch = 0;
         let mut acc = StreamAccumulator::new("test");
-        acc.submit_epoch_ms = Some(epoch);
+        acc.turn_started_ms = Some(epoch);
 
         let msgs = vec![SessionMessage {
             info: MessageInfo {
@@ -1155,7 +1321,7 @@ mod tests {
         }];
 
         // Long turn: the poll loop already rendered the parts.
-        assert!(render_new_turn_parts(&mut acc, &msgs, epoch));
+        assert!(render_new_turn_parts(&mut acc, &msgs));
 
         // Final reconcile: nothing new from messages → falls back to the
         // response parts (identical content). Must NOT append again.
