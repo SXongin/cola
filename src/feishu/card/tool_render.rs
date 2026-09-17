@@ -243,12 +243,18 @@ fn needs_code_block(text: &str) -> bool {
         .any(|l| l.chars().count() > 100 || is_setext_underline(l))
 }
 
-/// A line Feishu's markdown parser reads as a Setext heading underline: one or
-/// more `=` or `-` and nothing else (CommonMark allows up to three leading
-/// spaces and trailing whitespace).
+/// A line Feishu's markdown parser reads as a Setext heading underline: up to
+/// three leading spaces, then one or more `-` or `=`, then only trailing
+/// whitespace. More indentation is an indented code block, and internal
+/// whitespace (`- - -`) is a thematic break — which can interrupt a paragraph,
+/// so neither folds the lines above it.
 fn is_setext_underline(line: &str) -> bool {
-    let t = line.trim();
-    !t.is_empty() && (t.chars().all(|c| c == '-') || t.chars().all(|c| c == '='))
+    let t = line.trim_end();
+    let body = t.trim_start_matches(' ');
+    if t.len() - body.len() > 3 || body.is_empty() {
+        return false;
+    }
+    body.bytes().all(|b| b == b'-') || body.bytes().all(|b| b == b'=')
 }
 
 /// Render a tool's input JSON as human-readable markdown, keyed on the tool
@@ -721,8 +727,8 @@ Index: /a/lua.lua
             "the marker must not be swallowed by the output: {md}"
         );
         assert!(
-            md.contains("\n--\n"),
-            "the separator stays a literal line inside the fence: {md}"
+            md.contains(&format!("```\n{out}\n```")),
+            "the fenced body must hold the separator verbatim: {md}"
         );
     }
 
@@ -762,6 +768,23 @@ Index: /a/lua.lua
         // Markdown that only looks like an underline is left alone.
         assert!(!needs_code_block("- item\n- item"));
         assert!(!needs_code_block("|---|---|"));
+    }
+
+    /// The underline rule is CommonMark's: at most three leading spaces, no
+    /// internal whitespace, trailing whitespace allowed. Anything wider would
+    /// fence outputs that were never at risk.
+    #[test]
+    fn setext_underline_rule_matches_commonmark() {
+        assert!(is_setext_underline("--"));
+        assert!(is_setext_underline("="));
+        assert!(is_setext_underline("   ---"));
+        assert!(is_setext_underline("  ====  "), "trailing whitespace allowed");
+        assert!(!is_setext_underline("    ---"), "four spaces is indented code");
+        assert!(!is_setext_underline("\t---"), "a tab is not leading spaces");
+        assert!(!is_setext_underline("- - -"), "internal whitespace is a break");
+        assert!(!is_setext_underline(""));
+        assert!(!is_setext_underline("   "));
+        assert!(!is_setext_underline("--- x"));
     }
 
     #[test]
