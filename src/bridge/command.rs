@@ -1085,13 +1085,14 @@ pub(crate) fn feishu_side_label(thread_key: &ThreadKey) -> &'static str {
 /// Fetch + shape the data the `/switch` card renders: the session list
 /// (children and archived excluded, filtered by `keyword`, sorted by last
 /// activity) plus the thread's active + mapped session ids. The list is scoped
-/// by `scope` (ADR-0022): `Directory` filters to the active session's
-/// directory, falling back to the whole store when the thread has no session;
-/// `All` shows everything. Returns the effective scope (the fallback may
-/// downgrade `Directory` to `All`) and the current directory, so the card can
-/// render the right header and toggle. Shared by the text send path
-/// (`send_switch_card`) and the card ack refresh (`App::build_switch_card_for`)
-/// so both render from one source of truth.
+/// by `scope` (ADR-0022): `Directory` filters to the current directory (the
+/// Pending Session's when one exists, else the active session's — ADR-0041),
+/// falling back to the whole store when the thread has neither; `All` shows
+/// everything. Returns the effective scope (the fallback may downgrade
+/// `Directory` to `All`) and the current directory, so the card can render the
+/// right header and toggle. Shared by the text send path (`send_switch_card`)
+/// and the card ack refresh (`App::build_switch_card_for`) so both render from
+/// one source of truth.
 pub(crate) async fn switch_card_data(
     core: &Arc<SharedCore>,
     thread_key: &ThreadKey,
