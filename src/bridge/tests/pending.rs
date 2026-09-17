@@ -562,3 +562,97 @@ async fn materialisation_drops_the_session_list_cache() {
         "materialisation drops the session-list cache"
     );
 }
+
+/// `/name` on a pending sets the creation title: no server PATCH yet, and the
+/// first message creates the session with that title.
+#[tokio::test]
+async fn name_on_a_pending_sets_the_creation_title() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let titles = backend.update_title_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+
+    crate::bridge::command::handle_command(
+        &app.core,
+        crate::bridge::command::Command::New(None),
+        key(),
+        "msg_new",
+        crate::config::ConversationKind::P2p,
+    )
+    .await
+    .unwrap();
+    crate::bridge::command::handle_command(
+        &app.core,
+        crate::bridge::command::Command::Name("api-refactor".into()),
+        key(),
+        "msg_name",
+        crate::config::ConversationKind::P2p,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        titles.lock().await.is_empty(),
+        "nothing is PATCHed before the session exists"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&key())
+            .and_then(|p| p.title.clone()),
+        Some("api-refactor".to_string())
+    );
+    let texts = platform.texts().await;
+    assert!(
+        texts.iter().any(|t| t.contains("已记下标题")),
+        "the reply says the title is pending: {texts:?}"
+    );
+
+    app.handle_message(incoming(
+        "msg_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+    assert_eq!(
+        *titles.lock().await,
+        vec![("ses_test".to_string(), "api-refactor".to_string())],
+        "materialisation PATCHes the title /name recorded"
+    );
+}
+
+/// `/name` with neither an active session nor a pending no longer lies about a
+/// rename: it replies like the other commands that need a session.
+#[tokio::test]
+async fn name_without_a_session_replies_no_session() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+    crate::bridge::command::handle_command(
+        &app.core,
+        crate::bridge::command::Command::Name("api-refactor".into()),
+        key(),
+        "msg_name",
+        crate::config::ConversationKind::P2p,
+    )
+    .await
+    .unwrap();
+
+    let texts = platform.texts().await;
+    assert!(
+        texts.iter().any(|t| t.contains("还没有会话")),
+        "truthful no-session reply: {texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("Renamed")),
+        "no false rename confirmation: {texts:?}"
+    );
+}

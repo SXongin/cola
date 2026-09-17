@@ -420,6 +420,16 @@ impl SharedCore {
         Ok(pending)
     }
 
+    /// Mutate the conversation's Pending Session and persist (ADR-0041:
+    /// `/name` and the settings commands configure a pending). `false` when
+    /// the thread has none.
+    pub(crate) async fn update_pending<F>(&self, thread_key: &ThreadKey, f: F) -> crate::error::Result<bool>
+    where
+        F: FnOnce(&mut PendingEntry),
+    {
+        self.sessions.lock().await.update_pending(thread_key, f)
+    }
+
     /// Mutate the mapped session in place and persist, returning the updated
     /// entry (`None` when `session_id` is not mapped). The session-list cache
     /// is untouched: per-session overrides are not server-list state.

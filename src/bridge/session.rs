@@ -217,6 +217,22 @@ impl SessionStore {
         Ok(Some(updated))
     }
 
+    /// Mutate the conversation's Pending Session in place and persist,
+    /// returning `false` when the thread has no pending (ADR-0041: `/name`
+    /// and the per-session settings commands configure a pending). Mirrors
+    /// [`SessionStore::update`] for entries.
+    pub fn update_pending<F>(&mut self, key: &ThreadKey, f: F) -> crate::error::Result<bool>
+    where
+        F: FnOnce(&mut PendingEntry),
+    {
+        let Some(pending) = self.pending.iter_mut().find(|p| &p.thread_key == key) else {
+            return Ok(false);
+        };
+        f(pending);
+        self.write_to_disk()?;
+        Ok(true)
+    }
+
     /// Remove a session entry by session ID.
     fn remove(&mut self, session_id: &str) -> Option<SessionEntry> {
         if let Some(pos) = self.entries.iter().position(|e| e.session_id == session_id) {

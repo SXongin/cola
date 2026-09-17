@@ -4,8 +4,9 @@ How cola decides what identity a session has, and which session a thread may use
 
 > **Amended by ADR-0041**: `/new <name>` no longer PATCHes the server title at
 > command time — it records a Pending Session whose title is PATCHed when the
-> conversation's first message materialises the session. `/name <new>` still
-> PATCHes immediately (it requires a real active session).
+> conversation's first message materialises the session. `/name` on a real
+> session still PATCHes immediately; on a Pending Session it sets the pending's
+> creation title instead (ADR-0041's command matrix).
 
 ## Context
 
