@@ -7,6 +7,11 @@ on a historical session popped into the lobby and interleaved its cards with the
 current conversation's. We decided external-message sync only follows the ACTIVE
 session of each thread.
 
+> **Amended by ADR-0041**: `/new` no longer promotes a session to active at
+> command time — it records a Pending Session, so a thread has no active session
+> until its first prompt materialises one. Inactive sessions keep the
+> clear-and-re-baseline behaviour described here.
+
 ## Decision
 
 - The external poller (`bridge/external.rs`) notifies and renders only for a

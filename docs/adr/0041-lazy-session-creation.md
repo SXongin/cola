@@ -5,11 +5,12 @@ Every session-selection command today creates a real backend Session immediately
 ## Context
 
 - All session creation is eager today: `/new` (`src/bridge/command.rs:575-597`), `/dir` (`command.rs:526-568`), the `/dir` card's `pick` (`src/bridge/handler.rs:1075-1113`), the switch card's `新建` (`handler.rs:788-815`), and `/topic` Fresh (`src/bridge/topic.rs:73-95`). The only lazy paths are the first-message auto-create (`handler.rs:615-628`) and the 404-recreate, both of which create because a prompt is already there.
-- The junk is store-wide and permanent. A never-prompted session appears in `GET /session` and `GET /experimental/session` with the default title `New session - <iso>`; the server has no cleanup job. OpenChamber's session list does not filter them; cola's own `/switch` list (top 15 by `time.updated`, `command.rs:1135-1139`) and `/dir` Recent Directories (deduped by directory, `command.rs:1183-1203`) show them too — a wrong `/dir` also pollutes the directory picker.
+- The junk is store-wide and permanent. A never-prompted session appears in `GET /session` and `GET /experimental/session` with the default title `New session - <iso>`; the server has no cleanup job. OpenChamber's session list does not filter them; cola's own `/switch` list (top 15 by `time.updated` — the sort at `command.rs:1135-1139`, the cap at `command.rs:1555`) and `/dir` Recent Directories (deduped by directory, `command.rs:1183-1203`) show them too — a wrong `/dir` also pollutes the directory picker.
 - The mistakes that produce them are noticed **before** the first prompt (grilling): a wrong directory, a `/new` where a topic was intended, a new session where an adoption was intended. A corrected mistake therefore only needs the eager creation not to have happened.
 - Other clients already cover cleanup of what does exist: OpenChamber's session retention (`useSessionAutoCleanup`: delete or archive by age, keeping the recent 5 and the current session) and `opencode session delete`.
 - Server facts: session ids are server-generated — `Session.CreateInput` has no `id` field, so a client cannot pre-name a session; a prompt to a missing session 404s; there is no create-and-prompt endpoint; archiving is `PATCH` with `time.archived`, deletion `DELETE /session/{id}`.
 - ADR-0013 already made the Owned Server lazy (spawned at the moment a prompt needs it). This ADR applies the same principle one level up.
+- **Amends five existing ADRs** (each now carries an `Amended by ADR-0041` banner): ADR-0006 (`/topic` no longer creates the session at command time), ADR-0012 (project derivation is pending-first), ADR-0017 (`/new` no longer promotes a session to active), ADR-0022 (switch-card scope falls back to the pending directory; 会话 stays reserved for real Sessions), ADR-0025 (建话题 writes a pending). Everything else in those ADRs stands.
 
 ## Decision
 
@@ -36,7 +37,7 @@ Every session-selection command today creates a real backend Session immediately
 
 ### Topic cover card
 
-- A fresh `/topic` cover shows the directory and 「会话 · 下一条消息创建」. After materialisation the existing cover-sync path patches it to the full brief (title, session id, model). Fallback anchoring and the quote-injection guard (ADR-0023) are unchanged.
+- A fresh `/topic` cover shows the directory and 「下一条消息创建」 in place of the session line — the 会话 noun stays reserved for a real Session (ADR-0022). After materialisation the existing cover-sync path patches it to the full brief (title, session id, model). Fallback anchoring and the quote-injection guard (ADR-0023) are unchanged.
 
 ### Non-goals
 
