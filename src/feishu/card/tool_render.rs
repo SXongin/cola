@@ -35,6 +35,10 @@ impl ToolPanel {
 /// absent (a payload with no server time) no clock is rendered.
 pub(super) fn tool_panel_element(tool: &ToolPanel, at_ms: Option<i64>) -> serde_json::Value {
     let mut content = String::new();
+    // A todo panel is folded by default and its rows only change in place, so
+    // its status counts ride the header (below) instead of opening the body:
+    // progress stays readable — and visibly refreshed — while collapsed.
+    let mut title_counts: Option<String> = None;
     if let Some(i) = &tool.input {
         let formatted = format_tool_input(&tool.name, i);
         if !formatted.is_empty() {
@@ -54,7 +58,10 @@ pub(super) fn tool_panel_element(tool: &ToolPanel, at_ms: Option<i64>) -> serde_
         // the whole run above it, marker included, into one heading
         // (`## Output99- …`), glued together.
         content.push_str("**Output**\n\n");
-        if let Some(h) = &header {
+        if tool.name == "todowrite" {
+            // The counts line is the panel's header, not a body intro.
+            title_counts = header;
+        } else if let Some(h) = &header {
             content.push_str(&format!("{}\n\n", h));
         }
         let body = truncate_md(&body, TOOL_OUTPUT_MAX_CHARS);
@@ -63,7 +70,16 @@ pub(super) fn tool_panel_element(tool: &ToolPanel, at_ms: Option<i64>) -> serde_
         // underline: Feishu markdown wraps plain text but not code blocks, and
         // a Setext underline merges the lines above it — so both cases stay on
         // one visual line per source line inside a fence.
-        if tool.name == "read" || tool.name == "edit" || needs_code_block(&body) {
+        let as_code_block = match tool.name.as_str() {
+            "read" | "edit" => true,
+            // A PARSED todo checklist is markdown by construction (status
+            // icons, strikethrough); a long task text must not fence it into
+            // literal `- ✅ …` rows. The unparsed fallback (error text, a
+            // malformed list) is raw text again and takes the generic rule.
+            "todowrite" => title_counts.is_none() && needs_code_block(&body),
+            _ => needs_code_block(&body),
+        };
+        if as_code_block {
             content.push_str(&fenced_code(&body, lang));
         } else {
             content.push_str(&body);
@@ -72,10 +88,11 @@ pub(super) fn tool_panel_element(tool: &ToolPanel, at_ms: Option<i64>) -> serde_
     if content.is_empty() {
         content = "_(no details)_".to_string();
     }
-    collapsible_panel(
-        &format!("{} {}{}", tool.status_icon(), tool.name, panel_time_suffix(at_ms)),
-        &content,
-    )
+    let mut title = format!("{} {}{}", tool.status_icon(), tool.name, panel_time_suffix(at_ms));
+    if let Some(c) = &title_counts {
+        title.push_str(&format!(" · {}", c));
+    }
+    collapsible_panel(&title, &content)
 }
 
 /// The meaningful parts of an `edit` tool's unified diff (recorded by OpenCode
@@ -151,12 +168,117 @@ pub(crate) fn parse_edit_diff(diff: &str) -> Option<EditDiff> {
     })
 }
 
+/// One item of a `todowrite` tool payload (OpenCode's `Todo.Info`). The
+/// payload's `priority` is dropped on purpose: it rarely varies within one
+/// list (agents mark nearly everything high), so showing it would add a marker
+/// to almost every row and buy no signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TodoItem {
+    content: String,
+    status: String,
+}
+
+/// Parse a `todowrite` payload into its items. The tool's input is
+/// `{"todos":[…]}` and its output is that same array JSON-encoded, so both
+/// shapes are accepted. Anything else (an empty list, a running call's
+/// placeholder, an error text) returns `None`, and the caller falls back to
+/// showing the payload unchanged.
+fn parse_todos(value: &serde_json::Value) -> Option<Vec<TodoItem>> {
+    let arr = match value {
+        serde_json::Value::Array(arr) => arr,
+        serde_json::Value::Object(obj) => obj.get("todos")?.as_array()?,
+        _ => return None,
+    };
+    let mut items = Vec::new();
+    for v in arr {
+        // A list with one malformed row falls back to the raw payload as a
+        // whole: rendering the readable rows and silently dropping the rest
+        // would lose content the model wrote.
+        let content = v.get("content")?.as_str()?;
+        if content.is_empty() {
+            return None;
+        }
+        // An unknown status renders as pending (`todo_style`'s fallback);
+        // normalize it here so the row and the counts line can't disagree.
+        let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("pending");
+        let status = if TODO_STATUSES.iter().any(|(s, _, _)| *s == status) {
+            status
+        } else {
+            "pending"
+        };
+        items.push(TodoItem {
+            content: content.to_string(),
+            status: status.to_string(),
+        });
+    }
+    (!items.is_empty()).then_some(items)
+}
+
+/// How one todo status renders — its icon and its row markup. The counts line
+/// reads the table in this order (active first), so this is the one place the
+/// status vocabulary lives. Unknown statuses read as pending.
+#[derive(Clone, Copy)]
+enum TodoMarkup {
+    Plain,
+    Bold,
+    Strike,
+}
+
+const TODO_STATUSES: [(&str, &str, TodoMarkup); 4] = [
+    ("in_progress", "🔄", TodoMarkup::Bold),
+    ("pending", "⬜", TodoMarkup::Plain),
+    ("completed", "✅", TodoMarkup::Strike),
+    ("cancelled", "🚫", TodoMarkup::Strike),
+];
+
+fn todo_style(status: &str) -> (&'static str, TodoMarkup) {
+    TODO_STATUSES
+        .iter()
+        .find(|(s, _, _)| *s == status)
+        .map(|(_, icon, markup)| (*icon, *markup))
+        .unwrap_or(("⬜", TodoMarkup::Plain))
+}
+
+/// The header of a todo panel: one `icon count` group per non-empty status, so
+/// the folded panel still answers "how far along is this?" without unfolding.
+fn todo_counts(todos: &[TodoItem]) -> String {
+    TODO_STATUSES
+        .iter()
+        .filter_map(|(status, icon, _)| {
+            let n = todos.iter().filter(|t| t.status == *status).count();
+            (n > 0).then(|| format!("{icon} {n}"))
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// The checklist body of a todo panel: one `- <icon> content` line per item,
+/// in the order the agent wrote them (that order carries the plan's sequence).
+/// Finished and dropped items are struck through so the eye can skip them; the
+/// in-progress item is bolded — it is the only actionable row.
+fn format_todo_list(todos: &[TodoItem]) -> String {
+    todos
+        .iter()
+        .map(|t| {
+            let text = first_chunk(&t.content, 120);
+            let (icon, markup) = todo_style(&t.status);
+            match markup {
+                TodoMarkup::Bold => format!("- {icon} **{text}**"),
+                TodoMarkup::Strike => format!("- {icon} ~~{text}~~"),
+                TodoMarkup::Plain => format!("- {icon} {text}"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Render a tool's raw output string human-friendly. OpenCode's `read` tool
 /// wraps its output in XML tags (`<path>…</path>`, `<type>…</type>`,
 /// `<content>…</content>`); strip them so the card shows just the file path and
 /// the numbered lines instead of raw markup. An `edit` tool's output is its
 /// unified diff (substituted by the renderer) — keep only the hunks and report
-/// the change count. Other tools pass through unchanged.
+/// the change count. A `todowrite` output is its todo list JSON-encoded — render
+/// it as a status checklist. Other tools pass through unchanged.
 ///
 /// Returns `(header, language hint, body)`: the header (the file-path line) is
 /// markdown; the body is shown as a code block so long lines don't wrap.
@@ -168,6 +290,16 @@ fn format_tool_output(name: &str, output: &str) -> (Option<String>, Option<&'sta
             Some(d) => (Some(format!("+{} −{}", d.additions, d.deletions)), None, d.body),
             None => (None, None, output.to_string()),
         };
+    }
+    if name == "todowrite" {
+        // The output is the list itself, `JSON.stringify(todos, null, 2)`.
+        // Parse it back into a checklist; a payload that doesn't parse (a
+        // running call, an error, a truncated dump) falls through unchanged.
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(output)
+            && let Some(todos) = parse_todos(&value)
+        {
+            return (Some(todo_counts(&todos)), None, format_todo_list(&todos));
+        }
     }
     if name != "read" || !output.contains("<path>") {
         return (None, None, output.to_string());
@@ -344,6 +476,12 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
                 .unwrap_or_default();
             format!("🔀 {}{}", desc, sub)
         }
+        "todowrite" => match parse_todos(input) {
+            // The list itself is the Output section; the input only reports
+            // how big the plan is — and is all a still-running panel can show.
+            Some(todos) => format!("📋 共 {} 项任务", todos.len()),
+            None => input.to_string(),
+        },
         _ => {
             // Generic: one `- key: value` line per scalar field.
             let mut lines = Vec::new();
@@ -648,6 +786,94 @@ Index: /a/lua.lua
         // File content renders as a fenced code block (no line wrapping).
         assert!(text.contains("```rust"), "rust fenced code block: {}", text);
         assert!(text.contains("```"), "closing fence: {}", text);
+    }
+
+    /// A `todowrite` call renders as a status checklist, not raw JSON: the
+    /// input reports the plan size, the output is the iconed list with a count
+    /// header, and the payload's priority (noise) never leaks.
+    #[test]
+    fn todowrite_panel_renders_a_checklist_not_raw_json() {
+        let todos = json!([
+            {"content": "调研", "status": "completed", "priority": "high"},
+            {"content": "实现渲染", "status": "in_progress", "priority": "high"},
+            {"content": "补测试", "status": "pending", "priority": "medium"},
+            {"content": "旧方案", "status": "cancelled", "priority": "low"},
+        ]);
+        let tool = ToolPanel {
+            name: "todowrite".into(),
+            status: "completed".into(),
+            input: Some(json!({ "todos": todos.clone() })),
+            // Real outputs are `JSON.stringify(todos, null, 2)`.
+            output: Some(todos.to_string()),
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        let md = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .expect("panel markdown content");
+
+        let title = card["body"]["elements"][0]["header"]["title"]["content"]
+            .as_str()
+            .expect("panel title");
+        assert_eq!(
+            title, "✅ todowrite · 🔄 1 · ⬜ 1 · ✅ 1 · 🚫 1",
+            "the folded header must carry the status counts"
+        );
+        assert!(md.contains("**Input**\n📋 共 4 项任务"), "plan size: {md}");
+        assert!(
+            md.contains("**Output**\n\n- ✅ ~~调研~~"),
+            "the checklist follows the marker: {md}"
+        );
+        assert!(md.contains("- ✅ ~~调研~~"), "completed struck: {md}");
+        assert!(md.contains("- 🔄 **实现渲染**"), "in-progress bolded: {md}");
+        assert!(md.contains("- ⬜ 补测试"), "pending plain: {md}");
+        assert!(md.contains("- 🚫 ~~旧方案~~"), "cancelled struck: {md}");
+        assert!(!md.contains('"'), "raw JSON leaked: {md}");
+        assert!(!md.contains("priority"), "raw priority leaked: {md}");
+        assert!(!md.contains("```"), "checklist must stay markdown: {md}");
+    }
+
+    /// A todo item long enough to trip the generic long-line rule must stay a
+    /// markdown row: fencing it would show the literal `- ✅ …` syntax.
+    #[test]
+    fn todowrite_long_item_stays_markdown_not_fenced() {
+        let content = format!("修复 {}", "很长".repeat(80));
+        let tool = ToolPanel {
+            name: "todowrite".into(),
+            status: "completed".into(),
+            input: None,
+            output: Some(json!([{"content": content, "status": "pending"}]).to_string()),
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        let md = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .expect("panel markdown content");
+        assert!(md.contains("- ⬜ 修复 很长"), "row kept and clipped: {md}");
+        assert!(!md.contains("```"), "must not be fenced: {md}");
+    }
+
+    /// An unparseable `todowrite` output — a running call's placeholder, an
+    /// error, a truncated dump, or a list with one malformed row — passes
+    /// through unchanged rather than being dropped, and so does an empty list.
+    #[test]
+    fn todowrite_output_without_a_todo_array_passes_through() {
+        for raw in [
+            "0 todos",
+            "❌ permission denied",
+            "[]",
+            "",
+            r#"[{"content":"ok","status":"pending"},{"status":"pending"}]"#,
+        ] {
+            let (header, lang, body) = format_tool_output("todowrite", raw);
+            assert_eq!(header, None, "no header for {raw:?}");
+            assert_eq!(lang, None, "no language hint for {raw:?}");
+            assert_eq!(body, raw, "raw output kept for {raw:?}");
+        }
     }
 
     #[test]

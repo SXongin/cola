@@ -245,7 +245,18 @@ fn render_part(acc: &mut StreamAccumulator, part: &serde_json::Value) {
                 input,
                 output,
             };
-            acc.push_tool_at(at, &call_id, panel);
+            if name == "todowrite" {
+                // A live status section, not a transcript row: the latest call
+                // replaces the panel the card tail renders (on the live card,
+                // so a split can't strand an outdated list). The clock is
+                // always reassigned — a payload without a server time shows no
+                // clock rather than the previous call's, which would read as a
+                // write time this list never had.
+                acc.todo_panel = Some(panel);
+                acc.todo_shown_at = at;
+            } else {
+                acc.push_tool_at(at, &call_id, panel);
+            }
             if status == "running" {
                 acc.card_state = crate::feishu::card::CardState::Streaming;
             }
@@ -324,7 +335,14 @@ fn render_part_once(acc: &mut StreamAccumulator, part: &serde_json::Value) -> bo
             .and_then(|v| v.as_str())
             .map(|s| s.len())
             .unwrap_or(0);
-        let sig = format!("{status}|{output_len}|{diff_len}");
+        // A todowrite's panel is replaced on every call, so its signature must
+        // fold in the state CONTENT: a list whose items changed without
+        // changing any length (任务 A → 任务 B) must still refresh the panel.
+        let sig = if part.get("tool").and_then(|v| v.as_str()) == Some("todowrite") {
+            part.get("state").map(|s| s.to_string()).unwrap_or_default()
+        } else {
+            format!("{status}|{output_len}|{diff_len}")
+        };
         if acc.rendered_tool_states.get(call_id) == Some(&sig) {
             return false;
         }
@@ -1025,6 +1043,178 @@ mod tests {
 
         // No change → nothing new.
         assert!(!render_new_turn_parts(&mut acc, &msgs("completed", "src\n")));
+    }
+
+    /// The model re-sends the whole todo list on every update, each as a NEW
+    /// `todowrite` call (new callID). The panel is a card-TAIL status section:
+    /// no timeline row, the latest call replaces it in place, and its header
+    /// carries the latest list's counts (visible while folded) and clock.
+    #[test]
+    fn todowrite_calls_share_one_panel_refreshed_in_place() {
+        let at_a = crate::feishu::card::test_local_ms(2026, 9, 17, 10, 0);
+        let at_b = crate::feishu::card::test_local_ms(2026, 9, 17, 10, 7);
+        let mut acc = StreamAccumulator::new("test");
+        render_parts(
+            &mut acc,
+            &serde_json::json!([
+                { "type": "tool", "tool": "todowrite", "callID": "call_a",
+                  "state": { "status": "completed", "time": { "start": at_a },
+                             "input": { "todos": [ { "content": "第一步", "status": "in_progress", "priority": "high" } ] },
+                             "output": "[{\"content\":\"第一步\",\"status\":\"in_progress\",\"priority\":\"high\"}]" } },
+                { "type": "tool", "tool": "todowrite", "callID": "call_b",
+                  "state": { "status": "completed", "time": { "start": at_b },
+                             "input": { "todos": [ { "content": "第一步", "status": "completed", "priority": "high" },
+                                                    { "content": "第二步", "status": "pending", "priority": "medium" } ] },
+                             "output": "[{\"content\":\"第一步\",\"status\":\"completed\",\"priority\":\"high\"},{\"content\":\"第二步\",\"status\":\"pending\",\"priority\":\"medium\"}]" } },
+            ]),
+        );
+
+        assert!(
+            acc.tools.is_empty(),
+            "todowrite must not take a timeline row: {:?}",
+            acc.tools.keys().collect::<Vec<_>>()
+        );
+        let card = acc.build_card().to_string();
+        assert_eq!(
+            card.matches("todowrite").count(),
+            1,
+            "exactly one todo panel must render: {card}"
+        );
+        // The latest call's list, not the first one's.
+        assert!(card.contains("- ✅ ~~第一步~~"), "latest status: {card}");
+        assert!(card.contains("- ⬜ 第二步"), "latest item: {card}");
+        assert!(
+            !card.contains("**第一步**"),
+            "the first call's in-progress row must be gone: {card}"
+        );
+        // The header shows the latest update's clock and counts.
+        assert!(card.contains("✅ todowrite · 10:07"), "latest clock: {card}");
+        assert!(card.contains("· ⬜ 1 · ✅ 1"), "header counts: {card}");
+        assert!(!card.contains("10:00"), "the first clock must be gone: {card}");
+    }
+
+    /// The tail is what makes the live list survive a split: a timeline row
+    /// would freeze on whichever card the call landed on, and later updates
+    /// (which re-render the live continuation) could never reach it.
+    #[test]
+    fn todowrite_panel_rides_the_live_continuation_after_a_split() {
+        let mut acc = StreamAccumulator::new("test");
+        render_parts(
+            &mut acc,
+            &serde_json::json!([
+                { "type": "tool", "tool": "todowrite", "callID": "call_a",
+                  "state": { "status": "completed",
+                             "input": { "todos": [ { "content": "第一步", "status": "in_progress" } ] },
+                             "output": "[{\"content\":\"第一步\",\"status\":\"in_progress\"}]" } },
+            ]),
+        );
+        // Enough text to push the timeline past one card's budget.
+        acc.push_text(&"很长的回答。".repeat(2000));
+
+        let (full_card, full) = acc.build_card_with_split();
+        assert!(full, "long text must split");
+        assert!(
+            !full_card.to_string().contains("todowrite"),
+            "a finalized card carries no tail: {}",
+            full_card
+        );
+
+        // The continuation is the live card; the todo panel rides it, so a
+        // later list update is visible there.
+        render_parts(
+            &mut acc,
+            &serde_json::json!([
+                { "type": "tool", "tool": "todowrite", "callID": "call_b",
+                  "state": { "status": "completed",
+                             "input": { "todos": [ { "content": "第一步", "status": "completed" },
+                                                    { "content": "第二步", "status": "pending" } ] },
+                             "output": "[{\"content\":\"第一步\",\"status\":\"completed\"},{\"content\":\"第二步\",\"status\":\"pending\"}]" } },
+            ]),
+        );
+        let (rest, full2) = acc.build_card_with_split();
+        assert!(!full2, "the tail should fit on the continuation");
+        let rest_text = rest.to_string();
+        assert!(
+            rest_text.contains("- ✅ ~~第一步~~") && rest_text.contains("- ⬜ 第二步"),
+            "the continuation must show the latest list: {rest_text}"
+        );
+    }
+
+    /// The todo tail's reserve must never wedge the card chain: when the first
+    /// remaining item plus the panel's reserve exceeds the budget, that item is
+    /// finalized WITHOUT the tail (never an empty slice, which would freeze
+    /// `render_from` and re-send blank "部分完成" cards forever) and the panel
+    /// rides a later card.
+    #[test]
+    fn todo_reserve_never_wedges_the_card_chain() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Done;
+        // A near-maximal todo panel: one item whose CJK content fills the
+        // reserve's 3000-char output window (~9KB).
+        let output = serde_json::json!([{
+            "content": "很长的任务描述".repeat(500),
+            "status": "pending",
+        }])
+        .to_string();
+        acc.todo_panel = Some(crate::feishu::card::tool_render::ToolPanel {
+            name: "todowrite".into(),
+            status: "completed".into(),
+            input: None,
+            output: Some(output),
+        });
+        // Two max-size CJK text chunks (~18KB each): the first alone plus the
+        // reserve is over the budget, so only the progress guarantee keeps the
+        // chain moving.
+        acc.push_text(&"很长的回答。".repeat(1000));
+        acc.push_text(&"另一段回答。".repeat(1000));
+
+        let mut cards = 0;
+        loop {
+            let before = acc.render_from;
+            let (card, full) = acc.build_card_with_split();
+            let text = card.to_string();
+            assert!(
+                text.contains("回答。") || text.contains("todowrite"),
+                "an empty card was built at render_from={before}: {text}"
+            );
+            cards += 1;
+            assert!(cards < 10, "the card chain did not terminate");
+            if !full {
+                break;
+            }
+            assert!(acc.render_from > before, "a full card must advance render_from");
+        }
+        let last = acc.build_card();
+        assert!(
+            last.to_string().contains("todowrite"),
+            "the panel must ride the final card: {last}"
+        );
+    }
+
+    /// A todowrite update whose state has the same byte length as the previous
+    /// one (任务 A → 任务 B) must still refresh the panel: length alone is not a
+    /// change signal for a re-written list.
+    #[test]
+    fn todowrite_same_length_update_still_refreshes() {
+        let mut acc = StreamAccumulator::new("test");
+        let part = |call_id: &str, task: &str| {
+            serde_json::json!([
+                { "type": "tool", "tool": "todowrite", "callID": call_id,
+                  "state": { "status": "completed",
+                             "input": { "todos": [ { "content": task, "status": "pending" } ] },
+                             "output": format!("[{{\"content\":\"{task}\",\"status\":\"pending\"}}]") } }
+            ])
+        };
+        render_parts(&mut acc, &part("call_a", "任务 A"));
+        render_parts(&mut acc, &part("call_b", "任务 B"));
+
+        let card = acc.build_card().to_string();
+        assert!(card.contains("任务 B"), "latest content must render: {card}");
+        assert!(
+            !card.contains("任务 A"),
+            "the stale list must be replaced: {card}"
+        );
+        assert!(acc.todo_panel.is_some(), "the tail holds the panel");
     }
 
     #[test]
