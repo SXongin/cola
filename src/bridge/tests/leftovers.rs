@@ -61,7 +61,8 @@ fn gated_abort(app: &Arc<App>) -> tokio::task::JoinHandle<()> {
 }
 
 /// `/stop` with an inline permission pending: the request is rejected at the
-/// source and the card carries the denial receipt instead of a live block.
+/// source, the card carries the denial receipt, and the next turn does not
+/// re-host the block.
 #[tokio::test]
 async fn aborted_turn_rejects_its_pending_permission() {
     let _wd = test_work_dir();
@@ -69,11 +70,16 @@ async fn aborted_turn_rejects_its_pending_permission() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.prompt_error = Some("Aborted".into());
+    // The first turn aborts (the mock's scripted stand-in for the server
+    // returning the AbortedError), the second one runs normally.
+    backend
+        .fail_prompt_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
     backend.prompt_gate = Some(Arc::clone(&gate));
     backend.permissions = vec![perm_request("per_1", "ses_test", "ls -la")];
     let replies = backend.reply_permission_calls.clone();
     let replied = backend.replied_permissions.clone();
+    let interrupts = backend.interrupt_calls.clone();
     let (app, platform) = build_app(cfg, backend).await;
 
     let turn = gated_abort(&app);
@@ -94,7 +100,22 @@ async fn aborted_turn_rejects_its_pending_permission() {
         "the permission must be live on the card before the abort"
     );
 
-    // /stop: the prompt returns the abort, the turn finishes, leftovers settle.
+    // /stop through the real command path interrupts the in-flight prompt.
+    app.handle_message(incoming(
+        "msg_stop".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/stop".into(),
+        None,
+    ))
+    .await;
+    assert_eq!(
+        interrupts.lock().await.as_slice(),
+        &["ses_test".to_string()],
+        "/stop must interrupt the running session"
+    );
+    // The aborted prompt returns: the turn finishes and settles its leftovers.
     gate.add_permits(1);
     turn.await.unwrap();
 
@@ -115,6 +136,72 @@ async fn aborted_turn_rejects_its_pending_permission() {
     assert!(
         !card.contains("🔐 **权限请求**") && !card.contains("允许一次"),
         "no live controls may survive on the card: {card}"
+    );
+
+    // The next turn must not re-host the block: the server dropped it, so the
+    // sweep finds nothing to move onto the fresh card.
+    gate.add_permits(1);
+    app.handle_message(incoming(
+        "msg_2".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "再来一次".into(),
+        None,
+    ))
+    .await;
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.core, &mut seen).await;
+    assert!(
+        app.cards
+            .lock()
+            .await
+            .get("ses_test")
+            .unwrap()
+            .acc
+            .live_permissions()
+            .is_empty(),
+        "the rejected request must not come back on the next turn"
+    );
+    assert!(
+        !final_card(&platform)
+            .await
+            .to_string()
+            .contains("🔐 **权限请求**"),
+        "the next turn's card must not host the ghost block"
+    );
+}
+
+/// A sub-task child's pending request is the aborted turn's to reject: the
+/// ownership filter walks the parent chain, like `/autoaccept`'s approval.
+#[tokio::test]
+async fn aborted_turn_rejects_a_child_sessions_request() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.prompt_error = Some("Aborted".into());
+    backend.permissions = vec![perm_request("per_child", "ses_child", "ls -la")];
+    backend
+        .session_parents
+        .insert("ses_child".into(), "ses_test".into());
+    let replies = backend.reply_permission_calls.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+
+    app.handle_message(incoming(
+        "msg_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "跑个命令".into(),
+        None,
+    ))
+    .await;
+
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_child".to_string(), "reject".to_string())],
+        "a sub-task descendant's request belongs to the aborted turn"
     );
 }
 
