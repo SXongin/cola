@@ -197,8 +197,8 @@ start_server = "auto"            # auto (default) | never | eager
   `/claim`.
 - **`work_dir`** — default directory for new sessions when a conversation has no
   active session (fresh chat, or after `/switch forget`). Defaults to the process
-  cwd. `/new` inherits the active session's directory; `/dir` overrides per
-  session.
+  cwd. `/new` inherits the active session's directory (or the pending's);
+  `/dir` overrides per session.
 - **`group_completion_notice`** — in group chats, reply to the requester with a
   short completion notice (the streaming card is patched in place, so it does not
   push a new notification). `false` disables it. p2p chats don't need it.
@@ -339,7 +339,7 @@ detailed help for any of these.
 | `/switch list [kw] [--all]` | List recent sessions across the shared store (up to 15) |
 | `/switch <id> [--force]` | Take over a session by id/title |
 | `/switch forget` | Un-map this chat's session (the server session stays) |
-| `/new [name]` | New session in the current project (no session → default dir) |
+| `/new [name]` | Declare a new session in the current project — created by the next message (no session → default dir) |
 | `/topic [dir] [name]` | Create a new Feishu topic + session in `<dir>` (bare `/topic` uses the current project) |
 | `/topic --adopt <kw> [--force]` | Open a topic around an existing session |
 | `/name <name>` | Rename current session (server-side, visible to all clients) |
@@ -357,6 +357,10 @@ detailed help for any of these.
 
 Notes:
 
+- `/new` only **declares** the session — the conversation's next non-command
+  message creates it in the chosen directory and maps it here, so a mistaken
+  `/new` can be corrected with another `/new`, `/dir`, `/switch` or `/topic`
+  before then without leaving a session in the shared store.
 - `/agent`, `/model`, `/think`, `/autoaccept` are **per-session** overrides sent
   with the next message and persisted across restarts. `/model`'s value must
   exist on the server cola attaches to. Bare `/model` opens the provider → model

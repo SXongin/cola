@@ -1310,14 +1310,16 @@ async fn switch_card_adopt_in_topic_persists_anchor() {
     );
 }
 
-/// A `/switch` card "new" action creates a session in the current project
-/// (equivalent to `/new`) and maps it as active.
+/// A `/switch` card "new" action declares a Pending Session in the current
+/// project (equivalent to `/new`, ADR-0041) — it creates NO server session.
 #[tokio::test]
-async fn switch_card_new_action_creates_session_in_current_project() {
+async fn switch_card_new_action_declares_pending_in_current_project() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let backend = MockBackend::new(realistic_parts());
+    let created = backend.created_session_dirs.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     // Root an existing session in /work/proj so "current project" is set.
     seed_entry(
@@ -1347,7 +1349,21 @@ async fn switch_card_new_action_creates_session_in_current_project() {
         .await
         .expect("switch new should return a result");
     assert!(result.card.is_some(), "new returns a refreshed card");
-    let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
-    assert_ne!(entry.session_id, "ses_old", "a fresh session is created");
-    assert_eq!(entry.directory, "/work/proj", "inherits the current project");
+    assert_eq!(
+        result.toast.as_deref(),
+        Some("下一条消息创建会话"),
+        "the toast states the creation timing"
+    );
+    assert!(
+        created.lock().await.is_empty(),
+        "the card's 新建 must not create a server session"
+    );
+    let pending = app
+        .sessions
+        .lock()
+        .await
+        .pending_for(&key)
+        .cloned()
+        .expect("a pending is declared");
+    assert_eq!(pending.directory, "/work/proj", "inherits the current project");
 }

@@ -58,7 +58,8 @@ async fn new_command_inherits_active_sessions_directory() {
     .await
     .unwrap();
 
-    // Then `/new` must stay in the project, not jump back to work_dir.
+    // Then `/new` declares a Pending Session in the project, not back in
+    // work_dir (ADR-0012 / ADR-0041).
     crate::bridge::command::handle_command(
         &app.core,
         crate::bridge::command::Command::New(None),
@@ -69,24 +70,24 @@ async fn new_command_inherits_active_sessions_directory() {
     .await
     .unwrap();
 
-    let entry = app
+    let pending = app
         .sessions
         .lock()
         .await
-        .get_active(&thread_key)
+        .pending_for(&thread_key)
         .cloned()
-        .expect("a session should be active after /new");
+        .expect("/new declares a pending");
     // normalize_directory canonicalizes the project path (resolving
     // /private/var on macOS and \\?\ / 8.3 short names on Windows), so
     // compare against the canonicalized form — not the raw tempdir path.
     let canonical = std::fs::canonicalize(proj.path()).unwrap();
     assert_eq!(
-        entry.directory,
+        pending.directory,
         canonical.to_string_lossy(),
         "/new must inherit the active session's directory, not work_dir"
     );
     assert_ne!(
-        entry.directory,
+        pending.directory,
         work.to_string_lossy().to_string(),
         "/new must NOT fall back to work_dir when a session is active"
     );
@@ -115,14 +116,14 @@ async fn new_command_falls_back_to_work_dir_without_active_session() {
     .await
     .unwrap();
 
-    let entry = app
+    let pending = app
         .sessions
         .lock()
         .await
-        .get_active(&thread_key)
+        .pending_for(&thread_key)
         .cloned()
-        .expect("a session should be active after /new");
-    assert_eq!(entry.directory, work.to_string_lossy().to_string());
+        .expect("/new declares a pending");
+    assert_eq!(pending.directory, work.to_string_lossy().to_string());
 }
 
 /// `dir_card_data` derives Recent Directories from the shared store:

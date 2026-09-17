@@ -514,6 +514,13 @@ pub struct MockBackend {
     pub prompt_async_message_ids: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
     /// The session id `create_session` returns.
     pub session_id: String,
+    /// Every `create_session` call's requested directory (ADR-0041: asserts
+    /// lazy creation — nothing on `/new`, one creation on the first message,
+    /// in the pending's directory).
+    pub created_session_dirs: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
+    /// Number of initial `create_session` calls to fail — materialisation must
+    /// keep the pending and retry on the next message.
+    pub fail_create_session_count: Arc<std::sync::atomic::AtomicUsize>,
     /// When true, `prompt` 404s for any session id other than `session_id`
     /// (simulates a stale mapping to a session that no longer exists).
     pub stale_session_404: bool,
@@ -596,6 +603,8 @@ impl MockBackend {
             prompt_async_agents: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_async_message_ids: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             session_id: "ses_test".into(),
+            created_session_dirs: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            fail_create_session_count: std::sync::atomic::AtomicUsize::new(0).into(),
             stale_session_404: false,
             session_parents: std::collections::HashMap::new(),
             session_list: Vec::new(),
@@ -663,8 +672,23 @@ impl opencode::Backend for MockBackend {
 
     async fn create_session(
         &self,
-        _i: &opencode::types::CreateSessionInput,
+        input: &opencode::types::CreateSessionInput,
     ) -> crate::error::Result<opencode::types::Session> {
+        self.created_session_dirs
+            .lock()
+            .await
+            .push(input.location.as_ref().map(|l| l.directory.clone()));
+        if self
+            .fail_create_session_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            self.fail_create_session_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(crate::error::BridgeError::OpenCode(
+                "Simulated create failure".into(),
+            ));
+        }
         Ok(opencode::types::Session {
             id: self.session_id.clone(),
             project_id: None,

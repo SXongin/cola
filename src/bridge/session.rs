@@ -39,7 +39,6 @@ pub struct PendingEntry {
 
 impl PendingEntry {
     /// A pending with every optional field at its default.
-    #[allow(dead_code)] // ADR-0041 storage; the command tickets (#211-#214) construct it
     pub fn new(thread_key: ThreadKey, directory: impl Into<String>) -> Self {
         Self {
             thread_key,
@@ -137,7 +136,6 @@ impl SessionStore {
     }
 
     /// Declare (or replace) the conversation's Pending Session and persist.
-    #[allow(dead_code)] // ADR-0041 storage; the command tickets (#211-#214) write pendings
     pub fn set_pending(&mut self, pending: PendingEntry) -> crate::error::Result<()> {
         self.pending.retain(|p| p.thread_key != pending.thread_key);
         self.pending.push(pending);
@@ -159,19 +157,13 @@ impl SessionStore {
             .or_else(|| self.get_active(key).map(|e| e.directory.clone()))
     }
 
-    /// Materialise a pending: promote `entry` and clear the pending in ONE
-    /// store write, so a crash can never leave both a live session and its
-    /// pending declared (ADR-0041).
-    #[allow(dead_code)] // ADR-0041 storage; materialisation (#211) activates through it
-    pub fn activate_and_clear_pending(&mut self, entry: SessionEntry) -> crate::error::Result<()> {
-        self.pending.retain(|p| p.thread_key != entry.thread_key);
-        self.promote(entry);
-        self.write_to_disk()
-    }
-
     /// Add or promote a session entry as the active one for its thread.
-    /// The entry is moved to the front so `get_active` returns it.
+    /// The entry is moved to the front so `get_active` returns it, and any
+    /// Pending Session of the thread is resolved in the same in-memory step:
+    /// a thread cannot have both (ADR-0041). Centralised here so no activation
+    /// path can leave a pending behind to supersede the session it activated.
     fn promote(&mut self, entry: SessionEntry) {
+        self.pending.retain(|p| p.thread_key != entry.thread_key);
         // Remove any existing entry with the same session_id
         if let Some(pos) = self.entries.iter().position(|e| e.session_id == entry.session_id) {
             self.entries.remove(pos);
@@ -181,7 +173,9 @@ impl SessionStore {
 
     /// Promote `entry` as its thread's active session and persist the store.
     /// The durable half of every create/adopt/promote path: callers cannot
-    /// forget the save.
+    /// forget the save. Activation also resolves the thread's Pending Session
+    /// (a pending and an active session are mutually exclusive, ADR-0041) —
+    /// materialisation is exactly this operation, in one write.
     pub fn activate(&mut self, entry: SessionEntry) -> crate::error::Result<()> {
         self.promote(entry);
         self.write_to_disk()
@@ -706,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn activate_and_clear_pending_materialises_in_one_write() {
+    fn activation_resolves_the_pending_in_one_write() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("sessions.json");
         let key = ThreadKey::new("chat1".into(), "root1".into());
@@ -718,8 +712,9 @@ mod tests {
             .set_pending(make_pending("chat1", "root1", "/tmp/new"))
             .unwrap();
 
+        // Materialisation and adoption both reach this operation.
         store
-            .activate_and_clear_pending(make_entry("chat1", "root1", "ses_new", "/tmp/new"))
+            .activate(make_entry("chat1", "root1", "ses_new", "/tmp/new"))
             .unwrap();
 
         assert!(store.pending_for(&key).is_none());
