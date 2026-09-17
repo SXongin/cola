@@ -8,6 +8,7 @@ pub(crate) mod card_handles;
 pub(crate) mod config_commands;
 pub(crate) mod dir;
 pub(crate) mod external;
+pub(crate) mod leftovers;
 pub(crate) mod misc;
 pub(crate) mod permission;
 pub(crate) mod prompt_render;

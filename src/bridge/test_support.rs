@@ -434,6 +434,11 @@ pub struct MockBackend {
     /// leave an uncommitted file) to exercise the Turn Footer's turn-end
     /// refresh (ADR-0019).
     pub on_prompt: Option<Box<dyn Fn() + Send + Sync>>,
+    /// When set, `prompt` waits for a permit here before returning, so a test
+    /// can hold a turn in flight (inline a pending request, then abort) and
+    /// only afterwards let it finish — the mid-turn ordering the turn-end
+    /// leftover rejection (#187) acts on.
+    pub prompt_gate: Option<Arc<tokio::sync::Semaphore>>,
     /// Records every `prompt_async` call's text (asserts supplement path).
     pub prompt_async_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// Records the number of images attached to each `prompt_async` call.
@@ -522,6 +527,7 @@ impl MockBackend {
             prompt_agents: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_message_ids: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             on_prompt: None,
+            prompt_gate: None,
             prompt_async_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_async_images: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_async_models: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -653,6 +659,12 @@ impl opencode::Backend for MockBackend {
             .await
             .push(variant.map(|v| v.to_string()));
         self.prompt_agents.lock().await.push(agent.map(|s| s.to_string()));
+        // Hold the turn in flight while a test injects state (a pending
+        // request) through the normal seams, then release it into the scripted
+        // outcome — abort or success.
+        if let Some(gate) = &self.prompt_gate {
+            let _permit = gate.acquire().await;
+        }
         if self.stale_session_404 && session_id != self.session_id {
             return Err(crate::error::BridgeError::SessionNotFound(session_id.to_string()));
         }

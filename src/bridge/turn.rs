@@ -283,6 +283,17 @@ impl Turn {
             Err(e) => Some(e.to_string()),
         };
 
+        // #187: a turn that ended without completing (abort, interrupt, prompt
+        // error) leaves every still-pending Permission/Question behind with a
+        // dead tool fiber. Reject them here, so their blocks become `🚫 已拒绝`
+        // receipts on the card instead of ghosting onto the next turn (#177).
+        // Only an unfinished turn does this: a completed one has nothing
+        // pending, and a request that outlived a healthy turn (external or
+        // concurrent work) is not this turn's to deny.
+        if prompt_err.is_some() {
+            crate::bridge::request::reject_leftovers_for_turn(&app.core, &self.session_id).await;
+        }
+
         // Reconcile: render any parts the incremental poll missed, then mark the
         // card Done (or Error). Fall back to the response parts if the fetch fails.
         let final_msgs = app.opencode.messages(&self.session_id).await.ok();

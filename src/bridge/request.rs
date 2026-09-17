@@ -1299,6 +1299,99 @@ impl RequestFlow {
         self.missing_question_result(directory, inline).await
     }
 
+    /// #187: reject every request of this kind that is still pending for
+    /// `session_id` or one of its sub-task descendants, when the turn that
+    /// would have consumed it ended without completing (`/stop`, interrupt,
+    /// prompt error). The tool fiber behind such a request is dead, so
+    /// approving it is meaningless; leaving it alive only lets the next turn
+    /// re-host a ghost block (ADR-0038, rule 1). Mirrors
+    /// `SharedCore::approve_pending_for_session`'s session/descendant filter.
+    ///
+    /// Only a KNOWN state is resolved: a failed/timed-out list, an empty
+    /// session id, another session, and a snapshot claim all stay untouched —
+    /// unknown is never read as resolved (#130/#144). Returns the ids the
+    /// server actually rejected, in list order, so the caller turns their
+    /// blocks into `🚫 已拒绝` receipts through `resolve_blocks`.
+    pub(crate) async fn reject_pending_for_session(
+        &self,
+        core: &Arc<SharedCore>,
+        session_id: &str,
+        directory: &str,
+    ) -> Vec<String> {
+        let backend = core.opencode.clone().for_directory(directory);
+        // Bounded like the sweep's list: a half-open connection must not stall
+        // the turn's finish behind a request that will never answer.
+        let listed = match crate::bridge::bounded_call(
+            &format!("turn end {} ({}) list", self.kind.label(), directory),
+            self.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
+            self.kind.list(&backend),
+        )
+        .await
+        {
+            Some(Ok(listed)) => listed,
+            Some(Err(e)) => {
+                tracing::warn!("turn end {} ({}): {}", self.kind.label(), directory, e);
+                return Vec::new();
+            }
+            None => return Vec::new(),
+        };
+        let mut rejected = Vec::new();
+        for req in &listed {
+            let sid = req.session_id();
+            if sid.is_empty() {
+                continue;
+            }
+            if sid != session_id && !core.session_descends_from(sid, session_id, directory).await {
+                continue;
+            }
+            // An answered request was already resolved (or is being resolved)
+            // by its click: never reply a second time.
+            if self.is_answered(core, req.id()).await {
+                continue;
+            }
+            // A claimed request's block lives on a snapshot card, whose
+            // lifecycle is its own (ADR-0038, rule 6).
+            if core.snapshot_claims.lock().await.contains(req.id()) {
+                continue;
+            }
+            let result = match req {
+                PendingRequest::Permission(p) => backend.reply_permission(&p.request_id, "reject").await,
+                PendingRequest::Question(q) => backend.reject_question(&q.id).await,
+            };
+            match result {
+                Ok(()) => {
+                    tracing::info!(
+                        "Rejected leftover {} {} on session {} (its turn ended without completing)",
+                        self.kind.label(),
+                        req.id(),
+                        sid
+                    );
+                    if let PendingRequest::Question(q) = req {
+                        // The reply landed: drop the in-flight state like a
+                        // reject click does, so nothing serves stale answers.
+                        self.remove_question(&q.id).await;
+                    }
+                    rejected.push(req.id().to_string());
+                }
+                // Resolved elsewhere in the meantime: the sweep's next pass
+                // leaves the neutral receipt for it — cola did not decide.
+                Err(e) if e.is_not_found() => {
+                    tracing::info!(
+                        "leftover {} {} was already resolved: {}",
+                        self.kind.label(),
+                        req.id(),
+                        e
+                    )
+                }
+                // Genuine failure (network, routing): the request may still be
+                // pending, so leave its block live — the Host can still answer
+                // it, and the sweep keeps polling.
+                Err(e) => tracing::warn!("reject leftover {} {}: {}", self.kind.label(), req.id(), e),
+            }
+        }
+        rejected
+    }
+
     /// Independent poller: surfaces pending requests as cards (inline on a
     /// streaming card when possible, else a separate card), auto-resolves where
     /// the kind says so, and marks stale cards when another client resolves a
@@ -2067,6 +2160,51 @@ pub(crate) async fn resolve_blocks(
         }
     }
     ack
+}
+
+/// #187: settle what a turn that ended without completing left behind. Reject
+/// the still-pending Permission/Question requests of the turn's session and
+/// its sub-task descendants on the server, then resolve their blocks through
+/// the one seam into `🚫 已拒绝` receipts — nobody else handled them, so the
+/// neutral `⏱ 已由其他客户端处理` line would be a lie. A no-op without a mapped
+/// directory and on a failed list (unknown is never resolved). Returns how
+/// many requests were rejected.
+pub(crate) async fn reject_leftovers_for_turn(core: &Arc<SharedCore>, session_id: &str) -> usize {
+    let directory = {
+        let store = core.sessions.lock().await;
+        store.entry_for_session(session_id).map(|e| e.directory.clone())
+    };
+    let Some(directory) = directory.filter(|d| !d.is_empty()) else {
+        return 0;
+    };
+    let mut rejected = 0;
+    for flow in [&core.permission, &core.question] {
+        let ids = flow
+            .reject_pending_for_session(core, session_id, &directory)
+            .await;
+        if ids.is_empty() {
+            continue;
+        }
+        rejected += ids.len();
+        resolve_blocks(
+            flow,
+            core,
+            &Some(session_id.to_string()),
+            session_id,
+            Origin::Command,
+            &ids,
+            Residue::PerBlock(&denied_receipt),
+        )
+        .await;
+    }
+    if rejected > 0 {
+        tracing::info!(
+            "turn {} ended without completing: rejected {} leftover request(s)",
+            session_id,
+            rejected
+        );
+    }
+    rejected
 }
 
 /// Restamp an edited card's header title and template from the accumulator's
