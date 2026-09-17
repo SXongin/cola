@@ -52,6 +52,26 @@ pub struct BuiltCard {
     pub spans: Vec<BlockSpan>,
 }
 
+/// Estimated serialized size (bytes) of one collapsible tool panel, mirroring
+/// [`StreamAccumulator::estimate_split_index`]'s accounting (element overhead
+/// plus the capped input and output the renderer keeps). Shared by the
+/// timeline's tool items and the todo tail reserve.
+fn panel_estimate(p: &ToolPanel) -> usize {
+    let first_n_bytes = |s: &str, n: usize| s.chars().take(n).map(|c| c.len_utf8()).sum::<usize>();
+    let input = p
+        .input
+        .as_ref()
+        .map(|x| x.to_string())
+        .map(|s| first_n_bytes(&s, 400))
+        .unwrap_or(0);
+    let output = p
+        .output
+        .as_deref()
+        .map(|s| first_n_bytes(s, crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS))
+        .unwrap_or(0);
+    400 + input + output
+}
+
 /// A permission request surfaced inline on the streaming card (instead of a
 /// separate card), so the whole turn lives on ONE card.
 #[derive(Debug, Clone)]
@@ -227,6 +247,17 @@ pub struct StreamAccumulator {
     pub reasoning: String,
     /// Tool panels keyed by call ID (current state; `timeline` keeps order).
     pub tools: IndexMap<String, ToolPanel>,
+    /// The latest `todowrite` panel of this turn, rendered as a card-TAIL
+    /// status section instead of a timeline row. A timeline row would freeze on
+    /// whichever card the call landed on: once that card finalizes (a long
+    /// turn splits into several), later updates land on an already-sent card
+    /// and stay invisible. The tail rides the live card, so every flush shows
+    /// the current list. Each later call replaces it in place.
+    pub todo_panel: Option<ToolPanel>,
+    /// The server start time of the todowrite call that last refreshed
+    /// [`Self::todo_panel`] — its panel header shows when the list was last
+    /// written.
+    pub todo_shown_at: Option<i64>,
     /// Text, reasoning, tool and receipt entries ordered by their key (the
     /// server-side part start time) — the card is built from this, so message ↔
     /// tool interleaving is preserved even when a part renders late.
@@ -295,8 +326,9 @@ pub struct StreamAccumulator {
     /// separately in `rendered_tool_states` because they get re-rendered on
     /// status changes (running → completed).
     pub rendered_parts: std::collections::HashSet<String>,
-    /// callID → state signature for tool panels (status + output length); a tool
-    /// is re-rendered when its signature changes.
+    /// callID → state signature for tool panels (status + output length; a
+    /// todowrite's whole state, since its list can change without changing any
+    /// length); a tool is re-rendered when its signature changes.
     pub rendered_tool_states: std::collections::HashMap<String, String>,
     /// The turn's start on the SERVER's clock: the created time of the user
     /// message this turn answers. External renders arm with it directly; a
@@ -367,7 +399,12 @@ impl StreamAccumulator {
             CardState::Loading => Some(HeaderPhase::Loading),
             CardState::Reasoning => Some(HeaderPhase::Reasoning),
             CardState::Streaming => {
-                if self.tools.values().any(|t| t.status == "running") {
+                // A running todowrite is a tail panel, not a timeline tool, but
+                // it is still a running tool: ADR-0014 gives it the Tool phase
+                // (and the timer reset that comes with it), like any other.
+                let running = self.tools.values().any(|t| t.status == "running")
+                    || self.todo_panel.as_ref().is_some_and(|t| t.status == "running");
+                if running {
                     Some(HeaderPhase::Tool)
                 } else {
                     Some(HeaderPhase::Streaming)
@@ -560,7 +597,11 @@ impl StreamAccumulator {
     /// response — resolving the last live block must clear
     /// "等待你的授权/回答" immediately, not a poll later.
     pub fn header_title_and_template(&self) -> (String, &'static str) {
-        let running = self.tools.values().find(|t| t.status == "running");
+        let running = self
+            .tools
+            .values()
+            .find(|t| t.status == "running")
+            .or_else(|| self.todo_panel.as_ref().filter(|t| t.status == "running"));
         crate::feishu::card::shell::header_title_and_template(
             &self.card_state,
             running,
@@ -745,8 +786,25 @@ impl StreamAccumulator {
     /// interaction block's element range, for the card handle (ADR-0038,
     /// rule 2).
     pub fn build_card_with_info(&mut self) -> BuiltCard {
-        let split = self.estimate_split_index(self.render_from);
-        let full = split < self.timeline.len();
+        // The slice that fits on its own. When items remain, it must hold at
+        // least one: an empty slice would leave `render_from` frozen and the
+        // flush loop would re-send empty "部分完成" cards forever.
+        let mut split = self.estimate_split_index(self.render_from, None);
+        if self.render_from < self.timeline.len() {
+            split = split.max(self.render_from + 1);
+        }
+        let mut full = split < self.timeline.len();
+        // The todo list rides the tail, which only a non-full (live) card
+        // carries. When the remainder fits without the panel but not with it,
+        // this card finalizes without the tail — sized so the next card, with
+        // fewer items, can carry it — instead of overflowing Feishu's limit.
+        if !full && let Some(todo) = &self.todo_panel {
+            let with_tail = self.estimate_split_index(self.render_from, Some(todo));
+            if with_tail < split {
+                split = with_tail.max(self.render_from + 1).min(split);
+                full = true;
+            }
+        }
         let state = if full { Some(CardState::Continued) } else { None };
         let (card, spans) = self.build_card_inner(self.render_from, split, !full, state);
         // Advance `render_from` ONLY on an actual split: while the card still
@@ -788,34 +846,28 @@ impl StreamAccumulator {
     /// (measured ~260-340 bytes for a collapsible panel, ~35 for a markdown
     /// element) so the estimate trails the real card size by only a few
     /// hundred bytes — the `MAX_CARD_JSON_CHARS` margin absorbs the rest.
-    fn estimate_split_index(&self, start: usize) -> usize {
+    ///
+    /// `tail_reserve` is a panel the built card will ALSO carry in its tail
+    /// (the todo list); charging its size to the same budget keeps the card
+    /// and its tail together under the cap. Callers pass it only when the
+    /// slice is the final, tail-carrying one — see
+    /// [`Self::build_card_with_info`].
+    fn estimate_split_index(&self, start: usize, tail_reserve: Option<&ToolPanel>) -> usize {
         // Byte length of the first `n` chars (mirrors `truncate_md`, which caps
         // rendered content by characters).
         let first_n_bytes = |s: &str, n: usize| s.chars().take(n).map(|c| c.len_utf8()).sum::<usize>();
         let mut comps = 0usize;
         let mut size = 0usize;
         let mut card_text = 0usize;
+        if let Some(panel) = tail_reserve {
+            comps += 1;
+            size += panel_estimate(panel);
+        }
         for (i, item) in self.timeline.iter().enumerate().skip(start) {
             let (c, s, t) = match &item.kind {
                 TimelineKind::Reasoning(r) => (4, 300 + first_n_bytes(r, 800), 0),
                 TimelineKind::Tool(call_id) => {
-                    let panel_size = self.tools.get(call_id).map(|p| {
-                        let input = p
-                            .input
-                            .as_ref()
-                            .map(|x| x.to_string())
-                            .map(|s| first_n_bytes(&s, 400))
-                            .unwrap_or(0);
-                        let output = p
-                            .output
-                            .as_deref()
-                            .map(|s| {
-                                first_n_bytes(s, crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS)
-                            })
-                            .unwrap_or(0);
-                        400 + input + output
-                    });
-                    (4, panel_size.unwrap_or(400), 0)
+                    (4, self.tools.get(call_id).map(panel_estimate).unwrap_or(400), 0)
                 }
                 // Text is chunked to ≤ MAX_CARD_TEXT_CHARS per item, so a
                 // single item never exceeds the per-card budget; the budget
@@ -918,6 +970,14 @@ impl StreamAccumulator {
 
         let mut spans: Vec<BlockSpan> = Vec::new();
         if include_tail {
+            // The live todo list opens the tail: it is the turn's current plan,
+            // and the tail is the one section every flush re-renders, so the
+            // list always lands on the LIVE card (a timeline row would freeze
+            // on a finalized one). The block spans below are recorded from
+            // `builder.body_len()`, so they stay correct with it in front.
+            if let Some(todo) = &self.todo_panel {
+                builder = builder.with_tool_at(todo.clone(), self.todo_shown_at);
+            }
             // The card's tail: the live interaction blocks, in accumulated
             // order. A permission renders its buttons right here (the whole
             // turn lives on one card); a question renders its current display
