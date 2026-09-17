@@ -32,18 +32,26 @@ impl ToolPanel {
 /// One tool panel as a folded collapsible element. `at_ms` is the part's
 /// server `state.time.start`; when present, the panel header carries it as
 /// `· HH:MM` so the start time is visible while collapsed (#183), and when
-/// absent (a payload with no server time) no clock is rendered.
-pub(super) fn tool_panel_element(tool: &ToolPanel, at_ms: Option<i64>) -> serde_json::Value {
+/// absent (a payload with no server time) no clock is rendered. `element_id`
+/// is the panel's stable identity on the card (see
+/// [`super::shell::collapsible_panel_chunks`]).
+pub(super) fn tool_panel_element(
+    tool: &ToolPanel,
+    at_ms: Option<i64>,
+    element_id: Option<&str>,
+) -> serde_json::Value {
     let output = tool
         .output
         .as_ref()
         .map(|raw| format_tool_output(&tool.name, raw));
-    // A parsed todo output IS the panel: the list's size and status counts ride
-    // the folded header (below), so the generic Input line and Output marker
-    // would only frame the checklist. A still-running call has no parsed output
-    // yet — the Input line (`📋 共 N 项任务`) is all it can show.
-    let todowrite_list =
-        tool.name == "todowrite" && output.as_ref().is_some_and(|(header, _, _)| header.is_some());
+    // The todo panel is a status section, not a transcript: a parsed list is
+    // the panel, so the generic Input line and Output marker would only frame
+    // the checklist (a still-running call has no parsed output yet — the Input
+    // line `📋 共 N 项任务` is all it can show), and its prefix names the
+    // section rather than the call (a finished call would sit at a permanent ✅
+    // while the counts right beside it still report open items).
+    let todo_panel = tool.name == "todowrite";
+    let todowrite_list = todo_panel && output.as_ref().is_some_and(|(header, _, _)| header.is_some());
     let mut content = String::new();
     if !todowrite_list && let Some(i) = &tool.input {
         let formatted = format_tool_input(&tool.name, i);
@@ -95,19 +103,12 @@ pub(super) fn tool_panel_element(tool: &ToolPanel, at_ms: Option<i64>) -> serde_
     if content.is_empty() {
         content = "_(no details)_".to_string();
     }
-    // The todo panel's prefix names the section (a plan checklist), not the
-    // call: a finished call would sit at a permanent ✅ while the counts right
-    // beside it still report open items.
-    let icon = if tool.name == "todowrite" {
-        "📋"
-    } else {
-        tool.status_icon()
-    };
+    let icon = if todo_panel { "📋" } else { tool.status_icon() };
     let mut title = format!("{icon} {}{}", tool.name, panel_time_suffix(at_ms));
-    if let Some(d) = &title_details {
-        title.push_str(&format!(" · {}", d));
+    if let Some(details) = &title_details {
+        title.push_str(&format!(" · {}", details));
     }
-    collapsible_panel(&title, &content)
+    collapsible_panel(&title, &content, element_id)
 }
 
 /// The meaningful parts of an `edit` tool's unified diff (recorded by OpenCode
@@ -582,7 +583,7 @@ mod tests {
         };
         let card = CardBuilder::new()
             .with_state(CardState::Done)
-            .with_tool_at(tool.clone(), Some(at))
+            .with_tool_at(tool.clone(), Some(at), None)
             .build();
         let elements = card["body"]["elements"].as_array().unwrap();
         assert_eq!(
@@ -592,7 +593,7 @@ mod tests {
 
         let untimed = CardBuilder::new()
             .with_state(CardState::Done)
-            .with_tool_at(tool, None)
+            .with_tool_at(tool, None, None)
             .build();
         let elements = untimed["body"]["elements"].as_array().unwrap();
         assert_eq!(

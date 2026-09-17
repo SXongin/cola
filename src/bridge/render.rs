@@ -1220,6 +1220,63 @@ mod tests {
         assert!(acc.todo_panel.is_some(), "the tail holds the panel");
     }
 
+    /// Every collapsible panel carries a stable `element_id`, derived from the
+    /// timeline entry it renders — never from its position. The card is
+    /// re-rendered whole on every flush while the client holds each panel's
+    /// open/closed state locally; an id that moved would hand that state to a
+    /// different panel, which is how the todo panel used to lose its expansion.
+    #[test]
+    fn panel_element_ids_stay_with_their_timeline_item() {
+        let panel_ids = |card: &serde_json::Value| -> Vec<String> {
+            card["body"]["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["tag"] == "collapsible_panel")
+                .map(|e| {
+                    format!(
+                        "{}({})",
+                        e["element_id"].as_str().expect("panel element_id"),
+                        e["header"]["title"]["content"].as_str().unwrap()
+                    )
+                })
+                .collect()
+        };
+
+        let mut acc = StreamAccumulator::new("test");
+        render_parts(
+            &mut acc,
+            &serde_json::json!([
+                { "type": "reasoning", "text": "想一想" },
+                { "type": "tool", "tool": "bash", "callID": "call_1",
+                  "state": { "status": "completed", "output": "ok" } },
+                { "type": "tool", "tool": "todowrite", "callID": "call_todo",
+                  "state": { "status": "completed",
+                             "input": { "todos": [ { "content": "第一步", "status": "pending" } ] },
+                             "output": "[{\"content\":\"第一步\",\"status\":\"pending\"}]" } },
+            ]),
+        );
+        let before = panel_ids(&acc.build_card());
+        assert_eq!(before.len(), 3, "reasoning, tool, todo: {before:?}");
+        assert!(before[0].starts_with("reason_"), "{before:?}");
+        assert!(before[1].starts_with("tool_"), "{before:?}");
+        assert!(
+            before[2].starts_with("todo("),
+            "the tail panel is the todo: {before:?}"
+        );
+
+        // A part that arrives late but sorts first must not steal the ids of
+        // the entries it was inserted before.
+        acc.push_reasoning_at(Some(0), "迟到的推理");
+        let after = panel_ids(&acc.build_card());
+        assert_eq!(after.len(), 4, "{after:?}");
+        assert!(
+            after[0].starts_with("reason_") && !before.contains(&after[0]),
+            "the late part gets its own fresh id: {after:?}"
+        );
+        assert_eq!(&after[1..], &before[..], "existing panels keep their ids");
+    }
+
     #[test]
     fn empty_then_updated_part_renders_once_with_content() {
         use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};

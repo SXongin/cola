@@ -15,6 +15,12 @@ use std::sync::Arc;
 pub struct TimelineItem {
     pub key: i64,
     pub shown_at: Option<i64>,
+    /// Identity of this entry, assigned once at insertion and never reused.
+    /// It names the entry's panel on the card (`tool_{seq}` / `reason_{seq}`);
+    /// unlike the entry's position it survives timeline insertions and
+    /// merges, so the client's local panel state can't drift to another panel
+    /// when the card re-renders.
+    pub seq: u64,
     pub kind: TimelineKind,
 }
 
@@ -268,6 +274,8 @@ pub struct StreamAccumulator {
     /// Highest key inserted so far — keeps [`Self::next_order`] ahead of the
     /// timeline even when a server clock runs ahead of cola's.
     last_key: i64,
+    /// Next [`TimelineItem::seq`] to hand out (see [`Self::insert_kind`]).
+    item_seq: u64,
     /// The card's interaction section: the live permission/question blocks
     /// (rendered in the tail) and the tombstones of resolved ones (their
     /// receipt is a timeline entry).
@@ -640,7 +648,16 @@ impl StreamAccumulator {
         } else {
             (idx, key)
         };
-        self.timeline.insert(idx, TimelineItem { key, shown_at, kind });
+        self.item_seq += 1;
+        self.timeline.insert(
+            idx,
+            TimelineItem {
+                key,
+                shown_at,
+                seq: self.item_seq,
+                kind,
+            },
+        );
         self.last_key = self.last_key.max(key);
     }
 
@@ -936,7 +953,8 @@ impl StreamAccumulator {
                         builder = builder.with_text(&pending);
                         pending.clear();
                     }
-                    builder = builder.with_reasoning_at(r, item.shown_at);
+                    builder =
+                        builder.with_reasoning_at(r, item.shown_at, Some(&format!("reason_{}", item.seq)));
                     saw_content = true;
                 }
                 TimelineKind::Text(t) => {
@@ -949,7 +967,11 @@ impl StreamAccumulator {
                         pending.clear();
                     }
                     if let Some(panel) = self.tools.get(call_id) {
-                        builder = builder.with_tool_at(panel.clone(), item.shown_at);
+                        builder = builder.with_tool_at(
+                            panel.clone(),
+                            item.shown_at,
+                            Some(&format!("tool_{}", item.seq)),
+                        );
                     }
                 }
                 // A resolved block's residue: one receipt line, no controls,
@@ -976,7 +998,7 @@ impl StreamAccumulator {
             // on a finalized one). The block spans below are recorded from
             // `builder.body_len()`, so they stay correct with it in front.
             if let Some(todo) = &self.todo_panel {
-                builder = builder.with_tool_at(todo.clone(), self.todo_shown_at);
+                builder = builder.with_tool_at(todo.clone(), self.todo_shown_at, Some("todo"));
             }
             // The card's tail: the live interaction blocks, in accumulated
             // order. A permission renders its buttons right here (the whole
