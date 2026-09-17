@@ -1338,10 +1338,7 @@ impl RequestFlow {
         let mut rejected = Vec::new();
         for req in &listed {
             let sid = req.session_id();
-            if sid.is_empty() {
-                continue;
-            }
-            if sid != session_id && !core.session_descends_from(sid, session_id, directory).await {
+            if !session_belongs_to(core, sid, session_id, directory).await {
                 continue;
             }
             // An answered request was already resolved (or is being resolved)
@@ -2160,6 +2157,20 @@ pub(crate) async fn resolve_blocks(
         }
     }
     ack
+}
+
+/// Whether session `candidate` belongs to `session_id` — the session itself or
+/// one of its sub-task descendants (parent-chain walk). The ownership filter
+/// `/autoaccept`'s pending approval and the turn-end leftover rejection (#187)
+/// share; an empty id matches nothing.
+pub(crate) async fn session_belongs_to(
+    core: &SharedCore,
+    candidate: &str,
+    session_id: &str,
+    directory: &str,
+) -> bool {
+    !candidate.is_empty()
+        && (candidate == session_id || core.session_descends_from(candidate, session_id, directory).await)
 }
 
 /// #187: settle what a turn that ended without completing left behind. Reject
