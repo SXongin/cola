@@ -72,3 +72,33 @@ A pending Permission/Question is rendered inline on the card the operator is alr
 ## Domain note
 
 The concepts enter the glossary as **Card Chain**, **Interaction Block** (交互块) and **Interaction Receipt** (回执).
+
+## Update (2026-09-17)
+
+Rule 2's single mutation seam also needs **serialization** — the risk the
+original Risks section named. Every card write is a read-send-record sequence
+(`flush_card`'s build → Feishu PATCH → handle record; `resolve_blocks`' mutate →
+ack/PATCH), and its callers are concurrent: the render poll, the two request
+pollers, and click acks. Two interleavings were observed live:
+
+- a flush that snapshotted before a resolution recorded the resolved block back
+  (its stale body overwrote the receipt), and the sweep then reported cola's own
+  auto-accept approval as `⏱ 已由其他客户端处理` — the Host saw exactly that
+  line before the mode receipt;
+- a flush whose build had already advanced a split PATCHed the continuation's
+  slice onto the card it had just finalized: two identical messages, only one
+  tracked and repaintable, the other frozen with live controls (the duplicate
+  question cards the Host answered twice).
+
+**Rule 8: one card writer per session at a time.** `flush_card` and
+`resolve_blocks` hold the session's card-write lock
+(`SharedCore::card_write_lock`) across their whole sequence, so a resolution can
+never be overwritten by a stale flush and a split advances its card id before
+another flush reads it. The sweep's vanished passes stay lock-free; instead they
+skip every request cola itself is answering or has answered
+(`answered_requests` ∪ `settling_requests` — the latter claimed before an
+auto-accept approval's reply lands, released when `resolve_blocks` settles),
+because the neutral `⏱` receipt is only true when another client did the
+resolving. The auto-accept toggle card now settles its approved blocks with the
+mode receipt exactly as the command and the permission card's own button do,
+instead of leaving them to the sweep.
