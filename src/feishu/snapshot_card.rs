@@ -119,8 +119,10 @@ fn tail_panels(tail: &[TailEntry]) -> Vec<serde_json::Value> {
         } else {
             chunks
         };
+        // The snapshot is a one-shot card — never re-rendered in place — so its
+        // panels need no stable element_id.
         panels.push(crate::feishu::card::shell::collapsible_panel_chunks(
-            &title, &chunks,
+            &title, &chunks, None,
         ));
     }
     panels

@@ -152,12 +152,19 @@ impl CardBuilder {
     /// A reasoning panel with its part's start time (`HH:MM`, local) in the
     /// panel header (#183), so the time is visible while collapsed. `at_ms` is
     /// the part's server `time.start`; `None` (a payload without one) renders
-    /// no clock — the card only ever shows server times.
-    pub fn with_reasoning_at(mut self, reasoning: &str, at_ms: Option<i64>) -> Self {
+    /// no clock — the card only ever shows server times. `element_id` is the
+    /// panel's stable identity on the card (see [`collapsible_panel_chunks`]).
+    pub fn with_reasoning_at(
+        mut self,
+        reasoning: &str,
+        at_ms: Option<i64>,
+        element_id: Option<&str>,
+    ) -> Self {
         if !reasoning.is_empty() {
             self.body.push(collapsible_panel(
                 &format!("💭 推理过程{}", panel_time_suffix(at_ms)),
                 &truncate_md(reasoning, 800),
+                element_id,
             ));
         }
         self
@@ -167,26 +174,27 @@ impl CardBuilder {
     /// tests only, mirroring the accumulator's unkeyed push forms.
     #[cfg(test)]
     pub fn with_reasoning(self, reasoning: &str) -> Self {
-        self.with_reasoning_at(reasoning, None)
+        self.with_reasoning_at(reasoning, None, None)
     }
 
     /// A tool panel with the call's start time (`HH:MM`, local) in its header
     /// (#183). `at_ms` is the part's server `state.time.start`, so a
     /// running → completed update keeps the start time (the item is keyed once,
-    /// on first appearance); `None` renders no clock.
-    pub fn with_tool_at(mut self, tool: ToolPanel, at_ms: Option<i64>) -> Self {
+    /// on first appearance); `None` renders no clock. `element_id` is the
+    /// panel's stable identity on the card (see [`collapsible_panel_chunks`]).
+    pub fn with_tool_at(mut self, tool: ToolPanel, at_ms: Option<i64>, element_id: Option<&str>) -> Self {
         let panel = tool.clone();
         self.tools.push(tool);
         // All tools are shown; the streaming card splits into continuation
         // cards when the component estimate exceeds the Feishu limit.
-        self.body.push(tool_panel_element(&panel, at_ms));
+        self.body.push(tool_panel_element(&panel, at_ms, element_id));
         self
     }
 
     /// [`Self::with_tool_at`] for panels with no part time — tests only.
     #[cfg(test)]
     pub fn with_tool(self, tool: ToolPanel) -> Self {
-        self.with_tool_at(tool, None)
+        self.with_tool_at(tool, None, None)
     }
 
     pub fn with_footer(mut self, footer: &str) -> Self {
@@ -298,9 +306,10 @@ pub(crate) fn header_title_and_template(
     (title, template)
 }
 
-/// Build a collapsible panel (v2), folded by default.
-pub(super) fn collapsible_panel(title: &str, content: &str) -> serde_json::Value {
-    collapsible_panel_chunks(title, &[content.to_string()])
+/// Build a collapsible panel (v2), folded by default. `element_id` is the
+/// panel's stable identity on the card — see [`collapsible_panel_chunks`].
+pub(super) fn collapsible_panel(title: &str, content: &str, element_id: Option<&str>) -> serde_json::Value {
+    collapsible_panel_chunks(title, &[content.to_string()], element_id)
 }
 
 /// The `· HH:MM` suffix a panel header shows for its part's start time
@@ -318,8 +327,19 @@ pub(super) fn panel_time_suffix(at_ms: Option<i64>) -> String {
 /// default. Used when one logical section (e.g. a snapshot tail entry's full
 /// text) needs splitting across multiple markdown elements to stay within the
 /// per-element character cap — a single `content` string would silently truncate.
-pub(crate) fn collapsible_panel_chunks(title: &str, chunks: &[String]) -> serde_json::Value {
-    json!({
+///
+/// `element_id` names the panel for the duration of the card: the streaming
+/// card re-renders its whole JSON on every flush, and the client holds each
+/// panel's open/closed state locally. A panel whose id is derived from the
+/// timeline item it renders (`tool_{seq}` / `reason_{seq}`) keeps that id as
+/// the timeline grows or reorders, so the fold state follows the panel instead
+/// of whichever panel happens to sit at its old position.
+pub(crate) fn collapsible_panel_chunks(
+    title: &str,
+    chunks: &[String],
+    element_id: Option<&str>,
+) -> serde_json::Value {
+    let mut panel = json!({
         "tag": "collapsible_panel",
         "expanded": false,
         "header": {
@@ -331,7 +351,11 @@ pub(crate) fn collapsible_panel_chunks(title: &str, chunks: &[String]) -> serde_
             .iter()
             .map(|c| json!({ "tag": "markdown", "content": c }))
             .collect::<Vec<_>>(),
-    })
+    });
+    if let Some(id) = element_id {
+        panel["element_id"] = json!(id);
+    }
+    panel
 }
 
 #[cfg(test)]
@@ -584,7 +608,7 @@ mod tests {
         let at = crate::feishu::card::test_local_ms(2026, 9, 16, 14, 3);
         let card = CardBuilder::new()
             .with_state(CardState::Reasoning)
-            .with_reasoning_at("Let me analyze this code...", Some(at))
+            .with_reasoning_at("Let me analyze this code...", Some(at), None)
             .build();
         let elements = card["body"]["elements"].as_array().unwrap();
         assert_eq!(
@@ -594,7 +618,7 @@ mod tests {
 
         let untimed = CardBuilder::new()
             .with_state(CardState::Reasoning)
-            .with_reasoning_at("synthetic", None)
+            .with_reasoning_at("synthetic", None, None)
             .build();
         let elements = untimed["body"]["elements"].as_array().unwrap();
         assert_eq!(
