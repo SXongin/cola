@@ -1087,8 +1087,11 @@ mod tests {
             !card.contains("**第一步**"),
             "the first call's in-progress row must be gone: {card}"
         );
-        // The header shows the latest update's clock and counts.
-        assert!(card.contains("✅ todowrite · 10:07"), "latest clock: {card}");
+        // The header shows the latest update's clock, size and counts.
+        assert!(
+            card.contains("📋 todowrite · 10:07 · 共 2 项"),
+            "latest clock and size: {card}"
+        );
         assert!(card.contains("· ⬜ 1 · ✅ 1"), "header counts: {card}");
         assert!(!card.contains("10:00"), "the first clock must be gone: {card}");
     }
