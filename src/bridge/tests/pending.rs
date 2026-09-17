@@ -479,3 +479,50 @@ async fn materialisation_carries_the_pending_overrides() {
         "the first prompt already runs with the pending's agent"
     );
 }
+
+/// A failed title PATCH must not orphan the created session or keep the pending
+/// alive: the session materialises with the server title, and the user gets a
+/// warning naming the `/name` retry.
+#[tokio::test]
+async fn failed_title_patch_still_materialises_and_warns() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.fail_title_patch = true;
+    let created = backend.created_session_dirs.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+
+    crate::bridge::command::handle_command(
+        &app.core,
+        crate::bridge::command::Command::New(Some("api-refactor".into())),
+        key(),
+        "msg_new",
+        crate::config::ConversationKind::P2p,
+    )
+    .await
+    .unwrap();
+
+    app.handle_message(incoming(
+        "msg_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+
+    let texts = platform.texts().await;
+    assert!(
+        texts.iter().any(|t| t.contains("标题") && t.contains("失败")),
+        "the title failure is surfaced: {texts:?}"
+    );
+    assert_eq!(created.lock().await.len(), 1, "the session was still created");
+    let store = app.sessions.lock().await;
+    assert!(
+        store.pending_for(&key()).is_none(),
+        "the pending must not survive a created session"
+    );
+    assert!(store.get_active(&key()).is_some(), "the session is mapped");
+}

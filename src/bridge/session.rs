@@ -52,6 +52,19 @@ impl PendingEntry {
             topic_root: None,
         }
     }
+
+    /// The Session Mapping entry a materialised session gets: this pending's
+    /// directory and per-session fields under the new `session_id` (ADR-0041).
+    pub fn into_entry(self, session_id: impl Into<String>) -> SessionEntry {
+        let mut entry = SessionEntry::new(self.thread_key, session_id, self.directory);
+        entry.agent = self.agent;
+        entry.model = self.model;
+        entry.variant = self.variant;
+        entry.auto_accept = self.auto_accept;
+        entry.topic_anchor = self.topic_anchor;
+        entry.topic_root = self.topic_root;
+        entry
+    }
 }
 
 /// The current on-disk shape (ADR-0041). `pending` defaults so a file written

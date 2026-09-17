@@ -532,6 +532,9 @@ pub struct MockBackend {
     pub session_list: Vec<opencode::types::SessionListInfo>,
     /// Records `update_session_title` calls: (session_id, title).
     pub update_title_calls: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
+    /// When true, `update_session_title` fails — materialisation must keep the
+    /// created session (never orphan it) and warn.
+    pub fail_title_patch: bool,
     /// Counts `list_sessions` invocations (asserts the 30 s cache).
     pub list_sessions_calls: Arc<std::sync::atomic::AtomicUsize>,
     /// Available agents served by `list_agents` (for the `/agent` card).
@@ -609,6 +612,7 @@ impl MockBackend {
             session_parents: std::collections::HashMap::new(),
             session_list: Vec::new(),
             update_title_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            fail_title_patch: false,
             list_sessions_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             agents: Vec::new(),
             provider_models: Vec::new(),
@@ -712,6 +716,11 @@ impl opencode::Backend for MockBackend {
             .lock()
             .await
             .push((session_id.to_string(), title.to_string()));
+        if self.fail_title_patch {
+            return Err(crate::error::BridgeError::OpenCode(
+                "Simulated title failure".into(),
+            ));
+        }
         self.session_titles
             .lock()
             .unwrap()

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::bridge::session::SessionStore;
+use crate::bridge::session::{PendingEntry, SessionStore};
 use crate::config::{SessionEntry, ThreadKey};
 use crate::feishu;
 use crate::opencode;
@@ -403,6 +403,21 @@ impl SharedCore {
         pending: crate::bridge::session::PendingEntry,
     ) -> crate::error::Result<()> {
         self.sessions.lock().await.set_pending(pending)
+    }
+
+    /// Declare (or replace) the conversation's Pending Session in its current
+    /// project (ADR-0041) — the shape `/new` and the switch card's 新建 share.
+    /// Returns the declared pending, whose directory the confirmation names.
+    pub(crate) async fn declare_pending_in_current_project(
+        &self,
+        thread_key: &ThreadKey,
+        title: Option<String>,
+    ) -> crate::error::Result<PendingEntry> {
+        let directory = self.current_project_directory(thread_key).await;
+        let mut pending = PendingEntry::new(thread_key.clone(), directory);
+        pending.title = title;
+        self.set_pending_session(pending.clone()).await?;
+        Ok(pending)
     }
 
     /// Mutate the mapped session in place and persist, returning the updated

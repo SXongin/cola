@@ -377,7 +377,6 @@ pub fn command_help(name: &str) -> Option<String> {
 
 use crate::bridge::core::SharedCore;
 use crate::bridge::display::{id_tail, title_or_id_tail};
-use crate::bridge::session::PendingEntry;
 use crate::config::{ConversationKind, SessionEntry, ThreadKey};
 use crate::feishu;
 use std::sync::Arc;
@@ -574,23 +573,18 @@ pub(crate) async fn handle_command(
             handle_switch_action(core, &thread_key, action, message_id, kind).await?;
         }
         Command::New(name) => {
-            // The current project follows the pending, else the active session
-            // (ADR-0012): `/new` stays in the project the user is already
-            // working in. Only when the conversation has neither (fresh topic,
-            // after `/forget`, adopted-away) does it fall back to the default
-            // directory.
-            let directory = core.current_project_directory(&thread_key).await;
             // Lazy Session Creation (ADR-0041): `/new` records a Pending
-            // Session instead of creating a backend session — the first
-            // non-command message materialises it. A mistaken `/new` therefore
-            // leaves nothing in the shared store. The creation-title policy
-            // (ADR-0007) applies at materialisation.
-            let mut pending = PendingEntry::new(thread_key.clone(), directory.clone());
-            pending.title = name.clone();
-            core.set_pending_session(pending).await?;
-            let reply = match &name {
-                Some(n) => format!("下一条消息将创建会话「{}」（目录 `{}`）。", n, directory),
-                None => format!("下一条消息将创建会话（目录 `{}`）。", directory),
+            // Session in the current project (the pending's, else the active
+            // session's directory — ADR-0012) instead of creating a backend
+            // session; the first non-command message materialises it. A
+            // mistaken `/new` therefore leaves nothing in the shared store.
+            // The creation-title policy (ADR-0007) applies at materialisation.
+            let pending = core
+                .declare_pending_in_current_project(&thread_key, name.clone())
+                .await?;
+            let reply = match &pending.title {
+                Some(n) => format!("下一条消息将创建会话「{}」（目录 `{}`）。", n, pending.directory),
+                None => format!("下一条消息将创建会话（目录 `{}`）。", pending.directory),
             };
             core.feishu.reply_text(message_id, &reply).await?;
         }
