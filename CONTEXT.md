@@ -152,6 +152,10 @@ _Avoid_: Widget, component, bubble
 The one or more **Card**s a single **Turn** renders into when its content exceeds what one Feishu card may hold: the filled card is finalized with a 部分完成，继续中 header and a continuation card takes over. Only the newest card of the chain keeps receiving updates; an **Interaction Block** rides that newest card.
 _Avoid_: Split card, multi-card turn, card pagination
 
+**Todo Panel** (待办面板):
+A **Turn**'s live task checklist, rendered as a card-TAIL status section instead of a timeline row: each `todowrite` call replaces it in place, so it rides the newest card of the **Card Chain** and a split never strands the reader on a stale list. Folded by default; its header carries the plan size and the non-empty status counts (`共 N 项 · 🔄 1 · ⬜ 2`) plus the last write's clock, so progress is readable without unfolding. An update arrives as a whole new list, never as an edit of the previous panel.
+_Avoid_: Todo card, task list card, progress panel
+
 **Interaction Block** (交互块):
 A pending **Permission** or **Question** rendered inline inside another card — a **Turn**'s card tail, or a **Session Snapshot**'s pending section — carrying its prompt, controls and answer state, as opposed to a standalone request card. It follows the newest card of its **Turn**'s **Card Chain** (including when a new **Turn** replaces the accumulator) and is updated in place on whichever card currently shows it.
 _Avoid_: Pending section, inline card, request block
