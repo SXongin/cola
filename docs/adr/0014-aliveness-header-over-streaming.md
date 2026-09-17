@@ -2,6 +2,11 @@
 
 cola deliberately does **not** use Feishu's streaming-card mode. The real problem was UX: during long reasoning/tool phases the card header sat frozen on "思考中/调用工具中", so users could not tell a slow turn from a dead one. Streaming mode fixes that only by accident: its typewriter effect targets the final answer text (not the goal), and its interactive-callback restriction conflicts with cola's inline permission/question buttons — the split-card workaround would bury interactions on separate cards users may miss, re-creating the very "looks stuck" case it tries to solve. Instead the card header carries honest progress signals — phase timer, reasoning length, and a "等待你的授权/回答" state when a permission/question is pending — refreshed by re-rendering only when the header text changes.
 
+> **Amended by ADR-0040**: collapsible panels on the message card now carry a
+> stable `element_id`, for the client's own fold-state keying. No card entity and
+> no streaming-mode lifecycle enter the pipeline; the message-PATCH path remains
+> the single card-update mechanism.
+
 ## Considered options
 
 - **Feishu streaming mode** (cardkit entities, `streaming_mode`, `card-element/content`): rejected. Needs `cardkit:card:write`, globally unique `element_id`s, and a streaming-mode lifecycle (disable before any interactive callback); while active it blocks interactive-callback card updates; typewriter only benefits the final answer, which is not the goal.

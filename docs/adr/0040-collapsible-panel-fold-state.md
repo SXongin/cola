@@ -30,6 +30,15 @@ keeps the plan size and status counts readable.
 - **Observed failure.** Expanding the todo tail collapsed it as soon as a new
   tool panel was inserted before it, and the new panel appeared expanded — the
   client's local override was keyed to the position, not the panel.
+- **ADR-0014 rejected streaming mode, not client-side panel state.** Its
+  consequence "No `element_id` bookkeeping or card-entity lifecycle enters the
+  render pipeline" (`docs/adr/0014-aliveness-header-over-streaming.md:15`) is
+  amended, not overridden: the ids ride the message-card JSON for the client's
+  own fold-state keying. There is no card entity, no `streaming_mode`, and no
+  element-level update API; the message-PATCH path remains the single
+  card-update mechanism.
+- **Retry reuses a card.** A retry re-renders the same message from a fresh
+  `StreamAccumulator` (`src/bridge/turn.rs:117-146`), so `seq` restarts on it.
 
 ## Decision
 
@@ -40,12 +49,20 @@ timeline entry it renders.**
   (`build_card_inner`, `src/bridge/streaming.rs:957-973`).
 - The todo tail: the fixed `todo` (`src/bridge/streaming.rs:1001`) — it renders
   once per card in the tail and is not a timeline entry.
-- `seq` is assigned once, in `insert_kind`, and never reused or renumbered.
-- One-shot cards (the Session Snapshot) pass `None`: nothing re-renders those
-  cards in place.
+- The Session Snapshot's 最近对话 panels: `snap_{i}` — that card is sent once but
+  rebuilt in place on a claim ack and on remote resolution
+  (`SnapshotClaims::rebuild`, `src/bridge/snapshot_claims.rs:123-139`), its tail
+  order is fixed, so the entry index is a stable id.
+- `seq` is assigned once per accumulator, in `insert_kind`, and never reused or
+  renumbered within it.
 - **A Card Chain split's continuation starts folded.** Accepted: a new card is a
   new message with no local state to inherit, and the todo panel's header still
   carries the plan size and the non-empty status counts.
+- **A retry may inherit fold state.** Ids restart with the fresh accumulator, so
+  a panel can come back wearing the state its id held in the failed attempt
+  (`todo` does so by design). Accepted: a retry is a fresh read, and a
+  globally-seeded counter would only make the tail and the timeline panels
+  disagree about it.
 
 ## Why
 
@@ -58,7 +75,7 @@ timeline entry it renders.**
 ## Consequences
 
 - Panel ids are load-bearing for the panel UX: `TimelineItem::seq` must never be
-  reused, and no id may be derived from a body position.
+  reused within an accumulator, and no id may be derived from a body position.
 - The client's keying is undocumented and verified by observation, not contract.
   If a client version stops honouring `element_id`, the old position-jump
   returns; the folded default keeps that non-fatal.
