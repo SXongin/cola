@@ -425,8 +425,8 @@ impl SharedCore {
         let mut approved = Vec::new();
         for p in &perms {
             // Match the session itself or a sub-task child (its parent chain).
-            let Some(sid) = p.session_id.clone() else { continue };
-            if sid != session_id && !self.session_descends_from(&sid, session_id, directory).await {
+            let sid = p.session_id.clone().unwrap_or_default();
+            if !crate::bridge::request::session_belongs_to(self, &sid, session_id, directory).await {
                 continue;
             }
             match self
