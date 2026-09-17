@@ -43,6 +43,206 @@ async fn dir_card_current_reads_pending() {
     assert_eq!(current.as_deref(), Some("/work/pending"));
 }
 
+/// `/dir <path>` declares a Pending Session in the given directory instead of
+/// creating a server session; an older eagerly-created active session is
+/// superseded (mapped, switchable, not deleted), exactly like `/new`.
+#[tokio::test]
+async fn dir_declares_a_pending_and_supersedes_the_active_session() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let created = backend.created_session_dirs.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    let proj = tempfile::tempdir().unwrap();
+    let proj_dir = std::fs::canonicalize(proj.path())
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key(), "ses_old", "/work/a"),
+    )
+    .await;
+
+    crate::bridge::command::handle_command(
+        &app.core,
+        crate::bridge::command::Command::Dir(proj_dir.clone()),
+        key(),
+        "msg_dir",
+        crate::config::ConversationKind::P2p,
+    )
+    .await
+    .unwrap();
+
+    assert!(created.lock().await.is_empty(), "/dir creates no server session");
+    {
+        let store = app.sessions.lock().await;
+        assert_eq!(
+            store.pending_for(&key()).map(|p| p.directory.as_str()),
+            Some(proj_dir.as_str()),
+            "the pending carries the picked directory"
+        );
+        assert!(
+            store.get_active(&key()).is_none(),
+            "the pending supersedes the old session"
+        );
+        assert_eq!(
+            store.list_thread(&key()).len(),
+            1,
+            "the superseded session stays mapped"
+        );
+    }
+    let texts = platform.texts().await;
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("下一条消息") && t.contains(&proj_dir)),
+        "the reply states the creation timing and directory: {texts:?}"
+    );
+
+    app.handle_message(incoming(
+        "msg_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+    let entry = app
+        .sessions
+        .lock()
+        .await
+        .get_active(&key())
+        .cloned()
+        .expect("the first message materialises the /dir pending");
+    assert_eq!(entry.directory, proj_dir);
+    assert_eq!(
+        *created.lock().await,
+        vec![Some(proj_dir.clone())],
+        "exactly one session, created in the picked directory"
+    );
+}
+
+/// Picking the pending's own directory is a no-op toast, not a second pending:
+/// the pending (title included) is left exactly as declared.
+#[tokio::test]
+async fn dir_card_pick_pendings_own_directory_is_a_noop() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let (app, _platform) = build_app(cfg, backend).await;
+    let mut pending = PendingEntry::new(key(), "/work/pending");
+    pending.title = Some("keep-me".into());
+    seed_pending(&app, pending).await;
+
+    let value = serde_json::json!({
+        "action": "dir",
+        "op": "pick",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "directory": "/work/pending",
+    });
+    let result = app
+        .host_action(value)
+        .await
+        .expect("dir pick should return a result");
+    assert!(result.card.is_some(), "card still refreshes");
+    assert_eq!(
+        result.toast.as_deref(),
+        Some("已在当前目录"),
+        "pending's own directory pick toasts only: {:?}",
+        result.toast
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&key())
+            .and_then(|p| p.title.clone()),
+        Some("keep-me".to_string()),
+        "the pending was not replaced"
+    );
+}
+
+/// Correcting a wrong `/dir` before the first prompt replaces the pending —
+/// including one declared by `/new` — so only the last directory materialises;
+/// nothing was ever created at the abandoned one.
+#[tokio::test]
+async fn second_dir_before_the_first_prompt_replaces_the_pending() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let created = backend.created_session_dirs.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let first_dir = std::fs::canonicalize(first.path())
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let second_dir = std::fs::canonicalize(second.path())
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    for (msg, cmd) in [
+        (
+            "msg_new",
+            crate::bridge::command::Command::New(Some("wrong".into())),
+        ),
+        ("msg_dir", crate::bridge::command::Command::Dir(first_dir.clone())),
+        (
+            "msg_dir2",
+            crate::bridge::command::Command::Dir(second_dir.clone()),
+        ),
+    ] {
+        crate::bridge::command::handle_command(
+            &app.core,
+            cmd,
+            key(),
+            msg,
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+    }
+
+    assert!(created.lock().await.is_empty(), "corrections create nothing");
+    {
+        let store = app.sessions.lock().await;
+        let pending = store.pending_for(&key()).expect("one pending remains");
+        assert_eq!(pending.directory, second_dir);
+        assert_eq!(pending.title, None, "a replaced pending drops the old title");
+    }
+
+    app.handle_message(incoming(
+        "msg_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+    let entry = app
+        .sessions
+        .lock()
+        .await
+        .get_active(&key())
+        .cloned()
+        .expect("the last pending materialises");
+    assert_eq!(entry.directory, second_dir);
+    assert_eq!(
+        *created.lock().await,
+        vec![Some(second_dir.clone())],
+        "only the corrected directory is ever used"
+    );
+}
+
 /// The `/switch` card's current-directory scope follows the pending, and no
 /// row is marked active — the pending is not a Session (ADR-0041); the
 /// superseded session stays mapped and switchable.

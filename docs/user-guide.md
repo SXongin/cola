@@ -198,7 +198,8 @@ start_server = "auto"            # auto (default) | never | eager
 - **`work_dir`** — default directory for new sessions when a conversation has no
   active session (fresh chat, or after `/switch forget`). Defaults to the process
   cwd. `/new` inherits the active session's directory (or the pending's);
-  `/dir` overrides per session.
+  `/dir` names an explicit one. Both only declare the session: it is created by
+  the conversation's next message.
 - **`group_completion_notice`** — in group chats, reply to the requester with a
   short completion notice (the streaming card is patched in place, so it does not
   push a new notification). `false` disables it. p2p chats don't need it.
@@ -331,9 +332,9 @@ detailed help for any of these.
 
 | Command | What it does |
 | --- | --- |
-| `/dir <path> [name]` | Switch to a project: open a NEW session rooted at `<path>` |
+| `/dir <path> [name]` | Declare a new session rooted at `<path>` — created by the next message |
 | `/claim <code>` | Claim this cola as Host (private chat only; code from the startup log) |
-| `/dir` | Recent Directories card: pick a folder and switch there, or open it as a fresh topic (每行「建话题」= `/topic <dir>` 的免打字版) |
+| `/dir` | Recent Directories card: pick a folder and declare a session there, or open it as a fresh topic (每行「建话题」= `/topic <dir>` 的免打字版) |
 | `/switch` | Session card: browse / search / adopt / new |
 | `/switch <kw>` | Switch to a session by name/dir/id (adopts foreign ones) |
 | `/switch list [kw] [--all]` | List recent sessions across the shared store (up to 15) |
@@ -357,10 +358,11 @@ detailed help for any of these.
 
 Notes:
 
-- `/new` only **declares** the session — the conversation's next non-command
-  message creates it in the chosen directory and maps it here, so a mistaken
-  `/new` can be corrected with another `/new`, `/dir`, `/switch` or `/topic`
-  before then without leaving a session in the shared store.
+- `/new` and `/dir` only **declare** the session — the conversation's next
+  non-command message creates it in the chosen directory and maps it here, so a
+  mistaken `/new` or `/dir` can be corrected with another `/new`, `/dir`,
+  `/switch` or `/topic` before then without leaving a session in the shared
+  store. The `/dir` card's pick follows the same timing.
 - `/agent`, `/model`, `/think`, `/autoaccept` are **per-session** overrides sent
   with the next message and persisted across restarts. `/model`'s value must
   exist on the server cola attaches to. Bare `/model` opens the provider → model

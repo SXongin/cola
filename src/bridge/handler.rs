@@ -1103,12 +1103,12 @@ impl App {
     }
 
     /// Handle a `/dir` Recent Directories card button (ADR-0025): `op:
-    /// "pick"` re-roots the thread into the picked directory by creating a
-    /// NEW session there (matching the text `/dir <path>` form); `op:
-    /// "topic"` wraps a NEW session in a brand-new Feishu topic instead — the
-    /// card equivalent of `/topic <dir>`. Clicking the current directory's
-    /// `pick` is a no-op that just toasts. Refreshes the card in place so the
-    /// new directory shows as `当前`.
+    /// "pick"` re-roots the thread into the picked directory by declaring a
+    /// Pending Session there (the card form of `/dir <path>`, ADR-0041 — the
+    /// first message materialises it); `op: "topic"` wraps a NEW session in a
+    /// brand-new Feishu topic instead — the card equivalent of `/topic <dir>`.
+    /// Clicking the current directory's `pick` is a no-op that just toasts.
+    /// Refreshes the card in place so the pending's directory shows as `当前`.
     async fn handle_dir_card_action(
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
@@ -1129,43 +1129,26 @@ impl App {
         }
         match op {
             "pick" => {
-                let current_dir = core
-                    .sessions
-                    .lock()
-                    .await
-                    .get_active(&thread_key)
-                    .map(|e| e.directory.clone());
+                // Pending-first (ADR-0041): 当前 is the pending's directory
+                // when one exists, else the active session's.
+                let current_dir = core.sessions.lock().await.current_directory(&thread_key);
                 if current_dir.as_deref() == Some(directory.as_str()) {
                     return Some(CardActionResult {
                         card: Some(self.build_dir_card_for(core, &thread_key).await),
                         toast: Some("已在当前目录".to_string()),
                     });
                 }
-                let session = match core
-                    .opencode
-                    .create_session(&core.opencode.new_session_input(Some(&directory)))
-                    .await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!("dir card pick session failed: {}", e);
-                        return Some(CardActionResult {
-                            card: None,
-                            toast: Some(format!("创建会话失败：{e}")),
-                        });
-                    }
-                };
-                let entry = crate::config::SessionEntry::new(
-                    thread_key.clone(),
-                    session.id.clone(),
-                    directory.clone(),
-                );
-                if let Err(e) = core.activate_session(entry).await {
+                // Lazy Session Creation (ADR-0041): the card form of
+                // `/dir <path>` — declare a Pending Session; the first
+                // non-command message materialises it. A persist failure is
+                // logged and still toasts success, parity with the switch
+                // card's 新建.
+                if let Err(e) = core.declare_pending(&thread_key, directory.clone(), None).await {
                     tracing::warn!("dir card pick: persist failed: {}", e);
                 }
                 Some(CardActionResult {
                     card: Some(self.build_dir_card_for(core, &thread_key).await),
-                    toast: Some(format!("已切换目录并新建会话（`{directory}`）")),
+                    toast: Some(format!("下一条消息将在目录 `{directory}` 创建会话")),
                 })
             }
             "topic" => {

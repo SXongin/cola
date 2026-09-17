@@ -405,6 +405,22 @@ impl SharedCore {
         self.sessions.lock().await.set_pending(pending)
     }
 
+    /// Declare (or replace) a Pending Session rooted at an explicit
+    /// `directory` (ADR-0041) — the shape `/dir`, its card pick and the other
+    /// explicit-directory forms share. Returns the declared pending, whose
+    /// directory the confirmation names.
+    pub(crate) async fn declare_pending(
+        &self,
+        thread_key: &ThreadKey,
+        directory: impl Into<String>,
+        title: Option<String>,
+    ) -> crate::error::Result<PendingEntry> {
+        let mut pending = PendingEntry::new(thread_key.clone(), directory);
+        pending.title = title;
+        self.set_pending_session(pending.clone()).await?;
+        Ok(pending)
+    }
+
     /// Declare (or replace) the conversation's Pending Session in its current
     /// project (ADR-0041) — the shape `/new` and the switch card's 新建 share.
     /// Returns the declared pending, whose directory the confirmation names.
@@ -414,10 +430,7 @@ impl SharedCore {
         title: Option<String>,
     ) -> crate::error::Result<PendingEntry> {
         let directory = self.current_project_directory(thread_key).await;
-        let mut pending = PendingEntry::new(thread_key.clone(), directory);
-        pending.title = title;
-        self.set_pending_session(pending.clone()).await?;
-        Ok(pending)
+        self.declare_pending(thread_key, directory, title).await
     }
 
     /// Mutate the conversation's Pending Session and persist (ADR-0041:

@@ -259,8 +259,8 @@ async fn topic_command_bare_inherits_current_project_directory() {
 
     let thread_key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
 
-    // Root a session in the project with `/dir`; it becomes the active
-    // session whose directory bare `/topic` must inherit.
+    // Root the conversation in the project with `/dir`; its Pending Session's
+    // directory is the current project bare `/topic` must inherit (ADR-0041).
     crate::bridge::command::handle_command(
         &app.core,
         crate::bridge::command::Command::Dir(proj_dir.clone()),

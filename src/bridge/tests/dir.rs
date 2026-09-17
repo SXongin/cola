@@ -31,9 +31,9 @@ async fn new_session_uses_configured_work_dir() {
     assert_eq!(entry.directory, work.to_string_lossy().to_string());
 }
 
-/// `/new` in a conversation whose active session lives in a project must
-/// inherit that project's directory (ADR-0012) — NOT the configured
-/// work_dir. Only a conversation with no session falls back to work_dir.
+/// `/new` in a conversation whose current project is rooted elsewhere must
+/// inherit that project's directory (ADR-0012) — NOT the configured work_dir.
+/// Only a conversation with no session falls back to work_dir.
 #[tokio::test]
 async fn new_command_inherits_active_sessions_directory() {
     let _wd = test_work_dir();
@@ -47,7 +47,7 @@ async fn new_command_inherits_active_sessions_directory() {
     let proj = tempfile::tempdir().unwrap();
     let proj_dir = proj.path().to_string_lossy().to_string();
 
-    // First `/dir <proj>` roots a session in the project.
+    // First `/dir <proj>` declares a pending rooted in the project (ADR-0041).
     crate::bridge::command::handle_command(
         &app.core,
         crate::bridge::command::Command::Dir(proj_dir.clone()),
@@ -158,11 +158,12 @@ async fn dir_card_data_dedupes_sorts_and_filters() {
     assert_eq!(current, None);
 }
 
-/// The `/dir` Recent Directories card's `pick` op re-roots the thread into
-/// the picked directory: it creates a NEW session there (matching the text
-/// `/dir <path>` form), maps it active, and refreshes the card in place.
+/// The `/dir` Recent Directories card's `pick` op declares a Pending Session
+/// rooted at the picked directory (the card form of `/dir <path>`, ADR-0041):
+/// no server session is created, and the refreshed card marks the pending's
+/// directory as `当前`.
 #[tokio::test]
-async fn dir_card_pick_creates_session_and_refreshes_card() {
+async fn dir_card_pick_declares_a_pending_and_refreshes_card() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -171,6 +172,7 @@ async fn dir_card_pick_creates_session_and_refreshes_card() {
         list_session("ses_a", "项目A", "/work/a", 100),
         list_session("ses_b", "项目B", "/work/b", 200),
     ];
+    let created = backend.created_session_dirs.clone();
     let (app, _platform) = build_app(cfg, backend).await;
 
     let value = serde_json::json!({
@@ -185,21 +187,29 @@ async fn dir_card_pick_creates_session_and_refreshes_card() {
         .await
         .expect("dir pick should return a result");
     assert!(result.card.is_some(), "dir pick refreshes the card");
+    let toast = result.toast.clone().unwrap_or_default();
     assert!(
-        result.toast.clone().unwrap_or_default().contains("已切换目录"),
-        "dir pick toasts: {:?}",
-        result.toast
+        toast.contains("下一条消息") && toast.contains("/work/b"),
+        "dir pick toasts the pending timing and directory: {toast:?}"
+    );
+    assert!(
+        created.lock().await.is_empty(),
+        "dir pick creates NO server session"
     );
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-    let entry = app
-        .sessions
-        .lock()
-        .await
-        .get_active(&key)
-        .cloned()
-        .expect("dir pick maps the new session active");
-    assert_eq!(entry.directory, "/work/b");
-    // The refreshed card marks the new directory as current.
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&key)
+            .map(|p| p.directory.clone()),
+        Some("/work/b".to_string())
+    );
+    assert!(
+        app.sessions.lock().await.get_active(&key).is_none(),
+        "a pending supersedes the active session"
+    );
+    // The refreshed card marks the pending's directory as current.
     let card_str = result.card.unwrap().to_string();
     assert!(
         card_str.contains("当前"),
@@ -509,9 +519,9 @@ async fn dir_card_topic_no_thread_id_degrades_with_guidance() {
 }
 
 /// The location-based guard also covers a topic that bound its session via
-/// the row's left button on THIS same card: after `pick` binds the
-/// never-bound topic, clicking 建话题 on the refreshed card must still
-/// reject — the topic now has a session, so it cannot open another topic.
+/// the row's left button on THIS same card: after `pick` declares the
+/// never-bound topic's pending, clicking 建话题 on the refreshed card must
+/// still reject — the guard is location-based, not state-based.
 #[tokio::test]
 async fn dir_card_topic_rejects_after_topic_bound_via_pick() {
     let _wd = test_work_dir();
@@ -521,7 +531,7 @@ async fn dir_card_topic_rejects_after_topic_bound_via_pick() {
     let (app, _platform) = build_app(cfg, backend).await;
     let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into());
 
-    // Step 1: the never-bound topic binds its single session via `pick`.
+    // Step 1: the never-bound topic declares its pending via `pick`.
     let pick_value = serde_json::json!({
         "action": "dir",
         "op": "pick",
@@ -532,9 +542,14 @@ async fn dir_card_topic_rejects_after_topic_bound_via_pick() {
     app.host_action(pick_value)
         .await
         .expect("pick should bind the topic");
-    assert!(
-        app.sessions.lock().await.get_active(&topic_key).is_some(),
-        "pick binds the never-bound topic's session"
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&topic_key)
+            .map(|p| p.directory.clone()),
+        Some("/work/a".to_string()),
+        "pick declares the never-bound topic's pending"
     );
 
     // Step 2: 建话题 on the same thread is rejected — the guard is
@@ -557,6 +572,11 @@ async fn dir_card_topic_rejects_after_topic_bound_via_pick() {
         "bound topic still rejects nesting: {:?}",
         result.toast
     );
-    // Only the original binding remains — no second topic was created.
-    assert_eq!(app.sessions.lock().await.all_entries().len(), 1);
+    // Only the original pending remains — no topic, no session was created.
+    let store = app.sessions.lock().await;
+    assert!(store.all_entries().is_empty());
+    assert_eq!(
+        store.pending_for(&topic_key).map(|p| p.directory.as_str()),
+        Some("/work/a")
+    );
 }
