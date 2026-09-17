@@ -52,6 +52,14 @@ _Avoid_: Give way, step down, hand over
 Spawning an Owned Server only at the moment a server is actually needed (a prompt is about to be sent and no server exists), never proactively at boot. Boot-time behavior is attach-only unless `start_server = "eager"`.
 _Avoid_: On-demand start, deferred start
 
+**Lazy Session Creation**:
+Creating a Session only when a prompt is actually sent — never when the conversation's intent is declared. `/new`, `/dir` and `/topic` write a **Pending Session**; the first prompt materialises it. The session-side counterpart of **Lazy Start**.
+_Avoid_: Cold start (means the opposite), deferred creation, eager creation
+
+**Pending Session**:
+A conversation's recorded intent for its next Session — directory, optional title, and per-session overrides — with no Backend identity yet. NOT a Session: it has no server id, and while it exists the conversation has no **Active Session**. The first prompt materialises it into a Session and the Pending Session ceases to exist; a later selection command replaces it. Written by `/new`, `/dir`, `/topic` and their card forms.
+_Avoid_: Draft session, session intent, tentative session
+
 **Session**:
 A single conversation thread with an AI backend, identified by the server's session id and `title` (the server is the single source of truth for identity, ADR-0007). A session has a directory (project) and an optional agent selection. One session maps to at most one Feishu thread at a time.
 _Avoid_: Chat, conversation, room
@@ -63,7 +71,7 @@ _Avoid_: Conversation, room, group
 _UI label_: 聊天 (the Feishu-side container; a Feishu user's own term). Feishu's own UI calls the top-level thing a 会话, which is exactly the collision cola avoids — cola never uses 会话 for this.
 
 **Topic**:
-A Feishu thread inside a Chat, identified by `thread_id` (`omt_...`; called "话题" in the Feishu UI). A message is a topic message IFF it carries `thread_id`. A topic holds exactly one Session; the boundary that isolates one session from another. A topic is created around a message (its Topic Root) and is usually opened by cola with a seed card (Topic Anchor).
+A Feishu thread inside a Chat, identified by `thread_id` (`omt_...`; called "话题" in the Feishu UI). A message is a topic message IFF it carries `thread_id`. A topic holds exactly one Session (or one Pending Session before that Session exists); the boundary that isolates one session from another. A topic is created around a message (its Topic Root) and is usually opened by cola with a seed card (Topic Anchor).
 _UI label_: 话题.
 
 **Topic Root**:
@@ -86,11 +94,11 @@ _Avoid_: 对话 as a user-facing term for this (overloads "conversation"); 消�
 A Feishu topic, identified by `thread_id` (`omt_...`). Retained in code as `ThreadKey { chat_id, thread_id }`; the glossary now calls the Feishu side Chat/Topic, and 话题 for topics in the UI. See Topic.
 
 **Active Session**:
-The single session of a chat/topic that messages route to and that external-message sync follows. Exactly one per ThreadKey at a time (the SessionStore's first entry); `/switch` and `/new` promote a session to active, and cola derives the conversation's current project from it.
+The single session of a chat/topic that messages route to and that external-message sync follows. At most one per ThreadKey at a time (the SessionStore's first entry); `/switch` promotes a session to active, and so does a **Pending Session**'s materialisation. A conversation with a Pending Session has NO Active Session until that first prompt materialises it.
 _Avoid_: Current session, latest session, selected session
 
 **Session Mapping**:
-Cola's record of which Sessions a Chat or Topic has activated, and which one is its Active Session. Established when a Session is opened or adopted for a conversation and remembered across restarts; distinct from the Session itself, whose identity lives on the Backend (ADR-0007), and from the server's session list, which is Backend state rather than cola's.
+Cola's record of which Sessions a Chat or Topic has activated, and which one is its Active Session. Established when a Session is opened or adopted for a conversation and remembered across restarts; distinct from the Session itself, whose identity lives on the Backend (ADR-0007), and from the server's session list, which is Backend state rather than cola's. A Pending Session is stored beside the mapping, not in it — it is not a Session.
 _Avoid_: Session list, session store, mapping table
 
 **Cola-Authored Message**:
@@ -106,7 +114,7 @@ The external-message poller's per-session record of the newest user message it h
 _Avoid_: Baseline (the old name; it implied the prompt path owned it)
 
 **Project**:
-A working directory on the filesystem where OpenCode operates. A property of a session, not of the bot. A conversation's current project is the directory of its active session (derived, never stored separately); `/new` and the bare `/topic` form inherit it and fall back to the default directory only when the conversation has no session. Sessions created outside a conversation still carry their own directory.
+A working directory on the filesystem where OpenCode operates. A property of a session, not of the bot. A conversation's current project is the directory of its Pending Session when it has one, otherwise of its active session (derived, never stored separately); `/new` and the bare `/topic` form inherit it and fall back to the default directory only when the conversation has neither. Sessions created outside a conversation still carry their own directory.
 _Avoid_: Workspace, repo
 
 **Recent Directories** (「最近目录」):
@@ -238,7 +246,7 @@ _Avoid_: Notification, message, signal
 - Every inbound message or card action carries exactly one **Principal** (its sender or clicking user), authorized against the **Access List** before cola acts
 - The first successful **Claim** writes the **Host** into the **Access List**; every other Principal is refused
 - A **Chat** contains many **Topics**; a **Chat** may hold several **Sessions** directly (lobby), while a **Topic** holds exactly one **Session**
-- A **Chat** or **Topic** has one **Session Mapping**: the set of **Session**s it has activated, with exactly one of them its **Active Session**
+- A **Chat** or **Topic** has one **Session Mapping**: the set of **Session**s it has activated, with exactly one of them its **Active Session**, plus at most one **Pending Session** that materialises at the conversation's first prompt
 - A **Topic** is created around its **Topic Root** and, when cola opens it, is anchored on its **Topic Anchor**; a cola-created **Topic Root** is a **Topic Cover Card**
 - A **Session** contains many **Turns** and has one **Project** and one optional **Agent**
 - A **Turn** renders into a **Card Chain**; a pending **Permission**/**Question** rides its newest card as an **Interaction Block**, and resolving one leaves an **Interaction Receipt**
@@ -255,6 +263,9 @@ _Avoid_: Notification, message, signal
 
 > **Dev:** "If a user sends a message in a new topic, does the Bridge create a new Session?"
 > **Domain expert:** "Yes — the first message in a topic triggers session creation. If there's an existing topic, the message routes to that topic's session."
+>
+> **Dev:** "I ran `/new` — which session did that create?"
+> **Domain expert:** "None. `/new` records a Pending Session; the Session itself appears when the conversation's first prompt arrives."
 >
 > **Dev:** "What happens when a Permission request arrives mid-stream?"
 > **Domain expert:** "The Bridge pauses the Card stream, renders a Permission card with action buttons, and waits for the user to reply. Once resolved, streaming resumes."
