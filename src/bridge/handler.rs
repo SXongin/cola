@@ -1382,16 +1382,36 @@ impl App {
             let store = core.sessions.lock().await;
             store.get_active(&thread_key).cloned()
         };
+        let mut approved = Vec::new();
         if on && let Some(e) = &current_entry {
-            core.approve_pending_for_session(&e.session_id, &e.directory)
+            approved = core
+                .approve_pending_for_session(&e.session_id, &e.directory)
                 .await;
         }
-        if let Some(e) = current_entry
+        if let Some(e) = &current_entry
             && let Err(err) = core
                 .update_session(&e.session_id, |entry| entry.auto_accept = on)
                 .await
         {
             tracing::warn!("autoaccept card: persist failed: {}", err);
+        }
+        // The same residue the permission card's toggle and `/autoaccept on`
+        // leave: ONE mode receipt and the approved blocks dismissed. Without it
+        // the sweep would resolve them as `⏱ 已由其他客户端处理` — a lie, cola
+        // itself approved them.
+        if let Some(e) = &current_entry
+            && !approved.is_empty()
+        {
+            crate::bridge::request::resolve_blocks(
+                &core.permission,
+                core,
+                &Some(e.session_id.clone()),
+                &e.session_id,
+                crate::bridge::request::Origin::Command,
+                &approved,
+                crate::bridge::request::Residue::Single(crate::bridge::request::AUTOACCEPT_RECEIPT),
+            )
+            .await;
         }
         let current_on = core
             .sessions

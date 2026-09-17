@@ -698,3 +698,177 @@ async fn rehost_preserves_a_questions_partial_answers() {
     assert_eq!(handles.cached_count(), 0);
     assert_eq!(backend.reply_question_calls.lock().await.len(), 1);
 }
+
+/// Two flushes racing a split (`flush_card` is called from the render poll,
+/// the request poller and click acks) must not duplicate a card. Freezing the
+/// first flush's continuation send leaves the window: the second flush builds
+/// the continuation slice (`render_from` is already advanced) while the card
+/// id still names the finalized card, and PATCHes that slice onto it — two
+/// identical messages with live controls, only one of them tracked.
+#[tokio::test]
+async fn a_concurrent_flush_leaves_the_tail_on_one_card() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
+
+    // A card far over the component budget with a live permission in its tail:
+    // a flush finalizes it and sends the continuation that carries the block.
+    let mut acc = StreamAccumulator::new("test");
+    acc.card_state = CardState::Done;
+    for i in 0..50 {
+        acc.push_tool(
+            &format!("call_{i}"),
+            ToolPanel {
+                name: format!("tool{i}"),
+                status: "completed".into(),
+                input: None,
+                output: None,
+            },
+        );
+    }
+    acc.add_interaction(permission_block("per_split", "ses_split", "/work"));
+    acc.reply_to_message_id = Some("msg_1".into());
+    app.cards.lock().await.insert(
+        "ses_split".into(),
+        CardSession::new(acc, Some("om_filled".into())),
+    );
+
+    // Freeze the continuation send: the finalized patch has been sent, the
+    // continuation is not yet registered as the session's card.
+    let (entered, release) = platform.pause("reply", "msg_1");
+    let first = {
+        let app = app.clone();
+        tokio::spawn(async move { crate::bridge::render::flush_card(&app.core, "ses_split").await })
+    };
+    entered.notified().await;
+
+    // The render poll's flush now races the request poller's. Without a
+    // serialized card write it completes against the stale card id; with one
+    // it parks until the first flush is done.
+    let finished = Arc::new(tokio::sync::Notify::new());
+    let second = {
+        let app = app.clone();
+        let finished = finished.clone();
+        tokio::spawn(async move {
+            crate::bridge::render::flush_card(&app.core, "ses_split").await;
+            finished.notify_one();
+        })
+    };
+    let parked = tokio::time::timeout(std::time::Duration::from_millis(200), finished.notified()).await;
+    release.notify_one();
+    first.await.unwrap();
+    if parked.is_err() {
+        finished.notified().await;
+    }
+    second.await.unwrap();
+
+    // The finalized card must end WITHOUT the tail: the racing flush PATCHed
+    // the continuation's content (the block) onto it.
+    let finalized = last_card_of(&platform, "om_filled").await;
+    assert!(
+        !finalized.contains("🔐 **权限请求**"),
+        "the finalized card was overwritten with the continuation's tail: {finalized}"
+    );
+    // The block renders on exactly one card: the continuation.
+    let continuations = platform.replied_cards().await;
+    assert_eq!(continuations.len(), 1, "exactly one continuation card");
+    assert!(
+        continuations[0].to_string().contains("🔐 **权限请求**"),
+        "the continuation carries the block: {}",
+        continuations[0]
+    );
+    assert_eq!(
+        app.card_handles.lock().await.message_of("per_split"),
+        Some("msg_reply"),
+        "the handle follows the continuation"
+    );
+}
+
+/// A resolution racing an in-flight flush must not be resurrected: freezing
+/// the flush inside its PATCH, then letting the click resolve, leaves the
+/// stale snapshot to record and re-PATCH the just-resolved block — which the
+/// sweep reads as "another client handled it". That was the auto-accept
+/// sequence the Host saw (a `⏱` line before the mode receipt).
+#[tokio::test]
+async fn a_resolution_racing_an_in_flight_flush_is_not_resurrected() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.permissions = vec![perm_request("per_live", "ses_live", "ls -la")];
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_live", "/work").await;
+
+    // The live card carries the inline permission (the poller path).
+    let mut acc = StreamAccumulator::new("回合");
+    acc.card_state = CardState::Done;
+    acc.push_text("回合的内容。");
+    acc.reply_to_message_id = Some("msg_1".into());
+    app.cards
+        .lock()
+        .await
+        .insert("ses_live".into(), CardSession::new(acc, Some("om_live".into())));
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.core, &mut seen).await;
+
+    // A render-poll flush takes its snapshot (the block is live) and parks in
+    // the PATCH.
+    let (entered, release) = platform.pause("update", "om_live");
+    let flush = {
+        let app = app.clone();
+        tokio::spawn(async move { crate::bridge::render::flush_card(&app.core, "ses_live").await })
+    };
+    entered.notified().await;
+
+    // The Host clicks 允许一次 while that PATCH is in flight. Without the lock
+    // the click resolves immediately; with it the click waits its turn.
+    let click = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            app.host_action(serde_json::json!({
+                "action": "perm",
+                "reply": "once",
+                "session_id": "ses_live",
+                "directory": "/work",
+                "request_id": "per_live",
+                "open_message_id": "om_live",
+                "perm_label": "✅ 已允许一次",
+                "perm_color": "green",
+                "perm_body": "bash",
+            }))
+            .await
+        })
+    };
+    release.notify_one();
+    flush.await.unwrap();
+    let result = click.await.unwrap().expect("a card-action result");
+    assert!(
+        ack_text(&result).contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la`"),
+        "the click ack carries the decision: {}",
+        ack_text(&result)
+    );
+
+    // The request left the pending list when cola replied: the next sweep must
+    // NOT read that as another client's resolution and stamp the neutral line.
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.core, &mut seen).await;
+    let neutral = platform.calls.lock().await.iter().any(|c| {
+        matches!(
+            c,
+            PlatformCall::UpdateMessage { message_id, card }
+                if message_id == "om_live" && card.to_string().contains("⏱ 已由其他客户端处理")
+        )
+    });
+    assert!(
+        !neutral,
+        "cola's own decision must not be reported as handled elsewhere"
+    );
+    let handles = app.card_handles.lock().await;
+    assert_eq!(handles.live_count(), 0, "no live block survives the resolution");
+    assert_eq!(handles.cached_count(), 0, "no cache survives the resolution");
+}

@@ -97,13 +97,16 @@ pub trait RequestKind: Send + Sync {
     /// Resolve the kind's own inline blocks whose request vanished (resolved
     /// by another client) into their Interaction Receipts; an item owned by a
     /// directory whose list call failed stays live: unknown must never be read
-    /// as resolved (#130, #144). Returns how many blocks were resolved — the
-    /// sweep repaints each affected card so the receipt lands within one poll.
+    /// as resolved (#130, #144). An item cola itself is answering (`answered`)
+    /// also stays: the settlement owns its receipt, the sweep's neutral one
+    /// would be a lie. Returns how many blocks were resolved — the sweep
+    /// repaints each affected card so the receipt lands within one poll.
     fn resolve_vanished_inline(
         &self,
         acc: &mut StreamAccumulator,
         pending: &std::collections::HashSet<String>,
         failed_dirs: &std::collections::HashSet<String>,
+        claimed: &std::collections::HashSet<String>,
     ) -> usize;
 
     /// The snapshot-claim kind of this flow's requests (ADR-0028): each flow's
@@ -134,17 +137,24 @@ pub trait RequestKind: Send + Sync {
 /// kind owns (`own`) whose request vanished into its
 /// `⏱ 已由其他客户端处理` Interaction Receipt. A block owned by a directory
 /// whose list call failed stays: that directory said nothing, so its request
-/// may still be pending (#130, #144). Returns how many were resolved — the
-/// sweep repaints each affected card so the receipt lands within one poll.
+/// may still be pending (#130, #144). A block cola itself is answering (or
+/// answered) also stays: its disappearance from the pending list is cola's own
+/// doing, and the sweep's neutral line would be a lie — the settlement leaves
+/// the true receipt. Returns how many were resolved — the sweep repaints each
+/// affected card so the receipt lands within one poll.
 fn resolve_vanished_blocks(
     acc: &mut StreamAccumulator,
     pending: &std::collections::HashSet<String>,
     failed_dirs: &std::collections::HashSet<String>,
+    claimed: &std::collections::HashSet<String>,
     own: impl Fn(&InteractionBlock) -> bool,
 ) -> usize {
     acc.resolve_vanished(
         |block| {
-            own(block) && !pending.contains(block.request_id()) && !failed_dirs.contains(block.directory())
+            own(block)
+                && !pending.contains(block.request_id())
+                && !claimed.contains(block.request_id())
+                && !failed_dirs.contains(block.directory())
         },
         |block| handled_elsewhere_receipt(&block.receipt_target()),
     )
@@ -249,8 +259,9 @@ impl RequestKind for PermissionKind {
         acc: &mut StreamAccumulator,
         pending: &std::collections::HashSet<String>,
         failed_dirs: &std::collections::HashSet<String>,
+        claimed: &std::collections::HashSet<String>,
     ) -> usize {
-        resolve_vanished_blocks(acc, pending, failed_dirs, |block| {
+        resolve_vanished_blocks(acc, pending, failed_dirs, claimed, |block| {
             matches!(block, InteractionBlock::Permission(_))
         })
     }
@@ -674,8 +685,9 @@ impl RequestKind for QuestionKind {
         acc: &mut StreamAccumulator,
         pending: &std::collections::HashSet<String>,
         failed_dirs: &std::collections::HashSet<String>,
+        claimed: &std::collections::HashSet<String>,
     ) -> usize {
-        resolve_vanished_blocks(acc, pending, failed_dirs, |block| {
+        resolve_vanished_blocks(acc, pending, failed_dirs, claimed, |block| {
             matches!(block, InteractionBlock::Question(_))
         })
     }
@@ -1559,6 +1571,13 @@ impl RequestFlow {
         // (resolved by another client) and was NOT answered by cola. A card
         // owned by a directory whose list failed stays live (#144).
         mark_stale_cards(core, &pending, &self.sent_cards, &failed_dirs, self.kind.label()).await;
+        // Requests cola itself is answering or has answered (a click's claim,
+        // an auto-accept approval): their block belongs to the settlement
+        // writing the true receipt, so the sweep must not read their
+        // disappearance from the pending list as another client's work.
+        // Snapshot once — every pass below must judge the same moment.
+        let mut claimed = core.answered_requests.lock().await.clone();
+        claimed.extend(core.settling_requests.lock().await.iter().cloned());
         // Card handles (ADR-0038, rule 2): a live block on a card whose
         // accumulator is gone (a replaced/aborted turn) is repainted from the
         // cached JSON — the accumulator pass below only reaches the card its
@@ -1583,6 +1602,7 @@ impl RequestFlow {
             self.kind.claim_kind(),
             &pending,
             &failed_dirs,
+            &claimed,
             &flush_owned,
             handled_elsewhere_receipt,
         );
@@ -1608,7 +1628,7 @@ impl RequestFlow {
             for (session_id, card) in cards.iter_mut() {
                 if self
                     .kind
-                    .resolve_vanished_inline(&mut card.acc, &pending, &failed_dirs)
+                    .resolve_vanished_inline(&mut card.acc, &pending, &failed_dirs, &claimed)
                     > 0
                 {
                     affected.push(session_id.clone());
@@ -2026,6 +2046,13 @@ pub(crate) async fn resolve_blocks(
     ids: &[String],
     residue: Residue<'_>,
 ) -> Option<serde_json::Value> {
+    // The session's card-write lock, shared with `flush_card`: a resolution
+    // settles the accumulator and the cached cards, and a flush that
+    // snapshotted before it must not record its stale copy after — the block
+    // would come back to life and the sweep would report cola's own decision
+    // as another client's.
+    let write_lock = core.card_write_lock(host.as_deref().unwrap_or(session_id)).await;
+    let _guard = write_lock.lock().await;
     // A click settles the standalone surface too, so its `sent_cards` entry
     // goes. A COMMAND does not: an id with no inline block and no card handle
     // is a standalone card, and clearing its entry here would strand its live
@@ -2154,6 +2181,15 @@ pub(crate) async fn resolve_blocks(
     for (message_id, card) in patches {
         if let Err(e) = core.feishu.update_message(&message_id, &card).await {
             tracing::warn!("resolved block repaint failed on {}: {}", message_id, e);
+        }
+    }
+    // The settlement rendered (or found nothing to render): release the
+    // in-flight claim, so a standalone copy of the same request is left to
+    // `mark_stale_cards` again.
+    {
+        let mut settling = core.settling_requests.lock().await;
+        for id in ids {
+            settling.remove(id);
         }
     }
     ack

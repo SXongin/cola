@@ -77,8 +77,18 @@ pub struct SharedCore {
     /// request ids already answered on the permission/question cards. Guards
     /// against double-click races (two card callbacks before the result card
     /// replaces the buttons): a second click on the same request is ignored
-    /// server-side instead of re-replying.
+    /// server-side instead of re-replying. Also tells `mark_stale_cards` that
+    /// cola's answer already settled a standalone card.
     pub answered_requests: Arc<Mutex<HashSet<String>>>,
+    /// Request ids whose settlement cola has STARTED — the auto-accept
+    /// approval's reply has landed (or is landing) but the mode receipt has
+    /// not rendered yet. While an id sits here its disappearance from the
+    /// pending list is cola's own doing, so the sweep's vanished passes must
+    /// not read it as another client's resolution (`resolve_blocks` clears the
+    /// mark once it settled). Kept apart from `answered_requests`: that one
+    /// makes `mark_stale_cards` skip a card, and a standalone card approved by
+    /// `/autoaccept on` still needs the sweep to repaint its buttons away.
+    pub settling_requests: Arc<Mutex<HashSet<String>>>,
     /// Session ids with a prompt currently in flight (serializes prompts per
     /// session so concurrent messages don't clobber each other's cards).
     pub inflight: Arc<Mutex<HashSet<String>>>,
@@ -108,6 +118,14 @@ pub struct SharedCore {
     /// loop's re-attach/yield — so concurrent first messages can't double-spawn
     /// or race a yield with a reconnect.
     pub server_lock: Arc<tokio::sync::Mutex<()>>,
+    /// session_id → the lock serializing that session's card writes. A card
+    /// write is a read-send-record sequence (the flush's build→PATCH→record, a
+    /// resolution's mutate→ack/PATCH), and two of them interleaving land out of
+    /// order: a stale flush PATCHes a resolution away, or a split's
+    /// continuation content is written onto the card it just finalized. One
+    /// writer per session at a time; entries are never evicted (bounded by the
+    /// session store). Private: `card_write_lock` is the accessor.
+    card_write_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl SharedCore {
@@ -132,6 +150,7 @@ impl SharedCore {
                 crate::bridge::snapshot_claims::SnapshotClaims::default(),
             )),
             answered_requests: Arc::new(Mutex::new(HashSet::new())),
+            settling_requests: Arc::new(Mutex::new(HashSet::new())),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             cover_titles: Arc::new(Mutex::new(HashMap::new())),
             work_dir: cfg
@@ -146,7 +165,21 @@ impl SharedCore {
             server_start: cfg.opencode.start_server,
             preferred_port: cfg.opencode.preferred_port(),
             server_lock: Arc::new(tokio::sync::Mutex::new(())),
+            card_write_locks: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// The lock serializing card writes for `session_id` (see
+    /// `card_write_locks`). Every path that reads a session's card state, sends
+    /// the result to Feishu, and then records it must hold this across the
+    /// whole sequence: `flush_card` and `resolve_blocks` are the two.
+    pub(crate) async fn card_write_lock(&self, session_id: &str) -> Arc<Mutex<()>> {
+        self.card_write_locks
+            .lock()
+            .await
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// The directory a brand-new session starts in: `[bridge] work_dir` when
@@ -429,6 +462,14 @@ impl SharedCore {
             if !crate::bridge::request::session_belongs_to(self, &sid, session_id, directory).await {
                 continue;
             }
+            // Take the settlement claim BEFORE the reply lands: the request
+            // leaves the server's pending list the moment it is applied, and a
+            // sweep landing in that window would otherwise read the
+            // disappearance as another client's resolution and stamp
+            // `⏱ 已由其他客户端处理` on the card — the lie the Host saw when
+            // enabling auto-accept. `resolve_blocks` clears the claim once the
+            // true receipt rendered; a failed reply releases it right here.
+            let claimed_here = self.settling_requests.lock().await.insert(p.request_id.clone());
             match self
                 .opencode
                 .clone()
@@ -445,7 +486,12 @@ impl SharedCore {
                     );
                     approved.push(p.request_id.clone());
                 }
-                Err(e) => tracing::warn!("auto-accept pending {} on session {}: {}", p.request_id, sid, e),
+                Err(e) => {
+                    if claimed_here {
+                        self.settling_requests.lock().await.remove(&p.request_id);
+                    }
+                    tracing::warn!("auto-accept pending {} on session {}: {}", p.request_id, sid, e);
+                }
             }
         }
         approved

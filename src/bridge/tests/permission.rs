@@ -762,6 +762,174 @@ async fn autoaccept_command_leaves_the_mode_receipt_on_the_card() {
     assert_eq!(after, patches.len(), "the sweep must not repaint again");
 }
 
+/// The `/autoaccept` toggle CARD's "on" button (not the command, not the
+/// permission card's own button) leaves the same mode receipt on a pending
+/// permission: the approval settles the block itself and never lets the sweep
+/// report it as another client's work.
+#[tokio::test]
+async fn autoaccept_toggle_card_settles_pending_permissions() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.permissions = vec![perm_request("per_1", "ses_1", "ls -la")];
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_1", "/work").await;
+    seed_inline_permission_card(&app, "ses_1", "per_1").await;
+    crate::bridge::render::flush_card(&app.core, "ses_1").await;
+    let card_id = app
+        .card_handles
+        .lock()
+        .await
+        .message_of("per_1")
+        .expect("the flush registers the card that renders the block")
+        .to_string();
+
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "autoaccept",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "value": "on",
+        }))
+        .await
+        .expect("the toggle card acks");
+    assert!(result.card.is_some(), "the refreshed toggle card is returned");
+    assert!(
+        app.sessions
+            .lock()
+            .await
+            .entry_for_session("ses_1")
+            .unwrap()
+            .auto_accept
+    );
+
+    let patches: Vec<String> = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::UpdateMessage { message_id, card } if message_id == &card_id => {
+                Some(card.to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    let repaint = patches.last().expect("the toggle must patch the permission card");
+    assert!(
+        repaint.contains("🔄 已开启自动授权"),
+        "the mode receipt must render: {repaint}"
+    );
+    assert!(
+        !repaint.contains("⏱ 已由其他客户端处理") && !repaint.contains("🔐 **权限请求**"),
+        "the approved block leaves the mode receipt, not the neutral line: {repaint}"
+    );
+    assert!(
+        app.core.settling_requests.lock().await.is_empty(),
+        "the settlement released its in-flight claim"
+    );
+
+    // The sweep after the toggle finds nothing left to resolve.
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.core, &mut seen).await;
+    let after = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter(|c| matches!(c, PlatformCall::UpdateMessage { message_id, .. } if message_id == &card_id))
+        .count();
+    assert_eq!(after, patches.len(), "the sweep must not repaint again");
+}
+
+/// An auto-accept approval replies to the server BEFORE its block settles: a
+/// sweep landing in that window must leave the claimed block to its own
+/// settlement instead of reporting "handled elsewhere". That gap is what the
+/// Host saw — the pending permission card flipped to
+/// `⏱ 已由其他客户端处理` the moment auto-accept was enabled from that card.
+#[tokio::test]
+async fn sweep_leaves_a_claimed_approval_to_its_settlement() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.permissions = vec![perm_request("per_1", "ses_1", "ls -la")];
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_1", "/work").await;
+    seed_inline_permission_card(&app, "ses_1", "per_1").await;
+    crate::bridge::render::flush_card(&app.core, "ses_1").await;
+    assert_eq!(
+        app.card_handles.lock().await.message_of("per_1"),
+        Some("msg_live"),
+        "precondition: the block's handle is recorded"
+    );
+
+    // cola took the answer claim (a click, or the auto-accept approval) and the
+    // reply landed: the request is off the pending list, its settlement has not
+    // run yet.
+    assert!(app.permission.try_mark_answered(&app.core, "per_1").await);
+    backend.replied_permissions.lock().await.insert("per_1".into());
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.core, &mut seen).await;
+
+    // The sweep left it alone: no neutral receipt reached the card, the handle
+    // and the accumulator still carry the block for the in-flight settlement.
+    let neutral = platform.calls.lock().await.iter().any(|c| {
+        matches!(
+            c,
+            PlatformCall::UpdateMessage { card, .. }
+                if card.to_string().contains("⏱ 已由其他客户端处理")
+        )
+    });
+    assert!(!neutral, "a claimed approval must not be settled by the sweep");
+    assert_eq!(
+        app.card_handles.lock().await.message_of("per_1"),
+        Some("msg_live"),
+        "the handle still names the card the settlement will repaint"
+    );
+    assert!(
+        app.cards
+            .lock()
+            .await
+            .get("ses_1")
+            .unwrap()
+            .acc
+            .live_permissions()
+            .iter()
+            .any(|p| p.request_id == "per_1"),
+        "the accumulator keeps the claimed block live for its own settlement"
+    );
+}
+
+/// `/autoaccept on` (and the picker toggle) marks the requests it approves
+/// before they leave the pending list, so the sweep's claimed-approval check
+/// has something to honour. Without the mark the sweep races the settlement.
+#[tokio::test]
+async fn autoaccept_approval_claims_the_requests_it_answers() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.permissions = vec![perm_request("per_1", "ses_1", "ls -la")];
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_1", "/work").await;
+
+    let approved = app.core.approve_pending_for_session("ses_1", "/work").await;
+
+    assert_eq!(approved, vec!["per_1".to_string()]);
+    assert!(backend.replied_permissions.lock().await.contains("per_1"));
+    assert!(
+        app.core.settling_requests.lock().await.contains("per_1"),
+        "the approval must take the claim its settlement owns"
+    );
+}
+
 /// A standalone permission card (no accumulator, no card handle) must keep its
 /// `sent_cards` entry when `/autoaccept on` approves it: clearing it would
 /// strand the card's live buttons. `mark_stale_cards` owns that lifecycle and

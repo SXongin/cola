@@ -423,6 +423,19 @@ pub(crate) fn render_new_turn_parts(
 const MAX_CARD_CHAIN: usize = 8;
 
 pub(crate) async fn flush_card(core: &Arc<SharedCore>, session_id: &str) {
+    // One card writer per session at a time. A flush is a read-send-record
+    // sequence, and callers are concurrent (the render poll, the request
+    // poller surfacing a block, a click's ack fallback); interleaved, the
+    // second writer still names the card the first just finalized and PATCHes
+    // its continuation slice onto it — two identical messages, only one
+    // tracked and repaintable. The resolution paths take the same lock
+    // (`resolve_blocks`), so a click cannot be overwritten by a stale flush.
+    let write_lock = core.card_write_lock(session_id).await;
+    let _guard = write_lock.lock().await;
+    flush_card_locked(core, session_id).await;
+}
+
+async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
     // Is the accumulator's current card still the live (growing) card? It is
     // until the first split finalizes it. Every card after that was sent as a
     // FINALIZED slice (its build was already over the budget) and must never be
