@@ -34,12 +34,18 @@ impl ToolPanel {
 /// `· HH:MM` so the start time is visible while collapsed (#183), and when
 /// absent (a payload with no server time) no clock is rendered.
 pub(super) fn tool_panel_element(tool: &ToolPanel, at_ms: Option<i64>) -> serde_json::Value {
+    let output = tool
+        .output
+        .as_ref()
+        .map(|raw| format_tool_output(&tool.name, raw));
+    // A parsed todo output IS the panel: the list's size and status counts ride
+    // the folded header (below), so the generic Input line and Output marker
+    // would only frame the checklist. A still-running call has no parsed output
+    // yet — the Input line (`📋 共 N 项任务`) is all it can show.
+    let todowrite_list =
+        tool.name == "todowrite" && output.as_ref().is_some_and(|(header, _, _)| header.is_some());
     let mut content = String::new();
-    // A todo panel is folded by default and its rows only change in place, so
-    // its status counts ride the header (below) instead of opening the body:
-    // progress stays readable — and visibly refreshed — while collapsed.
-    let mut title_counts: Option<String> = None;
-    if let Some(i) = &tool.input {
+    if !todowrite_list && let Some(i) = &tool.input {
         let formatted = format_tool_input(&tool.name, i);
         if !formatted.is_empty() {
             // Trailing blank line so a multi-line input (edit diff, skill
@@ -49,48 +55,57 @@ pub(super) fn tool_panel_element(tool: &ToolPanel, at_ms: Option<i64>) -> serde_
             content.push_str(&format!("**Input**\n{}\n\n", truncate_md(&formatted, 400)));
         }
     }
-    if let Some(ref o) = tool.output {
-        let (header, lang, body) = format_tool_output(&tool.name, o);
-        // The Output marker owns its own paragraph: without the blank line any
-        // following line that Feishu reads as a block start that cannot
-        // interrupt a paragraph (a Setext underline, an indented line) makes
-        // the marker a lazy continuation — and a Setext underline even turns
-        // the whole run above it, marker included, into one heading
-        // (`## Output99- …`), glued together.
-        content.push_str("**Output**\n\n");
-        if tool.name == "todowrite" {
-            // The counts line is the panel's header, not a body intro.
-            title_counts = header;
-        } else if let Some(h) = &header {
-            content.push_str(&format!("{}\n\n", h));
-        }
-        let body = truncate_md(&body, TOOL_OUTPUT_MAX_CHARS);
-        // File content (read) and edit hunks render as a fenced code block, as
-        // does anything with long lines or a line Feishu would read as a Setext
-        // underline: Feishu markdown wraps plain text but not code blocks, and
-        // a Setext underline merges the lines above it — so both cases stay on
-        // one visual line per source line inside a fence.
-        let as_code_block = match tool.name.as_str() {
-            "read" | "edit" => true,
-            // A PARSED todo checklist is markdown by construction (status
-            // icons, strikethrough); a long task text must not fence it into
-            // literal `- ✅ …` rows. The unparsed fallback (error text, a
-            // malformed list) is raw text again and takes the generic rule.
-            "todowrite" => title_counts.is_none() && needs_code_block(&body),
-            _ => needs_code_block(&body),
-        };
-        if as_code_block {
-            content.push_str(&fenced_code(&body, lang));
+    let mut title_details: Option<String> = None;
+    if let Some((header, lang, body)) = output {
+        if todowrite_list {
+            // The header is the panel's progress line, not a body intro; the
+            // checklist is markdown by construction (status icons,
+            // strikethrough), so it must not be fenced into literal `- ✅ …`
+            // rows even when a task text is long.
+            title_details = header;
+            content.push_str(&truncate_md(&body, TOOL_OUTPUT_MAX_CHARS));
         } else {
-            content.push_str(&body);
+            // The Output marker owns its own paragraph: without the blank line any
+            // following line that Feishu reads as a block start that cannot
+            // interrupt a paragraph (a Setext underline, an indented line) makes
+            // the marker a lazy continuation — and a Setext underline even turns
+            // the whole run above it, marker included, into one heading
+            // (`## Output99- …`), glued together.
+            content.push_str("**Output**\n\n");
+            if let Some(h) = &header {
+                content.push_str(&format!("{}\n\n", h));
+            }
+            let body = truncate_md(&body, TOOL_OUTPUT_MAX_CHARS);
+            // File content (read) and edit hunks render as a fenced code block, as
+            // does anything with long lines or a line Feishu would read as a Setext
+            // underline: Feishu markdown wraps plain text but not code blocks, and
+            // a Setext underline merges the lines above it — so both cases stay on
+            // one visual line per source line inside a fence.
+            let as_code_block = match tool.name.as_str() {
+                "read" | "edit" => true,
+                _ => needs_code_block(&body),
+            };
+            if as_code_block {
+                content.push_str(&fenced_code(&body, lang));
+            } else {
+                content.push_str(&body);
+            }
         }
     }
     if content.is_empty() {
         content = "_(no details)_".to_string();
     }
-    let mut title = format!("{} {}{}", tool.status_icon(), tool.name, panel_time_suffix(at_ms));
-    if let Some(c) = &title_counts {
-        title.push_str(&format!(" · {}", c));
+    // The todo panel's prefix names the section (a plan checklist), not the
+    // call: a finished call would sit at a permanent ✅ while the counts right
+    // beside it still report open items.
+    let icon = if tool.name == "todowrite" {
+        "📋"
+    } else {
+        tool.status_icon()
+    };
+    let mut title = format!("{icon} {}{}", tool.name, panel_time_suffix(at_ms));
+    if let Some(d) = &title_details {
+        title.push_str(&format!(" · {}", d));
     }
     collapsible_panel(&title, &content)
 }
@@ -281,7 +296,9 @@ fn format_todo_list(todos: &[TodoItem]) -> String {
 /// it as a status checklist. Other tools pass through unchanged.
 ///
 /// Returns `(header, language hint, body)`: the header (the file-path line) is
-/// markdown; the body is shown as a code block so long lines don't wrap.
+/// markdown; the body is shown as a code block so long lines don't wrap. A
+/// `todowrite` header is the list's size and per-status counts — the folded
+/// panel's progress line.
 fn format_tool_output(name: &str, output: &str) -> (Option<String>, Option<&'static str>, String) {
     if name == "edit" {
         // The panel input already shows the target file, so the header is just
@@ -298,7 +315,11 @@ fn format_tool_output(name: &str, output: &str) -> (Option<String>, Option<&'sta
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(output)
             && let Some(todos) = parse_todos(&value)
         {
-            return (Some(todo_counts(&todos)), None, format_todo_list(&todos));
+            return (
+                Some(format!("共 {} 项 · {}", todos.len(), todo_counts(&todos))),
+                None,
+                format_todo_list(&todos),
+            );
         }
     }
     if name != "read" || !output.contains("<path>") {
@@ -789,8 +810,8 @@ Index: /a/lua.lua
     }
 
     /// A `todowrite` call renders as a status checklist, not raw JSON: the
-    /// input reports the plan size, the output is the iconed list with a count
-    /// header, and the payload's priority (noise) never leaks.
+    /// folded header carries the plan size plus the status counts, the body is
+    /// the iconed list alone, and the payload's priority (noise) never leaks.
     #[test]
     fn todowrite_panel_renders_a_checklist_not_raw_json() {
         let todos = json!([
@@ -818,14 +839,16 @@ Index: /a/lua.lua
             .as_str()
             .expect("panel title");
         assert_eq!(
-            title, "✅ todowrite · 🔄 1 · ⬜ 1 · ✅ 1 · 🚫 1",
-            "the folded header must carry the status counts"
+            title, "📋 todowrite · 共 4 项 · 🔄 1 · ⬜ 1 · ✅ 1 · 🚫 1",
+            "the folded header must carry the size and status counts"
         );
-        assert!(md.contains("**Input**\n📋 共 4 项任务"), "plan size: {md}");
         assert!(
-            md.contains("**Output**\n\n- ✅ ~~调研~~"),
-            "the checklist follows the marker: {md}"
+            md.starts_with("- ✅ ~~调研~~"),
+            "the checklist is the whole body: {md}"
         );
+        assert!(!md.contains("**Input**"), "no Input placeholder: {md}");
+        assert!(!md.contains("**Output**"), "no Output marker: {md}");
+        assert!(!md.contains("共 4 项"), "the size lives in the header: {md}");
         assert!(md.contains("- ✅ ~~调研~~"), "completed struck: {md}");
         assert!(md.contains("- 🔄 **实现渲染**"), "in-progress bolded: {md}");
         assert!(md.contains("- ⬜ 补测试"), "pending plain: {md}");
@@ -833,6 +856,34 @@ Index: /a/lua.lua
         assert!(!md.contains('"'), "raw JSON leaked: {md}");
         assert!(!md.contains("priority"), "raw priority leaked: {md}");
         assert!(!md.contains("```"), "checklist must stay markdown: {md}");
+    }
+
+    /// A still-running `todowrite` has no output to parse: the panel falls back
+    /// to the generic Input rendering, where `📋 共 N 项任务` is the only content
+    /// the call can show yet (and the header carries no counts).
+    #[test]
+    fn running_todowrite_panel_shows_the_plan_size_in_its_body() {
+        let tool = ToolPanel {
+            name: "todowrite".into(),
+            status: "running".into(),
+            input: Some(json!({ "todos": [
+                {"content": "第一步", "status": "in_progress"},
+                {"content": "第二步", "status": "pending"},
+            ] })),
+            output: None,
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Streaming)
+            .with_tool(tool)
+            .build();
+        let md = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .expect("panel markdown content");
+        let title = card["body"]["elements"][0]["header"]["title"]["content"]
+            .as_str()
+            .expect("panel title");
+        assert_eq!(title, "📋 todowrite", "no counts before the list exists");
+        assert!(md.contains("**Input**\n📋 共 2 项任务"), "plan size: {md}");
     }
 
     /// A todo item long enough to trip the generic long-line rule must stay a
