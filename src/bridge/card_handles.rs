@@ -228,7 +228,7 @@ impl CardHandles {
         kind: ClaimKind,
         pending: &HashSet<String>,
         failed_dirs: &HashSet<String>,
-        claimed: &HashSet<String>,
+        cola_claimed: &HashSet<String>,
         flush_owned: &HashMap<String, String>,
         line: impl Fn(&str) -> String,
     ) -> Vec<(String, serde_json::Value)> {
@@ -238,7 +238,7 @@ impl CardHandles {
             .filter(|(id, h)| {
                 h.kind == kind
                     && !pending.contains(*id)
-                    && !claimed.contains(*id)
+                    && !cola_claimed.contains(*id)
                     && !failed_dirs.contains(&h.directory)
                     && flush_owned.get(*id) != Some(&h.message_id)
             })
@@ -498,7 +498,7 @@ mod tests {
 
         let pending: HashSet<String> = ["p_pending".to_string()].into();
         let failed_dirs: HashSet<String> = ["/failed".to_string()].into();
-        let claimed: HashSet<String> = ["p_claimed".to_string()].into();
+        let cola_claimed: HashSet<String> = ["p_claimed".to_string()].into();
         let flush_owned: HashMap<String, String> = [
             ("p_owned".to_string(), "om_other".to_string()),
             ("p_stale".to_string(), "om_other".to_string()),
@@ -508,7 +508,7 @@ mod tests {
             ClaimKind::Permission,
             &pending,
             &failed_dirs,
-            &claimed,
+            &cola_claimed,
             &flush_owned,
             |t| format!("⏱ {t}"),
         );

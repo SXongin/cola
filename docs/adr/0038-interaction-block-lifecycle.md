@@ -94,11 +94,17 @@ pollers, and click acks. Two interleavings were observed live:
 `resolve_blocks` hold the session's card-write lock
 (`SharedCore::card_write_lock`) across their whole sequence, so a resolution can
 never be overwritten by a stale flush and a split advances its card id before
-another flush reads it. The sweep's vanished passes stay lock-free; instead they
-skip every request cola itself is answering or has answered
-(`answered_requests` ∪ `settling_requests` — the latter claimed before an
-auto-accept approval's reply lands, released when `resolve_blocks` settles),
-because the neutral `⏱` receipt is only true when another client did the
-resolving. The auto-accept toggle card now settles its approved blocks with the
-mode receipt exactly as the command and the permission card's own button do,
-instead of leaving them to the sweep.
+another flush reads it. The lock deliberately covers exactly these two writers:
+they are the ones that can name the same message (the flush's PATCH and a
+resolution's ack/cache edit). The sweep's and re-host's own patches target
+standalone or superseded cards that no flush PATCHes; where a racing flush does
+revive a block the sweep already resolved, the next sweep re-resolves it into
+the same neutral line, so those paths stay lock-free rather than serializing the
+poll loop behind a click. The sweep's vanished passes instead skip every request
+cola itself is answering or has answered (`answered_requests` ∪
+`settling_requests` — the latter claimed before an auto-accept approval's reply
+lands and released when `resolve_blocks` settles; a claim left behind by a
+cancelled settlement expires after a short TTL), because the neutral `⏱` receipt
+is only true when another client did the resolving. The auto-accept toggle card
+now settles its approved blocks with the mode receipt exactly as the command and
+the permission card's own button do, instead of leaving them to the sweep.

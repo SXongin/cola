@@ -925,7 +925,7 @@ async fn autoaccept_approval_claims_the_requests_it_answers() {
     assert_eq!(approved, vec!["per_1".to_string()]);
     assert!(backend.replied_permissions.lock().await.contains("per_1"));
     assert!(
-        app.core.settling_requests.lock().await.contains("per_1"),
+        app.core.settling_requests.lock().await.contains_key("per_1"),
         "the approval must take the claim its settlement owns"
     );
 }
