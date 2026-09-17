@@ -109,9 +109,10 @@ cola autostart status   # confirm it is registered
 - **macOS**: a LaunchAgent.
 - **Windows**: an `HKCU\...\Run` registry value.
 
-`cola autostart disable` removes the registration. Enable it **after**
-installing both cola and `opencode` — the launcher snapshots the binary path
-and your `PATH`, so re-run `enable` if you ever move either.
+`cola autostart disable` stops the running instance and removes the
+registration; `cola stop` stops it but keeps the registration. Enable it
+**after** installing both cola and `opencode` — the registration snapshots
+the binary path and your `PATH`, so re-run `enable` if you ever move either.
 
 To run in the foreground instead, just `cola` (Ctrl-C stops it). To detach it
 from the terminal: `nohup cola >/dev/null 2>&1 &` on Linux/macOS, or

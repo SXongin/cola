@@ -208,6 +208,14 @@ _Avoid_: pid file, lock file
 A cola instance that can still process events: running with its identity still readable. A process whose memory map the kernel has already torn down (mid-`exit()`) is NOT Functionally Alive even though the OS reports a live status — a `/restart` replacement reclaims its lock instead of waiting for it.
 _Avoid_: alive, running, process alive (all ambiguous — they include the mid-`exit()` state)
 
+**Autostart** (自动启动):
+cola's boot/login registration — the OS artifact that starts the cola binary at boot (a systemd user unit, a LaunchAgent, or an `HKCU\...\Run` value), managed by `cola autostart enable|disable|status`. `disable` unregisters and stops a running instance; `cola stop` stops without unregistering.
+_Avoid_: service, launcher (both ambiguous between the registration and the facility)
+
+**Supervisor**:
+The OS facility that honours cola's **Autostart** registration and can also stop or restart the instance — a systemd user unit or a launchd agent. cola stops a supervised instance through it (a LaunchAgent with `KeepAlive` would respawn a directly-killed process); Windows' `Run` key only launches, so stop falls back to terminating the lock-holding PID.
+_Avoid_: launcher, systemd/launchd (platform names for one platform's Supervisor)
+
 **Command**:
 A slash-prefixed instruction (e.g. `/new`, `/dir`, `/switch`, `/compact`). Every command supports two forms: a text-direct form (an argument that completes the action in one step) and a card form (no argument pops a card — an **Interactive Card** for strong-interaction commands like `/switch`, `/dir`, `/model`, `/agent`, `/autoaccept`, or a **Reference Card** for `/help`). cola parses its own commands locally and forwards unrecognized ones to the Backend as prompt text.
 _Avoid_: Slash command, action, operation
