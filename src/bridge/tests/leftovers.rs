@@ -39,7 +39,7 @@ async fn wait_for_turn_card(app: &Arc<App>, session_id: &str) {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    panic!("session {session_id} never got a turn card");
+    panic!("the turn's card never appeared");
 }
 
 /// One turn whose prompt is held at the backend's gate until the test releases
