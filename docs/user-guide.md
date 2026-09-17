@@ -267,10 +267,12 @@ itself (Lazy Start handles the OpenCode server), so no flags are needed:
   started is left running: it is a shared-store endpoint other clients may
   still use.
 
-`cola autostart disable` does both — it stops the running instance, then
-removes the registration (a failed stop still unregisters, with a non-zero
-exit). `cola stop` leaves the registration alone, so the next boot starts cola
-again.
+`cola autostart disable` does both — it stops the instance, then removes the
+registration (a failed stop still unregisters, with a non-zero exit). It also
+stops a supervised instance that is still starting up (or crash-looping) and
+has not taken the singleton lock yet: the registration, not the lock, tells
+`disable` what to stop. `cola stop` leaves the registration alone, so the next
+boot starts cola again.
 
 ## Logs
 

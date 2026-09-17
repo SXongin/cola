@@ -209,7 +209,7 @@ A cola instance that can still process events: running with its identity still r
 _Avoid_: alive, running, process alive (all ambiguous — they include the mid-`exit()` state)
 
 **Autostart** (自动启动):
-cola's boot/login registration — the OS artifact that starts the cola binary at boot (a systemd user unit, a LaunchAgent, or an `HKCU\...\Run` value), managed by `cola autostart enable|disable|status`. `disable` unregisters and stops a running instance; `cola stop` stops without unregistering.
+cola's boot/login registration — the OS artifact that starts the cola binary at boot (a systemd user unit, a LaunchAgent, or an `HKCU\...\Run` value), managed by `cola autostart enable|disable|status`. `disable` unregisters and stops the instance, including a supervised one that never took the **Singleton Lock** (still starting up, or crash-looping); `cola stop` stops the lock holder without unregistering.
 _Avoid_: service, launcher (both ambiguous between the registration and the facility)
 
 **Supervisor**:

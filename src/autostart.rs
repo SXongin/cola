@@ -1,6 +1,8 @@
 //! Boot-time autostart registration: `cola autostart enable|disable|status`.
-//! `disable` also stops the running instance first (ADR-0039), through
-//! [`supervisor_stop_command`] when an Autostart registration is installed.
+//! `disable` also stops the instance first (ADR-0039), through
+//! [`supervisor_stop_command`] when an Autostart registration is installed —
+//! including a supervised instance that never took the Singleton Lock (still
+//! starting up, or crash-looping; see [`supervisor_is_active`]).
 //!
 //! cola is a long-lived daemon; `autostart` registers the OS launcher that
 //! starts it at boot/login. The launcher runs the `cola` binary itself (Lazy
@@ -81,6 +83,27 @@ pub(crate) fn supervisor_stop_command() -> Option<String> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         None
+    }
+}
+
+/// Whether the registered supervisor currently runs the unit — active,
+/// activating, or reloading. `autostart disable` uses this to stop an instance
+/// that never took the Singleton Lock: still starting up (the lock comes after
+/// config/log setup) or crash-looping, which the lock-holder definition of
+/// "running" misses. Always `false` when no supervisor exists for this
+/// platform (ADR-0039 update).
+pub(crate) fn supervisor_is_active() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::supervisor_is_active()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::supervisor_is_active()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        false
     }
 }
 
@@ -256,6 +279,27 @@ mod linux {
             .then(|| format!("systemctl --user stop {UNIT_NAME}"))
     }
 
+    /// Whether systemd has the unit active or activating. The printed state is
+    /// authoritative — `is-active`'s exit status for an activating unit is not
+    /// stable across versions — and a query that cannot run (no systemd user
+    /// session) reads as not active.
+    pub(super) fn supervisor_is_active() -> bool {
+        let out = std::process::Command::new("systemctl")
+            .args(["--user", "is-active", UNIT_NAME])
+            .output();
+        match out {
+            Ok(o) => parse_is_active(&o.stdout),
+            Err(_) => false,
+        }
+    }
+
+    fn parse_is_active(stdout: &[u8]) -> bool {
+        matches!(
+            String::from_utf8_lossy(stdout).trim(),
+            "active" | "activating" | "reloading"
+        )
+    }
+
     /// Parse the executable from a systemd unit's `ExecStart=` line. The
     /// generated unit quotes paths with spaces (`systemd_quote`); an unquoted
     /// value may carry arguments, so only the first word is taken.
@@ -319,6 +363,19 @@ mod linux {
         #[test]
         fn parse_exec_start_missing_line_is_none() {
             assert_eq!(parse_exec_start("[Unit]\nDescription=no exec\n"), None);
+        }
+
+        #[test]
+        fn parse_is_active_accepts_running_states_only() {
+            assert!(parse_is_active(b"active\n"));
+            assert!(parse_is_active(b"activating\n"));
+            assert!(parse_is_active(b"reloading\n"));
+            assert!(!parse_is_active(b"inactive\n"));
+            assert!(!parse_is_active(b"failed\n"));
+            assert!(!parse_is_active(b""));
+            assert!(!parse_is_active(
+                b"Failed to connect to user scope bus via local transport\n"
+            ));
         }
     }
 }
@@ -405,10 +462,11 @@ mod macos {
 
     pub(super) fn disable() -> anyhow::Result<()> {
         // No bootout here: stopping is the caller's job — `disable` already ran
-        // `supervisor_stop_command` (bootout) when an instance was stopped, and
+        // `supervisor_stop_command` (bootout) whenever it was warranted (a
+        // lock-holder stop, or an active unit with no holder; ADR-0039), and
         // booting out here would kill an instance the user just declined to
-        // stop (ADR-0039). Removing the plist unregisters; in the declined (or
-        // crash-loop) case a still-loaded agent goes away at logout.
+        // stop. Removing the plist unregisters; in the declined case a
+        // still-loaded agent goes away at logout.
         let path = plist_path();
         let _ = std::fs::remove_file(&path);
         if !path.exists() {
@@ -426,14 +484,10 @@ mod macos {
             return Ok(());
         }
         println!("cola autostart: installed at {}", path.display());
-        let target = format!("gui/{}/{}", uid(), LABEL);
-        let out = std::process::Command::new("launchctl")
-            .arg("print")
-            .arg(&target)
-            .output();
-        match out {
-            Ok(o) if o.status.success() => println!("  launchd: loaded"),
-            _ => println!("  launchd: not loaded — run `cola autostart enable`"),
+        if supervisor_is_active() {
+            println!("  launchd: loaded");
+        } else {
+            println!("  launchd: not loaded — run `cola autostart enable`");
         }
         Ok(())
     }
@@ -453,6 +507,17 @@ mod macos {
         plist_path()
             .exists()
             .then(|| format!("launchctl bootout gui/{}/{}", uid(), LABEL))
+    }
+
+    /// Whether launchd has the agent loaded — `launchctl print` succeeding is
+    /// the same check `status` reports as "loaded".
+    pub(super) fn supervisor_is_active() -> bool {
+        let target = format!("gui/{}/{}", uid(), LABEL);
+        std::process::Command::new("launchctl")
+            .arg("print")
+            .arg(&target)
+            .output()
+            .is_ok_and(|o| o.status.success())
     }
 
     /// Parse the first `ProgramArguments` string (the executable) from the
@@ -575,7 +640,13 @@ fn enable() -> anyhow::Result<()> {
 /// a failed stop still unregisters — removing the registration is the
 /// command's primary act — but surfaces as a non-zero exit so scripts see the
 /// instance is still up.
+///
+/// The stop has two halves: the lock-holder stop (with its confirmation), and
+/// — for an instance too young to hold the lock, or crash-looping — a direct
+/// supervisor stop (ADR-0039 update). A live holder goes through the first
+/// half only: it already runs the supervisor itself.
 fn disable(assume_yes: bool) -> anyhow::Result<()> {
+    let supervised = crate::stop_supervised_without_holder();
     let stopped = crate::stop_running_cola(assume_yes);
     platform::disable()?;
     match stopped {
@@ -588,6 +659,11 @@ fn disable(assume_yes: bool) -> anyhow::Result<()> {
         }
         Ok(crate::StopOutcome::NotRunning) => {}
         Err(e) => anyhow::bail!("自启动已注销，但停止运行中的 cola 失败：{e}"),
+    }
+    match supervised {
+        Ok(true) => println!("已停止 supervisor 启动的 cola 实例。"),
+        Ok(false) => {}
+        Err(e) => anyhow::bail!("自启动已注销，但停止 supervisor 启动的 cola 失败：{e}"),
     }
     Ok(())
 }

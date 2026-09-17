@@ -470,6 +470,42 @@ pub(crate) fn stop_running_cola(assume_yes: bool) -> anyhow::Result<StopOutcome>
     stop_running_cola_at(&lock, confirm, autostart::supervisor_stop_command().as_deref())
 }
 
+/// The stop half of `autostart disable` that [`stop_running_cola`] cannot
+/// reach: a registered unit may be activating — the Singleton Lock is taken
+/// only after config/log setup — or crash-looping, so no lock holder exists
+/// and [`stop_running_cola`] reports 未运行 without ever consulting the
+/// Supervisor. `cola stop` stays scoped to the lock holder (ADR-0039).
+/// Returns whether an active unit was asked to stop.
+pub(crate) fn stop_supervised_without_holder() -> anyhow::Result<bool> {
+    let Some(cmd) = autostart::supervisor_stop_command() else {
+        return Ok(false); // no registration: nothing to stop outside the lock
+    };
+    stop_supervised_without_holder_at(&lock_file_path(), Some(&cmd), autostart::supervisor_is_active())
+}
+
+/// [`stop_supervised_without_holder`] with the lock path, supervisor command,
+/// and unit state injected for tests. `supervisor = None` means no
+/// registration; `active = false` means an inactive unit (no stop to run).
+fn stop_supervised_without_holder_at(
+    lock_path: &std::path::Path,
+    supervisor: Option<&str>,
+    active: bool,
+) -> anyhow::Result<bool> {
+    if running_daemon_pid_at(lock_path).is_some() {
+        // A live holder belongs to `stop_running_cola_at`, which already runs
+        // the Supervisor (and honors a decline) — don't stop it twice.
+        return Ok(false);
+    }
+    let Some(cmd) = supervisor else {
+        return Ok(false);
+    };
+    if !active {
+        return Ok(false);
+    }
+    run_supervisor_command(cmd)?;
+    Ok(true)
+}
+
 /// `cola stop`: report the outcome and exit. Exit status stays 0 for a plain
 /// no-op and for a decline — only a failing stop is an error.
 fn stop_cli(assume_yes: bool) -> anyhow::Result<()> {
@@ -1010,9 +1046,10 @@ mod tests {
 
     #[test]
     fn stop_without_a_live_holder_does_not_touch_the_supervisor() {
-        // Scope boundary (ADR-0039): "running" is the live lock holder. A
-        // supervised crash loop that never holds the lock is out of scope; the
-        // stop must not shell out to the supervisor on a bare no-op.
+        // Scope boundary (ADR-0039) for `cola stop`: "running" is the live lock
+        // holder, so a bare no-op (or a supervised crash loop) must not shell
+        // out to the supervisor. `autostart disable` widens this deliberately —
+        // see the `stop_supervised_without_holder_at` tests below.
         let home = tempfile::tempdir().unwrap();
         let lock = home.path().join("cola.lock");
         let marker = home.path().join("supervisor-ran");
@@ -1022,6 +1059,65 @@ mod tests {
             StopOutcome::NotRunning
         );
         assert!(!marker.exists(), "no live holder means no supervisor call");
+    }
+
+    #[test]
+    fn disable_stop_reaches_an_active_supervisor_without_a_holder() {
+        // The startup/crash-loop window: a unit can be activating before it
+        // ever writes the lock, so the holder gate must not suppress the stop.
+        let home = tempfile::tempdir().unwrap();
+        let lock = home.path().join("cola.lock");
+        let marker = home.path().join("supervisor-ran");
+        let supervisor = format!("touch {}", marker.display());
+        assert!(stop_supervised_without_holder_at(&lock, Some(&supervisor), true).unwrap());
+        assert!(
+            marker.exists(),
+            "an active unit must be stopped through the supervisor"
+        );
+    }
+
+    #[test]
+    fn disable_stop_skips_an_inactive_supervisor() {
+        let home = tempfile::tempdir().unwrap();
+        let lock = home.path().join("cola.lock");
+        let marker = home.path().join("supervisor-ran");
+        let supervisor = format!("touch {}", marker.display());
+        assert!(!stop_supervised_without_holder_at(&lock, Some(&supervisor), false).unwrap());
+        assert!(!marker.exists(), "an inactive unit needs no supervisor call");
+    }
+
+    #[test]
+    fn disable_stop_without_a_registration_is_a_no_op() {
+        let home = tempfile::tempdir().unwrap();
+        let lock = home.path().join("cola.lock");
+        assert!(!stop_supervised_without_holder_at(&lock, None, true).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disable_stop_leaves_a_live_holder_to_the_lock_path() {
+        let home = tempfile::tempdir().unwrap();
+        let lock = home.path().join("cola.lock");
+        let mut child = spawn_fake_cola(&lock);
+        let marker = home.path().join("supervisor-ran");
+        let supervisor = format!("touch {}", marker.display());
+        assert!(!stop_supervised_without_holder_at(&lock, Some(&supervisor), true).unwrap());
+        assert!(
+            !marker.exists(),
+            "the holder path owns the supervisor stop, so it must not run here"
+        );
+        assert!(pid_alive(child.id() as i32));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn disable_stop_surfaces_a_failing_supervisor_command() {
+        // disable unregisters anyway (the caller's primary act) and reports the
+        // failure with a non-zero exit; here the error must reach the caller.
+        let home = tempfile::tempdir().unwrap();
+        let lock = home.path().join("cola.lock");
+        assert!(stop_supervised_without_holder_at(&lock, Some("false"), true).is_err());
     }
 
     #[cfg(unix)]
