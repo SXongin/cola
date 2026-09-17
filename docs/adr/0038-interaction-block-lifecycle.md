@@ -15,7 +15,7 @@ A pending Permission/Question is rendered inline on the card the operator is alr
 
 ## Decision
 
-**Interaction blocks stay inline and follow the live card.** Six rules:
+**Interaction blocks stay inline and follow the live card.** Seven rules:
 
 1. **Follow the live card.** A split keeps the tail (and with it the block) on the newest card, as today. When a new turn replaces the accumulator, the sweep re-hosts every still-pending block of that session onto the new card and repaints the old card without it. A block never lives on a card that is not the session's current card for longer than the re-host/repaint takes.
 
@@ -28,6 +28,8 @@ A pending Permission/Question is rendered inline on the card the operator is alr
 5. **Remote resolution repaints within one sweep (≤3 s), after the turn as well.** The sweep repaints the block's card from the cache instead of only stripping memory. Clicks stay instant (rule 3).
 
 6. **Standalone cards and snapshot claims keep their lifecycles.** Where no accumulator exists (restarts, external turns, pre-existing adopt-time pendings) the standalone card path with `sent_cards`/stale marking stays as it is — a resolved standalone card keeps its existing result-card rendering. A Session Snapshot's claimed blocks ARE Interaction Blocks and adopt Interaction Receipts; the claim registry itself is unchanged.
+
+7. **An unfinished cola turn rejects what it left pending (#187).** When a cola turn ends without completing — `/stop`, an interrupt, a prompt error — the tool fibers behind its still-pending Permission/Question requests are dead, so answering them reaches nobody. The turn rejects every such request of its session or a sub-task descendant at the source and settles its block into a `🚫 已拒绝` receipt (not the neutral `⏱ 已由其他客户端处理` line: cola itself decided). This removes the ghost-block case at its source; a request that is genuinely still live when a card stops being current (external turns, a turn replaced mid-flight) remains rule 1's re-host.
 
 ## Why
 
