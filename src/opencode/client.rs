@@ -74,6 +74,13 @@ fn build_http_client_with(
     builder.build().expect("failed to build reqwest client")
 }
 
+/// Total timeout for the request-reply endpoints (permission/question). They
+/// resolve an already-pending request and answer in milliseconds when healthy,
+/// so a hung server must not hold the card-callback handler past Feishu's 3 s
+/// ack budget. Prompt POSTs deliberately keep the client's no-total-timeout
+/// policy: real turns run for minutes.
+const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// Apply the shared policy for a request-reply endpoint's response: a 404
 /// means the request was already resolved elsewhere — benign and expected (a
 /// double-click, another client, or a click replayed after a cola restart) —
@@ -445,7 +452,13 @@ impl Client {
         if let Some(d) = directory {
             url.query_pairs_mut().append_pair("directory", d);
         }
-        let resp = self.http().post(url).json(&body).send().await?;
+        let resp = self
+            .http()
+            .post(url)
+            .json(&body)
+            .timeout(REPLY_TIMEOUT)
+            .send()
+            .await?;
         check_reply_status(resp, "permission", request_id)?;
         Ok(())
     }
@@ -613,7 +626,13 @@ impl Client {
         if let Some(d) = directory {
             url.query_pairs_mut().append_pair("directory", d);
         }
-        let resp = self.http().post(url).json(&body).send().await?;
+        let resp = self
+            .http()
+            .post(url)
+            .json(&body)
+            .timeout(REPLY_TIMEOUT)
+            .send()
+            .await?;
         check_reply_status(resp, "question", request_id)?;
         Ok(())
     }
@@ -664,7 +683,7 @@ impl Client {
         if let Some(d) = directory {
             url.query_pairs_mut().append_pair("directory", d);
         }
-        let resp = self.http().post(url).send().await?;
+        let resp = self.http().post(url).timeout(REPLY_TIMEOUT).send().await?;
         check_reply_status(resp, "question", request_id)?;
         Ok(())
     }
@@ -1511,6 +1530,37 @@ mod wire_tests {
 
         let message = not_found_error(client.reply_question("q_gone", &[], None).await.unwrap_err());
         assert!(message.contains("question q_gone"), "unexpected: {message}");
+    }
+
+    /// A hung request-reply endpoint must not hold its caller (a card click's
+    /// handler) forever: the call gives up on its own and the bridge renders a
+    /// retryable failure. Prompt POSTs deliberately keep running for minutes —
+    /// only these reply endpoints are bounded.
+    #[tokio::test(start_paused = true)]
+    async fn reply_endpoints_give_up_on_a_hung_server() {
+        let server = TestHttpServer::start().await;
+        let hang = std::time::Duration::from_secs(60);
+        server.route_delayed("POST", "/question/q_1/reply", 200, r#"{"code":0}"#, hang);
+        server.route_delayed("POST", "/question/q_1/reject", 200, r#"{"code":0}"#, hang);
+        server.route_delayed("POST", "/permission/p_1/reply", 200, r#"{"code":0}"#, hang);
+        let client = wire_client(&server, None);
+
+        for (label, err) in [
+            (
+                "reply",
+                client.reply_question("q_1", &[], None).await.unwrap_err(),
+            ),
+            ("reject", client.reject_question("q_1", None).await.unwrap_err()),
+            (
+                "permission",
+                client.reply_permission("p_1", "once", None).await.unwrap_err(),
+            ),
+        ] {
+            assert!(
+                matches!(err, BridgeError::Http(ref e) if e.is_timeout()),
+                "{label} did not time out: {err:?}"
+            );
+        }
     }
 
     #[tokio::test]

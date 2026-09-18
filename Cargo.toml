@@ -61,6 +61,11 @@ semver = "1"
 sha2 = "0.11"
 tempfile = "3"
 
+[dev-dependencies]
+# `start_paused` for timeout tests without wall-clock waits (`full` does not
+# include `test-util`).
+tokio = { version = "1", features = ["test-util"] }
+
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 flate2 = "1"
 tar = "0.4"
