@@ -121,7 +121,13 @@ Put the decision to the user when:
 
 ## Recovery
 
-Re-run `/foreman <spec>` after an interruption: if the branch exists, switch to it instead of recreating it. A ticket with a progress comment is done; a ticket with `Refs: #<n>` commits but no comment gets its window reviewed, then its comment. Everything else comes from the branch log and the comments — no hidden state.
+Re-run `/foreman <spec>` after an interruption. The branch log and the progress comments are the batch's state; the session's captured `PRE` and implementer `task_id`s do not survive it, so rebuild them:
+
+- **Branch**: if `<branch>` exists, verify it is this spec's — its commits carry `Refs:` trailers for the spec's tickets — and that it still holds commits `main` does not; then switch to it. A branch that fails either check stops and asks instead of being adopted.
+- **Windows**: a ticket's window is the run of commits carrying its `Refs: #<n>` trailer, with `PRE` at the commit before the run. Rebuild both from the log.
+- **Tickets**: one with a progress comment is done. One with commits but no comment gets its window reviewed, then its comment. One with neither is re-dispatched.
+- **Interrupted fix round**: the `task_id` is gone; re-review the window (the findings resurface), then dispatch a fresh implementer with them.
+- **Dirty tree**: never start a ticket on one. Inspect `git status` and the diff: work belonging to a ticket goes to a fresh implementer to finish and commit; anything else stops and asks.
 
 ## Setup
 
