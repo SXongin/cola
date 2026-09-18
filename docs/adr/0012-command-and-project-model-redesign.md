@@ -19,12 +19,14 @@ backend).
 > **Amended by ADR-0041**: the conversation's current project is the Pending
 > Session's directory when one exists, otherwise the active session's
 > (pending-first); `/new` records a Pending Session instead of creating and
-> activating a session at command time.
+> activating a session at command time; the session file's structure changed
+> to `{"entries":[…],"pending":[…]}` (legacy bare arrays still load).
 
 Consequences: config simplifies (`url` optional, `username`/`password` deleted,
 `work_dir` = default project), the log rotates daily (`cola-YYYY-MM-DD.log`,
 keep N days) with cross-day sessions queried by `grep session_id=... cola-*.log`,
-and the session file's structure is unchanged — only its semantics shift. Cards
+and the session file's semantics shift (ADR-0041 later adds the `pending` list
+to its structure — see the amendment above). Cards
 are only used where interaction is strong (`/switch`, `/model`, `/agent`,
 `/autoaccept`) or where a reference is useful (`/help` — a buttonless command
 manual, detail stays text via `/help <command>`, and a failed card falls back to

@@ -68,6 +68,15 @@ Every session-selection command today creates a real backend Session immediately
 - `/new` followed by the first prompt still issues create-then-prompt; the total work is unchanged from today's first message, but both calls now land at prompt time — with Lazy Start, that prompt may also wait for the server spawn (see #99).
 - Whether `/switch list` should show the pending as a row is a presentation question, not required for correctness.
 
+## Compatibility
+
+Forward compatibility is guaranteed: the dual loader (see the Decision) still
+accepts the legacy bare array, and an unreadable file warns and starts empty.
+Backward is not: an older binary parses the new object with its old bare-array
+loader, the parse fails, and its thread→session mapping comes up empty. The
+release that ships this format change must carry a note about it in its
+release notes.
+
 ## Domain note
 
 Glossary: **Pending Session** and **Lazy Session Creation** (the session-side counterpart of **Lazy Start**); **Active Session** is now at-most-one and absent while a Pending Session exists, and the **Project** derivation checks the Pending Session first. The UI avoids the noun 会话 for the pending state and uses verb phrases (「下一条消息创建」).
