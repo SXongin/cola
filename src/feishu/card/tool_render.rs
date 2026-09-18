@@ -423,23 +423,37 @@ fn format_tool_output(name: &str, output: &str) -> (Option<String>, BodyStyle, S
     )
 }
 
+/// The raw lines inside an XML-envelope output — the shape `task` and `skill`
+/// produce: verifies the first line opens the envelope (`<tag …>`) and yields
+/// every following line up to the matching close tag. `None` when the first
+/// line doesn't open it, so the caller shows the output unchanged.
+fn envelope_lines<'a>(
+    output: &'a str,
+    open_prefix: &str,
+    close_tag: &str,
+) -> Option<impl Iterator<Item = &'a str>> {
+    let first = output.lines().next()?;
+    if !first.starts_with(open_prefix) || !first.ends_with('>') {
+        return None;
+    }
+    Some(
+        output
+            .lines()
+            .skip(1)
+            .take_while(move |line| line.trim() != close_tag),
+    )
+}
+
 /// Strip a `task` tool's XML envelope: `<task id state>` around an optional
 /// `<summary>` and the `<task_result>`/`<task_error>` body. Returns
 /// `(summary as header, body text)`; `None` when the shape doesn't match (an
 /// error text, a legacy payload), so the caller shows the output unchanged.
 fn parse_task_envelope(output: &str) -> Option<(Option<String>, String)> {
-    let first = output.lines().next()?;
-    if !first.starts_with("<task ") || !first.ends_with('>') {
-        return None;
-    }
     let mut summary = None;
     let mut body = String::new();
     let mut in_body = false;
-    for line in output.lines().skip(1) {
+    for line in envelope_lines(output, "<task ", "</task>")? {
         let t = line.trim();
-        if t == "</task>" {
-            break;
-        }
         if t.starts_with("<summary>") && t.ends_with("</summary>") {
             summary = Some(
                 t.trim_start_matches("<summary>")
@@ -455,11 +469,9 @@ fn parse_task_envelope(output: &str) -> Option<(Option<String>, String)> {
             body.push('\n');
         }
     }
-    let body = body.trim_end().to_string();
-    if body.is_empty() && summary.is_none() {
-        return None;
-    }
-    Some((summary, body))
+    // The envelope stays stripped even when it carried no text: an empty
+    // output is better than the raw XML back on the card.
+    Some((summary, body.trim_end().to_string()))
 }
 
 /// Strip a `skill` tool's XML envelope: `<skill_content name=…>` around the
@@ -467,17 +479,10 @@ fn parse_task_envelope(output: &str) -> Option<(Option<String>, String)> {
 /// file list the reader can't use). `None` when the wrapper isn't there, so the
 /// caller shows the output unchanged.
 fn parse_skill_envelope(output: &str) -> Option<String> {
-    let first = output.lines().next()?;
-    if !first.starts_with("<skill_content ") || !first.ends_with('>') {
-        return None;
-    }
     let mut body = String::new();
     let mut in_files = false;
-    for line in output.lines().skip(1) {
+    for line in envelope_lines(output, "<skill_content ", "</skill_content>")? {
         let t = line.trim();
-        if t == "</skill_content>" {
-            break;
-        }
         if t == "<skill_files>" {
             in_files = true;
         } else if t == "</skill_files>" {
@@ -487,8 +492,7 @@ fn parse_skill_envelope(output: &str) -> Option<String> {
             body.push('\n');
         }
     }
-    let body = body.trim_end().to_string();
-    (!body.is_empty()).then_some(body)
+    Some(body.trim_end().to_string())
 }
 
 /// Parse a `websearch` tool's JSON result envelope into an un-fenced markdown
@@ -498,34 +502,83 @@ fn parse_skill_envelope(output: &str) -> Option<String> {
 /// provider's no-results text, a different provider's shape), so the caller
 /// shows it unchanged.
 fn parse_websearch_results(output: &str) -> Option<(usize, String)> {
+    let results = parse_parallel_results(output).or_else(|| parse_exa_results(output))?;
+    let lines = results
+        .iter()
+        .enumerate()
+        .map(|(i, (title, url, date))| {
+            let title = first_chunk(title, 100);
+            let mut line = match (title.is_empty(), url.is_empty()) {
+                (false, false) => format!("{}. [{}]({})", i + 1, title, url),
+                (false, true) => format!("{}. {}", i + 1, title),
+                _ => format!("{}. {}", i + 1, url),
+            };
+            if let Some(date) = date.as_deref().filter(|d| !d.is_empty()) {
+                line.push_str(&format!(" · {}", date));
+            }
+            line
+        })
+        .collect::<Vec<_>>();
+    Some((results.len(), lines.join("\n")))
+}
+
+/// `(title, url, publish date)` of one websearch result, shared by both
+/// provider parsers.
+type SearchEntry = (String, String, Option<String>);
+
+/// The `parallel` provider's JSON envelope:
+/// `{search_id, results: [{url, title, publish_date, excerpts}]}`.
+fn parse_parallel_results(output: &str) -> Option<Vec<SearchEntry>> {
     let value: serde_json::Value = serde_json::from_str(output).ok()?;
     let results = value.get("results")?.as_array()?;
     if results.is_empty() {
         return None;
     }
-    let mut lines = Vec::with_capacity(results.len());
-    for (i, r) in results.iter().enumerate() {
-        let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
-        let title = r
-            .get("title")
-            .and_then(|v| v.as_str())
-            .map(|t| first_chunk(t, 100))
-            .unwrap_or_default();
-        let mut line = match (title.is_empty(), url.is_empty()) {
-            (false, false) => format!("{}. [{}]({})", i + 1, title, url),
-            (false, true) => format!("{}. {}", i + 1, title),
-            _ => format!("{}. {}", i + 1, url),
-        };
-        if let Some(date) = r
-            .get("publish_date")
-            .and_then(|v| v.as_str())
-            .filter(|d| !d.is_empty())
-        {
-            line.push_str(&format!(" · {}", date));
-        }
-        lines.push(line);
+    Some(
+        results
+            .iter()
+            .map(|r| {
+                let get = |k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                (get("title"), get("url"), Some(get("publish_date")))
+            })
+            .collect(),
+    )
+}
+
+/// The `exa` provider's plain-text blocks — `Title:`, `URL:`, `Published:`,
+/// `Author:`, then `Highlights:` and the excerpt — separated by `---`. `N/A`
+/// stands in for every missing field. A chunk without a `URL` (an excerpt that
+/// itself contains `---`) is dropped.
+fn parse_exa_results(output: &str) -> Option<Vec<SearchEntry>> {
+    if !output.starts_with("Title: ") {
+        return None;
     }
-    Some((results.len(), lines.join("\n")))
+    let mut results = Vec::new();
+    for chunk in output.split("\n\n---\n\n") {
+        let mut title = String::new();
+        let mut url = String::new();
+        let mut date = None;
+        for line in chunk.lines() {
+            if let Some(v) = line.trim().strip_prefix("Title: ") {
+                title = v.trim().to_string();
+            } else if let Some(v) = line.trim().strip_prefix("URL: ") {
+                url = v.trim().to_string();
+            } else if let Some(v) = line.trim().strip_prefix("Published: ") {
+                date = Some(v.trim().to_string());
+            } else if line.trim_start().starts_with("Highlights:") {
+                // The excerpt is the model's reading material — stop here so a
+                // quoted `Title:` line inside it is never read as a result.
+                break;
+            }
+        }
+        if url.is_empty() {
+            continue;
+        }
+        let title = if title == "N/A" { String::new() } else { title };
+        let date = date.filter(|d| !d.is_empty() && d != "N/A");
+        results.push((title, url, date));
+    }
+    (!results.is_empty()).then_some(results)
 }
 
 /// A language hint for a file path's extension, used as the fenced-code-block
@@ -682,11 +735,7 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let first = first_chunk(first, 120);
-                if questions.len() == 1 {
-                    format!("❓ {}", first)
-                } else {
-                    format!("❓ {} 个问题 · {}", questions.len(), first)
-                }
+                format!("❓ {} 个问题 · {}", questions.len(), first)
             }
             _ => input.to_string(),
         },
@@ -883,6 +932,25 @@ boom
         assert_eq!(format_tool_output("task", "plain text").2, "plain text");
     }
 
+    /// An empty `<task_result>` must still lose its envelope — dumping the raw
+    /// XML back on the card is worse than an empty output.
+    #[test]
+    fn task_output_with_an_empty_result_still_strips_the_envelope() {
+        let raw = "<task id=\"ses_1\" state=\"completed\">\n<task_result>\n</task_result>\n</task>";
+        let tool = ToolPanel {
+            name: "task".into(),
+            status: "completed".into(),
+            input: Some(json!({"description": "sub"})),
+            output: Some(raw.into()),
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        let text = card.to_string();
+        assert!(!text.contains("<task"), "envelope leaked: {text}");
+    }
+
     /// #202: a `skill` output is a `<skill_content>` XML envelope; the panel
     /// shows the skill's instructions alone (the sampled `<skill_files>` list is
     /// a file inventory the reader can't use).
@@ -909,6 +977,9 @@ Relative paths in this skill (e.g., scripts/, reference/) are relative to this b
         assert!(!body.contains("<skill_content"), "wrapper stripped: {body:?}");
         assert!(!body.contains("skill_files"), "file list stripped: {body:?}");
         assert!(!body.contains("other.md"), "sampled files stripped: {body:?}");
+        // An empty envelope is stripped too, never leaked raw.
+        let (_, _, empty) = format_tool_output("skill", "<skill_content name=\"x\">\n</skill_content>");
+        assert_eq!(empty, "");
     }
 
     /// #202: a `websearch` output is a JSON result envelope. The panel shows a
@@ -960,6 +1031,40 @@ Relative paths in this skill (e.g., scripts/, reference/) are relative to this b
         let plain = format_tool_output("websearch", "No search results found.");
         assert_eq!(plain.0, None);
         assert_eq!(plain.2, "No search results found.");
+    }
+
+    /// The `exa` provider — the other half of websearch's per-session provider
+    /// selection — returns plain-text blocks, not the `parallel` JSON envelope.
+    /// The panel must render the same title+url list (highlights dropped).
+    #[test]
+    fn websearch_exa_text_renders_as_a_result_list() {
+        let raw = "\
+Title: First doc
+URL: https://a.example/doc
+Published: 2026-01-02
+Author: someone
+Highlights:
+long excerpt that must not appear
+
+---
+
+Title: N/A
+URL: https://b.example/other
+Published: N/A
+Author: N/A
+Highlights:
+more text";
+        let (header, _, body) = format_tool_output("websearch", raw);
+        assert_eq!(header.as_deref(), Some("🔎 2 条结果"));
+        assert!(
+            body.contains("1. [First doc](https://a.example/doc) · 2026-01-02"),
+            "dated first result: {body}"
+        );
+        assert!(
+            body.contains("2. https://b.example/other"),
+            "an N/A title falls back to the url: {body}"
+        );
+        assert!(!body.contains("excerpt"), "highlights dropped: {body}");
     }
 
     #[test]
@@ -1638,9 +1743,9 @@ Index: /a/two.rs
         );
         assert!(!text.contains("- questions:"), "generic blob leaked: {text}");
 
-        // A single question reads without the count.
+        // The count reads the same for one question or many.
         let single = json!({"questions": [{"question": "继续?", "header": "确认", "options": []}]});
-        assert_eq!(format_tool_input("question", &single), "❓ 继续?");
+        assert_eq!(format_tool_input("question", &single), "❓ 1 个问题 · 继续?");
         assert_eq!(
             format_tool_input("question", &input),
             "❓ 2 个问题 · issue 202 你想让我做什么？"
