@@ -10,4 +10,10 @@ The skills speak in terms of five canonical triage roles. This file maps those r
 | `ready-for-human` | `ready-for-human`    | Requires human implementation            |
 | `wontfix`         | `wontfix`            | Will not be actioned                     |
 
+Repo-local, not a skill role — skills neither apply nor consume it:
+
+| Label      | Meaning                                                                                       |
+| ---------- | --------------------------------------------------------------------------------------------- |
+| `deferred` | Evaluated; intentionally postponed and may be revisited. Stays open, unlike `wontfix`.        |
+
 When a skill mentions a role (e.g. "apply the AFK-ready triage label"), use the corresponding GitHub label. Archive files under `.scratch/` still carry the equivalent `Status:` string, but those are inert.
