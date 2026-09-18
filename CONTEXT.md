@@ -90,6 +90,10 @@ _Avoid_: Root, seed message, confirmation card
 A single user→assistant exchange inside a Session (one prompt plus its streamed card response). cola's internal vocabulary is the English word "turn" (Turn Footer, ADR-0019); there is deliberately NO user-facing Chinese noun for it — the UI never labels individual turns. If one is ever needed, use 轮次/本轮.
 _Avoid_: 对话 as a user-facing term for this (overloads "conversation"); 消息 (a single message, not a full exchange).
 
+**Supplement** (补充消息):
+A user message sent while its **Session** has a **Turn** in flight. cola does not start a competing Turn: it submits the message to the Backend's running loop, which merges it into that Turn when the loop is still alive, or starts a new Turn when it has already exited. Either way the message lands below the live card, so it splits the **Card Chain** — the continuation card is its reply and carries a receipt line; there is no separate text acknowledgement. A command reply is NOT a Supplement: cola deliberately leaves it as the newest message.
+_Avoid_: Follow-up, addition, queued message
+
 **Thread** (legacy name for Topic):
 A Feishu topic, identified by `thread_id` (`omt_...`). Retained in code as `ThreadKey { chat_id, thread_id }`; the glossary now calls the Feishu side Chat/Topic, and 话题 for topics in the UI. See Topic.
 
@@ -157,8 +161,12 @@ A Feishu interactive message card. Evolves through states (loading → reasoning
 _Avoid_: Widget, component, bubble
 
 **Card Chain**:
-The one or more **Card**s a single **Turn** renders into when its content exceeds what one Feishu card may hold: the filled card is finalized with a 部分完成，继续中 header and a continuation card takes over. Only the newest card of the chain keeps receiving updates; an **Interaction Block** rides that newest card.
+The one or more **Card**s a single **Turn** renders into when its content exceeds what one Feishu card may hold, or when a **Supplement** lands below the live card and the chain must continue there to stay the newest message: the filled card is finalized with a 部分完成，继续中 header and a continuation card takes over, replied to the user message it continues from. Only the newest card of the chain keeps receiving updates; an **Interaction Block** rides that newest card; a command reply deliberately does not split the chain.
 _Avoid_: Split card, multi-card turn, card pagination
+
+**Instant Reminder** (即时提醒):
+Feishu's `time_sensitive` capability: temporarily pinning a conversation at the top of a **Principal**'s message list. cola enables it while a **Permission** or **Question** is pending, or while a **Turn** runs past a threshold, and clears it when the wait resolves — a completed long Turn stays pinned for a short TTL so someone waiting elsewhere still catches the end. The pin carries no reason text; the card title in the conversation preview does. Distinct from an app feed card, which is a separate list entry cola does not create (its link cannot address a specific message).
+_Avoid_: App message stream, feed card, message-list notification
 
 **Todo Panel** (待办面板):
 A **Turn**'s live task checklist, rendered as a card-TAIL status section instead of a timeline row: each `todowrite` call replaces it in place, so it rides the newest card of the **Card Chain** and a split never strands the reader on a stale list. Folded by default; its header carries the plan size and the non-empty status counts (`共 N 项 · 🔄 1 · ⬜ 2`) plus the last write's clock, so progress is readable without unfolding. An update arrives as a whole new list, never as an edit of the previous panel.
@@ -258,6 +266,8 @@ _Avoid_: Notification, message, signal
 - A **Topic** is created around its **Topic Root** and, when cola opens it, is anchored on its **Topic Anchor**; a cola-created **Topic Root** is a **Topic Cover Card**
 - A **Session** contains many **Turns** and has one **Project** and one optional **Agent**
 - A **Turn** renders into a **Card Chain**; a pending **Permission**/**Question** rides its newest card as an **Interaction Block**, and resolving one leaves an **Interaction Receipt**
+- A **Supplement** splits its **Turn**'s **Card Chain** so the continuation card is the newest message; the render loop stays alive across a Supplement that starts a new **Turn**; a **Command** reply deliberately does not split the chain
+- An **Instant Reminder** pins the conversation while a **Permission**/**Question** is pending or a **Turn** runs past the threshold, and clears when the wait resolves (a completed long Turn keeps a short TTL)
 - A **Turn** renders one **Tool Panel** per tool call; only **Built-in Tool**s (and tools cola itself injects) may get tailored rendering — every other tool's payload stays opaque
 - A **Session** receives many **Permissions** and **Questions**
 - A **Session Snapshot** reports the state of one **Session** (its last **Turn**'s completion, pending **Permissions**/**Questions**, recent messages) to the **Chat**/**Topic** that activated it
