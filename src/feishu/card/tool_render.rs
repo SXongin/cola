@@ -141,6 +141,11 @@ pub(crate) struct EditDiff {
     pub additions: usize,
     pub deletions: usize,
     pub body: String,
+    /// Non-diff text after the hunks: the tool's trailing note (its
+    /// "LSP errors detected …" diagnostics), which the bridge appends after
+    /// the diff. Kept out of `body` so a permission description still shows
+    /// just the change, but shown after the fenced hunks on a Tool Panel.
+    pub tail: String,
 }
 
 /// Parse a unified diff produced by OpenCode's `edit` tool into its hunks.
@@ -163,14 +168,24 @@ fn parse_diff(diff: &str, keep_file_headers: bool) -> Option<EditDiff> {
     let mut additions = 0usize;
     let mut deletions = 0usize;
     let mut body = String::new();
+    let mut tail = String::new();
     let mut changed = false;
     // The `--- path` / `+++ path` file headers only appear BEFORE the first
     // `@@` hunk. Past that point any `-`/`+` line is real content — a removed
     // line whose text starts with `-- ` (Lua/YAML `--` comments) renders as
     // `--- …` and must stay a removal, not be mistaken for a header.
     let mut in_hunk = false;
+    // Once a non-diff line shows up (the bridge appended the tool's LSP note
+    // after the diff), everything after it is that note — even a line that
+    // happens to start like diff syntax (a diagnostic quoting `+`/`-` code).
+    let mut in_tail = false;
     for line in diff.lines() {
         let l = line.trim_end();
+        if in_tail {
+            tail.push_str(l);
+            tail.push('\n');
+            continue;
+        }
         if let Some(p) = l.strip_prefix("Index: ") {
             path = Some(p.to_string());
             // A new `Index:` starts a new file's header block even after an
@@ -207,6 +222,13 @@ fn parse_diff(diff: &str, keep_file_headers: bool) -> Option<EditDiff> {
             changed = true;
             body.push_str(l);
             body.push('\n');
+        } else if !l.is_empty() && !l.starts_with(' ') && !l.starts_with('\\') {
+            // Not diff syntax and not an (indented) context line: the start of
+            // the trailing note. Blank lines (the separator) and the
+            // `\ No newline…` marker are not it.
+            in_tail = true;
+            tail.push_str(l);
+            tail.push('\n');
         }
         // Anything else (context lines, "\ No newline…") is dropped.
     }
@@ -218,6 +240,7 @@ fn parse_diff(diff: &str, keep_file_headers: bool) -> Option<EditDiff> {
         additions,
         deletions,
         body,
+        tail,
     })
 }
 
@@ -348,11 +371,22 @@ fn format_tool_output(name: &str, output: &str) -> (Option<String>, BodyStyle, S
             parse_edit_diff(output)
         };
         return match parsed {
-            Some(d) => (
-                Some(format!("+{} −{}", d.additions, d.deletions)),
-                BodyStyle::Code(None),
-                d.body,
-            ),
+            Some(d) => {
+                // The hunks, then the tool's trailing note (LSP diagnostics) on
+                // its own paragraph — inside the same code block so the panel
+                // never loses it.
+                let mut body = d.body;
+                if !d.tail.is_empty() {
+                    body.push('\n');
+                    body.push_str(d.tail.trim_end());
+                    body.push('\n');
+                }
+                (
+                    Some(format!("+{} −{}", d.additions, d.deletions)),
+                    BodyStyle::Code(None),
+                    body,
+                )
+            }
             None => (None, BodyStyle::Auto, output.to_string()),
         };
     }
@@ -1149,7 +1183,8 @@ Index: src/main.rs
     }
 
     /// #202: an `apply_patch` panel shows the same hunks as `edit`, fenced
-    /// (monospace, no wrapping), with each patched file named in the body.
+    /// (monospace, no wrapping), with each patched file named in the body —
+    /// and the LSP note the bridge appends after the diff reaches the card.
     #[test]
     fn apply_patch_output_renders_fenced_hunks_in_panel() {
         let diff = "\
@@ -1162,11 +1197,14 @@ Index: /x/one.rs
 -let b = 2;
 +let b = 3;
  let c = 4;";
+        // The bridge appends the tool's LSP note after the diff (`{diff}\n\n{tail}`);
+        // the panel must show it too.
+        let output = format!("{diff}\n\nLSP errors detected in /x/one.rs, please fix:\nunused variable `c`");
         let tool = ToolPanel {
             name: "apply_patch".into(),
             status: "completed".into(),
             input: Some(json!({"patchText": "*** Begin Patch"})),
-            output: Some(diff.into()),
+            output: Some(output),
         };
         let card = CardBuilder::new()
             .with_state(CardState::Done)
@@ -1183,6 +1221,10 @@ Index: /x/one.rs
         assert!(md.contains("-let b = 2;"), "removed line: {md}");
         assert!(md.contains("+let b = 3;"), "added line: {md}");
         assert!(!md.contains("let a = 1;"), "context line dropped: {md}");
+        assert!(
+            md.contains("LSP errors detected in /x/one.rs"),
+            "LSP note on the card: {md}"
+        );
     }
 
     #[test]
@@ -1265,6 +1307,42 @@ Index: /a/two.rs
         assert!(body.contains("+y"), "second hunk kept: {body}");
         assert!(!body.contains("let a = 1;"), "context dropped: {body}");
         assert!(!body.contains("+++"), "file header noise dropped: {body}");
+    }
+
+    /// #202 review: the bridge appends the tool's LSP note after the diff; the
+    /// parser must keep it as `tail` (not drop it with the context lines), and
+    /// a note that quotes `+`/`-` lines must stay in the tail, not the hunks.
+    #[test]
+    fn parse_edit_diff_keeps_the_trailing_lsp_note() {
+        let diff = "\
+Index: a.rs
+===================================================================
+--- a.rs
++++ a.rs
+@@ -1 +1 @@
+-old
++new
+
+LSP errors detected in a.rs, please fix:
+- a diagnostic that starts like a removal
++ a diagnostic that starts like an addition";
+        let d = parse_edit_diff(diff).expect("diff parsed");
+        assert_eq!(d.body.trim_end(), "@@ -1 +1 @@\n-old\n+new");
+        assert!(
+            d.tail.contains("LSP errors detected in a.rs"),
+            "note kept as tail: {:?}",
+            d.tail
+        );
+        assert!(
+            d.tail.contains("a diagnostic that starts like a removal"),
+            "diff-looking note lines stay in the tail: {:?}",
+            d.tail
+        );
+        assert!(
+            !d.body.contains("diagnostic"),
+            "note must not leak into the hunks: {:?}",
+            d.body
+        );
     }
 
     #[test]

@@ -62,8 +62,9 @@ it would couple cola's card code to servers it does not own.
 - **Generic JSON pretty-printer for all unrecognized outputs**: rejected — it
   applies to whatever payloads happen to exist (today's OpenChamber envelope,
   tomorrow's unknown), which is exactly the shape dependency this decision
-  refuses. Built-ins that return JSON (`websearch`, `lsp`) get their own
-  renderer instead.
+  refuses. A built-in that returns JSON gets its own renderer (`websearch`
+  today); any other built-in — `lsp` included — stays raw until someone adds
+  one.
 - **Per-tool renderers for the MCP servers in use** (`codegraph_*`,
   `context7_*`): rejected — they return markdown already, and pinning cola to
   their tool names would break the moment a Host configures different servers.
@@ -78,6 +79,12 @@ it would couple cola's card code to servers it does not own.
   small, and the fallback is safe.
 - The name match is against the part's `tool` field: a renamed or replaced
   built-in silently falls back to raw, never to a wrong renderer.
+- **A third-party tool that claims a built-in id can hit a built-in arm.** The
+  part payload carries no provenance, so the id is all cola has; each renderer
+  additionally gates on shape (a `<path>` block, a `<task …>` envelope, a
+  `results` array, a parseable diff), so a same-named tool with a different
+  shape falls through to raw. A same-named tool with the exact same shape gets
+  the built-in rendering — accepted: the rendering is then correct anyway.
 - This bounds the renderer to OpenCode's registry; a future "cola tool" set must
   be named explicitly when cola starts injecting tools.
 
