@@ -108,3 +108,18 @@ cancelled settlement expires after a short TTL), because the neutral `⏱` recei
 is only true when another client did the resolving. The auto-accept toggle card
 now settles its approved blocks with the mode receipt exactly as the command and
 the permission card's own button do, instead of leaving them to the sweep.
+
+## Update (2026-09-18)
+
+Rule 3's ack now has a deadline. Feishu fails a card callback it does not hear
+back from within 3 s (`200341`), so the WS loop answers within
+`CARD_ACK_BUDGET` (2 s, `src/feishu/ws.rs`) even when the handler is still
+running: it acks with a `处理中…` toast and drops the late result, and the next
+render poll reconciles whatever card the handler was going to update. A handler
+that beats the budget still updates the clicked card in the ack exactly as
+rule 3 says — the budget changes nothing on the normal path, it only bounds the
+stalled one. The request-reply calls that gate the slow paths
+(permission/question) carry their own total timeout
+(`REPLY_TIMEOUT`, `src/opencode/client.rs`), so a stalled backend surfaces as
+the existing retryable failure card inside the budget instead of riding the ack
+deadline.
