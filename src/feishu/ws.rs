@@ -625,7 +625,7 @@ async fn handle_binary_frame(
             // rides the response.
             tracing::debug!("card action value: {:?}", value.to_string());
             tracing::info!(
-                "card action: action={} reply={} request_id={} operator={}",
+                "card action: action={} reply={} request_id={} principal={}",
                 card_action_field(&value, "action"),
                 card_action_field(&value, "reply"),
                 card_action_field(&value, "request_id"),
