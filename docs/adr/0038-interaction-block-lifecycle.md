@@ -114,11 +114,13 @@ the permission card's own button do, instead of leaving them to the sweep.
 Rule 3's ack now has a deadline. Feishu fails a card callback it does not hear
 back from within 3 s (`200341`), so the WS loop answers within
 `CARD_ACK_BUDGET` (2 s, `src/feishu/ws.rs`) even when the handler is still
-running: it acks with a `处理中…` toast and drops the late result, and the next
-render poll reconciles whatever card the handler was going to update. A handler
-that beats the budget still updates the clicked card in the ack exactly as
-rule 3 says — the budget changes nothing on the normal path, it only bounds the
-stalled one. The request-reply calls that gate the slow paths
+running: it acks with a `处理中…` toast and drops the late result. The next
+render poll repaints the session's current accumulator card; a dropped result
+on a standalone card or a non-current handle card (rules 2 and 6) is not
+repainted, and its controls stay live until a second click re-serves the
+settled result. A handler that beats the budget still updates the clicked
+card in the ack exactly as rule 3 says — the budget changes nothing on the
+normal path, it only bounds the stalled one. The request-reply calls that gate the slow paths
 (permission/question) carry their own total timeout
 (`REPLY_TIMEOUT`, `src/opencode/client.rs`), so a stalled backend surfaces as
 the existing retryable failure card inside the budget instead of riding the ack
