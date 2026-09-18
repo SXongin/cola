@@ -856,3 +856,393 @@ async fn name_without_a_session_replies_no_session() {
         "no false rename confirmation: {texts:?}"
     );
 }
+
+/// The settings commands write the Pending Session and the first message
+/// materialises it with those values — the prompt itself already carries the
+/// model, agent and variant (ADR-0041 command matrix).
+#[tokio::test]
+async fn settings_commands_write_the_pending_and_materialise() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.provider_models = vec![crate::opencode::types::ProviderModels {
+        provider: "p".into(),
+        models: vec![model_option("test", &["high"])],
+    }];
+    let prompt_models = backend.prompt_models.clone();
+    let prompt_agents = backend.prompt_agents.clone();
+    let prompt_variants = backend.prompt_variants.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_pending(&app, PendingEntry::new(key(), "/work/proj")).await;
+
+    for cmd in [
+        crate::bridge::command::Command::Agent("build".into()),
+        crate::bridge::command::Command::Model("p/test".into()),
+        crate::bridge::command::Command::Think("high".into()),
+        crate::bridge::command::Command::AutoAccept(crate::bridge::command::AutoAcceptAction::Set(true)),
+    ] {
+        crate::bridge::command::handle_command(
+            &app.core,
+            cmd,
+            key(),
+            "msg_cfg",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+    }
+
+    {
+        let store = app.sessions.lock().await;
+        let pending = store
+            .pending_for(&key())
+            .expect("the pending survives its configuration");
+        assert_eq!(pending.agent.as_deref(), Some("build"));
+        assert_eq!(pending.model.as_deref(), Some("p/test"));
+        assert_eq!(pending.variant.as_deref(), Some("high"));
+        assert!(pending.auto_accept);
+        assert!(
+            store.get_active(&key()).is_none(),
+            "configuring a pending creates no session"
+        );
+    }
+
+    app.handle_message(incoming(
+        "msg_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+
+    let entry = app
+        .sessions
+        .lock()
+        .await
+        .get_active(&key())
+        .cloned()
+        .expect("materialised");
+    assert_eq!(entry.agent.as_deref(), Some("build"));
+    assert_eq!(entry.model.as_deref(), Some("p/test"));
+    assert_eq!(entry.variant.as_deref(), Some("high"));
+    assert!(entry.auto_accept);
+    assert_eq!(
+        *prompt_models.lock().await,
+        vec![Some("p/test".to_string())],
+        "the first prompt runs with the pending's model"
+    );
+    assert_eq!(
+        *prompt_agents.lock().await,
+        vec![Some("build".to_string())],
+        "the first prompt runs with the pending's agent"
+    );
+    assert_eq!(
+        *prompt_variants.lock().await,
+        vec![Some("high".to_string())],
+        "the first prompt runs with the pending's variant"
+    );
+}
+
+/// `/model` on a Pending Session applies the ADR-0020 variant-clearing rule to
+/// the pending exactly as it does to a real entry.
+#[tokio::test]
+async fn model_switch_on_a_pending_clears_an_undeclared_variant() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.provider_models = vec![
+        crate::opencode::types::ProviderModels {
+            provider: "p".into(),
+            models: vec![model_option("test", &["low", "high"])],
+        },
+        crate::opencode::types::ProviderModels {
+            provider: "q".into(),
+            models: vec![model_option("other", &[])],
+        },
+    ];
+    let (app, _platform) = build_app(cfg, backend).await;
+    let mut pending = PendingEntry::new(key(), "/work/proj");
+    pending.model = Some("p/test".into());
+    pending.variant = Some("high".into());
+    seed_pending(&app, pending).await;
+
+    // A model that still declares `high` keeps the variant.
+    crate::bridge::command::handle_command(
+        &app.core,
+        crate::bridge::command::Command::Model("p/test".into()),
+        key(),
+        "msg_model_1",
+        crate::config::ConversationKind::P2p,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&key())
+            .and_then(|p| p.variant.as_deref()),
+        Some("high")
+    );
+
+    // A model that lacks it clears the pending's variant.
+    crate::bridge::command::handle_command(
+        &app.core,
+        crate::bridge::command::Command::Model("q/other".into()),
+        key(),
+        "msg_model_2",
+        crate::config::ConversationKind::P2p,
+    )
+    .await
+    .unwrap();
+    let store = app.sessions.lock().await;
+    let pending = store.pending_for(&key()).unwrap();
+    assert_eq!(pending.model.as_deref(), Some("q/other"));
+    assert_eq!(pending.variant, None, "an undeclared variant is cleared");
+}
+
+/// `/think` on a Pending Session validates against the pending's effective
+/// model (its own override, else the configured default).
+#[tokio::test]
+async fn think_on_a_pending_validates_against_the_pending_model() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.provider_models = vec![crate::opencode::types::ProviderModels {
+        provider: "p".into(),
+        models: vec![model_option("test", &["low", "high"])],
+    }];
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut pending = PendingEntry::new(key(), "/work/proj");
+    pending.model = Some("p/test".into());
+    seed_pending(&app, pending).await;
+
+    crate::bridge::command::handle_command(
+        &app.core,
+        crate::bridge::command::Command::Think("medium".into()),
+        key(),
+        "msg_think_1",
+        crate::config::ConversationKind::P2p,
+    )
+    .await
+    .unwrap();
+    let texts = platform.texts().await;
+    assert!(
+        texts.iter().any(|t| t.contains("不支持思考等级")),
+        "an undeclared variant is rejected: {texts:?}"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&key())
+            .and_then(|p| p.variant.clone()),
+        None,
+        "a rejected variant writes nothing"
+    );
+
+    crate::bridge::command::handle_command(
+        &app.core,
+        crate::bridge::command::Command::Think("high".into()),
+        key(),
+        "msg_think_2",
+        crate::config::ConversationKind::P2p,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&key())
+            .and_then(|p| p.variant.as_deref()),
+        Some("high")
+    );
+}
+
+/// The interactive cards render a Pending Session's current values instead of
+/// the no-session error, and their buttons write the pending.
+#[tokio::test]
+async fn settings_cards_render_and_configure_a_pending() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.provider_models = vec![crate::opencode::types::ProviderModels {
+        provider: "p".into(),
+        models: vec![model_option("test", &["low", "high"])],
+    }];
+    backend.agents = vec![crate::opencode::types::AgentInfo {
+        name: "build".into(),
+        description: None,
+        mode: Some("primary".into()),
+        hidden: Some(false),
+    }];
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut pending = PendingEntry::new(key(), "/work/proj");
+    pending.model = Some("p/test".into());
+    pending.variant = Some("high".into());
+    seed_pending(&app, pending).await;
+
+    for cmd in [
+        crate::bridge::command::Command::AgentCard,
+        crate::bridge::command::Command::ModelCard,
+        crate::bridge::command::Command::ThinkCard,
+        crate::bridge::command::Command::AutoAccept(crate::bridge::command::AutoAcceptAction::Status),
+    ] {
+        crate::bridge::command::handle_command(
+            &app.core,
+            cmd,
+            key(),
+            "msg_card",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+    }
+
+    let calls = platform.calls.lock().await.clone();
+    let cards: Vec<String> = calls
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::ReplyCard { card, .. } => Some(card.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        cards
+            .iter()
+            .any(|c| c.contains("当前 Agent") && c.contains("`build`")),
+        "agent card shows the pending's effective agent: {cards:?}"
+    );
+    assert!(
+        cards
+            .iter()
+            .any(|c| c.contains("当前模型") && c.contains("p/test@high")),
+        "model card shows the pending's model and variant: {cards:?}"
+    );
+    assert!(
+        cards.iter().any(|c| c.contains("思考等级") && c.contains("high")),
+        "think card shows the pending's variant: {cards:?}"
+    );
+    assert!(
+        cards.iter().any(|c| c.contains("自动审批")),
+        "autoaccept card renders for a pending: {cards:?}"
+    );
+    assert!(
+        !platform.texts().await.iter().any(|t| t.contains("还没有会话")),
+        "no settings card fell back to the no-session reply"
+    );
+
+    // The buttons write the pending, not a session.
+    let agent = serde_json::json!({
+        "action": "agent", "chat_id": "chat_1", "thread_id": "chat_1", "value": "build",
+    });
+    let result = app.host_action(agent).await.expect("agent card action");
+    assert!(result.card.is_some(), "agent card refreshes");
+    let model = serde_json::json!({
+        "action": "model", "level": "model",
+        "chat_id": "chat_1", "thread_id": "chat_1", "value": "p/test",
+    });
+    app.host_action(model).await.expect("model card action");
+    let think = serde_json::json!({
+        "action": "think", "chat_id": "chat_1", "thread_id": "chat_1", "value": "low",
+    });
+    app.host_action(think).await.expect("think card action");
+    let autoaccept = serde_json::json!({
+        "action": "autoaccept", "chat_id": "chat_1", "thread_id": "chat_1", "value": "on",
+    });
+    app.host_action(autoaccept).await.expect("autoaccept card action");
+
+    let store = app.sessions.lock().await;
+    let pending = store
+        .pending_for(&key())
+        .expect("the pending survives the card actions");
+    assert_eq!(pending.agent.as_deref(), Some("build"));
+    assert_eq!(pending.model.as_deref(), Some("p/test"));
+    assert_eq!(pending.variant.as_deref(), Some("low"));
+    assert!(pending.auto_accept);
+    assert!(
+        store.get_active(&key()).is_none(),
+        "card actions create no session"
+    );
+}
+
+/// `/compact` and `/stop` on a Pending Session keep today's no-session replies
+/// and send nothing to the backend (ADR-0041 command matrix).
+#[tokio::test]
+async fn compact_and_stop_on_a_pending_do_not_reach_the_backend() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let interrupt_calls = backend.interrupt_calls.clone();
+    let compact_calls = backend.compact_calls.clone();
+    let created = backend.created_session_dirs.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_pending(&app, PendingEntry::new(key(), "/work/proj")).await;
+
+    for cmd in [
+        crate::bridge::command::Command::Compact,
+        crate::bridge::command::Command::Stop,
+    ] {
+        crate::bridge::command::handle_command(
+            &app.core,
+            cmd,
+            key(),
+            "msg_lifecycle",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+    }
+
+    let texts = platform.texts().await.join("\n");
+    assert!(texts.contains("还没有会话"), "compact no-session reply: {texts}");
+    assert!(
+        texts.contains("当前没有正在执行的会话"),
+        "stop no-session reply: {texts}"
+    );
+    assert!(compact_calls.lock().await.is_empty(), "nothing compacted");
+    assert!(interrupt_calls.lock().await.is_empty(), "nothing interrupted");
+    assert!(created.lock().await.is_empty(), "no session created");
+    assert!(
+        app.sessions.lock().await.pending_for(&key()).is_some(),
+        "both commands leave the pending alone"
+    );
+}
+
+/// `/switch forget` clears the Pending Session together with the thread's
+/// mappings (ADR-0041).
+#[tokio::test]
+async fn switch_forget_clears_the_pending_too() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key(), "ses_old", "/work/a"),
+    )
+    .await;
+    seed_pending(&app, PendingEntry::new(key(), "/work/proj")).await;
+
+    crate::bridge::command::handle_command(
+        &app.core,
+        crate::bridge::command::Command::Switch(crate::bridge::command::SwitchAction::Forget),
+        key(),
+        "msg_forget",
+        crate::config::ConversationKind::P2p,
+    )
+    .await
+    .unwrap();
+
+    let store = app.sessions.lock().await;
+    assert!(store.pending_for(&key()).is_none(), "the pending is forgotten");
+    assert!(store.list_thread(&key()).is_empty(), "the mappings are forgotten");
+}

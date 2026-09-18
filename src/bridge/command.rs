@@ -288,7 +288,7 @@ pub fn help_text() -> String {
 `/new [name]` · Declare a new session in the current project (created by the next message; no session → default dir)
 `/topic [dir] [name]` · Create a new Feishu topic in <dir>; the topic's first message creates the session (bare `/topic` uses the current project)
 `/topic --adopt <kw> [--force]` · Open a topic around an existing session
-`/name <name>` · Rename current session (server-side)
+`/name <name>` · Rename current session server-side (on a pending, set the creation title)
 `/stop` · Interrupt execution
 `/compact` · Compact context
 `/agent <name>` · Switch agent (takes effect next message)
@@ -331,7 +331,7 @@ pub fn command_help(name: &str) -> Option<String> {
             "/topic [dir] [name]\nCreate a real Feishu topic for a new session. The topic is UI-separated from the current conversation, so you can switch between topics in the Feishu client. Opening the topic creates NO session yet: the topic's first non-command message creates the session in the chosen directory and maps it here, so a mistaken `/topic` leaves nothing in the shared store — correct it in place with `/switch <id>` (or `/dir`/`/new`) inside the topic.\n- `/topic` (no args) — new session in the CURRENT PROJECT (the active session's directory, like `/new`; falls back to the default directory when the conversation has no session)\n- `/topic <dir>` — new session rooted at <dir>\n- `/topic <dir> <name>` — also name the session\nExample: `/topic /root/proj/lib api-refactor`\n\n/topic --adopt <keyword> [--force]\nOpen a topic around an EXISTING session instead of creating a new one. Resolution: exact id → unique id-prefix (the short hash shown on the card works too) → unique title substring (the whole remaining arg is the keyword, so multi-word titles match). Child (sub-task) sessions are rejected. If the session belongs to another chat, reject unless `--force` (which steals the mapping). No argument pops the session card — each row's 建话题接管 button does the same, and an occupied session offers a 强制建话题接管 confirmation.\nExample: `/topic --adopt 重写登录模块`"
         }
         "name" => {
-            "/name <name>\nRename the current session server-side (visible to every client sharing the store).\nExample: `/name frontend`"
+            "/name <name>\nRename the current session server-side (visible to every client sharing the store). With no session yet (a Pending Session declared by `/new`/`/dir`/`/topic`), there is nothing to PATCH: the name becomes the created session's title instead, and a pending topic's cover card updates right away.\nExample: `/name frontend`"
         }
         "stop" => {
             "/stop\nInterrupt the current execution (aborts the running prompt, e.g. a stuck question or tool)."
@@ -340,16 +340,16 @@ pub fn command_help(name: &str) -> Option<String> {
             "/compact\nCompact the current session's context: summarize older messages to free context window."
         }
         "agent" => {
-            "/agent <name>\nSwitch the agent for the current session — a per-session override sent on the NEXT message (the OpenCode server has no agent-switch endpoint). Without an override the server's default agent applies; the card (`/agent` alone) shows the current one. `--reset` clears the override back to the server default. Persisted across restarts. Unknown agent names surface as an error on the next prompt.\nExample: `/agent build`"
+            "/agent <name>\nSwitch the agent for the current session — a per-session override sent on the NEXT message (the OpenCode server has no agent-switch endpoint). Without an override the server's default agent applies; the card (`/agent` alone) shows the current one. `--reset` clears the override back to the server default. Persisted across restarts. On a Pending Session (`/new`/`/dir`/`/topic` before its first message) the override is recorded on the pending and applies to the session the first message creates. Unknown agent names surface as an error on the next prompt.\nExample: `/agent build`"
         }
         "model" => {
-            "/model <provider/model>\nSwitch the model for the current session — a per-session override sent on the NEXT message (the server has no model-switch endpoint; unset = the configured default / server default). Persisted across restarts.\nExample: `/model opencode-go/deepseek-v4-flash`"
+            "/model <provider/model>\nSwitch the model for the current session — a per-session override sent on the NEXT message (the server has no model-switch endpoint; unset = the configured default / server default). Persisted across restarts. On a Pending Session (`/new`/`/dir`/`/topic` before its first message) the override is recorded on the pending and applies to the session the first message creates.\nExample: `/model opencode-go/deepseek-v4-flash`"
         }
         "think" => {
-            "/think [等级]\nSet or clear the thinking level for the current session — a per-session override sent as `variant` on the NEXT message. Each model declares its own levels (e.g. `low`/`high`/`minimal`), so there is no universal scale: the card (`/think` alone) lists what the current model supports, and switching to a model that doesn't declare the current level clears it. `--reset` clears the override (= the server's default for the model). Persisted across restarts.\nExample: `/think high`"
+            "/think [等级]\nSet or clear the thinking level for the current session — a per-session override sent as `variant` on the NEXT message. Each model declares its own levels (e.g. `low`/`high`/`minimal`), so there is no universal scale: the card (`/think` alone) lists what the current model supports, and switching to a model that doesn't declare the current level clears it. `--reset` clears the override (= the server's default for the model). Persisted across restarts. On a Pending Session (`/new`/`/dir`/`/topic` before its first message) the level is recorded on the pending and applies to the session the first message creates.\nExample: `/think high`"
         }
         "autoaccept" => {
-            "/autoaccept [on|off]\nShow or switch auto-allowing permission requests for this session (no permission cards).\nNo arg: show current state. `/autoaccept on` / `/autoaccept off` switch it.\nExample: `/autoaccept`"
+            "/autoaccept [on|off]\nShow or switch auto-allowing permission requests for this session (no permission cards). On a Pending Session (`/new`/`/dir`/`/topic` before its first message) the flag is recorded on the pending and applies to the session the first message creates.\nNo arg: show current state. `/autoaccept on` / `/autoaccept off` switch it.\nExample: `/autoaccept`"
         }
         "restart" => {
             "/restart\nRestart cola itself, keeping startup args and the log redirect. The new process takes over the singleton lock (passes --replace). Under a systemd unit cola exits and lets `Restart=on-failure` bring it back; elsewhere it re-execs. cola announces in this chat when it's back."
@@ -672,22 +672,22 @@ pub(crate) async fn handle_command(
             // `Status` reports the current state; `Set(on)` switches the flag
             // AND clears requests that are already pending but were seen
             // before (the poller's `seen` set skips them, so they'd
-            // otherwise hang as cards forever).
-            let entry = {
-                let store = core.sessions.lock().await;
-                store.get_active(&thread_key).cloned()
-            };
+            // otherwise hang as cards forever). The flag lives on whatever
+            // the next prompt will use (ADR-0041): a Pending Session is
+            // configured too, it just has no requests to approve yet.
             match action {
                 crate::bridge::command::AutoAcceptAction::Status => {
                     send_autoaccept_card(core, &thread_key, message_id).await?;
                     return Ok(());
                 }
                 crate::bridge::command::AutoAcceptAction::Set(on) => {
+                    let settings = core.session_settings(&thread_key).await;
                     let mut approved = Vec::new();
-                    if on && let Some(e) = &entry {
-                        approved = core
-                            .approve_pending_for_session(&e.session_id, &e.directory)
-                            .await;
+                    if on
+                        && let Some(s) = settings.as_ref()
+                        && let Some(id) = s.session_id.as_deref()
+                    {
+                        approved = core.approve_pending_for_session(id, &s.directory).await;
                         if !approved.is_empty() {
                             // The same residue the card toggle leaves: ONE mode
                             // receipt and the approved blocks dismissed. Without
@@ -699,8 +699,8 @@ pub(crate) async fn handle_command(
                             crate::bridge::request::resolve_blocks(
                                 &core.permission,
                                 core,
-                                &Some(e.session_id.clone()),
-                                &e.session_id,
+                                &Some(id.to_string()),
+                                id,
                                 crate::bridge::request::Origin::Command,
                                 &approved,
                                 crate::bridge::request::Residue::Single(
@@ -710,9 +710,9 @@ pub(crate) async fn handle_command(
                             .await;
                         }
                     }
-                    if let Some(e) = entry {
-                        core.update_session(&e.session_id, |entry| entry.auto_accept = on)
-                            .await?;
+                    if let Some(mut s) = settings {
+                        s.auto_accept = on;
+                        core.set_session_settings(&thread_key, s).await?;
                     }
                     let state = if on { "开" } else { "关" };
                     let extra = if on && !approved.is_empty() {
@@ -756,17 +756,15 @@ pub(crate) async fn handle_command(
             // The OpenCode server has no agent-switch endpoint (the legacy
             // `/api/session/{id}/agent` route 500s, same as `/model`'s dead
             // route), so `/agent` records a per-session override here — persisted
-            // in the SessionEntry so it survives a restart — and cola sends it as
-            // a per-prompt agent on the next message (the server honors
-            // `PromptInput.agent`). Unknown agent names surface as a clear error
-            // on the next prompt's card. `--reset` clears the override (the
-            // server's default agent applies); an agent literally named
-            // `default`/`off`/`reset` is a normal pick, never a clear word.
-            let entry = {
-                let store = core.sessions.lock().await;
-                store.get_active(&thread_key).cloned()
-            };
-            let Some(entry) = entry else {
+            // with the session mapping so it survives a restart — and cola sends
+            // it as a per-prompt agent on the next message (the server honors
+            // `PromptInput.agent`). On a Pending Session the override is
+            // recorded on the pending and lands on the created session at
+            // materialisation (ADR-0041). Unknown agent names surface as a
+            // clear error on the next prompt's card. `--reset` clears the
+            // override (the server's default agent applies); an agent literally
+            // named `default`/`off`/`reset` is a normal pick, never a clear word.
+            let Some(mut settings) = core.session_settings(&thread_key).await else {
                 core.feishu
                     .reply_text(
                         message_id,
@@ -779,9 +777,8 @@ pub(crate) async fn handle_command(
                 return Ok(());
             };
             let cleared = is_reset_flag(&name);
-            let agent = if cleared { None } else { Some(name.clone()) };
-            core.update_session(&entry.session_id, |e| e.agent = agent)
-                .await?;
+            settings.agent = if cleared { None } else { Some(name.clone()) };
+            core.set_session_settings(&thread_key, settings).await?;
             let msg = if cleared {
                 "已清除 Agent（回到服务器默认）。".to_string()
             } else {
@@ -797,8 +794,9 @@ pub(crate) async fn handle_command(
             // `/api/session/{id}/model` route is gone), so `/model` records
             // a per-session override here and cola sends it as a per-prompt
             // model on the next message. Validate the shape up front so a
-            // typo gets immediate feedback instead of a silent no-op. The
-            // override is persisted in the SessionEntry (survives restart).
+            // typo gets immediate feedback instead of a silent no-op. On a
+            // Pending Session the override is recorded on the pending and
+            // lands on the created session at materialisation (ADR-0041).
             let Some(_) = crate::opencode::parsing::parse_model(&name) else {
                 core.feishu
                         .reply_text(
@@ -811,7 +809,7 @@ pub(crate) async fn handle_command(
                         .await?;
                 return Ok(());
             };
-            let Some(mut entry) = core.sessions.lock().await.get_active(&thread_key).cloned() else {
+            let Some(mut settings) = core.session_settings(&thread_key).await else {
                 core.feishu
                     .reply_text(
                         message_id,
@@ -823,15 +821,11 @@ pub(crate) async fn handle_command(
                     .await?;
                 return Ok(());
             };
-            entry.model = Some(name.clone());
+            settings.model = Some(name.clone());
             // Auto-clear the `/think` variant when the new model doesn't
             // declare it (ADR-0020), shared with the `/model` picker card.
-            let cleared_variant = core.clear_variant_for_model(&mut entry, &name).await;
-            core.update_session(&entry.session_id, |e| {
-                e.model = entry.model.clone();
-                e.variant = entry.variant.clone();
-            })
-            .await?;
+            let cleared_variant = core.clear_variant_for_model(&mut settings.variant, &name).await;
+            core.set_session_settings(&thread_key, settings).await?;
             let extra = cleared_variant
                 .map(|v| format!("（已清除思考等级 `{v}`：新模型不支持）"))
                 .unwrap_or_default();
@@ -848,11 +842,13 @@ pub(crate) async fn handle_command(
         Command::Think(name) => {
             // The OpenCode server has no thinking-level endpoint either —
             // `/think` records a per-session variant override and cola sends it
-            // as a per-prompt `variant` on the next message. `--reset` clears
+            // as a per-prompt `variant` on the next message. On a Pending
+            // Session the override is recorded on the pending and lands on the
+            // created session at materialisation (ADR-0041). `--reset` clears
             // the override (the server's default for the model); a variant
             // literally named `default`/`off`/`reset` is a normal pick, never
             // a clear word.
-            let Some(entry) = core.sessions.lock().await.get_active(&thread_key).cloned() else {
+            let Some(mut settings) = core.session_settings(&thread_key).await else {
                 core.feishu
                     .reply_text(
                         message_id,
@@ -866,7 +862,7 @@ pub(crate) async fn handle_command(
             };
             let cleared = is_reset_flag(&name);
             if !cleared
-                && let Some((provider, model)) = core.effective_model(&entry.session_id).await
+                && let Some((provider, model)) = core.effective_model(&settings).await
                 && let Some(variants) = core.model_variants(&provider, &model).await
                 && !variants.iter().any(|v| v == &name)
             {
@@ -885,9 +881,8 @@ pub(crate) async fn handle_command(
                     .await?;
                 return Ok(());
             }
-            let variant = if cleared { None } else { Some(name.clone()) };
-            core.update_session(&entry.session_id, |e| e.variant = variant)
-                .await?;
+            settings.variant = if cleared { None } else { Some(name.clone()) };
+            core.set_session_settings(&thread_key, settings).await?;
             let msg = if cleared {
                 "已清除思考等级（回到模型默认）。".to_string()
             } else {
@@ -1231,15 +1226,16 @@ pub(crate) fn server_default_agent(agents: &[crate::opencode::types::AgentInfo])
         .map(|a| a.name.clone())
 }
 
-/// Resolve what the `/agent` card should show for a thread's active session:
+/// Resolve what the `/agent` card should show for a thread's target session:
 /// the per-session override if set, else the server's default agent, plus the
-/// agent list. Shared by the text send path and the card-ack refresh so both
-/// render the current agent from one source of truth.
+/// agent list. The target is the Pending Session when one exists, else the
+/// active SessionEntry (ADR-0041). Shared by the text send path and the
+/// card-ack refresh so both render the current agent from one source of truth.
 pub(crate) async fn agent_card(
     core: &Arc<SharedCore>,
     thread_key: &ThreadKey,
 ) -> (Option<serde_json::Value>, Option<String>) {
-    let Some(entry) = core.sessions.lock().await.get_active(thread_key).cloned() else {
+    let Some(settings) = core.session_settings(thread_key).await else {
         return (
             None,
             Some(format!(
@@ -1253,7 +1249,7 @@ pub(crate) async fn agent_card(
     let card = crate::feishu::card::picker::build_agent_card(
         thread_key,
         &agents,
-        entry.agent.as_deref(),
+        settings.agent.as_deref(),
         default.as_deref(),
     );
     (Some(card), None)
@@ -1297,15 +1293,16 @@ async fn send_model_card(
 }
 
 /// The current model label the `/model` picker renders: `provider/model` from
-/// the effective-model ladder (session override → configured default →
-/// server-recorded), plus `@variant` when the session set a `/think` level.
-/// `None` when the thread has no session or no rung resolves — the picker then
-/// omits its current-model line. Shared by the text send path and the card-ack
-/// rebuild so both show one source of truth.
+/// the effective-model ladder (settings override → configured default →
+/// server-recorded), plus `@variant` when the target set a `/think` level. The
+/// target is the Pending Session when one exists, else the active SessionEntry
+/// (ADR-0041). `None` when the thread has no target or no rung resolves — the
+/// picker then omits its current-model line. Shared by the text send path and
+/// the card-ack rebuild so both show one source of truth.
 pub(crate) async fn current_model_label(core: &Arc<SharedCore>, thread_key: &ThreadKey) -> Option<String> {
-    let entry = core.sessions.lock().await.get_active(thread_key).cloned()?;
-    let (provider, model) = core.effective_model(&entry.session_id).await?;
-    let variant = entry
+    let settings = core.session_settings(thread_key).await?;
+    let (provider, model) = core.effective_model(&settings).await?;
+    let variant = settings
         .variant
         .as_deref()
         .map(|v| format!("@{v}"))
@@ -1313,18 +1310,20 @@ pub(crate) async fn current_model_label(core: &Arc<SharedCore>, thread_key: &Thr
     Some(format!("{provider}/{model}{variant}"))
 }
 
-/// Resolve what the `/think` card should show for a thread's active session:
-/// the effective model (override → configured default → server-recorded) and
-/// its declared variants. Returns `(card, error_text)` with exactly one set —
-/// an error text when the conversation has no session, no model can be
-/// resolved, or the model declares no variants (the caller then replies text
-/// instead of a card). Shared by the text send path and the card-ack refresh so
-/// both render the current selection from one source of truth.
+/// Resolve what the `/think` card should show for a thread's target session:
+/// the effective model (settings override → configured default →
+/// server-recorded) and its declared variants. The target is the Pending
+/// Session when one exists, else the active SessionEntry (ADR-0041). Returns
+/// `(card, error_text)` with exactly one set — an error text when the
+/// conversation has no target, no model can be resolved, or the model declares
+/// no variants (the caller then replies text instead of a card). Shared by the
+/// text send path and the card-ack refresh so both render the current selection
+/// from one source of truth.
 pub(crate) async fn think_card(
     core: &Arc<SharedCore>,
     thread_key: &ThreadKey,
 ) -> (Option<serde_json::Value>, Option<String>) {
-    let Some(entry) = core.sessions.lock().await.get_active(thread_key).cloned() else {
+    let Some(settings) = core.session_settings(thread_key).await else {
         return (
             None,
             Some(format!(
@@ -1333,7 +1332,7 @@ pub(crate) async fn think_card(
             )),
         );
     };
-    let Some((provider, model)) = core.effective_model(&entry.session_id).await else {
+    let Some((provider, model)) = core.effective_model(&settings).await else {
         return (
             None,
             Some("无法确定当前模型，请先用 `/model` 选择模型。".to_string()),
@@ -1346,7 +1345,7 @@ pub(crate) async fn think_card(
             Some(format!("当前模型 `{provider}/{model}` 没有思考等级可选。")),
         );
     }
-    let current = entry.variant.clone();
+    let current = settings.variant.clone();
     let card = crate::feishu::card::picker::build_think_card(
         thread_key,
         &provider,
@@ -1375,19 +1374,18 @@ async fn send_think_card(
     Ok(())
 }
 
-/// Send the `/autoaccept` toggle card (ADR-0012, issue 05).
+/// Send the `/autoaccept` toggle card (ADR-0012, issue 05). The shown state is
+/// the settings target's (Pending first, else active — ADR-0041).
 async fn send_autoaccept_card(
     core: &Arc<SharedCore>,
     thread_key: &ThreadKey,
     message_id: &str,
 ) -> crate::error::Result<()> {
-    let current_on = {
-        let store = core.sessions.lock().await;
-        store
-            .get_active(thread_key)
-            .map(|e| e.auto_accept)
-            .unwrap_or(false)
-    };
+    let current_on = core
+        .session_settings(thread_key)
+        .await
+        .map(|s| s.auto_accept)
+        .unwrap_or(false);
     let card = crate::feishu::card::picker::build_autoaccept_card(thread_key, current_on);
     core.feishu.reply_card(message_id, &card).await?;
     Ok(())

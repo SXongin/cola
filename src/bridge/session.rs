@@ -67,6 +67,30 @@ impl PendingEntry {
     }
 }
 
+/// The settings a conversation's next prompt will use (ADR-0041): the fields
+/// shared by a real [`SessionEntry`] and a [`PendingEntry`] — directory,
+/// per-session overrides, and (for a real session) its id. The settings
+/// commands read this snapshot, mutate it and write it back through
+/// [`SessionStore::set_settings`], so ONE code path configures either kind of
+/// target. `session_id` is `None` exactly when the settings belong to a Pending
+/// Session.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionSettings {
+    /// The directory the session is (or will be) rooted at: the auto-accept
+    /// approval target and the model ladder's fetch directory.
+    pub directory: String,
+    /// `Some` for a real SessionEntry, `None` for a Pending Session.
+    pub session_id: Option<String>,
+    /// Per-session agent override (`/agent`).
+    pub agent: Option<String>,
+    /// Per-session model override (`/model`, "provider/model").
+    pub model: Option<String>,
+    /// Per-session thinking level (`/think`).
+    pub variant: Option<String>,
+    /// `/autoaccept` state.
+    pub auto_accept: bool,
+}
+
 /// The current on-disk shape (ADR-0041). `pending` defaults so a file written
 /// by an older build (`{"entries":[…]}`) still loads.
 #[derive(Deserialize)]
@@ -231,6 +255,67 @@ impl SessionStore {
         f(pending);
         self.write_to_disk()?;
         Ok(true)
+    }
+
+    /// Snapshot the settings the conversation's next prompt will use (ADR-0041):
+    /// the Pending Session's fields when one exists, else the active
+    /// [`SessionEntry`]'s. `None` when the thread has neither.
+    pub fn settings(&self, key: &ThreadKey) -> Option<SessionSettings> {
+        if let Some(p) = self.pending_for(key) {
+            return Some(SessionSettings {
+                directory: p.directory.clone(),
+                session_id: None,
+                agent: p.agent.clone(),
+                model: p.model.clone(),
+                variant: p.variant.clone(),
+                auto_accept: p.auto_accept,
+            });
+        }
+        self.get_active(key).map(|e| SessionSettings {
+            directory: e.directory.clone(),
+            session_id: Some(e.session_id.clone()),
+            agent: e.agent.clone(),
+            model: e.model.clone(),
+            variant: e.variant.clone(),
+            auto_accept: e.auto_accept,
+        })
+    }
+
+    /// Write a [`SessionSettings`] snapshot back to the target it came from and
+    /// persist: by `session_id` for a real session, else the thread's Pending
+    /// Session. A snapshot taken while pending whose session materialises
+    /// before this write lands on the new active entry — the settings still
+    /// configure the conversation (ADR-0041). `false` when the target is gone.
+    pub fn set_settings(&mut self, key: &ThreadKey, settings: SessionSettings) -> crate::error::Result<bool> {
+        let overrides = (
+            settings.agent.clone(),
+            settings.model.clone(),
+            settings.variant.clone(),
+            settings.auto_accept,
+        );
+        let applied = if let Some(id) = settings.session_id.as_deref() {
+            match self.entries.iter_mut().find(|e| e.session_id == id) {
+                Some(e) => {
+                    (e.agent, e.model, e.variant, e.auto_accept) = overrides.clone();
+                    true
+                }
+                None => false,
+            }
+        } else if let Some(p) = self.pending.iter_mut().find(|p| &p.thread_key == key) {
+            (p.agent, p.model, p.variant, p.auto_accept) = overrides;
+            true
+        } else if let Some(e) = self.entries.iter_mut().find(|e| &e.thread_key == key) {
+            // The pending materialised between the read and this write: the
+            // overrides belong on the session it created.
+            (e.agent, e.model, e.variant, e.auto_accept) = overrides;
+            true
+        } else {
+            false
+        };
+        if applied {
+            self.write_to_disk()?;
+        }
+        Ok(applied)
     }
 
     /// Remove a session entry by session ID.
@@ -804,6 +889,73 @@ mod tests {
         assert_eq!(
             store.current_directory(&ThreadKey::new("chat3".into(), "root3".into())),
             None
+        );
+    }
+
+    /// The settings snapshot is pending-first, and a write goes back to the
+    /// target the snapshot came from — the pending, not the superseded entry
+    /// (ADR-0041).
+    #[test]
+    fn settings_round_trip_prefers_the_pending() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path).unwrap();
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+        let mut entry = make_entry("chat1", "root1", "ses_1", "/tmp/one");
+        entry.model = Some("old/model".into());
+        store.activate(entry).unwrap();
+        let mut pending = make_pending("chat1", "root1", "/tmp/pending");
+        pending.agent = Some("build".into());
+        store.set_pending(pending).unwrap();
+
+        let taken = store.settings(&key).expect("the pending is the target");
+        assert_eq!(taken.directory, "/tmp/pending");
+        assert_eq!(taken.session_id, None, "a pending has no session id");
+        assert_eq!(taken.agent.as_deref(), Some("build"));
+
+        let mut taken = taken;
+        taken.model = Some("new/model".into());
+        taken.auto_accept = true;
+        assert!(store.set_settings(&key, taken).unwrap());
+        assert_eq!(
+            store.pending_for(&key).and_then(|p| p.model.as_deref()),
+            Some("new/model"),
+            "the write landed on the pending"
+        );
+        assert_eq!(
+            store.entry_for_session("ses_1").and_then(|e| e.model.as_deref()),
+            Some("old/model"),
+            "the superseded entry is untouched"
+        );
+    }
+
+    /// Without a pending, the snapshot comes from the active entry and writes
+    /// back by session id.
+    #[test]
+    fn settings_round_trip_uses_the_active_entry() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path).unwrap();
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+        store
+            .activate(make_entry("chat1", "root1", "ses_1", "/tmp/one"))
+            .unwrap();
+
+        let mut taken = store.settings(&key).expect("the active entry is the target");
+        assert_eq!(taken.session_id.as_deref(), Some("ses_1"));
+        taken.variant = Some("high".into());
+        assert!(store.set_settings(&key, taken).unwrap());
+        assert_eq!(
+            store
+                .entry_for_session("ses_1")
+                .and_then(|e| e.variant.as_deref()),
+            Some("high")
+        );
+
+        assert!(
+            store
+                .settings(&ThreadKey::new("chat9".into(), "root9".into()))
+                .is_none()
         );
     }
 }

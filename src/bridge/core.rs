@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::bridge::session::{PendingEntry, SessionStore};
+use crate::bridge::session::{PendingEntry, SessionSettings, SessionStore};
 use crate::config::{SessionEntry, ThreadKey};
 use crate::feishu;
 use crate::opencode;
@@ -278,15 +278,16 @@ impl SharedCore {
             .and_then(|e| e.variant.clone())
     }
 
-    /// The model the NEXT turn will actually run, resolved session override →
+    /// The model the NEXT turn will actually run, resolved settings override →
     /// configured default → server-recorded session model (`GET /session/{id}`).
     /// `None` only when every rung fails (no override, no config, server
     /// unreachable) — the `/think` card then tells the user to `/model` first,
     /// and the `/model` picker omits its current-model line. Returns
-    /// `(provider, model)`.
-    pub async fn effective_model(&self, session_id: &str) -> Option<(String, String)> {
-        // 1. The session's own `/model` override.
-        if let Some(m) = self.session_model_override(session_id).await {
+    /// `(provider, model)`. A Pending Session has no server-recorded rung
+    /// (nothing exists on the server yet, ADR-0041).
+    pub async fn effective_model(&self, settings: &SessionSettings) -> Option<(String, String)> {
+        // 1. The `/model` override in the snapshot.
+        if let Some(m) = settings.model.as_deref().and_then(opencode::parsing::parse_model) {
             return Some((m.provider_id, m.id));
         }
         // 2. The configured default (`[opencode] model`).
@@ -296,16 +297,11 @@ impl SharedCore {
         // 3. What the server actually recorded for the session. Bounded: a
         //    hung server degrades the ladder (no current-model line / a
         //    `/think` "pick a model" prompt), never the card send.
-        let directory = self
-            .sessions
-            .lock()
-            .await
-            .entry_for_session(session_id)
-            .map(|e| e.directory.clone());
-        if let Some(dir) = directory
+        let session_id = settings.session_id.as_deref()?;
+        if !settings.directory.is_empty()
             && let Ok(Ok(info)) = tokio::time::timeout(
                 SESSION_INFO_TIMEOUT,
-                self.opencode.session_info(session_id, Some(&dir)),
+                self.opencode.session_info(session_id, Some(&settings.directory)),
             )
             .await
             && let Some(m) = info.model
@@ -329,24 +325,25 @@ impl SharedCore {
             .map(|m| m.variants)
     }
 
-    /// Auto-clear the `/think` variant when switching a session to a model that
-    /// doesn't declare it (ADR-0020): a leftover variant would make every prompt
-    /// fail with a server `VariantUnavailableError`. Shared by the `/model` text
-    /// form and the `/model` picker card. Returns the cleared variant name, or
-    /// `None` when the variant survives. Best-effort: a model not found in the
-    /// advertised catalog is left alone (can't be judged, so it is not
+    /// Auto-clear a `/think` variant when switching to a model that doesn't
+    /// declare it (ADR-0020): a leftover variant would make every prompt fail
+    /// with a server `VariantUnavailableError`. Works on the variant field of
+    /// either a real session or a Pending Session — the settings commands
+    /// choose the target, this owns the rule. Returns the cleared variant name,
+    /// or `None` when the variant survives. Best-effort: a model not found in
+    /// the advertised catalog is left alone (can't be judged, so it is not
     /// destroyed — the server error is the fallback).
     pub async fn clear_variant_for_model(
         &self,
-        entry: &mut crate::config::SessionEntry,
+        variant: &mut Option<String>,
         model_spec: &str,
     ) -> Option<String> {
-        if let Some(v) = entry.variant.clone()
+        if let Some(v) = variant.clone()
             && let Some(m) = crate::opencode::parsing::parse_model(model_spec)
             && let Some(variants) = self.model_variants(&m.provider_id, &m.id).await
             && !variants.iter().any(|x| x == &v)
         {
-            entry.variant = None;
+            *variant = None;
             Some(v)
         } else {
             None
@@ -458,6 +455,26 @@ impl SharedCore {
         F: FnOnce(&mut PendingEntry),
     {
         self.sessions.lock().await.update_pending(thread_key, f)
+    }
+
+    /// The settings the conversation's next prompt will use (ADR-0041): the
+    /// Pending Session's when one exists, else the active session's. `None`
+    /// when the thread has neither. The four settings commands
+    /// (`/agent` `/model` `/think` `/autoaccept`), their cards and the
+    /// effective-model ladder all read through this one accessor.
+    pub(crate) async fn session_settings(&self, thread_key: &ThreadKey) -> Option<SessionSettings> {
+        self.sessions.lock().await.settings(thread_key)
+    }
+
+    /// Write a [`SessionSettings`] snapshot back to its target (a real session
+    /// by id, else the thread's Pending Session) and persist. `false` when the
+    /// target is gone.
+    pub(crate) async fn set_session_settings(
+        &self,
+        thread_key: &ThreadKey,
+        settings: SessionSettings,
+    ) -> crate::error::Result<bool> {
+        self.sessions.lock().await.set_settings(thread_key, settings)
     }
 
     /// Mutate the mapped session in place and persist, returning the updated

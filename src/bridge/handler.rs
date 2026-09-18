@@ -1249,7 +1249,7 @@ impl App {
             .unwrap_or("")
             .to_string();
         let thread_key = thread_key_from_value(value);
-        let Some(entry) = core.sessions.lock().await.get_active(&thread_key).cloned() else {
+        let Some(mut settings) = core.session_settings(&thread_key).await else {
             return Some(CardActionResult {
                 card: None,
                 toast: Some(format!(
@@ -1258,8 +1258,8 @@ impl App {
                 )),
             });
         };
-        let agent = if clear { None } else { Some(picked.clone()) };
-        if let Err(e) = core.update_session(&entry.session_id, |e| e.agent = agent).await {
+        settings.agent = if clear { None } else { Some(picked.clone()) };
+        if let Err(e) = core.set_session_settings(&thread_key, settings).await {
             tracing::warn!("agent card: persist failed: {}", e);
         }
         let (card, _error) = crate::bridge::command::agent_card(core, &thread_key).await;
@@ -1319,7 +1319,7 @@ impl App {
                 toast: Some("模型格式应为 <provider>/<model>".to_string()),
             });
         }
-        let Some(mut entry) = core.sessions.lock().await.get_active(&thread_key).cloned() else {
+        let Some(mut settings) = core.session_settings(&thread_key).await else {
             return Some(CardActionResult {
                 card: None,
                 toast: Some(format!(
@@ -1328,17 +1328,11 @@ impl App {
                 )),
             });
         };
-        entry.model = Some(picked.clone());
+        settings.model = Some(picked.clone());
         // Auto-clear the `/think` variant when the new model doesn't declare
         // it (ADR-0020), same as the `/model` text form.
-        let cleared_variant = core.clear_variant_for_model(&mut entry, &picked).await;
-        if let Err(e) = core
-            .update_session(&entry.session_id, |e| {
-                e.model = entry.model.clone();
-                e.variant = entry.variant.clone();
-            })
-            .await
-        {
+        let cleared_variant = core.clear_variant_for_model(&mut settings.variant, &picked).await;
+        if let Err(e) = core.set_session_settings(&thread_key, settings).await {
             tracing::warn!("model card: persist failed: {}", e);
         }
         let extra = cleared_variant
@@ -1371,7 +1365,7 @@ impl App {
             .unwrap_or("")
             .to_string();
         let thread_key = thread_key_from_value(value);
-        let Some(entry) = core.sessions.lock().await.get_active(&thread_key).cloned() else {
+        let Some(mut settings) = core.session_settings(&thread_key).await else {
             return Some(CardActionResult {
                 card: None,
                 toast: Some(format!(
@@ -1381,7 +1375,7 @@ impl App {
             });
         };
         if !clear
-            && let Some((provider, model)) = core.effective_model(&entry.session_id).await
+            && let Some((provider, model)) = core.effective_model(&settings).await
             && let Some(variants) = core.model_variants(&provider, &model).await
             && !variants.iter().any(|v| v == &picked)
         {
@@ -1390,11 +1384,8 @@ impl App {
                 toast: Some(format!("当前模型 `{provider}/{model}` 不支持思考等级 `{picked}`")),
             });
         }
-        let variant = if clear { None } else { Some(picked.clone()) };
-        if let Err(e) = core
-            .update_session(&entry.session_id, |e| e.variant = variant)
-            .await
-        {
+        settings.variant = if clear { None } else { Some(picked.clone()) };
+        if let Err(e) = core.set_session_settings(&thread_key, settings).await {
             tracing::warn!("think card: persist failed: {}", e);
         }
         let (card, _error) = crate::bridge::command::think_card(core, &thread_key).await;
@@ -1435,35 +1426,34 @@ impl App {
     ) -> Option<CardActionResult> {
         let on = value.get("value").and_then(|v| v.as_str()) == Some("on");
         let thread_key = thread_key_from_value(value);
-        let current_entry = {
-            let store = core.sessions.lock().await;
-            store.get_active(&thread_key).cloned()
-        };
+        let settings = core.session_settings(&thread_key).await;
+        // Only a real session has requests to approve; a Pending Session has
+        // none yet (ADR-0041).
+        let active = settings
+            .as_ref()
+            .and_then(|s| s.session_id.clone().map(|id| (id, s.directory.clone())));
         let mut approved = Vec::new();
-        if on && let Some(e) = &current_entry {
-            approved = core
-                .approve_pending_for_session(&e.session_id, &e.directory)
-                .await;
+        if on && let Some((id, directory)) = &active {
+            approved = core.approve_pending_for_session(id, directory).await;
         }
-        if let Some(e) = &current_entry
-            && let Err(err) = core
-                .update_session(&e.session_id, |entry| entry.auto_accept = on)
-                .await
-        {
-            tracing::warn!("autoaccept card: persist failed: {}", err);
+        if let Some(mut s) = settings {
+            s.auto_accept = on;
+            if let Err(err) = core.set_session_settings(&thread_key, s).await {
+                tracing::warn!("autoaccept card: persist failed: {}", err);
+            }
         }
         // The same residue the permission card's toggle and `/autoaccept on`
         // leave: ONE mode receipt and the approved blocks dismissed. Without it
         // the sweep would resolve them as `⏱ 已由其他客户端处理` — a lie, cola
         // itself approved them.
-        if let Some(e) = &current_entry
+        if let Some((id, _)) = &active
             && !approved.is_empty()
         {
             crate::bridge::request::resolve_blocks(
                 &core.permission,
                 core,
-                &Some(e.session_id.clone()),
-                &e.session_id,
+                &Some(id.clone()),
+                id,
                 crate::bridge::request::Origin::Command,
                 &approved,
                 crate::bridge::request::Residue::Single(crate::bridge::request::AUTOACCEPT_RECEIPT),
@@ -1471,11 +1461,9 @@ impl App {
             .await;
         }
         let current_on = core
-            .sessions
-            .lock()
+            .session_settings(&thread_key)
             .await
-            .get_active(&thread_key)
-            .map(|e| e.auto_accept)
+            .map(|s| s.auto_accept)
             .unwrap_or(false);
         Some(CardActionResult {
             card: Some(crate::feishu::card::picker::build_autoaccept_card(
