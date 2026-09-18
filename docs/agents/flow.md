@@ -4,7 +4,7 @@ The route work travels through the skills in this repo. `/ask-matt` is the full 
 
 ## Main flow: idea → ship
 
-Keep steps 1–3 in one unbroken context window, so the grilling, spec, and tickets build on the same thinking; `/clear` only between the `/implement`s of a multi-session build. If the window approaches the smart zone before tickets exist, `/compact` at the nearest phase boundary rather than pushing on.
+Keep steps 1–3 in one unbroken context window, so the grilling, spec, and tickets build on the same thinking. A multi-session build then runs under `/foreman`, which keeps the orchestrating window lean; `/clear` between tickets is needed only when implementing them by hand. If the window approaches the smart zone before tickets exist, `/compact` at the nearest phase boundary rather than pushing on.
 
 1. **`/grill-with-docs`** sharpens the idea by interview and writes what it learns into `CONTEXT.md` and `docs/adr/` as it goes (`domain.md`). Done when every question is settled, or routed to step 2.
 2. **Does a question need a runnable answer?** — a state model, business logic, a UI you have to see. Take the prototype detour:
@@ -14,7 +14,7 @@ Keep steps 1–3 in one unbroken context window, so the grilling, spec, and tick
 
    Done when the one design question is answered.
 3. **Is this a multi-session build?**
-   - **Yes** → `/to-spec` turns the thread into a spec, then `/to-tickets` cuts it into tracer-bullet GitHub issues with native blocking edges (`issue-tracker.md`). Then one `/implement` per issue, blockers first, clearing context between tickets — each issue is self-contained.
+   - **Yes** → `/to-spec` turns the thread into a spec, then `/to-tickets` cuts it into tracer-bullet GitHub issues with native blocking edges (`issue-tracker.md`). Pass `/to-tickets` the spec's issue number so every ticket's `## Parent` points back at it. Then **`/foreman <spec-number>`** works the batch: one `implementer` sub-agent per ticket, blockers first, on one branch, reviewed per ticket, and stopped for one spec-level acceptance before a single PR. Implementing the issues by hand with `/implement` stays the fallback.
    - **No** → `/implement` right here, in this context window.
 4. **`/implement` drives `/tdd`** — one red-green slice at a time — and closes with **`/code-review`**, the two-axis Standards + Spec review, before committing. Done when both axes are clean or their findings are fixed.
 
