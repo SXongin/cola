@@ -6,7 +6,7 @@ Issues and specs for this repo live as GitHub issues on `SXongin/cola`. Use the 
 
 - **Create an issue**: `gh issue create --title "..." --body "..."`. Use a heredoc or `--body-file` for multi-line bodies.
 - **Read an issue**: `gh issue view <number> --comments`, filtering comments by `jq` and also fetching labels.
-- **List issues**: `gh issue list --state open --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters.
+- **List issues**: `gh issue list --state open --limit 500 --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters. `gh issue list` returns 30 rows by default and `--json` does not auto-paginate — always pass a `--limit` (or use `gh api --paginate`) when the list feeds a batch.
 - **Comment on an issue**: `gh issue comment <number> --body "..."`
 - **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
 - **Close**: `gh issue close <number> --comment "..."`
@@ -35,7 +35,7 @@ Run `gh issue view <number> --comments`.
 
 ## Specs and tickets
 
-A spec is an issue; its tickets are standalone issues linked back to it by a `## Parent` body reference. `/to-tickets` writes the reference when the spec issue is the source it was given, so pass the spec's issue number to `/to-tickets`. To resolve a spec's batch: list open `ready-for-agent` issues and keep the bodies whose `## Parent` names the spec issue.
+A spec is an issue; its tickets are standalone issues linked back to it by a `## Parent` body reference. `/to-tickets` writes the reference when the spec issue is the source it was given, so pass the spec's issue number to `/to-tickets`. To resolve a spec's batch: list the spec's open children (every open issue whose `## Parent` names the spec issue) and keep the `ready-for-agent` ones as the runnable set; every other child is a reported drop, never a silent omission.
 
 ## Wayfinding operations
 
