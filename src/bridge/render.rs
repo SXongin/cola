@@ -155,14 +155,15 @@ fn extract_tool_output(part: &serde_json::Value, status: &str) -> Option<String>
     }
 }
 
-/// For an `edit` tool, prefer the REAL diff recorded in `state.metadata.diff`
-/// (OpenCode computes it with `createTwoFilesPatch`) over the tool's plain
-/// text output ("Edit applied successfully."), which tells the reader nothing
-/// about what changed. `extract_tool_output` only reads
+/// For a file-editing tool (`edit`, `apply_patch`), prefer the REAL diff
+/// recorded in `state.metadata.diff` (OpenCode computes it with
+/// `createTwoFilesPatch`) over the tool's plain text output ("Edit applied
+/// successfully." / "Success. Updated the following files: …"), which tells
+/// the reader nothing about what changed. `extract_tool_output` only reads
 /// `state.output/content/result`, so without this the diff — the actual
 /// interesting content of every file edit — was silently dropped and the card
 /// just repeated the file name. Failures keep their extracted error text.
-fn edit_tool_output(part: &serde_json::Value, status: &str) -> Option<String> {
+fn edit_tool_output(part: &serde_json::Value, status: &str, name: &str) -> Option<String> {
     let orig = extract_tool_output(part, status);
     if status == "error" {
         return orig;
@@ -171,17 +172,30 @@ fn edit_tool_output(part: &serde_json::Value, status: &str) -> Option<String> {
         .pointer("/state/metadata/diff")
         .and_then(|v| v.as_str())
         .filter(|d| !d.is_empty())?;
-    // The success sentence is noise once the diff is shown; anything beyond it
-    // (e.g. an "LSP errors detected" note) is kept as a tail after the diff.
+    // The success sentence (and, for apply_patch, the A/M/D file summary after
+    // it) is noise once the diff is shown; anything beyond it (e.g. an "LSP
+    // errors detected" note) is kept as a tail after the diff.
     let tail = orig
         .as_deref()
-        .and_then(|o| o.strip_prefix("Edit applied successfully."))
+        .and_then(|o| match name {
+            "apply_patch" => strip_patch_summary(o),
+            _ => o.strip_prefix("Edit applied successfully."),
+        })
         .map(|s| s.trim_start_matches('\n'))
         .filter(|s| !s.is_empty());
     Some(match tail {
         Some(t) => format!("{diff}\n\n{t}"),
         None => diff.to_string(),
     })
+}
+
+/// Drop `apply_patch`'s success summary — `Success. Updated the following
+/// files:` plus its `A`/`M`/`D` path lines — and return what follows (the LSP
+/// note blocks, separated by a blank line), or `None` when nothing follows.
+fn strip_patch_summary(output: &str) -> Option<&str> {
+    output
+        .strip_prefix("Success. Updated the following files:")
+        .and_then(|rest| rest.split_once("\n\n").map(|(_, tail)| tail))
 }
 
 /// Render canonical message parts (from `POST /session/{id}/message` response)
@@ -234,8 +248,8 @@ fn render_part(acc: &mut StreamAccumulator, part: &serde_json::Value) {
             // field on tool parts — reading it silently lost every result. An
             // `edit` call additionally records its unified diff in
             // `state.metadata.diff`, which is what the panel should show.
-            let output = if name == "edit" {
-                edit_tool_output(part, status)
+            let output = if name == "edit" || name == "apply_patch" {
+                edit_tool_output(part, status, name)
             } else {
                 extract_tool_output(part, status)
             };
@@ -716,6 +730,44 @@ mod tests {
         let mut acc = StreamAccumulator::new("test");
         render_parts(&mut acc, &parts);
         assert_eq!(acc.tools["call_2"].output.as_deref(), Some("fn main() {}"));
+    }
+
+    /// #202: an `apply_patch` records its real change in `metadata.diff` (like
+    /// `edit`), while `state.output` is only the success summary. The panel
+    /// must show the diff, keep an LSP note as its tail, and drop the summary.
+    #[test]
+    fn apply_patch_uses_metadata_diff_and_keeps_the_lsp_tail() {
+        let diff = "\
+Index: /x/src/main.rs
+===================================================================
+--- /x/src/main.rs
++++ /x/src/main.rs
+@@ -1,3 +1,3 @@
+ let a = 1;
+-let b = 2;
++let b = 3;
+ let c = 4;";
+        let output = "Success. Updated the following files:\nM src/main.rs\n\n\
+                      LSP errors detected in src/main.rs, please fix:\nboom";
+        let parts = serde_json::json!([
+            {"type": "tool", "tool": "apply_patch", "callID": "call_patch",
+             "state": {"status": "completed",
+                       "input": {"patchText": "*** Begin Patch"},
+                       "output": output,
+                       "metadata": {"diff": diff}}},
+        ]);
+        let mut acc = StreamAccumulator::new("test");
+        render_parts(&mut acc, &parts);
+        let out = acc.tools["call_patch"].output.as_deref().unwrap();
+        assert!(out.contains("+let b = 3;"), "hunk shown: {out}");
+        assert!(
+            out.contains("LSP errors detected in src/main.rs"),
+            "LSP tail kept: {out}"
+        );
+        assert!(
+            !out.contains("Success. Updated"),
+            "success summary dropped: {out}"
+        );
     }
 
     #[test]
