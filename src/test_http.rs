@@ -7,6 +7,7 @@
 //! production ones (ADR-0031). Compiled only for tests.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
@@ -17,6 +18,8 @@ struct Route {
     status: u16,
     content_type: String,
     body: Vec<u8>,
+    /// Held before the response is written — for exercising client timeouts.
+    delay: Duration,
 }
 
 /// One request received by the server, recorded for assertions.
@@ -112,6 +115,27 @@ impl TestHttpServer {
             status,
             content_type: content_type.to_string(),
             body: body.into(),
+            delay: Duration::ZERO,
+        });
+    }
+
+    /// Answer every matching request only after `delay` — a hanging backend
+    /// for timeout tests (pair with a paused runtime to keep it instant).
+    pub fn route_delayed(
+        &self,
+        method: &str,
+        path_prefix: &str,
+        status: u16,
+        body: impl Into<String>,
+        delay: Duration,
+    ) {
+        self.state.routes.lock().unwrap().push(Route {
+            method: method.to_ascii_uppercase(),
+            path_prefix: path_prefix.to_string(),
+            status,
+            content_type: "application/json".to_string(),
+            body: body.into().into_bytes(),
+            delay,
         });
     }
 
@@ -150,7 +174,10 @@ async fn handle_connection(stream: tokio::net::TcpStream, state: Arc<ServerState
         return;
     };
     state.requests.lock().unwrap().push(request.clone());
-    let (status, content_type, body) = response_for(&state, &request);
+    let (status, content_type, body, delay) = response_for(&state, &request);
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
     let mut stream = reader.into_inner();
     write_response(&mut stream, status, &content_type, &body).await;
 }
@@ -198,14 +225,19 @@ async fn read_request(reader: &mut tokio::io::BufReader<tokio::net::TcpStream>) 
     })
 }
 
-fn response_for(state: &ServerState, request: &RecordedRequest) -> (u16, String, Vec<u8>) {
+fn response_for(state: &ServerState, request: &RecordedRequest) -> (u16, String, Vec<u8>, Duration) {
     let routes = state.routes.lock().unwrap();
     let matched = routes
         .iter()
         .filter(|route| route.method == request.method && request.path.starts_with(&route.path_prefix))
         .max_by_key(|route| route.path_prefix.len());
     match matched {
-        Some(route) => (route.status, route.content_type.clone(), route.body.clone()),
+        Some(route) => (
+            route.status,
+            route.content_type.clone(),
+            route.body.clone(),
+            route.delay,
+        ),
         None => (
             404,
             "application/json".to_string(),
@@ -215,6 +247,7 @@ fn response_for(state: &ServerState, request: &RecordedRequest) -> (u16, String,
             })
             .to_string()
             .into_bytes(),
+            Duration::ZERO,
         ),
     }
 }
