@@ -51,9 +51,13 @@ pub const FEISHU_CARD_LIMIT_BYTES: usize = 30_000;
 /// count.
 pub const MAX_CARD_JSON_CHARS: usize = FEISHU_CARD_LIMIT_BYTES - 5_000;
 
-/// A single text element; bound it so a very long reply never pushes the card
-/// over Feishu's total card size / element limits. Reasoning, tool input/output
-/// and the question are already truncated per-element.
+/// Cola's own budget for one markdown element — NOT a Feishu per-element cap.
+/// The platform documents no text-length limit per markdown element (a single
+/// 8000-char ASCII / 3060-char CJK element renders fully via both create and
+/// PATCH); the hard card limits are 30KB total and 200 elements/components
+/// (11310). Keeping each element ≤ 3000 chars keeps a card of many elements
+/// comfortably inside both. Reasoning, tool input/output and the question are
+/// capped per-element on top of this.
 pub const MAX_ELEMENT_TEXT_CHARS: usize = 3000;
 
 /// Split `text` into chunks of at most `max` chars (character-aware), keeping

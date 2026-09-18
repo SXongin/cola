@@ -140,9 +140,10 @@ impl CardBuilder {
     }
 
     pub fn with_text(mut self, text: &str) -> Self {
-        // Long text is split across multiple elements (each within the
-        // per-element limit) so nothing is truncated; the card splitter bounds
-        // how much text one card carries.
+        // Long text is split across multiple elements, each within cola's
+        // per-element budget (MAX_ELEMENT_TEXT_CHARS), while the card splitter
+        // bounds how much text one card carries. The split is a size budget,
+        // not a workaround for a Feishu truncation.
         for chunk in chunk_text(text, MAX_ELEMENT_TEXT_CHARS) {
             self.body.push(json!({ "tag": "markdown", "content": chunk }));
         }
@@ -325,8 +326,10 @@ pub(super) fn panel_time_suffix(at_ms: Option<i64>) -> String {
 
 /// Build a collapsible panel (v2) holding several markdown chunks, folded by
 /// default. Used when one logical section (e.g. a snapshot tail entry's full
-/// text) needs splitting across multiple markdown elements to stay within the
-/// per-element character cap — a single `content` string would silently truncate.
+/// text) needs splitting across multiple markdown elements to stay within
+/// cola's per-element budget ([`MAX_ELEMENT_TEXT_CHARS`]) — Feishu does not
+/// truncate a long element itself; the budget keeps the card's total size and
+/// element count bounded.
 ///
 /// `element_id` names the panel for the duration of the card: the streaming
 /// card re-renders its whole JSON on every flush, and the client holds each
@@ -713,8 +716,8 @@ mod tests {
             text_els.len(),
             card
         );
-        // No element exceeds the per-element cap, and NOTHING is truncated —
-        // the full text is preserved across the elements.
+        // No element exceeds cola's per-element budget, and NOTHING is
+        // truncated — the full text is preserved across the elements.
         for el in &text_els {
             let content = el["content"].as_str().unwrap();
             assert!(

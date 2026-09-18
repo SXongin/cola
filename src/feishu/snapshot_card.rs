@@ -98,7 +98,7 @@ fn pending_block_elements(
 
 /// The 最近对话 panel: the last-four tail entries, each role-marked and shown
 /// folded — its header previews the entry briefly and expanding reveals the
-/// full verbatim text (chunked to the per-element cap). No tail → no panel.
+/// full verbatim text (chunked to cola's per-element budget). No tail → no panel.
 fn tail_panels(tail: &[TailEntry]) -> Vec<serde_json::Value> {
     let mut panels = Vec::new();
     if tail.is_empty() {
@@ -484,15 +484,16 @@ mod tests {
                 )
             })
             .collect();
-        // Push the last entry past the single-element markdown cap so the panel
-        // must chunk its full text rather than truncating it — long enough to
-        // cross the cap, small enough that the whole card still fits Feishu's
-        // byte budget (a truly unbounded message has no one-card answer; the
-        // streaming path splits turns for that, a snapshot is one-shot).
+        // Push the last entry past cola's single-element budget so the panel
+        // chunks its full text rather than truncating it — long enough to
+        // cross the budget, small enough that the whole card still fits
+        // Feishu's byte budget (a truly unbounded message has no one-card
+        // answer; the streaming path splits turns for that, a snapshot is
+        // one-shot).
         long_tail.push(tail(
             "assistant",
             9000,
-            // Just over the 3000-char per-element cap ("超长内容。" is 5 chars),
+            // Just over the 3000-char element budget ("超长内容。" is 5 chars),
             // so the entry splits into two chunks while the whole card still
             // fits the one-shot byte budget.
             &format!(
