@@ -45,7 +45,11 @@ Done when the ticket's commits are on the branch, its window review is clean or 
 
 ## 4. Verify and build the dossier
 
-Fetch and, if `origin/main` advanced, rebase the branch onto it — a conflict pauses the batch. Then run the repo's full verification loop (`AGENTS.md`, "Local development") on the branch: fmt check, clippy, tests, release build.
+Fetch and, if `origin/main` advanced, rebase the branch onto it — a conflict pauses the batch.
+
+Then close the per-ticket review's fidelity gap. A later ticket can edit a file an earlier ticket's window already passed, so the earlier ticket's reviewed state is not its shipped state, and no per-ticket pass examined the two together. Collect the files touched by two or more tickets (group `main..HEAD` commits by their `Refs: #<n>` trailer and intersect the per-ticket file sets) and, when any exist, run `/code-review` once with `main` as the fixed point, the diff scoped to that shared set (`git diff main...HEAD -- <paths>`), and the spec issue as the spec source. A file touched by a single ticket was reviewed exactly as it ships — skip it; no shared files at all — skip the pass. Fix findings like step 3.4 and re-run the pass on the changed shared files until clean or two rounds have passed.
+
+Then run the repo's full verification loop (`AGENTS.md`, "Local development") on the branch: fmt check, clippy, tests, release build.
 
 Assemble the dossier:
 
@@ -54,6 +58,8 @@ Assemble the dossier:
 
     ## Tickets
     - #<n> <title> — <commit shas> — review: clean | fixed N findings — criteria: all met | gaps
+
+    Aggregate review (shared files): clean | fixed N findings | skipped, no shared files
 
     ## Verification
     <one line per command, with its result>
