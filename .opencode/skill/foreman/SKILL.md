@@ -15,9 +15,9 @@ Input: a spec issue number, plus optional explicit ticket numbers that override 
 
 Use the gh conventions in `docs/agents/issue-tracker.md`, and paginate — `gh issue list` returns 30 rows by default, `--json` does not auto-paginate, and a result at the `--limit` ceiling is truncated: raise the limit (or fall back to `gh api --paginate`) before resolving.
 
-- Fetch the spec's open children — every open issue whose `## Parent` references the spec issue, whatever its label. Explicit numbers from the user are used verbatim; a scan that finds nothing falls back to asking for numbers.
-- The batch is the `ready-for-agent` children, ordered blockers-first from the native `blocked_by` edges (`issue-tracker.md`); tracker order breaks ties.
-- Reconcile before presenting: every child outside the batch goes on the drop list with its reason — not `ready-for-agent`, or a blocker outside the batch. A child that appears in neither the batch nor the drop list is a resolution bug, not a silent omission.
+- Fetch the spec's open children — every open issue whose `## Parent` references the spec issue, whatever its label. A scan that finds nothing falls back to asking for numbers.
+- The batch is the `ready-for-agent` children, ordered blockers-first from the native `blocked_by` edges (`issue-tracker.md`); tracker order breaks ties. Explicit ticket numbers from the user skip the scan and the label filter — they are the batch verbatim — except that a ticket whose blocker falls outside the batch is still dropped.
+- Reconcile before presenting (scan mode): every child outside the batch goes on the drop list with its reason — not `ready-for-agent`, or a blocker outside the batch. A child that appears in neither the batch nor the drop list is a resolution bug, not a silent omission.
 - Derive the branch name `<type>/<spec-slug>` from the spec's title, e.g. `feat/lazy-session-creation`.
 
 Present the batch: each ticket's number, title, and blockers; the resulting order; the branch name; and the drop list with reasons. Ask the user to confirm. Done when the user approves the list, the order, the branch, and the drop list.
