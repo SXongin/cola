@@ -15,7 +15,7 @@ Input: a spec issue number, plus optional explicit ticket numbers that override 
 
 Use the gh conventions in `docs/agents/issue-tracker.md`:
 
-- List open `ready-for-agent` issues, and keep the bodies whose `## Parent` references the spec issue. Explicit numbers from the user are used verbatim.
+- List open `ready-for-agent` issues, and keep the bodies whose `## Parent` references the spec issue (`issue-tracker.md`, "Specs and tickets"). Explicit numbers from the user are used verbatim; a scan that finds nothing falls back to asking for numbers.
 - Order the set blockers-first from the native `blocked_by` edges (`issue-tracker.md`); tracker order breaks ties.
 - A ticket whose blockers fall outside the batch is not runnable — leave it out and report it.
 - Derive the branch name `<type>/<spec-slug>` from the spec's title, e.g. `feat/lazy-session-creation`.
@@ -72,7 +72,7 @@ Present the dossier and stop. Do not push. Continue only on the user's explicit 
 On the user's go:
 
 - Push the branch.
-- Open exactly one PR against `main`: title from the spec, body with what the batch delivers, the per-ticket summary, the risks, and a `Closes #a, #b, …` line listing every ticket.
+- Open exactly one PR against `main`: a Conventional Commits title derived from the spec (`CONTRIBUTING.md`, "Pull request rules"), body with what the batch delivers, the per-ticket summary, the risks, and a `Closes #a, #b, …` line listing every ticket.
 
 Done when the PR exists. Stop there — the user merges.
 
@@ -117,4 +117,4 @@ Re-run `/foreman <spec>` after an interruption: if the branch exists, switch to 
 
 ## Setup
 
-The implementer inherits this session's model and the user's permission rules. For an unattended batch, allow `git checkout`/`switch`, `git fetch`/`pull`/`rebase`, and `gh issue view`/`list`/`comment`/`api`; keep `git push` and `gh pr create` on ask, so acceptance is enforced twice.
+The implementer inherits this session's model and takes the user's permission rules, except where its own block sets them (`task` and `todowrite` are denied). For an unattended batch, allow `git checkout`/`switch`, `git fetch`/`pull`/`rebase`, and `gh issue view`/`list`/`comment`/`api`; keep `git push` and `gh pr create` on ask, so acceptance is enforced twice.

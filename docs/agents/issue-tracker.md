@@ -33,6 +33,10 @@ Create a GitHub issue.
 
 Run `gh issue view <number> --comments`.
 
+## Specs and tickets
+
+A spec is an issue; its tickets are standalone issues linked back to it by a `## Parent` body reference. `/to-tickets` writes the reference when the spec issue is the source it was given, so pass the spec's issue number to `/to-tickets`. To resolve a spec's batch: list open `ready-for-agent` issues and keep the bodies whose `## Parent` names the spec issue.
+
 ## Wayfinding operations
 
 Used by `/wayfinder`. The **map** is a single issue with **child** issues as tickets.
