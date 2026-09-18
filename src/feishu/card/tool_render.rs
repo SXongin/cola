@@ -334,6 +334,12 @@ fn format_tool_output(name: &str, output: &str) -> (Option<String>, Option<&'sta
             None => (None, None, output.to_string()),
         };
     }
+    if name == "task"
+        && output.starts_with("<task ")
+        && let Some((header, body)) = parse_task_envelope(output)
+    {
+        return (header, None, body);
+    }
     if name == "todowrite" {
         // The output is the list itself, `JSON.stringify(todos, null, 2)`.
         // Parse it back into a checklist; a payload that doesn't parse (a
@@ -378,6 +384,45 @@ fn format_tool_output(name: &str, output: &str) -> (Option<String>, Option<&'sta
         return (None, None, output.to_string());
     }
     (Some(format!("📄 `{}`", path)), code_lang_for_path(&path), body)
+}
+
+/// Strip a `task` tool's XML envelope: `<task id state>` around an optional
+/// `<summary>` and the `<task_result>`/`<task_error>` body. Returns
+/// `(summary as header, body text)`; `None` when the shape doesn't match (an
+/// error text, a legacy payload), so the caller shows the output unchanged.
+fn parse_task_envelope(output: &str) -> Option<(Option<String>, String)> {
+    let first = output.lines().next()?;
+    if !first.starts_with("<task ") || !first.ends_with('>') {
+        return None;
+    }
+    let mut summary = None;
+    let mut body = String::new();
+    let mut in_body = false;
+    for line in output.lines().skip(1) {
+        let t = line.trim();
+        if t == "</task>" {
+            break;
+        }
+        if t.starts_with("<summary>") && t.ends_with("</summary>") {
+            summary = Some(
+                t.trim_start_matches("<summary>")
+                    .trim_end_matches("</summary>")
+                    .to_string(),
+            );
+        } else if t == "<task_result>" || t == "<task_error>" {
+            in_body = true;
+        } else if t == "</task_result>" || t == "</task_error>" {
+            in_body = false;
+        } else if in_body {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    let body = body.trim_end().to_string();
+    if body.is_empty() && summary.is_none() {
+        return None;
+    }
+    Some((summary, body))
 }
 
 /// A language hint for a file path's extension, used as the fenced-code-block
@@ -675,6 +720,45 @@ mod tests {
         assert_eq!(format_tool_output("bash", raw).0, None);
         // Even a read-named tool without the wrapper is left alone.
         assert_eq!(format_tool_output("read", "no wrapper here").2, "no wrapper here");
+    }
+
+    /// #202: a `task` output is an XML envelope (`<task id state>`) around the
+    /// subagent's report. The panel shows the report alone — the wrapper must
+    /// not leak, and a background task's `<summary>` becomes the header.
+    #[test]
+    fn task_output_strips_the_xml_envelope() {
+        let raw = "\
+<task id=\"ses_1\" state=\"completed\">
+<task_result>
+Report line 1
+
+Report line 2
+</task_result>
+</task>";
+        let (header, lang, body) = format_tool_output("task", raw);
+        assert_eq!(header, None, "no summary, no header");
+        assert_eq!(lang, None);
+        assert!(body.starts_with("Report line 1"), "report kept: {body:?}");
+        assert!(body.contains("Report line 2"), "report kept: {body:?}");
+        assert!(!body.contains("<task"), "wrapper stripped: {body:?}");
+        assert!(!body.contains("task_result"), "wrapper stripped: {body:?}");
+    }
+
+    /// A background/error task carries a `<summary>` (the header) and its text
+    /// under `<task_error>`; a task output without the envelope passes through.
+    #[test]
+    fn task_output_keeps_summary_and_error_text() {
+        let raw = "\
+<task id=\"ses_1\" state=\"error\">
+<summary>Background task failed: research</summary>
+<task_error>
+boom
+</task_error>
+</task>";
+        let (header, _, body) = format_tool_output("task", raw);
+        assert_eq!(header.as_deref(), Some("Background task failed: research"));
+        assert_eq!(body.trim(), "boom");
+        assert_eq!(format_tool_output("task", "plain text").2, "plain text");
     }
 
     #[test]
