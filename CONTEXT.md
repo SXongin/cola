@@ -164,6 +164,14 @@ _Avoid_: Split card, multi-card turn, card pagination
 A **Turn**'s live task checklist, rendered as a card-TAIL status section instead of a timeline row: each `todowrite` call replaces it in place, so it rides the newest card of the **Card Chain** and a split never strands the reader on a stale list. Folded by default; its header carries the plan size and the non-empty status counts (`共 N 项 · 🔄 1 · ⬜ 2`) plus the last write's clock, so progress is readable without unfolding. An update arrives as a whole new list, never as an edit of the previous panel.
 _Avoid_: Todo card, task list card, progress panel
 
+**Tool Panel** (工具面板):
+The card element recording one tool call in a **Turn**'s timeline — a folded collapsible panel carrying the tool's name, status icon and server start time, plus its rendered input and output. One call, one panel, and it is not interactive: dealing with a tool's **Permission** or **Question** lives in an **Interaction Block**. The `todowrite` status section is a **Todo Panel**, not a Tool Panel.
+_Avoid_: tool card, call card, tool bubble
+
+**Built-in Tool**:
+A tool OpenCode ships itself, identified by a stable tool id (`bash`, `read`, `edit`, `task`, …). Cola may tailor a Built-in Tool's **Tool Panel** rendering because that id and its payload shapes are a contract cola can follow. Contrast MCP servers and injected plugins (OpenChamber), whose input/output shapes cola treats as opaque text and never models.
+_Avoid_: native tool, core tool, internal tool
+
 **Interaction Block** (交互块):
 A pending **Permission** or **Question** rendered inline inside another card — a **Turn**'s card tail, or a **Session Snapshot**'s pending section — carrying its prompt, controls and answer state, as opposed to a standalone request card. It follows the newest card of its **Turn**'s **Card Chain** (including when a new **Turn** replaces the accumulator) and is updated in place on whichever card currently shows it.
 _Avoid_: Pending section, inline card, request block
@@ -250,6 +258,7 @@ _Avoid_: Notification, message, signal
 - A **Topic** is created around its **Topic Root** and, when cola opens it, is anchored on its **Topic Anchor**; a cola-created **Topic Root** is a **Topic Cover Card**
 - A **Session** contains many **Turns** and has one **Project** and one optional **Agent**
 - A **Turn** renders into a **Card Chain**; a pending **Permission**/**Question** rides its newest card as an **Interaction Block**, and resolving one leaves an **Interaction Receipt**
+- A **Turn** renders one **Tool Panel** per tool call; only **Built-in Tool**s (and tools cola itself injects) may get tailored rendering — every other tool's payload stays opaque
 - A **Session** receives many **Permissions** and **Questions**
 - A **Session Snapshot** reports the state of one **Session** (its last **Turn**'s completion, pending **Permissions**/**Questions**, recent messages) to the **Chat**/**Topic** that activated it
 - The **Bridge** receives **Events** from a **Backend** and renders them as **Card** updates on the **Platform**
