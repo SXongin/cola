@@ -675,6 +675,21 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
             Some(name) => format!("🧩 {}", name),
             None => input.to_string(),
         },
+        "question" => match obj.get("questions").and_then(|v| v.as_array()) {
+            Some(questions) if !questions.is_empty() => {
+                let first = questions[0]
+                    .get("question")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let first = first_chunk(first, 120);
+                if questions.len() == 1 {
+                    format!("❓ {}", first)
+                } else {
+                    format!("❓ {} 个问题 · {}", questions.len(), first)
+                }
+            }
+            _ => input.to_string(),
+        },
         "todowrite" => match parse_todos(input) {
             // The list itself is the Output section; the input only reports
             // how big the plan is — and is all a still-running panel can show.
@@ -1592,6 +1607,44 @@ Index: /a/two.rs
         let text = card.to_string();
         assert!(text.contains("🧩 implement"), "skill name missing: {text}");
         assert!(!text.contains("- name:"), "generic kv leaked: {text}");
+    }
+
+    /// #202: a `question` input is a nested `questions` array that the generic
+    /// key-value fallback rendered as one clipped JSON blob. The panel names
+    /// (the first) question and its count instead.
+    #[test]
+    fn tool_input_question_summarizes_its_questions() {
+        let input = json!({"questions": [
+            {"question": "issue 202 你想让我做什么？", "header": "下一步",
+             "options": [{"label": "先做盘点审计", "description": "…"},
+                         {"label": "直接实现改进", "description": "…"}]},
+            {"question": "第二个问题", "header": "其他", "options": []},
+        ]});
+        let tool = ToolPanel {
+            name: "question".into(),
+            status: "running".into(),
+            input: Some(input.clone()),
+            output: None,
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Streaming)
+            .with_tool(tool)
+            .build();
+        let text = card.to_string();
+        assert!(text.contains("❓ 2 个问题"), "count missing: {text}");
+        assert!(
+            text.contains("issue 202 你想让我做什么？"),
+            "first question missing: {text}"
+        );
+        assert!(!text.contains("- questions:"), "generic blob leaked: {text}");
+
+        // A single question reads without the count.
+        let single = json!({"questions": [{"question": "继续?", "header": "确认", "options": []}]});
+        assert_eq!(format_tool_input("question", &single), "❓ 继续?");
+        assert_eq!(
+            format_tool_input("question", &input),
+            "❓ 2 个问题 · issue 202 你想让我做什么？"
+        );
     }
 
     /// Regression: a tool whose input renders as markdown LIST lines (the
