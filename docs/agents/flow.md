@@ -4,7 +4,7 @@ The route work travels through the skills in this repo. `/ask-matt` is the full 
 
 ## Main flow: idea → ship
 
-Keep steps 1–3 in one unbroken context window, so the grilling, spec, and tickets build on the same thinking. A multi-session build then runs under `/foreman`, which keeps the orchestrating window lean; `/clear` between tickets is needed only when implementing them by hand. If the window approaches the smart zone before tickets exist, `/compact` at the nearest phase boundary rather than pushing on.
+Keep steps 1–3 in one unbroken context window, so the grilling, spec, and tickets build on the same thinking. A multi-session build then runs under `/foreman`: implementation stays out of the orchestrating window (one implementer sub-agent per ticket), while the per-ticket review reports and fix rounds do accumulate there — so each ticket's progress comment is a sanctioned `/compact` boundary, and `/clear` between tickets is needed only when implementing them by hand. If the window approaches the smart zone before tickets exist, `/compact` at the nearest phase boundary rather than pushing on.
 
 1. **`/grill-with-docs`** sharpens the idea by interview and writes what it learns into `CONTEXT.md` and `docs/adr/` as it goes (`domain.md`). Done when every question is settled, or routed to step 2.
 2. **Does a question need a runnable answer?** — a state model, business logic, a UI you have to see. Take the prototype detour:

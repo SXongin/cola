@@ -39,7 +39,7 @@ For each ticket, in order:
 2. **Dispatch the implementer** (`subagent_type: implementer`) with the dispatch prompt below.
 3. **Review the window** — load the `/code-review` skill and run both axes over `PRE...HEAD` with the ticket as the spec source. The review sub-agents dispatch from this main session; a sub-agent cannot spawn them.
 4. **Fix findings** — resume the same implementer session (`task_id`) with the findings, then re-review. Stop and ask after two fix rounds.
-5. **Record progress** — post the progress comment below.
+5. **Record progress** — post the progress comment below. It carries the review outcome and marks the batch's sanctioned `/compact` boundary; never compact mid-ticket.
 
 Done when the ticket's commits are on the branch, its window review is clean or fixed, and the progress comment is posted. Then take the next ticket; never two at once.
 
@@ -95,9 +95,11 @@ Fix rounds resume the same `task_id` and carry the findings verbatim, plus: "Fix
 
 ## Progress comments
 
-After each ticket, post exactly one comment so an interrupted batch can be resumed:
+After each ticket, post exactly one comment so an interrupted batch can be resumed, and carry the review outcome so the batch's bookkeeping survives a `/compact`:
 
-    gh issue comment <ticket> --body "foreman: implemented in <sha>… on <branch> (batch spec #<spec>)."
+    gh issue comment <ticket> --body "foreman: implemented in <sha>… on <branch> (batch spec #<spec>). review: clean | fixed N findings."
+
+That comment is also the batch's sanctioned phase boundary: the ticket is self-contained and everything step 3 accumulated for it — both review reports and the fix exchange — is now disposable, so the main session may `/compact` here before the next dispatch, carrying the batch state forward (spec, branch, tickets done, next ticket). Never compact mid-ticket: a live findings thread is session-local.
 
 ## Pause and ask
 
