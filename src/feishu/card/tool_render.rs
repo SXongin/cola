@@ -84,13 +84,14 @@ pub(super) fn tool_panel_element(
                 content.push_str(&format!("{}\n\n", h));
             }
             let body = truncate_md(&body, TOOL_OUTPUT_MAX_CHARS);
-            // File content (read) and edit hunks render as a fenced code block, as
-            // does anything with long lines or a line Feishu would read as a Setext
-            // underline: Feishu markdown wraps plain text but not code blocks, and
-            // a Setext underline merges the lines above it — so both cases stay on
-            // one visual line per source line inside a fence.
+            // File content (read) and edit/apply_patch hunks render as a fenced
+            // code block, as does anything with long lines or a line Feishu
+            // would read as a Setext underline: Feishu markdown wraps plain text
+            // but not code blocks, and a Setext underline merges the lines above
+            // it — so both cases stay on one visual line per source line inside
+            // a fence.
             let as_code_block = match tool.name.as_str() {
-                "read" | "edit" => true,
+                "read" | "edit" | "apply_patch" => true,
                 _ => needs_code_block(&body),
             };
             if as_code_block {
@@ -130,6 +131,18 @@ pub(crate) struct EditDiff {
 /// Returns `None` when `diff` isn't a recognizable edit diff (plain text
 /// output, an error message), so callers fall back to showing it unchanged.
 pub(crate) fn parse_edit_diff(diff: &str) -> Option<EditDiff> {
+    parse_diff(diff, false)
+}
+
+/// [`parse_edit_diff`] for a multi-file patch (`apply_patch`): each `Index:`
+/// line stays in the body, because a patch can touch several files and —
+/// unlike `edit`, whose single target is named by the input panel — the hunks
+/// alone would not say which file they belong to.
+fn parse_multi_file_diff(diff: &str) -> Option<EditDiff> {
+    parse_diff(diff, true)
+}
+
+fn parse_diff(diff: &str, keep_file_headers: bool) -> Option<EditDiff> {
     let mut path = None;
     let mut additions = 0usize;
     let mut deletions = 0usize;
@@ -144,6 +157,14 @@ pub(crate) fn parse_edit_diff(diff: &str) -> Option<EditDiff> {
         let l = line.trim_end();
         if let Some(p) = l.strip_prefix("Index: ") {
             path = Some(p.to_string());
+            // A new `Index:` starts a new file's header block even after an
+            // earlier file's hunks (a concatenated multi-file patch), so its
+            // `---`/`+++` lines are headers again, not content.
+            in_hunk = false;
+            if keep_file_headers {
+                body.push_str(l);
+                body.push('\n');
+            }
         } else if !in_hunk && l.starts_with("diff --git ") {
             // `a/old b/new` — the explicit Index/filepath carries the target.
         } else if !in_hunk
@@ -291,20 +312,24 @@ fn format_todo_list(todos: &[TodoItem]) -> String {
 /// Render a tool's raw output string human-friendly. OpenCode's `read` tool
 /// wraps its output in XML tags (`<path>…</path>`, `<type>…</type>`,
 /// `<content>…</content>`); strip them so the card shows just the file path and
-/// the numbered lines instead of raw markup. An `edit` tool's output is its
-/// unified diff (substituted by the renderer) — keep only the hunks and report
-/// the change count. A `todowrite` output is its todo list JSON-encoded — render
-/// it as a status checklist. Other tools pass through unchanged.
+/// the numbered lines instead of raw markup. An `edit` or `apply_patch` output
+/// is substituted by its unified diff (`apply_patch` keeps each file's `Index:`
+/// line) — keep only the hunks and report the change count. A `todowrite`
+/// output is its todo list JSON-encoded — render it as a status checklist.
+/// Other tools pass through unchanged.
 ///
 /// Returns `(header, language hint, body)`: the header (the file-path line) is
 /// markdown; the body is shown as a code block so long lines don't wrap. A
 /// `todowrite` header is the list's size and per-status counts — the folded
 /// panel's progress line.
 fn format_tool_output(name: &str, output: &str) -> (Option<String>, Option<&'static str>, String) {
-    if name == "edit" {
-        // The panel input already shows the target file, so the header is just
-        // the change count; the hunks render as a code block.
-        return match parse_edit_diff(output) {
+    if name == "edit" || name == "apply_patch" {
+        let parsed = if name == "apply_patch" {
+            parse_multi_file_diff(output)
+        } else {
+            parse_edit_diff(output)
+        };
+        return match parsed {
             Some(d) => (Some(format!("+{} −{}", d.additions, d.deletions)), None, d.body),
             None => (None, None, output.to_string()),
         };
@@ -733,6 +758,43 @@ Index: src/main.rs
         assert!(md.contains("\n```"), "closing fence: {}", md);
     }
 
+    /// #202: an `apply_patch` panel shows the same hunks as `edit`, fenced
+    /// (monospace, no wrapping), with each patched file named in the body.
+    #[test]
+    fn apply_patch_output_renders_fenced_hunks_in_panel() {
+        let diff = "\
+Index: /x/one.rs
+===================================================================
+--- /x/one.rs
++++ /x/one.rs
+@@ -1,3 +1,3 @@
+ let a = 1;
+-let b = 2;
++let b = 3;
+ let c = 4;";
+        let tool = ToolPanel {
+            name: "apply_patch".into(),
+            status: "completed".into(),
+            input: Some(json!({"patchText": "*** Begin Patch"})),
+            output: Some(diff.into()),
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        let md = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .expect("panel markdown content");
+        assert!(md.contains("**Output**\n\n+1 −1"), "count header: {md}");
+        assert!(
+            md.contains("```\nIndex: /x/one.rs"),
+            "fenced body with the patched file: {md}"
+        );
+        assert!(md.contains("-let b = 2;"), "removed line: {md}");
+        assert!(md.contains("+let b = 3;"), "added line: {md}");
+        assert!(!md.contains("let a = 1;"), "context line dropped: {md}");
+    }
+
     #[test]
     fn parse_edit_diff_counts_and_tracks_path() {
         let diff = "\
@@ -780,6 +842,39 @@ Index: /a/lua.lua
         assert!(d.body.contains("--- old comment"), "removal kept: {}", d.body);
         assert!(d.body.contains("+-- new comment"), "addition kept: {}", d.body);
         assert!(!d.body.contains("return 1"), "context dropped: {}", d.body);
+    }
+
+    /// #202: an `apply_patch` can touch several files, so its hunks keep each
+    /// file's `Index:` line in the body — unlike `edit`, whose single target is
+    /// named by the input panel.
+    #[test]
+    fn apply_patch_output_keeps_per_file_attribution() {
+        let diff = "\
+Index: /a/one.rs
+===================================================================
+--- /a/one.rs
++++ /a/one.rs
+@@ -1,3 +1,3 @@
+ let a = 1;
+-let b = 2;
++let b = 3;
+ let c = 4;
+Index: /a/two.rs
+===================================================================
+--- /a/two.rs
++++ /a/two.rs
+@@ -1 +1 @@
+-x
++y";
+        let (header, lang, body) = format_tool_output("apply_patch", diff);
+        assert_eq!(header.as_deref(), Some("+2 −2"), "count header: {header:?}");
+        assert_eq!(lang, None, "hunks have no language hint");
+        assert!(body.contains("Index: /a/one.rs"), "first file named: {body}");
+        assert!(body.contains("Index: /a/two.rs"), "second file named: {body}");
+        assert!(body.contains("+let b = 3;"), "hunk kept: {body}");
+        assert!(body.contains("+y"), "second hunk kept: {body}");
+        assert!(!body.contains("let a = 1;"), "context dropped: {body}");
+        assert!(!body.contains("+++"), "file header noise dropped: {body}");
     }
 
     #[test]
