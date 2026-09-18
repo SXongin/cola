@@ -340,6 +340,12 @@ fn format_tool_output(name: &str, output: &str) -> (Option<String>, Option<&'sta
     {
         return (header, None, body);
     }
+    if name == "skill"
+        && output.starts_with("<skill_content ")
+        && let Some(body) = parse_skill_envelope(output)
+    {
+        return (None, None, body);
+    }
     if name == "todowrite" {
         // The output is the list itself, `JSON.stringify(todos, null, 2)`.
         // Parse it back into a checklist; a payload that doesn't parse (a
@@ -423,6 +429,35 @@ fn parse_task_envelope(output: &str) -> Option<(Option<String>, String)> {
         return None;
     }
     Some((summary, body))
+}
+
+/// Strip a `skill` tool's XML envelope: `<skill_content name=…>` around the
+/// skill's own markdown, dropping the sampled `<skill_files>` inventory (a
+/// file list the reader can't use). `None` when the wrapper isn't there, so the
+/// caller shows the output unchanged.
+fn parse_skill_envelope(output: &str) -> Option<String> {
+    let first = output.lines().next()?;
+    if !first.starts_with("<skill_content ") || !first.ends_with('>') {
+        return None;
+    }
+    let mut body = String::new();
+    let mut in_files = false;
+    for line in output.lines().skip(1) {
+        let t = line.trim();
+        if t == "</skill_content>" {
+            break;
+        }
+        if t == "<skill_files>" {
+            in_files = true;
+        } else if t == "</skill_files>" {
+            in_files = false;
+        } else if !in_files {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    let body = body.trim_end().to_string();
+    (!body.is_empty()).then_some(body)
 }
 
 /// A language hint for a file path's extension, used as the fenced-code-block
@@ -568,6 +603,10 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
                 .unwrap_or_default();
             format!("🔀 {}{}", desc, sub)
         }
+        "skill" => match get("name") {
+            Some(name) => format!("🧩 {}", name),
+            None => input.to_string(),
+        },
         "todowrite" => match parse_todos(input) {
             // The list itself is the Output section; the input only reports
             // how big the plan is — and is all a still-running panel can show.
@@ -759,6 +798,34 @@ boom
         assert_eq!(header.as_deref(), Some("Background task failed: research"));
         assert_eq!(body.trim(), "boom");
         assert_eq!(format_tool_output("task", "plain text").2, "plain text");
+    }
+
+    /// #202: a `skill` output is a `<skill_content>` XML envelope; the panel
+    /// shows the skill's instructions alone (the sampled `<skill_files>` list is
+    /// a file inventory the reader can't use).
+    #[test]
+    fn skill_output_strips_the_envelope_and_file_list() {
+        let raw = "\
+<skill_content name=\"implement\">
+# Skill: implement
+
+Do the work.
+
+Base directory for this skill: /root/.agents/skills/implement
+Relative paths in this skill (e.g., scripts/, reference/) are relative to this base directory.
+
+<skill_files>
+<file>/root/.agents/skills/implement/SKILL.md</file>
+<file>/root/.agents/skills/implement/other.md</file>
+</skill_files>
+</skill_content>";
+        let (header, lang, body) = format_tool_output("skill", raw);
+        assert_eq!(header, None, "the input names the skill");
+        assert_eq!(lang, None);
+        assert!(body.contains("Do the work."), "content kept: {body:?}");
+        assert!(!body.contains("<skill_content"), "wrapper stripped: {body:?}");
+        assert!(!body.contains("skill_files"), "file list stripped: {body:?}");
+        assert!(!body.contains("other.md"), "sampled files stripped: {body:?}");
     }
 
     #[test]
@@ -1387,6 +1454,25 @@ Index: /a/two.rs
             "glob pattern must appear once: {}",
             text
         );
+    }
+
+    /// #202: a `skill` input is just the skill's name — show it as a one-liner
+    /// instead of the generic `- name: …` key-value line.
+    #[test]
+    fn tool_input_skill_shows_its_name() {
+        let tool = ToolPanel {
+            name: "skill".into(),
+            status: "completed".into(),
+            input: Some(json!({"name": "implement"})),
+            output: None,
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        let text = card.to_string();
+        assert!(text.contains("🧩 implement"), "skill name missing: {text}");
+        assert!(!text.contains("- name:"), "generic kv leaked: {text}");
     }
 
     /// Regression: a tool whose input renders as markdown LIST lines (the
