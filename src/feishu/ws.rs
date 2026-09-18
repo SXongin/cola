@@ -647,8 +647,9 @@ async fn handle_binary_frame(
                     // The handler is stuck. Answer now and drop its late
                     // result; the handler keeps running, because cancelling it
                     // would strand whatever it already mutated mid-settle. The
-                    // next render poll reconciles the card it was going to
-                    // update.
+                    // next render poll repaints the current card; a standalone
+                    // or non-current clicked card keeps its controls until the
+                    // settled result re-serves on a second click.
                     tracing::warn!(
                         "card action exceeded the {}ms ack budget; answered early",
                         state.card_ack_budget.as_millis()
@@ -1259,6 +1260,18 @@ mod transport_tests {
         }
     }
 
+    /// A sink whose card handler panics — the detached task must contain it.
+    struct PanickingSink;
+
+    #[async_trait::async_trait]
+    impl EventSink for PanickingSink {
+        async fn handle_message(&self, _msg: IncomingMessage) {}
+
+        async fn handle_card_action(&self, _value: serde_json::Value) -> Option<CardActionResult> {
+            panic!("card handler exploded");
+        }
+    }
+
     /// The fake HTTP response serving a WS endpoint, in Feishu's shape
     /// (`data.URL` is uppercase on the wire).
     fn ws_endpoint_route(url: &str) -> String {
@@ -1472,6 +1485,53 @@ mod transport_tests {
             socket.try_next_binary(Duration::from_millis(200)).await.is_none(),
             "the late card result must be dropped, not sent as a second frame"
         );
+
+        socket.close().await;
+        let result = tokio::time::timeout(Duration::from_secs(5), listener)
+            .await
+            .expect("listener task did not finish after close")
+            .expect("listener task panicked");
+        assert!(result.is_ok(), "a clean close should end the loop with Ok");
+    }
+
+    /// A panicking handler must not take the connection down with it: the click
+    /// is still answered (keeping the current card) and the next frame flows.
+    #[tokio::test]
+    async fn panicking_card_action_is_acked_and_the_connection_survives() {
+        let rig = rig().await;
+        let sink: Arc<dyn EventSink> = Arc::new(PanickingSink);
+
+        let listener = tokio::spawn({
+            let sink = Arc::clone(&sink);
+            let feishu = Arc::clone(&rig.feishu);
+            let state = Arc::clone(&rig.state);
+            async move { connect_and_listen(&sink, &feishu, &state).await }
+        });
+
+        let mut socket = rig.ws.accept().await;
+        socket.send_binary(event_bytes(&card_action_payload())).await;
+        let resp = Frame::decode(&socket.next_binary(Duration::from_secs(5)).await).expect("ack decodes");
+        let resp_json: serde_json::Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(resp_json["code"], 200);
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(resp_json["data"].as_str().expect("data is base64"))
+            .expect("data decodes");
+        let inner: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert!(
+            inner.as_object().is_some_and(|o| o.is_empty()),
+            "a panicking handler must keep the card, got: {inner}"
+        );
+
+        // The loop must still answer the next frame.
+        socket
+            .send_binary(event_bytes(&receive_payload(
+                "e_after_panic",
+                chrono::Utc::now().timestamp_millis(),
+            )))
+            .await;
+        let ack = Frame::decode(&socket.next_binary(Duration::from_secs(5)).await).expect("next ack decodes");
+        let ack_json: serde_json::Value = serde_json::from_slice(&ack.payload).unwrap();
+        assert_eq!(ack_json["code"], 200);
 
         socket.close().await;
         let result = tokio::time::timeout(Duration::from_secs(5), listener)
