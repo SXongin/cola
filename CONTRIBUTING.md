@@ -190,6 +190,11 @@ release cannot be revoked. Two operational rules follow:
 - If a version must be yanked on crates.io, remove the matching GitHub Release
   too, or GitHub-channel installs keep receiving it.
 
+Release notes are generated from merged PR titles (`generate_release_notes`).
+A release that ships a user-visible compatibility change must add the note
+itself (`gh release edit <version>`) — e.g. ADR-0041's `sessions.json` format
+change, which older binaries read as an empty mapping.
+
 ### Release smoke test
 
 `cargo xtask release` prints this checklist and waits for confirmation
