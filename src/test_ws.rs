@@ -77,6 +77,21 @@ impl TestWsSocket {
         }
     }
 
+    /// Like [`next_binary`], but `None` on timeout or close instead of
+    /// panicking — for asserting that NO frame follows.
+    pub async fn try_next_binary(&mut self, timeout: Duration) -> Option<Vec<u8>> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let msg = tokio::time::timeout_at(deadline, self.ws.next()).await.ok()?;
+            let msg = msg?.ok()?;
+            match msg {
+                Message::Binary(data) => return Some(data.to_vec()),
+                Message::Close(_) => return None,
+                _ => continue,
+            }
+        }
+    }
+
     /// Close the connection cleanly (the close handshake), like a server
     /// shutting down.
     pub async fn close(&mut self) {

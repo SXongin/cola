@@ -52,19 +52,34 @@ impl DedupeSet {
     }
 }
 
+/// How long the WS loop waits for a card action's handler before answering
+/// Feishu anyway. Feishu fails a card callback it does not hear back from
+/// within 3 s, and 2 s leaves room for delivery while every legitimate handler
+/// finishes in milliseconds. On expiry the handler keeps running; only its
+/// final card update is forfeited (it must never hold the ack hostage).
+const CARD_ACK_BUDGET: Duration = Duration::from_secs(2);
+
 /// State the ws platform owns, folded out of the bridge core: event-id dedupe
-/// (Feishu re-delivers at-least-once) and cola's own open_id (needed to strip
-/// the bot's own @mention from prompt text).
+/// (Feishu re-delivers at-least-once), cola's own open_id (needed to strip
+/// the bot's own @mention from prompt text), and the card-action ack budget.
 pub struct WsState {
     seen_event_ids: Mutex<DedupeSet>,
     bot_open_id: Mutex<Option<String>>,
+    card_ack_budget: Duration,
 }
 
 impl WsState {
     pub fn new() -> Self {
+        Self::with_card_ack_budget(CARD_ACK_BUDGET)
+    }
+
+    /// The production budget unless a test shrinks it (a blocked handler must
+    /// not stall the test for seconds).
+    fn with_card_ack_budget(card_ack_budget: Duration) -> Self {
         Self {
             seen_event_ids: Mutex::new(DedupeSet::new(10_000)),
             bot_open_id: Mutex::new(None),
+            card_ack_budget,
         }
     }
 
@@ -138,6 +153,13 @@ fn build_response_frame(
     let payload = format!(r#"{{"code":200,"headers":null,"data":"{}"}}"#, data_b64);
 
     pbbp2::encode(&request.routing, &reply_headers(request), payload.as_bytes())
+}
+
+/// One string field of a card-action payload, `-` when absent. The click log
+/// names the action and its subject without dumping form contents — those are
+/// the user's answers.
+fn card_action_field<'a>(value: &'a serde_json::Value, key: &str) -> &'a str {
+    value.get(key).and_then(|v| v.as_str()).unwrap_or("-")
 }
 
 /// Build the ack frame Feishu requires for EVERY ordinary event (message
@@ -596,17 +618,69 @@ async fn handle_binary_frame(
         }
         FrameAction::CardAction(value) => {
             // Ack ALWAYS — even an unparseable card action must be acked,
-            // otherwise Feishu re-delivers it forever (pitfall 8).
+            // otherwise Feishu re-delivers it forever (pitfall 8) — and always
+            // within CARD_ACK_BUDGET: Feishu fails a callback it does not hear
+            // back from within 3 s. The handler runs detached so a slow backend
+            // cannot hold the ack hostage; only a result that beats the budget
+            // rides the response.
             tracing::debug!("card action value: {:?}", value.to_string());
-            let result = sink.handle_card_action(value).await;
-            let resp_bytes = build_response_frame(&frame, result.as_ref());
+            tracing::info!(
+                "card action: action={} reply={} request_id={} operator={}",
+                card_action_field(&value, "action"),
+                card_action_field(&value, "reply"),
+                card_action_field(&value, "request_id"),
+                card_action_field(&value, "operator_open_id"),
+            );
+            let started = std::time::Instant::now();
+            let mut handler = tokio::spawn({
+                let sink = sink.clone();
+                async move { sink.handle_card_action(value).await }
+            });
+            let resp_bytes = match tokio::time::timeout(state.card_ack_budget, &mut handler).await {
+                Ok(Ok(result)) => build_response_frame(&frame, result.as_ref()),
+                Ok(Err(e)) => {
+                    // The handler panicked: the click still needs an answer.
+                    tracing::error!("card action handler failed: {}", e);
+                    build_response_frame(&frame, None)
+                }
+                Err(_) => {
+                    // The handler is stuck. Answer now and drop its late
+                    // result; the handler keeps running, because cancelling it
+                    // would strand whatever it already mutated mid-settle. The
+                    // next render poll reconciles the card it was going to
+                    // update.
+                    tracing::warn!(
+                        "card action exceeded the {}ms ack budget; answered early",
+                        state.card_ack_budget.as_millis()
+                    );
+                    tokio::spawn(async move {
+                        match handler.await {
+                            Ok(result) => {
+                                let (card, toast) = result
+                                    .as_ref()
+                                    .map(|r| (r.card.is_some(), r.toast.as_deref()))
+                                    .unwrap_or((false, None));
+                                tracing::info!(
+                                    "late card action result dropped (card={card}, toast={toast:?})"
+                                );
+                            }
+                            Err(e) => tracing::error!("late card action handler failed: {}", e),
+                        }
+                    });
+                    let pending = crate::bridge::handler::CardActionResult {
+                        card: None,
+                        toast: Some("处理中…".to_string()),
+                    };
+                    build_response_frame(&frame, Some(&pending))
+                }
+            };
             if let Err(e) = ws
                 .send(tokio_tungstenite::tungstenite::Message::Binary(resp_bytes.into()))
                 .await
             {
                 tracing::warn!("WS response send failed: {}", e);
             } else {
-                tracing::info!("Sent card action ack");
+                tracing::info!("Sent card action ack ({}ms)", started.elapsed().as_millis());
             }
         }
         FrameAction::None => {
@@ -1140,6 +1214,7 @@ mod transport_tests {
     use crate::test_http::TestHttpServer;
     use crate::test_ws::TestWsServer;
     use base64::Engine as _;
+    use tokio::sync::Notify;
 
     /// An `EventSink` that records what reached the bridge side of the socket.
     #[derive(Default)]
@@ -1159,6 +1234,27 @@ mod transport_tests {
             Some(CardActionResult {
                 card: Some(serde_json::json!({ "schema": "2.0" })),
                 toast: Some("已处理".into()),
+            })
+        }
+    }
+
+    /// A sink whose card handler blocks until the test releases it — the shape
+    /// of a handler stuck on a slow backend.
+    struct BlockingSink {
+        started: Notify,
+        release: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl EventSink for BlockingSink {
+        async fn handle_message(&self, _msg: IncomingMessage) {}
+
+        async fn handle_card_action(&self, _value: serde_json::Value) -> Option<CardActionResult> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Some(CardActionResult {
+                card: Some(serde_json::json!({ "schema": "2.0", "late": true })),
+                toast: Some("late".into()),
             })
         }
     }
@@ -1195,12 +1291,16 @@ mod transport_tests {
     }
 
     async fn rig() -> TestRig {
+        rig_with_budget(CARD_ACK_BUDGET).await
+    }
+
+    async fn rig_with_budget(card_ack_budget: Duration) -> TestRig {
         let http = TestHttpServer::start().await;
         let ws = TestWsServer::start().await;
         http.route("POST", "/callback/ws/endpoint", 200, ws_endpoint_route(&ws.url()));
         TestRig {
             feishu: test_client(http.base_url()),
-            state: Arc::new(WsState::new()),
+            state: Arc::new(WsState::with_card_ack_budget(card_ack_budget)),
             _http: http,
             ws,
         }
@@ -1318,6 +1418,61 @@ mod transport_tests {
         assert_eq!(recorder.actions.lock().await[0]["request_id"], "p1");
 
         // A clean server close ends the loop with Ok.
+        socket.close().await;
+        let result = tokio::time::timeout(Duration::from_secs(5), listener)
+            .await
+            .expect("listener task did not finish after close")
+            .expect("listener task panicked");
+        assert!(result.is_ok(), "a clean close should end the loop with Ok");
+    }
+
+    /// A card action stuck in its handler must still be answered before Feishu's
+    /// 3 s callback budget: the ack goes out at the budget and the handler's
+    /// late result is dropped, never sent as a second frame.
+    #[tokio::test]
+    async fn slow_card_action_is_acked_before_the_handler_finishes() {
+        let rig = rig_with_budget(Duration::from_millis(50)).await;
+        let recorder = Arc::new(BlockingSink {
+            started: Notify::new(),
+            release: Notify::new(),
+        });
+        let sink: Arc<dyn EventSink> = recorder.clone();
+
+        let listener = tokio::spawn({
+            let sink = Arc::clone(&sink);
+            let feishu = Arc::clone(&rig.feishu);
+            let state = Arc::clone(&rig.state);
+            async move { connect_and_listen(&sink, &feishu, &state).await }
+        });
+
+        let mut socket = rig.ws.accept().await;
+        socket.send_binary(event_bytes(&card_action_payload())).await;
+        tokio::time::timeout(Duration::from_secs(5), recorder.started.notified())
+            .await
+            .expect("the card action never reached the sink");
+
+        // The handler is blocked; the ack must arrive anyway. With no budget it
+        // would wait for the handler forever.
+        let resp = Frame::decode(&socket.next_binary(Duration::from_secs(5)).await).expect("ack decodes");
+        let resp_json: serde_json::Value = serde_json::from_slice(&resp.payload).unwrap();
+        assert_eq!(resp_json["code"], 200);
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(resp_json["data"].as_str().expect("data is base64"))
+            .expect("data decodes");
+        let inner: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert_eq!(
+            inner["toast"]["content"], "处理中…",
+            "the budget ack must tell the user it is still working"
+        );
+        assert!(inner["card"].is_null(), "the original card must stay untouched");
+
+        // Releasing the handler must not send its result frame after the ack.
+        recorder.release.notify_one();
+        assert!(
+            socket.try_next_binary(Duration::from_millis(200)).await.is_none(),
+            "the late card result must be dropped, not sent as a second frame"
+        );
+
         socket.close().await;
         let result = tokio::time::timeout(Duration::from_secs(5), listener)
             .await
