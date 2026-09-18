@@ -343,7 +343,7 @@ detailed help for any of these.
 | `/new [name]` | Declare a new session in the current project — created by the next message (no session → default dir) |
 | `/topic [dir] [name]` | Open a new Feishu topic in `<dir>`; its first message creates the session (bare `/topic` uses the current project) |
 | `/topic --adopt <kw> [--force]` | Open a topic around an existing session |
-| `/name <name>` | Rename current session (server-side, visible to all clients) |
+| `/name <name>` | Rename current session (server-side, visible to all clients; on a pending, set the creation title) |
 | `/stop` | Interrupt execution |
 | `/compact` | Compact context |
 | `/agent <name>` | Switch agent (takes effect next message; persisted; `--reset` clears to the server default) |
@@ -367,10 +367,14 @@ Notes:
   card's pick and 建话题 follow the same timing (建话题's cover card shows
   「下一条消息创建」 until then).
 - `/agent`, `/model`, `/think`, `/autoaccept` are **per-session** overrides sent
-  with the next message and persisted across restarts. `/model`'s value must
-  exist on the server cola attaches to. Bare `/model` opens the provider → model
-  picker, whose intro shows the model the next message will actually run
-  (session override, else `[opencode] model`, else what the server recorded).
+  with the next message and persisted across restarts. On a session that is still
+  pending (`/new`, `/dir` or `/topic` before its first message — including its
+  card forms), the override is recorded on the pending and applies to the session
+  the first message creates. `/model`'s value must exist on the server cola
+  attaches to. Bare `/model` opens the provider → model picker, whose intro shows
+  the model the next message will actually run (session override, else
+  `[opencode] model`, else what the server recorded). `/compact` and `/stop` need
+  a real session and keep their "还没有会话" replies on a pending.
 - `/restart-opencode` leaves a server launched by another tool alone — it only
   restarts a server cola started itself.
 - Topic rule: inside a topic already bound to a session, `/switch`, `/new` and

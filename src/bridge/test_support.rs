@@ -442,6 +442,8 @@ pub struct MockBackend {
     pub reply_permission_calls: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
     /// Records every `interrupt` call's session id (the `/stop` path).
     pub interrupt_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// Records every `compact` call's session id (the `/compact` path).
+    pub compact_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// Request ids cola answered via `reply_permission` — filtered out of
     /// `list_permissions` like the real server drops a replied request. A test
     /// simulating resolution by ANOTHER client inserts the id here directly.
@@ -580,6 +582,7 @@ impl MockBackend {
             external_user_created: Arc::new(std::sync::Mutex::new(None)),
             reply_permission_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             interrupt_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            compact_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             replied_permissions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             reply_permission_not_found: false,
             fail_reply_permission_count: std::sync::atomic::AtomicUsize::new(0).into(),
@@ -1057,6 +1060,7 @@ impl opencode::Backend for MockBackend {
         Ok(())
     }
     async fn compact(&self, _s: &str) -> crate::error::Result<()> {
+        self.compact_calls.lock().await.push(_s.to_string());
         Ok(())
     }
     async fn reconnect(&self, _url: &str, _password: &str) -> crate::error::Result<()> {
