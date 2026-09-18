@@ -47,7 +47,7 @@ Done when the ticket's commits are on the branch, its window review is clean or 
 
 Fetch and, if `origin/main` advanced, rebase the branch onto it — a conflict pauses the batch.
 
-Then close the per-ticket review's fidelity gap. A later ticket can edit a file an earlier ticket's window already passed, so the earlier ticket's reviewed state is not its shipped state, and no per-ticket pass examined the two together. Collect the files touched by two or more tickets (group `main..HEAD` commits by their `Refs: #<n>` trailer and intersect the per-ticket file sets) and, when any exist, run `/code-review` once with `main` as the fixed point, the diff scoped to that shared set (`git diff main...HEAD -- <paths>`), and the spec issue as the spec source. A file touched by a single ticket was reviewed exactly as it ships — skip it; no shared files at all — skip the pass. Fix findings like step 3.4 and re-run the pass on the changed shared files until clean or two rounds have passed.
+Then close the per-ticket review's fidelity gap. A later ticket can edit a file an earlier ticket's window already passed, so the earlier ticket's reviewed state is not its shipped state, and no per-ticket pass examined the two together. Collect the files touched by two or more tickets (group `main..HEAD` commits by their `Refs: #<n>` trailer and intersect the per-ticket file sets) and, when any exist, run `/code-review` once with `main` as the fixed point, the diff scoped to that shared set (`git diff main...HEAD -- <paths>`), and the spec issue as the spec source. A file touched by a single ticket was reviewed exactly as it ships — skip it; no shared files at all — skip the pass. Fix findings like step 3.4 (a fresh implementer when the ticket's session is gone) and re-run the pass on the changed shared files until clean or two rounds have passed.
 
 Then run the repo's full verification loop (`AGENTS.md`, "Local development") on the branch: fmt check, clippy, tests, release build.
 
@@ -67,7 +67,7 @@ Assemble the dossier:
     ## Risks / gaps
     <what to look at first, or "none">
 
-Done when every ticket appears and every verification command has a result.
+Done when every ticket appears, the aggregate review has a verdict or a skip, and every verification command has a result.
 
 ## 5. Stop for acceptance
 
