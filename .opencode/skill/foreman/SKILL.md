@@ -13,7 +13,7 @@ The main session is the foreman — it resolves the batch, prepares the branch, 
 
 Input: a spec issue number, plus optional explicit ticket numbers that override the scan.
 
-Use the gh conventions in `docs/agents/issue-tracker.md`, and paginate — `gh issue list` returns 30 rows by default and `--json` does not auto-paginate:
+Use the gh conventions in `docs/agents/issue-tracker.md`, and paginate — `gh issue list` returns 30 rows by default, `--json` does not auto-paginate, and a result at the `--limit` ceiling is truncated: raise the limit (or fall back to `gh api --paginate`) before resolving.
 
 - Fetch the spec's open children — every open issue whose `## Parent` references the spec issue, whatever its label. Explicit numbers from the user are used verbatim; a scan that finds nothing falls back to asking for numbers.
 - The batch is the `ready-for-agent` children, ordered blockers-first from the native `blocked_by` edges (`issue-tracker.md`); tracker order breaks ties.
@@ -110,7 +110,7 @@ Put the decision to the user when:
 - the implementer reports a blocker or a question;
 - review findings survive two fix rounds;
 - the rebase onto `main` conflicts, or full verification fails and the implementer cannot fix it;
-- the working tree is dirty.
+- the working tree is dirty with work that is not a ticket's (Recovery covers a ticket's own uncommitted work).
 
 ## Guardrails
 
@@ -123,7 +123,7 @@ Put the decision to the user when:
 
 Re-run `/foreman <spec>` after an interruption. The branch log and the progress comments are the batch's state; the session's captured `PRE` and implementer `task_id`s do not survive it, so rebuild them:
 
-- **Branch**: if `<branch>` exists, verify it is this spec's — its commits carry `Refs:` trailers for the spec's tickets — and that it still holds commits `main` does not; then switch to it. A branch that fails either check stops and asks instead of being adopted.
+- **Branch**: if `<branch>` exists, verify it still has commits `origin/main` does not and that every one of them carries a `Refs:` trailer naming one of this spec's tickets; then switch to it. A branch failing either check stops and asks instead of being adopted.
 - **Windows**: a ticket's window is the run of commits carrying its `Refs: #<n>` trailer, with `PRE` at the commit before the run. Rebuild both from the log.
 - **Tickets**: one with a progress comment is done. One with commits but no comment gets its window reviewed, then its comment. One with neither is re-dispatched.
 - **Interrupted fix round**: the `task_id` is gone; re-review the window (the findings resurface), then dispatch a fresh implementer with them.

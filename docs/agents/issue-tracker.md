@@ -6,7 +6,7 @@ Issues and specs for this repo live as GitHub issues on `SXongin/cola`. Use the 
 
 - **Create an issue**: `gh issue create --title "..." --body "..."`. Use a heredoc or `--body-file` for multi-line bodies.
 - **Read an issue**: `gh issue view <number> --comments`, filtering comments by `jq` and also fetching labels.
-- **List issues**: `gh issue list --state open --limit 500 --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters. `gh issue list` returns 30 rows by default and `--json` does not auto-paginate — always pass a `--limit` (or use `gh api --paginate`) when the list feeds a batch.
+- **List issues**: `gh issue list --state open --limit 1000 --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters. `gh issue list` returns 30 rows by default and `--json` does not auto-paginate — pass a `--limit`, and treat a result whose length equals it as truncated (raise the limit, or fall back to `gh api --paginate`) so a list that feeds a batch is never silently cut short.
 - **Comment on an issue**: `gh issue comment <number> --body "..."`
 - **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
 - **Close**: `gh issue close <number> --comment "..."`
