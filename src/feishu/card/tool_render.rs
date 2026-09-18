@@ -29,6 +29,22 @@ impl ToolPanel {
     }
 }
 
+/// How a Tool Panel's output body renders. The renderer for a tool knows its
+/// own body best, so the choice travels with `format_tool_output`'s result
+/// instead of being re-derived from the tool name at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyStyle {
+    /// Fence it when Feishu markdown would wrap a long line or fold lines into
+    /// a Setext heading (the generic fallback for free text).
+    Auto,
+    /// Always a fenced code block: file content and diff hunks, where one
+    /// visual line per source line matters.
+    Code(Option<&'static str>),
+    /// Markdown by construction (a generated list): never fenced, even when a
+    /// line is long — fencing would show the literal list syntax.
+    Markdown,
+}
+
 /// One tool panel as a folded collapsible element. `at_ms` is the part's
 /// server `state.time.start`; when present, the panel header carries it as
 /// `· HH:MM` so the start time is visible while collapsed (#183), and when
@@ -51,7 +67,10 @@ pub(super) fn tool_panel_element(
     // section rather than the call (a finished call would sit at a permanent ✅
     // while the counts right beside it still report open items).
     let todo_panel = tool.name == "todowrite";
-    let todowrite_list = todo_panel && output.as_ref().is_some_and(|(header, _, _)| header.is_some());
+    let todowrite_list = todo_panel
+        && output
+            .as_ref()
+            .is_some_and(|(_, style, _)| *style == BodyStyle::Markdown);
     let mut content = String::new();
     if !todowrite_list && let Some(i) = &tool.input {
         let formatted = format_tool_input(&tool.name, i);
@@ -64,7 +83,7 @@ pub(super) fn tool_panel_element(
         }
     }
     let mut title_details: Option<String> = None;
-    if let Some((header, lang, body)) = output {
+    if let Some((header, style, body)) = output {
         if todowrite_list {
             // The header is the panel's progress line, not a body intro; the
             // checklist is markdown by construction (status icons,
@@ -84,20 +103,17 @@ pub(super) fn tool_panel_element(
                 content.push_str(&format!("{}\n\n", h));
             }
             let body = truncate_md(&body, TOOL_OUTPUT_MAX_CHARS);
-            // File content (read) and edit/apply_patch hunks render as a fenced
-            // code block, as does anything with long lines or a line Feishu
-            // would read as a Setext underline: Feishu markdown wraps plain text
-            // but not code blocks, and a Setext underline merges the lines above
-            // it — so both cases stay on one visual line per source line inside
-            // a fence.
-            let as_code_block = match tool.name.as_str() {
-                "read" | "edit" | "apply_patch" => true,
-                _ => needs_code_block(&body),
-            };
-            if as_code_block {
-                content.push_str(&fenced_code(&body, lang));
-            } else {
-                content.push_str(&body);
+            // File content (read) and edit/apply_patch hunks always render as a
+            // fenced code block; a `Markdown` body (websearch results) never
+            // does; anything else fences when Feishu markdown would wrap a long
+            // line or fold lines above a Setext underline into one heading.
+            match style {
+                BodyStyle::Code(lang) => content.push_str(&fenced_code(&body, lang)),
+                BodyStyle::Markdown => content.push_str(&body),
+                BodyStyle::Auto if needs_code_block(&body) => {
+                    content.push_str(&fenced_code(&body, None));
+                }
+                BodyStyle::Auto => content.push_str(&body),
             }
         }
     }
@@ -311,18 +327,20 @@ fn format_todo_list(todos: &[TodoItem]) -> String {
 
 /// Render a tool's raw output string human-friendly. OpenCode's `read` tool
 /// wraps its output in XML tags (`<path>…</path>`, `<type>…</type>`,
-/// `<content>…</content>`); strip them so the card shows just the file path and
-/// the numbered lines instead of raw markup. An `edit` or `apply_patch` output
-/// is substituted by its unified diff (`apply_patch` keeps each file's `Index:`
+/// `<content>…</content>`) — strip them so the card shows just the file path
+/// and the numbered lines; a `task`/`skill` output is an XML envelope around
+/// the content the reader wants. An `edit` or `apply_patch` output is
+/// substituted by its unified diff (`apply_patch` keeps each file's `Index:`
 /// line) — keep only the hunks and report the change count. A `todowrite`
-/// output is its todo list JSON-encoded — render it as a status checklist.
-/// Other tools pass through unchanged.
+/// output is its todo list JSON-encoded — render it as a status checklist; a
+/// `websearch` output is its JSON result envelope — render it as a title+url
+/// list. Other tools pass through unchanged.
 ///
-/// Returns `(header, language hint, body)`: the header (the file-path line) is
-/// markdown; the body is shown as a code block so long lines don't wrap. A
-/// `todowrite` header is the list's size and per-status counts — the folded
-/// panel's progress line.
-fn format_tool_output(name: &str, output: &str) -> (Option<String>, Option<&'static str>, String) {
+/// Returns `(header, body style, body)`: the header is the short markdown line
+/// above the body (file path, change count, result count); the style decides
+/// how the body blocks (see [`BodyStyle`]). A `todowrite` header is the list's
+/// size and per-status counts — the folded panel's progress line.
+fn format_tool_output(name: &str, output: &str) -> (Option<String>, BodyStyle, String) {
     if name == "edit" || name == "apply_patch" {
         let parsed = if name == "apply_patch" {
             parse_multi_file_diff(output)
@@ -330,21 +348,25 @@ fn format_tool_output(name: &str, output: &str) -> (Option<String>, Option<&'sta
             parse_edit_diff(output)
         };
         return match parsed {
-            Some(d) => (Some(format!("+{} −{}", d.additions, d.deletions)), None, d.body),
-            None => (None, None, output.to_string()),
+            Some(d) => (
+                Some(format!("+{} −{}", d.additions, d.deletions)),
+                BodyStyle::Code(None),
+                d.body,
+            ),
+            None => (None, BodyStyle::Auto, output.to_string()),
         };
     }
     if name == "task"
         && output.starts_with("<task ")
         && let Some((header, body)) = parse_task_envelope(output)
     {
-        return (header, None, body);
+        return (header, BodyStyle::Auto, body);
     }
     if name == "skill"
         && output.starts_with("<skill_content ")
         && let Some(body) = parse_skill_envelope(output)
     {
-        return (None, None, body);
+        return (None, BodyStyle::Auto, body);
     }
     if name == "todowrite" {
         // The output is the list itself, `JSON.stringify(todos, null, 2)`.
@@ -355,13 +377,18 @@ fn format_tool_output(name: &str, output: &str) -> (Option<String>, Option<&'sta
         {
             return (
                 Some(format!("共 {} 项 · {}", todos.len(), todo_counts(&todos))),
-                None,
+                BodyStyle::Markdown,
                 format_todo_list(&todos),
             );
         }
     }
+    if name == "websearch"
+        && let Some((count, body)) = parse_websearch_results(output)
+    {
+        return (Some(format!("🔎 {} 条结果", count)), BodyStyle::Markdown, body);
+    }
     if name != "read" || !output.contains("<path>") {
-        return (None, None, output.to_string());
+        return (None, BodyStyle::Auto, output.to_string());
     }
     let mut path = String::new();
     let mut body = String::new();
@@ -387,9 +414,13 @@ fn format_tool_output(name: &str, output: &str) -> (Option<String>, Option<&'sta
     }
     if body.trim().is_empty() {
         // Nothing usable parsed — show the raw output so info isn't lost.
-        return (None, None, output.to_string());
+        return (None, BodyStyle::Auto, output.to_string());
     }
-    (Some(format!("📄 `{}`", path)), code_lang_for_path(&path), body)
+    (
+        Some(format!("📄 `{}`", path)),
+        BodyStyle::Code(code_lang_for_path(&path)),
+        body,
+    )
 }
 
 /// Strip a `task` tool's XML envelope: `<task id state>` around an optional
@@ -458,6 +489,43 @@ fn parse_skill_envelope(output: &str) -> Option<String> {
     }
     let body = body.trim_end().to_string();
     (!body.is_empty()).then_some(body)
+}
+
+/// Parse a `websearch` tool's JSON result envelope into an un-fenced markdown
+/// list: one `[title](url)` per result, with its publish date when present.
+/// Excerpts are deliberately dropped — they are the model's reading material,
+/// not the card's. `None` when the payload isn't the expected envelope (the
+/// provider's no-results text, a different provider's shape), so the caller
+/// shows it unchanged.
+fn parse_websearch_results(output: &str) -> Option<(usize, String)> {
+    let value: serde_json::Value = serde_json::from_str(output).ok()?;
+    let results = value.get("results")?.as_array()?;
+    if results.is_empty() {
+        return None;
+    }
+    let mut lines = Vec::with_capacity(results.len());
+    for (i, r) in results.iter().enumerate() {
+        let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        let title = r
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(|t| first_chunk(t, 100))
+            .unwrap_or_default();
+        let mut line = match (title.is_empty(), url.is_empty()) {
+            (false, false) => format!("{}. [{}]({})", i + 1, title, url),
+            (false, true) => format!("{}. {}", i + 1, title),
+            _ => format!("{}. {}", i + 1, url),
+        };
+        if let Some(date) = r
+            .get("publish_date")
+            .and_then(|v| v.as_str())
+            .filter(|d| !d.is_empty())
+        {
+            line.push_str(&format!(" · {}", date));
+        }
+        lines.push(line);
+    }
+    Some((results.len(), lines.join("\n")))
 }
 
 /// A language hint for a file path's extension, used as the fenced-code-block
@@ -721,8 +789,8 @@ mod tests {
 2:     println!(\"hi\");
 3: }
 </content>";
-        let (header, lang, body) = format_tool_output("read", raw);
-        assert_eq!(lang, Some("rust"), "language hint from .rs: {:?}", lang);
+        let (header, style, body) = format_tool_output("read", raw);
+        assert_eq!(style, BodyStyle::Code(Some("rust")), "language hint from .rs");
         let header = header.unwrap_or_default();
         assert!(
             !header.contains("<path>"),
@@ -774,9 +842,9 @@ Report line 1
 Report line 2
 </task_result>
 </task>";
-        let (header, lang, body) = format_tool_output("task", raw);
+        let (header, style, body) = format_tool_output("task", raw);
         assert_eq!(header, None, "no summary, no header");
-        assert_eq!(lang, None);
+        assert_eq!(style, BodyStyle::Auto);
         assert!(body.starts_with("Report line 1"), "report kept: {body:?}");
         assert!(body.contains("Report line 2"), "report kept: {body:?}");
         assert!(!body.contains("<task"), "wrapper stripped: {body:?}");
@@ -819,13 +887,64 @@ Relative paths in this skill (e.g., scripts/, reference/) are relative to this b
 <file>/root/.agents/skills/implement/other.md</file>
 </skill_files>
 </skill_content>";
-        let (header, lang, body) = format_tool_output("skill", raw);
+        let (header, style, body) = format_tool_output("skill", raw);
         assert_eq!(header, None, "the input names the skill");
-        assert_eq!(lang, None);
+        assert_eq!(style, BodyStyle::Auto);
         assert!(body.contains("Do the work."), "content kept: {body:?}");
         assert!(!body.contains("<skill_content"), "wrapper stripped: {body:?}");
         assert!(!body.contains("skill_files"), "file list stripped: {body:?}");
         assert!(!body.contains("other.md"), "sampled files stripped: {body:?}");
+    }
+
+    /// #202: a `websearch` output is a JSON result envelope. The panel shows a
+    /// title+url list (excerpts are the model's reading material) and it stays
+    /// markdown even when a URL trips the long-line fence — fencing would show
+    /// the literal `1. [title](url)` syntax.
+    #[test]
+    fn websearch_output_renders_as_an_unfenced_result_list() {
+        let long_url = format!("https://example.com/{}", "x".repeat(120));
+        let raw = json!({
+            "search_id": "search_1",
+            "results": [
+                {"url": "https://a.example/one", "title": "First result",
+                 "publish_date": "2026-01-02", "excerpts": ["ignored"]},
+                {"url": long_url, "title": "Second result",
+                 "publish_date": null, "excerpts": ["ignored too"]},
+            ]
+        })
+        .to_string();
+        let (header, _, body) = format_tool_output("websearch", &raw);
+        assert_eq!(header.as_deref(), Some("🔎 2 条结果"));
+        assert!(
+            body.contains("1. [First result](https://a.example/one) · 2026-01-02"),
+            "dated first result: {body}"
+        );
+        assert!(body.contains("2. [Second result]("), "second result: {body}");
+        assert!(!body.contains("ignored"), "excerpts dropped: {body}");
+
+        let tool = ToolPanel {
+            name: "websearch".into(),
+            status: "completed".into(),
+            input: Some(json!({"query": "x"})),
+            output: Some(raw.clone()),
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        let md = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .expect("panel markdown content");
+        assert!(
+            md.contains("1. [First result](https://a.example/one)"),
+            "list on card: {md}"
+        );
+        assert!(!md.contains("```"), "the list must not be fenced: {md}");
+
+        // An unparseable output (the provider's no-results text) passes through.
+        let plain = format_tool_output("websearch", "No search results found.");
+        assert_eq!(plain.0, None);
+        assert_eq!(plain.2, "No search results found.");
     }
 
     #[test]
@@ -845,9 +964,9 @@ Index: /x/src/main.rs
 +let b = 3;
  let c = 4;
 \\ No newline at end of file";
-        let (header, lang, body) = format_tool_output("edit", diff);
+        let (header, style, body) = format_tool_output("edit", diff);
         assert_eq!(header.as_deref(), Some("+1 −1"), "count header: {:?}", header);
-        assert_eq!(lang, None, "edit hunks have no language hint");
+        assert_eq!(style, BodyStyle::Code(None), "edit hunks are fenced");
         assert!(body.contains("@@ -10,3 +10,3 @@"), "hunk header kept: {}", body);
         assert!(body.contains("-let b = 2;"), "removed line kept: {}", body);
         assert!(body.contains("+let b = 3;"), "added line kept: {}", body);
@@ -861,9 +980,9 @@ Index: /x/src/main.rs
     fn edit_tool_plain_output_passes_through() {
         // An edit without a parseable diff (running / error text) stays as-is.
         let raw = "❌ Could not find oldString in the file.";
-        let (header, lang, body) = format_tool_output("edit", raw);
+        let (header, style, body) = format_tool_output("edit", raw);
         assert_eq!(header, None);
-        assert_eq!(lang, None);
+        assert_eq!(style, BodyStyle::Auto);
         assert_eq!(body, raw);
         assert_eq!(parse_edit_diff(raw), None);
     }
@@ -1017,9 +1136,9 @@ Index: /a/two.rs
 @@ -1 +1 @@
 -x
 +y";
-        let (header, lang, body) = format_tool_output("apply_patch", diff);
+        let (header, style, body) = format_tool_output("apply_patch", diff);
         assert_eq!(header.as_deref(), Some("+2 −2"), "count header: {header:?}");
-        assert_eq!(lang, None, "hunks have no language hint");
+        assert_eq!(style, BodyStyle::Code(None), "hunks are fenced");
         assert!(body.contains("Index: /a/one.rs"), "first file named: {body}");
         assert!(body.contains("Index: /a/two.rs"), "second file named: {body}");
         assert!(body.contains("+let b = 3;"), "hunk kept: {body}");
@@ -1167,9 +1286,9 @@ Index: /a/two.rs
             "",
             r#"[{"content":"ok","status":"pending"},{"status":"pending"}]"#,
         ] {
-            let (header, lang, body) = format_tool_output("todowrite", raw);
+            let (header, style, body) = format_tool_output("todowrite", raw);
             assert_eq!(header, None, "no header for {raw:?}");
-            assert_eq!(lang, None, "no language hint for {raw:?}");
+            assert_eq!(style, BodyStyle::Auto, "raw fallback for {raw:?}");
             assert_eq!(body, raw, "raw output kept for {raw:?}");
         }
     }
