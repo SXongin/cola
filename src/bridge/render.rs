@@ -771,7 +771,7 @@ pub(crate) async fn render_and_flush(
         let mut cards = core.cards.lock().await;
         match cards.get_mut(session_id) {
             Some(card) => {
-                let sig = (card.acc.context_tokens, card.acc.context_window);
+                let sig = card.acc.context_sig();
                 let changed = card.last_context_sig != sig;
                 card.last_context_sig = sig;
                 changed

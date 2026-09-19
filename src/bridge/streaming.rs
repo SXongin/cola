@@ -244,9 +244,9 @@ pub struct CardSession {
     /// card is re-flushed when the progress timer / state changes even with no
     /// new content (ADR-0014).
     pub last_header_sig: String,
-    /// The context segment's render inputs `(context_tokens, context_window)`
-    /// as of the last flush (ADR-0044), compared each poll so a step's usage
-    /// change flushes even when no part and no header second changed.
+    /// The context segment's render inputs as of the last flush (ADR-0044),
+    /// compared each poll so a step's usage change flushes even when no part
+    /// and no header second changed.
     pub last_context_sig: (i64, Option<i64>),
     /// The Supplement split queue (ADR-0043), in arrival order — never
     /// coalesced. The serving rule: the flush that finalizes the live card
@@ -273,7 +273,7 @@ impl CardSession {
     /// always flushes (stamping the progress timer). `card_message_id` is the
     /// live card to update in place.
     pub fn new(acc: StreamAccumulator, card_message_id: Option<String>) -> Self {
-        let last_context_sig = (acc.context_tokens, acc.context_window);
+        let last_context_sig = acc.context_sig();
         Self {
             acc,
             card_message_id,
@@ -727,16 +727,38 @@ impl StreamAccumulator {
         format!("{}|{}", title, template)
     }
 
+    /// The memoized window, but only when it was fetched for the model that
+    /// produced [`Self::context_tokens`]. A stale denominator paired with a
+    /// newer model's usage would silently lie; ADR-0044 says an unknown window
+    /// renders the used tokens alone.
+    fn current_context_window(&self) -> Option<i64> {
+        let (Some(provider), Some(model)) = (&self.provider_id, &self.model_id) else {
+            return None;
+        };
+        match &self.context_window_key {
+            Some((p, m)) if p == provider && m == model => self.context_window.filter(|w| *w > 0),
+            _ => None,
+        }
+    }
+
+    /// The context segment's render inputs `(used tokens, effective window)` —
+    /// the signature the flush compares. [`Self::context_segment`] renders from
+    /// exactly this, so the two cannot drift.
+    pub fn context_sig(&self) -> (i64, Option<i64>) {
+        (self.context_tokens, self.current_context_window())
+    }
+
     /// The Turn Footer's context-usage segment (ADR-0044), derived from the
     /// latest usage and the memoized window: `📊 上下文 84k/200k (42%)`, or the
     /// used tokens alone when the server reports no window. `None` until the
     /// first usage lands — a step that has not finished has no token data.
     pub fn context_segment(&self) -> Option<String> {
-        if self.context_tokens <= 0 {
+        let (used, window) = self.context_sig();
+        if used <= 0 {
             return None;
         }
-        let used = format_tokens(self.context_tokens);
-        match self.context_window.filter(|w| *w > 0) {
+        let used = format_tokens(used);
+        match window {
             Some(window) => {
                 let ratio = (self.context_tokens as f64 / window as f64).clamp(0.0, 1.0);
                 Some(format!(
@@ -1337,6 +1359,7 @@ mod tests {
         acc.model_id = Some("deepseek-v4-flash".into());
         acc.context_tokens = 84_200;
         acc.context_window = Some(200_000);
+        acc.context_window_key = Some(("opencode-go".into(), "deepseek-v4-flash".into()));
         acc.push_text("结果");
 
         let card = acc.build_card();
@@ -1381,6 +1404,27 @@ mod tests {
         fresh.context_window = Some(200_000);
         fresh.push_text("结果");
         assert!(!fresh.build_card().to_string().contains("📊"));
+    }
+
+    /// ADR-0044: a window memoized for ANOTHER model is never paired with the
+    /// current model's usage (the denominator would silently lie). It stays
+    /// used-only until the current model's lookup lands.
+    #[test]
+    fn stale_window_for_another_model_is_ignored() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Done;
+        acc.provider_id = Some("p".into());
+        acc.model_id = Some("m2".into());
+        acc.context_tokens = 42_000;
+        acc.context_window = Some(200_000);
+        acc.context_window_key = Some(("p".into(), "m1".into()));
+        acc.push_text("结果");
+
+        let text = acc.build_card().to_string();
+        assert!(
+            text.contains("📊 上下文 42k") && !text.contains("42k/"),
+            "a stale denominator must not render: {text}"
+        );
     }
 
     #[test]
@@ -1516,6 +1560,7 @@ mod tests {
         acc.model_id = Some("deepseek-v4-flash".into());
         acc.context_tokens = 84_200;
         acc.context_window = Some(200_000);
+        acc.context_window_key = Some(("opencode-go".into(), "deepseek-v4-flash".into()));
         acc.push_text("结果");
 
         let mid = acc
