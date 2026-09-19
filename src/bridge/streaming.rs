@@ -244,6 +244,10 @@ pub struct CardSession {
     /// card is re-flushed when the progress timer / state changes even with no
     /// new content (ADR-0014).
     pub last_header_sig: String,
+    /// The context segment's render inputs `(context_tokens, context_window)`
+    /// as of the last flush (ADR-0044), compared each poll so a step's usage
+    /// change flushes even when no part and no header second changed.
+    pub last_context_sig: (i64, Option<i64>),
     /// The Supplement split queue (ADR-0043), in arrival order — never
     /// coalesced. The serving rule: the flush that finalizes the live card
     /// writes one receipt per queued supplement (arrival order) and sends
@@ -269,10 +273,12 @@ impl CardSession {
     /// always flushes (stamping the progress timer). `card_message_id` is the
     /// live card to update in place.
     pub fn new(acc: StreamAccumulator, card_message_id: Option<String>) -> Self {
+        let last_context_sig = (acc.context_tokens, acc.context_window);
         Self {
             acc,
             card_message_id,
             last_header_sig: String::new(),
+            last_context_sig,
             pending_split: Vec::new(),
             card_is_live: true,
         }

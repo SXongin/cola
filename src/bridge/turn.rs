@@ -495,10 +495,9 @@ impl Turn {
         crate::bridge::streaming::refresh_work_context(&app.core, &self.session_id).await;
         // Refresh the Turn Footer's context window (ADR-0044) before the final
         // flush: the render-poll refresh usually covered it, but the reconcile
-        // above may have just captured a final usage the polls never saw.
-        if prompt_err.is_none() {
-            crate::bridge::streaming::refresh_context_window(&app.core, &self.session_id).await;
-        }
+        // above may have just captured a final usage the polls never saw. Runs
+        // on a failed prompt too — the card already carries that usage.
+        crate::bridge::streaming::refresh_context_window(&app.core, &self.session_id).await;
         flush_card(&app.core, &self.session_id).await;
 
         // Topic cover card (ADR-0023): once the server holds a real title for
