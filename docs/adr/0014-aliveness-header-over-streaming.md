@@ -18,3 +18,11 @@ cola deliberately does **not** use Feishu's streaming-card mode. The real proble
 - Active turns re-flush the card up to ~1/s (when the header's displayed second changes), similar to today's peak PATCH rate; the "flush only when header text differs" rule keeps it throttled.
 - cola cannot positively declare a turn "stuck" — the header stays honest (a ticking phase timer) instead of guessing; a future silence-threshold alarm was explicitly deferred. An earlier seconds-since-last-content ("静默") signal was dropped as redundant once per-step tool status and timing rendered into the card.
 - No `element_id` bookkeeping or card-entity lifecycle enters the render pipeline; the message-PATCH path remains the single card-update mechanism.
+
+## Update (2026-09-19)
+
+The awaiting-action title now names the pending kind: a permission-only wait
+shows "⏳ 等待你的授权", a question-only wait "⏳ 等待你的回答", and the combined
+"⏳ 等待你的授权/回答" only when both are live at once (`AwaitingAction`). The
+decision itself is unchanged — a paused turn still says what it waits on, and
+the header still re-flushes only when its text changes.
