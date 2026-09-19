@@ -185,3 +185,10 @@ telling.
 
 Source: product-owner live-testing observation of a pin firing right after a
 permission click, and approval of the silence semantics.
+
+## Update (2026-09-19)
+
+The preview example in Consequences tracks the kind split above: a
+permission-only wait previews 等待你的授权, a question-only wait 等待你的回答,
+and only both pending at once keep 等待你的授权/回答 (ADR-0014, 2026-09-19
+update).
