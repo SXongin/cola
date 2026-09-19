@@ -175,7 +175,7 @@ The command is the whole process — do not hand-edit the version or tag by hand
    1.2.3` on a `release-1.2.3` branch and pushes it.
 3. Opens the PR and watches every check — the release cut is the one flow where
    advisory CodeQL gates too.
-4. Rebase-merges with the admin bypass once the required checks are green (the
+4. Rebase-merges with the admin bypass once every check is green (the
    `main: review` ruleset requires a PR and one approval — the admin role
    bypasses both; the `main: CI` ruleset has no bypass, so the checks are
    always enforced).

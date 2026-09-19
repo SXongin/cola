@@ -1,7 +1,7 @@
 //! `cargo xtask release <version>` — the release cut (ADR-0033).
 //!
 //! The cut bumps `Cargo.toml`/`Cargo.lock` on a `release-<version>` branch,
-//! opens a PR, waits for the required checks, rebase-merges it with the admin
+//! opens a PR, watches every check, rebase-merges it with the admin
 //! bypass, and only then tags the **merged** commit on `main` and pushes the
 //! tag — `release.yml` takes over from there. Tagging a branch commit is the
 //! `0.7.0` failure: a rebase merge can rewrite it, leaving the tag off `main`.
