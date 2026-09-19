@@ -27,6 +27,13 @@ impl ToolPanel {
             _ => "🔧",
         }
     }
+
+    /// Whether the call is still live (`running`/`pending`): its panel is
+    /// TAIL content that rides the live card, and joins the timeline only once
+    /// the tool settles (ADR-0045).
+    pub fn is_live(&self) -> bool {
+        matches!(self.status.as_str(), "running" | "pending")
+    }
 }
 
 /// How a Tool Panel's output body renders. The renderer for a tool knows its

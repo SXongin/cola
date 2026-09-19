@@ -1999,6 +1999,34 @@ async fn late_rendered_command_lands_above_the_receipt() {
         );
     crate::bridge::render::flush_card(&app.core, "ses_test").await;
 
+    // While the command runs, its panel is live tail content (ADR-0045): it
+    // renders on the live card, below the timeline — the receipt included.
+    let live = final_card(&platform).await;
+    assert!(
+        live.to_string().contains("ls -la"),
+        "the running panel must ride the live card: {live}"
+    );
+
+    // Settling moves it into the timeline at its OWN start time, so it lands
+    // above the receipt that resolved its permission despite rendering late.
+    app.cards
+        .lock()
+        .await
+        .get_mut("ses_test")
+        .unwrap()
+        .acc
+        .push_tool_at(
+            Some(clicked_at - 200),
+            "call_1",
+            crate::feishu::card::tool_render::ToolPanel {
+                name: "bash".into(),
+                status: "completed".into(),
+                input: Some(serde_json::json!({ "command": "ls -la" })),
+                output: Some("src".into()),
+            },
+        );
+    crate::bridge::render::flush_card(&app.core, "ses_test").await;
+
     let card = final_card(&platform).await;
     let elements = card["body"]["elements"].as_array().expect("elements");
     let index_of = |needle: &str| {
