@@ -103,6 +103,10 @@ cargo build --release --locked
 Note: CI's Format job is `cargo fmt --all -- --check` — clippy and rustc do
 **not** check formatting, so a clean clippy does not mean a clean fmt.
 
+`Dependency audit` runs `cargo deny check` on every push and PR; a scheduled
+`Advisory audit` workflow re-runs `cargo deny check advisories` weekly, so
+newly published RUSTSEC advisories surface even when nothing is pushed.
+
 ## Pull request rules
 
 1. **Title** is a Conventional Commits subject (kept verbatim by the rebase
