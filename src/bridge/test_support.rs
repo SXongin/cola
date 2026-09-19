@@ -45,7 +45,7 @@ pub enum PlatformCall {
         text: String,
     },
     /// An Instant Reminder (`time_sensitive`, ADR-0043) call: the pinned
-    /// conversation, its kind, the targeted users and whether it was pinned
+    /// Chat/Topic, its kind, the targeted users and whether it was pinned
     /// (`true`) or cleared (`false`).
     InstantReminder {
         chat_id: String,

@@ -135,7 +135,7 @@ pub struct SharedCore {
     /// Whether to send the group completion notice (from `[bridge] group_completion_notice`).
     pub group_completion_notice: bool,
     /// The Instant Reminder lifecycle (ADR-0043, from `[bridge] pin`): pins a
-    /// conversation while a Permission/Question is pending. Off means every
+    /// Chat/Topic while a Permission/Question is pending. Off means every
     /// method is a no-op — no reminder call is ever made.
     pub pins: crate::bridge::pin::PinState,
     /// Cached session-list snapshot for `/list`, `/switch`, `/attach`

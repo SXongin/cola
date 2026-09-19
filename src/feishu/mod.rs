@@ -80,8 +80,8 @@ pub trait Platform: Send + Sync {
     /// error.
     async fn download_image(&self, message_id: &str, image_key: &str) -> Result<client::ImageAttachment>;
 
-    /// Set or clear a conversation's **Instant Reminder** (`time_sensitive`,
-    /// ADR-0043): a group targets its own `chat_id`, a bot p2p conversation
+    /// Set or clear a Chat/Topic's **Instant Reminder** (`time_sensitive`,
+    /// ADR-0043): a group targets its own `chat_id`, a bot p2p chat targets
     /// the fixed bot feed card. `user_ids` are the open_ids whose message
     /// lists are pinned (the turn's requester). Best-effort for the bridge: a
     /// failure (e.g. the `im:datasync.feed_card.time_sensitive:write` scope
