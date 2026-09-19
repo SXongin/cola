@@ -9,7 +9,7 @@ use crate::feishu::snapshot_card::SnapshotQuestionState;
 /// Which request kind a snapshot claim hosts (ADR-0028). One registry holds
 /// both kinds' claims, and each flow's poll sweep only drops claims of its own
 /// kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ClaimKind {
     Permission,
     Question,

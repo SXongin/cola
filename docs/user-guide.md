@@ -188,6 +188,7 @@ start_server = "auto"            # auto (default) | never | eager
 # access_file = "~/.cola/access.json"
 # work_dir = "/path/to/a/project"
 # group_completion_notice = true
+# pin = true
 # log_days = 14
 ```
 
@@ -203,6 +204,11 @@ start_server = "auto"            # auto (default) | never | eager
 - **`group_completion_notice`** — in group chats, reply to the requester with a
   short completion notice (the streaming card is patched in place, so it does not
   push a new notification). `false` disables it. p2p chats don't need it.
+- **`pin`** — opt-in, **off by default**: use Feishu's Instant Reminder to pin
+  the Chat or Topic at the top of the requester's message list while a permission
+  or question is pending, and clear it the moment it is resolved. Requires the
+  `im:datasync.feed_card.time_sensitive:write` scope; without it pinning is
+  skipped (a log line only) and everything else keeps working.
 - **`log_days`** — how many days of rotated daily logs to keep (default 14).
 
 ## Run

@@ -79,6 +79,20 @@ pub trait Platform: Send + Sync {
     /// permission (already held); callers degrade to a `[图片]` placeholder on
     /// error.
     async fn download_image(&self, message_id: &str, image_key: &str) -> Result<client::ImageAttachment>;
+
+    /// Set or clear a conversation's **Instant Reminder** (`time_sensitive`,
+    /// ADR-0043): a group targets its own `chat_id`, a bot p2p conversation
+    /// the fixed bot feed card. `user_ids` are the open_ids whose message
+    /// lists are pinned (the turn's requester). Best-effort for the bridge: a
+    /// failure (e.g. the `im:datasync.feed_card.time_sensitive:write` scope
+    /// is missing) is logged by the caller and never affects the turn.
+    async fn set_instant_reminder(
+        &self,
+        chat_id: &str,
+        is_group: bool,
+        user_ids: &[String],
+        on: bool,
+    ) -> Result<()>;
 }
 
 #[async_trait]
@@ -147,5 +161,15 @@ impl Platform for Client {
 
     async fn download_image(&self, message_id: &str, image_key: &str) -> Result<client::ImageAttachment> {
         Client::download_image(self, message_id, image_key).await
+    }
+
+    async fn set_instant_reminder(
+        &self,
+        chat_id: &str,
+        is_group: bool,
+        user_ids: &[String],
+        on: bool,
+    ) -> Result<()> {
+        Client::set_instant_reminder(self, chat_id, is_group, user_ids, on).await
     }
 }

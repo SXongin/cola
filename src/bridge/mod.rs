@@ -6,6 +6,7 @@ pub mod discovery;
 pub mod display;
 pub mod external;
 pub mod handler;
+pub mod pin;
 pub mod pollers;
 pub mod question;
 pub mod render;

@@ -12,6 +12,7 @@ pub(crate) mod leftovers;
 pub(crate) mod misc;
 pub(crate) mod pending;
 pub(crate) mod permission;
+pub(crate) mod pin;
 pub(crate) mod prompt_render;
 pub(crate) mod question;
 pub(crate) mod session_routing;

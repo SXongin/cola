@@ -165,7 +165,7 @@ The one or more **Card**s a single **Turn** renders into when its content exceed
 _Avoid_: Split card, multi-card turn, card pagination
 
 **Instant Reminder** (即时提醒):
-Feishu's `time_sensitive` capability: temporarily pinning a conversation at the top of a **Principal**'s message list. cola enables it while a **Permission** or **Question** is pending, or while a **Turn** runs past a threshold, and clears it when the wait resolves — a completed long Turn stays pinned for a short TTL so someone waiting elsewhere still catches the end. The pin carries no reason text; the card title in the conversation preview does. Distinct from an app feed card, which is a separate list entry cola does not create (its link cannot address a specific message).
+Feishu's `time_sensitive` capability (opt-in via `[bridge] pin`): temporarily pinning a conversation at the top of a **Principal**'s message list. cola enables it while a **Permission** or **Question** is pending, or while a **Turn** runs past a threshold, and clears it when the wait resolves — a completed long Turn stays pinned for a short TTL so someone waiting elsewhere still catches the end. Every pin carries its **Turn**'s generation, so a stale clear can never unpin a newer turn's pin; the in-memory state is not reconciled at startup and self-heals on the conversation's next turn. The pin carries no reason text; the card title in the conversation preview does. Distinct from an app feed card, which is a separate list entry cola does not create (its link cannot address a specific message).
 _Avoid_: App message stream, feed card, message-list notification
 
 **Todo Panel** (待办面板):
