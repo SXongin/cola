@@ -173,7 +173,7 @@ A **Turn**'s live task checklist, rendered as a card-TAIL status section instead
 _Avoid_: Todo card, task list card, progress panel
 
 **Tool Panel** (工具面板):
-The card element recording one tool call in a **Turn**'s timeline — a folded collapsible panel carrying the tool's name, status icon and server start time, plus its rendered input and output. One call, one panel, and it is not interactive: dealing with a tool's **Permission** or **Question** lives in an **Interaction Block**. The `todowrite` status section is a **Todo Panel**, not a Tool Panel.
+The card element recording one tool call in a **Turn** — a folded collapsible panel carrying the tool's name, status icon and server start time, plus its rendered input and output. One call, one panel, and it is not interactive: dealing with a tool's **Permission** or **Question** lives in an **Interaction Block**. An unfinished call (`running`/`pending`) is live content: its panel rides the newest card of the **Card Chain** as a card-TAIL section, like the **Todo Panel**, so a split can never strand it; once the tool settles, the panel takes its ordered place in the card timeline. The `todowrite` status section is a **Todo Panel**, not a Tool Panel.
 _Avoid_: tool card, call card, tool bubble
 
 **Built-in Tool**:
@@ -268,7 +268,7 @@ _Avoid_: Notification, message, signal
 - A **Turn** renders into a **Card Chain**; a pending **Permission**/**Question** rides its newest card as an **Interaction Block**, and resolving one leaves an **Interaction Receipt**
 - A **Supplement** splits its **Turn**'s **Card Chain** so the continuation card is the newest message; the render loop stays alive across a Supplement that starts a new **Turn**; a **Command** reply deliberately does not split the chain
 - An **Instant Reminder** pins the conversation while a **Permission**/**Question** is pending or a **Turn** runs past the threshold, and clears when the wait resolves (a completed long Turn keeps a short TTL)
-- A **Turn** renders one **Tool Panel** per tool call; only **Built-in Tool**s (and tools cola itself injects) may get tailored rendering — every other tool's payload stays opaque
+- A **Turn** renders one **Tool Panel** per tool call; an unfinished panel rides the newest card of its **Card Chain** as a tail section and joins the card timeline when the tool settles; only **Built-in Tool**s (and tools cola itself injects) may get tailored rendering — every other tool's payload stays opaque
 - A **Session** receives many **Permissions** and **Questions**
 - A **Session Snapshot** reports the state of one **Session** (its last **Turn**'s completion, pending **Permissions**/**Questions**, recent messages) to the **Chat**/**Topic** that activated it
 - The **Bridge** receives **Events** from a **Backend** and renders them as **Card** updates on the **Platform**
