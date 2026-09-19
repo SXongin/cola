@@ -129,10 +129,10 @@ red CodeQL result never blocks a normal merge. The release cut is the one flow
 that makes it required (its watch covers every check).
 
 Release PRs (`release/*`) and docs-only PRs skip the code-dependent jobs
-(Format, Check, Coverage, Test): a skipped job reports success and still
-satisfies the `main: CI` ruleset, so the PR stays mergeable without spending
-runner time on code that did not change. `Dependency audit` always runs, and
-the release cut keeps its CodeQL gate.
+(Format, Check, Coverage, Test): a skipped job reports success, so the required
+checks among them still satisfy the `main: CI` ruleset and the PR stays
+mergeable without spending runner time on code that did not change.
+`Dependency audit` always runs, and the release cut keeps its CodeQL gate.
 
 Description template:
 

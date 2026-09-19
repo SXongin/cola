@@ -144,7 +144,8 @@ Two Scorecard facts recorded while doing this:
 
 ## Amendment (2026-09-20): release PRs skip the review
 
-The gate also skips `release/*` PRs: their diff is a version bump of the tree
-that was already reviewed when it landed on `main`, and the release cut merges
-with the admin bypass, so the missing approval changes nothing. Every other
-non-draft in-repo PR still gets the review the 2026-09-15 amendment describes.
+The gate also skips `release/*` PRs: the diff is a generated version-bump
+commit, the code it bumps was already reviewed on `main`, and the release cut
+merges with the admin bypass — so the missing approval changes nothing. Every
+other non-draft in-repo PR still gets the review the 2026-09-15 amendment
+describes.

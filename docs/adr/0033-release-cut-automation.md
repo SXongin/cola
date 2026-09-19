@@ -111,3 +111,14 @@ Decision 2 names the branch `release-<version>`, but the repository's branch
 convention is `<type>/<slug>`. Release cuts now use the branch-only `release/`
 type — `release/<version>` — so every branch has the same shape. `xtask` and
 its tests were updated; no remote `release-*` branches existed at the switch.
+
+## Amendment (2026-09-20, release PR scope): the cut skips code-dependent jobs
+
+The Consequences bullet "A release PR runs the same CI as any change" describes
+the watch, not the job set: `xtask` still waits on every check reported for the
+PR. The release PR bumps only the manifest, so `Format`, `Check`, `Coverage` and
+`Test` skip on `release/*` branches — a skipped job reports success and still
+satisfies the `main: CI` ruleset, so the PR stays mergeable. `Dependency audit`
+keeps running (the lockfile changed) and CodeQL keeps running (the amendment
+above), so the cut still blocks on both. The admin bypass remains what covers
+the missing review approval.
