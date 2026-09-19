@@ -141,3 +141,10 @@ Two Scorecard facts recorded while doing this:
   `Code-Review` (approved bot changesets are skipped entirely), so skipping
   Dependabot PRs in the gate has a small score cost. Worth revisiting only if
   the score matters more than the automation.
+
+## Amendment (2026-09-20): release PRs skip the review
+
+The gate also skips `release/*` PRs: their diff is a version bump of the tree
+that was already reviewed when it landed on `main`, and the release cut merges
+with the admin bypass, so the missing approval changes nothing. Every other
+non-draft in-repo PR still gets the review the 2026-09-15 amendment describes.

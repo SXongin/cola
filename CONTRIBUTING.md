@@ -128,6 +128,12 @@ also runs on PRs, but it is advisory: it is not a required check, so a slow or
 red CodeQL result never blocks a normal merge. The release cut is the one flow
 that makes it required (its watch covers every check).
 
+Release PRs (`release/*`) and docs-only PRs skip the code-dependent jobs
+(Format, Check, Coverage, Test): a skipped job reports success and still
+satisfies the `main: CI` ruleset, so the PR stays mergeable without spending
+runner time on code that did not change. `Dependency audit` always runs, and
+the release cut keeps its CodeQL gate.
+
 Description template:
 
 ```markdown
@@ -160,7 +166,9 @@ satisfies the `main: review` ruleset's required review for solo work. A
 blocking review is a comment with a `FAIL` verdict and no approval, not a
 `request-changes`: Actions bots cannot dismiss their own review and would lock
 the PR. Fork PRs are skipped (no secrets) and Dependabot PRs are skipped
-(upstream's permission check rejects bot actors). The admin bypass remains for
+(upstream's permission check rejects bot actors). Release PRs (`release/*`) are
+skipped too: their diff is a version bump of code already reviewed on `main`,
+and the cut merges with the admin bypass. The admin bypass remains for
 emergencies; the bot can never lock the maintainer out.
 
 ## Releasing
@@ -179,7 +187,9 @@ The command is the whole process — do not hand-edit the version or tag by hand
 2. Bumps `Cargo.toml`/`Cargo.lock`, commits `chore(release): bump version to
    1.2.3` on a `release/1.2.3` branch and pushes it.
 3. Opens the PR and watches every check — the release cut is the one flow where
-   advisory CodeQL gates too.
+   advisory CodeQL gates too. The PR skips the code-dependent jobs and the
+   automated review (the cut merges with the admin bypass), so what it waits on
+   is Dependency audit and CodeQL.
 4. Rebase-merges with the admin bypass once every check is green (the
    `main: review` ruleset requires a PR and one approval — the admin role
    bypasses both; the `main: CI` ruleset has no bypass, so the checks are

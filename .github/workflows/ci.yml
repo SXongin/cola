@@ -13,8 +13,37 @@ permissions:
   contents: read
 
 jobs:
+  classify:
+    name: Classify
+    if: github.event_name == 'pull_request' && !startsWith(github.head_ref || '', 'release/')
+    runs-on: ubuntu-latest
+    outputs:
+      heavy: ${{ steps.diff.outputs.heavy }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Detect docs-only changes
+        id: diff
+        env:
+          BASE: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$BASE"
+          changed=$(git diff --name-only "origin/$BASE...HEAD")
+          if [ -n "$changed" ] && ! echo "$changed" | grep -qvE '^(docs/|\.scratch/)|\.md$|^LICENSE$|^deny\.toml$'; then
+            echo "heavy=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "heavy=true" >> "$GITHUB_OUTPUT"
+          fi
+
   fmt:
     name: Format
+    needs: classify
+    if: >-
+      always() &&
+      needs.classify.outputs.heavy != 'false' &&
+      !startsWith(github.head_ref || '', 'release/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -30,6 +59,11 @@ jobs:
     # cache so dependencies compile once instead of once per gate. The tests
     # run instrumented in the coverage job, so they are not repeated here.
     name: Check
+    needs: classify
+    if: >-
+      always() &&
+      needs.classify.outputs.heavy != 'false' &&
+      !startsWith(github.head_ref || '', 'release/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -53,6 +87,11 @@ jobs:
     # the CODECOV_TOKEN repository secret. Until then the upload fails softly
     # (fail_ci_if_error: false) and CI stays green.
     name: Coverage
+    needs: classify
+    if: >-
+      always() &&
+      needs.classify.outputs.heavy != 'false' &&
+      !startsWith(github.head_ref || '', 'release/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -77,6 +116,11 @@ jobs:
     # Compile + test only on the other platforms: catches platform quirks
     # cheaply. Full release builds still run on all three in release.yml.
     name: Test (${{ matrix.os }})
+    needs: classify
+    if: >-
+      always() &&
+      needs.classify.outputs.heavy != 'false' &&
+      !startsWith(github.head_ref || '', 'release/')
     strategy:
       fail-fast: false
       matrix:
