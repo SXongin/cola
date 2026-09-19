@@ -115,10 +115,11 @@ precondition for the message and resource APIs.
 Notes:
 
 - `im:datasync.feed_card.time_sensitive:write` is the only **optional** scope:
-  it powers Instant Reminder (including its waiting-card message pins), an
-  **experimental** opt-in feature (`[bridge] instant_reminder = true`).
-  Grant it only if you want to trial pinning; without it cola logs the failed
-  call and continues.
+  it powers the conversation-level Instant Reminder, an **experimental**
+  opt-in feature (`[bridge] instant_reminder = true`). The waiting-card
+  message pins under the same opt-in need no extra scope — `im:message`
+  covers them. Grant this one only if you want to trial the conversation
+  pin; without it cola logs the failed call and continues.
 - `im:chat` (获取与更新群组信息) is a superset of `im:chat:readonly` — cola only
   reads chat info, so the read-only scope is the minimum.
 - The contact API needs two scopes: one to authorize the call
