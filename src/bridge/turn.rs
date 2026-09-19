@@ -110,6 +110,35 @@ impl Turn {
             inflight.insert(session_id.clone());
         }
 
+        // Fresh accumulator per prompt: reuse leaks stale text/tools from the
+        // previous turn into the next card. The card's IDENTITY (the message
+        // id) carries over — only the content is reset.
+        //
+        // The CardSession is inserted BEFORE the loading-card round-trip (and
+        // with `card_message_id: None`, filled in once the reply lands): a
+        // Supplement that arrives while that request is in flight must find a
+        // live card to split (ADR-0043). Only lock acquisitions separate the
+        // busy guard from this insert — no I/O — so the card-less window is as
+        // small as the two mutexes make it. The flush leaves the split pending
+        // on a missing id, and the first flush after the id lands serves it.
+        let mut acc = StreamAccumulator::new(&subtitle);
+        acc.reply_to_message_id = Some(message_id.clone());
+        acc.session_id = Some(session_id.clone());
+        // The id this turn's user message carries, so a later retry reuses
+        // it (ADR-0026) — the server deduplicates by id.
+        acc.cola_message_id = Some(cola_message_id.clone());
+        // Full original prompt, so the error-card "retry" can re-submit it.
+        acc.prompt = Some(text.clone());
+        acc.requester_open_id = requester_open_id.clone();
+        acc.is_group = is_group;
+        {
+            let mut cards = app.cards.lock().await;
+            cards.insert(
+                session_id.clone(),
+                crate::bridge::streaming::CardSession::new(acc, None),
+            );
+        }
+
         let loading = crate::feishu::card::shell::CardBuilder::new()
             .with_state(crate::feishu::card::CardState::Loading)
             .with_subtitle(&subtitle)
@@ -125,40 +154,40 @@ impl Turn {
             None => match app.feishu.reply_card(&message_id, &loading).await {
                 Ok(id) => Some(id),
                 Err(e) => {
-                    // The turn never started: release the guard so the session
-                    // does not look busy until a restart.
+                    // The turn never started: drop the just-inserted card
+                    // session and release the guard, so nothing leaks and the
+                    // session does not look busy until a restart.
+                    app.cards.lock().await.remove(&session_id);
                     release_inflight(app, &session_id).await;
                     return Err(e);
                 }
             },
         };
-        {
-            // Fresh accumulator per prompt: reuse leaks stale text/tools from the
-            // previous turn into the next card. The card's IDENTITY (the
-            // message id) carries over — only the content is reset.
-            let session_dir = {
-                let store = app.sessions.lock().await;
-                store
-                    .entry_for_session(&session_id)
-                    .map(|e| e.directory.clone())
-                    .unwrap_or_default()
-            };
-            let mut acc = StreamAccumulator::new(&subtitle);
-            acc.reply_to_message_id = Some(message_id.clone());
-            acc.session_id = Some(session_id.clone());
-            // The id this turn's user message carries, so a later retry reuses
-            // it (ADR-0026) — the server deduplicates by id.
-            acc.cola_message_id = Some(cola_message_id.clone());
-            // Full original prompt, so the error-card "retry" can re-submit it.
-            acc.prompt = Some(text.clone());
-            acc.requester_open_id = requester_open_id.clone();
-            acc.is_group = is_group;
-            acc.attach_work_context(&session_dir).await;
+
+        if let Some(cid) = new_card_id {
             let mut cards = app.cards.lock().await;
-            cards.insert(
-                session_id.clone(),
-                crate::bridge::streaming::CardSession::new(acc, new_card_id),
-            );
+            if let Some(card) = cards.get_mut(&session_id) {
+                card.card_message_id = Some(cid);
+            }
+        }
+
+        // The work context (ADR-0019) is captured before the prompt runs but
+        // AFTER the card is live and its id known: the git read neither delays
+        // the loading card nor keeps the session card-less, and it runs outside
+        // the cards lock.
+        let session_dir = {
+            let store = app.sessions.lock().await;
+            store
+                .entry_for_session(&session_id)
+                .map(|e| e.directory.clone())
+                .unwrap_or_default()
+        };
+        let work_context = StreamAccumulator::capture_work_context(&session_dir).await;
+        {
+            let mut cards = app.cards.lock().await;
+            if let Some(card) = cards.get_mut(&session_id) {
+                card.acc.apply_work_context(work_context);
+            }
         }
 
         Ok(Some(Turn {

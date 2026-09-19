@@ -523,8 +523,14 @@ async fn stale_topic_recreate_preserves_creation_messages() {
 /// competing run_prompt (which would overwrite the running accumulator and
 /// race on the same card). It goes through the supplement path: the message
 /// is sent fire-and-forget via prompt_async (OpenCode merges it into the
-/// current turn) and the user gets a notice — no Loading card, no second
-/// accumulator.
+/// current turn) — no Loading card, no second accumulator, and no deleted
+/// text acknowledgement (ADR-0043).
+///
+/// This seeds the turn's STARTUP WINDOW — the busy guard is held while the
+/// loading card's reply is still in flight, so the session has a live
+/// accumulator but no card id yet. The split must be requested and left
+/// pending (not silently dropped); the first flush after the id lands serves
+/// it (covered end to end in `tests::supplement`).
 #[tokio::test]
 async fn message_during_inflight_goes_to_supplement_path() {
     let _wd = test_work_dir();
@@ -550,6 +556,13 @@ async fn message_during_inflight_goes_to_supplement_path() {
     )
     .await;
     app.inflight.lock().await.insert("ses_test".to_string());
+    app.cards.lock().await.insert(
+        "ses_test".into(),
+        crate::bridge::streaming::CardSession::new(
+            crate::bridge::streaming::StreamAccumulator::new("回合"),
+            None,
+        ),
+    );
 
     app.handle_message(incoming(
         "msg_sup".into(),
@@ -578,13 +591,22 @@ async fn message_during_inflight_goes_to_supplement_path() {
         ids
     );
 
-    // NO Loading card / run_prompt was started for the supplement message.
+    // NO Loading card / run_prompt was started for the supplement message, and
+    // no text acknowledgement is sent either (ADR-0043). The card id has not
+    // landed yet, so nothing can be sent — but the split request survives.
     let sent = platform.calls.lock().await.clone();
     assert!(
-        sent.iter().all(|c| matches!(c, PlatformCall::ReplyText { .. })),
-        "supplement must only reply text, not start a card: {:?}",
+        sent.is_empty(),
+        "supplement must neither start a card nor reply text: {:?}",
         sent
     );
+    let cards = app.cards.lock().await;
+    let card = cards.get("ses_test").expect("the startup card session");
+    assert!(
+        !card.pending_split.is_empty(),
+        "the supplement split must survive the startup window"
+    );
     // The in-flight marker is preserved (still running).
+    drop(cards);
     assert!(app.inflight.lock().await.contains("ses_test"));
 }

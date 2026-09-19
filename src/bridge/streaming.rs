@@ -198,6 +198,26 @@ pub(crate) fn question_target(questions: &[crate::opencode::types::QuestionInfo]
     )
 }
 
+/// The turn-start work context (ADR-0019): the session directory plus the git
+/// halves the Turn Footer shows. Captured before the prompt runs, applied to
+/// the live card separately (see [`StreamAccumulator::capture_work_context`]).
+#[derive(Debug, Clone, Default)]
+pub struct WorkContext {
+    pub directory: String,
+    pub project_name: Option<String>,
+    pub git: crate::git::GitState,
+}
+
+/// One Supplement waiting in a Card Chain's split queue (ADR-0043): the
+/// message its continuation must reply to, and whether its receipt line has
+/// already been written into the accumulator. The flag keeps the receipt
+/// exactly-once when a continuation send fails and the split is retried.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingSplit {
+    pub reply_to: String,
+    pub receipt_pushed: bool,
+}
+
 /// One live card per session: the streaming accumulator plus the card identity
 /// chain — the current live card's message id, updated in place by
 /// `flush_card` (including continuation cards). Replaces the two per-session
@@ -210,6 +230,24 @@ pub struct CardSession {
     /// card is re-flushed when the progress timer / state changes even with no
     /// new content (ADR-0014).
     pub last_header_sig: String,
+    /// The Supplement split queue (ADR-0043), in arrival order — never
+    /// coalesced. The serving rule: the flush that finalizes the live card
+    /// writes one receipt per queued supplement (arrival order) and sends
+    /// exactly ONE continuation, replied to the NEWEST queued supplement,
+    /// carrying only the delta after the finalized slice; a successful send
+    /// clears the queue. While the chain still owes that continuation (a failed
+    /// send, or a finalized slice carrying the remainder), the newest entry
+    /// stays the anchor and only supplements whose receipt was not written yet
+    /// get one — so a retry duplicates nothing and a later arrival is still
+    /// served.
+    pub pending_split: Vec<PendingSplit>,
+    /// Whether the tracked card is still the live (growing) card that flushes
+    /// update in place. True until a split finalizes it; a continuation that
+    /// fits becomes the new live card, while one that is itself over the size
+    /// budget stays FINALIZED (and is never overwritten). Persisted so a flush
+    /// that exhausted the chain bound — or died between a finalize and its
+    /// continuation — resumes the chain instead of losing the slice it sent.
+    pub card_is_live: bool,
 }
 
 impl CardSession {
@@ -221,6 +259,8 @@ impl CardSession {
             acc,
             card_message_id,
             last_header_sig: String::new(),
+            pending_split: Vec::new(),
+            card_is_live: true,
         }
     }
 
@@ -230,6 +270,8 @@ impl CardSession {
     pub fn repoint(&mut self, message_id: &str) {
         self.card_message_id = Some(message_id.to_string());
         self.acc.reply_to_message_id = Some(message_id.to_string());
+        // The fresh snapshot is this chain's newest, growing card.
+        self.card_is_live = true;
     }
 }
 
@@ -374,19 +416,41 @@ impl StreamAccumulator {
         }
     }
 
+    /// Capture the turn's work context without touching the accumulator — the
+    /// async half of [`Self::attach_work_context`]. Split out so a caller can
+    /// insert the live card first (a Supplement must always find one, ADR-0043)
+    /// and attach the context after the card's own send, without holding the
+    /// cards lock across the git read.
+    pub async fn capture_work_context(dir: &str) -> WorkContext {
+        if dir.is_empty() {
+            return WorkContext::default();
+        }
+        WorkContext {
+            directory: dir.to_string(),
+            project_name: crate::git::project_name(dir),
+            git: crate::git::read_state(dir).await,
+        }
+    }
+
+    /// Apply a context captured by [`Self::capture_work_context`].
+    pub fn apply_work_context(&mut self, ctx: WorkContext) {
+        if ctx.directory.is_empty() {
+            self.directory = None;
+            return;
+        }
+        self.directory = Some(ctx.directory);
+        self.project_name = ctx.project_name;
+        self.apply_git_state(ctx.git);
+    }
+
     /// Capture the turn's work context (ADR-0019): project name, git branch and
     /// dirty state — measured BEFORE the prompt runs, so the dirty flag reflects
     /// the state the AI operates on, not the changes it leaves behind. Best
     /// effort: an empty or non-git directory leaves the fields unset.
     /// `refresh_work_context` re-reads the git halves when the turn ends.
     pub async fn attach_work_context(&mut self, dir: &str) {
-        if dir.is_empty() {
-            self.directory = None;
-            return;
-        }
-        self.directory = Some(dir.to_string());
-        self.project_name = crate::git::project_name(dir);
-        self.apply_git_state(crate::git::read_state(dir).await);
+        let ctx = Self::capture_work_context(dir).await;
+        self.apply_work_context(ctx);
     }
 
     /// Apply freshly read git state to the work-context halves. The halves move
@@ -599,20 +663,29 @@ impl StreamAccumulator {
         }
     }
 
+    /// The tool the Turn is currently running: a live `tools` panel, else the
+    /// live todo panel. This is TURN state, not slice state — the header uses
+    /// it even on a card whose slice does not contain the panel, so a split
+    /// continuation keeps saying "⏳ tool" instead of falling back to
+    /// "回复中". A tool that finished is not `running`, so it drops out.
+    /// Selection is deterministic: `IndexMap` preserves insertion order, so
+    /// the first running tool (the one the Turn started first) wins.
+    fn running_tool(&self) -> Option<&ToolPanel> {
+        self.tools
+            .values()
+            .find(|t| t.status == "running")
+            .or_else(|| self.todo_panel.as_ref().filter(|t| t.status == "running"))
+    }
+
     /// The header (title, template) this accumulator's card should show: the
     /// state label, the waiting override, the phase timer and the running-tool
     /// hint. Exposed so a click's ack can restamp a card's header in the same
     /// response — resolving the last live block must clear
     /// "等待你的授权/回答" immediately, not a poll later.
     pub fn header_title_and_template(&self) -> (String, &'static str) {
-        let running = self
-            .tools
-            .values()
-            .find(|t| t.status == "running")
-            .or_else(|| self.todo_panel.as_ref().filter(|t| t.status == "running"));
         crate::feishu::card::shell::header_title_and_template(
             &self.card_state,
-            running,
+            self.running_tool(),
             &self.header_progress(),
         )
     }
@@ -840,6 +913,22 @@ impl StreamAccumulator {
         (built.card, built.full)
     }
 
+    /// Build the card's LIVE slice (`render_from` to the end) as a finalized
+    /// card — the split header, no tail — and ADVANCE `render_from` past it.
+    /// A Supplement forces this split even though the slice fits (ADR-0043):
+    /// the finalized card keeps everything before the split, and the
+    /// continuation renders only the delta appended afterwards — the same
+    /// handoff a size split performs. Receipts queued after this build land
+    /// past the new boundary, so they ride the continuation.
+    pub fn build_finalized_handoff(&mut self) -> serde_json::Value {
+        let end = self.timeline.len();
+        let card = self
+            .build_card_inner(self.render_from, end, false, Some(CardState::Continued))
+            .0;
+        self.render_from = end;
+        card
+    }
+
     /// The request ids of every block the accumulator still awaits. A block
     /// resident here is the accumulator's own render source — the sweep
     /// resolves it through the timeline, not through the card handle.
@@ -926,9 +1015,13 @@ impl StreamAccumulator {
         state_override: Option<CardState>,
     ) -> (serde_json::Value, Vec<BlockSpan>) {
         let state = state_override.unwrap_or_else(|| self.card_state.clone());
+        // The header shows the Turn's running tool even when THIS slice has no
+        // panel for it (a split continuation after `sleep 30` started): pass
+        // the accumulator's global selection as the builder's override.
         let mut builder = CardBuilder::new()
             .with_state(state)
-            .with_progress(self.header_progress());
+            .with_progress(self.header_progress())
+            .with_header_running_tool(self.running_tool().cloned());
 
         // The card is a reply to the user's message, so the session/thread name
         // goes in the subtitle and the question is NOT echoed again. The date
