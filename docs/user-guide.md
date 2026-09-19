@@ -206,9 +206,17 @@ start_server = "auto"            # auto (default) | never | eager
   push a new notification). `false` disables it. p2p chats don't need it.
 - **`pin`** — opt-in, **off by default**: use Feishu's Instant Reminder to pin
   the Chat or Topic at the top of the requester's message list while a permission
-  or question is pending, and clear it the moment it is resolved. Requires the
+  or question is pending, and while a turn has seen no activity from you for
+  60 seconds. The pin clears the moment the wait is resolved, and any message
+  or card click restarts that silence clock; a completed long turn stays pinned
+  for 2 minutes, so the result is catchable from another chat — unless you act
+  first, which releases it right away (you are active again). The
+  pin means "this conversation still needs you" — the card title in the
+  preview says why (等待你的授权/回答 · 运行中 · ✅ 完成). Requires the
   `im:datasync.feed_card.time_sensitive:write` scope; without it pinning is
-  skipped (a log line only) and everything else keeps working.
+  skipped (a log line only) and everything else keeps working. Pin state is
+  in-memory: a pin left behind by a crash or restart is cleared on the
+  conversation's next turn, never left up permanently.
 - **`log_days`** — how many days of rotated daily logs to keep (default 14).
 
 ## Run

@@ -96,6 +96,10 @@ pub(crate) struct Turn {
     /// The variant the last attempt actually sent, captured at send time —
     /// what the Turn Footer shows.
     turn_variant: Option<String>,
+    /// This turn's Instant Reminder generation (ADR-0043), registered at turn
+    /// start. The threshold timer and the completion TTL both carry it, so
+    /// neither can touch a newer turn's pin.
+    generation: u64,
 }
 
 impl Turn {
@@ -112,7 +116,13 @@ impl Turn {
         // fresh session and retry once.
         if prompt_resp.as_ref().is_err_and(|e| e.is_session_not_found()) {
             tracing::warn!("session {} not found on the server; recreating", turn.session_id);
-            turn.recreate(app).await?;
+            if let Err(e) = turn.recreate(app).await {
+                // This turn will never reach `finish`: close its long-turn
+                // lifecycle, or a still-sleeping threshold timer would pin a
+                // turn that can never complete (ADR-0043).
+                turn.settle_long_turn_pin(app).await;
+                return Err(e);
+            }
             prompt_resp = turn.attempt(app).await;
         }
         turn.finish(app, &prompt_resp).await;
@@ -187,17 +197,17 @@ impl Turn {
         // turn's requester and a stale clear from an earlier turn can never
         // unpin it. This is also where a pin orphaned by a crash or restart
         // is cleared once, on the conversation's next turn (self-healing).
-        acc.turn_generation = Some(
-            app.core
-                .pins
-                .begin_turn(
-                    &app.core.feishu,
-                    &thread_key.chat_id,
-                    is_group,
-                    requester_open_id.as_deref(),
-                )
-                .await,
-        );
+        let generation = app
+            .core
+            .pins
+            .begin_turn(
+                &app.core.feishu,
+                &thread_key.chat_id,
+                is_group,
+                requester_open_id.as_deref(),
+            )
+            .await;
+        acc.turn_generation = Some(generation);
         {
             let mut cards = app.cards.lock().await;
             cards.insert(
@@ -257,6 +267,27 @@ impl Turn {
             }
         }
 
+        // Instant Reminder (ADR-0043): arm the long-turn silence checker now
+        // that the Loading card is live — a turn that failed to start must not
+        // pin. The checker and the completion decide under the pin lock, so a
+        // turn finishing before the threshold never pins, one finishing after
+        // it keeps the pin for the TTL, and an interaction mid-turn restarts
+        // the silence clock and releases the hold.
+        let user_ids: Vec<String> = requester_open_id
+            .iter()
+            .filter(|open_id| !open_id.is_empty())
+            .cloned()
+            .collect();
+        crate::bridge::pin::spawn_long_turn_checker(
+            &app.core,
+            crate::bridge::pin::PinTarget {
+                chat_id: thread_key.chat_id.clone(),
+                is_group,
+                user_ids,
+                generation,
+            },
+        );
+
         Ok(Some(Turn {
             session_id,
             thread_key,
@@ -265,6 +296,7 @@ impl Turn {
             images,
             directory: session_dir,
             turn_variant: None,
+            generation,
         }))
     }
 
@@ -546,9 +578,31 @@ impl Turn {
             }
         }
 
+        // Instant Reminder (ADR-0043): close this turn's long-turn lifecycle.
+        // Completion wins the race with a still-sleeping threshold timer (a
+        // short turn never pins); a long turn's live pin is kept for the
+        // completion TTL, then cleared generation-scoped.
+        self.settle_long_turn_pin(app).await;
+
         self.release(app).await;
         // Permissions are handled by the independent poller spawned in App::run,
         // so a prompt blocked on a permission still gets its card shown.
+    }
+
+    /// Close this turn's long-turn Instant Reminder lifecycle (ADR-0043):
+    /// [`crate::bridge::pin::PinState::complete_turn`] decides atomically
+    /// whether the threshold pin is live, and a live one is kept for the
+    /// completion TTL. Called by `finish` on every outcome and by `run` when
+    /// the turn can never reach it.
+    async fn settle_long_turn_pin(&self, app: &Arc<App>) {
+        if app
+            .core
+            .pins
+            .complete_turn(&self.thread_key.chat_id, self.generation)
+            .await
+        {
+            crate::bridge::pin::spawn_pin_ttl(&app.core, self.thread_key.chat_id.clone(), self.generation);
+        }
     }
 
     /// Release this turn's busy guard. Idempotent.

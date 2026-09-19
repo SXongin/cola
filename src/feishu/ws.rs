@@ -303,7 +303,11 @@ async fn send_event_ack(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>, fra
 ///   `question_index` + `answer`;
 /// - form containers deliver their inputs as `action.form_value` → the first
 ///   non-empty input value becomes `answer` (the typed custom answer).
-fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Value> {
+///
+/// It also threads the callback context (the card's message id, the clicking
+/// Chat/Topic and the operator's identity) into the value. `pub(crate)` so the
+/// bridge tests can drive the real callback shape through `handle_card_action`.
+pub(crate) fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Value> {
     let v = serde_json::from_slice::<serde_json::Value>(payload).ok()?;
     let a = v.get("event")?.get("action")?;
     let mut val = match a.get("value").cloned() {
@@ -400,6 +404,27 @@ fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Value> {
         .or_else(|| a.get("open_message_id").and_then(|m| m.as_str()));
     if let Some(open_message_id) = open_message_id {
         val["open_message_id"] = serde_json::Value::String(open_message_id.to_string());
+    }
+    // A payload-supplied `open_chat_id` is untrusted: drop it before the
+    // trusted callback source below inserts one, so a button value can never
+    // spoof where the click happened (the bridge routes user activity by it).
+    // `open_message_id` keeps its historical pass-through behavior.
+    if let Some(object) = val.as_object_mut() {
+        object.remove("open_chat_id");
+    }
+    // Where the click happened. In the schema 2.0 callback it lives on
+    // `event.context.open_chat_id`; older shapes carried it on the action
+    // object. The bridge counts a click as user activity in that Chat/Topic
+    // (ADR-0043 amendment), and permission/question button payloads carry no
+    // `chat_id` of their own — without this the click would not count.
+    let open_chat_id = v
+        .get("event")
+        .and_then(|e| e.get("context"))
+        .and_then(|c| c.get("open_chat_id"))
+        .and_then(|m| m.as_str())
+        .or_else(|| a.get("open_chat_id").and_then(|m| m.as_str()));
+    if let Some(open_chat_id) = open_chat_id {
+        val["open_chat_id"] = serde_json::Value::String(open_chat_id.to_string());
     }
     // The clicking user's identity (ADR-0035): the bridge gates every card
     // action on it, so thread it into the value. The callback carries it on
@@ -1102,7 +1127,9 @@ fn process_frame_routes_card_actions() {
 fn card_action_carries_open_message_id_from_context() {
     // `/topic --adopt`'s card button (ADR-0016) anchors the new topic on the
     // card's own message id; the schema 2.0 callback carries it on
-    // `event.context.open_message_id`.
+    // `event.context.open_message_id`. The same context carries where the
+    // click happened (`open_chat_id`), which the bridge counts as user
+    // activity (ADR-0043 amendment).
     let payload = br#"{
             "header": { "event_type": "card.action.trigger", "event_id": "e_card" },
             "event": {
@@ -1118,7 +1145,103 @@ fn card_action_carries_open_message_id_from_context() {
         FrameAction::CardAction(v) => {
             assert_eq!(v["op"], "topic_adopt");
             assert_eq!(v["open_message_id"], "om_switch_card");
+            assert_eq!(v["open_chat_id"], "oc_1");
         }
+        other => panic!("expected CardAction, got {:?}", std::mem::discriminant(&other)),
+    }
+}
+
+/// A permission/question button's payload carries no routing `chat_id`; the
+/// click's Chat/Topic must still reach the value, from the callback context
+/// (or, on older shapes, the action object) — the bridge needs it to count
+/// the click as user activity (ADR-0043 amendment).
+#[test]
+fn card_action_carries_open_chat_id_without_a_payload_chat_id() {
+    let payload = br#"{
+            "header": { "event_type": "card.action.trigger", "event_id": "e_card" },
+            "event": {
+                "action": {
+                    "tag": "button",
+                    "value": { "action": "perm", "reply": "once", "request_id": "p1", "session_id": "s1" }
+                },
+                "context": { "open_message_id": "om_perm", "open_chat_id": "oc_perm" }
+            }
+        }"#;
+    let frame = event_frame(payload);
+    match process_frame(&frame, &mut DedupeSet::new(10)) {
+        FrameAction::CardAction(v) => {
+            assert!(
+                v.get("chat_id").is_none(),
+                "the permission payload has no chat_id"
+            );
+            assert_eq!(v["open_chat_id"], "oc_perm");
+        }
+        other => panic!("expected CardAction, got {:?}", std::mem::discriminant(&other)),
+    }
+
+    // Older shape: the action object itself carries it.
+    let payload = br#"{
+            "header": { "event_type": "card.action.trigger", "event_id": "e_card" },
+            "event": {
+                "action": {
+                    "tag": "button",
+                    "open_chat_id": "oc_old",
+                    "value": { "action": "question", "reply": "answer", "request_id": "q1", "session_id": "s1" }
+                }
+            }
+        }"#;
+    let frame = event_frame(payload);
+    match process_frame(&frame, &mut DedupeSet::new(10)) {
+        FrameAction::CardAction(v) => assert_eq!(v["open_chat_id"], "oc_old"),
+        other => panic!("expected CardAction, got {:?}", std::mem::discriminant(&other)),
+    }
+}
+
+/// A payload-supplied `open_chat_id` is untrusted and dropped: only Feishu's
+/// callback context/action supplies the click's Chat/Topic, so a button value
+/// can never spoof it (the bridge routes user activity by that value). A real
+/// context value still wins over the payload's.
+#[test]
+fn card_action_drops_a_payload_supplied_open_chat_id() {
+    // No trusted source: the payload's own `open_chat_id` must not survive.
+    let payload = br#"{
+            "header": { "event_type": "card.action.trigger", "event_id": "e_card" },
+            "event": {
+                "action": {
+                    "tag": "button",
+                    "value": {
+                        "action": "perm", "reply": "once", "request_id": "p1", "session_id": "s1",
+                        "open_chat_id": "oc_spoofed"
+                    }
+                }
+            }
+        }"#;
+    let frame = event_frame(payload);
+    match process_frame(&frame, &mut DedupeSet::new(10)) {
+        FrameAction::CardAction(v) => assert!(
+            v.get("open_chat_id").is_none(),
+            "a payload-supplied open_chat_id must be dropped: {v}"
+        ),
+        other => panic!("expected CardAction, got {:?}", std::mem::discriminant(&other)),
+    }
+
+    // The trusted context wins over the payload's value.
+    let payload = br#"{
+            "header": { "event_type": "card.action.trigger", "event_id": "e_card" },
+            "event": {
+                "action": {
+                    "tag": "button",
+                    "value": {
+                        "action": "perm", "reply": "once", "request_id": "p1", "session_id": "s1",
+                        "open_chat_id": "oc_spoofed"
+                    }
+                },
+                "context": { "open_chat_id": "oc_real" }
+            }
+        }"#;
+    let frame = event_frame(payload);
+    match process_frame(&frame, &mut DedupeSet::new(10)) {
+        FrameAction::CardAction(v) => assert_eq!(v["open_chat_id"], "oc_real"),
         other => panic!("expected CardAction, got {:?}", std::mem::discriminant(&other)),
     }
 }
