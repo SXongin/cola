@@ -2248,8 +2248,16 @@ mod tests {
             "permission + question must name both: {}",
             acc.header_sig()
         );
-        // Resolving every live block lifts the awaiting title.
+        // Resolving one of the two leaves the other kind's title.
         assert!(acc.dismiss_interaction("p"));
+        assert_eq!(acc.awaiting_action(), AwaitingAction::Question);
+        assert!(
+            acc.header_sig()
+                .contains(crate::feishu::card::AWAITING_QUESTION_TITLE),
+            "resolving the permission must leave the question wait: {}",
+            acc.header_sig()
+        );
+        // Resolving every live block lifts the awaiting title.
         assert!(acc.dismiss_interaction("q"));
         assert_eq!(acc.awaiting_action(), AwaitingAction::None);
         assert!(
