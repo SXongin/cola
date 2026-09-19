@@ -453,6 +453,8 @@ impl Turn {
                 // Capture the answering model + token usage from the LATEST
                 // assistant message unconditionally — the render dedup may have
                 // captured them before the message carried its final tokens.
+                // Usage only when nonzero: an in-flight step's message carries
+                // zeros and must not wipe the last completed step's figure.
                 if let Some(msgs) = &final_msgs {
                     let latest_assistant = msgs.iter().rfind(|m| m.info.role.as_deref() == Some("assistant"));
                     if let Some(m) = latest_assistant {
@@ -463,7 +465,10 @@ impl Turn {
                             acc.provider_id = Some(provider_id.clone());
                         }
                         if let Some(tokens) = &m.info.tokens {
-                            acc.context_tokens = tokens.context_used();
+                            let used = tokens.context_used();
+                            if used > 0 {
+                                acc.context_tokens = used;
+                            }
                         }
                     }
                 }

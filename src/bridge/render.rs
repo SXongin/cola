@@ -441,8 +441,14 @@ pub(crate) fn render_new_turn_parts(
         if let Some(provider_id) = &m.info.provider_id {
             acc.provider_id = Some(provider_id.clone());
         }
+        // An in-flight step is its own assistant message and carries all-zero
+        // usage until it finishes. Capturing that zero would wipe the last
+        // completed step's figure and hide the footer's 📊 segment mid-turn.
         if let Some(tokens) = &m.info.tokens {
-            acc.context_tokens = tokens.context_used();
+            let used = tokens.context_used();
+            if used > 0 {
+                acc.context_tokens = used;
+            }
         }
         let Some(parts) = m.parts.as_array() else { continue };
         for part in parts {
@@ -861,6 +867,60 @@ mod tests {
 
         assert!(render_new_turn_parts(&mut acc, &msgs));
         assert_eq!(acc.current_phase, Some(HeaderPhase::Streaming));
+    }
+
+    /// Every step is its own assistant message, and an in-flight step carries
+    /// all-zero usage until it finishes. The zero must not wipe the last
+    /// completed step's figure: doing so hid the footer's 📊 segment for the
+    /// whole streaming phase and showed it only at turn end (reported bug).
+    #[test]
+    fn inflight_zero_usage_keeps_the_last_completed_steps_figure() {
+        use crate::opencode::types::{MessageInfo, MessageTime, MessageTokens, SessionMessage};
+
+        let message = |id: &str, created: i64, tokens: MessageTokens| SessionMessage {
+            info: MessageInfo {
+                id: id.into(),
+                role: Some("assistant".into()),
+                parent_id: None,
+                time: Some(MessageTime { created }),
+                model_id: Some("m".into()),
+                provider_id: Some("p".into()),
+                tokens: Some(tokens),
+            },
+            parts: serde_json::json!([]),
+        };
+        let mut acc = StreamAccumulator::new("test");
+        acc.turn_started_ms = Some(0);
+
+        let msgs = vec![
+            message(
+                "a1",
+                100,
+                MessageTokens {
+                    total: 210_239,
+                    ..Default::default()
+                },
+            ),
+            // The step now streaming: its message exists, usage still zeros.
+            message("a2", 200, MessageTokens::default()),
+        ];
+        render_new_turn_parts(&mut acc, &msgs);
+        assert_eq!(acc.context_tokens, 210_239);
+
+        // The next completed step updates the figure as usual.
+        let msgs = vec![
+            message("a2", 200, MessageTokens::default()),
+            message(
+                "a3",
+                300,
+                MessageTokens {
+                    total: 216_860,
+                    ..Default::default()
+                },
+            ),
+        ];
+        render_new_turn_parts(&mut acc, &msgs);
+        assert_eq!(acc.context_tokens, 216_860);
     }
 
     #[test]
