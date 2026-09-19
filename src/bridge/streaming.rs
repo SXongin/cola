@@ -24,6 +24,17 @@ pub struct TimelineItem {
     pub kind: TimelineKind,
 }
 
+/// Bookkeeping for a Tool Panel that is still live (ADR-0045): the timeline
+/// key and element identity allocated when its call first appeared, so the
+/// settle move into the timeline lands in the call's original order and keeps
+/// the reader's fold state.
+#[derive(Debug, Clone)]
+struct LiveTool {
+    key: i64,
+    shown_at: Option<i64>,
+    seq: u64,
+}
+
 /// What a timeline entry renders.
 #[derive(Debug, Clone)]
 pub enum TimelineKind {
@@ -315,6 +326,12 @@ pub struct StreamAccumulator {
     pub reasoning: String,
     /// Tool panels keyed by call ID (current state; `timeline` keeps order).
     pub tools: IndexMap<String, ToolPanel>,
+    /// Live (unfinished) Tool Panels keyed by call ID: the timeline key,
+    /// server start time and element identity allocated when the call first
+    /// appeared. A live panel renders in the card TAIL, so a split can never
+    /// strand it on a closed card; it joins `timeline` — with the identity it
+    /// was born with — only when the tool settles (ADR-0045).
+    live_tools: IndexMap<String, LiveTool>,
     /// The latest `todowrite` panel of this turn, rendered as a card-TAIL
     /// status section instead of a timeline row. A timeline row would freeze on
     /// whichever card the call landed on: once that card finalizes (a long
@@ -787,6 +804,15 @@ impl StreamAccumulator {
     /// (or `None` for a synthetic key) as the instant a panel header may
     /// display.
     fn insert_kind(&mut self, key: i64, shown_at: Option<i64>, kind: TimelineKind) {
+        self.item_seq += 1;
+        self.insert_item(key, shown_at, self.item_seq, kind);
+    }
+
+    /// [`Self::insert_kind`] with a pre-allocated identity: a live Tool Panel
+    /// keeps the seq it was born with when it settles into the timeline, so
+    /// its card element — and the reader's fold state — survives the move
+    /// (ADR-0045).
+    fn insert_item(&mut self, key: i64, shown_at: Option<i64>, seq: u64, kind: TimelineKind) {
         let idx = self.timeline.partition_point(|item| item.key <= key);
         let (idx, key) = if idx < self.render_from {
             (
@@ -796,13 +822,13 @@ impl StreamAccumulator {
         } else {
             (idx, key)
         };
-        self.item_seq += 1;
+        self.item_seq = self.item_seq.max(seq);
         self.timeline.insert(
             idx,
             TimelineItem {
                 key,
                 shown_at,
-                seq: self.item_seq,
+                seq,
                 kind,
             },
         );
@@ -914,14 +940,54 @@ impl StreamAccumulator {
     /// [`Self::push_tool`] for a tool part that started at `at_ms` (the
     /// server's `state.time.start`). A tool first seen before the server
     /// stamped it (a pending part, no time) gains its start time on the later
-    /// update without moving its key; a part with no server time keeps showing
-    /// no clock.
+    /// update: a live panel adopts it as its timeline key — nothing is placed
+    /// yet — while a panel already in the timeline keeps its key and only
+    /// gains the clock. A part with no server time keeps showing no clock.
     pub fn push_tool_at(&mut self, at_ms: Option<i64>, call_id: &str, panel: ToolPanel) {
+        let live = panel.is_live();
         let is_new = !self.tools.contains_key(call_id);
         self.tools.insert(call_id.to_string(), panel);
         if is_new {
             let key = at_ms.unwrap_or_else(|| self.next_order());
-            self.insert_kind(key, at_ms, TimelineKind::Tool(call_id.to_string()));
+            if live {
+                // Unfinished: TAIL content. Allocate its identity and key now,
+                // but do not join the timeline — a split must never finalize a
+                // panel whose tool is still running (ADR-0045).
+                self.item_seq += 1;
+                self.live_tools.insert(
+                    call_id.to_string(),
+                    LiveTool {
+                        key,
+                        shown_at: at_ms,
+                        seq: self.item_seq,
+                    },
+                );
+            } else {
+                self.insert_kind(key, at_ms, TimelineKind::Tool(call_id.to_string()));
+            }
+        } else if self.live_tools.contains_key(call_id) {
+            // A later sighting may carry the server start time the first one
+            // lacked (a pending part with no `state.time`). The panel is not on
+            // the timeline yet, so the real start time REPLACES the synthetic
+            // fallback key — the settle move must land where the call started.
+            if let Some(at) = at_ms {
+                let entry = self.live_tools.get_mut(call_id).expect("checked");
+                entry.shown_at = entry.shown_at.or(at_ms);
+                entry.key = at;
+            }
+            if !live {
+                // Settled: the panel joins the timeline at the key it was born
+                // with — clamped to the top of the live slice when that key is
+                // behind it (ADR-0038's late-part rule) — carrying the element
+                // identity it was born with, so its fold state survives.
+                let entry = self.live_tools.shift_remove(call_id).expect("checked");
+                self.insert_item(
+                    entry.key,
+                    entry.shown_at,
+                    entry.seq,
+                    TimelineKind::Tool(call_id.to_string()),
+                );
+            }
         } else if at_ms.is_some()
             && let Some(item) = self
                 .timeline
@@ -954,17 +1020,17 @@ impl StreamAccumulator {
         // The slice that fits on its own. When items remain, it must hold at
         // least one: an empty slice would leave `render_from` frozen and the
         // flush loop would re-send empty "部分完成" cards forever.
-        let mut split = self.estimate_split_index(self.render_from, None);
+        let mut split = self.estimate_split_index(self.render_from, false);
         if self.render_from < self.timeline.len() {
             split = split.max(self.render_from + 1);
         }
         let mut full = split < self.timeline.len();
-        // The todo list rides the tail, which only a non-full (live) card
-        // carries. When the remainder fits without the panel but not with it,
-        // this card finalizes without the tail — sized so the next card, with
-        // fewer items, can carry it — instead of overflowing Feishu's limit.
-        if !full && let Some(todo) = &self.todo_panel {
-            let with_tail = self.estimate_split_index(self.render_from, Some(todo));
+        // The tail rides only a non-full (live) card. When the remainder fits
+        // without the tail but not with it — a long todo list, or running tool
+        // panels (ADR-0045) — this card finalizes without the tail, sized so
+        // the next card can carry it, instead of overflowing Feishu's limit.
+        if !full {
+            let with_tail = self.estimate_split_index(self.render_from, true);
             if with_tail < split {
                 split = with_tail.max(self.render_from + 1).min(split);
                 full = true;
@@ -1028,21 +1094,33 @@ impl StreamAccumulator {
     /// element) so the estimate trails the real card size by only a few
     /// hundred bytes — the `MAX_CARD_JSON_CHARS` margin absorbs the rest.
     ///
-    /// `tail_reserve` is a panel the built card will ALSO carry in its tail
-    /// (the todo list); charging its size to the same budget keeps the card
-    /// and its tail together under the cap. Callers pass it only when the
-    /// slice is the final, tail-carrying one — see
-    /// [`Self::build_card_with_info`].
-    fn estimate_split_index(&self, start: usize, tail_reserve: Option<&ToolPanel>) -> usize {
+    /// `reserve_tail` charges the panels the built card will ALSO carry in its
+    /// tail — the todo list and every running tool's panel (ADR-0045) — to the
+    /// same budget, keeping the card and its tail together under the cap.
+    /// Callers pass it only when the slice is the final, tail-carrying one —
+    /// see [`Self::build_card_with_info`].
+    fn estimate_split_index(&self, start: usize, reserve_tail: bool) -> usize {
         // Byte length of the first `n` chars (mirrors `truncate_md`, which caps
         // rendered content by characters).
         let first_n_bytes = |s: &str, n: usize| s.chars().take(n).map(|c| c.len_utf8()).sum::<usize>();
         let mut comps = 0usize;
         let mut size = 0usize;
         let mut card_text = 0usize;
-        if let Some(panel) = tail_reserve {
-            comps += 1;
-            size += panel_estimate(panel);
+        if reserve_tail {
+            // The tail rides only the live card, but it counts against that
+            // card's budget: the todo list, then every running tool's panel
+            // (ADR-0045). When they don't fit, the card finalizes without the
+            // tail and the continuation carries it.
+            if let Some(panel) = &self.todo_panel {
+                comps += 1;
+                size += panel_estimate(panel);
+            }
+            for call_id in self.live_tools.keys() {
+                if let Some(panel) = self.tools.get(call_id) {
+                    comps += 1;
+                    size += panel_estimate(panel);
+                }
+            }
         }
         for (i, item) in self.timeline.iter().enumerate().skip(start) {
             let (c, s, t) = match &item.kind {
@@ -1167,6 +1245,20 @@ impl StreamAccumulator {
             // `builder.body_len()`, so they stay correct with it in front.
             if let Some(todo) = &self.todo_panel {
                 builder = builder.with_tool_at(todo.clone(), self.todo_shown_at, Some("todo"));
+            }
+            // Running tools are live content, so their panels ride the tail —
+            // after the todo list and before the interaction blocks, keeping a
+            // running tool's Permission/Question below its own panel. A split
+            // finalizes the card without them; they continue on the newest
+            // card and join the timeline once they settle (ADR-0045).
+            for (call_id, live) in &self.live_tools {
+                if let Some(panel) = self.tools.get(call_id) {
+                    builder = builder.with_tool_at(
+                        panel.clone(),
+                        live.shown_at,
+                        Some(&format!("tool_{}", live.seq)),
+                    );
+                }
             }
             // The card's tail: the live interaction blocks, in accumulated
             // order. A permission renders its buttons right here (the whole
@@ -1931,6 +2023,121 @@ mod tests {
         );
         assert_eq!(acc.tools.len(), 1);
         assert_eq!(acc.timeline.len(), 1, "one tool marker, no duplicates");
+    }
+
+    /// #243 / ADR-0045: a tool that is still running is LIVE content. A card
+    /// split finalizes without its panel, and the continuation — the new live
+    /// card — carries it, so the completion can never strand on a closed card.
+    #[test]
+    fn a_running_tool_panel_rides_the_live_continuation() {
+        let bash = |status: &str, output: Option<&str>| ToolPanel {
+            name: "bash".into(),
+            status: status.into(),
+            input: Some(serde_json::json!({ "command": "sleep 30" })),
+            output: output.map(|o| o.to_string()),
+        };
+        let mut acc = StreamAccumulator::new("test");
+        acc.push_tool("call_bash", bash("running", None));
+        // Enough text to push the timeline past one card's budget.
+        acc.push_text(&"很长的回答。".repeat(2000));
+
+        let (finalized, full) = acc.build_card_with_split();
+        assert!(full, "long text must split");
+        assert!(
+            !finalized.to_string().contains("bash"),
+            "a finalized card must not carry a running panel: {finalized}"
+        );
+
+        // The live continuation takes the panel over; completing it later
+        // renders there, not on a card that can no longer change.
+        let (continuation, full2) = acc.build_card_with_split();
+        assert!(!full2, "the continuation should fit");
+        assert!(
+            continuation.to_string().contains("bash"),
+            "the live continuation must carry the running panel: {continuation}"
+        );
+    }
+
+    /// #243 / ADR-0045: a pending tool first sighted before the server
+    /// stamped it has a synthetic fallback key; when the server start time
+    /// arrives, the settle move must use THAT time, or the panel lands after
+    /// content it actually preceded.
+    #[test]
+    fn a_late_server_start_time_orders_the_settled_panel() {
+        let bash = |status: &str, output: Option<&str>| ToolPanel {
+            name: "bash".into(),
+            status: status.into(),
+            input: Some(serde_json::json!({ "command": "sleep 30" })),
+            output: output.map(|o| o.to_string()),
+        };
+        let mut acc = StreamAccumulator::new("test");
+        acc.push_tool_at(None, "call_bash", bash("pending", None));
+        // Content that really started before and after the tool (server keys
+        // 0 and 1000); the tool's own start time lands later.
+        acc.push_text_at(Some(0), "第一段");
+        acc.push_text_at(Some(1_000), "第二段");
+        acc.push_tool_at(Some(500), "call_bash", bash("running", None));
+        acc.push_tool_at(Some(500), "call_bash", bash("completed", Some("done")));
+
+        let card = acc.build_card();
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let order: Vec<&str> = elements
+            .iter()
+            .map(|e| {
+                if e["tag"] == "collapsible_panel" {
+                    "tool"
+                } else {
+                    e["content"].as_str().unwrap_or_default()
+                }
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec!["第一段", "tool", "第二段"],
+            "the settled panel must sit at its server start time: {card}"
+        );
+    }
+
+    /// #243 / ADR-0045: when the tool settles, its panel leaves the tail and
+    /// joins the timeline — with the element identity it was born with, so the
+    /// reader's fold state survives the move.
+    #[test]
+    fn a_settled_tool_panel_joins_the_timeline_keeping_its_identity() {
+        let panel_ids = |card: &serde_json::Value| -> Vec<String> {
+            card["body"]["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["tag"] == "collapsible_panel")
+                .map(|e| e["element_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let bash = |status: &str, output: Option<&str>| ToolPanel {
+            name: "bash".into(),
+            status: status.into(),
+            input: Some(serde_json::json!({ "command": "sleep 30" })),
+            output: output.map(|o| o.to_string()),
+        };
+        let mut acc = StreamAccumulator::new("test");
+        acc.push_tool("call_bash", bash("running", None));
+        // While the tool runs the panel is live: it renders on the card, but
+        // has not joined the timeline.
+        assert!(acc.timeline.is_empty(), "a running panel is not history yet");
+        let running_card = acc.build_card();
+        assert_eq!(panel_ids(&running_card).len(), 1, "{running_card}");
+
+        acc.push_tool("call_bash", bash("completed", Some("done")));
+        assert_eq!(acc.timeline.len(), 1, "the settled panel joins the timeline");
+        let done_card = acc.build_card();
+        assert!(
+            done_card.to_string().contains("done"),
+            "the result must render: {done_card}"
+        );
+        assert_eq!(
+            panel_ids(&done_card),
+            panel_ids(&running_card),
+            "the settle move keeps the panel's element identity"
+        );
     }
 
     /// The header phase (ADR-0014) follows state transitions: Loading until the

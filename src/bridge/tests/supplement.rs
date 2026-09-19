@@ -231,13 +231,13 @@ async fn supplement_splits_the_chain_and_the_continuation_takes_over() {
     assert!(has(&last_update.1, "后续进度。"));
 }
 
-/// A split while a tool is running: the finalized card keeps the tool panel
-/// (it is in the pre-split slice), and the continuation's slice has no panel —
-/// but its header still names the Turn's running tool instead of falling back
-/// to "✍️ 回复中". A tool that already finished is not running, so it does not
-/// leak into the continuation's header.
+/// A split while a tool is running: the panel is live tail content (ADR-0045),
+/// so the finalized card finalizes WITHOUT it and the continuation — the new
+/// live card — carries it, its header still naming the Turn's running tool
+/// instead of falling back to "✍️ 回复中". A tool that already finished is not
+/// running, so it does not leak into the continuation's header.
 #[tokio::test]
-async fn a_split_continuation_keeps_the_turns_running_tool_in_its_header() {
+async fn a_split_continuation_takes_the_running_tool_panel_over() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -271,20 +271,95 @@ async fn a_split_continuation_keeps_the_turns_running_tool_in_its_header() {
     ))
     .await;
 
-    // The finalized card keeps the panel (it precedes the split)...
+    // A running panel must never freeze on a finalized card...
     let finalized = last_update_of(&platform, "om_live").await;
     assert!(
-        finalized.contains("bash"),
-        "the finalized card keeps the running tool's panel: {finalized}"
+        !finalized.contains("bash"),
+        "a finalized card must not carry a running panel: {finalized}"
     );
-    // ...and the continuation, whose delta has no panel, still says the Turn is
-    // executing it — not the bare streaming label.
+    // ...it continues on the live continuation, whose header still says the
+    // Turn is executing it — not the bare streaming label.
     let (reply_to, card) = continuation(&platform).await;
     assert_eq!(reply_to, "msg_sup");
+    assert!(
+        has(&card, "bash"),
+        "the continuation must carry the running panel: {card}"
+    );
     let header = card["header"]["title"]["content"].as_str().unwrap();
     assert!(
         header.starts_with("⏳ bash"),
         "the continuation header must show the Turn's running tool: {card}"
+    );
+}
+
+/// #243 / ADR-0045: the tool completes after the split. Its result renders on
+/// the continuation — the live card — never on the finalized one, and never
+/// nowhere (the bug this fixes).
+#[tokio::test]
+async fn a_tool_completing_after_the_split_renders_on_the_continuation() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    seed_session(&app, "ses_test", "/work").await;
+
+    let mut acc = StreamAccumulator::new("回合");
+    acc.card_state = CardState::Streaming;
+    acc.push_text("开始分析。");
+    acc.push_tool(
+        "call_bash",
+        crate::feishu::card::tool_render::ToolPanel {
+            name: "bash".into(),
+            status: "running".into(),
+            input: Some(serde_json::json!({"command": "sleep 30"})),
+            output: None,
+        },
+    );
+    acc.reply_to_message_id = Some("msg_1".into());
+    app.cards
+        .lock()
+        .await
+        .insert("ses_test".into(), CardSession::new(acc, Some("om_live".into())));
+    app.inflight.lock().await.insert("ses_test".to_string());
+
+    app.handle_message(incoming(
+        "msg_sup".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "补充一下".into(),
+        None,
+    ))
+    .await;
+
+    // The tool settles through the render path the poll uses: `sleep 30`
+    // completes and its output lands.
+    {
+        let mut cards = app.cards.lock().await;
+        let acc = &mut cards.get_mut("ses_test").unwrap().acc;
+        crate::bridge::render::render_parts(
+            acc,
+            &serde_json::json!([
+                { "type": "tool", "tool": "bash", "callID": "call_bash",
+                  "state": { "status": "completed",
+                             "input": { "command": "sleep 30" },
+                             "output": "done" } },
+            ]),
+        );
+    }
+    crate::bridge::render::flush_card(&app.core, "ses_test").await;
+
+    // The completion renders on the continuation, in its live tail...
+    let updated = last_update_of(&platform, "msg_reply").await;
+    assert!(
+        updated.contains("done") && updated.contains("✅ bash"),
+        "the completion must render on the continuation: {updated}"
+    );
+    // ...and the finalized card stays frozen without it.
+    let finalized = last_update_of(&platform, "om_live").await;
+    assert!(
+        !finalized.contains("done"),
+        "the finalized card must keep its pre-split slice: {finalized}"
     );
 }
 
