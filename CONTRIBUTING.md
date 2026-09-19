@@ -38,8 +38,12 @@ The per-task loop is always:
 
 Keep one PR to one thing (see *Before you start*) and the branch short-lived.
 
-This rule applies to agents too — run the full loop by default; do not stop at
-"branch off `main`" or ask which base to use. The base is always `main`.
+This rule applies to agents too, with one exception: **agents never merge.**
+They run the loop up to the green PR — branch, work, commit, rebase, open the
+PR, get CI and review green — and then stop. The user verifies the change
+themselves and gives the explicit go-ahead (or merges it themselves). Do not
+stop at "branch off `main`" or ask which base to use; the base is always
+`main`.
 
 ### Branch naming
 
@@ -108,7 +112,8 @@ Note: CI's Format job is `cargo fmt --all -- --check` — clippy and rustc do
 4. Record architectural decisions as ADRs in `docs/adr/` when the change is
    hard to reverse.
 5. Do not merge until CI (fmt, clippy, test, release build, dependency audit) is
-   green.
+   green. Agent-authored PRs additionally wait for the user's own verification
+   and explicit go-ahead before merging (see *Branch workflow*).
 
 Description template:
 
