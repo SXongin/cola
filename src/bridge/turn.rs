@@ -493,28 +493,11 @@ impl Turn {
         // git state before the final flush — the footer shows where the turn
         // landed, not just where it started.
         crate::bridge::streaming::refresh_work_context(&app.core, &self.session_id).await;
-        // Compute the context-usage ratio for the card footer (input tokens ÷
-        // the model's context window), then flush so the footer is on the card.
+        // Refresh the Turn Footer's context window (ADR-0044) before the final
+        // flush: the render-poll refresh usually covered it, but the reconcile
+        // above may have just captured a final usage the polls never saw.
         if prompt_err.is_none() {
-            let info = {
-                let cards = app.cards.lock().await;
-                cards.get(&self.session_id).map(|c| &c.acc).and_then(|a| {
-                    match (&a.provider_id, &a.model_id, a.context_tokens) {
-                        (Some(p), Some(m), input) if input > 0 => Some((p.clone(), m.clone(), input)),
-                        _ => None,
-                    }
-                })
-            };
-            if let Some((provider, model, input)) = info
-                && let Ok(Some(window)) = app.opencode.model_context_window(&provider, &model).await
-                && window > 0
-            {
-                let ratio = (input as f64 / window as f64).clamp(0.0, 1.0);
-                let mut cards = app.cards.lock().await;
-                if let Some(acc) = cards.get_mut(&self.session_id).map(|c| &mut c.acc) {
-                    acc.context_ratio = Some(ratio);
-                }
-            }
+            crate::bridge::streaming::refresh_context_window(&app.core, &self.session_id).await;
         }
         flush_card(&app.core, &self.session_id).await;
 

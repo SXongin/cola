@@ -634,6 +634,12 @@ pub struct MockBackend {
     /// The configured default model served by `configured_default_model` (the
     /// second rung of the `/think` effective-model resolution).
     pub default_model: Option<opencode::types::ModelInfo>,
+    /// The context-window size `model_context_window` reports; `None`
+    /// simulates a server that reports none (ADR-0044's used-only fallback).
+    pub context_window: Option<i64>,
+    /// Counts `model_context_window` calls, so a test can prove the per-turn
+    /// memo fetches at most once per (provider, model).
+    pub context_window_calls: Arc<std::sync::atomic::AtomicUsize>,
     /// The server-recorded session model served by `session_info` (the third
     /// rung of the `/think` effective-model resolution).
     pub session_model: Option<opencode::types::SessionModel>,
@@ -710,6 +716,8 @@ impl MockBackend {
             agents: Vec::new(),
             provider_models: Vec::new(),
             default_model: None,
+            context_window: Some(100_000),
+            context_window_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_model: None,
             session_statuses: std::collections::HashMap::new(),
             session_status_error: None,
@@ -1074,7 +1082,9 @@ impl opencode::Backend for MockBackend {
     }
 
     async fn model_context_window(&self, _provider: &str, _model: &str) -> crate::error::Result<Option<i64>> {
-        Ok(Some(100_000))
+        self.context_window_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self.context_window)
     }
 
     fn configured_default_model(&self) -> Option<opencode::types::ModelInfo> {

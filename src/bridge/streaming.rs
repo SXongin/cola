@@ -179,6 +179,20 @@ impl InteractionBlock {
     }
 }
 
+/// Compact token count for the Turn Footer's context segment: `842`, `84k`,
+/// `1.2M`. One decimal only under 10M, so a large window stays readable.
+fn format_tokens(n: i64) -> String {
+    if n >= 10_000_000 {
+        format!("{}M", n / 1_000_000)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        format!("{n}")
+    }
+}
+
 /// Compact one-line target for a question's receipt: each question's header
 /// (or a clipped question text), joined, clipped to stay a residue.
 pub(crate) fn question_target(questions: &[crate::opencode::types::QuestionInfo]) -> String {
@@ -336,10 +350,15 @@ pub struct StreamAccumulator {
     /// server reports the model but not the variant.
     pub variant: Option<String>,
     /// Context tokens the model consumed this turn (includes cached prefix), for
-    /// the context-usage ratio in the card footer.
+    /// the context-usage segment in the card footer.
     pub context_tokens: i64,
-    /// Estimated context-window usage (0..1); set when the turn completes.
-    pub context_ratio: Option<f64>,
+    /// The answering model's context-window size (tokens), fetched from
+    /// `GET /provider` and memoized for the turn — `None` before the lookup or
+    /// when the server reports none (ADR-0044).
+    pub context_window: Option<i64>,
+    /// The (provider, model) pair [`Self::context_window`] was fetched for; a
+    /// mismatch triggers a re-fetch, since the answering model can change.
+    pub context_window_key: Option<(String, String)>,
     /// Working directory of the session, shown in the card footer.
     pub directory: Option<String>,
     /// Project name (directory basename) for the Turn Footer's 📁 segment.
@@ -702,6 +721,29 @@ impl StreamAccumulator {
         format!("{}|{}", title, template)
     }
 
+    /// The Turn Footer's context-usage segment (ADR-0044), derived from the
+    /// latest usage and the memoized window: `📊 上下文 84k/200k (42%)`, or the
+    /// used tokens alone when the server reports no window. `None` until the
+    /// first usage lands — a step that has not finished has no token data.
+    pub fn context_segment(&self) -> Option<String> {
+        if self.context_tokens <= 0 {
+            return None;
+        }
+        let used = format_tokens(self.context_tokens);
+        match self.context_window.filter(|w| *w > 0) {
+            Some(window) => {
+                let ratio = (self.context_tokens as f64 / window as f64).clamp(0.0, 1.0);
+                Some(format!(
+                    "📊 上下文 {}/{} ({:.0}%)",
+                    used,
+                    format_tokens(window),
+                    ratio * 100.0
+                ))
+            }
+            None => Some(format!("📊 上下文 {}", used)),
+        }
+    }
+
     /// Insert a timeline entry at its key's position: after every entry whose
     /// part started no later, before the ones that started later. The poll can
     /// deliver parts out of order (a panel whose content lands after later
@@ -1008,10 +1050,10 @@ impl StreamAccumulator {
 
     /// Assemble the card JSON for `timeline[start..end]`. `include_tail` adds
     /// the non-timeline sections (inline permission/question, error, retry
-    /// button, context-ratio footer) — only the turn's final card should carry
-    /// them. `state_override` forces the header state (e.g. "部分完成" on split
-    /// cards). Returns the card and the element range of every live block the
-    /// tail rendered (empty without a tail).
+    /// button) — only the live card should carry them. `state_override` forces
+    /// the header state (e.g. "部分完成" on split cards). Returns the card and
+    /// the element range of every live block the tail rendered (empty without a
+    /// tail).
     fn build_card_inner(
         &self,
         start: usize,
@@ -1169,11 +1211,10 @@ impl StreamAccumulator {
         // branch · dirty) is captured at turn start — so a wrong-branch run is
         // visible before it completes — and refreshed at turn end, so the final
         // card shows where the turn landed (a branch the AI created or switched
-        // to, and whether it left uncommitted work). The 🤖 model is captured
-        // from the assistant message while the turn streams, so it renders on
-        // EVERY card (a split "部分完成" card must still say which model is
-        // answering); the context-window ratio is computed at turn end, so it
-        // appends only on the final card (include_tail).
+        // to, and whether it left uncommitted work). The 🤖 model and the 📊
+        // context usage are captured while the turn streams, so both render on
+        // EVERY card — including a split "部分完成" one — from the moment their
+        // data exists (ADR-0020, ADR-0044).
         let mut footer_parts: Vec<String> = Vec::new();
         if let Some(dir) = &self.directory {
             let name = self.project_name.as_deref().unwrap_or(dir);
@@ -1202,8 +1243,8 @@ impl StreamAccumulator {
             };
             footer_parts.push(format!("🤖 {}", label));
         }
-        if include_tail && let Some(ratio) = self.context_ratio {
-            footer_parts.push(format!("📊 上下文 {:.0}%", ratio * 100.0));
+        if let Some(segment) = self.context_segment() {
+            footer_parts.push(segment);
         }
         if !footer_parts.is_empty() {
             builder = builder.with_footer(&footer_parts.join(" · "));
@@ -1232,6 +1273,50 @@ pub(crate) async fn refresh_work_context(core: &Arc<SharedCore>, session_id: &st
     }
 }
 
+/// Fetch and memoize the answering model's context-window size for the live
+/// turn (ADR-0044) — the denominator of the footer's 📊 segment. The lookup is
+/// the only cost of the live refresh and is paid at most once per
+/// (provider, model) per turn: the accumulator remembers what it was fetched
+/// for, so later polls are a no-op. The request runs OUTSIDE the cards lock
+/// (network); the lock only wraps the memo swap. Best effort: a missing card,
+/// no usage yet, or a failed request leaves the memo unset so a later poll
+/// retries.
+pub(crate) async fn refresh_context_window(core: &Arc<SharedCore>, session_id: &str) {
+    let key = {
+        let cards = core.cards.lock().await;
+        let Some(acc) = cards.get(session_id).map(|c| &c.acc) else {
+            return;
+        };
+        // Before the first usage there is nothing any card could show.
+        if acc.context_tokens <= 0 {
+            return;
+        }
+        let (Some(provider), Some(model)) = (&acc.provider_id, &acc.model_id) else {
+            return;
+        };
+        let key = (provider.clone(), model.clone());
+        if acc.context_window_key.as_ref() == Some(&key) {
+            return;
+        }
+        key
+    };
+    let Ok(window) = core.opencode.model_context_window(&key.0, &key.1).await else {
+        return;
+    };
+    let mut cards = core.cards.lock().await;
+    if let Some(acc) = cards.get_mut(session_id).map(|c| &mut c.acc)
+        // A concurrent refresh may have moved the memo to a newer model while
+        // this request was in flight; never clobber it with a stale answer.
+        && acc
+            .context_window_key
+            .as_ref()
+            .is_none_or(|current| current == &key)
+    {
+        acc.context_window_key = Some(key);
+        acc.context_window = window;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1244,7 +1329,8 @@ mod tests {
         acc.directory = Some("/root/workspace/dev/cola".into());
         acc.provider_id = Some("opencode-go".into());
         acc.model_id = Some("deepseek-v4-flash".into());
-        acc.context_ratio = Some(0.36);
+        acc.context_tokens = 84_200;
+        acc.context_window = Some(200_000);
         acc.push_text("结果");
 
         let card = acc.build_card();
@@ -1259,7 +1345,45 @@ mod tests {
             "model missing: {}",
             text
         );
-        assert!(text.contains("📊 上下文 36%"), "ratio missing: {}", text);
+        assert!(
+            text.contains("📊 上下文 84k/200k (42%)"),
+            "context segment missing: {}",
+            text
+        );
+    }
+
+    /// ADR-0044: when the server reports no window size the segment degrades
+    /// to the used tokens alone — no percentage against an unknown denominator.
+    #[test]
+    fn card_footer_shows_used_tokens_when_the_window_is_unknown() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Done;
+        acc.provider_id = Some("opencode-go".into());
+        acc.model_id = Some("deepseek-v4-flash".into());
+        acc.context_tokens = 84_200;
+        acc.context_window = None;
+        acc.push_text("结果");
+
+        let text = acc.build_card().to_string();
+        assert!(text.contains("📊 上下文 84k"), "used tokens missing: {}", text);
+        assert!(!text.contains("84k/"), "no denominator expected: {}", text);
+
+        // Nothing to show before the first usage lands.
+        let mut fresh = StreamAccumulator::new("test");
+        fresh.provider_id = Some("opencode-go".into());
+        fresh.model_id = Some("m".into());
+        fresh.context_window = Some(200_000);
+        fresh.push_text("结果");
+        assert!(!fresh.build_card().to_string().contains("📊"));
+    }
+
+    #[test]
+    fn format_tokens_is_compact() {
+        assert_eq!(format_tokens(842), "842");
+        assert_eq!(format_tokens(84_200), "84k");
+        assert_eq!(format_tokens(200_000), "200k");
+        assert_eq!(format_tokens(1_200_000), "1.2M");
+        assert_eq!(format_tokens(20_000_000), "20M");
     }
 
     /// The footer model line renders the full identity `provider/model@variant`
@@ -1370,11 +1494,12 @@ mod tests {
         assert!(!acc.dirty);
     }
 
-    /// ADR-0019: the 📁 segment and the 🤖 model line render on every card
-    /// (the model is known while streaming), while the context ratio only
-    /// appends on the final card.
+    /// ADR-0019/ADR-0044: the 📁 segment, the 🤖 model line and the 📊 context
+    /// segment all render on every card once their data exists — including a
+    /// finalized 「部分完成」 slice (`include_tail = false`), which cannot be
+    /// updated afterwards.
     #[test]
-    fn work_context_and_model_show_before_final_card_but_ratio_does_not() {
+    fn work_context_model_and_context_show_before_final_card() {
         let mut acc = StreamAccumulator::new("test");
         acc.card_state = CardState::Streaming;
         acc.directory = Some("/root/workspace/dev/cola".into());
@@ -1383,7 +1508,8 @@ mod tests {
         acc.dirty = true;
         acc.provider_id = Some("opencode-go".into());
         acc.model_id = Some("deepseek-v4-flash".into());
-        acc.context_ratio = Some(0.36);
+        acc.context_tokens = 84_200;
+        acc.context_window = Some(200_000);
         acc.push_text("结果");
 
         let mid = acc
@@ -1396,7 +1522,11 @@ mod tests {
             "model must show mid-turn: {}",
             mid
         );
-        assert!(!mid.contains("📊"), "ratio must not show mid-turn: {}", mid);
+        assert!(
+            mid.contains("📊 上下文 84k/200k (42%)"),
+            "context must show mid-turn: {}",
+            mid
+        );
 
         acc.card_state = CardState::Done;
         let final_card = acc.build_card().to_string();
@@ -1405,7 +1535,11 @@ mod tests {
             "final: {}",
             final_card
         );
-        assert!(final_card.contains("📊 上下文 36%"), "final: {}", final_card);
+        assert!(
+            final_card.contains("📊 上下文 84k/200k (42%)"),
+            "final: {}",
+            final_card
+        );
     }
 
     /// While the card fits the component budget, successive flushes must
