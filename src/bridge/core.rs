@@ -108,6 +108,22 @@ pub struct SharedCore {
     /// Session ids with a prompt currently in flight (serializes prompts per
     /// session so concurrent messages don't clobber each other's cards).
     pub inflight: Arc<Mutex<HashSet<String>>>,
+    /// Session ids whose run was interrupted by `/stop`. The post-prompt drain
+    /// (ADR-0043) reads it so a stopped session finalizes promptly instead of
+    /// waiting out its bound on a Supplement the abort left unanswered; a new
+    /// Turn clears the marker when it starts.
+    pub stopped_sessions: Arc<Mutex<HashSet<String>>>,
+    /// A Turn's render poll cadence (ms): the incremental renderer while the
+    /// prompt is in flight, and the post-prompt drain that keeps rendering a
+    /// Supplement's new Turn (ADR-0043). Defaults to 1.5 s; tests store a small
+    /// value so the drain's branches run without real seconds (the
+    /// external-poller atomics pattern).
+    pub turn_render_poll_ms: std::sync::atomic::AtomicU64,
+    /// Bound on a Turn's post-prompt drain (ms): how long the render poll (and
+    /// the inflight guard) stays alive waiting for a Supplement's new Turn
+    /// before finalization (ADR-0043). Defaults to the external renderer's
+    /// 10 min; tests store a small value to exercise the bound.
+    pub turn_drain_timeout_ms: std::sync::atomic::AtomicU64,
     /// session_id → the cover card's current title for topics created with a
     /// bot cover card as their root (ADR-0023). In-memory only: the post-turn
     /// hook compares the server title and patches the cover card in place when
@@ -172,6 +188,9 @@ impl SharedCore {
             answered_requests: Arc::new(Mutex::new(HashSet::new())),
             settling_requests: Arc::new(Mutex::new(HashMap::new())),
             inflight: Arc::new(Mutex::new(HashSet::new())),
+            stopped_sessions: Arc::new(Mutex::new(HashSet::new())),
+            turn_render_poll_ms: std::sync::atomic::AtomicU64::new(1_500),
+            turn_drain_timeout_ms: std::sync::atomic::AtomicU64::new(600_000),
             cover_titles: Arc::new(Mutex::new(HashMap::new())),
             work_dir: cfg
                 .bridge

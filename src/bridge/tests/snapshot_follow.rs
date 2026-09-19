@@ -910,6 +910,12 @@ async fn user_prompt_during_follow_takes_over() {
         .external
         .render_poll_ms
         .store(50, std::sync::atomic::Ordering::Relaxed);
+    // The Busy status is this test's fixture for the FOLLOW decision; the
+    // user's own turn must not sit in the post-prompt drain waiting on a run
+    // that never ends in this mock, so disable the drain before it sleeps.
+    app.core
+        .turn_drain_timeout_ms
+        .store(0, std::sync::atomic::Ordering::Relaxed);
 
     crate::bridge::command::handle_command(
         &app.core,

@@ -381,8 +381,13 @@ fn render_part_once(acc: &mut StreamAccumulator, part: &serde_json::Value) -> bo
 /// (ADR-0026). External renders arm with the anchor directly; this fills it in
 /// for cola's own turns on the first poll that sees the message. It must run
 /// before any filtering: the anchor alone decides which messages are this
-/// turn's, and cola's clock cannot.
-fn capture_turn_anchor(acc: &mut StreamAccumulator, msgs: &[crate::opencode::types::SessionMessage]) {
+/// turn's, and cola's clock cannot. Shared with the post-prompt drain
+/// (ADR-0043), whose Backend snapshot must capture the anchor before it can
+/// judge an unanswered supplement.
+pub(crate) fn capture_turn_anchor(
+    acc: &mut StreamAccumulator,
+    msgs: &[crate::opencode::types::SessionMessage],
+) {
     if acc.turn_started_ms.is_some() {
         return;
     }
@@ -762,15 +767,18 @@ pub(crate) async fn render_and_flush(
 
 /// Incremental renderer: while the synchronous prompt is in flight, poll the
 /// session's messages and flush the card as parts complete (reasoning, tools,
-/// text). `done` stops the loop once the prompt returns.
+/// text). `done` stops the loop once the prompt returns. `poll_ms` is the
+/// injected cadence (`SharedCore::turn_render_poll_ms`), so tests never wait
+/// on the production 1.5 s.
 pub(crate) async fn render_poll_loop(
     core: &Arc<SharedCore>,
     session_id: String,
     done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    poll_ms: u64,
 ) {
     use std::sync::atomic::Ordering;
     loop {
-        tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(poll_ms)).await;
         if done.load(Ordering::SeqCst) {
             return;
         }

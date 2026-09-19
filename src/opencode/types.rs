@@ -181,14 +181,14 @@ pub struct PromptResponse {
 }
 
 /// A message returned by `GET /session/{id}/message`: `{ info, parts }`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SessionMessage {
     pub info: MessageInfo,
     #[serde(default)]
     pub parts: serde_json::Value,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct MessageInfo {
     pub id: String,
     #[serde(default)]
@@ -206,7 +206,7 @@ pub struct MessageInfo {
 }
 
 /// Token usage carried on an assistant message's `info.tokens`.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct MessageTokens {
     #[serde(default)]
     pub input: i64,
@@ -218,7 +218,7 @@ pub struct MessageTokens {
     pub cache: Option<MessageTokenCache>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct MessageTokenCache {
     #[serde(default)]
     pub read: i64,
@@ -237,7 +237,7 @@ impl MessageTokens {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct MessageTime {
     pub created: i64,
 }
