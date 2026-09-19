@@ -4,7 +4,7 @@
 //! while a Permission or Question is pending — and while a Turn runs past the
 //! long-turn threshold. A resolved wait unpins immediately; a long Turn that
 //! completes keeps its pin for the completion TTL, then unpins — unless a new
-//! Turn starts first, whose [`PinState::begin_turn`] releases the TTL hold at
+//! Turn starts first, whose [`ReminderState::begin_turn`] releases the TTL hold at
 //! once (the user is active again; a Pending hold survives). The pin is
 //! best-effort: every failure logs and the turn is unaffected (a missing
 //! `im:datasync.feed_card.time_sensitive:write` scope disables only pinning).
@@ -18,15 +18,15 @@
 //! Pins are generation-scoped: every pin records the **turn generation** that
 //! owns it, and a clear from an older generation can never unpin a newer
 //! turn's pin — so the long-turn TTL timer can never clear a newer turn's
-//! pin. The long-turn lifecycle ([`PinState::check_long_turn`] /
-//! [`PinState::complete_turn`]) is decided under the pin lock, so a
+//! pin. The long-turn lifecycle ([`ReminderState::check_long_turn`] /
+//! [`ReminderState::complete_turn`]) is decided under the pin lock, so a
 //! completion or an interaction racing a tick resolves exactly one way: no
 //! double pin, no leaked pin, no pin after completion.
 //!
 //! State is in-memory and not reconciled at startup: a pin orphaned by a crash
 //! or restart is not tracked, so the Chat/Topic's next turn issues one
 //! best-effort clear for its requester (the self-heal in
-//! [`PinState::begin_turn`]) and records that the Chat/Topic is known
+//! [`ReminderState::begin_turn`]) and records that the Chat/Topic is known
 //! unpinned — never a permanent pin.
 
 use std::collections::{HashMap, HashSet};
@@ -44,7 +44,7 @@ use crate::feishu::Platform;
 /// turn's requester (the pinned user) and the turn generation the pin belongs
 /// to.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PinTarget {
+pub(crate) struct ReminderTarget {
     pub(crate) chat_id: String,
     pub(crate) is_group: bool,
     /// The requester's open_id — Feishu requires at least one user id.
@@ -53,11 +53,11 @@ pub(crate) struct PinTarget {
 }
 
 /// Why a Chat/Topic is currently pinned. The pending-request lifecycle owns
-/// [`PinReason::Pending`]; the long-turn threshold/TTL lifecycle owns
-/// [`PinReason::LongTurn`]. The reminder is only actually cleared once every
+/// [`ReminderReason::Pending`]; the long-turn threshold/TTL lifecycle owns
+/// [`ReminderReason::LongTurn`]. The reminder is only actually cleared once every
 /// owner has released it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum PinReason {
+pub(crate) enum ReminderReason {
     /// A Permission/Question is pending.
     Pending,
     /// A Turn has run past the long-turn threshold (still running, or within
@@ -77,11 +77,11 @@ const DEFAULT_TTL_MS: u64 = 120_000;
 /// The reminder cola believes is currently ON at Feishu, the generation that
 /// owns it, and the reasons currently holding it on.
 #[derive(Clone)]
-struct LivePin {
+struct LiveReminder {
     generation: u64,
     is_group: bool,
     user_ids: Vec<String>,
-    reasons: HashSet<PinReason>,
+    reasons: HashSet<ReminderReason>,
 }
 
 /// A Chat/Topic's newest Turn's long-turn lifecycle (ADR-0043). The
@@ -99,7 +99,7 @@ struct Inner {
     /// chat_id → the generation counter, bumped at every turn start.
     generations: HashMap<String, u64>,
     /// chat_id → the reminder currently ON at Feishu.
-    live: HashMap<String, LivePin>,
+    live: HashMap<String, LiveReminder>,
     /// Chats/Topics whose Feishu reminder cola confirmed OFF in this process
     /// (a clear landed, or the startup-orphan self-heal ran) — never cleared
     /// again without a new pin.
@@ -120,7 +120,7 @@ struct Inner {
 /// The Instant Reminder state machine: `[bridge] instant_reminder` opt-in, generation
 /// counters, the tracked live pin, the pending membership of both request
 /// flows, and the long-turn silence/TTL lifecycle.
-pub(crate) struct PinState {
+pub(crate) struct ReminderState {
     enabled: bool,
     /// The long-turn silence threshold (ms): a Turn whose Chat/Topic has seen
     /// no user activity for this long pins it. A field, not a constant, so
@@ -136,7 +136,7 @@ pub(crate) struct PinState {
     inner: Mutex<Inner>,
 }
 
-impl PinState {
+impl ReminderState {
     pub(crate) fn new(enabled: bool) -> Self {
         Self {
             enabled,
@@ -227,7 +227,7 @@ impl PinState {
     /// [`Self::note_interaction`]), so a completion or interaction racing a
     /// tick resolves exactly one way: no pin after completion, no pin
     /// against a stale interaction.
-    pub(crate) async fn check_long_turn(&self, feishu: &Arc<dyn Platform>, target: &PinTarget) -> bool {
+    pub(crate) async fn check_long_turn(&self, feishu: &Arc<dyn Platform>, target: &ReminderTarget) -> bool {
         if !self.enabled {
             return false;
         }
@@ -245,7 +245,7 @@ impl PinState {
             .get(&target.chat_id)
             .is_some_and(|at| at.elapsed() >= threshold);
         if silent {
-            Self::ensure_locked(&mut inner, feishu, target, PinReason::LongTurn).await;
+            Self::ensure_locked(&mut inner, feishu, target, ReminderReason::LongTurn).await;
         }
         true
     }
@@ -274,13 +274,13 @@ impl PinState {
             .last_interaction
             .insert(chat_id.to_string(), tokio::time::Instant::now());
         if let Some(live) = inner.live.get(chat_id).cloned() {
-            Self::clear_locked(inner, feishu, chat_id, live.generation, PinReason::LongTurn).await;
+            Self::clear_locked(inner, feishu, chat_id, live.generation, ReminderReason::LongTurn).await;
         }
     }
 
     /// The turn finished (or can never finish): mark its long-turn lifecycle
     /// complete and report whether its threshold pin is live — the caller
-    /// then keeps that pin for the TTL via [`spawn_pin_ttl`].
+    /// then keeps that pin for the TTL via [`spawn_reminder_ttl`].
     ///
     /// Idempotent and generation-scoped: a second completion, or a completion
     /// from an older turn, reports `false` and arms no timer. Atomic with
@@ -295,10 +295,9 @@ impl PinState {
             return false;
         }
         turn.completed = true;
-        inner
-            .live
-            .get(chat_id)
-            .is_some_and(|live| live.generation == generation && live.reasons.contains(&PinReason::LongTurn))
+        inner.live.get(chat_id).is_some_and(|live| {
+            live.generation == generation && live.reasons.contains(&ReminderReason::LongTurn)
+        })
     }
 
     /// Ensure the Chat/Topic is pinned towards `target` for `reason` — either
@@ -311,7 +310,12 @@ impl PinState {
     /// `LongTurn` path atomically through [`Self::check_long_turn`]; the tests
     /// drive both reasons through this entry.
     #[cfg(test)]
-    pub(crate) async fn ensure(&self, feishu: &Arc<dyn Platform>, target: &PinTarget, reason: PinReason) {
+    pub(crate) async fn ensure(
+        &self,
+        feishu: &Arc<dyn Platform>,
+        target: &ReminderTarget,
+        reason: ReminderReason,
+    ) {
         if !self.enabled {
             return;
         }
@@ -322,8 +326,8 @@ impl PinState {
     async fn ensure_locked(
         inner: &mut Inner,
         feishu: &Arc<dyn Platform>,
-        target: &PinTarget,
-        reason: PinReason,
+        target: &ReminderTarget,
+        reason: ReminderReason,
     ) {
         if target.user_ids.is_empty() {
             return;
@@ -370,7 +374,7 @@ impl PinState {
             Ok(()) => {
                 inner.live.insert(
                     target.chat_id.clone(),
-                    LivePin {
+                    LiveReminder {
                         generation: target.generation,
                         is_group: target.is_group,
                         user_ids: target.user_ids.clone(),
@@ -395,14 +399,14 @@ impl PinState {
     /// newer turn's pin). `generation` is the turn the caller believes owns
     /// the pin. Idempotent: nothing tracked means no call.
     ///
-    /// The long-turn TTL timer ([`spawn_pin_ttl`]) passes the generation it
+    /// The long-turn TTL timer ([`spawn_reminder_ttl`]) passes the generation it
     /// captured at turn start, so a newer turn's pin survives a stale timer.
     pub(crate) async fn clear(
         &self,
         feishu: &Arc<dyn Platform>,
         chat_id: &str,
         generation: u64,
-        reason: PinReason,
+        reason: ReminderReason,
     ) {
         if !self.enabled {
             return;
@@ -416,7 +420,7 @@ impl PinState {
         feishu: &Arc<dyn Platform>,
         chat_id: &str,
         generation: u64,
-        reason: PinReason,
+        reason: ReminderReason,
     ) {
         let Some(live) = inner.live.get(chat_id).cloned() else {
             return;
@@ -462,7 +466,7 @@ impl PinState {
         &self,
         feishu: &Arc<dyn Platform>,
         kind: ClaimKind,
-        targets: &HashMap<String, PinTarget>,
+        targets: &HashMap<String, ReminderTarget>,
     ) {
         if !self.enabled {
             return;
@@ -492,7 +496,7 @@ impl PinState {
                 .unwrap_or(false);
             if pending {
                 if let Some(target) = targets.get(&chat_id) {
-                    Self::ensure_locked(&mut inner, feishu, target, PinReason::Pending).await;
+                    Self::ensure_locked(&mut inner, feishu, target, ReminderReason::Pending).await;
                 }
                 // Pending in the OTHER flow only: that flow's own sync owns
                 // the target; leave the tracked pin as it is.
@@ -500,7 +504,14 @@ impl PinState {
                 // Clear with the live pin's own generation: the generation
                 // guard protects against stale timers, not against the flow
                 // that owns the pin ending its wait.
-                Self::clear_locked(&mut inner, feishu, &chat_id, live.generation, PinReason::Pending).await;
+                Self::clear_locked(
+                    &mut inner,
+                    feishu,
+                    &chat_id,
+                    live.generation,
+                    ReminderReason::Pending,
+                )
+                .await;
             }
         }
     }
@@ -518,16 +529,16 @@ impl PinState {
 /// turn, a newer turn's Chat/Topic, or a Chat/Topic whose user just acted. A
 /// turn with no requester has nobody to pin for, and with `[bridge] instant_reminder` off
 /// nothing is ever spawned.
-pub(crate) fn spawn_long_turn_checker(core: &Arc<SharedCore>, target: PinTarget) {
-    if !core.pins.enabled || target.user_ids.is_empty() {
+pub(crate) fn spawn_long_turn_checker(core: &Arc<SharedCore>, target: ReminderTarget) {
+    if !core.reminder.enabled || target.user_ids.is_empty() {
         return;
     }
-    let tick_ms = core.pins.long_turn_tick_ms.load(Ordering::Relaxed);
+    let tick_ms = core.reminder.long_turn_tick_ms.load(Ordering::Relaxed);
     let core = Arc::clone(core);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(tick_ms)).await;
-            if !core.pins.check_long_turn(&core.feishu, &target).await {
+            if !core.reminder.check_long_turn(&core.feishu, &target).await {
                 return;
             }
         }
@@ -537,16 +548,16 @@ pub(crate) fn spawn_long_turn_checker(core: &Arc<SharedCore>, target: PinTarget)
 /// Schedule a completed long turn's TTL clear (ADR-0043): after the injected
 /// TTL the pin is released with the generation it captured at turn start.
 /// Generation-scoped, so the timer can never unpin a newer turn.
-pub(crate) fn spawn_pin_ttl(core: &Arc<SharedCore>, chat_id: String, generation: u64) {
-    if !core.pins.enabled {
+pub(crate) fn spawn_reminder_ttl(core: &Arc<SharedCore>, chat_id: String, generation: u64) {
+    if !core.reminder.enabled {
         return;
     }
-    let ttl_ms = core.pins.ttl_ms.load(Ordering::Relaxed);
+    let ttl_ms = core.reminder.ttl_ms.load(Ordering::Relaxed);
     let core = Arc::clone(core);
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(ttl_ms)).await;
-        core.pins
-            .clear(&core.feishu, &chat_id, generation, PinReason::LongTurn)
+        core.reminder
+            .clear(&core.feishu, &chat_id, generation, ReminderReason::LongTurn)
             .await;
     });
 }
@@ -563,7 +574,7 @@ pub(crate) async fn reminder_target(
     core: &Arc<SharedCore>,
     session_id: &str,
     directory: &str,
-) -> Option<PinTarget> {
+) -> Option<ReminderTarget> {
     let (host, is_group, requester, generation) =
         crate::bridge::pollers::walk_parent_chain(core, session_id, Some(directory), |current| {
             let current = current.to_string();
@@ -587,7 +598,7 @@ pub(crate) async fn reminder_target(
     if chat_id.is_empty() {
         return None;
     }
-    Some(PinTarget {
+    Some(ReminderTarget {
         chat_id,
         is_group,
         user_ids: vec![requester],
@@ -600,8 +611,8 @@ mod tests {
     use super::*;
     use crate::bridge::test_support::RecordingPlatform;
 
-    fn target_for(chat_id: &str, generation: u64, requester: &str) -> PinTarget {
-        PinTarget {
+    fn target_for(chat_id: &str, generation: u64, requester: &str) -> ReminderTarget {
+        ReminderTarget {
             chat_id: chat_id.into(),
             is_group: false,
             user_ids: vec![requester.into()],
@@ -609,7 +620,7 @@ mod tests {
         }
     }
 
-    fn target(chat_id: &str, generation: u64) -> PinTarget {
+    fn target(chat_id: &str, generation: u64) -> ReminderTarget {
         target_for(chat_id, generation, "ou_host")
     }
 
@@ -627,8 +638,8 @@ mod tests {
     /// is already old enough, so the lifecycle tests can drive the checker
     /// without real waits. The silence tests build their own state with a real
     /// (tiny) threshold.
-    fn pins_with_instant_silence() -> PinState {
-        let pins = PinState::new(true);
+    fn pins_with_instant_silence() -> ReminderState {
+        let pins = ReminderState::new(true);
         pins.long_turn_ms.store(0, Ordering::Relaxed);
         pins
     }
@@ -640,18 +651,18 @@ mod tests {
     async fn a_stale_clear_never_unpins_a_newer_turns_pin() {
         let platform = Arc::new(RecordingPlatform::new());
         let feishu: Arc<dyn Platform> = platform.clone();
-        let pins = PinState::new(true);
+        let pins = ReminderState::new(true);
 
-        pins.ensure(&feishu, &target("chat_1", 1), PinReason::Pending)
+        pins.ensure(&feishu, &target("chat_1", 1), ReminderReason::Pending)
             .await;
         // Turn 2 begins while the wait is still pending: ensure adopts the
         // newer generation without a duplicate call.
-        pins.ensure(&feishu, &target("chat_1", 2), PinReason::Pending)
+        pins.ensure(&feishu, &target("chat_1", 2), ReminderReason::Pending)
             .await;
         assert_eq!(platform.reminders().await.len(), 1, "one pin, no duplicates");
 
         // A stale clear from turn 1 must not touch turn 2's pin.
-        pins.clear(&feishu, "chat_1", 1, PinReason::Pending).await;
+        pins.clear(&feishu, "chat_1", 1, ReminderReason::Pending).await;
         assert_eq!(
             platform.reminders().await.len(),
             1,
@@ -659,7 +670,7 @@ mod tests {
         );
 
         // The owning generation still clears.
-        pins.clear(&feishu, "chat_1", 2, PinReason::Pending).await;
+        pins.clear(&feishu, "chat_1", 2, ReminderReason::Pending).await;
         let calls = reminder_calls(&platform).await;
         assert_eq!(calls.len(), 2);
         assert!(calls[0].1, "the pin call comes first");
@@ -672,27 +683,27 @@ mod tests {
     async fn a_stale_ensure_never_downgrades_a_newer_turns_pin() {
         let platform = Arc::new(RecordingPlatform::new());
         let feishu: Arc<dyn Platform> = platform.clone();
-        let pins = PinState::new(true);
+        let pins = ReminderState::new(true);
 
         // Turn 2 pins first (two turns of one chat can overlap: two topics of
         // one group each carry their own generation).
-        pins.ensure(&feishu, &target("chat_1", 2), PinReason::Pending)
+        pins.ensure(&feishu, &target("chat_1", 2), ReminderReason::Pending)
             .await;
         // A delayed sweep for turn 1 must not touch the pin...
-        pins.ensure(&feishu, &target("chat_1", 1), PinReason::Pending)
+        pins.ensure(&feishu, &target("chat_1", 1), ReminderReason::Pending)
             .await;
         assert_eq!(platform.reminders().await.len(), 1, "no duplicate, no retarget");
 
         // ...and must not have downgraded the generation, or its own stale
         // clear would pass the guard and unpin turn 2's pin.
-        pins.clear(&feishu, "chat_1", 1, PinReason::Pending).await;
+        pins.clear(&feishu, "chat_1", 1, ReminderReason::Pending).await;
         assert_eq!(
             platform.reminders().await.len(),
             1,
             "a stale clear must not unpin the newer pin"
         );
         // Turn 2's own clear still releases it.
-        pins.clear(&feishu, "chat_1", 2, PinReason::Pending).await;
+        pins.clear(&feishu, "chat_1", 2, ReminderReason::Pending).await;
         assert_eq!(platform.reminders().await.len(), 2);
     }
 
@@ -703,12 +714,20 @@ mod tests {
     async fn a_stale_retarget_leaves_a_newer_turns_pin_untouched() {
         let platform = Arc::new(RecordingPlatform::new());
         let feishu: Arc<dyn Platform> = platform.clone();
-        let pins = PinState::new(true);
+        let pins = ReminderState::new(true);
 
-        pins.ensure(&feishu, &target_for("chat_1", 2, "ou_new"), PinReason::Pending)
-            .await;
-        pins.ensure(&feishu, &target_for("chat_1", 1, "ou_old"), PinReason::Pending)
-            .await;
+        pins.ensure(
+            &feishu,
+            &target_for("chat_1", 2, "ou_new"),
+            ReminderReason::Pending,
+        )
+        .await;
+        pins.ensure(
+            &feishu,
+            &target_for("chat_1", 1, "ou_old"),
+            ReminderReason::Pending,
+        )
+        .await;
 
         let calls = reminder_calls(&platform).await;
         assert_eq!(calls.len(), 1, "the stale retarget must not clear or re-pin");
@@ -720,8 +739,12 @@ mod tests {
         );
 
         // A same-generation requester change is legitimate and retargets.
-        pins.ensure(&feishu, &target_for("chat_1", 2, "ou_other"), PinReason::Pending)
-            .await;
+        pins.ensure(
+            &feishu,
+            &target_for("chat_1", 2, "ou_other"),
+            ReminderReason::Pending,
+        )
+        .await;
         let calls = reminder_calls(&platform).await;
         assert_eq!(
             calls.len(),
@@ -739,20 +762,20 @@ mod tests {
     async fn a_pending_clear_keeps_a_pin_another_reason_holds() {
         let platform = Arc::new(RecordingPlatform::new());
         let feishu: Arc<dyn Platform> = platform.clone();
-        let pins = PinState::new(true);
+        let pins = ReminderState::new(true);
 
-        pins.ensure(&feishu, &target("chat_1", 1), PinReason::LongTurn)
+        pins.ensure(&feishu, &target("chat_1", 1), ReminderReason::LongTurn)
             .await;
-        pins.ensure(&feishu, &target("chat_1", 1), PinReason::Pending)
+        pins.ensure(&feishu, &target("chat_1", 1), ReminderReason::Pending)
             .await;
-        pins.clear(&feishu, "chat_1", 1, PinReason::Pending).await;
+        pins.clear(&feishu, "chat_1", 1, ReminderReason::Pending).await;
         assert_eq!(
             platform.reminders().await.len(),
             1,
             "the long-turn pin stays on: the pending wait ending is not the last owner"
         );
 
-        pins.clear(&feishu, "chat_1", 1, PinReason::LongTurn).await;
+        pins.clear(&feishu, "chat_1", 1, ReminderReason::LongTurn).await;
         let calls = platform.reminders().await;
         assert_eq!(calls.len(), 2);
         assert!(!calls[1].3, "the last owner releases the reminder");
@@ -764,7 +787,7 @@ mod tests {
     async fn a_turn_start_clears_a_possible_startup_orphan_once() {
         let platform = Arc::new(RecordingPlatform::new());
         let feishu: Arc<dyn Platform> = platform.clone();
-        let pins = PinState::new(true);
+        let pins = ReminderState::new(true);
 
         assert_eq!(
             pins.begin_turn(&feishu, "chat_1", false, Some("ou_host")).await,
@@ -780,17 +803,17 @@ mod tests {
         assert_eq!(calls[0], ("chat_1".into(), false, vec!["ou_host".into()]));
     }
 
-    /// The opt-in default: a disabled `PinState` never makes a reminder call.
+    /// The opt-in default: a disabled `ReminderState` never makes a reminder call.
     #[tokio::test]
     async fn a_disabled_pin_state_never_calls_the_platform() {
         let platform = Arc::new(RecordingPlatform::new());
         let feishu: Arc<dyn Platform> = platform.clone();
-        let pins = PinState::new(false);
+        let pins = ReminderState::new(false);
 
         pins.begin_turn(&feishu, "chat_1", false, Some("ou_host")).await;
-        pins.ensure(&feishu, &target("chat_1", 1), PinReason::Pending)
+        pins.ensure(&feishu, &target("chat_1", 1), ReminderReason::Pending)
             .await;
-        pins.clear(&feishu, "chat_1", 1, PinReason::Pending).await;
+        pins.clear(&feishu, "chat_1", 1, ReminderReason::Pending).await;
 
         assert!(platform.reminders().await.is_empty());
     }
@@ -822,7 +845,7 @@ mod tests {
             "a second completion must not arm a second TTL"
         );
 
-        pins.clear(&feishu, "chat_1", generation, PinReason::LongTurn)
+        pins.clear(&feishu, "chat_1", generation, ReminderReason::LongTurn)
             .await;
         let calls = reminder_calls(&platform).await;
         assert_eq!(calls.len(), 2, "one pin, one TTL clear: {calls:?}");
@@ -875,7 +898,7 @@ mod tests {
     async fn the_threshold_measures_silence_since_the_last_interaction() {
         let platform = Arc::new(RecordingPlatform::new());
         let feishu: Arc<dyn Platform> = platform.clone();
-        let pins = PinState::new(true);
+        let pins = ReminderState::new(true);
         pins.long_turn_ms.store(200, Ordering::Relaxed);
 
         let generation = pins.begin_turn(&feishu, "chat_1", false, None).await;
@@ -924,7 +947,7 @@ mod tests {
         let pins = pins_with_instant_silence();
         let generation = pins.begin_turn(&feishu, "chat_1", false, None).await;
         assert!(pins.check_long_turn(&feishu, &target("chat_1", generation)).await);
-        pins.ensure(&feishu, &target("chat_1", generation), PinReason::Pending)
+        pins.ensure(&feishu, &target("chat_1", generation), ReminderReason::Pending)
             .await;
         assert_eq!(platform.reminders().await.len(), 1);
 
@@ -936,7 +959,7 @@ mod tests {
         );
 
         // The wait resolves: the last hold is gone, so the reminder clears.
-        pins.clear(&feishu, "chat_1", generation, PinReason::Pending)
+        pins.clear(&feishu, "chat_1", generation, ReminderReason::Pending)
             .await;
         let calls = reminder_calls(&platform).await;
         assert_eq!(
@@ -954,7 +977,7 @@ mod tests {
     async fn renewed_silence_re_pins_while_the_turn_runs() {
         let platform = Arc::new(RecordingPlatform::new());
         let feishu: Arc<dyn Platform> = platform.clone();
-        let pins = PinState::new(true);
+        let pins = ReminderState::new(true);
         pins.long_turn_ms.store(150, Ordering::Relaxed);
         let generation = pins.begin_turn(&feishu, "chat_1", false, None).await;
         let target = target("chat_1", generation);
@@ -1026,7 +1049,8 @@ mod tests {
 
         // The live pin is gone: the old TTL timer (generation 1) makes no
         // further call when it fires.
-        pins.clear(&feishu, "chat_1", first, PinReason::LongTurn).await;
+        pins.clear(&feishu, "chat_1", first, ReminderReason::LongTurn)
+            .await;
         assert_eq!(platform.reminders().await.len(), 2);
     }
 
@@ -1042,7 +1066,7 @@ mod tests {
 
         let first = pins.begin_turn(&feishu, "chat_1", false, None).await;
         assert!(pins.check_long_turn(&feishu, &target("chat_1", first)).await);
-        pins.ensure(&feishu, &target("chat_1", first), PinReason::Pending)
+        pins.ensure(&feishu, &target("chat_1", first), ReminderReason::Pending)
             .await;
         assert!(pins.complete_turn("chat_1", first).await);
         assert_eq!(platform.reminders().await.len(), 1);
@@ -1058,7 +1082,8 @@ mod tests {
         // The wait resolves: the last hold is gone, so the reminder clears.
         // (Before the fix the `LongTurn` reason was still tracked and this
         // clear no-op'd, leaking the pin.)
-        pins.clear(&feishu, "chat_1", first, PinReason::Pending).await;
+        pins.clear(&feishu, "chat_1", first, ReminderReason::Pending)
+            .await;
         let calls = reminder_calls(&platform).await;
         assert_eq!(calls.len(), 2, "the pending resolution unpins: {calls:?}");
         assert!(!calls[1].1);
@@ -1089,14 +1114,16 @@ mod tests {
         );
         assert!(calls[0].1 && !calls[1].1 && calls[2].1);
 
-        pins.clear(&feishu, "chat_1", first, PinReason::LongTurn).await;
+        pins.clear(&feishu, "chat_1", first, ReminderReason::LongTurn)
+            .await;
         assert_eq!(
             platform.reminders().await.len(),
             3,
             "the stale TTL clear must not unpin the newer turn"
         );
 
-        pins.clear(&feishu, "chat_1", second, PinReason::LongTurn).await;
+        pins.clear(&feishu, "chat_1", second, ReminderReason::LongTurn)
+            .await;
         assert_eq!(platform.reminders().await.len(), 4);
     }
 

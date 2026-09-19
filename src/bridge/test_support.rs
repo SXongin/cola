@@ -53,6 +53,12 @@ pub enum PlatformCall {
         user_ids: Vec<String>,
         on: bool,
     },
+    /// A waiting-message pin call (ADR-0043 amendment): the message put into
+    /// (or removed from) its Chat/Topic's pinned-message list.
+    PinMessage {
+        message_id: String,
+        on: bool,
+    },
 }
 
 /// A one-shot gate on one platform call, so a test can freeze a card write
@@ -87,6 +93,11 @@ pub struct RecordingPlatform {
     /// When true, `set_instant_reminder` fails after recording the attempt
     /// (tests the best-effort pin path: failures log and never affect a turn).
     pub fail_instant_reminder: bool,
+    /// When set, `pin_message`/`unpin_message` fail after recording the
+    /// attempt (tests the best-effort waiting-card pin path: a failed pin is
+    /// retried, a failed unpin stays tracked). Atomic so a test can flip it
+    /// mid-lifecycle.
+    pub fail_pin: std::sync::atomic::AtomicBool,
     /// The thread_id `reply_in_thread` returns; `None` simulates a chat
     /// without topic support (the create-topic surfaces degrade with a
     /// message instead of mapping).
@@ -110,6 +121,7 @@ impl RecordingPlatform {
             fail_reply_card: false,
             fail_reply_card_count: std::sync::atomic::AtomicUsize::new(0),
             fail_instant_reminder: false,
+            fail_pin: std::sync::atomic::AtomicBool::new(false),
             reply_in_thread_thread_id: Some("omt_created_topic".into()),
             quoted_messages: std::sync::Mutex::new(std::collections::HashMap::new()),
             pause_call: std::sync::Mutex::new(None),
@@ -199,6 +211,21 @@ impl RecordingPlatform {
                     user_ids,
                     on,
                 } => Some((chat_id.clone(), *is_group, user_ids.clone(), *on)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every waiting-message pin call in order: `(message_id, on)` — `on`
+    /// `true` puts the message into its Chat/Topic's pinned-message list,
+    /// `false` removes it (ADR-0043 amendment).
+    pub(crate) async fn message_pins(&self) -> Vec<(String, bool)> {
+        self.calls
+            .lock()
+            .await
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::PinMessage { message_id, on } => Some((message_id.clone(), *on)),
                 _ => None,
             })
             .collect()
@@ -396,6 +423,32 @@ impl feishu::Platform for RecordingPlatform {
         if self.fail_instant_reminder {
             return Err(crate::error::BridgeError::Feishu(
                 "simulated set_instant_reminder failure".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn pin_message(&self, message_id: &str) -> crate::error::Result<()> {
+        self.calls.lock().await.push(PlatformCall::PinMessage {
+            message_id: message_id.into(),
+            on: true,
+        });
+        if self.fail_pin.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(crate::error::BridgeError::Feishu(
+                "simulated pin_message failure".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn unpin_message(&self, message_id: &str) -> crate::error::Result<()> {
+        self.calls.lock().await.push(PlatformCall::PinMessage {
+            message_id: message_id.into(),
+            on: false,
+        });
+        if self.fail_pin.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(crate::error::BridgeError::Feishu(
+                "simulated unpin_message failure".into(),
             ));
         }
         Ok(())

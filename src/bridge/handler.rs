@@ -328,7 +328,7 @@ impl App {
         // clock and releases a live long-turn pin (a pending wait's hold
         // survives). Commands (`/new` included), supplements and plain prompts
         // all land here; external/non-Feishu activity never does.
-        self.pins.note_interaction(&self.feishu, &msg.chat_id).await;
+        self.reminder.note_interaction(&self.feishu, &msg.chat_id).await;
         let kind = ConversationKind::classify(&msg.chat_type, msg.thread_id.as_deref());
         let thread_key = kind.thread_key(&msg.chat_id, msg.thread_id.as_deref());
         if let Some(cmd) = command::parse_command(&msg.text) {
@@ -772,7 +772,7 @@ impl App {
                     .filter(|chat_id| !chat_id.is_empty())
             })
         {
-            self.pins.note_interaction(&self.feishu, chat_id).await;
+            self.reminder.note_interaction(&self.feishu, chat_id).await;
         }
         let action = value.get("action").and_then(|v| v.as_str()).unwrap_or("");
         match action {

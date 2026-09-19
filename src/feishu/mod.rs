@@ -93,6 +93,18 @@ pub trait Platform: Send + Sync {
         user_ids: &[String],
         on: bool,
     ) -> Result<()>;
+
+    /// Pin a message into its Chat/Topic's pinned-message list (ADR-0043
+    /// amendment): the in-chat locator for a waiting Permission/Question card.
+    /// NOT idempotent at Feishu (pinning twice can fail) — the caller owns
+    /// single-shot semantics. Best-effort for the bridge: failures log and the
+    /// card lives on.
+    async fn pin_message(&self, message_id: &str) -> Result<()>;
+
+    /// Remove a message from its Chat/Topic's pinned-message list. Feishu
+    /// reports success for a message that was not pinned (e.g. the user
+    /// unpinned it by hand), so this is safe to call unconditionally.
+    async fn unpin_message(&self, message_id: &str) -> Result<()>;
 }
 
 #[async_trait]
@@ -171,5 +183,13 @@ impl Platform for Client {
         on: bool,
     ) -> Result<()> {
         Client::set_instant_reminder(self, chat_id, is_group, user_ids, on).await
+    }
+
+    async fn pin_message(&self, message_id: &str) -> Result<()> {
+        Client::pin_message(self, message_id).await
+    }
+
+    async fn unpin_message(&self, message_id: &str) -> Result<()> {
+        Client::unpin_message(self, message_id).await
     }
 }

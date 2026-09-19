@@ -536,6 +536,65 @@ impl Client {
         }
     }
 
+    /// Pin a message into its Chat/Topic's **pinned-message list**
+    /// (`POST /im/v1/pins`, ADR-0043 amendment): the in-chat companion to the
+    /// list-level Instant Reminder, pointing at the exact message waiting on
+    /// the user.
+    ///
+    /// Feishu is NOT idempotent here: pinning an already-pinned message can
+    /// fail (observed 500/2200 on a rapid repeat). The caller (the card-pin
+    /// tracker) owns single-shot semantics; unpinning is safe to repeat.
+    pub async fn pin_message(&self, message_id: &str) -> crate::error::Result<()> {
+        let token = self.get_access_token().await?;
+        let text = read_body_with_diag(
+            self.http
+                .post(self.endpoint("/open-apis/im/v1/pins"))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({ "message_id": message_id }))
+                .send()
+                .await?,
+            "pin message",
+        )
+        .await?;
+        let resp: ApiResponse = parse_json(&text, "pin message response")?;
+
+        if resp.code != 0 {
+            Err(crate::error::BridgeError::Feishu(format!(
+                "pin message error {}: {}",
+                resp.code, resp.msg
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Remove a message from its Chat/Topic's pinned-message list
+    /// (`DELETE /im/v1/pins/{message_id}`, ADR-0043 amendment). Success is
+    /// reported even when the message was not pinned, so this is safe to call
+    /// on a message the user already unpinned by hand.
+    pub async fn unpin_message(&self, message_id: &str) -> crate::error::Result<()> {
+        let token = self.get_access_token().await?;
+        let text = read_body_with_diag(
+            self.http
+                .delete(self.endpoint(&format!("/open-apis/im/v1/pins/{message_id}")))
+                .bearer_auth(&token)
+                .send()
+                .await?,
+            "unpin message",
+        )
+        .await?;
+        let resp: ApiResponse = parse_json(&text, "unpin message response")?;
+
+        if resp.code != 0 {
+            Err(crate::error::BridgeError::Feishu(format!(
+                "unpin message error {}: {}",
+                resp.code, resp.msg
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
     /// List the most recent messages in a chat or topic (newest first, a single
     /// page of 50). Production use: `resolve_topic_anchor` scans a topic's
     /// messages for the newest cola message to anchor a card reply — the send
@@ -1119,6 +1178,60 @@ mod tests {
             "unexpected error: {message}"
         );
         assert!(message.contains("no permission"), "unexpected error: {message}");
+    }
+
+    /// A waiting card is pinned with its message id and unpinned by the same
+    /// id (the chat's pinned-message list, ADR-0043 amendment).
+    #[tokio::test]
+    async fn pin_posts_the_message_id_and_unpin_deletes_it() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/pins",
+            200,
+            r#"{"code":0,"msg":"success"}"#,
+        );
+        server.route(
+            "DELETE",
+            "/open-apis/im/v1/pins/om_card_1",
+            200,
+            r#"{"code":0,"msg":"success"}"#,
+        );
+
+        client.pin_message("om_card_1").await.unwrap();
+        let pinned = last_request(&server);
+        assert_eq!(pinned.method, "POST");
+        assert_eq!(pinned.path, "/open-apis/im/v1/pins");
+        assert_eq!(pinned.header("authorization"), Some("Bearer t-abc"));
+        assert_eq!(body_json(&pinned)["message_id"], "om_card_1");
+
+        client.unpin_message("om_card_1").await.unwrap();
+        let unpinned = last_request(&server);
+        assert_eq!(unpinned.method, "DELETE");
+        assert_eq!(unpinned.path, "/open-apis/im/v1/pins/om_card_1");
+        assert_eq!(unpinned.header("authorization"), Some("Bearer t-abc"));
+    }
+
+    /// A non-zero API code (e.g. the 2200 a re-pin of an already-pinned
+    /// message returns, or a missing scope) is an error the bridge logs —
+    /// never a success.
+    #[tokio::test]
+    async fn pin_message_maps_a_business_error_code() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/pins",
+            200,
+            r#"{"code":2200,"msg":"Internal Error"}"#,
+        );
+
+        let message = feishu_error(client.pin_message("om_card_1").await.unwrap_err());
+
+        assert!(
+            message.contains("pin message error 2200"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("Internal Error"), "unexpected error: {message}");
     }
 
     #[tokio::test]

@@ -137,7 +137,12 @@ pub struct SharedCore {
     /// The Instant Reminder lifecycle (ADR-0043, from `[bridge] instant_reminder`): pins a
     /// Chat/Topic while a Permission/Question is pending. Off means every
     /// method is a no-op — no reminder call is ever made.
-    pub pins: crate::bridge::pin::PinState,
+    pub reminder: crate::bridge::reminder::ReminderState,
+    /// The waiting-card pin registry (ADR-0043 amendment): pins the exact card
+    /// a pending Permission/Question lives on into its chat's pinned-message
+    /// list, so the reminder's list-level nudge leads to the waiting message.
+    /// Same `[bridge] instant_reminder` opt-in as the reminder itself.
+    pub message_pins: crate::bridge::message_pins::MessagePins,
     /// Cached session-list snapshot for `/list`, `/switch`, `/attach`
     /// (30 s TTL; invalidated on create/adopt/rename). Private: the core's
     /// write wrappers and `invalidate_session_list_cache` own it.
@@ -198,7 +203,8 @@ impl SharedCore {
                 .clone()
                 .map(|p| p.to_string_lossy().to_string()),
             group_completion_notice: cfg.bridge.group_completion_notice,
-            pins: crate::bridge::pin::PinState::new(cfg.bridge.instant_reminder),
+            reminder: crate::bridge::reminder::ReminderState::new(cfg.bridge.instant_reminder),
+            message_pins: crate::bridge::message_pins::MessagePins::new(cfg.bridge.instant_reminder),
             session_list_cache: Arc::new(Mutex::new(None)),
             opencode,
             feishu,

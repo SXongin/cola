@@ -199,7 +199,7 @@ impl Turn {
         // is cleared once, on the Chat/Topic's next turn (self-healing).
         let generation = app
             .core
-            .pins
+            .reminder
             .begin_turn(
                 &app.core.feishu,
                 &thread_key.chat_id,
@@ -278,9 +278,9 @@ impl Turn {
             .filter(|open_id| !open_id.is_empty())
             .cloned()
             .collect();
-        crate::bridge::pin::spawn_long_turn_checker(
+        crate::bridge::reminder::spawn_long_turn_checker(
             &app.core,
-            crate::bridge::pin::PinTarget {
+            crate::bridge::reminder::ReminderTarget {
                 chat_id: thread_key.chat_id.clone(),
                 is_group,
                 user_ids,
@@ -577,18 +577,22 @@ impl Turn {
     }
 
     /// Close this turn's long-turn Instant Reminder lifecycle (ADR-0043):
-    /// [`crate::bridge::pin::PinState::complete_turn`] decides atomically
+    /// [`crate::bridge::reminder::ReminderState::complete_turn`] decides atomically
     /// whether the threshold pin is live, and a live one is kept for the
     /// completion TTL. Called by `finish` on every outcome and by `run` when
     /// the turn can never reach it.
     async fn settle_long_turn_pin(&self, app: &Arc<App>) {
         if app
             .core
-            .pins
+            .reminder
             .complete_turn(&self.thread_key.chat_id, self.generation)
             .await
         {
-            crate::bridge::pin::spawn_pin_ttl(&app.core, self.thread_key.chat_id.clone(), self.generation);
+            crate::bridge::reminder::spawn_reminder_ttl(
+                &app.core,
+                self.thread_key.chat_id.clone(),
+                self.generation,
+            );
         }
     }
 

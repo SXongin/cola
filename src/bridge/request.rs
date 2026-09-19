@@ -1470,7 +1470,10 @@ impl RequestFlow {
                     listed_now.insert(dir.clone());
                     for req in &requests {
                         pending.insert(req.id().to_string());
-                        if core.pins.enabled() {
+                        // Both pin surfaces need the listed candidates: the
+                        // reminder's chat-level target and the waiting-card
+                        // registry's host message.
+                        if core.reminder.enabled() || core.message_pins.enabled() {
                             pin_candidates.push((req.clone(), dir.clone()));
                         }
                         // ADR-0028: a claimed request is hosted by a
@@ -1583,8 +1586,8 @@ impl RequestFlow {
         // resolved (#130) — so the pin survives until a complete sweep. A
         // request auto-resolved in this sweep (prepare said handled) is not a
         // wait, so it never pins.
-        if core.pins.enabled() && failed_dirs.is_empty() {
-            let mut pin_targets: std::collections::HashMap<String, crate::bridge::pin::PinTarget> =
+        if core.reminder.enabled() && failed_dirs.is_empty() {
+            let mut pin_targets: std::collections::HashMap<String, crate::bridge::reminder::ReminderTarget> =
                 std::collections::HashMap::new();
             for (req, dir) in &pin_candidates {
                 if auto_resolved.contains(req.id()) {
@@ -1592,11 +1595,13 @@ impl RequestFlow {
                 }
                 // `None` (an external turn, or a request pending across a
                 // restart) cannot be pinned — there is no requester to target.
-                if let Some(target) = crate::bridge::pin::reminder_target(core, req.session_id(), dir).await {
+                if let Some(target) =
+                    crate::bridge::reminder::reminder_target(core, req.session_id(), dir).await
+                {
                     pin_targets.insert(target.chat_id.clone(), target);
                 }
             }
-            core.pins
+            core.reminder
                 .sync(&core.feishu, self.kind.claim_kind(), &pin_targets)
                 .await;
         }
@@ -1691,6 +1696,61 @@ impl RequestFlow {
             } else {
                 tracing::info!("snapshot {} re-rendered without resolved claims", message_id);
             }
+        }
+        // Waiting-card pins (ADR-0043 amendment): keep every card still
+        // waiting on the user in its chat's pinned-message list, so the
+        // Chat/Topic's Instant Reminder nudge leads to the exact message once
+        // the user opens the chat. The host is the card rendering the live
+        // block (the streaming card, possibly a re-hosted newer one), the
+        // standalone card the request was sent as, or — for a request claimed
+        // by a Session Snapshot (ADR-0028) — the snapshot card itself, whose
+        // lifecycle owns the claimed block. A request cola is already
+        // answering or one auto-resolved in this sweep is not a wait and never
+        // pins. Best-effort, like the reminder; a failed directory's tracked
+        // pin stays (#130).
+        if core.message_pins.enabled() {
+            let claimed_hosts: std::collections::HashMap<String, String> = {
+                let claims = core.snapshot_claims.lock().await;
+                pin_candidates
+                    .iter()
+                    .filter_map(|(req, _)| {
+                        claims
+                            .claim_of(req.id())
+                            .map(|(message_id, _)| (req.id().to_string(), message_id.to_string()))
+                    })
+                    .collect()
+            };
+            // Snapshot the standalone cards first: never hold `sent_cards` and
+            // `card_handles` at once (one lock order, no deadlock surface).
+            let sent_ids: std::collections::HashMap<String, String> = self
+                .sent_cards
+                .lock()
+                .await
+                .iter()
+                .map(|(id, card)| (id.clone(), card.message_id.clone()))
+                .collect();
+            let waiting: Vec<crate::bridge::message_pins::WaitingCard> = {
+                let handles = core.card_handles.lock().await;
+                pin_candidates
+                    .iter()
+                    .filter(|(req, _)| !auto_resolved.contains(req.id()) && !cola_claimed.contains(req.id()))
+                    .filter_map(|(req, dir)| {
+                        let message_id = claimed_hosts
+                            .get(req.id())
+                            .cloned()
+                            .or_else(|| handles.message_of(req.id()).map(str::to_string))
+                            .or_else(|| sent_ids.get(req.id()).cloned())?;
+                        Some(crate::bridge::message_pins::WaitingCard {
+                            request_id: req.id().to_string(),
+                            directory: dir.clone(),
+                            message_id,
+                        })
+                    })
+                    .collect()
+            };
+            core.message_pins
+                .sync(&core.feishu, self.kind.claim_kind(), &waiting, &failed_dirs)
+                .await;
         }
         // #130: remember which directories listed successfully — with that
         // knowledge a missing state entry proves the request left pending.
