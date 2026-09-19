@@ -99,9 +99,9 @@ One-time setup at <https://open.feishu.cn/app> (create a custom app):
    - `im:message.group_at_msg:readonly` — receive group messages that @ the bot
    - `im:chat:readonly` — read chat names
    - `contact:contact.base:readonly`, `contact:user.base:readonly` — read user names
-   - `im:datasync.feed_card.time_sensitive:write` — *(optional)* Feishu's Instant
-     Reminder, used by `[bridge] instant_reminder` (off by default); without it
-     pinning is skipped and everything else keeps working
+   - `im:datasync.feed_card.time_sensitive:write` — *(optional, experimental)*
+     Feishu's Instant Reminder, used by `[bridge] instant_reminder` (off by
+     default); without it pinning is skipped and everything else keeps working
 3. Configure event subscription (事件与回调): use **long-connection mode** and
    subscribe to the `im.message.receive_v1` event. Card-button callbacks
    (`card.action.trigger`) arrive over the same connection automatically — no
@@ -125,9 +125,10 @@ app_secret = "your-app-secret"
 ```
 
 That's the minimum. Every other setting is optional — e.g. Feishu's Instant
-Reminder is opt-in via `[bridge] instant_reminder = true` (off by default; needs
-the optional `im:datasync.feed_card.time_sensitive:write` scope above). See the
-[user guide](docs/user-guide.md#configuration).
+Reminder is an **experimental** opt-in via `[bridge] instant_reminder = true`
+(off by default; needs the optional `im:datasync.feed_card.time_sensitive:write`
+scope above). The pin lifecycle is still being designed and may change between
+releases. See the [user guide](docs/user-guide.md#configuration).
 
 ### 4. Run
 
