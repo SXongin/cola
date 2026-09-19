@@ -133,7 +133,7 @@ pub struct BridgeConfig {
     /// Permission/Question is pending (ADR-0043). OFF by default — an upgrade
     /// must never change notification behavior without consent.
     #[serde(default)]
-    pub pin: bool,
+    pub instant_reminder: bool,
     /// How many days of rotated daily logs to keep (default 14). Older
     /// `cola-YYYY-MM-DD.log` files are swept on startup and at each rotation.
     #[serde(default = "default_log_days")]
@@ -147,7 +147,7 @@ impl Default for BridgeConfig {
             access_file: default_access_file(),
             work_dir: None,
             group_completion_notice: default_group_completion_notice(),
-            pin: false,
+            instant_reminder: false,
             log_days: default_log_days(),
         }
     }
@@ -389,15 +389,18 @@ mod tests {
     /// mean off, so an upgrade never changes notification behavior; only an
     /// explicit `true` enables the pin lifecycle.
     #[test]
-    fn pin_defaults_to_off_and_requires_an_explicit_true() {
+    fn instant_reminder_defaults_to_off_and_requires_an_explicit_true() {
         let absent: BridgeConfig = toml::from_str("").unwrap();
-        assert!(!absent.pin, "an absent pin key means off");
+        assert!(
+            !absent.instant_reminder,
+            "an absent instant_reminder key means off"
+        );
 
-        let off: BridgeConfig = toml::from_str("pin = false").unwrap();
-        assert!(!off.pin);
+        let off: BridgeConfig = toml::from_str("instant_reminder = false").unwrap();
+        assert!(!off.instant_reminder);
 
-        let on: BridgeConfig = toml::from_str("pin = true").unwrap();
-        assert!(on.pin);
+        let on: BridgeConfig = toml::from_str("instant_reminder = true").unwrap();
+        assert!(on.instant_reminder);
     }
 
     #[test]

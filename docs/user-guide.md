@@ -110,12 +110,12 @@ precondition for the message and resource APIs.
 | `im:chat:readonly` | 获取群组信息 | chat display names (`/attach` rejection card, `/switch` cards) | raw chat ids instead of names |
 | `contact:contact.base:readonly` | 获取通讯录基本信息 | authorizes the contact API call | user names unavailable |
 | `contact:user.base:readonly` | 获取用户基本信息 | returns the user's `name` field | completion notices lose the @name |
-| `im:datasync.feed_card.time_sensitive:write` | 设置即时提醒 (`time_sensitive`) — optional | Instant Reminder: pin the Chat or Topic while a permission/question waits or a turn stays silent (`[bridge] pin`, off by default) | pinning is skipped (one log line); everything else keeps working |
+| `im:datasync.feed_card.time_sensitive:write` | 设置即时提醒 (`time_sensitive`) — optional | Instant Reminder: pin the Chat or Topic while a permission/question waits or a turn stays silent (`[bridge] instant_reminder`, off by default) | pinning is skipped (one log line); everything else keeps working |
 
 Notes:
 
 - `im:datasync.feed_card.time_sensitive:write` is the only **optional** scope:
-  it powers Instant Reminder, which is itself opt-in (`[bridge] pin = true`).
+  it powers Instant Reminder, which is itself opt-in (`[bridge] instant_reminder = true`).
   Grant it only if you want pinning; without it cola logs the failed call and
   continues.
 - `im:chat` (获取与更新群组信息) is a superset of `im:chat:readonly` — cola only
@@ -193,7 +193,7 @@ start_server = "auto"            # auto (default) | never | eager
 # access_file = "~/.cola/access.json"
 # work_dir = "/path/to/a/project"
 # group_completion_notice = true
-# pin = true
+# instant_reminder = true
 # log_days = 14
 ```
 
@@ -209,10 +209,11 @@ start_server = "auto"            # auto (default) | never | eager
 - **`group_completion_notice`** — in group chats, reply to the requester with a
   short completion notice (the streaming card is patched in place, so it does not
   push a new notification). `false` disables it. p2p chats don't need it.
-- **`pin`** — opt-in, **off by default**: use Feishu's Instant Reminder to pin
-  the Chat or Topic at the top of the requester's message list while a permission
-  or question is pending, and while a turn has seen no activity from you for
-  60 seconds. The pin clears the moment the wait is resolved, and any message
+- **`instant_reminder`** — opt-in, **off by default**: use Feishu's Instant
+  Reminder to pin the Chat or Topic at the top of the requester's message list
+  while a permission or question is pending, and while a turn has seen no
+  activity from you for 60 seconds. The pin clears the moment the wait is
+  resolved, and any message
   or card click restarts that silence clock; a completed long turn stays pinned
   for 2 minutes, so the result is catchable from another chat — unless you act
   first, which releases it right away (you are active again). The

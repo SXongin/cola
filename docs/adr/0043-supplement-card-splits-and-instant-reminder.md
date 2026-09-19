@@ -80,10 +80,10 @@ the conversation while a Turn needs attention.
   The state is not reconciled at startup: a pin orphaned by a crash or
   restart is cleared on the Chat or Topic's next turn (self-healing), never a
   permanent pin.
-- **One config switch, off by default:** `[bridge] pin = true` turns Instant
-  Reminder on. Absent or `false` means off — an upgrade never changes
-  notification behavior without consent. The split behavior itself is not
-  configurable for now.
+- **One config switch, off by default:** `[bridge] instant_reminder = true`
+  turns Instant Reminder on. Absent or `false` means off — an upgrade never
+  changes notification behavior without consent. The split behavior itself is
+  not configurable for now.
 
 ## Why
 

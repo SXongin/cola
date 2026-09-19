@@ -1,6 +1,6 @@
 //! Instant Reminder pin/unpin lifecycle tests (ADR-0043): a pending
 //! Permission/Question pins the Chat/Topic towards its turn's requester,
-//! resolution clears it exactly once, and the `[bridge] pin` opt-in is off
+//! resolution clears it exactly once, and the `[bridge] instant_reminder` opt-in is off
 //! unless explicitly enabled (#234). A Turn whose Chat/Topic stays silent past
 //! the injected long-turn threshold pins too, and its completion keeps the pin
 //! for the injected TTL before clearing it (#236); any inbound user activity
@@ -56,11 +56,11 @@ async fn seed_turn(app: &Arc<App>, session_id: &str, is_group: bool, generation:
     );
 }
 
-/// A `[bridge] pin = true` app whose MockBackend serves one permission.
+/// A `[bridge] instant_reminder = true` app whose MockBackend serves one permission.
 fn pinned_permission_app(
     cfg: &mut crate::config::Config,
 ) -> (Arc<App>, Arc<RecordingPlatform>, Arc<MockBackend>) {
-    cfg.bridge.pin = true;
+    cfg.bridge.instant_reminder = true;
     let mut backend = MockBackend::new(realistic_parts());
     backend.permissions = vec![permission("per_1", "ses_1")];
     let backend = Arc::new(backend);
@@ -121,7 +121,7 @@ async fn a_pending_question_pins_and_resolution_unpins() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = test_config(&dir.path().join("sessions.json"));
-    cfg.bridge.pin = true;
+    cfg.bridge.instant_reminder = true;
     let mut backend = MockBackend::new(realistic_parts());
     backend.questions = vec![question("que_1", "ses_1")];
     let backend = Arc::new(backend);
@@ -165,7 +165,7 @@ async fn a_group_pin_targets_its_chat() {
     );
 }
 
-/// The opt-in default: with `[bridge] pin` unset/false, the same pending
+/// The opt-in default: with `[bridge] instant_reminder` unset/false, the same pending
 /// lifecycle records no reminder call at all (an upgrade never changes
 /// notification behavior).
 #[tokio::test]
@@ -173,7 +173,7 @@ async fn pin_off_records_no_reminder_calls() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    assert!(!cfg.bridge.pin, "test_config is the off default");
+    assert!(!cfg.bridge.instant_reminder, "test_config is the off default");
     let mut backend = MockBackend::new(realistic_parts());
     backend.permissions = vec![permission("per_1", "ses_1")];
     let backend = Arc::new(backend);
@@ -202,7 +202,7 @@ async fn pin_off_records_no_reminder_calls() {
 
     assert!(
         platform.reminders().await.is_empty(),
-        "pin = false must make no Instant Reminder call"
+        "instant_reminder = false must make no Instant Reminder call"
     );
 }
 
@@ -214,7 +214,7 @@ async fn a_failed_pin_never_affects_the_turn_and_does_not_clear() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = test_config(&dir.path().join("sessions.json"));
-    cfg.bridge.pin = true;
+    cfg.bridge.instant_reminder = true;
     let mut backend = MockBackend::new(realistic_parts());
     backend.permissions = vec![permission("per_1", "ses_1")];
     let backend = Arc::new(backend);
@@ -289,7 +289,7 @@ async fn a_turn_start_self_heals_a_possible_orphan_once() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = test_config(&dir.path().join("sessions.json"));
-    cfg.bridge.pin = true;
+    cfg.bridge.instant_reminder = true;
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
     app.handle_message(incoming(
@@ -360,7 +360,7 @@ async fn a_long_turn_pins_and_completion_keeps_it_for_the_ttl() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = test_config(&dir.path().join("sessions.json"));
-    cfg.bridge.pin = true;
+    cfg.bridge.instant_reminder = true;
     // The gate holds the prompt in flight so the turn runs past the threshold.
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let mut backend = MockBackend::new(realistic_parts());
@@ -427,7 +427,7 @@ async fn an_interaction_defers_the_long_turn_pin() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = test_config(&dir.path().join("sessions.json"));
-    cfg.bridge.pin = true;
+    cfg.bridge.instant_reminder = true;
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let mut backend = MockBackend::new(realistic_parts());
     backend.prompt_gate = Some(gate.clone());
@@ -515,7 +515,7 @@ async fn a_card_action_releases_a_live_long_turn_hold() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = test_config(&dir.path().join("sessions.json"));
-    cfg.bridge.pin = true;
+    cfg.bridge.instant_reminder = true;
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
     // A live long-turn pin, as the checker would have left it.
@@ -601,7 +601,7 @@ async fn a_permission_click_releases_a_live_long_turn_hold() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = test_config(&dir.path().join("sessions.json"));
-    cfg.bridge.pin = true;
+    cfg.bridge.instant_reminder = true;
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
     app.pins
@@ -639,7 +639,7 @@ async fn a_permission_click_keeps_a_pending_hold() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = test_config(&dir.path().join("sessions.json"));
-    cfg.bridge.pin = true;
+    cfg.bridge.instant_reminder = true;
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
     let target = PinTarget {
@@ -676,7 +676,7 @@ async fn a_question_click_releases_a_live_long_turn_hold() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = test_config(&dir.path().join("sessions.json"));
-    cfg.bridge.pin = true;
+    cfg.bridge.instant_reminder = true;
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
     app.pins
@@ -714,7 +714,7 @@ async fn a_question_click_keeps_a_pending_hold() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = test_config(&dir.path().join("sessions.json"));
-    cfg.bridge.pin = true;
+    cfg.bridge.instant_reminder = true;
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
     let target = PinTarget {
@@ -750,7 +750,7 @@ async fn a_new_turn_releases_the_previous_turns_ttl_pin() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = test_config(&dir.path().join("sessions.json"));
-    cfg.bridge.pin = true;
+    cfg.bridge.instant_reminder = true;
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let mut backend = MockBackend::new(realistic_parts());
     backend.prompt_gate = Some(gate.clone());
@@ -801,7 +801,7 @@ async fn a_short_turn_never_pins() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = test_config(&dir.path().join("sessions.json"));
-    cfg.bridge.pin = true;
+    cfg.bridge.instant_reminder = true;
     let backend = Arc::new(MockBackend::new(realistic_parts()));
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -835,7 +835,7 @@ async fn a_stale_completion_ttl_never_clears_a_newer_turns_pin() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = test_config(&dir.path().join("sessions.json"));
-    cfg.bridge.pin = true;
+    cfg.bridge.instant_reminder = true;
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let mut backend = MockBackend::new(realistic_parts());
     backend.prompt_gate = Some(gate.clone());
