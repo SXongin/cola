@@ -75,7 +75,7 @@ Standard local verification loop before pushing (CI's Format job is `cargo fmt -
 
 ## Contribution guidelines
 
-- **Branch workflow (TBD, rebase-linear)**: `main` is the only long-lived branch. Every task runs the full loop — start on `main`, branch off it, work, rebase on the latest `main`, open a PR with base `main`, merge, return to `main` (`CONTRIBUTING.md` "Branch workflow"). Run the whole loop by default; the base is always `main`. Check `git branch --show-current` before editing.
+- **Branch workflow (TBD, rebase-linear)**: `main` is the only long-lived branch. Every task runs the loop — start on `main`, branch off it, work, rebase on the latest `main`, open a PR with base `main`, get CI and review green — and then **stops: agents never merge**. The user verifies the change themselves and gives the explicit go-ahead (or merges it themselves); only after the merge does the next task return to `main` (`CONTRIBUTING.md` "Branch workflow"). The base is always `main`. Check `git branch --show-current` before editing.
 - **PR rules**: `CONTRIBUTING.md` — commit conventions, the pre-PR verification loop, and the PR description checklist. Follow it when creating commits or PRs.
 - **Coding standards**: `CODING_STANDARDS.md` — the source the `/code-review` skill's Standards axis reads (together with `CONTRIBUTING.md`).
 - **Releases**: cut with `cargo xtask release <version>` (ADR-0033) — it bumps the manifest, merges through the CI-gated PR, and tags the merged commit. Never hand-edit the version or tag a branch commit; only pass `--yes` after a human confirmed the smoke test.
