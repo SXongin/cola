@@ -10,7 +10,7 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::bridge::pin::{PinReason, PinTarget};
+use crate::bridge::reminder::{ReminderReason, ReminderTarget};
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{PromptContext, Turn};
 use crate::config::ThreadKey;
@@ -370,9 +370,9 @@ async fn a_long_turn_pins_and_completion_keeps_it_for_the_ttl() {
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
-    app.pins.long_turn_ms.store(20, Ordering::Relaxed);
-    app.pins.long_turn_tick_ms.store(5, Ordering::Relaxed);
-    app.pins.ttl_ms.store(800, Ordering::Relaxed);
+    app.reminder.long_turn_ms.store(20, Ordering::Relaxed);
+    app.reminder.long_turn_tick_ms.store(5, Ordering::Relaxed);
+    app.reminder.ttl_ms.store(800, Ordering::Relaxed);
 
     let turn = {
         let app = Arc::clone(&app);
@@ -436,9 +436,9 @@ async fn an_interaction_defers_the_long_turn_pin() {
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
-    app.pins.long_turn_ms.store(400, Ordering::Relaxed);
-    app.pins.long_turn_tick_ms.store(5, Ordering::Relaxed);
-    app.pins.ttl_ms.store(800, Ordering::Relaxed);
+    app.reminder.long_turn_ms.store(400, Ordering::Relaxed);
+    app.reminder.long_turn_tick_ms.store(5, Ordering::Relaxed);
+    app.reminder.ttl_ms.store(800, Ordering::Relaxed);
 
     let turn = {
         let app = Arc::clone(&app);
@@ -519,16 +519,16 @@ async fn a_card_action_releases_a_live_long_turn_hold() {
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
     // A live long-turn pin, as the checker would have left it.
-    app.pins
+    app.reminder
         .ensure(
             &app.feishu,
-            &PinTarget {
+            &ReminderTarget {
                 chat_id: "chat_1".into(),
                 is_group: false,
                 user_ids: vec![TEST_HOST.into()],
                 generation: 1,
             },
-            PinReason::LongTurn,
+            ReminderReason::LongTurn,
         )
         .await;
     assert_eq!(platform.reminders().await.len(), 1, "the pin is up");
@@ -604,16 +604,16 @@ async fn a_permission_click_releases_a_live_long_turn_hold() {
     cfg.bridge.instant_reminder = true;
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
-    app.pins
+    app.reminder
         .ensure(
             &app.feishu,
-            &PinTarget {
+            &ReminderTarget {
                 chat_id: "chat_1".into(),
                 is_group: false,
                 user_ids: vec![TEST_HOST.into()],
                 generation: 1,
             },
-            PinReason::LongTurn,
+            ReminderReason::LongTurn,
         )
         .await;
     assert_eq!(platform.reminders().await.len(), 1, "the pin is up");
@@ -642,14 +642,18 @@ async fn a_permission_click_keeps_a_pending_hold() {
     cfg.bridge.instant_reminder = true;
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
-    let target = PinTarget {
+    let target = ReminderTarget {
         chat_id: "chat_1".into(),
         is_group: false,
         user_ids: vec![TEST_HOST.into()],
         generation: 1,
     };
-    app.pins.ensure(&app.feishu, &target, PinReason::LongTurn).await;
-    app.pins.ensure(&app.feishu, &target, PinReason::Pending).await;
+    app.reminder
+        .ensure(&app.feishu, &target, ReminderReason::LongTurn)
+        .await;
+    app.reminder
+        .ensure(&app.feishu, &target, ReminderReason::Pending)
+        .await;
     assert_eq!(platform.reminders().await.len(), 1, "the pin is up");
 
     app.handle_card_action(normalized_permission_click("per_1", "ses_1", "chat_1"))
@@ -662,7 +666,9 @@ async fn a_permission_click_keeps_a_pending_hold() {
 
     // Resolving the wait releases the last hold — which only unpins because
     // the click already released the `LongTurn` reason.
-    app.pins.clear(&app.feishu, "chat_1", 1, PinReason::Pending).await;
+    app.reminder
+        .clear(&app.feishu, "chat_1", 1, ReminderReason::Pending)
+        .await;
     let calls = platform.reminders().await;
     assert_eq!(calls.len(), 2, "the pending resolution unpins: {calls:?}");
     assert!(!calls[1].3);
@@ -679,16 +685,16 @@ async fn a_question_click_releases_a_live_long_turn_hold() {
     cfg.bridge.instant_reminder = true;
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
-    app.pins
+    app.reminder
         .ensure(
             &app.feishu,
-            &PinTarget {
+            &ReminderTarget {
                 chat_id: "chat_1".into(),
                 is_group: false,
                 user_ids: vec![TEST_HOST.into()],
                 generation: 1,
             },
-            PinReason::LongTurn,
+            ReminderReason::LongTurn,
         )
         .await;
     assert_eq!(platform.reminders().await.len(), 1, "the pin is up");
@@ -717,14 +723,18 @@ async fn a_question_click_keeps_a_pending_hold() {
     cfg.bridge.instant_reminder = true;
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
-    let target = PinTarget {
+    let target = ReminderTarget {
         chat_id: "chat_1".into(),
         is_group: false,
         user_ids: vec![TEST_HOST.into()],
         generation: 1,
     };
-    app.pins.ensure(&app.feishu, &target, PinReason::LongTurn).await;
-    app.pins.ensure(&app.feishu, &target, PinReason::Pending).await;
+    app.reminder
+        .ensure(&app.feishu, &target, ReminderReason::LongTurn)
+        .await;
+    app.reminder
+        .ensure(&app.feishu, &target, ReminderReason::Pending)
+        .await;
     assert_eq!(platform.reminders().await.len(), 1, "the pin is up");
 
     app.handle_card_action(normalized_question_click("que_1", "ses_1", "chat_1"))
@@ -735,7 +745,9 @@ async fn a_question_click_keeps_a_pending_hold() {
         "Pending holds the pin: the click makes no unpin call"
     );
 
-    app.pins.clear(&app.feishu, "chat_1", 1, PinReason::Pending).await;
+    app.reminder
+        .clear(&app.feishu, "chat_1", 1, ReminderReason::Pending)
+        .await;
     let calls = platform.reminders().await;
     assert_eq!(calls.len(), 2, "the pending resolution unpins: {calls:?}");
     assert!(!calls[1].3);
@@ -759,10 +771,10 @@ async fn a_new_turn_releases_the_previous_turns_ttl_pin() {
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
-    app.pins.long_turn_ms.store(20, Ordering::Relaxed);
-    app.pins.long_turn_tick_ms.store(5, Ordering::Relaxed);
+    app.reminder.long_turn_ms.store(20, Ordering::Relaxed);
+    app.reminder.long_turn_tick_ms.store(5, Ordering::Relaxed);
     // The TTL is minutes away: the release below cannot be the timer.
-    app.pins.ttl_ms.store(60_000, Ordering::Relaxed);
+    app.reminder.ttl_ms.store(60_000, Ordering::Relaxed);
 
     // Turn 1 runs long and completes: its pin stays for the TTL.
     let first = {
@@ -777,7 +789,7 @@ async fn a_new_turn_releases_the_previous_turns_ttl_pin() {
 
     // The next message starts a new short turn: it releases the TTL hold
     // immediately. The huge threshold keeps that turn from pinning again.
-    app.pins.long_turn_ms.store(60_000, Ordering::Relaxed);
+    app.reminder.long_turn_ms.store(60_000, Ordering::Relaxed);
     Turn::run(&app, turn_ctx("ses_test")).await.unwrap();
 
     let calls = platform.reminders().await;
@@ -807,9 +819,9 @@ async fn a_short_turn_never_pins() {
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
-    app.pins.long_turn_ms.store(600, Ordering::Relaxed);
-    app.pins.long_turn_tick_ms.store(5, Ordering::Relaxed);
-    app.pins.ttl_ms.store(50, Ordering::Relaxed);
+    app.reminder.long_turn_ms.store(600, Ordering::Relaxed);
+    app.reminder.long_turn_tick_ms.store(5, Ordering::Relaxed);
+    app.reminder.ttl_ms.store(50, Ordering::Relaxed);
 
     Turn::run(&app, turn_ctx("ses_test")).await.unwrap();
 
@@ -844,9 +856,9 @@ async fn a_stale_completion_ttl_never_clears_a_newer_turns_pin() {
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
-    app.pins.long_turn_ms.store(20, Ordering::Relaxed);
-    app.pins.long_turn_tick_ms.store(5, Ordering::Relaxed);
-    app.pins.ttl_ms.store(400, Ordering::Relaxed);
+    app.reminder.long_turn_ms.store(20, Ordering::Relaxed);
+    app.reminder.long_turn_tick_ms.store(5, Ordering::Relaxed);
+    app.reminder.ttl_ms.store(400, Ordering::Relaxed);
 
     // Turn 1 runs long and completes: its pin stays for the TTL.
     let first = {

@@ -158,6 +158,47 @@ top-down, and the reader's viewport is at the bottom where the delta lands.
 Source: product-owner smoke test of the accumulated-card behavior and
 approval of the delta revision.
 
+## Amendment (2026-09-19): waiting cards are message-pinned
+
+The Decision above pins only the conversation, and the pinned entry previews
+the chat's newest message. Once a chat holds several topics (several sessions
+share one `chat_id`), a wait in an older topic has no in-list surface: tapping
+the reminder lands on the newest message, which may be anything — a resolved
+card, another topic's completion, the user's own message. Feishu's **Pin
+message** API (`POST /im/v1/pins`; satisfied by the already-held `im:message`
+scope, or `im:message.pins:write_only`) pins a specific message into the
+chat's pinned-message list, so entering the chat shows exactly what waits.
+
+- A pending Permission/Question's **host card** — the streaming card carrying
+  its Interaction Block, the standalone card it was sent as, or the Session
+  Snapshot card hosting a claimed block (ADR-0028) — is pinned while the
+  request waits and unpinned once it leaves the pending list. A card rendering
+  both kinds is pinned once (reference-counted by message); the last wait off
+  it unpins it. A card replaced by a re-host, a split, or a snapshot claim
+  moves its pin.
+- Only waiting requests pin a message. A long Turn pins none: a running card
+  is not an item to answer, and its content changes; the conversation-level
+  reminder keeps the long-turn lifecycle above unchanged.
+- Cola pins each (request → card) transition once: an unchanged wait is never
+  re-asserted, so a card the user unpins by hand is not fought. A failed pin
+  retries while the wait lasts; a failed unpin stays tracked; a failed pin
+  never fabricates a later unpin. A directory whose list call failed is
+  unknown, never resolved (#130), exactly as in the reminder's sweep.
+- No read-back reconciliation: the pin list's consistency lags writes
+  (measured 2026-09-19: a `DELETE` still listed around 20 s later), so cola
+  tracks its own transitions in memory. A pin orphaned by a crash stays until
+  the user removes it — its message id is unknowable after a restart. Accepted
+  for now, like the reminder's startup self-heal exception.
+- Naming: the pre-existing `bridge/pin.rs` only ever implemented
+  `time_sensitive`, so it is renamed `bridge/reminder.rs`
+  (`ReminderState`/`ReminderReason`/`ReminderTarget`), and the new registry is
+  `bridge/message_pins.rs` (`MessagePins`) — "reminder" means the
+  conversation-level `time_sensitive` state, "message pin" the platform's
+  pinned-message list.
+
+Source: #247 grilling of multi-session precedence and the live API probe that
+confirmed message pinning works on the existing scope.
+
 ## Amendment (2026-09-19): the long-turn threshold measures user silence
 
 The Decision above says a Turn running past 60 s pins the conversation. Live

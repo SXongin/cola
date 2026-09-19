@@ -413,7 +413,7 @@ pub struct StreamAccumulator {
     /// Whether the prompt came from a group chat (completion notice is group-only).
     pub is_group: bool,
     /// The Chat/Topic's turn generation at this turn's start (ADR-0043),
-    /// assigned by [`crate::bridge::pin::PinState::begin_turn`]. The Instant
+    /// assigned by [`crate::bridge::reminder::ReminderState::begin_turn`]. The Instant
     /// Reminder pin lifecycle reads it so every pin carries the turn it
     /// belongs to and a stale clear cannot unpin a newer turn's pin.
     pub turn_generation: Option<u64>,
