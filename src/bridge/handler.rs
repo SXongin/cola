@@ -547,7 +547,10 @@ impl App {
         // running loop picks it up at the next tool boundary, merging it into
         // the current turn (original message preserved; model sees full
         // history). This is what lets the user append context mid-turn without
-        // /stop and without interrupting a tool call.
+        // /stop and without interrupting a tool call. The message landed below
+        // the live card, so the Card Chain splits at it (ADR-0043) — the split
+        // is requested even when the send failed, never for commands (they are
+        // dispatched above this path).
         {
             let busy = self.inflight.lock().await.contains(&session_id);
             if busy {
@@ -573,24 +576,26 @@ impl App {
                             "supplement: session {} in-flight, message queued to merge into current turn",
                             session_id
                         );
-                        if kind == ConversationKind::P2p || kind == ConversationKind::Topic {
-                            let _ = self
-                                .feishu
-                                .reply_text(
-                                    &message_id,
-                                    "📨 已收到补充，将并入当前处理。若当前轮已结束，会作为下一条消息继续。",
-                                )
-                                .await;
-                        }
                     }
                     Err(e) => {
                         tracing::warn!("supplement: prompt_async failed: {}", e);
+                        // The failure notice is sent first, then the split
+                        // still happens below — the live card must remain the
+                        // newest message, not the notice.
                         let _ = self
                             .feishu
                             .reply_text(&message_id, "⚠️ 补充消息发送失败，请稍后重试。")
                             .await;
                     }
                 }
+                // The supplement landed below the live card: split the Card
+                // Chain at this message (ADR-0043). The previous card is
+                // finalized with the standard split header and keeps everything
+                // before the split; the continuation — a reply to the
+                // supplement — carries the receipt (and only the content that
+                // arrives after it) and becomes the tracked live card. There is
+                // NO separate acknowledgement message.
+                crate::bridge::render::split_card_chain(&self.core, &session_id, &message_id).await;
                 return Ok(());
             }
         }

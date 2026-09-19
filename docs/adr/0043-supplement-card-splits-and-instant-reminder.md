@@ -114,3 +114,24 @@ the conversation while a Turn needs attention.
 
 **Card Chain** is broadened to cover position-driven splits. **Supplement** and
 **Instant Reminder** enter the glossary.
+
+## Amendment (2026-09-19): the continuation carries only the delta
+
+The Decision above says the continuation "carries the accumulated card" — it
+re-renders everything the previous card already shows. The acceptance smoke
+test showed that duplicating the whole Turn on every Supplement is worse than
+a non-self-contained newest card: the chain already reads contiguously
+top-down, and the reader's viewport is at the bottom where the delta lands.
+
+- The split is now a **delta handoff**, exactly like a size split: the
+  previous card is finalized with everything before the split, and the
+  continuation — the reply to the supplement message — carries its receipt
+  line plus only the content that arrives after it.
+- Consequence: the newest card is not self-contained. A reader who jumps
+  straight to the bottom sees the newest content and the receipts, not the
+  whole Turn; the earlier cards above carry the rest of the chain. Accepted,
+  because the cards are adjacent messages and reading them in order is the
+  normal path.
+
+Source: product-owner smoke test of the accumulated-card behavior and
+approval of the delta revision.

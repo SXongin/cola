@@ -38,6 +38,12 @@ pub struct CardBuilder {
     state: CardState,
     /// Tool panels in call order (also drives the header's running-tool hint).
     tools: Vec<ToolPanel>,
+    /// The Turn's globally running tool, used for the header when this card's
+    /// slice carries none of its own (a split continuation's slice may not
+    /// include the panel the Turn is still executing — the header describes
+    /// the Turn's state, not just this card's contents). `None` keeps the
+    /// slice-local selection.
+    header_running_tool: Option<ToolPanel>,
     /// Body elements, in call order.
     body: Vec<serde_json::Value>,
     footer: Option<String>,
@@ -85,6 +91,7 @@ impl CardBuilder {
         Self {
             state: CardState::Loading,
             tools: Vec::new(),
+            header_running_tool: None,
             body: Vec::new(),
             footer: None,
             subtitle: None,
@@ -198,6 +205,18 @@ impl CardBuilder {
         self.with_tool_at(tool, None, None)
     }
 
+    /// The Turn's globally running tool for the header, preferred over this
+    /// card's slice-local panels: a split continuation's slice may not carry
+    /// the panel the Turn is still executing (`sleep 30` at split time), yet
+    /// its header must keep saying "⏳ tool", not fall back to "回复中".
+    pub fn with_header_running_tool(mut self, tool: Option<ToolPanel>) -> Self {
+        // Self-defending: only a LIVE panel may drive the header. A stale
+        // override (finished/failed) would both lie and suppress the
+        // slice-local fallback, so it is treated as absent.
+        self.header_running_tool = tool.filter(|t| t.status == "running");
+        self
+    }
+
     pub fn with_footer(mut self, footer: &str) -> Self {
         self.footer = Some(footer.to_string());
         self
@@ -239,7 +258,15 @@ impl CardBuilder {
             }
         }
 
-        let running = self.tools.iter().find(|t| t.status == "running");
+        // The caller's global running tool first (a continuation's slice may
+        // lack the panel), else the slice-local one — unchanged for callers
+        // that never set the override. Both are first-match in insertion
+        // order (`Vec`/`IndexMap`), so multiple running tools pick
+        // deterministically: the one started first.
+        let running = self
+            .header_running_tool
+            .as_ref()
+            .or_else(|| self.tools.iter().find(|t| t.status == "running"));
         let (header_title, template) = header_title_and_template(&self.state, running, &self.progress);
         let mut header = serde_json::json!({
             "title": { "tag": "plain_text", "content": header_title },
@@ -261,7 +288,9 @@ impl CardBuilder {
 }
 
 /// Header title + template for a card. `running_tool` is the tool currently
-/// running (from the builder's tools), driving the "⏳ tool" streaming header.
+/// running (the builder's slice-local panel, or the caller's global selection
+/// via [`CardBuilder::with_header_running_tool`]), driving the "⏳ tool"
+/// streaming header.
 /// Active states append the progress signals passed in from the accumulator;
 /// `progress.waiting` (a pending permission/question) overrides the phase label
 /// entirely.
@@ -448,6 +477,88 @@ mod tests {
             header
         );
         assert_eq!(card["header"]["template"].as_str().unwrap(), "orange");
+    }
+
+    /// A card whose slice has NO tool panel still shows the Turn's running tool
+    /// when the caller passes the global override (a split continuation), and
+    /// falls back to today's slice-local selection when it does not.
+    #[test]
+    fn header_running_tool_override_wins_over_the_slice() {
+        let tool = ToolPanel {
+            name: "bash".into(),
+            status: "running".into(),
+            input: Some(json!({"command": "sleep 30"})),
+            output: None,
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Streaming)
+            .with_text("补充后的内容。")
+            .with_header_running_tool(Some(tool))
+            .build();
+        let header = card["header"]["title"]["content"].as_str().unwrap();
+        assert_eq!(
+            header, "⏳ bash",
+            "the global running tool must drive the header: {header}"
+        );
+        assert_eq!(card["header"]["template"].as_str().unwrap(), "orange");
+
+        // No override: the slice-local fallback (no panel here → phase label).
+        let card = CardBuilder::new()
+            .with_state(CardState::Streaming)
+            .with_text("补充后的内容。")
+            .build();
+        let header = card["header"]["title"]["content"].as_str().unwrap();
+        assert_eq!(
+            header, "✍️ 回复中",
+            "without the override the slice-local fallback stays: {header}"
+        );
+    }
+
+    /// A stale override (a finished tool) is treated as absent: it neither
+    /// lies in the header nor suppresses the slice-local running panel.
+    #[test]
+    fn a_non_running_header_tool_override_is_ignored() {
+        let finished = |name: &str| ToolPanel {
+            name: name.into(),
+            status: "completed".into(),
+            input: None,
+            output: None,
+        };
+
+        // The slice still has a running panel: the stale override must not
+        // hide it.
+        let card = CardBuilder::new()
+            .with_state(CardState::Streaming)
+            .with_tool(ToolPanel {
+                name: "bash".into(),
+                status: "running".into(),
+                input: Some(json!({"command": "sleep 30"})),
+                output: None,
+            })
+            .with_header_running_tool(Some(finished("stale")))
+            .build();
+        let header = card["header"]["title"]["content"].as_str().unwrap();
+        assert!(
+            header.starts_with("⏳ bash"),
+            "the slice-local running panel must win over a stale override: {header}"
+        );
+        assert!(
+            !header.contains("stale"),
+            "the stale panel must not show: {header}"
+        );
+
+        // No running panel anywhere: the stale override falls back to the
+        // plain streaming label, not to itself.
+        let card = CardBuilder::new()
+            .with_state(CardState::Streaming)
+            .with_text("补充后的内容。")
+            .with_header_running_tool(Some(finished("stale")))
+            .build();
+        let header = card["header"]["title"]["content"].as_str().unwrap();
+        assert_eq!(
+            header, "✍️ 回复中",
+            "a non-running override must fall back to the phase label: {header}"
+        );
     }
 
     #[test]

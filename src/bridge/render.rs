@@ -452,7 +452,38 @@ pub(crate) fn render_new_turn_parts(
 /// Push the accumulator's current card to Feishu as an update of the loading
 /// card, so the user sees reasoning/tool/text appear incrementally.
 /// Upper bound on continuation cards sent for one flush (each is a new message).
-const MAX_CARD_CHAIN: usize = 8;
+pub(crate) const MAX_CARD_CHAIN: usize = 8;
+
+/// The one-line receipt a supplement leaves on its continuation card (ADR-0043)
+/// — the same visual form as an Interaction Receipt, keyed in timeline order.
+const SUPPLEMENT_RECEIPT: &str = "📨 已收到补充";
+
+/// Split `session_id`'s Card Chain at a Supplement (ADR-0043): append the
+/// supplement to the chain's split queue and flush. The flush finalizes the
+/// live card with the standard split header (keeping everything before the
+/// split) and sends a continuation that replies to the NEWEST queued
+/// supplement, carrying one receipt per queued supplement plus only the
+/// content that arrives after the split — so the live card stays the newest
+/// message and no supplement is coalesced away. Runs under the session's
+/// card-write lock, so concurrent supplements queue in arrival order and the
+/// finalization reuses the size-split path (the live Interaction Blocks
+/// migrate to the continuation; the previous card's controls are settled).
+/// No-op when the session has no live card.
+pub(crate) async fn split_card_chain(core: &Arc<SharedCore>, session_id: &str, reply_to: &str) {
+    let write_lock = core.card_write_lock(session_id).await;
+    let _guard = write_lock.lock().await;
+    {
+        let mut cards = core.cards.lock().await;
+        let Some(card) = cards.get_mut(session_id) else {
+            return;
+        };
+        card.pending_split.push(crate::bridge::streaming::PendingSplit {
+            reply_to: reply_to.to_string(),
+            receipt_pushed: false,
+        });
+    }
+    flush_card_locked(core, session_id).await;
+}
 
 pub(crate) async fn flush_card(core: &Arc<SharedCore>, session_id: &str) {
     // One card writer per session at a time. A flush is a read-send-record
@@ -468,19 +499,59 @@ pub(crate) async fn flush_card(core: &Arc<SharedCore>, session_id: &str) {
 }
 
 async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
-    // Is the accumulator's current card still the live (growing) card? It is
-    // until the first split finalizes it. Every card after that was sent as a
-    // FINALIZED slice (its build was already over the budget) and must never be
-    // overwritten: an update with the next slice would drop the content — and
-    // the Interaction Receipts — that card carries.
-    let mut card_is_live = true;
-    for _ in 0..MAX_CARD_CHAIN {
-        let (built, rendered) = {
+    // The card-chain state a flush resumes from: a pending Supplement split
+    // (ADR-0043) and whether the tracked card is still the live (growing) one.
+    // Both survive the flush — a chain that exhausted the size bound, or died
+    // between a finalize and its continuation, must be picked up where it
+    // stopped, never restarted by overwriting the finalized slice.
+    let (pending_split, mut card_is_live) = {
+        let cards = core.cards.lock().await;
+        let Some(card) = cards.get(session_id) else {
+            return;
+        };
+        (card.pending_split.clone(), card.card_is_live)
+    };
+    // The size bound must never refuse a supplement split: it gets one
+    // continuation slot of its own beyond the cap, and any remaining slice is
+    // reconciled on the next flush.
+    let flush_limit = if !pending_split.is_empty() {
+        MAX_CARD_CHAIN + 1
+    } else {
+        MAX_CARD_CHAIN
+    };
+    // A chain that already owes a continuation (a failed send, or the remainder
+    // of a bound-exhausted chain) will build it below: apply the receipts of
+    // any supplements queued SINCE that attempt first, so they ride it. The
+    // finalizing flush applies its receipts after the previous card's final
+    // build instead (see the live branch), keeping them off that card.
+    if !card_is_live {
+        push_queued_receipts(core, session_id).await;
+    }
+    for _ in 0..flush_limit {
+        // The tracked card id, read BEFORE the build: while the loading card's
+        // reply is still in flight the session has a live accumulator but no
+        // card to send to, and building would advance `render_from` past a
+        // slice nothing rendered. Leaving the state untouched lets the first
+        // flush after the id lands serve it — including a Supplement split
+        // requested in that window.
+        let card_id = {
+            let cards = core.cards.lock().await;
+            cards.get(session_id).and_then(|c| c.card_message_id.clone())
+        };
+        let Some(card_id) = card_id else { return };
+
+        let (built, rendered, slice_from, slice_to) = {
             let mut cards = core.cards.lock().await;
             let Some(card) = cards.get_mut(session_id) else {
                 return;
             };
+            // `build_card_with_info` advances `render_from` when the built
+            // card is a finalized (full) slice. Remember the boundary: a
+            // failed continuation send must restore it, or the slice it built
+            // reaches no card and the retry silently starts after it.
+            let slice_from = card.acc.render_from;
             let built = card.acc.build_card_with_info();
+            let slice_to = card.acc.render_from;
             let rendered = built
                 .spans
                 .iter()
@@ -490,43 +561,85 @@ async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
                         .and_then(|block| RenderedBlock::of(span, block))
                 })
                 .collect();
-            (built, rendered)
+            (built, rendered, slice_from, slice_to)
         };
-        let card_id = {
-            let cards = core.cards.lock().await;
-            cards.get(session_id).and_then(|c| c.card_message_id.clone())
-        };
-        let Some(card_id) = card_id else { return };
 
         if card_is_live {
-            // The live card takes the slice in place: either it still fits
-            // (plain update) or this flush finalizes it with the "to be
-            // continued" marker.
-            if let Err(e) = core.feishu.update_message(&card_id, &built.card).await {
+            let supplement_split_requested = !pending_split.is_empty();
+            if !supplement_split_requested && !built.full {
+                // The live card still fits: a plain update.
+                if let Err(e) = core.feishu.update_message(&card_id, &built.card).await {
+                    tracing::warn!("Card update failed: {}", e);
+                }
+                // Record what this card now renders: the live blocks.
+                core.card_handles
+                    .lock()
+                    .await
+                    .record(&card_id, &built.card, rendered);
+                return;
+            }
+            // The tracked card is finalized: it overflowed (size split) or a
+            // supplement forced the split. Either way the finalized card
+            // renders NO tail — its live Interaction Blocks migrate to the
+            // continuation (ADR-0038), so the old card's controls are settled
+            // rather than left dead.
+            let finalized = if supplement_split_requested && !built.full {
+                // The live slice still fits, but a supplement forces the split
+                // anyway: finalize the slice here and HAND IT OFF — the
+                // continuation carries only the receipts queued below and the
+                // content that arrives after them, exactly like a size split.
+                let mut cards = core.cards.lock().await;
+                let Some(card) = cards.get_mut(session_id) else {
+                    return;
+                };
+                card.acc.build_finalized_handoff()
+            } else {
+                built.card
+            };
+            // Persist the finalization BEFORE the send: a failed or cancelled
+            // send must not leave the next flush thinking this card still
+            // grows — it would overwrite the finalized slice.
+            {
+                let mut cards = core.cards.lock().await;
+                if let Some(card) = cards.get_mut(session_id) {
+                    card.card_is_live = false;
+                }
+            }
+            card_is_live = false;
+            if supplement_split_requested {
+                // Record EVERY queued supplement with its own receipt line, in
+                // arrival order: written AFTER the previous card's final build
+                // and BEFORE the continuation's, so they ride the continuation
+                // only. The per-entry flag keeps a retried flush from doubling
+                // them.
+                push_queued_receipts(core, session_id).await;
+            }
+            if let Err(e) = core.feishu.update_message(&card_id, &finalized).await {
                 tracing::warn!("Card update failed: {}", e);
             }
-            // Record what this card now renders: the live blocks (or none, when
-            // the update finalized the card without its tail — the continuation
-            // below then takes them over).
             core.card_handles
                 .lock()
                 .await
-                .record(&card_id, &built.card, rendered);
-            if !built.full {
-                return;
-            }
-            card_is_live = false;
+                .record(&card_id, &finalized, Vec::new());
             continue;
         }
 
-        // A finalized slice needs its own card; `build_card_with_info` already
-        // advanced `render_from` past the split point, so each continuation
-        // holds exactly the slice it was built from — nothing is lost.
-        let reply_to = {
-            let cards = core.cards.lock().await;
-            cards
-                .get(session_id)
-                .and_then(|c| c.acc.reply_to_message_id.clone())
+        // The tracked card is a FINALIZED slice: the chain continues on a NEW
+        // card. Either split already advanced `render_from` past the finalized
+        // content — a size split inside `build_card_with_info`, a supplement
+        // split in `build_finalized_handoff` — so this card renders only the
+        // delta after it (the receipts included), never the prior content
+        // again.
+        let reply_to = match pending_split.last() {
+            // A supplement split anchors its chain at the NEWEST supplement:
+            // one continuation serves the whole queued batch.
+            Some(split) => Some(split.reply_to.clone()),
+            None => {
+                let cards = core.cards.lock().await;
+                cards
+                    .get(session_id)
+                    .and_then(|c| c.acc.reply_to_message_id.clone())
+            }
         };
         let Some(reply_to) = reply_to else { return };
         match core.feishu.reply_card(&reply_to, &built.card).await {
@@ -535,8 +648,24 @@ async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
                     let mut cards = core.cards.lock().await;
                     if let Some(card) = cards.get_mut(session_id) {
                         card.card_message_id = Some(new_id.clone());
+                        // A continuation that fits becomes the live card; one
+                        // that is itself over the budget stays finalized and
+                        // loops for the next slice.
+                        card.card_is_live = !built.full;
+                        if !pending_split.is_empty() {
+                            // The continuation is the chain's new anchor: a
+                            // later size split (and the group completion
+                            // notice) continues from the newest supplement. The
+                            // queue is served — its receipts are on the card —
+                            // so a later supplement starts a fresh one.
+                            if let Some(newest) = pending_split.last() {
+                                card.acc.reply_to_message_id = Some(newest.reply_to.clone());
+                            }
+                            card.pending_split.clear();
+                        }
                     }
                 }
+                card_is_live = !built.full;
                 // The continuation takes the blocks over from the finalized
                 // slice it follows (its spans are the tail this card renders).
                 core.card_handles
@@ -551,9 +680,39 @@ async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
             }
             Err(e) => {
                 tracing::warn!("Card continuation send failed: {}", e);
+                // The failed send's slice reached no card, but its build
+                // already advanced `render_from` past it: restore the
+                // boundary so the retry re-renders the SAME slice instead of
+                // silently skipping it. The equality check keeps a boundary
+                // moved elsewhere (defensive; the card-write lock serializes
+                // flushes) from being rewound.
+                let mut cards = core.cards.lock().await;
+                if let Some(card) = cards.get_mut(session_id)
+                    && card.acc.render_from == slice_to
+                {
+                    card.acc.render_from = slice_from;
+                }
                 return;
             }
         }
+    }
+}
+
+/// Write one receipt line per queued supplement that does not have one yet, in
+/// arrival order. Exactly once per supplement: the per-entry flag travels with
+/// the queue, so a flush retried after a failed continuation send re-applies
+/// nothing — and a supplement queued after that attempt still gets its line.
+async fn push_queued_receipts(core: &Arc<SharedCore>, session_id: &str) {
+    let mut cards = core.cards.lock().await;
+    let Some(card) = cards.get_mut(session_id) else {
+        return;
+    };
+    for i in 0..card.pending_split.len() {
+        if card.pending_split[i].receipt_pushed {
+            continue;
+        }
+        card.acc.push_receipt(SUPPLEMENT_RECEIPT);
+        card.pending_split[i].receipt_pushed = true;
     }
 }
 

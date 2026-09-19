@@ -71,6 +71,10 @@ pub struct RecordingPlatform {
     pub fail_send_card: bool,
     /// When true, `reply_card` fails (tests the restart-announce fallback).
     pub fail_reply_card: bool,
+    /// The next N `reply_card` calls fail (a CONTINUATION send that must be
+    /// retried without duplicating receipts, while the loading card's own
+    /// reply — if any — succeeds).
+    pub fail_reply_card_count: std::sync::atomic::AtomicUsize,
     /// The thread_id `reply_in_thread` returns; `None` simulates a chat
     /// without topic support (the create-topic surfaces degrade with a
     /// message instead of mapping).
@@ -92,6 +96,7 @@ impl RecordingPlatform {
             chat_names: std::collections::HashMap::new(),
             fail_send_card: false,
             fail_reply_card: false,
+            fail_reply_card_count: std::sync::atomic::AtomicUsize::new(0),
             reply_in_thread_thread_id: Some("omt_created_topic".into()),
             quoted_messages: std::sync::Mutex::new(std::collections::HashMap::new()),
             pause_call: std::sync::Mutex::new(None),
@@ -231,6 +236,17 @@ impl feishu::Platform for RecordingPlatform {
 
     async fn reply_card(&self, reply_to: &str, card: &serde_json::Value) -> crate::error::Result<String> {
         if self.fail_reply_card {
+            return Err(crate::error::BridgeError::Feishu(
+                "simulated reply_card failure".into(),
+            ));
+        }
+        if self
+            .fail_reply_card_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            self.fail_reply_card_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             return Err(crate::error::BridgeError::Feishu(
                 "simulated reply_card failure".into(),
             ));
@@ -503,6 +519,10 @@ pub struct MockBackend {
     pub prompt_gate: Option<Arc<tokio::sync::Semaphore>>,
     /// Records every `prompt_async` call's text (asserts supplement path).
     pub prompt_async_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// When set, `prompt_async` fails with this message (a supplement whose
+    /// send to the Backend failed — the failure notice must still be followed
+    /// by the Card Chain split).
+    pub prompt_async_error: Option<String>,
     /// Records the number of images attached to each `prompt_async` call.
     pub prompt_async_images: Arc<tokio::sync::Mutex<Vec<usize>>>,
     /// Records the model passed to each `prompt_async` call.
@@ -603,6 +623,7 @@ impl MockBackend {
             on_prompt: None,
             prompt_gate: None,
             prompt_async_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            prompt_async_error: None,
             prompt_async_images: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_async_models: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_async_variants: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -819,6 +840,9 @@ impl opencode::Backend for MockBackend {
             .lock()
             .await
             .push(agent.map(|s| s.to_string()));
+        if let Some(err) = &self.prompt_async_error {
+            return Err(crate::error::BridgeError::OpenCode(err.clone()));
+        }
         Ok(())
     }
 
