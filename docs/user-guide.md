@@ -110,14 +110,15 @@ precondition for the message and resource APIs.
 | `im:chat:readonly` | 获取群组信息 | chat display names (`/attach` rejection card, `/switch` cards) | raw chat ids instead of names |
 | `contact:contact.base:readonly` | 获取通讯录基本信息 | authorizes the contact API call | user names unavailable |
 | `contact:user.base:readonly` | 获取用户基本信息 | returns the user's `name` field | completion notices lose the @name |
-| `im:datasync.feed_card.time_sensitive:write` | 设置即时提醒 (`time_sensitive`) — optional | Instant Reminder: pin the Chat or Topic while a permission/question waits or a turn stays silent (`[bridge] instant_reminder`, off by default) | pinning is skipped (one log line); everything else keeps working |
+| `im:datasync.feed_card.time_sensitive:write` | 设置即时提醒 (`time_sensitive`) — optional, experimental | Instant Reminder: pin the Chat or Topic while a permission/question waits or a turn stays silent (`[bridge] instant_reminder`, off by default) | pinning is skipped (one log line); everything else keeps working |
 
 Notes:
 
 - `im:datasync.feed_card.time_sensitive:write` is the only **optional** scope:
-  it powers Instant Reminder, which is itself opt-in (`[bridge] instant_reminder = true`).
-  Grant it only if you want pinning; without it cola logs the failed call and
-  continues.
+  it powers Instant Reminder (including its waiting-card message pins), an
+  **experimental** opt-in feature (`[bridge] instant_reminder = true`).
+  Grant it only if you want to trial pinning; without it cola logs the failed
+  call and continues.
 - `im:chat` (获取与更新群组信息) is a superset of `im:chat:readonly` — cola only
   reads chat info, so the read-only scope is the minimum.
 - The contact API needs two scopes: one to authorize the call
@@ -209,8 +210,9 @@ start_server = "auto"            # auto (default) | never | eager
 - **`group_completion_notice`** — in group chats, reply to the requester with a
   short completion notice (the streaming card is patched in place, so it does not
   push a new notification). `false` disables it. p2p chats don't need it.
-- **`instant_reminder`** — opt-in, **off by default**: use Feishu's Instant
-  Reminder to pin the Chat or Topic at the top of the requester's message list
+- **`instant_reminder`** — **experimental**, opt-in, **off by default**: use
+  Feishu's Instant Reminder to pin the Chat or Topic at the top of the
+  requester's message list
   while a permission or question is pending, and while a turn has seen no
   activity from you for 60 seconds. The pin clears the moment the wait is
   resolved, and any message
@@ -223,7 +225,9 @@ start_server = "auto"            # auto (default) | never | eager
   `im:datasync.feed_card.time_sensitive:write` scope; without it pinning is
   skipped (a log line only) and everything else keeps working. Pin state is
   in-memory: a pin left behind by a crash or restart is cleared on the
-  Chat or Topic's next turn, never left up permanently.
+  Chat or Topic's next turn, never left up permanently. The lifecycle is still
+  being designed (precedence among several waits, orphaned pins on restart), so
+  expect the behavior to change between releases.
 - **`log_days`** — how many days of rotated daily logs to keep (default 14).
 
 ## Run
