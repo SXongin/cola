@@ -944,7 +944,9 @@ async fn render_poll_shows_live_context_and_memoizes_the_window() {
     );
 
     // A later step's usage refreshes the segment; the memo serves the window.
-    let _ = render_and_flush(&app.core, sid, &[message(55_000, "回答，继续")]).await;
+    // The text is the SAME (deduped) and the header second has not moved, so
+    // only the context signature can trigger this flush.
+    let _ = render_and_flush(&app.core, sid, &[message(55_000, "回答")]).await;
     let updates = platform.updated_cards().await;
     assert!(
         updates

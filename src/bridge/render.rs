@@ -764,7 +764,22 @@ pub(crate) async fn render_and_flush(
     // (provider, model) for the turn, so later polls are a field swap. Runs
     // outside the cards lock (network).
     crate::bridge::streaming::refresh_context_window(core, session_id).await;
-    if changed || header_changed {
+    // A usage (or window) change must flush even when no part and no header
+    // second changed: the 📊 segment is footer state the header signature
+    // cannot see, and a silently-stale percentage is the bug this fixes.
+    let context_changed = {
+        let mut cards = core.cards.lock().await;
+        match cards.get_mut(session_id) {
+            Some(card) => {
+                let sig = (card.acc.context_tokens, card.acc.context_window);
+                let changed = card.last_context_sig != sig;
+                card.last_context_sig = sig;
+                changed
+            }
+            None => false,
+        }
+    };
+    if changed || header_changed || context_changed {
         flush_card(core, session_id).await;
     }
     Some((new_parts, text_len, reasoning_len))
