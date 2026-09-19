@@ -3,7 +3,17 @@ name: CodeQL
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.scratch/**'
+      - LICENSE
   pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.scratch/**'
+      - LICENSE
   schedule:
     - cron: '17 3 * * 1'
 
@@ -26,7 +36,7 @@ jobs:
       actions: read
       contents: read
       security-events: write
-    timeout-minutes: 360
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -37,8 +47,10 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-targets: "false"
       - uses: github/codeql-action/init@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
         with:
           languages: ${{ matrix.language }}
-      - uses: github/codeql-action/autobuild@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
+          build-mode: none
       - uses: github/codeql-action/analyze@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0

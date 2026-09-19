@@ -117,6 +117,12 @@ Note: CI's Format job is `cargo fmt --all -- --check` — clippy and rustc do
    and explicit go-ahead before merging (see *Branch workflow*; the release cut
    is the ADR-0033 exception).
 
+The `main: CI` ruleset requires exactly those five checks — judge merge-readiness
+with `gh pr checks <branch> --required`, not by eyeballing every check. CodeQL
+also runs on PRs, but it is advisory: it is not a required check, so a slow or
+red CodeQL result never blocks a normal merge. The release cut is the one flow
+that makes it required (its watch covers every check).
+
 Description template:
 
 ```markdown
@@ -167,7 +173,8 @@ The command is the whole process — do not hand-edit the version or tag by hand
    the smoke test (agents: ask in chat first).
 2. Bumps `Cargo.toml`/`Cargo.lock`, commits `chore(release): bump version to
    1.2.3` on a `release-1.2.3` branch and pushes it.
-3. Opens the PR and watches CI.
+3. Opens the PR and watches every check — the release cut is the one flow where
+   advisory CodeQL gates too.
 4. Rebase-merges with the admin bypass once the required checks are green (the
    `main: review` ruleset requires a PR and one approval — the admin role
    bypasses both; the `main: CI` ruleset has no bypass, so the checks are
