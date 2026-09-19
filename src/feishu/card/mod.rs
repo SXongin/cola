@@ -76,16 +76,41 @@ pub(crate) fn chunk_text(text: &str, max: usize) -> Vec<String> {
     chunks
 }
 
-/// Progress/liveness signals for the card header (ADR-0014): whether the turn
-/// is paused waiting for a permission/question, how long the current phase has
-/// run, and the reasoning text length. Bundled so they travel through the
-/// builder, the header renderer, and the accumulator as one unit instead of
-/// three loose values.
+/// Which kind of request keeps the turn paused (ADR-0014): the header names
+/// the one that is actually pending (permission vs question) instead of
+/// lumping both under one title.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AwaitingAction {
+    /// Nothing pending: the header keeps its phase label.
+    #[default]
+    None,
+    Permission,
+    Question,
+    /// A permission and a question are live at the same time.
+    Both,
+}
+
+impl AwaitingAction {
+    /// The header title for this awaiting state, if the turn is paused.
+    pub(crate) fn title(self) -> Option<&'static str> {
+        match self {
+            AwaitingAction::None => None,
+            AwaitingAction::Permission => Some(AWAITING_PERMISSION_TITLE),
+            AwaitingAction::Question => Some(AWAITING_QUESTION_TITLE),
+            AwaitingAction::Both => Some(AWAITING_BOTH_TITLE),
+        }
+    }
+}
+
+/// Progress/liveness signals for the card header (ADR-0014): which request
+/// kinds pause the turn, how long the current phase has run, and the reasoning
+/// text length. Bundled so they travel through the builder, the header
+/// renderer, and the accumulator as one unit instead of three loose values.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HeaderProgress {
-    /// A permission/question is pending: the header shows "等待你的授权/回答"
-    /// instead of the phase label — the turn is paused, not stuck.
-    pub waiting: bool,
+    /// The live request kind(s): the header shows the matching title instead
+    /// of the phase label — the turn is paused, not stuck.
+    pub awaiting: AwaitingAction,
     /// Seconds the current phase (thinking/reasoning/tool/streaming) has run.
     pub elapsed: Option<u64>,
     /// Reasoning text length, shown on the thinking header as real progress.
@@ -102,9 +127,11 @@ pub struct CardActionButton {
     pub value: serde_json::Value,
 }
 
-/// The header title while a permission/question blocks the turn (ADR-0014).
-/// Tests assert this constant so the copy lives in one place.
-pub(crate) const AWAITING_ACTION_TITLE: &str = "⏳ 等待你的授权/回答";
+/// The header titles while a request blocks the turn (ADR-0014). Tests assert
+/// these constants so the copy lives in one place.
+pub(crate) const AWAITING_PERMISSION_TITLE: &str = "⏳ 等待你的授权";
+pub(crate) const AWAITING_QUESTION_TITLE: &str = "⏳ 等待你的回答";
+pub(crate) const AWAITING_BOTH_TITLE: &str = "⏳ 等待你的授权/回答";
 
 /// Wrap `text` in a fenced code block so long lines render without wrapping.
 /// The fence is sized longer than any backtick run in the content, so an

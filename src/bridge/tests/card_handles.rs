@@ -189,8 +189,8 @@ async fn click_with_open_message_id_acks_the_cached_card() {
     // still live, and leaving it to the next render-poll flush left the card
     // visibly "still waiting" for ~2 s after the click.
     assert!(
-        !ack.contains("等待你的授权/回答"),
-        "the ack must clear the waiting header: {ack}"
+        !ack.contains("等待你的"),
+        "the ack must clear the awaiting title: {ack}"
     );
     assert!(
         ack.contains("✅ 完成"),

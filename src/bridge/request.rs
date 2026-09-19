@@ -2101,7 +2101,7 @@ pub(crate) async fn resolve_blocks(
     // 1. The accumulator that still carries a block is the render source: a
     //    receipt must live in its timeline, or the next flush re-adds the
     //    block to the card the ack just cleaned. Resolving the last live block
-    //    also changes the HEADER (the "等待你的授权/回答" override lifts), so
+    //    also changes the HEADER (the awaiting-action title lifts), so
     //    the post-resolution header is captured here and restamped onto every
     //    card this resolution edits — otherwise a click leaves the clicked
     //    card titled "waiting" until the next render-poll flush (~2 s).
@@ -2289,8 +2289,8 @@ pub(crate) async fn reject_leftovers_for_turn(core: &Arc<SharedCore>, session_id
 /// Restamp an edited card's header title and template from the accumulator's
 /// post-resolution state, keeping the header's subtitle (the session/date
 /// line) untouched. The cached card's own header was captured while the block
-/// was still live, so without this a click would leave "等待你的授权/回答"
-/// showing until the next render-poll flush.
+/// was still live, so without this a click would leave the "等待你的授权 /
+/// 回答" title showing until the next render-poll flush.
 fn restamped_header(
     mut card: serde_json::Value,
     header: Option<&(String, &'static str)>,

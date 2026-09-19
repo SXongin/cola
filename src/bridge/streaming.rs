@@ -1,7 +1,7 @@
 use crate::bridge::core::SharedCore;
-use crate::feishu::card::CardState;
 use crate::feishu::card::shell::CardBuilder;
 use crate::feishu::card::tool_render::ToolPanel;
+use crate::feishu::card::{AwaitingAction, CardState};
 use indexmap::IndexMap;
 use std::sync::Arc;
 
@@ -693,18 +693,34 @@ impl StreamAccumulator {
             .collect()
     }
 
-    /// Whether the card carries any block awaiting the operator — drives the
-    /// header's awaiting-action state. A receipt no longer awaits anything.
-    pub fn has_live_interactions(&self) -> bool {
-        self.interactions.iter().any(InteractionBlock::is_live)
+    /// Which request kinds are live on the card — the header's awaiting state
+    /// (ADR-0014). A permission and a question pending at once report `Both`,
+    /// so the title names exactly what the operator must resolve.
+    pub fn awaiting_action(&self) -> AwaitingAction {
+        let mut permission = false;
+        let mut question = false;
+        for block in &self.interactions {
+            match block {
+                InteractionBlock::Permission(_) => permission = true,
+                InteractionBlock::Question(_) => question = true,
+                InteractionBlock::Receipt(_) => {}
+            }
+        }
+        match (permission, question) {
+            (true, true) => AwaitingAction::Both,
+            (true, false) => AwaitingAction::Permission,
+            (false, true) => AwaitingAction::Question,
+            (false, false) => AwaitingAction::None,
+        }
     }
 
-    /// Progress inputs for the header (ADR-0014): waiting flag, phase timer,
-    /// and reasoning length. Elapsed is whole seconds so the header signature
-    /// changes at most once per second — the flush throttle.
+    /// Progress inputs for the header (ADR-0014): which request kinds await the
+    /// operator, phase timer, and reasoning length. Elapsed is whole seconds so
+    /// the header signature changes at most once per second — the flush
+    /// throttle.
     pub fn header_progress(&self) -> crate::feishu::card::HeaderProgress {
         crate::feishu::card::HeaderProgress {
-            waiting: self.has_live_interactions(),
+            awaiting: self.awaiting_action(),
             elapsed: self.phase_started_at.map(|t| t.elapsed().as_secs()),
             reasoning_chars: self.reasoning.chars().count(),
         }
@@ -725,10 +741,10 @@ impl StreamAccumulator {
     }
 
     /// The header (title, template) this accumulator's card should show: the
-    /// state label, the waiting override, the phase timer and the running-tool
-    /// hint. Exposed so a click's ack can restamp a card's header in the same
-    /// response — resolving the last live block must clear
-    /// "等待你的授权/回答" immediately, not a poll later.
+    /// state label, the awaiting-action override, the phase timer and the
+    /// running-tool hint. Exposed so a click's ack can restamp a card's header
+    /// in the same response — resolving the last live block must lift the
+    /// "等待你的授权/回答" title immediately, not a poll later.
     pub fn header_title_and_template(&self) -> (String, &'static str) {
         crate::feishu::card::shell::header_title_and_template(
             &self.card_state,
@@ -2181,16 +2197,41 @@ mod tests {
         assert_eq!(acc.active_phase(), None);
     }
 
-    /// The header signature carries the phase label, and flips to a waiting
-    /// state when a permission/question is pending inline.
+    /// The header signature carries the phase label, and flips to a title
+    /// naming exactly which request kind is pending inline.
     #[test]
-    fn header_sig_reflects_waiting_and_phase() {
+    fn header_sig_reflects_awaiting_kind_and_phase() {
         let mut acc = StreamAccumulator::new("test");
         acc.card_state = CardState::Reasoning;
         acc.refresh_phase();
         assert!(
             acc.header_sig().contains("推理中"),
             "reasoning phase in sig: {}",
+            acc.header_sig()
+        );
+        let question = InteractionBlock::Question(PendingQuestion {
+            request_id: "q".into(),
+            session_id: "s".into(),
+            questions: vec![crate::opencode::types::QuestionInfo {
+                question: "继续?".into(),
+                header: "确认".into(),
+                options: vec![crate::opencode::types::QuestionOption {
+                    label: "继续".into(),
+                    description: String::new(),
+                }],
+                multiple: None,
+                custom: None,
+            }],
+            directory: "/w".into(),
+            answers: vec![None],
+            done: vec![false],
+        });
+        acc.add_interaction(question);
+        assert_eq!(acc.awaiting_action(), AwaitingAction::Question);
+        assert!(
+            acc.header_sig()
+                .contains(crate::feishu::card::AWAITING_QUESTION_TITLE),
+            "pending question must name the answer wait: {}",
             acc.header_sig()
         );
         acc.add_interaction(InteractionBlock::Permission(PendingPermission {
@@ -2200,10 +2241,20 @@ mod tests {
             target: "⚡ 执行 Shell 命令 `ls -la`".into(),
             directory: "/w".into(),
         }));
+        assert_eq!(acc.awaiting_action(), AwaitingAction::Both);
         assert!(
             acc.header_sig()
-                .contains(crate::feishu::card::AWAITING_ACTION_TITLE),
-            "pending permission must flip the header: {}",
+                .contains(crate::feishu::card::AWAITING_BOTH_TITLE),
+            "permission + question must name both: {}",
+            acc.header_sig()
+        );
+        // Resolving every live block lifts the awaiting title.
+        assert!(acc.dismiss_interaction("p"));
+        assert!(acc.dismiss_interaction("q"));
+        assert_eq!(acc.awaiting_action(), AwaitingAction::None);
+        assert!(
+            acc.header_sig().contains("推理中"),
+            "awaiting title must lift back to the phase label: {}",
             acc.header_sig()
         );
     }
