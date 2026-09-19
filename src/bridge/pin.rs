@@ -117,7 +117,7 @@ struct Inner {
     last_interaction: HashMap<String, tokio::time::Instant>,
 }
 
-/// The Instant Reminder state machine: `[bridge] pin` opt-in, generation
+/// The Instant Reminder state machine: `[bridge] instant_reminder` opt-in, generation
 /// counters, the tracked live pin, the pending membership of both request
 /// flows, and the long-turn silence/TTL lifecycle.
 pub(crate) struct PinState {
@@ -147,7 +147,7 @@ impl PinState {
         }
     }
 
-    /// Whether the `[bridge] pin` opt-in is on. Off means every method is a
+    /// Whether the `[bridge] instant_reminder` opt-in is on. Off means every method is a
     /// no-op: no reminder call is ever made.
     pub(crate) fn enabled(&self) -> bool {
         self.enabled
@@ -256,7 +256,7 @@ impl PinState {
     /// `Pending` hold survives (`clear_locked` removes only the named reason),
     /// and the release passes the live pin's own generation, so the
     /// newer-generation guard does not block it. Best-effort, like every other
-    /// pin call; nothing is recorded while `[bridge] pin` is off.
+    /// pin call; nothing is recorded while `[bridge] instant_reminder` is off.
     ///
     /// Called from every inbound Feishu seam — the message handler (commands,
     /// supplements and prompts alike), the card-action handler, and turn start
@@ -516,7 +516,7 @@ impl PinState {
 /// not once-only. The task holds only the shared core; all stop and pin
 /// decisions are atomic there, so a delayed tick can never pin a finished
 /// turn, a newer turn's Chat/Topic, or a Chat/Topic whose user just acted. A
-/// turn with no requester has nobody to pin for, and with `[bridge] pin` off
+/// turn with no requester has nobody to pin for, and with `[bridge] instant_reminder` off
 /// nothing is ever spawned.
 pub(crate) fn spawn_long_turn_checker(core: &Arc<SharedCore>, target: PinTarget) {
     if !core.pins.enabled || target.user_ids.is_empty() {

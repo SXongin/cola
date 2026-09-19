@@ -1206,7 +1206,7 @@ pub fn test_config(session_file: &std::path::Path) -> crate::config::Config {
             access_file: session_file.with_file_name("access.json"),
             work_dir: None,
             group_completion_notice: true,
-            pin: false,
+            instant_reminder: false,
             log_days: 14,
         },
     };

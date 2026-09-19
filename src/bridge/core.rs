@@ -134,7 +134,7 @@ pub struct SharedCore {
     pub work_dir: Option<String>,
     /// Whether to send the group completion notice (from `[bridge] group_completion_notice`).
     pub group_completion_notice: bool,
-    /// The Instant Reminder lifecycle (ADR-0043, from `[bridge] pin`): pins a
+    /// The Instant Reminder lifecycle (ADR-0043, from `[bridge] instant_reminder`): pins a
     /// Chat/Topic while a Permission/Question is pending. Off means every
     /// method is a no-op — no reminder call is ever made.
     pub pins: crate::bridge::pin::PinState,
@@ -198,7 +198,7 @@ impl SharedCore {
                 .clone()
                 .map(|p| p.to_string_lossy().to_string()),
             group_completion_notice: cfg.bridge.group_completion_notice,
-            pins: crate::bridge::pin::PinState::new(cfg.bridge.pin),
+            pins: crate::bridge::pin::PinState::new(cfg.bridge.instant_reminder),
             session_list_cache: Arc::new(Mutex::new(None)),
             opencode,
             feishu,
