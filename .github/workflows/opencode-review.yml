@@ -27,10 +27,13 @@ jobs:
     # with. Dependabot PRs are skipped too: `opencode github run` asserts the
     # triggering actor is a collaborator, and a bot actor 404s that check, so
     # the run would fail before reviewing. Drafts wait for ready_for_review.
+    # Release PRs are skipped: their diff is a version bump of code already
+    # reviewed on main, and the cut merges with the admin bypass.
     if: >-
       github.event.pull_request.draft == false &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.actor != 'dependabot[bot]'
+      github.actor != 'dependabot[bot]' &&
+      !startsWith(github.head_ref || '', 'release/')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
