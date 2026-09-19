@@ -53,7 +53,8 @@ A branch name is `<type>/<slug>`:
 - **`type`** is the Conventional Commits type, matching the change's nature:
   `feat/`, `fix/`, `docs/`, `refactor/`, `test/`, `chore/`, `ci/`, `build/`,
   `perf/`, `revert/`. A branch that only touches docs (including `.scratch/`)
-  is `docs/`; a release cut is `release-<version>` (no slash).
+  is `docs/`; a release cut uses the branch-only `release/` type
+  (`release/<version>`), the one type that is not a commit type.
 - **`slug`** is short, `kebab-case`, and says what the branch changes — the
   noun of the change, not the whole sentence. One feature, one fix, one branch.
 
@@ -63,7 +64,7 @@ Examples:
 feat/bridge-dir-recent-card
 fix/switch-card-action-tag
 docs/feishu-permissions
-release-0.6.2
+release/0.6.2
 ```
 
 ## Commit conventions
@@ -172,7 +173,7 @@ The command is the whole process — do not hand-edit the version or tag by hand
    confirmation. `--yes` skips the prompt; pass it only after a human confirmed
    the smoke test (agents: ask in chat first).
 2. Bumps `Cargo.toml`/`Cargo.lock`, commits `chore(release): bump version to
-   1.2.3` on a `release-1.2.3` branch and pushes it.
+   1.2.3` on a `release/1.2.3` branch and pushes it.
 3. Opens the PR and watches every check — the release cut is the one flow where
    advisory CodeQL gates too.
 4. Rebase-merges with the admin bypass once every check is green (the
