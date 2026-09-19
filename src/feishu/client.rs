@@ -492,9 +492,9 @@ impl Client {
         }
     }
 
-    /// Set or clear a conversation's **Instant Reminder** (`time_sensitive`,
+    /// Set or clear a Chat/Topic's **Instant Reminder** (`time_sensitive`,
     /// ADR-0043). A group targets its own chat (`feed_cards/{chat_id}`); a bot
-    /// p2p conversation targets the fixed `bot_time_sentive` feed card.
+    /// p2p chat targets the fixed `bot_time_sentive` feed card.
     /// `user_ids` are the open_ids whose message lists are pinned — the turn's
     /// requester; Feishu requires at least one. Requires the
     /// `im:datasync.feed_card.time_sensitive:write` scope; a missing scope or
@@ -1034,7 +1034,7 @@ mod tests {
         assert_eq!(body_json(&request)["content"], card.to_string());
     }
 
-    /// A p2p conversation pins through the fixed bot feed card, PATCHing the
+    /// A p2p Chat pins through the fixed bot feed card, PATCHing the
     /// `time_sensitive` body with the requester's open_id (ADR-0043).
     #[tokio::test]
     async fn instant_reminder_patches_the_bot_feed_card_for_p2p() {
@@ -1063,7 +1063,7 @@ mod tests {
         );
     }
 
-    /// A group conversation pins through its own chat's feed card, and a
+    /// A group Chat/Topic pins through its own chat's feed card, and a
     /// clear sends `time_sensitive: false` for the same requester.
     #[tokio::test]
     async fn instant_reminder_patches_the_group_feed_card_and_clears() {

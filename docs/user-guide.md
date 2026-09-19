@@ -110,9 +110,14 @@ precondition for the message and resource APIs.
 | `im:chat:readonly` | 获取群组信息 | chat display names (`/attach` rejection card, `/switch` cards) | raw chat ids instead of names |
 | `contact:contact.base:readonly` | 获取通讯录基本信息 | authorizes the contact API call | user names unavailable |
 | `contact:user.base:readonly` | 获取用户基本信息 | returns the user's `name` field | completion notices lose the @name |
+| `im:datasync.feed_card.time_sensitive:write` | 设置即时提醒 (`time_sensitive`) — optional | Instant Reminder: pin the Chat or Topic while a permission/question waits or a turn stays silent (`[bridge] pin`, off by default) | pinning is skipped (one log line); everything else keeps working |
 
 Notes:
 
+- `im:datasync.feed_card.time_sensitive:write` is the only **optional** scope:
+  it powers Instant Reminder, which is itself opt-in (`[bridge] pin = true`).
+  Grant it only if you want pinning; without it cola logs the failed call and
+  continues.
 - `im:chat` (获取与更新群组信息) is a superset of `im:chat:readonly` — cola only
   reads chat info, so the read-only scope is the minimum.
 - The contact API needs two scopes: one to authorize the call
@@ -211,12 +216,12 @@ start_server = "auto"            # auto (default) | never | eager
   or card click restarts that silence clock; a completed long turn stays pinned
   for 2 minutes, so the result is catchable from another chat — unless you act
   first, which releases it right away (you are active again). The
-  pin means "this conversation still needs you" — the card title in the
+  pin means "this Chat or Topic still needs you" — the card title in the
   preview says why (等待你的授权/回答 · 运行中 · ✅ 完成). Requires the
   `im:datasync.feed_card.time_sensitive:write` scope; without it pinning is
   skipped (a log line only) and everything else keeps working. Pin state is
   in-memory: a pin left behind by a crash or restart is cleared on the
-  conversation's next turn, never left up permanently.
+  Chat or Topic's next turn, never left up permanently.
 - **`log_days`** — how many days of rotated daily logs to keep (default 14).
 
 ## Run

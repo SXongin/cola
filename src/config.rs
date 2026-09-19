@@ -129,7 +129,7 @@ pub struct BridgeConfig {
     /// not push a new notification). p2p chats don't need it.
     #[serde(default = "default_group_completion_notice")]
     pub group_completion_notice: bool,
-    /// Opt-in: pin the conversation with Feishu's Instant Reminder while a
+    /// Opt-in: pin the Chat or Topic with Feishu's Instant Reminder while a
     /// Permission/Question is pending (ADR-0043). OFF by default — an upgrade
     /// must never change notification behavior without consent.
     #[serde(default)]

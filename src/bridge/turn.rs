@@ -193,10 +193,10 @@ impl Turn {
         acc.requester_open_id = requester_open_id.clone();
         acc.is_group = is_group;
         // Instant Reminder (ADR-0043): register this turn's generation for
-        // the conversation, so the pending-request pollers pin towards THIS
+        // the Chat/Topic, so the pending-request pollers pin towards THIS
         // turn's requester and a stale clear from an earlier turn can never
         // unpin it. This is also where a pin orphaned by a crash or restart
-        // is cleared once, on the conversation's next turn (self-healing).
+        // is cleared once, on the Chat/Topic's next turn (self-healing).
         let generation = app
             .core
             .pins

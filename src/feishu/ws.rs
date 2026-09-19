@@ -305,8 +305,9 @@ async fn send_event_ack(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>, fra
 ///   non-empty input value becomes `answer` (the typed custom answer).
 ///
 /// It also threads the callback context (the card's message id, the clicking
-/// Chat/Topic and the operator's identity) into the value. `pub(crate)` so the
-/// bridge tests can drive the real callback shape through `handle_card_action`.
+/// Chat/Topic and the clicking user's identity — the Principal) into the
+/// value. `pub(crate)` so the bridge tests can drive the real callback shape
+/// through `handle_card_action`.
 pub(crate) fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Value> {
     let v = serde_json::from_slice::<serde_json::Value>(payload).ok()?;
     let a = v.get("event")?.get("action")?;

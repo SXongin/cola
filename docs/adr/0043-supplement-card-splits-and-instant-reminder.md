@@ -45,6 +45,8 @@ the conversation while a Turn needs attention.
   to the supplement message, carries the accumulated card, and becomes the
   live card; the previous card is finalized with the standard split header.
   No new concept, no new card type, no recall.
+  **Superseded by the 2026-09-19 amendment below: the continuation carries
+  only the delta, not the accumulated card.**
 - **No text acknowledgement.** The continuation card records the supplement
   with a receipt line (「📨 已收到补充」). The wording is neutral: merge vs.
   new Turn is only observable after the fact, and both outcomes end with the
@@ -76,8 +78,7 @@ the conversation while a Turn needs attention.
   pin. The release a new Turn issues passes the live pin's own generation, so
   the guard protects against stale timers, not against the newer turn itself.
   The state is not reconciled at startup: a pin orphaned by a crash or
-  restart is cleared on the conversation's next turn (self-healing), never a
-  permanent pin.
+  restart is cleared on the Chat or Topic's next turn (self-healing), never a
   permanent pin.
 - **One config switch, off by default:** `[bridge] pin = true` turns Instant
   Reminder on. Absent or `false` means off — an upgrade never changes
