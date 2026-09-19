@@ -157,7 +157,7 @@ The one read-only card a Chat/Topic receives when it activates a Session it was 
 _Avoid_: Briefing, takeover summary, handoff card
 
 **Card**:
-A Feishu interactive message card. Evolves through states (loading → reasoning → running → streaming → done), uses collapsible panels for secondary content, and shows progress in its header (phase timer, silence, reasoning length) so a slow turn is distinguishable from a dead one — including a "等待你的授权/回答" state while a permission or question is pending.
+A Feishu interactive message card. Evolves through states (loading → reasoning → running → streaming → done), uses collapsible panels for secondary content, and shows progress in its header (phase timer, silence, reasoning length) so a slow turn is distinguishable from a dead one — including a "等待你的授权"/"等待你的回答" state that names whichever pending request blocks the turn (both at once reads "等待你的授权/回答").
 _Avoid_: Widget, component, bubble
 
 **Card Chain**:

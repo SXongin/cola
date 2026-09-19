@@ -218,7 +218,7 @@ start_server = "auto"            # auto (default) | never | eager
   for 2 minutes, so the result is catchable from another chat — unless you act
   first, which releases it right away (you are active again). The
   pin means "this Chat or Topic still needs you" — the card title in the
-  preview says why (等待你的授权/回答 · 运行中 · ✅ 完成). Requires the
+  preview says why (等待你的授权 · 等待你的回答 · 运行中 · ✅ 完成；两者同时挂起时为 等待你的授权/回答). Requires the
   `im:datasync.feed_card.time_sensitive:write` scope; without it pinning is
   skipped (a log line only) and everything else keeps working. Pin state is
   in-memory: a pin left behind by a crash or restart is cleared on the

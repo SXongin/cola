@@ -2,10 +2,7 @@ use serde_json::json;
 
 use super::MAX_ELEMENT_TEXT_CHARS;
 use super::tool_render::{ToolPanel, tool_panel_element};
-use super::{
-    AWAITING_ACTION_TITLE, CardActionButton, CardState, HeaderProgress, chunk_text, fmt_local_time,
-    truncate_md,
-};
+use super::{CardActionButton, CardState, HeaderProgress, chunk_text, fmt_local_time, truncate_md};
 
 /// Format a duration in seconds for the header's live timer (ADR-0014):
 /// `42s`, `1m23s`, `2h5m`, `3d4h`. Whole seconds, so a header signature built
@@ -292,15 +289,15 @@ impl CardBuilder {
 /// via [`CardBuilder::with_header_running_tool`]), driving the "⏳ tool"
 /// streaming header.
 /// Active states append the progress signals passed in from the accumulator;
-/// `progress.waiting` (a pending permission/question) overrides the phase label
-/// entirely.
+/// `progress.awaiting` (a pending permission and/or question) overrides the
+/// phase label entirely, naming whichever kind is pending.
 pub(crate) fn header_title_and_template(
     state: &CardState,
     running_tool: Option<&ToolPanel>,
     progress: &HeaderProgress,
 ) -> (String, &'static str) {
-    if progress.waiting {
-        return (AWAITING_ACTION_TITLE.to_string(), "orange");
+    if let Some(title) = progress.awaiting.title() {
+        return (title.to_string(), "orange");
     }
     let (label, template) = match state {
         CardState::Loading => ("⏳ 思考中".to_string(), "blue"),
@@ -393,6 +390,9 @@ pub(crate) fn collapsible_panel_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feishu::card::{
+        AWAITING_BOTH_TITLE, AWAITING_PERMISSION_TITLE, AWAITING_QUESTION_TITLE, AwaitingAction,
+    };
 
     #[test]
     fn card_shell_builds_the_json_2_0_skeleton() {
@@ -643,22 +643,43 @@ mod tests {
     }
 
     #[test]
-    fn waiting_header_overrides_phase() {
+    fn waiting_header_names_the_pending_request_kind() {
         // A pending permission/question pauses the turn: the header says the
-        // truth — it's waiting for the user, not stuck.
-        let card = CardBuilder::new()
-            .with_state(CardState::Reasoning)
-            .with_progress(HeaderProgress {
-                waiting: true,
-                elapsed: Some(83),
-                ..Default::default()
-            })
-            .build();
-        assert_eq!(
-            card["header"]["title"]["content"].as_str().unwrap(),
-            AWAITING_ACTION_TITLE
+        // truth — waiting for the authorization, for the answer, or both —
+        // not stuck.
+        let header_of = |awaiting| {
+            CardBuilder::new()
+                .with_state(CardState::Reasoning)
+                .with_progress(HeaderProgress {
+                    awaiting,
+                    elapsed: Some(83),
+                    ..Default::default()
+                })
+                .build()
+        };
+        for (awaiting, title) in [
+            (AwaitingAction::Permission, AWAITING_PERMISSION_TITLE),
+            (AwaitingAction::Question, AWAITING_QUESTION_TITLE),
+            (AwaitingAction::Both, AWAITING_BOTH_TITLE),
+        ] {
+            let card = header_of(awaiting);
+            assert_eq!(
+                card["header"]["title"]["content"].as_str().unwrap(),
+                title,
+                "awaiting state {awaiting:?} must name itself"
+            );
+            assert_eq!(card["header"]["template"].as_str().unwrap(), "orange");
+        }
+        // Nothing pending: the phase label stays, with its own template.
+        let card = header_of(AwaitingAction::None);
+        assert!(
+            card["header"]["title"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("推理中"),
+            "no awaiting -> phase label: {card}"
         );
-        assert_eq!(card["header"]["template"].as_str().unwrap(), "orange");
+        assert_eq!(card["header"]["template"].as_str().unwrap(), "blue");
     }
 
     #[test]
@@ -688,7 +709,7 @@ mod tests {
             header_of(
                 CardState::Streaming,
                 HeaderProgress {
-                    waiting: true,
+                    awaiting: AwaitingAction::Permission,
                     ..tick(Some(1))
                 }
             ),
