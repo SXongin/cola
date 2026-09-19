@@ -129,6 +129,11 @@ pub struct BridgeConfig {
     /// not push a new notification). p2p chats don't need it.
     #[serde(default = "default_group_completion_notice")]
     pub group_completion_notice: bool,
+    /// Opt-in: pin the conversation with Feishu's Instant Reminder while a
+    /// Permission/Question is pending (ADR-0043). OFF by default — an upgrade
+    /// must never change notification behavior without consent.
+    #[serde(default)]
+    pub pin: bool,
     /// How many days of rotated daily logs to keep (default 14). Older
     /// `cola-YYYY-MM-DD.log` files are swept on startup and at each rotation.
     #[serde(default = "default_log_days")]
@@ -142,6 +147,7 @@ impl Default for BridgeConfig {
             access_file: default_access_file(),
             work_dir: None,
             group_completion_notice: default_group_completion_notice(),
+            pin: false,
             log_days: default_log_days(),
         }
     }
@@ -377,6 +383,21 @@ mod tests {
         assert!(cfg.start_server.spawns_when_needed());
         assert!(!ServerStartPolicy::Never.spawns_when_needed());
         assert!(ServerStartPolicy::Eager.spawns_when_needed());
+    }
+
+    /// Instant Reminder is opt-in (ADR-0043): absent or explicit `false` must
+    /// mean off, so an upgrade never changes notification behavior; only an
+    /// explicit `true` enables the pin lifecycle.
+    #[test]
+    fn pin_defaults_to_off_and_requires_an_explicit_true() {
+        let absent: BridgeConfig = toml::from_str("").unwrap();
+        assert!(!absent.pin, "an absent pin key means off");
+
+        let off: BridgeConfig = toml::from_str("pin = false").unwrap();
+        assert!(!off.pin);
+
+        let on: BridgeConfig = toml::from_str("pin = true").unwrap();
+        assert!(on.pin);
     }
 
     #[test]

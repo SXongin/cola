@@ -1433,6 +1433,12 @@ impl RequestFlow {
         // known session directory.
         let directories = { core.sessions.lock().await.directories() };
         let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Feishu's Instant Reminder (ADR-0043): this kind's pin candidates,
+        // collected here and resolved after the sweep. Collected (not resolved
+        // inline) so a request auto-resolved in the same sweep (e.g.
+        // `/autoaccept`) never pins — it was never waiting on the user.
+        let mut pin_candidates: Vec<(PendingRequest, String)> = Vec::new();
+        let mut auto_resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
         // Directories whose list call failed (error or timeout) this sweep.
         // `pending` only speaks for directories that listed SUCCESSFULLY, so
         // their state must NOT be read as resolved (#130).
@@ -1464,6 +1470,9 @@ impl RequestFlow {
                     listed_now.insert(dir.clone());
                     for req in &requests {
                         pending.insert(req.id().to_string());
+                        if core.pins.enabled() {
+                            pin_candidates.push((req.clone(), dir.clone()));
+                        }
                         // ADR-0028: a claimed request is hosted by a
                         // snapshot card — already surfaced, never a
                         // standalone card, never re-inlined.
@@ -1489,6 +1498,7 @@ impl RequestFlow {
                         // Kind-specific pre-card handling (auto-accept /
                         // remember). true → handled, no card needed.
                         if self.kind.prepare(self, core, req, dir).await {
+                            auto_resolved.insert(req.id().to_string());
                             continue;
                         }
                         // One-card-per-turn: surface the request INLINE on the
@@ -1566,6 +1576,29 @@ impl RequestFlow {
                     failed_dirs.insert(dir.clone());
                 }
             }
+        }
+        // Instant Reminder (ADR-0043): reconcile this kind's pending requests
+        // with the pin state. A sweep where any directory failed must not
+        // move it — that directory said nothing, and unknown is never read as
+        // resolved (#130) — so the pin survives until a complete sweep. A
+        // request auto-resolved in this sweep (prepare said handled) is not a
+        // wait, so it never pins.
+        if core.pins.enabled() && failed_dirs.is_empty() {
+            let mut pin_targets: std::collections::HashMap<String, crate::bridge::pin::PinTarget> =
+                std::collections::HashMap::new();
+            for (req, dir) in &pin_candidates {
+                if auto_resolved.contains(req.id()) {
+                    continue;
+                }
+                // `None` (an external turn, or a request pending across a
+                // restart) cannot be pinned — there is no requester to target.
+                if let Some(target) = crate::bridge::pin::reminder_target(core, req.session_id(), dir).await {
+                    pin_targets.insert(target.chat_id.clone(), target);
+                }
+            }
+            core.pins
+                .sync(&core.feishu, self.kind.claim_kind(), &pin_targets)
+                .await;
         }
         // Mark stale: a card cola sent whose request is no longer pending
         // (resolved by another client) and was NOT answered by cola. A card

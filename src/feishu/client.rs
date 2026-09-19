@@ -492,6 +492,50 @@ impl Client {
         }
     }
 
+    /// Set or clear a conversation's **Instant Reminder** (`time_sensitive`,
+    /// ADR-0043). A group targets its own chat (`feed_cards/{chat_id}`); a bot
+    /// p2p conversation targets the fixed `bot_time_sentive` feed card.
+    /// `user_ids` are the open_ids whose message lists are pinned — the turn's
+    /// requester; Feishu requires at least one. Requires the
+    /// `im:datasync.feed_card.time_sensitive:write` scope; a missing scope or
+    /// any other failure surfaces as an error (the bridge logs it).
+    pub async fn set_instant_reminder(
+        &self,
+        chat_id: &str,
+        is_group: bool,
+        user_ids: &[String],
+        on: bool,
+    ) -> crate::error::Result<()> {
+        let token = self.get_access_token().await?;
+        let feed_card = if is_group { chat_id } else { "bot_time_sentive" };
+        let body = serde_json::json!({
+            "time_sensitive": on,
+            "user_ids": user_ids,
+        });
+
+        let text = read_body_with_diag(
+            self.http
+                .patch(self.endpoint(&format!("/open-apis/im/v2/feed_cards/{feed_card}")))
+                .query(&[("user_id_type", "open_id")])
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await?,
+            "instant reminder",
+        )
+        .await?;
+        let resp: ApiResponse = parse_json(&text, "instant reminder response")?;
+
+        if resp.code != 0 {
+            Err(crate::error::BridgeError::Feishu(format!(
+                "instant reminder error {}: {}",
+                resp.code, resp.msg
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
     /// List the most recent messages in a chat or topic (newest first, a single
     /// page of 50). Production use: `resolve_topic_anchor` scans a topic's
     /// messages for the newest cola message to anchor a card reply — the send
@@ -988,6 +1032,93 @@ mod tests {
         assert_eq!(request.query, "");
         assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
         assert_eq!(body_json(&request)["content"], card.to_string());
+    }
+
+    /// A p2p conversation pins through the fixed bot feed card, PATCHing the
+    /// `time_sensitive` body with the requester's open_id (ADR-0043).
+    #[tokio::test]
+    async fn instant_reminder_patches_the_bot_feed_card_for_p2p() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "PATCH",
+            "/open-apis/im/v2/feed_cards/bot_time_sentive",
+            200,
+            r#"{"code":0,"msg":"success"}"#,
+        );
+
+        client
+            .set_instant_reminder("oc_p2p_1", false, &["ou_requester".to_string()], true)
+            .await
+            .unwrap();
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "PATCH");
+        assert_eq!(request.path, "/open-apis/im/v2/feed_cards/bot_time_sentive");
+        assert_eq!(request.query_param("user_id_type").as_deref(), Some("open_id"));
+        assert_eq!(request.header("authorization"), Some("Bearer t-abc"));
+        assert_eq!(body_json(&request)["time_sensitive"], true);
+        assert_eq!(
+            body_json(&request)["user_ids"],
+            serde_json::json!(["ou_requester"])
+        );
+    }
+
+    /// A group conversation pins through its own chat's feed card, and a
+    /// clear sends `time_sensitive: false` for the same requester.
+    #[tokio::test]
+    async fn instant_reminder_patches_the_group_feed_card_and_clears() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "PATCH",
+            "/open-apis/im/v2/feed_cards/oc_group_1",
+            200,
+            r#"{"code":0,"msg":"success"}"#,
+        );
+
+        client
+            .set_instant_reminder("oc_group_1", true, &["ou_requester".to_string()], true)
+            .await
+            .unwrap();
+        client
+            .set_instant_reminder("oc_group_1", true, &["ou_requester".to_string()], false)
+            .await
+            .unwrap();
+
+        let cleared = last_request(&server);
+        assert_eq!(cleared.method, "PATCH");
+        assert_eq!(cleared.path, "/open-apis/im/v2/feed_cards/oc_group_1");
+        assert_eq!(cleared.query_param("user_id_type").as_deref(), Some("open_id"));
+        assert_eq!(body_json(&cleared)["time_sensitive"], false);
+        assert_eq!(
+            body_json(&cleared)["user_ids"],
+            serde_json::json!(["ou_requester"])
+        );
+    }
+
+    /// A non-zero API code (e.g. the `im:datasync.feed_card.time_sensitive:write`
+    /// scope missing) is an error the bridge logs — never a success.
+    #[tokio::test]
+    async fn instant_reminder_maps_a_business_error_code() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "PATCH",
+            "/open-apis/im/v2/feed_cards/bot_time_sentive",
+            200,
+            r#"{"code":99991672,"msg":"no permission"}"#,
+        );
+
+        let message = feishu_error(
+            client
+                .set_instant_reminder("oc_p2p_1", false, &["ou_requester".to_string()], true)
+                .await
+                .unwrap_err(),
+        );
+
+        assert!(
+            message.contains("instant reminder error 99991672"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("no permission"), "unexpected error: {message}");
     }
 
     #[tokio::test]

@@ -131,6 +131,22 @@ impl Turn {
         acc.prompt = Some(text.clone());
         acc.requester_open_id = requester_open_id.clone();
         acc.is_group = is_group;
+        // Instant Reminder (ADR-0043): register this turn's generation for
+        // the conversation, so the pending-request pollers pin towards THIS
+        // turn's requester and a stale clear from an earlier turn can never
+        // unpin it. This is also where a pin orphaned by a crash or restart
+        // is cleared once, on the conversation's next turn (self-healing).
+        acc.turn_generation = Some(
+            app.core
+                .pins
+                .begin_turn(
+                    &app.core.feishu,
+                    &thread_key.chat_id,
+                    is_group,
+                    requester_open_id.as_deref(),
+                )
+                .await,
+        );
         {
             let mut cards = app.cards.lock().await;
             cards.insert(

@@ -44,6 +44,15 @@ pub enum PlatformCall {
         name: Option<String>,
         text: String,
     },
+    /// An Instant Reminder (`time_sensitive`, ADR-0043) call: the pinned
+    /// conversation, its kind, the targeted users and whether it was pinned
+    /// (`true`) or cleared (`false`).
+    InstantReminder {
+        chat_id: String,
+        is_group: bool,
+        user_ids: Vec<String>,
+        on: bool,
+    },
 }
 
 /// A one-shot gate on one platform call, so a test can freeze a card write
@@ -75,6 +84,9 @@ pub struct RecordingPlatform {
     /// retried without duplicating receipts, while the loading card's own
     /// reply — if any — succeeds).
     pub fail_reply_card_count: std::sync::atomic::AtomicUsize,
+    /// When true, `set_instant_reminder` fails after recording the attempt
+    /// (tests the best-effort pin path: failures log and never affect a turn).
+    pub fail_instant_reminder: bool,
     /// The thread_id `reply_in_thread` returns; `None` simulates a chat
     /// without topic support (the create-topic surfaces degrade with a
     /// message instead of mapping).
@@ -97,6 +109,7 @@ impl RecordingPlatform {
             fail_send_card: false,
             fail_reply_card: false,
             fail_reply_card_count: std::sync::atomic::AtomicUsize::new(0),
+            fail_instant_reminder: false,
             reply_in_thread_thread_id: Some("omt_created_topic".into()),
             quoted_messages: std::sync::Mutex::new(std::collections::HashMap::new()),
             pause_call: std::sync::Mutex::new(None),
@@ -167,6 +180,25 @@ impl RecordingPlatform {
             .iter()
             .filter_map(|c| match c {
                 PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every Instant Reminder call in order: `(chat_id, is_group, user_ids,
+    /// on)` — `on = true` is the pin, `false` the clear (ADR-0043).
+    pub(crate) async fn reminders(&self) -> Vec<(String, bool, Vec<String>, bool)> {
+        self.calls
+            .lock()
+            .await
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::InstantReminder {
+                    chat_id,
+                    is_group,
+                    user_ids,
+                    on,
+                } => Some((chat_id.clone(), *is_group, user_ids.clone(), *on)),
                 _ => None,
             })
             .collect()
@@ -344,6 +376,29 @@ impl feishu::Platform for RecordingPlatform {
             text: text.into(),
         });
         Ok("msg_notice".into())
+    }
+
+    async fn set_instant_reminder(
+        &self,
+        chat_id: &str,
+        is_group: bool,
+        user_ids: &[String],
+        on: bool,
+    ) -> crate::error::Result<()> {
+        // Recorded even when failing, so a test can assert the attempt was
+        // made and the turn still proceeded.
+        self.calls.lock().await.push(PlatformCall::InstantReminder {
+            chat_id: chat_id.into(),
+            is_group,
+            user_ids: user_ids.to_vec(),
+            on,
+        });
+        if self.fail_instant_reminder {
+            return Err(crate::error::BridgeError::Feishu(
+                "simulated set_instant_reminder failure".into(),
+            ));
+        }
+        Ok(())
     }
 
     async fn user_name(&self, open_id: &str) -> crate::error::Result<Option<String>> {
@@ -1119,6 +1174,7 @@ pub fn test_config(session_file: &std::path::Path) -> crate::config::Config {
             access_file: session_file.with_file_name("access.json"),
             work_dir: None,
             group_completion_notice: true,
+            pin: false,
             log_days: 14,
         },
     };

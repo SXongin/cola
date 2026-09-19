@@ -64,8 +64,16 @@ the conversation while a Turn needs attention.
   waiting elsewhere still catches the end. Pinning is best-effort:
   failures log only, a missing scope disables nothing else, and p2p/group
   share the logic.
-- **One config switch:** `[bridge] pin = true | false` (default true) turns
-  Instant Reminder off. The split behavior itself is not configurable for now.
+- **Pins are generation-scoped and in-memory.** Every pin carries the turn
+  generation that owns it, and a clear from an older generation is a no-op
+  against a newer turn's pin — so a stale clear (the long-turn TTL timer) can
+  never unpin the turn that superseded it. The state is not reconciled at
+  startup: a pin orphaned by a crash or restart is cleared on the
+  conversation's next turn (self-healing), never a permanent pin.
+- **One config switch, off by default:** `[bridge] pin = true` turns Instant
+  Reminder on. Absent or `false` means off — an upgrade never changes
+  notification behavior without consent. The split behavior itself is not
+  configurable for now.
 
 ## Why
 
