@@ -886,3 +886,77 @@ fn panel_times_and_header_date_come_from_part_epochs() {
         "the header must carry the turn's date, not the parts'"
     );
 }
+
+/// ADR-0044: the shared render poll refreshes the footer's context segment as
+/// soon as a step's usage lands — the LIVE card carries it, not only the final
+/// one — and the `GET /provider` window lookup is memoized per
+/// (provider, model) for the turn, so later polls cost no extra request.
+#[tokio::test]
+async fn render_poll_shows_live_context_and_memoizes_the_window() {
+    use crate::bridge::render::render_and_flush;
+    use crate::bridge::streaming::{CardSession, StreamAccumulator};
+    use crate::opencode::types::{MessageInfo, MessageTime, MessageTokens, SessionMessage};
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mock = MockBackend::new(realistic_parts());
+    let window_calls = mock.context_window_calls.clone();
+    let (app, platform) = build_app(cfg, mock).await;
+
+    let sid = "ses_live";
+    {
+        let mut cards = app.core.cards.lock().await;
+        let mut acc = StreamAccumulator::new("proj");
+        // An armed anchor: every assistant message counts as this turn's.
+        acc.turn_started_ms = Some(0);
+        acc.provider_id = Some("p".into());
+        acc.model_id = Some("m".into());
+        cards.insert(sid.to_string(), CardSession::new(acc, Some("om_live".into())));
+    }
+    let tokens = |total: i64| MessageTokens {
+        total,
+        ..Default::default()
+    };
+    let message = |total: i64, text: &str| SessionMessage {
+        info: MessageInfo {
+            id: "a1".into(),
+            role: Some("assistant".into()),
+            parent_id: None,
+            time: Some(MessageTime { created: 1_000 }),
+            model_id: Some("m".into()),
+            provider_id: Some("p".into()),
+            tokens: Some(tokens(total)),
+        },
+        parts: serde_json::json!([{ "type": "text", "text": text }]),
+    };
+
+    let _ = render_and_flush(&app.core, sid, &[message(42_000, "回答")]).await;
+    let updates = platform.updated_cards().await;
+    let text = updates.last().expect("a live flush").to_string();
+    assert!(
+        text.contains("📊 上下文 42k/100k (42%)"),
+        "the live card must carry the context segment: {text}"
+    );
+    assert_eq!(
+        window_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the first usage triggers exactly one window lookup"
+    );
+
+    // A later step's usage refreshes the segment; the memo serves the window.
+    let _ = render_and_flush(&app.core, sid, &[message(55_000, "回答，继续")]).await;
+    let updates = platform.updated_cards().await;
+    assert!(
+        updates
+            .last()
+            .unwrap()
+            .to_string()
+            .contains("📊 上下文 55k/100k (55%)"),
+        "the refreshed usage must render on the live card"
+    );
+    assert_eq!(
+        window_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the per-turn memo must not re-fetch the window"
+    );
+}

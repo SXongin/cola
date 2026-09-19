@@ -759,6 +759,11 @@ pub(crate) async fn render_and_flush(
             card.acc.reasoning.len(),
         )
     };
+    // Keep the footer's context segment current (ADR-0044): the token usage
+    // landed in the render above, and the window lookup is memoized per
+    // (provider, model) for the turn, so later polls are a field swap. Runs
+    // outside the cards lock (network).
+    crate::bridge::streaming::refresh_context_window(core, session_id).await;
     if changed || header_changed {
         flush_card(core, session_id).await;
     }
