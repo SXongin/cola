@@ -1,6 +1,6 @@
 //! `cargo xtask release <version>` — the release cut (ADR-0033).
 //!
-//! The cut bumps `Cargo.toml`/`Cargo.lock` on a `release-<version>` branch,
+//! The cut bumps `Cargo.toml`/`Cargo.lock` on a `release/<version>` branch,
 //! opens a PR, watches every check, rebase-merges it with the admin
 //! bypass, and only then tags the **merged** commit on `main` and pushes the
 //! tag — `release.yml` takes over from there. Tagging a branch commit is the
@@ -124,7 +124,7 @@ fn plan(facts: &Facts, target: &Version, release_branch: &str) -> CutPlan {
 }
 
 fn run(target: &Version, yes: bool) -> Result<()> {
-    let release_branch = format!("release-{target}");
+    let release_branch = format!("release/{target}");
     match classify(target, &release_branch)? {
         CutPlan::Refuse(why) => Err(why),
         CutPlan::ResumeAfterMerge => finish_tag(target),
@@ -149,7 +149,7 @@ fn classify(target: &Version, release_branch: &str) -> Result<CutPlan> {
     Ok(plan(&facts, target, release_branch))
 }
 
-/// Bump the manifest and push `release-<version>` with a single commit.
+/// Bump the manifest and push `release/<version>` with a single commit.
 fn fresh_cut(target: &Version, release_branch: &str) -> Result<()> {
     println!("Syncing main...");
     git_ok(&["pull", "--ff-only"])?;
@@ -471,7 +471,7 @@ tokio = { version = \"1\", features = [\"full\"] }
     #[test]
     fn plan_finds_the_three_cut_states() {
         let target = v("0.9.0");
-        let rb = "release-0.9.0";
+        let rb = "release/0.9.0";
         assert_eq!(
             plan(&facts("main", true, "0.8.2", false), &target, rb),
             CutPlan::FreshCut
@@ -489,7 +489,7 @@ tokio = { version = \"1\", features = [\"full\"] }
     #[test]
     fn plan_refuses_unsafe_states() {
         let target = v("0.9.0");
-        let rb = "release-0.9.0";
+        let rb = "release/0.9.0";
         let cases = [
             (facts("main", true, "0.8.2", true), "tag"),
             (facts("main", false, "0.8.2", false), "clean"),

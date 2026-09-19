@@ -39,7 +39,7 @@ cut from the manifest bump to the pushed tag, keeping every existing gate.
    - prints the release smoke test and waits for confirmation (`--yes` skips
      it; agents pass it only after a human confirmed in chat);
    - bumps `Cargo.toml` + `Cargo.lock`, commits
-     `chore(release): bump version to <version>` on `release-<version>` and
+     `chore(release): bump version to <version>` on `release/<version>` and
      pushes the branch;
    - opens the PR, watches the required checks, and rebase-merges with the
      admin bypass once they are green;
@@ -104,3 +104,10 @@ six to nine minutes per run and is advisory for normal PRs — `CONTRIBUTING.md`
 is cut rarely and should carry every signal available, so the release cut is the
 one flow where advisory CodeQL gates the merge. The module comment in
 `xtask/src/release.rs` was updated to say so.
+
+## Amendment (2026-09-20, branch naming): release cuts use `release/<version>`
+
+Decision 2 names the branch `release-<version>`, but the repository's branch
+convention is `<type>/<slug>`. Release cuts now use the branch-only `release/`
+type — `release/<version>` — so every branch has the same shape. `xtask` and
+its tests were updated; no remote `release-*` branches existed at the switch.
