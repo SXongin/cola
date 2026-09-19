@@ -1,5 +1,5 @@
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -49,18 +49,12 @@ fn stamp_build_identity() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
     let cargo_version = env::var("CARGO_PKG_VERSION").unwrap_or_default();
 
-    // Re-run the stamp when git state moves (a commit, branch switch, or tag
-    // change touches HEAD / packed-refs / a ref under .git/refs) so a rebuilt
-    // binary carries fresh provenance.
-    let git_dir = Path::new(&manifest_dir).join(".git");
-    if git_dir.join("HEAD").exists() {
-        println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
+    // Re-run the stamp when git state moves (a commit, branch switch, or tag)
+    // so a rebuilt binary carries fresh provenance.
+    let dot_git = Path::new(&manifest_dir).join(".git");
+    if dot_git.exists() {
+        declare_git_inputs(&manifest_dir);
     }
-    let packed_refs = git_dir.join("packed-refs");
-    if packed_refs.exists() {
-        println!("cargo:rerun-if-changed={}", packed_refs.display());
-    }
-    declare_refs_changed(&git_dir.join("refs"));
 
     let tag = git_value(&manifest_dir, &["describe", "--tags", "--exact-match", "HEAD"]);
     // Clean means `git status --porcelain` succeeded with empty output; a git
@@ -76,7 +70,7 @@ fn stamp_build_identity() {
     // A crates.io package build (ADR-0030): no `.git`, but the package carries
     // `.cargo_vcs_info.json`. This is a release identity at the published
     // version, not a dev build.
-    if !git_dir.exists() && Path::new(&manifest_dir).join(".cargo_vcs_info.json").exists() {
+    if !dot_git.exists() && Path::new(&manifest_dir).join(".cargo_vcs_info.json").exists() {
         println!("cargo:rustc-env=COLA_BUILD_CHANNEL=crates.io");
         return;
     }
@@ -93,19 +87,50 @@ fn stamp_build_identity() {
     }
 }
 
-/// Declare every file under `refs` (recursively) as a build-script input, so a
-/// new commit or branch on an existing ref re-runs the provenance stamp.
-fn declare_refs_changed(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+/// Declare the git state that moves the provenance as build-script inputs: the
+/// worktree's HEAD (a branch switch, commit, or reset writes it) and the local
+/// ref store (a commit, tag, or branch update writes it). `refs/remotes` stays
+/// out on purpose — a fetch only moves remote-tracking refs, and re-stamping
+/// there would force a full rebuild the provenance cannot reflect.
+///
+/// The paths come from git, not from `<manifest>/.git`: a linked worktree's
+/// `.git` is a FILE, its HEAD lives under `.git/worktrees/<name>`, and its refs
+/// live in the shared common dir. Assuming `.git` was a directory declared no
+/// git input at all, so the script never re-ran and the stamp froze at whatever
+/// branch first built that worktree's target dir (#245).
+fn declare_git_inputs(manifest_dir: &str) {
+    if let Some(git_dir) = git_value(manifest_dir, &["rev-parse", "--absolute-git-dir"]) {
+        declare_rerun_if_changed(&Path::new(&git_dir).join("HEAD"));
+    }
+    let Some(common_dir) = git_value(manifest_dir, &["rev-parse", "--git-common-dir"]) else {
         return;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            declare_refs_changed(&path);
-        } else {
-            println!("cargo:rerun-if-changed={}", path.display());
-        }
+    let common_dir = absolutize(manifest_dir, &common_dir);
+    for path in ["refs/heads", "refs/tags", "packed-refs"] {
+        declare_rerun_if_changed(&common_dir.join(path));
+    }
+}
+
+/// Declare `path` as a build-script input when it exists: cargo treats a
+/// missing declared path as permanently dirty and re-runs the script on every
+/// build, so an absent path must not be emitted. The existence check loses
+/// nothing reachable: git creates `refs/heads` and `refs/tags` at init/clone
+/// and leaves them in place through `pack-refs` and `gc`, so the ref dirs are
+/// always there to be declared.
+fn declare_rerun_if_changed(path: &Path) {
+    if path.exists() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+}
+
+/// `git rev-parse` answers relative to the invocation dir (`-C manifest_dir`),
+/// which is the package root, unless it already resolved an absolute path.
+fn absolutize(manifest_dir: &str, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        Path::new(manifest_dir).join(path)
     }
 }
 
