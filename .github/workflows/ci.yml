@@ -31,7 +31,7 @@ jobs:
           set -euo pipefail
           git fetch --no-tags origin "$BASE"
           changed=$(git diff --name-only "origin/$BASE...HEAD")
-          if [ -n "$changed" ] && ! echo "$changed" | grep -qvE '^(docs/|\.scratch/)|\.md$|^LICENSE$|^deny\.toml$'; then
+          if [ -n "$changed" ] && ! grep -qvE '^(docs/|\.scratch/)|\.md$|^LICENSE$|^deny\.toml$' <<<"$changed"; then
             echo "heavy=false" >> "$GITHUB_OUTPUT"
           else
             echo "heavy=true" >> "$GITHUB_OUTPUT"
