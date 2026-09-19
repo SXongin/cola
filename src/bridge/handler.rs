@@ -323,6 +323,12 @@ impl App {
         if self.gate_message(&msg).await {
             return;
         }
+        // Instant Reminder (ADR-0043): an authorized inbound message is user
+        // activity in this Chat/Topic — it restarts the long-turn silence
+        // clock and releases a live long-turn pin (a pending wait's hold
+        // survives). Commands (`/new` included), supplements and plain prompts
+        // all land here; external/non-Feishu activity never does.
+        self.pins.note_interaction(&self.feishu, &msg.chat_id).await;
         let kind = ConversationKind::classify(&msg.chat_type, msg.thread_id.as_deref());
         let thread_key = kind.thread_key(&msg.chat_id, msg.thread_id.as_deref());
         if let Some(cmd) = command::parse_command(&msg.text) {
@@ -746,6 +752,27 @@ impl App {
     pub async fn handle_card_action(self: &Arc<Self>, value: serde_json::Value) -> Option<CardActionResult> {
         if let Some(refusal) = self.gate_card_action(&value).await {
             return Some(refusal);
+        }
+        // Instant Reminder (ADR-0043): a card action is user activity in the
+        // card's Chat/Topic — restart the long-turn silence clock and release
+        // a live long-turn pin (a pending wait's hold survives). Permission
+        // replies and question answers are exactly the "user is active" signal
+        // the threshold must not count as silence. The callback context's
+        // `open_chat_id` (normalized by the WS layer) is authoritative for
+        // where the click happened; payloads that already carry a routing
+        // `chat_id` fall back to it.
+        if let Some(chat_id) = value
+            .get("open_chat_id")
+            .and_then(|v| v.as_str())
+            .filter(|chat_id| !chat_id.is_empty())
+            .or_else(|| {
+                value
+                    .get("chat_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|chat_id| !chat_id.is_empty())
+            })
+        {
+            self.pins.note_interaction(&self.feishu, chat_id).await;
         }
         let action = value.get("action").and_then(|v| v.as_str()).unwrap_or("");
         match action {

@@ -61,15 +61,24 @@ the conversation while a Turn needs attention.
   enabled while a Permission/Question is pending, and for a Turn running past
   a threshold (60 s default); it is cleared when the wait resolves. A
   completed long Turn stays pinned for a short TTL (2 min default) so someone
-  waiting elsewhere still catches the end. Pinning is best-effort:
-  failures log only, a missing scope disables nothing else, and p2p/group
-  share the logic.
+  waiting elsewhere still catches the end — unless a new Turn starts first: a
+  new Turn means the user is active again, so its `begin_turn` releases the
+  previous turn's TTL hold immediately (a Pending hold survives; the user
+  still owes an answer). Pinning is best-effort: failures log only, a missing
+  scope disables nothing else, and p2p/group share the logic.
 - **Pins are generation-scoped and in-memory.** Every pin carries the turn
   generation that owns it, and a clear from an older generation is a no-op
   against a newer turn's pin — so a stale clear (the long-turn TTL timer) can
-  never unpin the turn that superseded it. The state is not reconciled at
-  startup: a pin orphaned by a crash or restart is cleared on the
-  conversation's next turn (self-healing), never a permanent pin.
+  never unpin the turn that superseded it. The threshold timer and the turn's
+  completion are decided under the pin lock: whichever runs first wins, so a
+  completion racing the threshold either makes the timer a no-op (a short turn
+  never pins) or keeps the live pin for the TTL — never both, never a leaked
+  pin. The release a new Turn issues passes the live pin's own generation, so
+  the guard protects against stale timers, not against the newer turn itself.
+  The state is not reconciled at startup: a pin orphaned by a crash or
+  restart is cleared on the conversation's next turn (self-healing), never a
+  permanent pin.
+  permanent pin.
 - **One config switch, off by default:** `[bridge] pin = true` turns Instant
   Reminder on. Absent or `false` means off — an upgrade never changes
   notification behavior without consent. The split behavior itself is not
@@ -114,6 +123,10 @@ the conversation while a Turn needs attention.
   message is a command reply, it shows that reply — accepted, it is what the
   user just did. The pin carries no reason; the preview does.
 - Pin disappears meaning "no longer needs you", not "just completed".
+- The long-turn threshold (60 s), the completion TTL (2 min) and the render
+  poll cadence are internal constants; the bridge tests inject tiny values
+  through the pin state's / external flow's atomics, so the whole lifecycle
+  runs in milliseconds without a real Feishu tenant.
 - Group chats can only split on messages cola receives (@-mentions) until the
   sensitive `im:message.group_msg` scope is ever granted; group behavior is
   untested in the current private model.
@@ -143,3 +156,31 @@ top-down, and the reader's viewport is at the bottom where the delta lands.
 
 Source: product-owner smoke test of the accumulated-card behavior and
 approval of the delta revision.
+
+## Amendment (2026-09-19): the long-turn threshold measures user silence
+
+The Decision above says a Turn running past 60 s pins the conversation. Live
+testing showed a one-shot timer from turn start firing even when the user had
+just acted — clicked a permission, answered a question, or sent a supplement —
+which is the opposite of the reminder's intent: the pin exists to say
+something needs the user, and a user who is already acting does not need
+telling.
+
+- The threshold is now measured from the Chat/Topic's last **inbound user
+  activity**: any Feishu message (a Supplement, a recognized command such as
+  `/new`, an unknown slash command) or card action (permission reply, question
+  answer/handoff), plus turn start. External/non-Feishu activity never counts.
+- Any interaction also releases a live `LongTurn` hold and restarts the clock;
+  a new Turn expresses its release through the same path. A `Pending` hold
+  survives — the user still owes an answer.
+- Firing is idempotent but not once-only: while the Turn keeps running,
+  renewed silence pins again, still generation-scoped and never after
+  completion.
+- The one-shot timer is replaced by a per-turn checker that re-evaluates the
+  silence under the pin lock every injected tick, and exits once the turn
+  completed or a newer generation armed the Chat/Topic. The tick, threshold
+  and TTL remain injectable atomics, so the tests run the lifecycle in
+  milliseconds.
+
+Source: product-owner live-testing observation of a pin firing right after a
+permission click, and approval of the silence semantics.
