@@ -536,6 +536,18 @@ pub struct MockBackend {
     /// `std::sync::Mutex` for interior mutability: `update_session_title`
     /// writes it through `&self` (the trait requires `&self`).
     pub session_titles: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// Session id → scripted Backend message timelines served by `messages`,
+    /// consumed one snapshot per call (the last snapshot repeats). Lets a test
+    /// script the Backend's history call by call — e.g. the post-prompt
+    /// drain's exit check seeing no supplement and the racing finish re-check
+    /// seeing one — and mutate it mid-turn (a supplement that missed the run,
+    /// then its assistant reply). Sessions absent from the map keep the
+    /// default shape.
+    pub message_scripts:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<Vec<opencode::types::SessionMessage>>>>>,
+    /// Records every `messages` call's session id, so tests can prove the
+    /// drain stopped reading the Backend once the turn ended.
+    pub messages_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// Pending questions served by `list_questions`.
     pub questions: Vec<opencode::types::QuestionRequest>,
     /// Records `reply_question` calls: (request_id, answers).
@@ -664,6 +676,8 @@ impl MockBackend {
             reply_question_not_found: false,
             extra_permissions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             session_titles: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            message_scripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            messages_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             questions: Vec::new(),
             reply_question_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             replied_questions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
@@ -906,6 +920,24 @@ impl opencode::Backend for MockBackend {
         _session_id: &str,
     ) -> crate::error::Result<Vec<opencode::types::SessionMessage>> {
         hang_if_scripted(&self.hang_messages).await;
+        self.messages_calls.lock().await.push(_session_id.to_string());
+        // A scripted Backend timeline wins over every default shape: it is
+        // the test's complete message history (anchor user message, first run,
+        // a supplement that missed the run, its reply), consumed one snapshot
+        // per call with the last one repeating.
+        {
+            let mut scripts = self.message_scripts.lock().await;
+            if let Some(script) = scripts.get_mut(_session_id)
+                && !script.is_empty()
+            {
+                let snapshot = if script.len() == 1 {
+                    script[0].clone()
+                } else {
+                    script.remove(0)
+                };
+                return Ok(snapshot);
+            }
+        }
         let now = chrono::Utc::now().timestamp_millis();
         let mut msgs: Vec<opencode::types::SessionMessage> = Vec::new();
         // cola's OWN user message persisting on the store (ADR-0026): id starts

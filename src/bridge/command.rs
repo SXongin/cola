@@ -729,6 +729,11 @@ pub(crate) async fn handle_command(
         Command::Stop => {
             if let Some(id) = core.get_session_id(&thread_key).await {
                 core.opencode.interrupt(&id).await?;
+                // Mark the session stopped so a running post-prompt drain
+                // (ADR-0043) finalizes promptly instead of waiting out its
+                // bound on a Supplement the abort left unanswered. The next
+                // Turn clears the marker when it starts.
+                core.stopped_sessions.lock().await.insert(id);
                 core.feishu.reply_text(message_id, "Interrupted.").await?;
             } else {
                 core.feishu

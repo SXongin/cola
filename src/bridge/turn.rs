@@ -3,11 +3,54 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::bridge::App;
 use crate::bridge::handler::image_inputs;
-use crate::bridge::render::{flush_card, render_new_turn_parts, render_parts, render_poll_loop};
+use crate::bridge::render::{
+    flush_card, render_and_flush, render_new_turn_parts, render_parts, render_poll_loop,
+};
 use crate::bridge::streaming::StreamAccumulator;
 use crate::config::ThreadKey;
 use crate::feishu::client::ImageAttachment;
 use crate::opencode;
+use crate::opencode::types::{SessionMessage, SessionStatus};
+
+/// How long one Backend read in the post-prompt drain may take before it is
+/// abandoned. The drain's own bound caps this further per call: a hung
+/// Backend must not hold the card (and the inflight guard) past the drain
+/// deadline, and `/stop` must be observable within one bounded request.
+const DRAIN_REQUEST_TIMEOUT_MS: u64 = 30_000;
+
+/// What one drain read saw (ADR-0043).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainState {
+    /// Nothing pending: the drain can end.
+    Settled,
+    /// The session's run is still going (busy, or scheduled for a retry).
+    Running,
+    /// A cola-authored Supplement newer than the turn anchor has no assistant
+    /// reply after it.
+    Supplement,
+}
+
+/// The per-call timeout for one drain request: the fixed request bound,
+/// shrunk to the remaining drain budget so a hung Backend cannot hold the
+/// drain (or `/stop`) past its deadline. Never zero — a deadline already
+/// passed still gets a token slice, enough for a healthy Backend to answer
+/// and for a hung one to fail fast.
+fn drain_request_timeout(deadline: tokio::time::Instant) -> u64 {
+    let remaining = deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .as_millis()
+        .min(u128::from(DRAIN_REQUEST_TIMEOUT_MS)) as u64;
+    remaining.max(1)
+}
+
+/// A fresh drain budget from the injected bound (`turn_drain_timeout_ms`):
+/// every drain phase — the post-prompt drain and its single re-check — gets
+/// its own, so a tiny injected bound keeps the whole lifecycle short and a
+/// hung Backend can never fall back to the fixed request timeout.
+fn drain_deadline(app: &Arc<App>) -> tokio::time::Instant {
+    tokio::time::Instant::now()
+        + std::time::Duration::from_millis(app.turn_drain_timeout_ms.load(Ordering::Relaxed))
+}
 
 /// Everything [`Turn::run`] needs for one turn. Built by `handle_prompt` for a
 /// fresh message and by the error-card "retry" action (which reuses the
@@ -38,14 +81,18 @@ pub(crate) struct PromptContext {
 ///   capturing the overrides at send time (ADR-0019);
 /// - `recreate` — replace a stale session mapping and carry the live card,
 ///   inflight guard and cover title across (the remap C1 deferred);
-/// - `finish` — reconcile the final parts, Turn Footer, cover sync, group
-///   notice, and release the guard.
+/// - `finish` — first drain the render poll across a Supplement that missed
+///   the run (ADR-0043), then reconcile the final parts, Turn Footer, cover
+///   sync, group notice, and release the guard.
 pub(crate) struct Turn {
     session_id: String,
     thread_key: ThreadKey,
     text: String,
     cola_message_id: String,
     images: Vec<ImageAttachment>,
+    /// The session's working directory, captured at turn start — the routing
+    /// key for the drain's `session_status` read (ADR-0010).
+    directory: String,
     /// The variant the last attempt actually sent, captured at send time —
     /// what the Turn Footer shows.
     turn_variant: Option<String>,
@@ -109,6 +156,10 @@ impl Turn {
             }
             inflight.insert(session_id.clone());
         }
+        // A fresh Turn supersedes any `/stop` from an earlier one: the drain
+        // marker (ADR-0043) is per-session and sticky until the next turn, so
+        // clearing it here keeps a past stop from silencing this turn's drain.
+        app.stopped_sessions.lock().await.remove(&session_id);
 
         // Fresh accumulator per prompt: reuse leaks stale text/tools from the
         // previous turn into the next card. The card's IDENTITY (the message
@@ -212,6 +263,7 @@ impl Turn {
             text,
             cola_message_id,
             images,
+            directory: session_dir,
             turn_variant: None,
         }))
     }
@@ -241,6 +293,10 @@ impl Turn {
             )
             .await;
         render.stop().await;
+        // The poll runs only while the prompt call is in flight. Should the
+        // run have ended with a Supplement already queued — or a new Turn
+        // started by one — the post-prompt drain takes the polling over on the
+        // same injected cadence (ADR-0043).
         prompt_resp
     }
 
@@ -314,11 +370,23 @@ impl Turn {
     /// Reconcile the final parts the incremental poll may have missed, fill in
     /// the Turn Footer's model/context data, sync the topic cover, send the
     /// group completion notice, and release the busy guard.
+    ///
+    /// Finalization begins with the post-prompt drain (ADR-0043): a Supplement
+    /// that missed the running run starts a new Turn on the server, and the
+    /// drain keeps the render poll alive (still holding the inflight guard, so
+    /// a further message is treated as a Supplement) until that Turn is
+    /// answered — then the card is marked Done and the guard released.
     async fn finish(
         &mut self,
         app: &Arc<App>,
         prompt_resp: &crate::error::Result<opencode::types::PromptResponse>,
     ) {
+        // Post-prompt drain + the pre-finalization re-check: a Supplement
+        // racing the drain's exit is drained here rather than dropped, and one
+        // that lands after the release becomes a normal new Turn on the
+        // handler's not-busy path.
+        self.drain_after_prompt(app).await;
+
         let prompt_err = match prompt_resp {
             Ok(r) => r.error.clone(),
             Err(e) => Some(e.to_string()),
@@ -487,6 +555,176 @@ impl Turn {
     async fn release(&self, app: &Arc<App>) {
         release_inflight(app, &self.session_id).await;
     }
+
+    /// The post-prompt phase (ADR-0043): keep the renderer polling while the
+    /// session is still running or an unanswered cola-authored Supplement is
+    /// newer than this turn's anchor — a Supplement that missed the running
+    /// run starts a new Turn on the Backend, and its reply must land on the
+    /// live (continuation) card instead of nowhere.
+    ///
+    /// The drain's exit is not the last word: finalization re-checks once more
+    /// BEFORE the card is marked Done and the guard released, no matter how
+    /// the drain ended (settled, the bound, or a failed read). The re-check
+    /// gets its own fresh budget from the same injected bound, so it can never
+    /// hold the card (or delay `/stop`) past a tiny injected drain timeout. A
+    /// Supplement the re-check finds is drained again — one bounded drain, so
+    /// a session that merely stays busy cannot extend finalization. A
+    /// Supplement that lands after the release is seen by the handler's
+    /// not-busy path and becomes a normal new Turn.
+    async fn drain_after_prompt(&mut self, app: &Arc<App>) {
+        self.drain(app).await;
+        if self
+            .drain_tick(app, drain_request_timeout(drain_deadline(app)))
+            .await
+            == Some(DrainState::Supplement)
+        {
+            tracing::info!(
+                "turn drain: supplement racing the finish on session {}; draining",
+                self.session_id
+            );
+            self.drain(app).await;
+        }
+    }
+
+    /// Poll the Backend, render it into the live card, and stop when nothing
+    /// is pending or the bound is reached. A failed Backend read while a run
+    /// was already observed pending is retried (the render poll's own policy):
+    /// dropping the drain on one transient error would lose the reply this
+    /// phase exists to render. Each request is bounded by the remaining drain
+    /// budget, so a hung Backend cannot hold the drain past the bound.
+    async fn drain(&mut self, app: &Arc<App>) {
+        let poll_ms = app.turn_render_poll_ms.load(Ordering::Relaxed);
+        let deadline = drain_deadline(app);
+        let mut observed_pending = false;
+        loop {
+            // The first check runs before any sleep: a Supplement that missed
+            // the run is already on the Backend when the prompt returns.
+            match self.drain_tick(app, drain_request_timeout(deadline)).await {
+                Some(DrainState::Settled) => return,
+                Some(_) => observed_pending = true,
+                None if !observed_pending => return,
+                None => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::info!("turn drain: bound reached on session {}", self.session_id);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
+        }
+    }
+
+    /// One drain tick: read the Backend, decide whether rendering must go on,
+    /// and — when it must — render the very snapshot the decision was made
+    /// from, so the live card follows the new Turn. `None` means the Backend
+    /// read failed (unknown state).
+    async fn drain_tick(&self, app: &Arc<App>, timeout_ms: u64) -> Option<DrainState> {
+        let msgs = self.drain_messages(app, timeout_ms).await?;
+        match self.drain_state(app, &msgs, timeout_ms).await {
+            DrainState::Settled => Some(DrainState::Settled),
+            pending => {
+                render_and_flush(&app.core, &self.session_id, &msgs).await;
+                Some(pending)
+            }
+        }
+    }
+
+    /// What the drain must do next (ADR-0043): keep going while the session's
+    /// run is still alive, or while the Backend's newest user message is a
+    /// cola-authored Supplement newer than this turn's anchor with no
+    /// assistant reply after it. `msgs` is the snapshot the caller just read.
+    /// The Supplement is classified before the run state so the re-check can
+    /// tell the racing Supplement apart from a session that is merely busy.
+    async fn drain_state(&self, app: &Arc<App>, msgs: &[SessionMessage], timeout_ms: u64) -> DrainState {
+        // `/stop` interrupted this session's run: no answer is coming, so the
+        // drain must end promptly instead of waiting out its bound on a
+        // Supplement the abort left unanswered (no rendering may continue once
+        // the session is stopped). The marker is cleared by the next Turn's
+        // `start`.
+        if app.stopped_sessions.lock().await.contains(&self.session_id) {
+            tracing::info!("turn drain: session {} was stopped; finalizing", self.session_id);
+            return DrainState::Settled;
+        }
+        // Capture the turn's server-time anchor from this snapshot if the
+        // incremental poll never saw it — the supplement comparison is
+        // meaningless without it, and a short turn's first poll only ever
+        // runs here.
+        let anchor_ms = {
+            let mut cards = app.cards.lock().await;
+            match cards.get_mut(&self.session_id) {
+                Some(card) => {
+                    crate::bridge::render::capture_turn_anchor(&mut card.acc, msgs);
+                    card.acc.turn_started_ms
+                }
+                None => None,
+            }
+        };
+        // A Supplement the Backend has not answered yet. Its `msg_cola_` id is
+        // authoritative (ADR-0026); the anchor is the server's own time for
+        // this turn's user message (#190). Cola's clock never enters here.
+        if let Some(anchor_ms) = anchor_ms {
+            let newest_user = msgs
+                .iter()
+                .filter(|m| m.info.role.as_deref() == Some("user"))
+                .filter_map(|m| m.info.time.as_ref().map(|t| (t.created, m.info.id.as_str())))
+                .max_by_key(|(created, _)| *created);
+            if let Some((created, id)) = newest_user
+                && crate::opencode::parsing::is_cola_message_id(id)
+                && created > anchor_ms
+            {
+                // No assistant message after it: either its new Turn has not
+                // started yet or it is being answered — keep rendering either
+                // way. (`/stop` was handled above; an aborted run leaves
+                // nothing for this check to wait for.)
+                let answered = msgs.iter().any(|m| {
+                    m.info.role.as_deref() == Some("assistant")
+                        && m.info
+                            .time
+                            .as_ref()
+                            .map(|t| t.created >= created)
+                            .unwrap_or(false)
+                });
+                if !answered {
+                    return DrainState::Supplement;
+                }
+            }
+        }
+        // The run is still alive: parts keep coming.
+        match crate::bridge::bounded_call(
+            "turn drain session status",
+            timeout_ms,
+            app.opencode
+                .session_status(&self.session_id, Some(&self.directory)),
+        )
+        .await
+        {
+            Some(Ok(Some(SessionStatus::Busy | SessionStatus::Retry))) => DrainState::Running,
+            Some(Ok(_)) | None => DrainState::Settled,
+            Some(Err(e)) => {
+                tracing::warn!("turn drain session status: {}", e);
+                DrainState::Settled
+            }
+        }
+    }
+
+    /// The drain's Backend read, bounded by the caller's per-call timeout so a
+    /// hung Backend cannot hold the card (and the inflight guard) past the
+    /// drain bound.
+    async fn drain_messages(&self, app: &Arc<App>, timeout_ms: u64) -> Option<Vec<SessionMessage>> {
+        match crate::bridge::bounded_call(
+            "turn drain messages",
+            timeout_ms,
+            app.opencode.messages(&self.session_id),
+        )
+        .await
+        {
+            Some(Ok(msgs)) => Some(msgs),
+            Some(Err(e)) => {
+                tracing::warn!("turn drain messages: {}", e);
+                None
+            }
+            None => None,
+        }
+    }
 }
 
 /// Release a session's busy guard. A free function so the phases' error paths
@@ -509,8 +747,9 @@ impl RenderPoll {
         let core = Arc::clone(&app.core);
         let sid = session_id.to_string();
         let flag = Arc::clone(&done);
+        let poll_ms = app.turn_render_poll_ms.load(Ordering::Relaxed);
         let handle = tokio::spawn(async move {
-            render_poll_loop(&core, sid, flag).await;
+            render_poll_loop(&core, sid, flag, poll_ms).await;
         });
         Self { done, handle }
     }
