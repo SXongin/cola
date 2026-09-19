@@ -92,3 +92,15 @@ It is a second guard over the same ADR-0027 identity contract decision 4 cites
 — `build.rs` had silently left `COLA_RELEASE` unset, so 0.8.0–0.8.3 shipped
 `-dev` binaries. Decision 4's "unchanged" describes the shape of the cut, not
 a freeze on adding read-only checks to it.
+
+## Amendment (2026-09-20): the cut watches every check, advisory CodeQL included
+
+Decision 2's "watches the required checks" is a pre-CodeQL phrase for what the
+command actually does: `watch_checks` runs `gh pr checks <branch> --watch`,
+which waits on **every** check reported for the PR, not just the five in the
+`main: CI` ruleset. That behavior stays, now deliberately. CodeQL costs about
+six to nine minutes per run and is advisory for normal PRs — `CONTRIBUTING.md`
+"Pull request rules" judges those with `gh pr checks --required` — but a release
+is cut rarely and should carry every signal available, so the release cut is the
+one flow where advisory CodeQL gates the merge. The module comment in
+`xtask/src/release.rs` was updated to say so.
