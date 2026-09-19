@@ -92,3 +92,10 @@ it would couple cola's card code to servers it does not own.
 
 The concepts enter the glossary as **Tool Panel** (工具面板) and **Built-in
 Tool**.
+
+## Update (2026-09-19)
+
+This ADR is about *how* a Tool Panel renders (tailored vs. opaque) and assumed
+it is a timeline row. ADR-0045 moves a panel whose tool is still running out of
+the timeline and into the card tail, so a Card Chain split can never strand it;
+the rendering boundary here is unchanged.
