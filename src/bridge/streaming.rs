@@ -1207,7 +1207,6 @@ impl StreamAccumulator {
         // so everything in [start..end) renders in full — no preview
         // truncation, no separate plain-text message.
         let mut pending = String::new();
-        let mut saw_content = false;
         for item in self.timeline.iter().take(end).skip(start) {
             match &item.kind {
                 TimelineKind::Reasoning(r) => {
@@ -1217,11 +1216,9 @@ impl StreamAccumulator {
                     }
                     builder =
                         builder.with_reasoning_at(r, item.shown_at, Some(&format!("reason_{}", item.seq)));
-                    saw_content = true;
                 }
                 TimelineKind::Text(t) => {
                     pending.push_str(t);
-                    saw_content = true;
                 }
                 TimelineKind::Tool(call_id) => {
                     if !pending.is_empty() {
@@ -1320,14 +1317,6 @@ impl StreamAccumulator {
 
             if let Some(ref err) = self.error {
                 builder = builder.with_text(&format!("\n**错误**: {}", err));
-            }
-
-            // Streaming/Loading with nothing rendered yet: keep the card alive.
-            if !saw_content
-                && self.error.is_none()
-                && (self.card_state == CardState::Streaming || self.card_state == CardState::Loading)
-            {
-                builder = builder.with_text("⏳ ...");
             }
 
             // Error card: offer a retry that re-submits the original prompt on
