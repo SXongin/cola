@@ -127,8 +127,10 @@ app_secret = "your-app-secret"
 That's the minimum. Every other setting is optional — e.g. Feishu's Instant
 Reminder is an **experimental** opt-in via `[bridge] instant_reminder = true`
 (off by default; needs the optional `im:datasync.feed_card.time_sensitive:write`
-scope above). The pin lifecycle is still being designed and may change between
-releases. See the [user guide](docs/user-guide.md#configuration).
+scope above), which pins a chat while a permission or question waits; and
+`[bridge] long_task_notice = true` (off by default) announces a p2p turn that
+ran 5+ minutes with a reply message, because the card patch itself pushes no
+notification. See the [user guide](docs/user-guide.md#configuration).
 
 ### 4. Run
 

@@ -201,6 +201,10 @@ confirmed message pinning works on the existing scope.
 
 ## Amendment (2026-09-19): the long-turn threshold measures user silence
 
+> **Superseded** by the 2026-09-21 amendment "the long-turn reminder is
+> removed": the whole long-turn class is gone, so this silence semantics no
+> longer applies. Kept as the record of what was tried.
+
 The Decision above says a Turn running past 60 s pins the conversation. Live
 testing showed a one-shot timer from turn start firing even when the user had
 just acted — clicked a permission, answered a question, or sent a supplement —
@@ -233,3 +237,121 @@ The preview example in Consequences tracks the kind split above: a
 permission-only wait previews 等待你的授权, a question-only wait 等待你的回答,
 and only both pending at once keep 等待你的授权/回答 (ADR-0014, 2026-09-19
 update).
+
+## Amendment (2026-09-21): pins are persisted, and one pending owns the chat
+
+> **Partially superseded** by the 2026-09-21 amendment "the long-turn reminder
+> is removed": the persistence and the pending-only owner rule stand; every
+> mention of the long-turn class below no longer applies.
+
+The Decision above says the pin state is in-memory and "not reconciled at
+startup". Live use showed the hole (#249): the Feishu client gives the user
+**no way to cancel an app's Instant Reminder**, so a pin orphaned by a crash
+stays until the chat's next Turn — and if cola never runs again in that chat,
+forever. The multi-pending sweep was also nondeterministic (#247): one slot
+per chat, last insertion wins, and a long-turn `ensure` could retarget away a
+waiting `Pending`.
+
+- **Pins are persisted.** Each live pin is mirrored to a small file beside
+  `sessions.json` as `{chat_id, is_group, user_ids}` — `user_ids` because
+  clearing an app reminder needs the target user (p2p clears
+  `feed_cards/bot_time_sentive`), not just the chat. The file is written
+  atomically when a pin lands, and the entry is removed when the clear is
+  confirmed.
+- **Startup clears the orphan set.** On startup cola best-effort clears every
+  recorded pin, then drops only the entries whose clear succeeded; a failed
+  clear stays for the next startup. The existing next-turn self-heal remains
+  the second net. A pin cola never sees again (app uninstalled, tenant gone)
+  stays — that is app-controlled platform state, and the user guide documents
+  the client-side 完成 workaround.
+- **One deterministic owner per chat.** `Pending` outranks `LongTurn`; within a
+  class the newest turn wins. When the owning pending resolves, the next sweep
+  hands the pin to the next pending in the chat immediately (no pause); with
+  no pending left the sweep clears it. A new pending may retarget a live pin
+  away from an older pending — the newest wait is the one needing the user
+  now. A `LongTurn` `ensure` never retargets or releases a live `Pending`
+  hold. Presence stays chat-wide: any interaction resets the silence clock
+  for the whole chat, whichever topic it happened in.
+- Rejected: FIFO (an older unanswered wait would hide a newer one), delayed
+  handover (the second wait still needs the user now), and leaving map
+  insertion order as the de-facto rule (nondeterministic across sweeps).
+
+Source: #247 grilling of multi-pending precedence and #249's platform finding.
+
+## Amendment (2026-09-21): the completed card offers 「取消置顶」
+
+> **Superseded** by the 2026-09-21 amendment "the long-turn reminder is
+> removed": with no completion TTL there is no pin to release, so the button
+> (and #246) is dropped.
+
+The Decision above leaves a completed long Turn pinned for a TTL. A user who
+already came back and read the card had no way to release it (#246) — typing
+anything already releases the hold, so only the silent reader was stuck.
+
+- The final card of a completed long Turn carries a small 「取消置顶」 button
+  **while its completion TTL hold is live**. It is not rendered while the turn
+  is running and not rendered while a `Pending` hold exists: there the
+  conversation still needs the user, and the button would imply a wait is
+  dismissible.
+- The click releases the `LongTurn` hold through the same generation-guarded
+  path any interaction uses. If the hold is already gone (activity, a new
+  turn, TTL expiry) the click is a no-op, and the next repaint no longer shows
+  the button.
+
+## Amendment (2026-09-21): message-scoped urgent and feed-card buttons deferred
+
+Feishu's message **urgent** (`PATCH /im/v1/messages/{message_id}/urgent_app`)
+is the only platform capability found that alerts a *specific* message: it
+buzzes named users about a message the app itself sent. It is not adopted now;
+if ever, it is a separate, explicit opt-in switch — a buzz is a far stronger
+interruption than a quiet pin, and `im:message.urgent` is an app permission
+release, not just a config flag.
+
+- Probe result (live, 2026-09-21): the app has no `im:message.urgent` scope
+  (`99991672`); the probe stopped there. Still unverified, and to be answered
+  before any adoption: urgent on an `interactive` card, where the popup click
+  lands, and p2p-specific constraints. Quotas to respect: 200 unread urgents
+  per recipient (`230023`), no cancel API, and group chats require "all
+  members may urgent" or the bot is an admin.
+- Neither feed-card mode can address a message. The chat-entry mode's
+  quick-action buttons (`im/v2/chat_button`) are deferred to an issue: their
+  callback path over cola's WS connection is unverified, and one chat hosting
+  several topics makes a list-level action ambiguous. The separate
+  app-entry mode stays rejected (this ADR's original alternative).
+- Persistent state keeps its job: urgent is a transient event;
+  `time_sensitive` and **Message Pin** are the state.
+
+## Amendment (2026-09-21): the long-turn reminder is removed; completion is a notice
+
+The long-turn reminder — the 2026-09-19 silence threshold, its completion TTL,
+and the completed card's 「取消置顶」 button — is removed. The pin surfaces are
+for **waiting**, not for running turns. A Permission/Question blocks the AI
+until a human acts, so the conversation must stay pinned until then: that is a
+**state**, and it cannot be missed the way a message can. A long Turn is
+different: it needs no attention while it runs, and its end is an **event**.
+Feishu's card PATCH pushes no notification and does not bump the conversation
+(only a new message does), so the event is delivered as a new message: the
+**Completion Notice**, a reply to the prompt.
+
+- p2p: notify only when the turn ran at least 5 minutes
+  (`LONG_TASK_NOTICE_MS`), opt-in `[bridge] long_task_notice`, no @ mention —
+  the reply itself is the notification. A short turn stays silent.
+- groups: unchanged — every turn notifies (`[bridge]
+  group_completion_notice`) and @-mentions the requester.
+- Removed with the long-turn class: the silence clock (`note_interaction`),
+  the threshold checker, the completion TTL, `CompletionPin`, the card's
+  「取消置顶」 button, and the `ReminderReason` set — a live pin now always
+  means a pending wait. The persistence and owner rules of the 2026-09-21
+  amendments stay, scoped to pending waits.
+
+Why not a "no-progress" (stuck) trigger: a silent long-running tool and a
+truly stuck turn are indistinguishable from the card's parts, so the trigger
+would false-positive on builds and test suites. The reliable "needs a human"
+signals are the pending Permission/Question — and a message-scoped urgent
+(the deferred capability above) would be the right event channel for a stuck
+turn, not a pin.
+
+Rejected alternatives: keeping the pin as a pure state and adding a notice
+(duplicates the surfaces for no gain), and a "read receipt cancels the pin"
+rule (Feishu gives bots no read receipts, and a card PATCH does not reset
+unread).

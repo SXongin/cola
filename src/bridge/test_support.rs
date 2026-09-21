@@ -216,6 +216,26 @@ impl RecordingPlatform {
             .collect()
     }
 
+    /// Every Completion Notice call in order: `(reply_to, open_id, name, text)`
+    /// — the reply that notifies the requester a Turn ended (ADR-0043
+    /// amendment 2026-09-21).
+    pub(crate) async fn completion_notices(&self) -> Vec<(String, String, Option<String>, String)> {
+        self.calls
+            .lock()
+            .await
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::CompletionNotice {
+                    reply_to,
+                    open_id,
+                    name,
+                    text,
+                } => Some((reply_to.clone(), open_id.clone(), name.clone(), text.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Every waiting-message pin call in order: `(message_id, on)` — `on`
     /// `true` puts the message into its Chat/Topic's pinned-message list,
     /// `false` removes it (ADR-0043 amendment).
@@ -1269,6 +1289,7 @@ pub fn test_config(session_file: &std::path::Path) -> crate::config::Config {
             access_file: session_file.with_file_name("access.json"),
             work_dir: None,
             group_completion_notice: true,
+            long_task_notice: false,
             instant_reminder: false,
             log_days: 14,
         },
