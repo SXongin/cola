@@ -110,7 +110,7 @@ precondition for the message and resource APIs.
 | `im:chat:readonly` | 获取群组信息 | chat display names (`/attach` rejection card, `/switch` cards) | raw chat ids instead of names |
 | `contact:contact.base:readonly` | 获取通讯录基本信息 | authorizes the contact API call | user names unavailable |
 | `contact:user.base:readonly` | 获取用户基本信息 | returns the user's `name` field | completion notices lose the @name |
-| `im:datasync.feed_card.time_sensitive:write` | 设置即时提醒 (`time_sensitive`) — optional, experimental | Instant Reminder: pin the Chat or Topic while a permission/question waits or a turn stays silent (`[bridge] instant_reminder`, off by default) | pinning is skipped (one log line); everything else keeps working |
+| `im:datasync.feed_card.time_sensitive:write` | 设置即时提醒 (`time_sensitive`) — optional, experimental | Instant Reminder: pin the Chat or Topic while a permission/question waits (`[bridge] instant_reminder`, off by default) | pinning is skipped (one log line); everything else keeps working |
 
 Notes:
 
@@ -195,6 +195,7 @@ start_server = "auto"            # auto (default) | never | eager
 # access_file = "~/.cola/access.json"
 # work_dir = "/path/to/a/project"
 # group_completion_notice = true
+# long_task_notice = true
 # instant_reminder = true
 # log_days = 14
 ```
@@ -213,22 +214,25 @@ start_server = "auto"            # auto (default) | never | eager
   push a new notification). `false` disables it. p2p chats don't need it.
 - **`instant_reminder`** — **experimental**, opt-in, **off by default**: use
   Feishu's Instant Reminder to pin the Chat or Topic at the top of the
-  requester's message list
-  while a permission or question is pending, and while a turn has seen no
-  activity from you for 60 seconds. The pin clears the moment the wait is
-  resolved, and any message
-  or card click restarts that silence clock; a completed long turn stays pinned
-  for 2 minutes, so the result is catchable from another chat — unless you act
-  first, which releases it right away (you are active again). The
-  pin means "this Chat or Topic still needs you" — the card title in the
-  preview says why: 等待你的授权 · 等待你的回答 · 运行中 · ✅ 完成 (with a
-  permission and a question both pending, they merge into 等待你的授权/回答). Requires the
+  requester's message list while a permission or question is pending. The pin
+  clears the moment the wait is resolved; it is a **state** that stays until
+  you act, so it cannot be missed the way a message can. A Chat or Topic has
+  one pin: the newest wait owns it, and when that wait resolves the next
+  pending wait takes it immediately. The pin means "this Chat or Topic still
+  needs you" — the card title in the preview says why (等待你的授权 ·
+  等待你的回答 · both merged into 等待你的授权/回答). Requires the
   `im:datasync.feed_card.time_sensitive:write` scope; without it pinning is
-  skipped (a log line only) and everything else keeps working. Pin state is
-  in-memory: a pin left behind by a crash or restart is cleared on the
-  Chat or Topic's next turn, never left up permanently. The lifecycle is still
-  being designed (precedence among several waits, orphaned pins on restart), so
-  expect the behavior to change between releases.
+  skipped (a log line only) and everything else keeps working. Live pins are
+  persisted beside the session mapping and cleared at startup if a crash
+  orphaned them (retrying a failed clear on the next start). The waiting card
+  is also message-pinned under the same opt-in, so opening the chat leads to
+  it.
+- **`long_task_notice`** — **off by default**: in p2p, reply to the requester's
+  message when a turn ran at least 5 minutes, so a long task's end is announced
+  by a new message. The streaming card is patched in place, which neither
+  pushes a notification nor bumps the conversation, so without this a long
+  task's end is easy to miss; a short turn stays silent. Group chats already
+  notify on every turn via `group_completion_notice`.
 - **`log_days`** — how many days of rotated daily logs to keep (default 14).
 
 ## Run

@@ -1587,8 +1587,7 @@ impl RequestFlow {
         // request auto-resolved in this sweep (prepare said handled) is not a
         // wait, so it never pins.
         if core.reminder.enabled() && failed_dirs.is_empty() {
-            let mut pin_targets: std::collections::HashMap<String, crate::bridge::reminder::ReminderTarget> =
-                std::collections::HashMap::new();
+            let mut pin_targets: Vec<crate::bridge::reminder::ReminderTarget> = Vec::new();
             for (req, dir) in &pin_candidates {
                 if auto_resolved.contains(req.id()) {
                     continue;
@@ -1598,7 +1597,7 @@ impl RequestFlow {
                 if let Some(target) =
                     crate::bridge::reminder::reminder_target(core, req.session_id(), dir).await
                 {
-                    pin_targets.insert(target.chat_id.clone(), target);
+                    pin_targets.push(target);
                 }
             }
             core.reminder

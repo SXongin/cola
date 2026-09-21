@@ -43,5 +43,9 @@ app_secret = "your-app-secret"
 # notice (the streaming card is patched in place, so it does not push a new
 # notification). Set false to disable.
 # group_completion_notice = true
+# In p2p, reply with a completion notice when a turn ran at least 5 minutes
+# (the streaming card patch pushes no notification, so a long task's end is
+# otherwise easy to miss). Off by default.
+# long_task_notice = true
 # How many days of rotated daily logs to keep (default 14).
 # log_days = 14

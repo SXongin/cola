@@ -18,6 +18,14 @@ use crate::opencode::types::{SessionMessage, SessionStatus};
 /// deadline, and `/stop` must be observable within one bounded request.
 const DRAIN_REQUEST_TIMEOUT_MS: u64 = 30_000;
 
+/// A p2p Turn that ran at least this long notifies on completion (ADR-0043
+/// amendment 2026-09-21): a long task's end is the one event worth a new
+/// message even when the user was around, because the card patch itself
+/// neither pushes a notification nor bumps the conversation. Five minutes is
+/// the "long" line; it is a constant, not a config key, and tests inject a
+/// tiny value through `SharedCore::long_task_notice_ms`.
+pub(crate) const LONG_TASK_NOTICE_MS: u64 = 300_000;
+
 /// What one drain read saw (ADR-0043).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DrainState {
@@ -96,10 +104,10 @@ pub(crate) struct Turn {
     /// The variant the last attempt actually sent, captured at send time —
     /// what the Turn Footer shows.
     turn_variant: Option<String>,
-    /// This turn's Instant Reminder generation (ADR-0043), registered at turn
-    /// start. The threshold timer and the completion TTL both carry it, so
-    /// neither can touch a newer turn's pin.
-    generation: u64,
+    /// When cola started the turn (wall clock), for the long-task Completion
+    /// Notice: a turn that ran past the threshold notifies on completion even
+    /// in p2p (ADR-0043 amendment 2026-09-21).
+    started_at: std::time::Instant,
 }
 
 impl Turn {
@@ -116,13 +124,7 @@ impl Turn {
         // fresh session and retry once.
         if prompt_resp.as_ref().is_err_and(|e| e.is_session_not_found()) {
             tracing::warn!("session {} not found on the server; recreating", turn.session_id);
-            if let Err(e) = turn.recreate(app).await {
-                // This turn will never reach `finish`: close its long-turn
-                // lifecycle, or a still-sleeping threshold timer would pin a
-                // turn that can never complete (ADR-0043).
-                turn.settle_long_turn_pin(app).await;
-                return Err(e);
-            }
+            turn.recreate(app).await?;
             prompt_resp = turn.attempt(app).await;
         }
         turn.finish(app, &prompt_resp).await;
@@ -267,27 +269,8 @@ impl Turn {
             }
         }
 
-        // Instant Reminder (ADR-0043): arm the long-turn silence checker now
-        // that the Loading card is live — a turn that failed to start must not
-        // pin. The checker and the completion decide under the pin lock, so a
-        // turn finishing before the threshold never pins, one finishing after
-        // it keeps the pin for the TTL, and an interaction mid-turn restarts
-        // the silence clock and releases the hold.
-        let user_ids: Vec<String> = requester_open_id
-            .iter()
-            .filter(|open_id| !open_id.is_empty())
-            .cloned()
-            .collect();
-        crate::bridge::reminder::spawn_long_turn_checker(
-            &app.core,
-            crate::bridge::reminder::ReminderTarget {
-                chat_id: thread_key.chat_id.clone(),
-                is_group,
-                user_ids,
-                generation,
-            },
-        );
-
+        // Instant Reminder (ADR-0043): the generation is registered so every
+        // pending Permission/Question of this turn pins with it.
         Ok(Some(Turn {
             session_id,
             thread_key,
@@ -296,7 +279,7 @@ impl Turn {
             images,
             directory: session_dir,
             turn_variant: None,
-            generation,
+            started_at: std::time::Instant::now(),
         }))
     }
 
@@ -525,27 +508,38 @@ impl Turn {
         // longer leave a stale watermark that makes cola's own message look
         // external after a server heal.
 
-        // Group completion notice: the streaming card is patched in place, which
-        // pushes no new notification — so reply to the requester's message so
-        // Feishu notifies them. p2p chats don't need it (the reply lands in the
-        // conversation directly).
-        if app.group_completion_notice {
+        // Completion notice (ADR-0043 amendment 2026-09-21): the streaming
+        // card is patched in place, which pushes no notification and does not
+        // bump the conversation — so reply to the requester's message to
+        // notify them. Groups notify on every turn (`[bridge]
+        // group_completion_notice`); p2p only for a long task
+        // (`[bridge] long_task_notice`, past the injected threshold), where
+        // "long" is the one event worth surfacing even though the user was
+        // presumably around.
+        if app.group_completion_notice || app.long_task_notice {
             let notice = {
                 let cards = app.cards.lock().await;
                 cards.get(&self.session_id).map(|c| &c.acc).and_then(|a| {
-                    if !a.is_group {
-                        return None;
-                    }
                     let requester = a.requester_open_id.clone()?;
                     let reply_to = a.reply_to_message_id.clone()?;
+                    let long_task = self.started_at.elapsed()
+                        >= std::time::Duration::from_millis(
+                            app.long_task_notice_ms.load(std::sync::atomic::Ordering::Relaxed),
+                        );
+                    if !(a.is_group && app.group_completion_notice
+                        || !a.is_group && app.long_task_notice && long_task)
+                    {
+                        return None;
+                    }
                     Some((
                         reply_to,
                         requester,
+                        a.is_group,
                         a.card_state == crate::feishu::card::CardState::Error,
                     ))
                 })
             };
-            if let Some((reply_to, requester, is_error)) = notice {
+            if let Some((reply_to, requester, is_group, is_error)) = notice {
                 let text = if is_error {
                     "❌ 上一条请求处理出错了，可点击卡片上的「重试」。"
                 } else {
@@ -553,47 +547,26 @@ impl Turn {
                 };
                 // Best-effort @-mention: the display name needs the contact API
                 // (permission granted). On any lookup failure cola falls back to
-                // a plain reply, which still notifies the message author.
-                let name = app.feishu.user_name(&requester).await.unwrap_or(None);
+                // a plain reply, which still notifies the message author. p2p
+                // needs no @ — the reply itself is the notification.
+                let name = if is_group {
+                    app.feishu.user_name(&requester).await.unwrap_or(None)
+                } else {
+                    None
+                };
                 if let Err(e) = app
                     .feishu
                     .reply_completion_notice(&reply_to, &requester, name.as_deref(), text)
                     .await
                 {
-                    tracing::warn!("group completion notice: {}", e);
+                    tracing::warn!("completion notice: {}", e);
                 }
             }
         }
 
-        // Instant Reminder (ADR-0043): close this turn's long-turn lifecycle.
-        // Completion wins the race with a still-sleeping threshold timer (a
-        // short turn never pins); a long turn's live pin is kept for the
-        // completion TTL, then cleared generation-scoped.
-        self.settle_long_turn_pin(app).await;
-
         self.release(app).await;
         // Permissions are handled by the independent poller spawned in App::run,
         // so a prompt blocked on a permission still gets its card shown.
-    }
-
-    /// Close this turn's long-turn Instant Reminder lifecycle (ADR-0043):
-    /// [`crate::bridge::reminder::ReminderState::complete_turn`] decides atomically
-    /// whether the threshold pin is live, and a live one is kept for the
-    /// completion TTL. Called by `finish` on every outcome and by `run` when
-    /// the turn can never reach it.
-    async fn settle_long_turn_pin(&self, app: &Arc<App>) {
-        if app
-            .core
-            .reminder
-            .complete_turn(&self.thread_key.chat_id, self.generation)
-            .await
-        {
-            crate::bridge::reminder::spawn_reminder_ttl(
-                &app.core,
-                self.thread_key.chat_id.clone(),
-                self.generation,
-            );
-        }
     }
 
     /// Release this turn's busy guard. Idempotent.

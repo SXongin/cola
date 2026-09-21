@@ -134,6 +134,12 @@ pub struct SharedCore {
     pub work_dir: Option<String>,
     /// Whether to send the group completion notice (from `[bridge] group_completion_notice`).
     pub group_completion_notice: bool,
+    /// Whether to send the long-task completion notice in p2p (from `[bridge] long_task_notice`).
+    pub long_task_notice: bool,
+    /// The long-task notice threshold (ms): a p2p Turn that ran at least this
+    /// long notifies on completion. Injectable for tests (the external
+    /// poller's interval-atomics pattern).
+    pub long_task_notice_ms: std::sync::atomic::AtomicU64,
     /// The Instant Reminder lifecycle (ADR-0043, from `[bridge] instant_reminder`): pins a
     /// Chat/Topic while a Permission/Question is pending. Off means every
     /// method is a no-op — no reminder call is ever made.
@@ -203,7 +209,14 @@ impl SharedCore {
                 .clone()
                 .map(|p| p.to_string_lossy().to_string()),
             group_completion_notice: cfg.bridge.group_completion_notice,
-            reminder: crate::bridge::reminder::ReminderState::new(cfg.bridge.instant_reminder),
+            long_task_notice: cfg.bridge.long_task_notice,
+            long_task_notice_ms: std::sync::atomic::AtomicU64::new(crate::bridge::turn::LONG_TASK_NOTICE_MS),
+            reminder: crate::bridge::reminder::ReminderState::new(
+                cfg.bridge.instant_reminder,
+                // The persisted pin set lives beside the session mapping
+                // (#249), so startup can clear reminders a crash orphaned.
+                Some(cfg.bridge.session_file.with_file_name("pinned_chats.json")),
+            ),
             message_pins: crate::bridge::message_pins::MessagePins::new(cfg.bridge.instant_reminder),
             session_list_cache: Arc::new(Mutex::new(None)),
             opencode,

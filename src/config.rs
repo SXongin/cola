@@ -129,6 +129,13 @@ pub struct BridgeConfig {
     /// not push a new notification). p2p chats don't need it.
     #[serde(default = "default_group_completion_notice")]
     pub group_completion_notice: bool,
+    /// In p2p, reply to the requester's message with a completion notice when
+    /// a Turn ran past the long-task threshold (5 minutes) — the card patch
+    /// pushes no notification and does not bump the conversation, so a long
+    /// task's end is otherwise invisible. OFF by default: an upgrade must
+    /// never change notification behavior without consent.
+    #[serde(default)]
+    pub long_task_notice: bool,
     /// Opt-in: pin the Chat or Topic with Feishu's Instant Reminder while a
     /// Permission/Question is pending (ADR-0043). OFF by default — an upgrade
     /// must never change notification behavior without consent.
@@ -147,6 +154,7 @@ impl Default for BridgeConfig {
             access_file: default_access_file(),
             work_dir: None,
             group_completion_notice: default_group_completion_notice(),
+            long_task_notice: false,
             instant_reminder: false,
             log_days: default_log_days(),
         }
