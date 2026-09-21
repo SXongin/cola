@@ -115,11 +115,15 @@ jobs:
   test:
     # Compile + test only on the other platforms: catches platform quirks
     # cheaply. Full release builds still run on all three in release.yml.
+    # The docs-only skip gates the STEPS, not the job: a job-level skip leaves
+    # the matrix unexpanded (`Test (${{ matrix.os }})`), so the two required
+    # `Test (…)` checks the ruleset waits for never report and the PR is
+    # blocked. A dispatched job with skipped steps reports success under the
+    # expanded names instead.
     name: Test (${{ matrix.os }})
     needs: classify
     if: >-
       always() &&
-      needs.classify.outputs.heavy != 'false' &&
       !startsWith(github.head_ref || '', 'release/')
     strategy:
       fail-fast: false
@@ -127,12 +131,16 @@ jobs:
         os: [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - if: needs.classify.outputs.heavy != 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - if: needs.classify.outputs.heavy != 'false'
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo test --workspace --locked
+      - if: needs.classify.outputs.heavy != 'false'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - if: needs.classify.outputs.heavy != 'false'
+        run: cargo test --workspace --locked
 
   audit:
     name: Dependency audit
