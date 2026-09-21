@@ -224,7 +224,10 @@ start_server = "auto"            # auto (default) | never | eager
   `im:datasync.feed_card.time_sensitive:write` scope; without it pinning is
   skipped (a log line only) and everything else keeps working. Live pins are
   persisted beside the session mapping and cleared at startup if a crash
-  orphaned them (retrying a failed clear on the next start). The waiting card
+  orphaned them (retrying a failed clear on the next start). If cola is
+  permanently gone the pin stays — that is app-controlled platform state, and
+  the Feishu client offers no cancel; marking the conversation 完成 dismisses
+  it, but new activity pins it again. The waiting card
   is also message-pinned under the same opt-in, so opening the chat leads to
   it.
 - **`long_task_notice`** — **off by default**: in p2p, reply to the requester's
