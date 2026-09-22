@@ -110,16 +110,16 @@ precondition for the message and resource APIs.
 | `im:chat:readonly` | 获取群组信息 | chat display names (`/attach` rejection card, `/switch` cards) | raw chat ids instead of names |
 | `contact:contact.base:readonly` | 获取通讯录基本信息 | authorizes the contact API call | user names unavailable |
 | `contact:user.base:readonly` | 获取用户基本信息 | returns the user's `name` field | completion notices lose the @name |
-| `im:datasync.feed_card.time_sensitive:write` | 设置即时提醒 (`time_sensitive`) — optional, experimental | Instant Reminder: pin the Chat or Topic while a permission/question waits (`[bridge] instant_reminder`, off by default) | pinning is skipped (one log line); everything else keeps working |
+| `im:datasync.feed_card.time_sensitive:write` | 设置即时提醒 (`time_sensitive`) — optional | Instant Reminder: pin the Chat or Topic while a permission/question waits (`[bridge] instant_reminder`, off by default) | pinning is skipped (one log line); everything else keeps working |
 
 Notes:
 
 - `im:datasync.feed_card.time_sensitive:write` is the only **optional** scope:
-  it powers the conversation-level Instant Reminder, an **experimental**
-  opt-in feature (`[bridge] instant_reminder = true`). The waiting-card
+  it powers the conversation-level Instant Reminder, an opt-in feature
+  (`[bridge] instant_reminder = true`, off by default). The waiting-card
   message pins under the same opt-in need no extra scope — `im:message`
-  covers them. Grant this one only if you want to trial the conversation
-  pin; without it cola logs the failed call and continues.
+  covers them. Grant this one only if you want the conversation pin;
+  without it cola logs the failed call and continues.
 - `im:chat` (获取与更新群组信息) is a superset of `im:chat:readonly` — cola only
   reads chat info, so the read-only scope is the minimum.
 - The contact API needs two scopes: one to authorize the call
@@ -212,7 +212,7 @@ start_server = "auto"            # auto (default) | never | eager
 - **`group_completion_notice`** — in group chats, reply to the requester with a
   short completion notice (the streaming card is patched in place, so it does not
   push a new notification). `false` disables it. p2p chats don't need it.
-- **`instant_reminder`** — **experimental**, opt-in, **off by default**: use
+- **`instant_reminder`** — opt-in, **off by default**: use
   Feishu's Instant Reminder to pin the Chat or Topic at the top of the
   requester's message list while a permission or question is pending. The pin
   clears the moment the wait is resolved; it is a **state** that stays until
