@@ -9,6 +9,14 @@ pub enum BridgeError {
     #[error("feishu error: {0}")]
     Feishu(String),
 
+    /// Feishu rejected the CARD CONTENT itself (HTTP 400 `code: 230099`,
+    /// "Failed to create card content"): the platform's parser or a card limit
+    /// refused the JSON, so re-sending the same content never succeeds. The
+    /// render layer degrades the card (fenced markdown) instead of retrying it
+    /// verbatim, which would leave the turn's card frozen forever.
+    #[error("card content rejected ({code}): {detail}")]
+    CardContentRejected { code: i64, detail: String },
+
     #[error("session not found: {0}")]
     SessionNotFound(String),
 

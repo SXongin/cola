@@ -1,6 +1,7 @@
 use serde_json::json;
 
 use super::clean_session_label;
+use super::sanitize::sanitize_markdown;
 use super::shell::card_shell;
 
 /// A notification card telling the Feishu side that OpenChamber (or another
@@ -13,6 +14,7 @@ pub fn build_external_message_card(session_name: &str, preview: &str) -> serde_j
         content.push_str(&format!("**{}**\n", session_name));
     }
     content.push_str(preview);
+    let content = sanitize_markdown(&content);
     card_shell(
         "💬 有新消息",
         "blue",
@@ -28,6 +30,7 @@ pub fn build_resolved_elsewhere_card(kind: &str, detail: &str) -> serde_json::Va
     if !detail.is_empty() {
         body.push_str(&format!("\n\n{}", detail));
     }
+    let body = sanitize_markdown(&body);
     card_shell(
         "✅ 已处理",
         "green",

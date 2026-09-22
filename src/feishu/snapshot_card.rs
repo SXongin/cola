@@ -74,6 +74,7 @@ fn pending_block_elements(
         crate::bridge::request::PendingRequest::Permission(p) => {
             let body = describe_permission(p);
             let sid = p.session_id.as_deref().unwrap_or("");
+            let body = crate::feishu::card::sanitize::CardMarkdown::new().clean(&body);
             let mut els = vec![json!({ "tag": "markdown", "content": format!("🔐 **权限请求**\n{body}") })];
             els.extend(permission_buttons(sid, &p.request_id, &body, directory));
             els
@@ -105,6 +106,9 @@ fn tail_panels(tail: &[TailEntry]) -> Vec<serde_json::Value> {
         return panels;
     }
     panels.push(json!({ "tag": "markdown", "content": "**最近对话**" }));
+    // Transcript text is model/user-authored: sanitize it for the card dialect
+    // (one budget for the card's tail).
+    let mut md = crate::feishu::card::sanitize::CardMarkdown::new();
     for (i, entry) in tail.iter().enumerate() {
         let (role, preview) = tail_preview(entry);
         let title = if preview.is_empty() {
@@ -119,6 +123,7 @@ fn tail_panels(tail: &[TailEntry]) -> Vec<serde_json::Value> {
         } else {
             chunks
         };
+        let chunks: Vec<String> = chunks.iter().map(|c| md.clean(c)).collect();
         // The snapshot is sent once, but SnapshotClaims rebuilds it in place on
         // a claim ack and on remote resolution — so its panels take stable ids
         // too (the tail's order is fixed, so the entry index is stable).

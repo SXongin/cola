@@ -2,6 +2,7 @@ pub(crate) mod help;
 pub(crate) mod notify;
 pub(crate) mod picker;
 pub(crate) mod question;
+pub(crate) mod sanitize;
 pub(crate) mod session;
 pub(crate) mod shell;
 pub(crate) mod tool_render;

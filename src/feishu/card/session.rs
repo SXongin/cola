@@ -21,6 +21,7 @@ use super::shell::card_shell;
 /// A full-width text row (schema-2.0 safe): a single weighted column holding a
 /// markdown element. Shared by the `/switch` and `/dir` card rows.
 fn card_text_row(text: &str) -> serde_json::Value {
+    let text = crate::feishu::card::sanitize::sanitize_markdown(text);
     json!({
         "tag": "column_set",
         "flex_mode": "none",
@@ -200,7 +201,10 @@ pub fn build_switch_card(
         } else {
             format!("**匹配 `{keyword}` 的会话**")
         };
-        elements.push(json!({ "tag": "markdown", "content": header }));
+        elements.push(json!({
+            "tag": "markdown",
+            "content": crate::feishu::card::sanitize::sanitize_markdown(&header)
+        }));
         for s in sessions.iter().take(MAX_SWITCH_ROWS) {
             let label = crate::bridge::display::title_or_id_tail(s);
             // ADR-0022: only the active session is marked; the 本会话 ownership
@@ -292,11 +296,11 @@ pub fn build_force_confirm_card(
         vec![
             json!({
                 "tag": "markdown",
-                "content": format!(
+                "content": crate::feishu::card::sanitize::sanitize_markdown(&format!(
                     "**{label}** 正被 **{owner_name}** 使用。\n`{}` · `{}`",
                     target.directory,
                     crate::bridge::display::id_tail(&target.id)
-                )
+                ))
             }),
             json!({
                 "tag": "markdown",
