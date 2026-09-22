@@ -38,7 +38,10 @@ jobs:
           key: pbbp2-corpus-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: pbbp2-corpus-
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        # Version-pinned rather than floating: the weekly job is the only
+        # place this tool runs, so the installed version should change only
+        # when someone bumps it here deliberately.
+        run: cargo install cargo-fuzz --locked --version 0.13.2
       - name: Fuzz pbbp2
         # `-timeout=25` keeps a hanging input inside the budget: libFuzzer
         # turns it into a timeout reproducer and a failed run instead of
