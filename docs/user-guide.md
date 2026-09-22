@@ -12,6 +12,7 @@ All runtime state defaults to `~/.cola/`:
 | `cola.toml` | configuration | `./cola.toml` (cwd) or `cola --config <path>` |
 | `cola.log` | logs (append, daily rotation) | `cola --log-file <path>` |
 | `sessions.json` | Feishu thread ↔ OpenCode session mapping | `[bridge] session_file` |
+| `access.json` | Access List (the Host; ADR-0035) | `[bridge] access_file` |
 | `cola.lock` | singleton lock (one cola per machine) | — |
 | `restart-notify.json` | restart announcement bookkeeping | — |
 
@@ -400,6 +401,13 @@ Notes:
   `/switch <id>` re-points the topic at an existing session instead. The `/dir`
   card's pick and 建话题 follow the same timing (建话题's cover card shows
   「下一条消息创建」 until then).
+- The `/dir` card's rows are a **union** (ADR-0046): the shared store's session
+  directories, the directories cola has mapped — they survive another client
+  deleting their sessions — and the conversation's current directory, so 当前
+  is always markable and a pending-only directory is never missing. "Recent"
+  therefore means what cola knows, not what still exists on the server: a
+  directory whose sessions were cleaned up can reappear. `/switch forget` and
+  removing the thread are what drop a mapped directory.
 - `/agent`, `/model`, `/think`, `/autoaccept` are **per-session** overrides sent
   with the next message and persisted across restarts. On a session that is still
   pending (`/new`, `/dir` or `/topic` before its first message — including its

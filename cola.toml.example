@@ -34,6 +34,9 @@ app_secret = "your-app-secret"
 [bridge]
 # Path to the session mapping file (chat thread <-> OpenCode session).
 # session_file = "~/.cola/sessions.json"
+# Path to the Access List file (the Host, ADR-0035). A missing file means the
+# bot is unclaimed and refuses every message until /claim.
+# access_file = "~/.cola/access.json"
 # Default directory for new sessions when the conversation has no active
 # session (a fresh chat, or after /forget). Leave unset to fall back to the
 # cwd. /new inherits the active session's directory; /dir still overrides
