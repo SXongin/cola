@@ -219,10 +219,17 @@ release cannot be revoked. Two operational rules follow:
 - If a version must be yanked on crates.io, remove the matching GitHub Release
   too, or GitHub-channel installs keep receiving it.
 
-Release notes are generated from merged PR titles (`generate_release_notes`).
-A release that ships a user-visible compatibility change must add the note
-itself (`gh release edit <version>`) — e.g. ADR-0041's `sessions.json` format
-change, which older binaries read as an empty mapping.
+Release notes are LLM-generated highlights prepended to the native
+`generate_release_notes` list (ADR-0047): the `notes` job reads the merged PRs
+since the previous tag and makes one tool-free model call, and `notes-apply`
+edits the published release — a generation failure leaves the native list as
+the body. A release that ships a user-visible compatibility change should
+still verify the highlights call it out; `gh release edit <version>` is the
+correction channel, and the automated pass only repeats what a PR or ADR
+states (e.g. ADR-0041's `sessions.json` format change, which older binaries
+read as an empty mapping). Rehearse on an existing tag range with
+`gh workflow run release.yml -f tag=<tag>`: it prints the notes and edits
+nothing.
 
 ### Release smoke test
 
