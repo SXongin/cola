@@ -157,16 +157,19 @@ describes.
 
 Item 5 is amended: the `pbbp2` target is now wired into CI (issue #264), as
 `.github/workflows/fuzz.yml` — a weekly scheduled run plus `workflow_dispatch`
-that fuzzes for 300 s, restores and saves `fuzz/corpus` through the Actions
-cache (a per-run key plus a shared `restore-keys` prefix, since cache entries
-are immutable), and uploads crash reproducers as an artifact. The target itself
-is unchanged.
+that fuzzes for 300 s on a nightly toolchain (cargo-fuzz requires nightly),
+restores and saves `fuzz/corpus` through the Actions cache (a per-run key plus
+a shared `restore-keys` prefix, since cache entries are immutable), and uploads
+crash reproducers as an artifact. The target itself is unchanged.
 
-ClusterFuzzLite and OSS-Fuzz stay rejected: this is one 446-line parser, and
-neither option buys it anything the plain job does not, at a much higher
-infrastructure cost. The consequence is recorded here so it is not
-re-litigated: Scorecard's `Fuzzing` check recognises only OSS-Fuzz projects,
-ClusterFuzzLite deployments, and a short list of language-native fuzzers (Go,
-Haskell, JS/TS, Erlang, C#) — **not Rust `cargo-fuzz`** — so the check stays at
-0 despite this work. That zero is a deliberate, accepted no, not an unfinished
-item: do not adopt ClusterFuzzLite just to move it.
+ClusterFuzzLite and OSS-Fuzz stay rejected: this is one small hand-written
+parser, and neither option buys it anything the plain job does not, at a much
+higher infrastructure cost. The Scorecard argument runs the other way, and is
+recorded here because this ADR originally listed `Fuzzing` as an open,
+actionable zero: the check detects the target itself — it matches
+`libfuzzer_sys` in any `*.rs` file (`RustCargoFuzzer`) — so it flipped to 10
+when item 5's target landed (`a3003fa`, 2026-09-14) and reads the same whether
+or not anything ever runs it (the published 2026-09-22 result at `c83eedf`
+shows `Fuzzing` 10). Wiring the weekly job therefore changes no score; it
+exists for the bug-finding value only. Do not adopt ClusterFuzzLite to "fix" a
+check that the fuzz target already satisfies.
