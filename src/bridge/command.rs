@@ -785,6 +785,7 @@ pub(crate) async fn handle_command(
                 core.feishu.reply_text(message_id, NO_LIVE_CARD).await?;
                 return Ok(());
             }
+            tracing::info!("card pull: session {session_id} live card split requested");
             crate::bridge::render::split_card_chain(
                 core,
                 &session_id,
