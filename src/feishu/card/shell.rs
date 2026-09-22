@@ -60,7 +60,7 @@ pub struct CardBuilder {
     progress: HeaderProgress,
     /// This card's markdown hygiene: Feishu-hostile model text is neutralized
     /// and the card's table budget tracked (see [`CardMarkdown`]).
-    md: CardMarkdown,
+    markdown: CardMarkdown,
 }
 
 /// Assemble a JSON 2.0 card from a ready-made header and body elements: the
@@ -101,7 +101,7 @@ impl CardBuilder {
             date: None,
             error_buttons: Vec::new(),
             progress: HeaderProgress::default(),
-            md: CardMarkdown::new(),
+            markdown: CardMarkdown::new(),
         }
     }
 
@@ -156,7 +156,7 @@ impl CardBuilder {
     /// of freezing the card on a rejection that repeats forever.
     pub fn with_fenced_markdown(mut self, fenced: bool) -> Self {
         if fenced {
-            self.md = CardMarkdown::fenced();
+            self.markdown = CardMarkdown::fenced();
         }
         self
     }
@@ -167,7 +167,7 @@ impl CardBuilder {
         // bounds how much text one card carries. The split is a size budget,
         // not a workaround for a Feishu truncation. The text is sanitized as
         // one blob (per-card table budget), then chunked.
-        if self.md.is_fenced() {
+        if self.markdown.is_fenced() {
             // Fallback mode: fence each chunk separately, so no element holds
             // an unclosed fence.
             for chunk in chunk_text(text, MAX_ELEMENT_TEXT_CHARS) {
@@ -176,7 +176,7 @@ impl CardBuilder {
             }
             return self;
         }
-        let text = self.md.clean(text);
+        let text = self.markdown.clean(text);
         for chunk in chunk_text(&text, MAX_ELEMENT_TEXT_CHARS) {
             self.body.push(json!({ "tag": "markdown", "content": chunk }));
         }
@@ -195,12 +195,7 @@ impl CardBuilder {
         element_id: Option<&str>,
     ) -> Self {
         if !reasoning.is_empty() {
-            let body = truncate_md(reasoning, 800);
-            let body = if self.md.is_fenced() {
-                fenced_code(&body, None)
-            } else {
-                self.md.clean(&body)
-            };
+            let body = self.markdown.element(&truncate_md(reasoning, 800));
             self.body.push(collapsible_panel(
                 &format!("💭 推理过程{}", panel_time_suffix(at_ms)),
                 &body,
@@ -228,7 +223,7 @@ impl CardBuilder {
         // All tools are shown; the streaming card splits into continuation
         // cards when the component estimate exceeds the Feishu limit.
         self.body
-            .push(tool_panel_element(&panel, at_ms, element_id, &mut self.md));
+            .push(tool_panel_element(&panel, at_ms, element_id, &mut self.markdown));
         self
     }
 
@@ -533,6 +528,24 @@ mod tests {
             content_of(50).contains("```\n| a | b |\n|---|---|"),
             "50 rows are fenced: {}",
             content_of(50)
+        );
+    }
+
+    /// The production 11311 hit a collapsible reasoning panel (the reporter's
+    /// log named `elements -> [3](tag: collapsible_panel)`), so the panel body
+    /// is sanitized like any other model text.
+    #[test]
+    fn reasoning_panels_are_sanitized() {
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_reasoning_at("thinking about <number_tag> and <link>", None, Some("reason_1"))
+            .build();
+        let content = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(
+            content.contains("&#60;number_tag>") && content.contains("&#60;link>"),
+            "reasoning markdown is escaped: {content}"
         );
     }
 

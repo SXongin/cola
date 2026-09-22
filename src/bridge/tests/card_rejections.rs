@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use crate::bridge::streaming::{CardSession, StreamAccumulator};
+use crate::bridge::streaming::{CardFallback, CardSession, StreamAccumulator};
 use crate::bridge::test_support::*;
 use crate::feishu::card::CardState;
 
@@ -32,6 +32,20 @@ async fn updates_of(platform: &RecordingPlatform, message_id: &str) -> Vec<serde
                 message_id: mid,
                 card,
             } if mid == message_id => Some(card.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every card the platform was asked to send, in call order.
+async fn sent_cards(platform: &RecordingPlatform) -> Vec<serde_json::Value> {
+    platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::ReplyCard { card, .. } => Some(card.clone()),
             _ => None,
         })
         .collect()
@@ -97,8 +111,9 @@ async fn a_rejected_card_update_is_retried_fenced() {
         "the retry fences the model markdown: {retry}"
     );
     let cards = app.cards.lock().await;
-    assert!(
-        cards.get("ses_test").unwrap().acc.fence_markdown,
+    assert_eq!(
+        cards.get("ses_test").unwrap().acc.card_fallback,
+        CardFallback::Fenced,
         "the fallback is sticky for the turn"
     );
 }
@@ -174,25 +189,66 @@ async fn a_rejected_finalized_update_is_re_sent_fenced_on_the_same_card() {
     );
 }
 
-/// The fenced retry happens once. If Feishu rejects that too, the flush stops
-/// instead of PATCHing the same content forever.
+/// The continuation `reply_card` can be rejected too: its retry re-renders the
+/// same slice fenced and lands.
 #[tokio::test]
-async fn a_rejected_card_update_is_retried_only_once() {
+async fn a_rejected_continuation_send_is_retried_fenced() {
+    let (app, platform) = app_with_live_card("回答 <number_tag> 里。").await;
+    // The tracked card is already finalized, so this flush owes a continuation.
+    {
+        let mut cards = app.cards.lock().await;
+        let session = cards.get_mut("ses_test").unwrap();
+        session.card_is_live = false;
+        session.acc.reply_to_message_id = Some("msg_1".into());
+    }
+    platform
+        .fail_reply_card_content_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    crate::bridge::render::flush_card(&app.core, "ses_test").await;
+
+    let cards = sent_cards(&platform).await;
+    assert_eq!(
+        cards.len(),
+        2,
+        "the rejected send and the fenced retry: {cards:?}"
+    );
+    assert!(
+        cards[1].to_string().contains("```") && cards[1].to_string().contains("<number_tag>"),
+        "the retry fences the model markdown: {}",
+        cards[1]
+    );
+    assert_eq!(
+        app.cards.lock().await.get("ses_test").unwrap().acc.card_fallback,
+        CardFallback::Fenced
+    );
+}
+
+/// A second rejection means fencing cannot help: the card is suspended, and a
+/// later flush makes no further PATCH attempts (no API hammering).
+#[tokio::test]
+async fn a_second_rejection_suspends_the_card() {
     let (app, platform) = app_with_live_card("回答 <number_tag> 里。").await;
     platform
         .fail_update_card_content_count
         .store(2, std::sync::atomic::Ordering::SeqCst);
 
     crate::bridge::render::flush_card(&app.core, "ses_test").await;
-
-    let updates = updates_of(&platform, "om_live").await;
     assert_eq!(
-        updates.len(),
+        updates_of(&platform, "om_live").await.len(),
         2,
-        "no third attempt on the same content: {updates:?}"
+        "the plain attempt and the fenced one only"
     );
-    assert!(
-        app.cards.lock().await.get("ses_test").unwrap().acc.fence_markdown,
-        "the turn stays in the fallback for later slices"
+    assert_eq!(
+        app.cards.lock().await.get("ses_test").unwrap().acc.card_fallback,
+        CardFallback::Suspended
+    );
+
+    // A later poll must not PATCH the suspended card again.
+    crate::bridge::render::flush_card(&app.core, "ses_test").await;
+    assert_eq!(
+        updates_of(&platform, "om_live").await.len(),
+        2,
+        "a suspended card is not retried on later flushes"
     );
 }
