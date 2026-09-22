@@ -233,13 +233,25 @@ pub struct WorkContext {
     pub git: crate::git::GitState,
 }
 
-/// One Supplement waiting in a Card Chain's split queue (ADR-0043): the
-/// message its continuation must reply to, and whether its receipt line has
-/// already been written into the accumulator. The flag keeps the receipt
+/// Why a Card Chain split was requested: each cause writes its own receipt
+/// line on the continuation (ADR-0043).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplitKind {
+    /// A Supplement landed below the live card (ADR-0043).
+    Supplement,
+    /// The user explicitly pulled the live card down with `/card`
+    /// (ADR-0043, 2026-09-22 amendment).
+    Pull,
+}
+
+/// One queued Card Chain split (ADR-0043): the message its continuation must
+/// reply to, why it was requested, and whether its receipt line has already
+/// been written into the accumulator. The flag keeps the receipt
 /// exactly-once when a continuation send fails and the split is retried.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingSplit {
     pub reply_to: String,
+    pub kind: SplitKind,
     pub receipt_pushed: bool,
 }
 
@@ -293,6 +305,18 @@ impl CardSession {
             pending_split: Vec::new(),
             card_is_live: true,
         }
+    }
+
+    /// True while this card belongs to a Turn that has not finished: the pull
+    /// condition for `/card` (ADR-0043, 2026-09-22 amendment). A completed
+    /// (Done) or failed (Error) card session stays in `SharedCore::cards` until
+    /// the next Turn replaces it, so the map's key alone does not mean a live
+    /// card.
+    pub fn is_running(&self) -> bool {
+        !matches!(
+            self.acc.card_state,
+            crate::feishu::card::CardState::Done | crate::feishu::card::CardState::Error
+        )
     }
 
     /// Re-point the live card identity at a new message (ADR-0028: a re-adopt

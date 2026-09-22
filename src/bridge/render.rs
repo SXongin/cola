@@ -469,18 +469,29 @@ pub(crate) const MAX_CARD_CHAIN: usize = 8;
 /// — the same visual form as an Interaction Receipt, keyed in timeline order.
 const SUPPLEMENT_RECEIPT: &str = "📨 已收到补充";
 
-/// Split `session_id`'s Card Chain at a Supplement (ADR-0043): append the
-/// supplement to the chain's split queue and flush. The flush finalizes the
-/// live card with the standard split header (keeping everything before the
-/// split) and sends a continuation that replies to the NEWEST queued
-/// supplement, carrying one receipt per queued supplement plus only the
-/// content that arrives after the split — so the live card stays the newest
-/// message and no supplement is coalesced away. Runs under the session's
-/// card-write lock, so concurrent supplements queue in arrival order and the
-/// finalization reuses the size-split path (the live Interaction Blocks
-/// migrate to the continuation; the previous card's controls are settled).
-/// No-op when the session has no live card.
-pub(crate) async fn split_card_chain(core: &Arc<SharedCore>, session_id: &str, reply_to: &str) {
+/// The status line `/card` leaves on its continuation card (ADR-0043,
+/// 2026-09-22 amendment) — the pull's acknowledgement, same visual form as an
+/// Interaction Receipt.
+const PULL_RECEIPT: &str = "⏬ 实时卡片已移到底部";
+
+/// Split `session_id`'s Card Chain at a user message (ADR-0043): append the
+/// split to the chain's split queue and flush. The flush finalizes the live
+/// card with the standard split header (keeping everything before the split)
+/// and sends a continuation that replies to the NEWEST queued split, carrying
+/// one receipt per queued split plus only the content that arrives after the
+/// split — so the live card stays the newest message and no supplement is
+/// coalesced away. `kind` selects the receipt line and nothing else: a
+/// Supplement and an explicit `/card` pull follow the same finalize-and-handoff
+/// path. Runs under the session's card-write lock, so concurrent requests
+/// queue in arrival order and the finalization reuses the size-split path (the
+/// live Interaction Blocks migrate to the continuation; the previous card's
+/// controls are settled). No-op when the session has no live card.
+pub(crate) async fn split_card_chain(
+    core: &Arc<SharedCore>,
+    session_id: &str,
+    reply_to: &str,
+    kind: crate::bridge::streaming::SplitKind,
+) {
     let write_lock = core.card_write_lock(session_id).await;
     let _guard = write_lock.lock().await;
     {
@@ -490,6 +501,7 @@ pub(crate) async fn split_card_chain(core: &Arc<SharedCore>, session_id: &str, r
         };
         card.pending_split.push(crate::bridge::streaming::PendingSplit {
             reply_to: reply_to.to_string(),
+            kind,
             receipt_pushed: false,
         });
     }
@@ -722,7 +734,11 @@ async fn push_queued_receipts(core: &Arc<SharedCore>, session_id: &str) {
         if card.pending_split[i].receipt_pushed {
             continue;
         }
-        card.acc.push_receipt(SUPPLEMENT_RECEIPT);
+        let receipt = match card.pending_split[i].kind {
+            crate::bridge::streaming::SplitKind::Supplement => SUPPLEMENT_RECEIPT,
+            crate::bridge::streaming::SplitKind::Pull => PULL_RECEIPT,
+        };
+        card.acc.push_receipt(receipt);
         card.pending_split[i].receipt_pushed = true;
     }
 }
