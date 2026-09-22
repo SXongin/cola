@@ -47,5 +47,10 @@ app_secret = "your-app-secret"
 # (the streaming card patch pushes no notification, so a long task's end is
 # otherwise easy to miss). Off by default.
 # long_task_notice = true
+# Pin the Chat or Topic (and the waiting card's message) with Feishu's
+# Instant Reminder while a permission or question waits, so a turn blocked
+# on you is hard to miss; it clears when the wait resolves. Off by default;
+# needs the optional im:datasync.feed_card.time_sensitive:write scope.
+# instant_reminder = true
 # How many days of rotated daily logs to keep (default 14).
 # log_days = 14
