@@ -52,6 +52,9 @@ byproduct**. Concretely:
    fuzzing (ClusterFuzzLite, OSS-Fuzz) is recurring infrastructure this project
    does not need. The target immediately justified itself — see the overflow
    fix it forced in `read_len_delimited`.
+
+   > **Amended 2026-09-22**: it now runs weekly in CI as a plain scheduled
+   > job; see the amendment at the end of this ADR.
 6. **AI review is the review gate until a human co-maintainer exists.**
    CodeRabbit (free for public repositories) reviews a PR on request; with
    `request_changes_workflow: true` it approves once its unresolved comments
@@ -149,3 +152,21 @@ commit, the code it bumps was already reviewed on `main`, and the release cut
 merges with the admin bypass — so the missing approval changes nothing. Every
 other non-draft in-repo PR still gets the review the 2026-09-15 amendment
 describes.
+
+## Amendment (2026-09-22): the pbbp2 fuzzer runs weekly as a plain scheduled job
+
+Item 5 is amended: the `pbbp2` target is now wired into CI (issue #264), as
+`.github/workflows/fuzz.yml` — a weekly scheduled run plus `workflow_dispatch`
+that fuzzes for 300 s, restores and saves `fuzz/corpus` through the Actions
+cache (a per-run key plus a shared `restore-keys` prefix, since cache entries
+are immutable), and uploads crash reproducers as an artifact. The target itself
+is unchanged.
+
+ClusterFuzzLite and OSS-Fuzz stay rejected: this is one 446-line parser, and
+neither option buys it anything the plain job does not, at a much higher
+infrastructure cost. The consequence is recorded here so it is not
+re-litigated: Scorecard's `Fuzzing` check recognises only OSS-Fuzz projects,
+ClusterFuzzLite deployments, and a short list of language-native fuzzers (Go,
+Haskell, JS/TS, Erlang, C#) — **not Rust `cargo-fuzz`** — so the check stays at
+0 despite this work. That zero is a deliberate, accepted no, not an unfinished
+item: do not adopt ClusterFuzzLite just to move it.
