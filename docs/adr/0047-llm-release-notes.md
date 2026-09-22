@@ -12,8 +12,9 @@ changelog automation as an additive step; this is that step.
 ## Decision
 
 - **Publish first, notes after.** `publish` creates the release with the native
-  body; `notes` then generates the artifact and `notes-apply` edits the
-  release. A hung or failing model call costs the release nothing.
+  body; `notes` generates the highlights artifact alongside the builds (no
+  `needs`), and `notes-apply` — which waits for `publish` — edits the release.
+  A hung or failing model call costs the release nothing.
 - **Read-only generation, one writer.** The `notes` job has `contents: read`
   and `pull-requests: read`, the model runs with every tool permission denied
   (`opencode run` auto-rejects an ask rather than hanging), and nothing evals
@@ -22,7 +23,9 @@ changelog automation as an additive step; this is that step.
 - **Highlights + native list.** The body is English `Highlights` / `Fixes` /
   `Breaking changes` sections (empty ones omitted, at most 8 bullets) followed
   by the untouched native list. That list is the safety net: no merged PR
-  disappears from the release body even if the model ignores it.
+  disappears from the release body even if the model ignores it. The material
+  handed to the model is byte-capped, which can thin the highlights but never
+  the list.
 - **Breaking changes need evidence.** The model may only list a compatibility
   change when a PR or ADR in the material states one, with the source cited.
   The manual `gh release edit` note is no longer a pre-step; it stays the
