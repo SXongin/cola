@@ -26,7 +26,8 @@ async fn current_project_directory_reads_pending_first() {
 }
 
 /// The `/dir` card's 当前 directory follows the pending, not the superseded
-/// active session.
+/// active session — and the pending's directory is carried on the card even
+/// though no server session or mapping exists for it yet (ADR-0041).
 #[tokio::test]
 async fn dir_card_current_reads_pending() {
     let _wd = test_work_dir();
@@ -39,7 +40,11 @@ async fn dir_card_current_reads_pending() {
     seed_pending(&app, PendingEntry::new(key(), "/work/pending")).await;
 
     let (dirs, current) = crate::bridge::command::dir_card_data(&app.core, &key()).await;
-    assert_eq!(dirs, vec!["/work/a".to_string()]);
+    assert_eq!(
+        dirs,
+        vec!["/work/pending".to_string(), "/work/a".to_string()],
+        "the current directory is never missing from the card"
+    );
     assert_eq!(current.as_deref(), Some("/work/pending"));
 }
 

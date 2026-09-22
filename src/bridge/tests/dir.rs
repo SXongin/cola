@@ -159,9 +159,9 @@ async fn dir_card_data_dedupes_sorts_and_filters() {
 }
 
 /// Directories cola has mapped are unioned in after the session-derived ones
-/// (deduped, in activation order): they survive the server-side deletion or
-/// archival that drops a directory's last session — the exact case the shared
-/// store stops reporting it.
+/// (deduped, most recently mapped first): they survive the server-side deletion
+/// or archival that drops a directory's last session — the exact case the
+/// shared store stops reporting it.
 #[tokio::test]
 async fn dir_card_data_unions_store_directories_dropped_by_the_server() {
     let _wd = test_work_dir();
@@ -192,7 +192,7 @@ async fn dir_card_data_unions_store_directories_dropped_by_the_server() {
             "/work/arch".to_string(),
             "/work/gone".to_string()
         ],
-        "server-derived dirs first, then cola's own in activation order"
+        "server-derived dirs first, then cola's own, most recently mapped first"
     );
     assert_eq!(current, Some("/work/arch".to_string()));
 }
@@ -213,6 +213,28 @@ async fn dir_card_data_shows_store_directories_with_an_empty_session_list() {
     let (dirs, current) = crate::bridge::command::dir_card_data(&app.core, &key).await;
     assert_eq!(dirs, vec!["/work/x".to_string()]);
     assert_eq!(current, Some("/work/x".to_string()));
+}
+
+/// A Pending Session's directory has no server session and no mapping entry
+/// (ADR-0041), so neither source carries it; the card still has to render it
+/// (as `当前`) instead of falling back to the empty-state hint.
+#[tokio::test]
+async fn dir_card_data_shows_a_pending_only_directory() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+
+    seed_pending(
+        &app,
+        crate::bridge::session::PendingEntry::new(key.clone(), "/work/pending"),
+    )
+    .await;
+
+    let (dirs, current) = crate::bridge::command::dir_card_data(&app.core, &key).await;
+    assert_eq!(dirs, vec!["/work/pending".to_string()]);
+    assert_eq!(current, Some("/work/pending".to_string()));
 }
 
 /// The `/dir` Recent Directories card's `pick` op declares a Pending Session
