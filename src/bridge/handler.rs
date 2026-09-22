@@ -603,7 +603,13 @@ impl App {
                 // supplement — carries the receipt (and only the content that
                 // arrives after it) and becomes the tracked live card. There is
                 // NO separate acknowledgement message.
-                crate::bridge::render::split_card_chain(&self.core, &session_id, &message_id).await;
+                crate::bridge::render::split_card_chain(
+                    &self.core,
+                    &session_id,
+                    &message_id,
+                    crate::bridge::streaming::SplitKind::Supplement,
+                )
+                .await;
                 return Ok(());
             }
         }

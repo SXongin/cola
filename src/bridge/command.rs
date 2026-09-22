@@ -31,6 +31,10 @@ pub enum Command {
     Stop,
     /// Compact the current session context
     Compact,
+    /// Pull the live card back to the newest position: split the Card Chain at
+    /// this command message (ADR-0043, 2026-09-22 amendment) — the explicit
+    /// exception to "commands never split the chain".
+    Card,
     /// Switch agent in the current session: an available agent name, or
     /// `--reset` to clear the per-session override (back to the server's
     /// default agent).
@@ -102,6 +106,11 @@ pub(crate) const TOPIC_NEST_REJECTION: &str =
 /// the keyword form and the no-arg picker card (ADR-0016, ADR-0023).
 pub(crate) const TOPIC_ADOPT_NEST_REJECTION: &str =
     "⚠️ /topic --adopt 只能从会话顶层使用，不能在话题里开话题。请在主会话里发 /topic --adopt <会话>。";
+
+/// `/card` with no live Card to pull down (ADR-0043, 2026-09-22 amendment):
+/// no Turn is rendering, so there is nothing to move — one text notice, no
+/// card.
+const NO_LIVE_CARD: &str = "当前没有正在运行的实时卡片。";
 
 /// What `/switch` should do (ADR-0012). The text-direct forms all share the
 /// session store; the no-arg form pops the interactive card.
@@ -238,6 +247,7 @@ pub fn parse_command(text: &str) -> Option<Command> {
         },
         "/stop" => Some(Command::Stop),
         "/compact" => Some(Command::Compact),
+        "/card" => Some(Command::Card),
         "/agent" => match arg {
             Some(p) => Some(Command::Agent(p.to_string())),
             None => Some(Command::AgentCard),
@@ -291,6 +301,7 @@ pub fn help_text() -> String {
 `/name <name>` · Rename current session server-side (on a pending, set the creation title)
 `/stop` · Interrupt execution
 `/compact` · Compact context
+`/card` · Pull the live card back to the newest position (after command replies bury it)
 `/agent <name>` · Switch agent (takes effect next message)
 `/model <p/m>` · Switch model (takes effect next message)
 `/think [等级]` · Set/clear thinking level (per model; takes effect next message)
@@ -338,6 +349,9 @@ pub fn command_help(name: &str) -> Option<String> {
         }
         "compact" => {
             "/compact\nCompact the current session's context: summarize older messages to free context window."
+        }
+        "card" => {
+            "/card\nPull the live card back to the newest position: split the Card Chain at this command, so a continuation card becomes the newest message and keeps receiving updates (ADR-0043). Use it after running commands mid-turn — their replies deliberately stay the newest messages, which buries the live card above them. Nothing happens without a running Turn: cola replies a notice. The previous card is finalized with the 部分完成，继续中 header and keeps everything streamed before the pull; the continuation carries the status line and only the content that arrives after it."
         }
         "agent" => {
             "/agent <name>\nSwitch the agent for the current session — a per-session override sent on the NEXT message (the OpenCode server has no agent-switch endpoint). Without an override the server's default agent applies; the card (`/agent` alone) shows the current one. `--reset` clears the override back to the server default. Persisted across restarts. On a Pending Session (`/new`/`/dir`/`/topic` before its first message) the override is recorded on the pending and applies to the session the first message creates. Unknown agent names surface as an error on the next prompt.\nExample: `/agent build`"
@@ -753,6 +767,31 @@ pub(crate) async fn handle_command(
                     )
                     .await?;
             }
+        }
+        Command::Card => {
+            // The pull is the explicit exception to "commands never split the
+            // chain" (ADR-0043, 2026-09-22 amendment): mid-turn, command
+            // replies bury the live card above them, and this command moves
+            // the chain's live continuation back to the newest message.
+            let Some(session_id) = core.get_session_id(&thread_key).await else {
+                core.feishu.reply_text(message_id, NO_LIVE_CARD).await?;
+                return Ok(());
+            };
+            let running = {
+                let cards = core.cards.lock().await;
+                cards.get(&session_id).is_some_and(|card| card.is_running())
+            };
+            if !running {
+                core.feishu.reply_text(message_id, NO_LIVE_CARD).await?;
+                return Ok(());
+            }
+            crate::bridge::render::split_card_chain(
+                core,
+                &session_id,
+                message_id,
+                crate::bridge::streaming::SplitKind::Pull,
+            )
+            .await;
         }
         Command::AgentCard => {
             send_agent_card(core, &thread_key, message_id).await?;
@@ -2369,6 +2408,14 @@ mod tests {
     #[test]
     fn parse_compact() {
         assert_eq!(parse_command("/compact"), Some(Command::Compact));
+    }
+
+    #[test]
+    fn parse_card() {
+        assert_eq!(parse_command("/card"), Some(Command::Card));
+        // Like `/stop`/`/version`, a stray argument is ignored.
+        assert_eq!(parse_command("/card now"), Some(Command::Card));
+        assert_eq!(parse_command("/CARD"), Some(Command::Card));
     }
 
     #[test]
