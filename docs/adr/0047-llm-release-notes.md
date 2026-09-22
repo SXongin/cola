@@ -18,7 +18,8 @@ changelog automation as an additive step; this is that step.
 - **Read-only generation, one writer.** The `notes` job has `contents: read`
   and `pull-requests: read`, the model runs with every tool permission denied
   (`opencode run` auto-rejects an ask rather than hanging), and nothing evals
-  its output. `notes-apply` is the only job with `contents: write`; its only
+  its output. `notes-apply` is the only job that writes the release body (the
+  pre-existing `publish` job keeps its `contents: write` for assets); its only
   input is the artifact file.
 - **Highlights + native list.** The body is English `Highlights` / `Fixes` /
   `Breaking changes` sections (empty ones omitted, at most 8 bullets) followed
@@ -27,9 +28,10 @@ changelog automation as an additive step; this is that step.
   handed to the model is byte-capped, which can thin the highlights but never
   the list.
 - **Breaking changes need evidence.** The model may only list a compatibility
-  change when a PR or ADR in the material states one, with the source cited.
-  The manual `gh release edit` note is no longer a pre-step; it stays the
-  correction channel.
+  change when a merged PR's body states one (a body citing an ADR counts, and
+  the material is PR bodies only), with the source cited. The manual
+  `gh release edit` note is no longer a pre-step; it stays the correction
+  channel (ADR-0041's `sessions.json` note is the model case).
 - **No `CHANGELOG.md`.** Notes are GitHub-side metadata. A repository file
   would have to be committed before the tag, making the notes a release gate
   and violating the tag-on-main contract (ADR-0033).

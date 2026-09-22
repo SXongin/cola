@@ -75,7 +75,10 @@ accepts the legacy bare array, and an unreadable file warns and starts empty.
 Backward is not: an older binary parses the new object with its old bare-array
 loader, the parse fails, and its thread→session mapping comes up empty. The
 release that ships this format change must carry a note about it in its
-release notes.
+release notes. Since ADR-0047 that note is normally produced by the automated
+release-notes pass (the model may only state a compatibility change a merged
+PR's body supports); `gh release edit` remains the correction channel, so this
+requirement is unchanged.
 
 ## Domain note
 
