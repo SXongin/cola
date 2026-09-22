@@ -158,6 +158,63 @@ async fn dir_card_data_dedupes_sorts_and_filters() {
     assert_eq!(current, None);
 }
 
+/// Directories cola has mapped are unioned in after the session-derived ones
+/// (deduped, in activation order): they survive the server-side deletion or
+/// archival that drops a directory's last session — the exact case the shared
+/// store stops reporting it.
+#[tokio::test]
+async fn dir_card_data_unions_store_directories_dropped_by_the_server() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    let mut archived = list_session("ses_arch", "归档", "/work/arch", 888);
+    archived.time = Some(opencode::types::SessionTime {
+        created: 1,
+        updated: 888,
+        archived: Some(1),
+    });
+    backend.session_list = vec![list_session("ses_a", "A", "/work/a", 100), archived];
+    let (app, _platform) = build_app(cfg, backend).await;
+
+    // /work/a is mapped too (dedup), /work/gone's session was deleted
+    // server-side, /work/arch's only session is archived (filtered out).
+    seed_session(&app, "ses_a", "/work/a").await;
+    seed_session(&app, "ses_gone", "/work/gone").await;
+    seed_session(&app, "ses_arch", "/work/arch").await;
+
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    let (dirs, current) = crate::bridge::command::dir_card_data(&app.core, &key).await;
+    assert_eq!(
+        dirs,
+        vec![
+            "/work/a".to_string(),
+            "/work/arch".to_string(),
+            "/work/gone".to_string()
+        ],
+        "server-derived dirs first, then cola's own in activation order"
+    );
+    assert_eq!(current, Some("/work/arch".to_string()));
+}
+
+/// An empty session list (fresh or swapped store, or a failed fetch — the
+/// `unwrap_or_default`) still renders the directories cola has mapped instead
+/// of the empty-state hint.
+#[tokio::test]
+async fn dir_card_data_shows_store_directories_with_an_empty_session_list() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+    seed_session(&app, "ses_x", "/work/x").await;
+
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    let (dirs, current) = crate::bridge::command::dir_card_data(&app.core, &key).await;
+    assert_eq!(dirs, vec!["/work/x".to_string()]);
+    assert_eq!(current, Some("/work/x".to_string()));
+}
+
 /// The `/dir` Recent Directories card's `pick` op declares a Pending Session
 /// rooted at the picked directory (the card form of `/dir <path>`, ADR-0041):
 /// no server session is created, and the refreshed card marks the pending's

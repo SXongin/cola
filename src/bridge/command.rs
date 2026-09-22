@@ -1216,9 +1216,13 @@ async fn send_switch_card(
 
 /// Fetch + shape the data the `/dir` Recent Directories card renders: distinct
 /// directories of recently-active sessions (children and archived excluded,
-/// deduped by directory, sorted by last activity), plus the thread's current
-/// directory. Shared by the text send path (`send_dir_card`) and the card ack
-/// refresh (`App::build_dir_card_for`) so both render from one source of truth.
+/// deduped by directory, sorted by last activity), unioned with the
+/// directories cola has mapped, plus the thread's current directory. The
+/// session list alone loses a directory as soon as its last session is
+/// deleted or archived (OpenChamber's retention, `opencode session delete`),
+/// while the SessionStore is cola's own file and keeps its mappings. Shared by
+/// the text send path (`send_dir_card`) and the card ack refresh
+/// (`App::build_dir_card_for`) so both render from one source of truth.
 pub(crate) async fn dir_card_data(
     core: &Arc<SharedCore>,
     thread_key: &ThreadKey,
@@ -1239,9 +1243,20 @@ pub(crate) async fn dir_card_data(
         }
     }
     by_dir.sort_by_key(|(_, updated)| std::cmp::Reverse(*updated));
-    let dirs: Vec<String> = by_dir.into_iter().map(|(d, _)| d).collect();
+    let mut dirs: Vec<String> = by_dir.into_iter().map(|(d, _)| d).collect();
     // Pending-first (ADR-0041): `get_active` is `None` while a pending exists.
-    let current_dir = core.sessions.lock().await.current_directory(thread_key);
+    let (mapped_dirs, current_dir) = {
+        let store = core.sessions.lock().await;
+        (store.directories(), store.current_directory(thread_key))
+    };
+    // The store lists a directory per mapping, in activation order — the
+    // sensible tail position for directories the session list no longer
+    // carries (their sessions were deleted or archived).
+    for dir in mapped_dirs {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
     (dirs, current_dir)
 }
 
