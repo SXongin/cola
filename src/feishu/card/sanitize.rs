@@ -36,7 +36,7 @@ pub(crate) const MAX_CARD_TABLES: usize = 5;
 pub(crate) const MAX_TABLE_ROWS: usize = 49;
 
 /// Feishu's documented escape for a literal `<` in card markdown.
-const LT: &str = "&#60;";
+const LESS_THAN_ESCAPE: &str = "&#60;";
 
 /// Sanitize a single markdown element for its own card — for one-shot cards
 /// whose text never shares a table budget with other elements (notifications,
@@ -75,6 +75,18 @@ impl CardMarkdown {
     /// Whether the whole-card fallback is active.
     pub(crate) fn is_fenced(&self) -> bool {
         self.fenced
+    }
+
+    /// The content of one markdown element under this card's policy: cleaned
+    /// normally, or fenced verbatim when the fallback is active. Callers that
+    /// chunk one blob across several elements (text) chunk first and fence
+    /// per chunk, so no element holds an unclosed fence.
+    pub(crate) fn element(&mut self, text: &str) -> String {
+        if self.fenced {
+            fenced_code(text, None)
+        } else {
+            self.clean(text)
+        }
     }
 
     /// Sanitize one markdown blob for the card, consuming table budget.
@@ -183,7 +195,7 @@ fn escape_line(line: &str) -> String {
     while i < line.len() {
         let c = line[i..].chars().next().expect("index on a char boundary");
         if c == '<' {
-            out.push_str(LT);
+            out.push_str(LESS_THAN_ESCAPE);
         } else if c == '!' && line[i..].starts_with("![") {
             match image_span(line, i) {
                 Some((end, link)) => {
@@ -211,7 +223,7 @@ fn image_span(line: &str, start: usize) -> Option<(usize, String)> {
     if !line[dest_start..].starts_with('(') {
         return None;
     }
-    let alt = line[start + 2..alt_end].replace('<', LT);
+    let alt = line[start + 2..alt_end].replace('<', LESS_THAN_ESCAPE);
     let mut depth = 0usize;
     let mut escaped = false;
     for (offset, c) in line[dest_start..].char_indices() {

@@ -94,6 +94,9 @@ pub struct RecordingPlatform {
     /// (`230099`, what Feishu returns for a card whose markdown it refuses):
     /// the flush must degrade the card and retry instead of resending it.
     pub fail_update_card_content_count: std::sync::atomic::AtomicUsize,
+    /// The next N `reply_card` calls fail with the same typed rejection, for
+    /// the continuation-send recovery path.
+    pub fail_reply_card_content_count: std::sync::atomic::AtomicUsize,
     /// When true, `set_instant_reminder` fails after recording the attempt
     /// (tests the best-effort pin path: failures log and never affect a turn).
     pub fail_instant_reminder: bool,
@@ -125,6 +128,7 @@ impl RecordingPlatform {
             fail_reply_card: false,
             fail_reply_card_count: std::sync::atomic::AtomicUsize::new(0),
             fail_update_card_content_count: std::sync::atomic::AtomicUsize::new(0),
+            fail_reply_card_content_count: std::sync::atomic::AtomicUsize::new(0),
             fail_instant_reminder: false,
             fail_pin: std::sync::atomic::AtomicBool::new(false),
             reply_in_thread_thread_id: Some("omt_created_topic".into()),
@@ -319,6 +323,22 @@ impl feishu::Platform for RecordingPlatform {
     }
 
     async fn reply_card(&self, reply_to: &str, card: &serde_json::Value) -> crate::error::Result<String> {
+        if self
+            .fail_reply_card_content_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            self.fail_reply_card_content_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.lock().await.push(PlatformCall::ReplyCard {
+                reply_to: reply_to.into(),
+                card: card.clone(),
+            });
+            return Err(crate::error::BridgeError::CardContentRejected {
+                code: 230099,
+                detail: "simulated card content rejection".into(),
+            });
+        }
         if self.fail_reply_card {
             return Err(crate::error::BridgeError::Feishu(
                 "simulated reply_card failure".into(),

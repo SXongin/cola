@@ -342,17 +342,40 @@ pub enum HeaderPhase {
     Streaming,
 }
 
+/// How a turn's card handles a Feishu content rejection (`230099`).
+///
+/// A rejected card fails on every retry — the platform refuses the same JSON
+/// forever — so the flush escalates through these states instead of
+/// re-PATCHing the rejected content.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CardFallback {
+    /// Normal rendering: model markdown is sanitized for the card parser.
+    #[default]
+    None,
+    /// Feishu rejected the card once: every model-markdown element renders as
+    /// a fenced code block — the one form the parser accepts unconditionally.
+    Fenced,
+    /// The fenced card was rejected too: the same content cannot start
+    /// succeeding, so the flush stops PATCHing this card instead of retrying
+    /// it on every poll.
+    Suspended,
+}
+
+impl CardFallback {
+    /// Whether model markdown renders fenced.
+    pub fn fenced(self) -> bool {
+        matches!(self, Self::Fenced | Self::Suspended)
+    }
+}
+
 /// Accumulates streaming state for one session.
 #[derive(Default, Clone)]
 pub struct StreamAccumulator {
     pub card_state: CardState,
-    /// The card-content rejection fallback (`230099`): from the moment Feishu
-    /// refuses a card this turn built, every model-markdown element renders as
-    /// a fenced code block — the one form the platform's card parser accepts
-    /// unconditionally. Sticky for the turn (set by the flush, see
-    /// [`crate::bridge::render`]); a fresh turn starts clean and re-tries the
-    /// normal rendering.
-    pub fence_markdown: bool,
+    /// This turn's card-content fallback (see [`CardFallback`]): starts at
+    /// `None` and is advanced by the flush when Feishu rejects a card it
+    /// built. A fresh turn starts clean and re-tries the normal rendering.
+    pub card_fallback: CardFallback,
     pub text: String,
     pub reasoning: String,
     /// Tool panels keyed by call ID (current state; `timeline` keeps order).
@@ -1221,7 +1244,7 @@ impl StreamAccumulator {
         let mut builder = CardBuilder::new()
             .with_state(state)
             .with_progress(self.header_progress())
-            .with_fenced_markdown(self.fence_markdown)
+            .with_fenced_markdown(self.card_fallback.fenced())
             .with_header_running_tool(self.running_tool().cloned());
 
         // The card is a reply to the user's message, so the session/thread name

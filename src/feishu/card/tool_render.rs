@@ -129,11 +129,7 @@ pub(super) fn tool_panel_element(
     if content.is_empty() {
         content = "_(no details)_".to_string();
     }
-    let content = if md.is_fenced() {
-        fenced_code(&content, None)
-    } else {
-        md.clean(&content)
-    };
+    let content = md.element(&content);
     let icon = if todo_panel { "📋" } else { tool.status_icon() };
     let mut title = format!("{icon} {}{}", tool.name, panel_time_suffix(at_ms));
     if let Some(details) = &title_details {

@@ -514,21 +514,32 @@ fn is_card_content_rejected(e: &crate::error::BridgeError) -> bool {
     matches!(e, crate::error::BridgeError::CardContentRejected { .. })
 }
 
-/// Flip the turn to the fenced-markdown fallback after Feishu rejected a card
-/// it built. Returns true when THIS call set it: the caller retries the same
-/// slice once, fenced. A rejection with the flag already set returns false —
-/// the same content cannot start succeeding, so the flush stops instead of
-/// PATCHing it forever.
-async fn degrade_card_markdown(core: &Arc<SharedCore>, session_id: &str) -> bool {
+/// What a rejected card's flush should do next.
+enum FallbackAdvance {
+    /// Retry the same slice once, with model markdown fenced.
+    RetryFenced,
+    /// Stop: the fenced content was rejected too, so the card is suspended
+    /// rather than PATCHed again on every poll.
+    Stop,
+}
+
+/// Advance the turn's [`CardFallback`] after Feishu rejected a card it built.
+async fn advance_card_fallback(core: &Arc<SharedCore>, session_id: &str) -> FallbackAdvance {
+    use crate::bridge::streaming::CardFallback;
     let mut cards = core.cards.lock().await;
     let Some(card) = cards.get_mut(session_id) else {
-        return false;
+        return FallbackAdvance::Stop;
     };
-    if card.acc.fence_markdown {
-        return false;
+    match card.acc.card_fallback {
+        CardFallback::None => {
+            card.acc.card_fallback = CardFallback::Fenced;
+            FallbackAdvance::RetryFenced
+        }
+        CardFallback::Fenced | CardFallback::Suspended => {
+            card.acc.card_fallback = CardFallback::Suspended;
+            FallbackAdvance::Stop
+        }
     }
-    card.acc.fence_markdown = true;
-    true
 }
 
 pub(crate) async fn flush_card(core: &Arc<SharedCore>, session_id: &str) {
@@ -550,13 +561,22 @@ async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
     // Both survive the flush — a chain that exhausted the size bound, or died
     // between a finalize and its continuation, must be picked up where it
     // stopped, never restarted by overwriting the finalized slice.
-    let (pending_split, mut card_is_live) = {
+    let (pending_split, mut card_is_live, suspended) = {
         let cards = core.cards.lock().await;
         let Some(card) = cards.get(session_id) else {
             return;
         };
-        (card.pending_split.clone(), card.card_is_live)
+        (
+            card.pending_split.clone(),
+            card.card_is_live,
+            card.acc.card_fallback == crate::bridge::streaming::CardFallback::Suspended,
+        )
     };
+    if suspended {
+        // The fenced fallback was rejected too: the card cannot be delivered,
+        // and re-PATCHing it on every poll would only hammer the API.
+        return;
+    }
     // The size bound must never refuse a supplement split: it gets one
     // continuation slot of its own beyond the cap, and any remaining slice is
     // reconciled on the next flush.
@@ -616,12 +636,17 @@ async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
                 // The live card still fits: a plain update.
                 if let Err(e) = core.feishu.update_message(&card_id, &built.card).await {
                     tracing::warn!("Card update failed: {}", e);
-                    if is_card_content_rejected(&e) && degrade_card_markdown(core, session_id).await {
-                        // Feishu refused the content: rebuild the SAME slice
-                        // with every markdown element fenced and PATCH again.
-                        // `render_from` did not advance, so the retry renders
-                        // exactly this content.
-                        continue;
+                    if is_card_content_rejected(&e) {
+                        match advance_card_fallback(core, session_id).await {
+                            // Feishu refused the content: rebuild the SAME
+                            // slice with every markdown element fenced and
+                            // PATCH again. `render_from` did not advance, so
+                            // the retry renders exactly this content.
+                            FallbackAdvance::RetryFenced => continue,
+                            // The fenced retry was rejected too — the card is
+                            // suspended; stop instead of PATCHing forever.
+                            FallbackAdvance::Stop => return,
+                        }
                     }
                 }
                 // Record what this card now renders: the live blocks.
@@ -669,19 +694,32 @@ async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
             }
             if let Err(e) = core.feishu.update_message(&card_id, &finalized).await {
                 tracing::warn!("Card update failed: {}", e);
-                if is_card_content_rejected(&e) && degrade_card_markdown(core, session_id).await {
-                    // The finalized slice never reached Feishu: restore it and
-                    // re-send it fenced on the same card, instead of losing it
-                    // to a rejection that would repeat verbatim.
-                    let mut cards = core.cards.lock().await;
-                    if let Some(card) = cards.get_mut(session_id)
-                        && card.acc.render_from == slice_to
-                    {
-                        card.acc.render_from = slice_from;
-                        card.card_is_live = true;
-                        card_is_live = true;
+                if is_card_content_rejected(&e) {
+                    if matches!(
+                        advance_card_fallback(core, session_id).await,
+                        FallbackAdvance::RetryFenced
+                    ) {
+                        // The finalized slice never reached Feishu: restore it
+                        // and re-send it fenced on the same card, instead of
+                        // losing it to a rejection that would repeat verbatim.
+                        let mut cards = core.cards.lock().await;
+                        if let Some(card) = cards.get_mut(session_id)
+                            && card.acc.render_from == slice_to
+                        {
+                            card.acc.render_from = slice_from;
+                            card.card_is_live = true;
+                            card_is_live = true;
+                        }
+                        continue;
                     }
-                    continue;
+                    // The fenced retry was rejected too: the card is
+                    // suspended, so stop the chain instead of building the
+                    // next card out of content the platform may refuse too.
+                    core.card_handles
+                        .lock()
+                        .await
+                        .record(&card_id, &finalized, Vec::new());
+                    return;
                 }
             }
             core.card_handles
@@ -747,8 +785,11 @@ async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
             }
             Err(e) => {
                 tracing::warn!("Card continuation send failed: {}", e);
-                let retry_fenced =
-                    is_card_content_rejected(&e) && degrade_card_markdown(core, session_id).await;
+                let retry_fenced = is_card_content_rejected(&e)
+                    && matches!(
+                        advance_card_fallback(core, session_id).await,
+                        FallbackAdvance::RetryFenced
+                    );
                 // The failed send's slice reached no card, but its build
                 // already advanced `render_from` past it: restore the
                 // boundary so the retry re-renders the SAME slice instead of
