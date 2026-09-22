@@ -355,3 +355,41 @@ Rejected alternatives: keeping the pin as a pure state and adding a notice
 (duplicates the surfaces for no gain), and a "read receipt cancels the pin"
 rule (Feishu gives bots no read receipts, and a card PATCH does not reset
 unread).
+
+## Amendment (2026-09-22): `/card` pulls the live card back to the newest position
+
+A user who runs several commands during a long Turn ends up with the live card
+buried above their replies, and the removal of the long-turn reminder
+(2026-09-21 amendment) left a running Turn with no attention surface at all
+(#244). The command replies themselves must still not split the chain — they
+are the interaction the user is performing — so the fix is an explicit
+request.
+
+- `/card` splits the Card Chain at the command message: the previous card is
+  finalized with the standard split header, and a continuation card — replied
+  to the command message — becomes the tracked live card and the newest
+  message. It reuses `split_card_chain` / `PendingSplit` exactly as a
+  Supplement does.
+- `PendingSplit` gains a kind: a Supplement's continuation carries its
+  「📨 已收到补充」 receipt, a pull's carries 「⏬ 实时卡片已移到底部」. The
+  continuation stays a delta handoff (2026-09-19 amendment): the status line
+  plus only the content that arrives after the split.
+- No separate acknowledgement message. When the conversation has no live card
+  (the Turn ended, or no Session exists), cola replies one text line
+  「当前没有正在运行的实时卡片」 and creates nothing.
+- A pending Permission/Question hosted on the pulled card migrates to the
+  continuation and its **Message Pin** follows on the next sweep — the
+  Supplement split's existing path, no special case.
+- Each pull costs one finalization plus one continuation message: Feishu
+  cannot move a message, so re-sending the card is the only way to put it at
+  the bottom.
+
+Rejected: a 「回到实时卡片」 button on every command reply card (the text
+replies — `/dir`, `/new`, `/model <name>` — cannot carry a button, so the
+scenario that buries the card most often would lose it, and every reply path
+would need the button), and an automatic split after every command (the
+command reply must stay where the user just acted — the rule this ADR already
+settled).
+
+Source: #244 cost/benefit evaluation with the product owner; approval of the
+minimal explicit-command form.
