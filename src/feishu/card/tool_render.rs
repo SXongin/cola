@@ -1,3 +1,4 @@
+use super::sanitize::CardMarkdown;
 use super::shell::{collapsible_panel, panel_time_suffix};
 use super::{fenced_code, truncate_md};
 
@@ -62,6 +63,7 @@ pub(super) fn tool_panel_element(
     tool: &ToolPanel,
     at_ms: Option<i64>,
     element_id: Option<&str>,
+    md: &mut CardMarkdown,
 ) -> serde_json::Value {
     let output = tool
         .output
@@ -127,6 +129,11 @@ pub(super) fn tool_panel_element(
     if content.is_empty() {
         content = "_(no details)_".to_string();
     }
+    let content = if md.is_fenced() {
+        fenced_code(&content, None)
+    } else {
+        md.clean(&content)
+    };
     let icon = if todo_panel { "📋" } else { tool.status_icon() };
     let mut title = format!("{icon} {}{}", tool.name, panel_time_suffix(at_ms));
     if let Some(details) = &title_details {

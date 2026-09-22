@@ -61,7 +61,10 @@ fn picker_card(
     clear: Option<(&str, &str)>,
     options: &[(String, String)],
 ) -> serde_json::Value {
-    let mut elements: Vec<serde_json::Value> = vec![json!({ "tag": "markdown", "content": intro })];
+    let mut elements: Vec<serde_json::Value> = vec![json!({
+        "tag": "markdown",
+        "content": crate::feishu::card::sanitize::sanitize_markdown(intro)
+    })];
     if back {
         elements.push(json!({
             "tag": "button",

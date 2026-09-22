@@ -346,6 +346,13 @@ pub enum HeaderPhase {
 #[derive(Default, Clone)]
 pub struct StreamAccumulator {
     pub card_state: CardState,
+    /// The card-content rejection fallback (`230099`): from the moment Feishu
+    /// refuses a card this turn built, every model-markdown element renders as
+    /// a fenced code block — the one form the platform's card parser accepts
+    /// unconditionally. Sticky for the turn (set by the flush, see
+    /// [`crate::bridge::render`]); a fresh turn starts clean and re-tries the
+    /// normal rendering.
+    pub fence_markdown: bool,
     pub text: String,
     pub reasoning: String,
     /// Tool panels keyed by call ID (current state; `timeline` keeps order).
@@ -1214,6 +1221,7 @@ impl StreamAccumulator {
         let mut builder = CardBuilder::new()
             .with_state(state)
             .with_progress(self.header_progress())
+            .with_fenced_markdown(self.fence_markdown)
             .with_header_running_tool(self.running_tool().cloned());
 
         // The card is a reply to the user's message, so the session/thread name
@@ -2025,6 +2033,41 @@ mod tests {
                 .contains("read")
         );
         assert!(elements[4]["content"].as_str().unwrap().contains("结论是"));
+    }
+
+    /// The markdown hygiene and table budget are per CARD, shared by every
+    /// element and panel the build emits: tables arriving through a tool panel
+    /// count against the budget the text already consumed, and a tool output's
+    /// raw markdown (a websearch body) is escaped like any other model text.
+    #[test]
+    fn card_markdown_hygiene_spans_text_and_tool_panels() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Done;
+        let text = (1..=5)
+            .map(|i| format!("| t{i} | b |\n|---|---|\n| 1 | 2 |"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        acc.push_text(&text);
+        acc.push_tool(
+            "call_web",
+            ToolPanel {
+                name: "websearch".into(),
+                status: "completed".into(),
+                input: None,
+                output: Some("see <number_tag> and\n\n| p | q |\n|---|---|\n| 1 | 2 |".into()),
+            },
+        );
+
+        let card = acc.build_card();
+        let joined = card.to_string();
+        assert!(
+            joined.contains("&#60;number_tag>"),
+            "panel markdown is escaped: {joined}"
+        );
+        assert!(
+            joined.contains("```\\n| p | q |\\n|---|---|\\n| 1 | 2 |\\n```"),
+            "the panel's table exceeds the card's budget and is fenced: {joined}"
+        );
     }
 
     /// Re-rendering the same tool (running → completed) must NOT duplicate its

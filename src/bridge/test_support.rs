@@ -90,6 +90,10 @@ pub struct RecordingPlatform {
     /// retried without duplicating receipts, while the loading card's own
     /// reply — if any — succeeds).
     pub fail_reply_card_count: std::sync::atomic::AtomicUsize,
+    /// The next N `update_message` calls fail with a card-content rejection
+    /// (`230099`, what Feishu returns for a card whose markdown it refuses):
+    /// the flush must degrade the card and retry instead of resending it.
+    pub fail_update_card_content_count: std::sync::atomic::AtomicUsize,
     /// When true, `set_instant_reminder` fails after recording the attempt
     /// (tests the best-effort pin path: failures log and never affect a turn).
     pub fail_instant_reminder: bool,
@@ -120,6 +124,7 @@ impl RecordingPlatform {
             fail_send_card: false,
             fail_reply_card: false,
             fail_reply_card_count: std::sync::atomic::AtomicUsize::new(0),
+            fail_update_card_content_count: std::sync::atomic::AtomicUsize::new(0),
             fail_instant_reminder: false,
             fail_pin: std::sync::atomic::AtomicBool::new(false),
             reply_in_thread_thread_id: Some("omt_created_topic".into()),
@@ -359,6 +364,14 @@ impl feishu::Platform for RecordingPlatform {
     }
 
     async fn update_message(&self, message_id: &str, card: &serde_json::Value) -> crate::error::Result<()> {
+        let rejected = self
+            .fail_update_card_content_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0;
+        if rejected {
+            self.fail_update_card_content_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
         if let Some(gate) = self.take_gate("update", message_id) {
             wait_gate(gate).await;
         }
@@ -366,6 +379,12 @@ impl feishu::Platform for RecordingPlatform {
             message_id: message_id.into(),
             card: card.clone(),
         });
+        if rejected {
+            return Err(crate::error::BridgeError::CardContentRejected {
+                code: 230099,
+                detail: "simulated card content rejection".into(),
+            });
+        }
         Ok(())
     }
 

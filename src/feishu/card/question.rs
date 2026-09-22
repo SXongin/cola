@@ -56,8 +56,9 @@ pub fn build_permission_card(
     body: &str,
     directory: &str,
 ) -> serde_json::Value {
+    let body = super::sanitize::CardMarkdown::new().clean(body);
     let mut elements = vec![json!({ "tag": "markdown", "content": body })];
-    elements.extend(permission_buttons(session_id, request_id, body, directory));
+    elements.extend(permission_buttons(session_id, request_id, &body, directory));
     card_shell("🔐 权限请求", "orange", elements)
 }
 
@@ -67,7 +68,7 @@ pub fn question_summary(questions: &[crate::opencode::types::QuestionInfo]) -> S
     for (i, q) in questions.iter().enumerate() {
         s.push_str(&format!("{}. {}\n", i + 1, q.question));
     }
-    s
+    super::sanitize::CardMarkdown::new().clean(&s)
 }
 
 /// Build the interactive question card (JSON 2.0). Each question renders as its
@@ -105,6 +106,9 @@ pub fn question_elements(
     let is_multi = |i: usize| -> bool { questions.get(i).is_some_and(|q| q.multiple == Some(true)) };
     let is_done = |i: usize| -> bool { done.get(i).copied().unwrap_or(false) };
     let mut elements: Vec<serde_json::Value> = Vec::new();
+    // Question text comes from the model: sanitize it for the card dialect
+    // (one budget for the block; a question rarely carries tables).
+    let mut md = super::sanitize::CardMarkdown::new();
 
     for (i, q) in questions.iter().enumerate() {
         let multi = is_multi(i);
@@ -142,6 +146,7 @@ pub fn question_elements(
         if let Some(Some(labels)) = answered.get(i) {
             heading.push_str(&format!("\n👉 已选：{}", labels.join("、")));
         }
+        let heading = md.clean(&heading);
         elements.push(json!({ "tag": "markdown", "content": heading }));
 
         if finalized {

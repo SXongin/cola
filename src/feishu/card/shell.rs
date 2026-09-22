@@ -1,8 +1,11 @@
 use serde_json::json;
 
 use super::MAX_ELEMENT_TEXT_CHARS;
+use super::sanitize::CardMarkdown;
 use super::tool_render::{ToolPanel, tool_panel_element};
-use super::{CardActionButton, CardState, HeaderProgress, chunk_text, fmt_local_time, truncate_md};
+use super::{
+    CardActionButton, CardState, HeaderProgress, chunk_text, fenced_code, fmt_local_time, truncate_md,
+};
 
 /// Format a duration in seconds for the header's live timer (ADR-0014):
 /// `42s`, `1m23s`, `2h5m`, `3d4h`. Whole seconds, so a header signature built
@@ -55,6 +58,9 @@ pub struct CardBuilder {
     /// the header renders the plain phase label — non-streaming builders
     /// (permission/switch cards) stay unchanged.
     progress: HeaderProgress,
+    /// This card's markdown hygiene: Feishu-hostile model text is neutralized
+    /// and the card's table budget tracked (see [`CardMarkdown`]).
+    md: CardMarkdown,
 }
 
 /// Assemble a JSON 2.0 card from a ready-made header and body elements: the
@@ -95,6 +101,7 @@ impl CardBuilder {
             date: None,
             error_buttons: Vec::new(),
             progress: HeaderProgress::default(),
+            md: CardMarkdown::new(),
         }
     }
 
@@ -143,12 +150,34 @@ impl CardBuilder {
         self
     }
 
+    /// The card-content rejection fallback (`230099`): render every
+    /// model-markdown element as a fenced code block. Set by the flush after
+    /// Feishu refused a card it built, so the rebuilt slice can land instead
+    /// of freezing the card on a rejection that repeats forever.
+    pub fn with_fenced_markdown(mut self, fenced: bool) -> Self {
+        if fenced {
+            self.md = CardMarkdown::fenced();
+        }
+        self
+    }
+
     pub fn with_text(mut self, text: &str) -> Self {
         // Long text is split across multiple elements, each within cola's
         // per-element budget (MAX_ELEMENT_TEXT_CHARS), while the card splitter
         // bounds how much text one card carries. The split is a size budget,
-        // not a workaround for a Feishu truncation.
-        for chunk in chunk_text(text, MAX_ELEMENT_TEXT_CHARS) {
+        // not a workaround for a Feishu truncation. The text is sanitized as
+        // one blob (per-card table budget), then chunked.
+        if self.md.is_fenced() {
+            // Fallback mode: fence each chunk separately, so no element holds
+            // an unclosed fence.
+            for chunk in chunk_text(text, MAX_ELEMENT_TEXT_CHARS) {
+                self.body
+                    .push(json!({ "tag": "markdown", "content": fenced_code(&chunk, None) }));
+            }
+            return self;
+        }
+        let text = self.md.clean(text);
+        for chunk in chunk_text(&text, MAX_ELEMENT_TEXT_CHARS) {
             self.body.push(json!({ "tag": "markdown", "content": chunk }));
         }
         self
@@ -166,9 +195,15 @@ impl CardBuilder {
         element_id: Option<&str>,
     ) -> Self {
         if !reasoning.is_empty() {
+            let body = truncate_md(reasoning, 800);
+            let body = if self.md.is_fenced() {
+                fenced_code(&body, None)
+            } else {
+                self.md.clean(&body)
+            };
             self.body.push(collapsible_panel(
                 &format!("💭 推理过程{}", panel_time_suffix(at_ms)),
-                &truncate_md(reasoning, 800),
+                &body,
                 element_id,
             ));
         }
@@ -192,7 +227,8 @@ impl CardBuilder {
         self.tools.push(tool);
         // All tools are shown; the streaming card splits into continuation
         // cards when the component estimate exceeds the Feishu limit.
-        self.body.push(tool_panel_element(&panel, at_ms, element_id));
+        self.body
+            .push(tool_panel_element(&panel, at_ms, element_id, &mut self.md));
         self
     }
 
@@ -393,6 +429,112 @@ mod tests {
     use crate::feishu::card::{
         AWAITING_BOTH_TITLE, AWAITING_PERMISSION_TITLE, AWAITING_QUESTION_TITLE, AwaitingAction,
     };
+
+    /// Feishu's card parser recognizes its own tag names inside markdown and
+    /// rejects a card whose tag is malformed (`<number_tag>` without a 1-99
+    /// body is `230099/11311 markdown content parse error`). Text reaches the
+    /// card from the model, so every `<` outside a fenced code block is
+    /// neutralized with Feishu's own escape — visually identical, never a tag.
+    /// Inline code is not exempt: measured 2026-09-22 it does not protect a
+    /// tag once an earlier unclosed tag fragment changes the parser's context,
+    /// so only fences are trusted.
+    #[test]
+    fn text_escapes_tag_openers_outside_fences() {
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_text("a <number_tag> b\n\n```\n<number_tag>\n```\n\n`<at id=x></at>`")
+            .build();
+        let content = card["body"]["elements"][0]["content"].as_str().unwrap();
+        assert!(content.contains("a &#60;number_tag> b"), "{content}");
+        assert!(
+            content.contains("```\n<number_tag>\n```"),
+            "fenced code untouched: {content}"
+        );
+        assert!(
+            content.contains("`&#60;at id=x>&#60;/at>`"),
+            "inline code escaped: {content}"
+        );
+    }
+
+    /// Feishu validates image keys: any `![alt](dest)` whose dest is not an
+    /// image this app uploaded fails the whole card with `230099/200570 card
+    /// contains invalid image keys`. Model text can never hold a valid key, so
+    /// images become plain links (same target, no validation); fenced code
+    /// stays literal.
+    #[test]
+    fn images_become_links_outside_fences() {
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_text("shot ![x](./x.png) here\n\n```\n![y](./y.png)\n```")
+            .build();
+        let content = card["body"]["elements"][0]["content"].as_str().unwrap();
+        assert!(content.contains("shot [x](./x.png) here"), "{content}");
+        assert!(!content.contains("![x]"), "no image syntax left: {content}");
+        assert!(
+            content.contains("```\n![y](./y.png)\n```"),
+            "fenced code untouched: {content}"
+        );
+    }
+
+    /// Feishu counts markdown tables across the whole card (elements and
+    /// panels): a 6th table fails with `230099/11310 card table number over
+    /// limit`. Cola budgets 5 per card build; the overflow renders as code.
+    #[test]
+    fn tables_beyond_the_card_budget_become_code() {
+        let table = |n: usize| format!("| t{n} | b |\n|---|---|\n| 1 | 2 |");
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_text(&format!("{}\n\n{}\n\n{}\n\n", table(1), table(2), table(3)))
+            .with_text(&format!("{}\n\n{}\n\n{}\n\n", table(4), table(5), table(6)))
+            .build();
+        let content: String = card["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["content"].as_str().unwrap_or_default())
+            .collect();
+        assert!(
+            content.contains("| t5 | b |\n|---|---|"),
+            "the fifth table still renders natively: {content}"
+        );
+        assert!(
+            content.contains("```\n| t6 | b |\n|---|---|\n| 1 | 2 |\n```"),
+            "the sixth table is fenced: {content}"
+        );
+    }
+
+    /// Feishu rejects a markdown table with 50 body rows (`230099/11310
+    /// element exceeds the limit`); 49 render. The whole table becomes code
+    /// instead of losing rows.
+    #[test]
+    fn over_long_tables_become_code() {
+        let table = |rows: usize| {
+            let mut t = String::from("| a | b |\n|---|---|\n");
+            for i in 0..rows {
+                t.push_str(&format!("| {i} | 2 |\n"));
+            }
+            t
+        };
+        let content_of = |rows: usize| {
+            let card = CardBuilder::new()
+                .with_state(CardState::Done)
+                .with_text(&table(rows))
+                .build();
+            card["body"]["elements"][0]["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert!(
+            content_of(49).contains("| a | b |\n|---|---|"),
+            "49 rows render natively"
+        );
+        assert!(
+            content_of(50).contains("```\n| a | b |\n|---|---|"),
+            "50 rows are fenced: {}",
+            content_of(50)
+        );
+    }
 
     #[test]
     fn card_shell_builds_the_json_2_0_skeleton() {

@@ -508,6 +508,29 @@ pub(crate) async fn split_card_chain(
     flush_card_locked(core, session_id).await;
 }
 
+/// Whether `e` is Feishu's deterministic card-content rejection (`230099`).
+/// The same card JSON fails on every retry, so the flush degrades instead.
+fn is_card_content_rejected(e: &crate::error::BridgeError) -> bool {
+    matches!(e, crate::error::BridgeError::CardContentRejected { .. })
+}
+
+/// Flip the turn to the fenced-markdown fallback after Feishu rejected a card
+/// it built. Returns true when THIS call set it: the caller retries the same
+/// slice once, fenced. A rejection with the flag already set returns false —
+/// the same content cannot start succeeding, so the flush stops instead of
+/// PATCHing it forever.
+async fn degrade_card_markdown(core: &Arc<SharedCore>, session_id: &str) -> bool {
+    let mut cards = core.cards.lock().await;
+    let Some(card) = cards.get_mut(session_id) else {
+        return false;
+    };
+    if card.acc.fence_markdown {
+        return false;
+    }
+    card.acc.fence_markdown = true;
+    true
+}
+
 pub(crate) async fn flush_card(core: &Arc<SharedCore>, session_id: &str) {
     // One card writer per session at a time. A flush is a read-send-record
     // sequence, and callers are concurrent (the render poll, the request
@@ -593,6 +616,13 @@ async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
                 // The live card still fits: a plain update.
                 if let Err(e) = core.feishu.update_message(&card_id, &built.card).await {
                     tracing::warn!("Card update failed: {}", e);
+                    if is_card_content_rejected(&e) && degrade_card_markdown(core, session_id).await {
+                        // Feishu refused the content: rebuild the SAME slice
+                        // with every markdown element fenced and PATCH again.
+                        // `render_from` did not advance, so the retry renders
+                        // exactly this content.
+                        continue;
+                    }
                 }
                 // Record what this card now renders: the live blocks.
                 core.card_handles
@@ -639,6 +669,20 @@ async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
             }
             if let Err(e) = core.feishu.update_message(&card_id, &finalized).await {
                 tracing::warn!("Card update failed: {}", e);
+                if is_card_content_rejected(&e) && degrade_card_markdown(core, session_id).await {
+                    // The finalized slice never reached Feishu: restore it and
+                    // re-send it fenced on the same card, instead of losing it
+                    // to a rejection that would repeat verbatim.
+                    let mut cards = core.cards.lock().await;
+                    if let Some(card) = cards.get_mut(session_id)
+                        && card.acc.render_from == slice_to
+                    {
+                        card.acc.render_from = slice_from;
+                        card.card_is_live = true;
+                        card_is_live = true;
+                    }
+                    continue;
+                }
             }
             core.card_handles
                 .lock()
@@ -703,6 +747,8 @@ async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
             }
             Err(e) => {
                 tracing::warn!("Card continuation send failed: {}", e);
+                let retry_fenced =
+                    is_card_content_rejected(&e) && degrade_card_markdown(core, session_id).await;
                 // The failed send's slice reached no card, but its build
                 // already advanced `render_from` past it: restore the
                 // boundary so the retry re-renders the SAME slice instead of
@@ -714,6 +760,12 @@ async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
                     && card.acc.render_from == slice_to
                 {
                     card.acc.render_from = slice_from;
+                }
+                drop(cards);
+                if retry_fenced {
+                    // Retry the same slice once, fenced; a second rejection
+                    // falls through to the plain retry-next-flush path.
+                    continue;
                 }
                 return;
             }

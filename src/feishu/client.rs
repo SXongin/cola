@@ -30,12 +30,48 @@ async fn read_body_with_diag(resp: reqwest::Response, what: &str) -> crate::erro
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
+        // A card-content rejection arrives as HTTP 400 with `code: 230099` in
+        // the body; type it so render callers can degrade instead of retrying
+        // the same JSON forever.
+        if let Some(code) = rejection_code(&text) {
+            return Err(crate::error::BridgeError::CardContentRejected {
+                code,
+                detail: format!("{what} HTTP {status}: {}", body_snippet(&text, 200)),
+            });
+        }
         return Err(crate::error::BridgeError::Feishu(format!(
             "{what} HTTP {status}: {}",
             body_snippet(&text, 200)
         )));
     }
     Ok(text)
+}
+
+/// The `230099` "Failed to create card content" umbrella: the platform refused
+/// the card JSON itself (markdown parse error, table count/row limits, element
+/// counts). Deterministic — the same content is rejected on every retry.
+fn is_card_content_rejection(code: i64) -> bool {
+    code == 230099
+}
+
+/// `Some(code)` when a response body is a card-content rejection.
+fn rejection_code(body: &str) -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let code = v.get("code")?.as_i64()?;
+    is_card_content_rejection(code).then_some(code)
+}
+
+/// Build the error for a non-zero Feishu API `code`, typing card-content
+/// rejections so render callers can recognize them.
+fn api_error(prefix: &str, code: i64, msg: &str) -> crate::error::BridgeError {
+    if is_card_content_rejection(code) {
+        crate::error::BridgeError::CardContentRejected {
+            code,
+            detail: format!("{prefix}: {msg}"),
+        }
+    } else {
+        crate::error::BridgeError::Feishu(format!("{prefix}: {msg}"))
+    }
 }
 
 /// Decode a JSON body, surfacing a snippet when it isn't JSON instead of the
@@ -159,10 +195,11 @@ impl Client {
         let resp: MessageResponse = parse_json(&text, "reply card response")?;
 
         if resp.code != 0 {
-            Err(crate::error::BridgeError::Feishu(format!(
-                "reply card error {}: {}",
-                resp.code, resp.msg
-            )))
+            Err(api_error(
+                &format!("reply card error {}", resp.code),
+                i64::from(resp.code),
+                &resp.msg,
+            ))
         } else {
             Ok(resp.data.message_id)
         }
@@ -256,10 +293,11 @@ impl Client {
         let resp: MessageResponse = parse_json(&text, "send card response")?;
 
         if resp.code != 0 {
-            Err(crate::error::BridgeError::Feishu(format!(
-                "send card error {}: {}",
-                resp.code, resp.msg
-            )))
+            Err(api_error(
+                &format!("send card error {}", resp.code),
+                i64::from(resp.code),
+                &resp.msg,
+            ))
         } else {
             Ok(resp.data.message_id)
         }
@@ -274,7 +312,7 @@ impl Client {
                 "config": { "wide_screen_mode": true },
                 "elements": [{
                     "tag": "markdown",
-                    "content": text
+                    "content": crate::feishu::card::sanitize::sanitize_markdown(text)
                 }]
             }).to_string()
         });
@@ -338,10 +376,11 @@ impl Client {
         let resp: MessageResponse = parse_json(&text, "reply card in thread response")?;
 
         if resp.code != 0 {
-            Err(crate::error::BridgeError::Feishu(format!(
-                "reply card in thread error {}: {}",
-                resp.code, resp.msg
-            )))
+            Err(api_error(
+                &format!("reply card in thread error {}", resp.code),
+                i64::from(resp.code),
+                &resp.msg,
+            ))
         } else {
             Ok((resp.data.message_id, resp.data.thread_id))
         }
@@ -483,10 +522,11 @@ impl Client {
         let resp: ApiResponse = parse_json(&text, "update message response")?;
 
         if resp.code != 0 {
-            Err(crate::error::BridgeError::Feishu(format!(
-                "update error {}: {}",
-                resp.code, resp.msg
-            )))
+            Err(api_error(
+                &format!("update error {}", resp.code),
+                i64::from(resp.code),
+                &resp.msg,
+            ))
         } else {
             Ok(())
         }
@@ -724,11 +764,15 @@ impl Client {
 }
 
 /// A minimal interactive card carrying one markdown element — the shape
-/// `reply_in_thread` and the topic cover card use (ADR-0023).
+/// `reply_in_thread` and the topic cover card use (ADR-0023). The text is
+/// sanitized for Feishu's card dialect at the one place the shape is written.
 pub(crate) fn markdown_card(text: &str) -> serde_json::Value {
     serde_json::json!({
         "config": { "wide_screen_mode": true },
-        "elements": [{ "tag": "markdown", "content": text }]
+        "elements": [{
+            "tag": "markdown",
+            "content": crate::feishu::card::sanitize::sanitize_markdown(text)
+        }]
     })
 }
 
@@ -1093,6 +1137,56 @@ mod tests {
         assert_eq!(body_json(&request)["content"], card.to_string());
     }
 
+    /// A card Feishu refuses to compile comes back as HTTP 400 with
+    /// `code: 230099`. It is deterministic — resending the same JSON can never
+    /// succeed — so the client maps it to a typed error the render layer can
+    /// degrade instead of retrying verbatim.
+    #[tokio::test]
+    async fn update_message_maps_a_card_content_rejection() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "PATCH",
+            "/open-apis/im/v1/messages/om_42",
+            400,
+            r#"{"code":230099,"msg":"Failed to create card content, ext=ErrCode: 11311; ErrPath: ROOT -> body -> elements -> [3](tag: collapsible_panel); ErrMsg: markdown content parse error; ErrorValue: markdown; "}"#,
+        );
+        let card = serde_json::json!({"elements": []});
+
+        let err = client.update_message("om_42", &card).await.unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                crate::error::BridgeError::CardContentRejected { code: 230099, .. }
+            ),
+            "a 230099 rejection must be typed: {err}"
+        );
+    }
+
+    /// Same mapping on the send path: a rejected continuation card must be
+    /// recognizable so its retry can degrade the content.
+    #[tokio::test]
+    async fn reply_card_maps_a_card_content_rejection() {
+        let (server, client) = wire_client().await;
+        server.route(
+            "POST",
+            "/open-apis/im/v1/messages/msg_1/reply",
+            400,
+            r#"{"code":230099,"msg":"Failed to create card content, ext=ErrCode: 11310; ErrMsg: card table number over limit; ErrorValue: table; "}"#,
+        );
+        let card = serde_json::json!({"elements": []});
+
+        let err = client.reply_card("msg_1", &card).await.unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                crate::error::BridgeError::CardContentRejected { code: 230099, .. }
+            ),
+            "a 230099 rejection must be typed: {err}"
+        );
+    }
+
     /// A p2p Chat pins through the fixed bot feed card, PATCHing the
     /// `time_sensitive` body with the requester's open_id (ADR-0043).
     #[tokio::test]
@@ -1256,7 +1350,9 @@ mod tests {
         let content = send_content(&request);
         assert_eq!(content["config"]["wide_screen_mode"], true);
         assert_eq!(content["elements"][0]["tag"], "markdown");
-        assert_eq!(content["elements"][0]["content"], "hello <world>");
+        // Card markdown is sanitized for Feishu's dialect at this one choke
+        // point (see `sanitize_markdown`).
+        assert_eq!(content["elements"][0]["content"], "hello &#60;world>");
     }
 
     #[tokio::test]
