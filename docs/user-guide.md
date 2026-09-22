@@ -379,6 +379,7 @@ detailed help for any of these.
 | `/name <name>` | Rename current session (server-side, visible to all clients; on a pending, set the creation title) |
 | `/stop` | Interrupt execution |
 | `/compact` | Compact context |
+| `/card` | Pull the live card down to the newest position after mid-turn command replies bury it (replies a notice when no turn is running) |
 | `/agent <name>` | Switch agent (takes effect next message; persisted; `--reset` clears to the server default) |
 | `/model <p/m>` | Switch model (takes effect next message; persisted) |
 | `/think [level]` | Set/clear thinking level, per model (takes effect next message) |
