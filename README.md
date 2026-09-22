@@ -99,7 +99,7 @@ One-time setup at <https://open.feishu.cn/app> (create a custom app):
    - `im:message.group_at_msg:readonly` — receive group messages that @ the bot
    - `im:chat:readonly` — read chat names
    - `contact:contact.base:readonly`, `contact:user.base:readonly` — read user names
-   - `im:datasync.feed_card.time_sensitive:write` — *(optional, experimental)*
+   - `im:datasync.feed_card.time_sensitive:write` — *(optional)*
      Feishu's Instant Reminder, used by `[bridge] instant_reminder` (off by
      default); without it pinning is skipped and everything else keeps working
 3. Configure event subscription (事件与回调): use **long-connection mode** and
@@ -125,7 +125,7 @@ app_secret = "your-app-secret"
 ```
 
 That's the minimum. Every other setting is optional — e.g. Feishu's Instant
-Reminder is an **experimental** opt-in via `[bridge] instant_reminder = true`
+Reminder is an opt-in via `[bridge] instant_reminder = true`
 (off by default; needs the optional `im:datasync.feed_card.time_sensitive:write`
 scope above), which pins a chat while a permission or question waits; and
 `[bridge] long_task_notice = true` (off by default) announces a p2p turn that
