@@ -1249,13 +1249,21 @@ pub(crate) async fn dir_card_data(
         let store = core.sessions.lock().await;
         (store.directories(), store.current_directory(thread_key))
     };
-    // The store lists a directory per mapping, in activation order — the
-    // sensible tail position for directories the session list no longer
-    // carries (their sessions were deleted or archived).
+    // The store lists directories most recently mapped first — the sensible
+    // tail position for directories the session list no longer carries (their
+    // sessions were deleted or archived).
     for dir in mapped_dirs {
         if !dirs.contains(&dir) {
             dirs.push(dir);
         }
+    }
+    // A Pending Session's directory has no server session yet and no mapping
+    // entry (ADR-0041), so neither source above carries it; the card still has
+    // to render it as `当前` rather than fall back to the empty-state hint.
+    if let Some(current) = current_dir.as_ref()
+        && !dirs.contains(current)
+    {
+        dirs.insert(0, current.clone());
     }
     (dirs, current_dir)
 }
