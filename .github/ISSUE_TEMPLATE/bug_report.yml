@@ -75,9 +75,9 @@ body:
         Attach the relevant log file (default `~/.cola/cola-YYYY-MM-DD.log`) **after removing secrets and
         personal data** (`app_secret`, tokens, chat IDs, message text). A narrow excerpt around the
         failure is more useful than the whole file.
-      accept: ".log,.txt,.zip"
     validations:
       required: false
+      accept: ".log,.txt,.zip"
   - type: textarea
     id: context
     attributes:
