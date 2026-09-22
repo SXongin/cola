@@ -5,8 +5,9 @@ name: Fuzz
 # `fuzz/fuzz_targets/pbbp2.rs`). The corpus rides the Actions cache so every
 # run continues where the last one stopped; a crash fails the run and its
 # reproducer lands in the uploaded artifacts. Plain scheduled job by decision:
-# ClusterFuzzLite/OSS-Fuzz are rejected, and the Scorecard `Fuzzing` check
-# stays at 0 because it does not recognise cargo-fuzz — see ADR-0034's
+# ClusterFuzzLite/OSS-Fuzz are rejected, and Scorecard's `Fuzzing` check
+# already detects this target (`libfuzzer_sys` -> `RustCargoFuzzer`) and scores
+# 10, so the schedule exists for the bug-finding value only — see ADR-0034's
 # 2026-09-22 amendment.
 
 on:
