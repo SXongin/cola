@@ -797,7 +797,7 @@ pub(crate) async fn handle_command(
                 &core.cards_handle(),
                 &session_id,
                 message_id,
-                crate::bridge::streaming::SplitKind::Pull,
+                crate::bridge::turn::state::SplitKind::Pull,
             )
             .await;
         }

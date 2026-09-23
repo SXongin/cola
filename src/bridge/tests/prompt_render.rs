@@ -695,8 +695,8 @@ async fn short_answer_stays_in_card_no_extra_message() {
 /// (provider, model) for the turn, so later polls cost no extra request.
 #[tokio::test]
 async fn render_poll_shows_live_context_and_memoizes_the_window() {
-    use crate::bridge::streaming::{CardSession, StreamAccumulator};
     use crate::bridge::turn::Turn;
+    use crate::bridge::turn::state::{CardSession, StreamAccumulator};
     use crate::opencode::types::{MessageInfo, MessageTime, MessageTokens, SessionMessage};
 
     let dir = tempfile::tempdir().unwrap();

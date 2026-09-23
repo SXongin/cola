@@ -53,13 +53,13 @@ async fn seed_turn(app: &Arc<App>, session_id: &str, is_group: bool, generation:
 /// Like [`seed_turn`], with an explicit requester — the multi-pending tests
 /// need distinct requesters in one Chat/Topic.
 async fn seed_turn_for(app: &Arc<App>, session_id: &str, is_group: bool, generation: u64, requester: &str) {
-    let mut acc = crate::bridge::streaming::StreamAccumulator::new("test");
+    let mut acc = crate::bridge::turn::state::StreamAccumulator::new("test");
     acc.requester_open_id = Some(requester.into());
     acc.is_group = is_group;
     acc.turn_generation = Some(generation);
     app.cards.lock().await.insert(
         session_id.to_string(),
-        crate::bridge::streaming::CardSession::new(acc, Some("msg_card".into())),
+        crate::bridge::turn::state::CardSession::new(acc, Some("msg_card".into())),
     );
 }
 

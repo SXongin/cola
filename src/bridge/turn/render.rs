@@ -13,7 +13,7 @@ use tracing::Instrument;
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
 use crate::bridge::handles::{CardsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
-use crate::bridge::streaming::StreamAccumulator;
+use crate::bridge::turn::state::StreamAccumulator;
 use crate::config::ThreadKey;
 use crate::opencode;
 
@@ -521,7 +521,7 @@ pub(super) async fn render_and_flush(
     // landed in the render above, and the window lookup is memoized per
     // (provider, model) for the turn, so later polls are a field swap. Runs
     // outside the cards lock (network).
-    crate::bridge::streaming::refresh_context_window(cards, backend, session_id).await;
+    crate::bridge::turn::state::refresh_context_window(cards, backend, session_id).await;
     // A usage (or window) change must flush even when no part and no header
     // second changed: the 📊 segment is footer state the header signature
     // cannot see, and a silently-stale percentage is the bug this fixes.
@@ -627,16 +627,16 @@ impl RenderPoll {
 mod tests {
     use super::*;
     use crate::bridge::App;
-    use crate::bridge::streaming::StreamAccumulator;
     use crate::bridge::test_support::{
         MockBackend, PlatformCall, RecordingPlatform, build_app, realistic_parts, seed_cover_title,
         seed_entry, test_config, test_work_dir,
     };
+    use crate::bridge::turn::state::StreamAccumulator;
     use crate::feishu::card::CardState;
 
     #[test]
     fn render_part_marks_content_and_tracks_header_phase() {
-        use crate::bridge::streaming::HeaderPhase;
+        use crate::bridge::turn::state::HeaderPhase;
         use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
 
         let epoch = 0;
@@ -1732,14 +1732,14 @@ Index: /x/src/main.rs
 
         // Simulate an in-flight turn whose card was captured with the OLD
         // default subtitle before the server auto-titled the session.
-        let mut acc = crate::bridge::streaming::StreamAccumulator::new("test");
+        let mut acc = crate::bridge::turn::state::StreamAccumulator::new("test");
         acc.reply_to_message_id = Some("msg_1".into());
         acc.session_id = Some("ses_test".into());
         {
             let mut cards = app.cards.lock().await;
             cards.insert(
                 "ses_test".into(),
-                crate::bridge::streaming::CardSession::new(acc, None),
+                crate::bridge::turn::state::CardSession::new(acc, None),
             );
         }
 
@@ -1813,14 +1813,14 @@ Index: /x/src/main.rs
         seed_cover_title(&app, "ses_test", "cola").await;
         // An in-flight turn whose card was captured with the OLD subtitle
         // (before the server auto-titled the session).
-        let mut acc = crate::bridge::streaming::StreamAccumulator::new("test");
+        let mut acc = crate::bridge::turn::state::StreamAccumulator::new("test");
         acc.reply_to_message_id = Some("msg_1".into());
         acc.session_id = Some("ses_test".into());
         {
             let mut cards = app.cards.lock().await;
             cards.insert(
                 "ses_test".into(),
-                crate::bridge::streaming::CardSession::new(acc, None),
+                crate::bridge::turn::state::CardSession::new(acc, None),
             );
         }
 
@@ -1871,7 +1871,7 @@ Index: /x/src/main.rs
     /// SERVER anchor (`turn_started_ms`), the accumulator's only clock (#190).
     #[test]
     fn panel_times_and_header_date_come_from_part_epochs() {
-        use crate::bridge::streaming::StreamAccumulator;
+        use crate::bridge::turn::state::StreamAccumulator;
         use crate::feishu::card::CardState;
         use crate::feishu::card::test_local_ms;
 

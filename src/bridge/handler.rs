@@ -617,7 +617,7 @@ impl App {
                     &self.cards_handle(),
                     &session_id,
                     &message_id,
-                    crate::bridge::streaming::SplitKind::Supplement,
+                    crate::bridge::turn::state::SplitKind::Supplement,
                 )
                 .await;
                 return Ok(());

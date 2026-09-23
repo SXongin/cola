@@ -4,8 +4,8 @@ use tokio::sync::Mutex;
 use tracing::Instrument;
 
 use crate::bridge::core::SharedCore;
-use crate::bridge::streaming::StreamAccumulator;
 use crate::bridge::turn::Turn;
+use crate::bridge::turn::state::StreamAccumulator;
 
 /// The external-message flow: watches for user messages that were NOT sent by
 /// cola (someone posted from OpenChamber or another client on the shared store)
@@ -306,7 +306,7 @@ impl ExternalFlow {
             let mut cards = core.cards.lock().await;
             cards.insert(
                 session_id.to_string(),
-                crate::bridge::streaming::CardSession::new(acc, Some(card_id.to_string())),
+                crate::bridge::turn::state::CardSession::new(acc, Some(card_id.to_string())),
             );
         }
         tracing::info!("external reply render armed for session {}", session_id);
@@ -449,8 +449,8 @@ impl ExternalFlow {
         for req in &data.pending {
             match req {
                 crate::bridge::request::PendingRequest::Permission(p) => {
-                    acc.add_interaction(crate::bridge::streaming::InteractionBlock::Permission(
-                        crate::bridge::streaming::PendingPermission {
+                    acc.add_interaction(crate::bridge::turn::state::InteractionBlock::Permission(
+                        crate::bridge::turn::state::PendingPermission {
                             session_id: session_id.to_string(),
                             request_id: p.request_id.clone(),
                             body: crate::bridge::request::describe_permission(p),
@@ -460,8 +460,8 @@ impl ExternalFlow {
                     ));
                 }
                 crate::bridge::request::PendingRequest::Question(q) => {
-                    acc.add_interaction(crate::bridge::streaming::InteractionBlock::Question(
-                        crate::bridge::streaming::PendingQuestion {
+                    acc.add_interaction(crate::bridge::turn::state::InteractionBlock::Question(
+                        crate::bridge::turn::state::PendingQuestion {
                             request_id: q.id.clone(),
                             session_id: q.session_id.clone(),
                             questions: q.questions.clone(),
@@ -482,7 +482,7 @@ impl ExternalFlow {
             let mut cards = core.cards.lock().await;
             cards.insert(
                 session_id.to_string(),
-                crate::bridge::streaming::CardSession::new(acc, Some(card_id.to_string())),
+                crate::bridge::turn::state::CardSession::new(acc, Some(card_id.to_string())),
             );
         }
         tracing::info!("snapshot follow armed for session {}", session_id);
@@ -651,7 +651,7 @@ async fn external_render_loop(
 /// is refreshed first (ADR-0019), so the final card shows where the turn
 /// landed (branch/dirty) rather than only where it started.
 async fn finalize_done(core: &Arc<SharedCore>, session_id: &str) {
-    crate::bridge::streaming::refresh_work_context(&core.cards_handle(), session_id).await;
+    crate::bridge::turn::state::refresh_work_context(&core.cards_handle(), session_id).await;
     {
         let mut cards = core.cards.lock().await;
         if let Some(card) = cards.get_mut(session_id) {

@@ -22,7 +22,7 @@ use crate::bridge::reminder::ReminderState;
 use crate::bridge::request::RequestFlow;
 use crate::bridge::session::SessionStore;
 use crate::bridge::snapshot_claims::SnapshotClaims;
-use crate::bridge::streaming::CardSession;
+use crate::bridge::turn::state::CardSession;
 use crate::config::{SessionEntry, ThreadKey};
 use crate::{feishu, opencode};
 

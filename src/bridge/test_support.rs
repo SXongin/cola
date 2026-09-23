@@ -1607,7 +1607,7 @@ pub(crate) struct FailedDirSurfaces {
     /// The snapshot host's Message id; the claim rides `claim`.
     pub snapshot_message_id: &'static str,
     /// A stream accumulator carrying the kind's inline section.
-    pub inline_acc: crate::bridge::streaming::StreamAccumulator,
+    pub inline_acc: crate::bridge::turn::state::StreamAccumulator,
     /// The request embedded (and claimed) by the snapshot card.
     pub claim: crate::bridge::request::PendingRequest,
 }
@@ -1638,7 +1638,7 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
     );
     app.cards.lock().await.insert(
         "ses_1".into(),
-        crate::bridge::streaming::CardSession::new(surfaces.inline_acc, None),
+        crate::bridge::turn::state::CardSession::new(surfaces.inline_acc, None),
     );
     app.core.snapshot_claims.lock().await.claim(
         surfaces.snapshot_message_id,
@@ -1741,7 +1741,7 @@ async fn inline_handled_elsewhere_receipt_present(app: &Arc<App>) -> bool {
         c.acc.timeline.iter().any(|item| {
             matches!(
                 &item.kind,
-                crate::bridge::streaming::TimelineKind::Receipt(text)
+                crate::bridge::turn::state::TimelineKind::Receipt(text)
                     if text.starts_with("⏱ 已由其他客户端处理")
             )
         })

@@ -64,7 +64,7 @@ pub(crate) const SETTLING_CLAIM_TTL: std::time::Duration = std::time::Duration::
 pub struct SharedCore {
     pub sessions: Arc<Mutex<SessionStore>>,
     /// session_id → the session's one live card (accumulator + card id chain).
-    pub cards: Arc<Mutex<HashMap<String, crate::bridge::streaming::CardSession>>>,
+    pub cards: Arc<Mutex<HashMap<String, crate::bridge::turn::state::CardSession>>>,
     /// The card handles (ADR-0038, rule 2): `request_id → message_id` plus, for
     /// every card that shows a live interaction block, the card JSON as last
     /// rendered. Lets any card showing a block be repainted — a click's ack, a
