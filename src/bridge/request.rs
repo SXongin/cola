@@ -1604,7 +1604,7 @@ impl RequestFlow {
             affected
         };
         for session_id in &repaint {
-            crate::bridge::render::flush_card(&core.cards_handle(), session_id).await;
+            crate::bridge::turn::flush::flush_card(&core.cards_handle(), session_id).await;
         }
         // ADR-0028: a claimed request that left the pending list was
         // resolved — by the snapshot's own buttons (the click handler
@@ -1770,7 +1770,7 @@ impl RequestFlow {
                 // Flush so the inline section appears NOW — the render loop
                 // only flushes on new parts, and a blocked prompt produces
                 // none.
-                crate::bridge::render::flush_card(&core.cards_handle(), &host).await;
+                crate::bridge::turn::flush::flush_card(&core.cards_handle(), &host).await;
             }
             return false;
         }
@@ -1853,7 +1853,7 @@ impl RequestFlow {
         }
         // Flush first: the current card renders the block and the handle moves
         // with it.
-        crate::bridge::render::flush_card(&core.cards_handle(), &host).await;
+        crate::bridge::turn::flush::flush_card(&core.cards_handle(), &host).await;
         tracing::info!(
             "{} {} re-hosted on session {} card (old {})",
             self.kind.label(),
@@ -2519,7 +2519,7 @@ async fn ack_inline_card(
 /// fires until the AI resumes — the card would stay frozen on the pre-answer
 /// state. Same reason the question paths flush explicitly.
 async fn flush_inline_card(core: &Arc<SharedCore>, host: &Option<String>, session_id: &str) {
-    crate::bridge::render::flush_card(&core.cards_handle(), host.as_deref().unwrap_or(session_id)).await;
+    crate::bridge::turn::flush::flush_card(&core.cards_handle(), host.as_deref().unwrap_or(session_id)).await;
 }
 
 /// Route a question reply/reject to the instance owning the session. The card

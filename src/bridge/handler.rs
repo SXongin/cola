@@ -613,7 +613,7 @@ impl App {
                 // supplement — carries the receipt (and only the content that
                 // arrives after it) and becomes the tracked live card. There is
                 // NO separate acknowledgement message.
-                crate::bridge::render::split_card_chain(
+                crate::bridge::turn::flush::split_card_chain(
                     &self.cards_handle(),
                     &session_id,
                     &message_id,
