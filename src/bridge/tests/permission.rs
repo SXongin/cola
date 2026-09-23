@@ -640,7 +640,7 @@ async fn autoaccept_command_leaves_the_mode_receipt_on_the_card() {
     seed_session(&app, "ses_1", "/work").await;
     seed_inline_permission_card(&app, "ses_1", "per_1").await;
     // Render once so the block is on the card AND its handle is registered.
-    crate::bridge::turn::flush::flush_card(&app.cards_handle(), "ses_1").await;
+    crate::bridge::turn::Turn::flush_card(&app.cards_handle(), "ses_1").await;
     let card_id = app
         .card_handles
         .lock()
@@ -776,7 +776,7 @@ async fn autoaccept_toggle_card_settles_pending_permissions() {
     let (app, platform) = build_app(cfg, backend).await;
     seed_session(&app, "ses_1", "/work").await;
     seed_inline_permission_card(&app, "ses_1", "per_1").await;
-    crate::bridge::turn::flush::flush_card(&app.cards_handle(), "ses_1").await;
+    crate::bridge::turn::Turn::flush_card(&app.cards_handle(), "ses_1").await;
     let card_id = app
         .card_handles
         .lock()
@@ -860,7 +860,7 @@ async fn sweep_leaves_a_claimed_approval_to_its_settlement() {
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_session(&app, "ses_1", "/work").await;
     seed_inline_permission_card(&app, "ses_1", "per_1").await;
-    crate::bridge::turn::flush::flush_card(&app.cards_handle(), "ses_1").await;
+    crate::bridge::turn::Turn::flush_card(&app.cards_handle(), "ses_1").await;
     assert_eq!(
         app.card_handles.lock().await.message_of("per_1"),
         Some("msg_live"),
@@ -1528,7 +1528,7 @@ async fn interaction_receipt_survives_later_flushes() {
         .unwrap()
         .acc
         .push_text("新的进展。");
-    crate::bridge::turn::flush::flush_card(&app.cards_handle(), "ses_test").await;
+    crate::bridge::turn::Turn::flush_card(&app.cards_handle(), "ses_test").await;
     let flushed = latest_card(&platform).await.to_string();
     assert!(
         flushed.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la`"),
@@ -1551,7 +1551,7 @@ async fn interaction_receipt_survives_later_flushes() {
         .unwrap()
         .acc
         .push_text(&"很长的回答。".repeat(2000));
-    crate::bridge::turn::flush::flush_card(&app.cards_handle(), "ses_test").await;
+    crate::bridge::turn::Turn::flush_card(&app.cards_handle(), "ses_test").await;
     let calls = platform.calls.lock().await.clone();
     assert!(
         calls.iter().any(|c| matches!(
@@ -1908,7 +1908,7 @@ async fn interaction_receipt_renders_at_the_interaction_position() {
         .unwrap()
         .acc
         .push_text("第二段。");
-    crate::bridge::turn::flush::flush_card(&app.cards_handle(), "ses_test").await;
+    crate::bridge::turn::Turn::flush_card(&app.cards_handle(), "ses_test").await;
 
     let card = final_card(&platform).await;
     let elements = card["body"]["elements"].as_array().expect("elements");
@@ -2001,7 +2001,7 @@ async fn late_rendered_command_lands_above_the_receipt() {
                 output: None,
             },
         );
-    crate::bridge::turn::flush::flush_card(&app.cards_handle(), "ses_test").await;
+    crate::bridge::turn::Turn::flush_card(&app.cards_handle(), "ses_test").await;
 
     // While the command runs, its panel is live tail content (ADR-0045): it
     // renders on the live card, below the timeline — the receipt included.
@@ -2029,7 +2029,7 @@ async fn late_rendered_command_lands_above_the_receipt() {
                 output: Some("src".into()),
             },
         );
-    crate::bridge::turn::flush::flush_card(&app.cards_handle(), "ses_test").await;
+    crate::bridge::turn::Turn::flush_card(&app.cards_handle(), "ses_test").await;
 
     let card = final_card(&platform).await;
     let elements = card["body"]["elements"].as_array().expect("elements");
