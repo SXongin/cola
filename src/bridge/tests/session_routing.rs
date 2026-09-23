@@ -299,8 +299,8 @@ async fn stale_session_mapping_is_recreated_on_404() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_id = "ses_new".into();
-    backend.stale_session_404 = true;
+    backend.with_session_id("ses_new");
+    backend.stale_session_mapping();
     let (app, platform) = build_app(cfg, backend).await;
 
     // Seed stale mappings: thread -> ses_old (active), then ses_old2. When
@@ -388,11 +388,11 @@ async fn stale_session_recreate_retry_button_names_the_fresh_session() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_id = "ses_new".into();
-    backend.stale_session_404 = true;
+    backend.with_session_id("ses_new");
+    backend.stale_session_mapping();
     // The recreated session's prompt also fails, producing the Error card
     // whose retry button this test inspects.
-    backend.prompt_error = Some("provider 503".into());
+    backend.fail_prompt("provider 503");
     let (app, platform) = build_app(cfg, backend).await;
 
     let thread = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
@@ -445,8 +445,8 @@ async fn stale_topic_recreate_preserves_creation_messages() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_id = "ses_new".into();
-    backend.stale_session_404 = true;
+    backend.with_session_id("ses_new");
+    backend.stale_session_mapping();
     let prompt_calls = backend.prompt_calls.clone();
     let (app, _platform) = build_app(cfg, backend).await;
 

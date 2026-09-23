@@ -163,7 +163,7 @@ async fn prompt_error_renders_error_card() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.prompt_error = Some("Streaming response failed: [503] The request queue is full.".into());
+    backend.fail_prompt("Streaming response failed: [503] The request queue is full.");
     let (app, platform) = build_app(cfg, backend).await;
 
     app.handle_message(incoming(
@@ -235,7 +235,7 @@ async fn error_card_retry_reuses_card_and_reruns_prompt() {
 
     // The card the retry will reuse: the loading reply card id.
     let card_id = match calls.first().unwrap() {
-        PlatformCall::ReplyCard { card, .. } if card.to_string().contains("思考中") => "msg_reply",
+        PlatformCall::ReplyCard { card, .. } if card_text(card).contains("思考中") => "msg_reply",
         _ => panic!("expected a loading reply card first: {:?}", calls),
     };
     assert_eq!(card_id, "msg_reply");
@@ -615,7 +615,9 @@ async fn long_answer_splits_across_cards_no_plain_text() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let (app, platform) = build_app(cfg, MockBackend::new(long_answer_parts())).await;
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_prompt("hi", long_answer_parts());
+    let (app, platform) = build_app(cfg, backend).await;
 
     app.handle_message(incoming(
         "msg_1".into(),

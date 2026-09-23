@@ -125,7 +125,7 @@ async fn click_with_open_message_id_acks_the_cached_card() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![perm_request("per_live", "ses_live", "ls -la")];
+    backend.ask_permission(perm_request("per_live", "ses_live", "ls -la"));
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -209,7 +209,7 @@ async fn click_updates_a_non_current_card_through_its_handle() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![perm_request("per_old", "ses_old", "ls -la")];
+    backend.ask_permission(perm_request("per_old", "ses_old", "ls -la"));
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -269,7 +269,7 @@ async fn sweep_repaints_a_non_current_card_from_its_cache() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![perm_request("per_old", "ses_old", "ls -la")];
+    backend.ask_permission(perm_request("per_old", "ses_old", "ls -la"));
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -402,7 +402,7 @@ async fn a_split_registers_the_continuation_card() {
             c,
             PlatformCall::UpdateMessage { message_id, card }
                 if message_id == "msg_reply"
-                    && card.to_string().contains("⏱ 已由其他客户端处理")
+                    && card_text(card).contains("⏱ 已由其他客户端处理")
         )),
         "the continuation is repainted with the receipt: {calls:?}"
     );
@@ -511,7 +511,7 @@ async fn sweep_rehosts_a_pending_block_onto_the_new_turn_card() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![perm_request("per_old", "ses_old", "ls -la")];
+    backend.ask_permission(perm_request("per_old", "ses_old", "ls -la"));
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -591,7 +591,7 @@ async fn rehost_preserves_a_questions_partial_answers() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     let request = question_request("que_old", "ses_q");
-    backend.questions = vec![request.clone()];
+    backend.ask_question(request.clone());
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -781,7 +781,7 @@ async fn a_resolution_racing_an_in_flight_flush_is_not_resurrected() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![perm_request("per_live", "ses_live", "ls -la")];
+    backend.ask_permission(perm_request("per_live", "ses_live", "ls -la"));
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -843,7 +843,7 @@ async fn a_resolution_racing_an_in_flight_flush_is_not_resurrected() {
         matches!(
             c,
             PlatformCall::UpdateMessage { message_id, card }
-                if message_id == "om_live" && card.to_string().contains("⏱ 已由其他客户端处理")
+                if message_id == "om_live" && card_text(card).contains("⏱ 已由其他客户端处理")
         )
     });
     assert!(

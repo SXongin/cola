@@ -82,11 +82,7 @@ async fn scripted_app(
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend
-        .message_scripts
-        .lock()
-        .await
-        .insert("ses_test".into(), scripts);
+    backend.given_timeline("ses_test", scripts);
     if let Some(status) = status {
         backend.session_statuses.insert("ses_test".into(), Some(status));
     }
@@ -115,7 +111,7 @@ async fn wait_for_card_text(platform: &RecordingPlatform, needle: &str) {
                 .updated_cards()
                 .await
                 .iter()
-                .any(|c| c.to_string().contains(needle));
+                .any(|c| card_text(c).contains(needle));
             if seen {
                 return;
             }
@@ -143,11 +139,6 @@ async fn assert_no_further_rendering(backend: &Arc<MockBackend>, platform: &Reco
         patches,
         "no card PATCH may continue after the turn"
     );
-}
-
-/// The card's final rendered header, for Done/Streaming assertions.
-fn header(card: &serde_json::Value) -> &str {
-    card["header"]["title"]["content"].as_str().unwrap_or("")
 }
 
 /// With a scripted backend where the first run ends and a cola-authored
@@ -192,13 +183,13 @@ async fn drain_renders_the_new_turns_reply_on_the_live_card() {
     let updates = platform.updated_cards().await;
     let final_card = updates.last().expect("the final card flush");
     assert!(
-        final_card.to_string().contains("补充后的回答。"),
+        card_text(final_card).contains("补充后的回答。"),
         "the new Turn's reply must render on the live card: {final_card}"
     );
     assert!(
-        header(final_card).contains("完成"),
+        card_header(final_card).contains("完成"),
         "the final card must be marked Done: {}",
-        header(final_card)
+        card_header(final_card)
     );
     assert!(
         !app.inflight.lock().await.contains("ses_test"),
@@ -236,12 +227,12 @@ async fn finish_rechecks_for_a_supplement_racing_the_drain_exit() {
     let rendered = platform.updated_cards().await;
     let first = rendered
         .iter()
-        .find(|c| c.to_string().contains("第一轮回答。"))
+        .find(|c| card_text(c).contains("第一轮回答。"))
         .expect("the first run's reply");
     assert!(
-        !header(first).contains("完成"),
+        !card_header(first).contains("完成"),
         "the drain must render before finalization: {}",
-        header(first)
+        card_header(first)
     );
     assert!(
         app.inflight.lock().await.contains("ses_test"),
@@ -258,8 +249,8 @@ async fn finish_rechecks_for_a_supplement_racing_the_drain_exit() {
     result.unwrap();
 
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
-    assert!(final_card.to_string().contains("补充后的回答。"));
-    assert!(header(&final_card).contains("完成"), "final card Done");
+    assert!(card_text(&final_card).contains("补充后的回答。"));
+    assert!(card_header(&final_card).contains("完成"), "final card Done");
     assert!(!app.inflight.lock().await.contains("ses_test"));
 }
 
@@ -332,8 +323,8 @@ async fn a_message_during_the_drain_is_handled_as_a_supplement() {
     result.unwrap();
 
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
-    assert!(final_card.to_string().contains("补充二的回答。"));
-    assert!(header(&final_card).contains("完成"));
+    assert!(card_text(&final_card).contains("补充二的回答。"));
+    assert!(card_header(&final_card).contains("完成"));
     assert!(!app.inflight.lock().await.contains("ses_test"));
     assert_no_further_rendering(&backend, &platform).await;
 }
@@ -386,7 +377,7 @@ async fn stop_ends_the_drain_promptly() {
         platform.calls.lock().await
     );
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
-    assert!(header(&final_card).contains("完成"), "final card Done");
+    assert!(card_header(&final_card).contains("完成"), "final card Done");
     assert!(!app.inflight.lock().await.contains("ses_test"));
     assert_no_further_rendering(&backend, &platform).await;
 }
@@ -460,8 +451,8 @@ async fn the_drain_bound_exits_cleanly_and_finishes_the_turn() {
         "the drain must keep polling while the session is busy"
     );
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
-    assert!(header(&final_card).contains("完成"), "final card Done");
-    assert!(final_card.to_string().contains("第一轮回答。"));
+    assert!(card_header(&final_card).contains("完成"), "final card Done");
+    assert!(card_text(&final_card).contains("第一轮回答。"));
     assert!(
         !app.inflight.lock().await.contains("ses_test"),
         "the guard must be released"
@@ -560,7 +551,7 @@ async fn a_hung_backend_read_ends_the_drain_at_the_bound() {
         started.elapsed()
     );
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
-    assert!(header(&final_card).contains("完成"), "final card Done");
+    assert!(card_header(&final_card).contains("完成"), "final card Done");
     assert!(!app.inflight.lock().await.contains("ses_test"));
     assert_no_further_rendering(&backend, &platform).await;
 }
@@ -574,11 +565,10 @@ async fn a_handler_started_turn_drains_the_new_turns_reply() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let mut backend = MockBackend::new(realistic_parts());
     // Park the prompt until the test has scripted the timeline: only the
     // handler knows the `msg_cola_` id this turn will carry.
-    let gate = Arc::new(tokio::sync::Semaphore::new(0));
-    backend.prompt_gate = Some(gate.clone());
+    let mut backend = MockBackend::new(realistic_parts());
+    let gate = backend.hold_prompts();
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -645,10 +635,10 @@ async fn a_handler_started_turn_drains_the_new_turns_reply() {
 
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
-        final_card.to_string().contains("补充后的回答。"),
+        card_text(&final_card).contains("补充后的回答。"),
         "the supplement's reply must render on the live card: {final_card}"
     );
-    assert!(header(&final_card).contains("完成"), "final card Done");
+    assert!(card_header(&final_card).contains("完成"), "final card Done");
     assert!(!app.inflight.lock().await.contains("ses_test"));
     assert_no_further_rendering(&backend, &platform).await;
 }
@@ -687,7 +677,7 @@ async fn a_hung_recheck_read_does_not_extend_finalization() {
         started.elapsed()
     );
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
-    assert!(header(&final_card).contains("完成"), "final card Done");
+    assert!(card_header(&final_card).contains("完成"), "final card Done");
     assert!(!app.inflight.lock().await.contains("ses_test"));
     assert_no_further_rendering(&backend, &platform).await;
 }
@@ -725,12 +715,12 @@ async fn a_supplement_landing_after_the_drain_exit_is_still_drained() {
     let rendered = platform.updated_cards().await;
     let first = rendered
         .iter()
-        .find(|c| c.to_string().contains("第一轮回答。"))
+        .find(|c| card_text(c).contains("第一轮回答。"))
         .expect("the first run's reply");
     assert!(
-        !header(first).contains("完成"),
+        !card_header(first).contains("完成"),
         "the re-check must drain before finalization: {}",
-        header(first)
+        card_header(first)
     );
     assert!(
         app.inflight.lock().await.contains("ses_test"),
@@ -749,10 +739,10 @@ async fn a_supplement_landing_after_the_drain_exit_is_still_drained() {
 
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
-        final_card.to_string().contains("补充后的回答。"),
+        card_text(&final_card).contains("补充后的回答。"),
         "the supplement's reply must ride the final card: {final_card}"
     );
-    assert!(header(&final_card).contains("完成"), "final card Done");
+    assert!(card_header(&final_card).contains("完成"), "final card Done");
     assert!(!app.inflight.lock().await.contains("ses_test"));
     assert_no_further_rendering(&backend, &platform).await;
 }
@@ -778,6 +768,6 @@ async fn an_idle_session_exits_the_drain_without_waiting() {
         "an idle session must not wait the drain bound"
     );
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
-    assert!(header(&final_card).contains("完成"));
+    assert!(card_header(&final_card).contains("完成"));
     assert!(!app.inflight.lock().await.contains("ses_test"));
 }

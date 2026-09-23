@@ -48,27 +48,25 @@ async fn new_command_inherits_active_sessions_directory() {
     let proj_dir = proj.path().to_string_lossy().to_string();
 
     // First `/dir <proj>` declares a pending rooted in the project (ADR-0041).
-    crate::bridge::command::handle_command(
-        &app.core,
-        crate::bridge::command::Command::Dir(proj_dir.clone()),
+    send_command_in(
+        &app,
+        &format!("/dir {}", proj_dir.clone()),
         thread_key.clone(),
         "msg_dir",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
 
     // Then `/new` declares a Pending Session in the project, not back in
     // work_dir (ADR-0012 / ADR-0041).
-    crate::bridge::command::handle_command(
-        &app.core,
-        crate::bridge::command::Command::New(None),
+    send_command_in(
+        &app,
+        "/new",
         thread_key.clone(),
         "msg_new",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
 
     let pending = app
         .sessions
@@ -106,15 +104,14 @@ async fn new_command_falls_back_to_work_dir_without_active_session() {
 
     let thread_key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        crate::bridge::command::Command::New(None),
+    send_command_in(
+        &app,
+        "/new",
         thread_key.clone(),
         "msg_new",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
 
     let pending = app
         .sessions
@@ -143,13 +140,13 @@ async fn dir_card_data_dedupes_sorts_and_filters() {
         updated: 888,
         archived: Some(1),
     });
-    backend.session_list = vec![
+    backend.given_sessions(vec![
         list_session("ses_a1", "A1", "/work/a", 100),
         list_session("ses_b", "B", "/work/b", 200),
         list_session("ses_a2", "A2", "/work/a", 300),
         child,
         archived,
-    ];
+    ]);
     let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
 
@@ -174,7 +171,7 @@ async fn dir_card_data_unions_store_directories_dropped_by_the_server() {
         updated: 888,
         archived: Some(1),
     });
-    backend.session_list = vec![list_session("ses_a", "A", "/work/a", 100), archived];
+    backend.given_sessions(vec![list_session("ses_a", "A", "/work/a", 100), archived]);
     let (app, _platform) = build_app(cfg, backend).await;
 
     // /work/a is mapped too (dedup), /work/gone's session was deleted
@@ -247,10 +244,10 @@ async fn dir_card_pick_declares_a_pending_and_refreshes_card() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![
+    backend.given_sessions(vec![
         list_session("ses_a", "项目A", "/work/a", 100),
         list_session("ses_b", "项目B", "/work/b", 200),
-    ];
+    ]);
     let created = backend.created_session_dirs.clone();
     let (app, _platform) = build_app(cfg, backend).await;
 
@@ -304,7 +301,7 @@ async fn dir_card_pick_current_directory_toasts_only() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_a", "项目A", "/work/a", 100)];
+    backend.given_sessions(vec![list_session("ses_a", "项目A", "/work/a", 100)]);
     let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     seed_entry(
@@ -358,8 +355,8 @@ async fn dir_card_topic_opens_a_pending_topic() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_id = "ses_dir".into();
-    backend.session_list = vec![list_session("ses_b", "项目B", "/work/b", 200)];
+    backend.with_session_id("ses_dir");
+    backend.given_sessions(vec![list_session("ses_b", "项目B", "/work/b", 200)]);
     let created = backend.created_session_dirs.clone();
     let (app, platform) = build_app(cfg, backend).await;
 

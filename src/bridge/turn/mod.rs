@@ -1671,7 +1671,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
         let mut backend = MockBackend::new(realistic_parts());
-        backend.prompt_error = Some("provider 503".into());
+        backend.fail_prompt("provider 503");
         let (app, _platform) = build_app(cfg, backend).await;
 
         Turn::run(&app.turn_handles(), ctx("ses_a", "hi")).await.unwrap();

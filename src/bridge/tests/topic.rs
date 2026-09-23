@@ -1,4 +1,3 @@
-use crate::bridge::command::*;
 use crate::bridge::test_support::*;
 
 /// `/topic <dir> [name]` opens the topic around a **Pending Session**
@@ -11,25 +10,19 @@ async fn topic_command_opens_a_pending_topic() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_id = "ses_topic".into();
+    backend.with_session_id("ses_topic");
     let created = backend.created_session_dirs.clone();
     let title_calls = backend.update_title_calls.clone();
     let (app, platform) = build_app(cfg, backend).await;
     let proj = tempfile::tempdir().unwrap();
     let proj_dir = proj.path().to_string_lossy().to_string();
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Topic {
-            directory: Some(proj_dir.clone()),
-            name: Some("api-refactor".into()),
-        },
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+    send_command(
+        &app,
+        &format!("/topic {} api-refactor", proj_dir.clone()),
         "msg_topic",
-        crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
 
     assert!(
         created.lock().await.is_empty(),
@@ -127,7 +120,7 @@ async fn first_message_in_pending_topic_materialises_and_completes_the_cover() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_id = "ses_topic".into();
+    backend.with_session_id("ses_topic");
     let created = backend.created_session_dirs.clone();
     let title_calls = backend.update_title_calls.clone();
     let (app, platform) = build_app(cfg, backend).await;
@@ -137,18 +130,12 @@ async fn first_message_in_pending_topic_materialises_and_completes_the_cover() {
         .to_string_lossy()
         .to_string();
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Topic {
-            directory: Some(proj_dir.clone()),
-            name: Some("api-refactor".into()),
-        },
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+    send_command(
+        &app,
+        &format!("/topic {} api-refactor", proj_dir.clone()),
         "msg_topic",
-        crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
 
     app.handle_message(crate::bridge::IncomingMessage {
         message_id: "msg_in_topic".into(),
@@ -237,35 +224,23 @@ async fn name_on_a_pending_topic_patches_the_cover() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_id = "ses_topic".into();
+    backend.with_session_id("ses_topic");
     let title_calls = backend.update_title_calls.clone();
     let (app, platform) = build_app(cfg, backend).await;
     let proj = tempfile::tempdir().unwrap();
     let proj_dir = proj.path().to_string_lossy().to_string();
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Topic {
-            directory: Some(proj_dir),
-            name: None,
-        },
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_topic",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, &format!("/topic {}", proj_dir), "msg_topic").await;
     let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Name("api-refactor".into()),
+    send_command_in(
+        &app,
+        "/name api-refactor",
         topic_key.clone(),
         "msg_name",
         crate::config::ConversationKind::Topic,
     )
-    .await
-    .unwrap();
+    .await;
 
     assert!(
         title_calls.lock().await.is_empty(),
@@ -321,8 +296,8 @@ async fn switch_inside_pending_topic_repoints_and_clears_the_pending() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_id = "ses_topic".into();
-    backend.session_list = vec![list_session("ses_old", "旧会话", "/work/proj", 100)];
+    backend.with_session_id("ses_topic");
+    backend.given_sessions(vec![list_session("ses_old", "旧会话", "/work/proj", 100)]);
     backend
         .session_titles
         .lock()
@@ -333,30 +308,18 @@ async fn switch_inside_pending_topic_repoints_and_clears_the_pending() {
     let proj = tempfile::tempdir().unwrap();
     let proj_dir = proj.path().to_string_lossy().to_string();
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Topic {
-            directory: Some(proj_dir),
-            name: None,
-        },
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_topic",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, &format!("/topic {}", proj_dir), "msg_topic").await;
     let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
     assert!(app.sessions.lock().await.pending_for(&topic_key).is_some());
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Match("ses_old".into())),
+    send_command_in(
+        &app,
+        "/switch ses_old",
         topic_key.clone(),
         "msg_switch",
         crate::config::ConversationKind::Topic,
     )
-    .await
-    .unwrap();
+    .await;
 
     let store = app.sessions.lock().await;
     assert!(
@@ -415,7 +378,7 @@ async fn dir_inside_pending_topic_keeps_the_topic_anchors() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_id = "ses_topic".into();
+    backend.with_session_id("ses_topic");
     let (app, _platform) = build_app(cfg, backend).await;
     let first = tempfile::tempdir().unwrap();
     let second = tempfile::tempdir().unwrap();
@@ -428,30 +391,18 @@ async fn dir_inside_pending_topic_keeps_the_topic_anchors() {
         .to_string_lossy()
         .to_string();
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Topic {
-            directory: Some(first_dir),
-            name: None,
-        },
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_topic",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, &format!("/topic {}", first_dir), "msg_topic").await;
     let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
 
     // Correct the pending's directory in place; the topic binding survives.
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Dir(second_dir.clone()),
+    send_command_in(
+        &app,
+        &format!("/dir {}", second_dir.clone()),
         topic_key.clone(),
         "msg_dir",
         crate::config::ConversationKind::Topic,
     )
-    .await
-    .unwrap();
+    .await;
     {
         let store = app.sessions.lock().await;
         let pending = store.pending_for(&topic_key).expect("pending replaced");
@@ -493,7 +444,7 @@ async fn pending_topic_plain_reply_skips_own_root_and_seed_injection() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_id = "ses_topic".into();
+    backend.with_session_id("ses_topic");
     let prompt_calls = backend.prompt_calls.clone();
     let platform = RecordingPlatform::new();
     for (id, text) in [
@@ -513,18 +464,7 @@ async fn pending_topic_plain_reply_skips_own_root_and_seed_injection() {
     let proj = tempfile::tempdir().unwrap();
     let proj_dir = proj.path().to_string_lossy().to_string();
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Topic {
-            directory: Some(proj_dir),
-            name: None,
-        },
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_topic",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, &format!("/topic {}", proj_dir), "msg_topic").await;
 
     for pid in ["msg_sent", "msg_topic_reply"] {
         prompt_calls.lock().await.clear();
@@ -564,18 +504,7 @@ async fn topic_cover_send_failure_falls_back_to_command_root() {
     let proj = tempfile::tempdir().unwrap();
     let proj_dir = proj.path().to_string_lossy().to_string();
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Topic {
-            directory: Some(proj_dir.clone()),
-            name: None,
-        },
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_topic",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, &format!("/topic {}", proj_dir.clone()), "msg_topic").await;
 
     let calls = platform.calls.lock().await.clone();
     assert!(
@@ -687,7 +616,7 @@ async fn topic_command_bare_inherits_current_project_directory() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_id = "ses_topic".into();
+    backend.with_session_id("ses_topic");
     let (app, platform) = build_app(cfg, backend).await;
     let proj = tempfile::tempdir().unwrap();
     let proj_dir = proj.path().to_string_lossy().to_string();
@@ -696,29 +625,24 @@ async fn topic_command_bare_inherits_current_project_directory() {
 
     // Root the conversation in the project with `/dir`; its Pending Session's
     // directory is the current project bare `/topic` must inherit (ADR-0041).
-    crate::bridge::command::handle_command(
-        &app.core,
-        crate::bridge::command::Command::Dir(proj_dir.clone()),
+    send_command_in(
+        &app,
+        &format!("/dir {}", proj_dir.clone()),
         thread_key.clone(),
         "msg_dir",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
 
     // Bare `/topic` — no directory given.
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Topic {
-            directory: None,
-            name: None,
-        },
+    send_command_in(
+        &app,
+        "/topic",
         thread_key.clone(),
         "msg_topic",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
 
     // The topic is created on the cover card sent to the chat, like the
     // explicit form (ADR-0023); the mock cover send returns "msg_sent".
@@ -753,25 +677,14 @@ async fn topic_command_created_topic_routes_messages_to_its_session() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_id = "ses_topic".into();
+    backend.with_session_id("ses_topic");
     let prompt_calls = backend.prompt_calls.clone();
     let (app, _platform) = build_app(cfg, backend).await;
 
     // Create the topic first.
     let proj = tempfile::tempdir().unwrap();
     let proj_dir = proj.path().to_string_lossy().to_string();
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Topic {
-            directory: Some(proj_dir),
-            name: None,
-        },
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_topic",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, &format!("/topic {}", proj_dir), "msg_topic").await;
 
     // Now a message arrives inside that topic (thread_id = the mapped one).
     app.handle_message(incoming(
@@ -811,7 +724,7 @@ async fn topic_command_gate_rejects_banned_commands_and_lets_others_through() {
     };
 
     struct Case {
-        cmd: Command,
+        text: String,
         has_session: bool,
         rejection: Option<&'static str>,
     }
@@ -821,166 +734,140 @@ async fn topic_command_gate_rejects_banned_commands_and_lets_others_through() {
     let cases = [
         // `/topic` family: banned in ANY topic, bound or not.
         Case {
-            cmd: Command::Topic {
-                directory: Some(dir.clone()),
-                name: None,
-            },
+            text: format!("/topic {dir}"),
             has_session: false,
             rejection: Some(TOPIC_NEST_REJECTION),
         },
         Case {
-            cmd: Command::Topic {
-                directory: None,
-                name: Some("n".into()),
-            },
-            has_session: true,
-            rejection: Some(TOPIC_NEST_REJECTION),
-        },
-        Case {
-            cmd: Command::TopicAdopt {
-                keyword: "kw".into(),
-                force: false,
-            },
+            text: "/topic --adopt kw".to_string(),
             has_session: false,
             rejection: Some(TOPIC_ADOPT_NEST_REJECTION),
         },
         Case {
-            cmd: Command::TopicAdoptCard,
+            text: "/topic --adopt".to_string(),
             has_session: true,
             rejection: Some(TOPIC_ADOPT_NEST_REJECTION),
         },
         // Selection commands: banned only once the topic is bound.
         Case {
-            cmd: Command::Dir(dir.clone()),
+            text: format!("/dir {dir}"),
             has_session: true,
             rejection: Some(TOPIC_SELECTION_REJECTION),
         },
         Case {
-            cmd: Command::DirCard,
+            text: "/dir".to_string(),
             has_session: true,
             rejection: Some(TOPIC_SELECTION_REJECTION),
         },
         Case {
-            cmd: Command::Switch(SwitchAction::Match("kw".into())),
+            text: "/switch kw".to_string(),
             has_session: true,
             rejection: Some(TOPIC_SELECTION_REJECTION),
         },
         Case {
-            cmd: Command::Switch(SwitchAction::Card),
+            text: "/switch".to_string(),
             has_session: true,
             rejection: Some(TOPIC_SELECTION_REJECTION),
         },
         Case {
-            cmd: Command::Switch(SwitchAction::List {
-                keyword: None,
-                all: false,
-            }),
+            text: "/switch list".to_string(),
             has_session: true,
             rejection: Some(TOPIC_SELECTION_REJECTION),
         },
         Case {
-            cmd: Command::Switch(SwitchAction::Forget),
+            text: "/switch forget".to_string(),
             has_session: true,
             rejection: Some(TOPIC_SELECTION_REJECTION),
         },
         Case {
-            cmd: Command::Switch(SwitchAction::Attach {
-                query: "ses_x".into(),
-                force: false,
-            }),
+            text: "/switch ses_x".to_string(),
             has_session: true,
             rejection: Some(TOPIC_SELECTION_REJECTION),
         },
         Case {
-            cmd: Command::New(None),
+            text: "/new".to_string(),
             has_session: true,
             rejection: Some(TOPIC_SELECTION_REJECTION),
         },
         // Selection commands in an UNBOUND topic pass...
         Case {
-            cmd: Command::Dir(dir.clone()),
+            text: format!("/dir {dir}"),
             has_session: false,
             rejection: None,
         },
         Case {
-            cmd: Command::DirCard,
+            text: "/dir".to_string(),
             has_session: false,
             rejection: None,
         },
         Case {
-            cmd: Command::Switch(SwitchAction::Match("kw".into())),
+            text: "/switch kw".to_string(),
             has_session: false,
             rejection: None,
         },
         Case {
-            cmd: Command::Switch(SwitchAction::List {
-                keyword: None,
-                all: false,
-            }),
+            text: "/switch list".to_string(),
             has_session: false,
             rejection: None,
         },
         Case {
-            cmd: Command::Switch(SwitchAction::Forget),
+            text: "/switch forget".to_string(),
             has_session: false,
             rejection: None,
         },
         Case {
-            cmd: Command::Switch(SwitchAction::Attach {
-                query: "ses_x".into(),
-                force: false,
-            }),
+            text: "/switch ses_x".to_string(),
             has_session: false,
             rejection: None,
         },
         Case {
-            cmd: Command::New(None),
+            text: "/new".to_string(),
             has_session: false,
             rejection: None,
         },
         Case {
-            cmd: Command::New(Some("n".into())),
+            text: "/new n".to_string(),
             has_session: false,
             rejection: None,
         },
         // ...and control commands even in a bound topic.
         Case {
-            cmd: Command::Name("n".into()),
+            text: "/name n".to_string(),
             has_session: true,
             rejection: None,
         },
         Case {
-            cmd: Command::Stop,
+            text: "/stop".to_string(),
             has_session: true,
             rejection: None,
         },
         Case {
-            cmd: Command::Compact,
+            text: "/compact".to_string(),
             has_session: true,
             rejection: None,
         },
         Case {
-            cmd: Command::Agent("--reset".into()),
+            text: "/agent --reset".to_string(),
             has_session: true,
             rejection: None,
         },
         Case {
-            cmd: Command::Think("--reset".into()),
+            text: "/think --reset".to_string(),
             has_session: true,
             rejection: None,
         },
         Case {
-            cmd: Command::AutoAccept(AutoAcceptAction::Status),
+            text: "/autoaccept".to_string(),
             has_session: true,
             rejection: None,
         },
         Case {
-            cmd: Command::Help(None),
+            text: "/help".to_string(),
             has_session: true,
             rejection: None,
         },
         Case {
-            cmd: Command::Version,
+            text: "/version".to_string(),
             has_session: true,
             rejection: None,
         },
@@ -1010,19 +897,18 @@ async fn topic_command_gate_rejects_banned_commands_and_lets_others_through() {
             .await;
         }
 
-        crate::bridge::command::handle_command(
-            &app.core,
-            case.cmd.clone(),
+        send_command_in(
+            &app,
+            &case.text,
             topic_key.clone(),
             "msg_gate",
             crate::config::ConversationKind::Topic,
         )
-        .await
-        .unwrap();
+        .await;
 
         let calls = platform.calls.lock().await.clone();
         let replies = platform.texts().await;
-        let label = format!("case {i} ({:?}, has_session={})", case.cmd, case.has_session);
+        let label = format!("case {i} ({}, has_session={})", case.text, case.has_session);
         if let Some(reason) = case.rejection {
             assert_eq!(
                 calls.len(),
@@ -1050,6 +936,56 @@ async fn topic_command_gate_rejects_banned_commands_and_lets_others_through() {
     }
 }
 
+/// `Command::topic_rejection` matches `/topic` on the VARIANT, so the fields
+/// never change the verdict. This shape (`directory: None, name: Some`) is
+/// unreachable through `parse_command` — no message text produces it — so it
+/// stays a direct dispatcher call, individually justified: the message entry
+/// point cannot express it.
+#[tokio::test]
+async fn topic_gate_rejects_the_unparseable_topic_shape() {
+    use crate::bridge::command::{Command, TOPIC_NEST_REJECTION};
+
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_gate".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: topic_key.clone(),
+            session_id: "ses_owned".into(),
+            directory: "/work/topic".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    crate::bridge::command::handle_command(
+        &app.core,
+        Command::Topic {
+            directory: None,
+            name: Some("n".into()),
+        },
+        topic_key,
+        "msg_gate",
+        crate::config::ConversationKind::Topic,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        platform.texts().await,
+        vec![TOPIC_NEST_REJECTION.to_string()],
+        "the variant match rejects regardless of the Topic fields"
+    );
+}
+
 // ===== /topic --adopt (ADR-0016) =====
 
 /// `/topic --adopt <kw>` resolves an existing session and opens a NEW topic
@@ -1060,26 +996,15 @@ async fn topic_adopt_opens_topic_around_existing_session() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session(
+    backend.given_sessions(vec![list_session(
         "ses_foreign123abc",
         "重写登录模块",
         "/work/auth",
         100,
-    )];
+    )]);
     let (app, platform) = build_app(cfg, backend).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::TopicAdopt {
-            keyword: "重写登录".into(),
-            force: false,
-        },
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_topic_adopt",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/topic --adopt 重写登录", "msg_topic_adopt").await;
 
     // The topic is created via a cover card sent to the chat, then the
     // Session Snapshot card replied in-thread on that card (ADR-0023 +
@@ -1135,23 +1060,19 @@ async fn topic_adopt_keeps_per_session_overrides() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)];
+    backend.given_sessions(vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)]);
     let (app, _platform) = build_app(cfg, backend).await;
     let lobby_key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     seed_overridden_entry(&app, lobby_key.clone(), "ses_own1", "/work/cola").await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::TopicAdopt {
-            keyword: "本项目".into(),
-            force: false,
-        },
+    send_command_in(
+        &app,
+        "/topic --adopt 本项目",
         lobby_key,
         "msg_topic_adopt",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
 
     let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
     let entry = app
@@ -1179,24 +1100,13 @@ async fn topic_adopt_rejects_child_session() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![opencode::types::SessionListInfo {
+    backend.given_sessions(vec![opencode::types::SessionListInfo {
         parent_id: Some("ses_parent".into()),
         ..list_session("ses_child09", "Child session - x", "/work/auth", 100)
-    }];
+    }]);
     let (app, platform) = build_app(cfg, backend).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::TopicAdopt {
-            keyword: "ses_child09".into(),
-            force: false,
-        },
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_topic_adopt",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/topic --adopt ses_child09", "msg_topic_adopt").await;
 
     let calls = platform.calls.lock().await.clone();
     let text = platform.texts().await.join("\n");
@@ -1218,7 +1128,7 @@ async fn topic_adopt_rejects_owned_session_without_force() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_owned", "被占用的会话", "/work/auth", 100)];
+    backend.given_sessions(vec![list_session("ses_owned", "被占用的会话", "/work/auth", 100)]);
     let mut platform = RecordingPlatform::new();
     platform
         .chat_names
@@ -1241,18 +1151,7 @@ async fn topic_adopt_rejects_owned_session_without_force() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::TopicAdopt {
-            keyword: "ses_owned".into(),
-            force: false,
-        },
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_topic_adopt",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/topic --adopt ses_owned", "msg_topic_adopt").await;
 
     let calls = platform.calls.lock().await.clone();
     let text = platform.texts().await.join("\n");
@@ -1277,7 +1176,7 @@ async fn topic_adopt_force_steals_mapping() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_owned", "被占用的会话", "/work/auth", 100)];
+    backend.given_sessions(vec![list_session("ses_owned", "被占用的会话", "/work/auth", 100)]);
     let (app, _platform) = build_app(cfg, backend).await;
     seed_entry(
         &app,
@@ -1295,18 +1194,7 @@ async fn topic_adopt_force_steals_mapping() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::TopicAdopt {
-            keyword: "ses_owned".into(),
-            force: true,
-        },
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_topic_adopt",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/topic --adopt ses_owned --force", "msg_topic_adopt").await;
 
     let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
     assert_eq!(
@@ -1333,18 +1221,10 @@ async fn topic_adopt_no_arg_sends_switch_card() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "重写登录", "/work/auth", 100)];
+    backend.given_sessions(vec![list_session("ses_alpha01", "重写登录", "/work/auth", 100)]);
     let (app, platform) = build_app(cfg, backend).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::TopicAdoptCard,
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_card",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/topic --adopt", "msg_card").await;
 
     let card = platform
         .replied_cards()
@@ -1379,7 +1259,7 @@ async fn switch_card_topic_adopt_action_creates_topic() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "重写登录", "/work/auth", 100)];
+    backend.given_sessions(vec![list_session("ses_alpha01", "重写登录", "/work/auth", 100)]);
     let (app, _platform) = build_app(cfg, backend).await;
 
     let value = serde_json::json!({
@@ -1427,7 +1307,7 @@ async fn switch_card_topic_adopt_occupied_offers_force_confirm() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_owned", "被占用的会话", "/work/auth", 100)];
+    backend.given_sessions(vec![list_session("ses_owned", "被占用的会话", "/work/auth", 100)]);
     let mut platform = RecordingPlatform::new();
     platform
         .chat_names
@@ -1496,7 +1376,7 @@ async fn switch_card_force_topic_adopt_steals_owned_session() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_owned", "被占用的会话", "/work/auth", 100)];
+    backend.given_sessions(vec![list_session("ses_owned", "被占用的会话", "/work/auth", 100)]);
     let mut platform = RecordingPlatform::new();
     platform
         .chat_names
@@ -1558,7 +1438,7 @@ async fn switch_card_force_topic_adopt_failure_keeps_old_owner() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_owned", "被占用的会话", "/work/auth", 100)];
+    backend.given_sessions(vec![list_session("ses_owned", "被占用的会话", "/work/auth", 100)]);
     let mut platform = RecordingPlatform::new();
     // No topic support: `reply_in_thread` returns no thread_id, so the topic
     // creation fails before any mapping write.
@@ -1621,7 +1501,7 @@ async fn switch_card_topic_adopt_missing_open_message_id() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "重写登录", "/work/auth", 100)];
+    backend.given_sessions(vec![list_session("ses_alpha01", "重写登录", "/work/auth", 100)]);
     let (app, _platform) = build_app(cfg, backend).await;
 
     let value = serde_json::json!({
@@ -1657,7 +1537,7 @@ async fn switch_card_topic_adopt_rejects_inside_topic() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "重写登录", "/work/auth", 100)];
+    backend.given_sessions(vec![list_session("ses_alpha01", "重写登录", "/work/auth", 100)]);
     let (app, _platform) = build_app(cfg, backend).await;
 
     let value = serde_json::json!({
@@ -1694,18 +1574,7 @@ async fn topic_command_rejects_nonexistent_directory() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Topic {
-            directory: Some("/nonexistent/dir/xyz".into()),
-            name: None,
-        },
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_topic",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/topic /nonexistent/dir/xyz", "msg_topic").await;
 
     let calls = platform.calls.lock().await.clone();
     let text = platform.texts().await.join("\n");
@@ -1733,22 +1602,23 @@ async fn fresh_topic_attach_adopts_with_in_topic_anchor() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_foreign123abc", "外部会话", "/work/ext", 100)];
+    backend.given_sessions(vec![list_session(
+        "ses_foreign123abc",
+        "外部会话",
+        "/work/ext",
+        100,
+    )]);
     let (app, platform) = build_app(cfg, backend).await;
     let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_fresh".into());
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Attach {
-            query: "ses_foreign123abc".into(),
-            force: false,
-        }),
+    send_command_in(
+        &app,
+        "/switch ses_foreign123abc",
         topic_key.clone(),
         "msg_topic_cmd",
         crate::config::ConversationKind::Topic,
     )
-    .await
-    .unwrap();
+    .await;
 
     // ADR-0028: the in-topic adoption confirmation is the Session Snapshot
     // card, sent inside the topic — no 「📎 已接管…」 text anchor anymore.
@@ -1960,8 +1830,8 @@ async fn switch_card_adopt_inside_pending_topic_repoints_in_place() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_id = "ses_topic".into();
-    backend.session_list = vec![list_session("ses_old", "旧会话", "/work/proj", 100)];
+    backend.with_session_id("ses_topic");
+    backend.given_sessions(vec![list_session("ses_old", "旧会话", "/work/proj", 100)]);
     backend
         .session_titles
         .lock()
@@ -1971,18 +1841,7 @@ async fn switch_card_adopt_inside_pending_topic_repoints_in_place() {
     let proj = tempfile::tempdir().unwrap();
     let proj_dir = proj.path().to_string_lossy().to_string();
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Topic {
-            directory: Some(proj_dir),
-            name: None,
-        },
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_topic",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, &format!("/topic {}", proj_dir), "msg_topic").await;
 
     let value = serde_json::json!({
         "action": "switch",

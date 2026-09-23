@@ -114,7 +114,7 @@ async fn card_pull_migrates_a_pending_permission() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![perm_request("per_live", "ses_test", "ls -la")];
+    backend.ask_permission(perm_request("per_live", "ses_test", "ls -la"));
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -215,7 +215,7 @@ async fn last_update_of(platform: &RecordingPlatform, message_id: &str) -> Strin
 }
 
 fn has(card: &serde_json::Value, needle: &str) -> bool {
-    card.to_string().contains(needle)
+    card_text(card).contains(needle)
 }
 
 /// `/card` mid-turn finalizes the live card with the standard split header and
