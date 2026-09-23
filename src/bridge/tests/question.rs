@@ -1068,7 +1068,7 @@ async fn inline_question_answered_on_streaming_card() {
     ))
     .await;
     assert!(
-        app.cards.lock().await.contains_key("ses_test"),
+        Turn::has_card(&app.cards_handle(), "ses_test").await,
         "accumulator expected"
     );
 

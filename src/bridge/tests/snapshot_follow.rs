@@ -690,7 +690,7 @@ async fn idle_adopt_does_not_arm_follow() {
     .unwrap();
 
     assert!(
-        !app.core.cards.lock().await.contains_key("ses_alpha01"),
+        !Turn::has_card(&app.core.cards_handle(), "ses_alpha01").await,
         "no renderer armed for an idle session"
     );
     assert!(
@@ -729,7 +729,7 @@ async fn busy_then_idle_race_stays_static() {
     .unwrap();
 
     assert!(
-        !app.core.cards.lock().await.contains_key("ses_alpha01"),
+        !Turn::has_card(&app.core.cards_handle(), "ses_alpha01").await,
         "no renderer armed for a turn that already finished"
     );
     assert!(
@@ -778,7 +778,7 @@ async fn busy_follow_skips_cola_authored_turn() {
     .unwrap();
 
     assert!(
-        !app.core.cards.lock().await.contains_key("ses_alpha01"),
+        !Turn::has_card(&app.core.cards_handle(), "ses_alpha01").await,
         "cola's own turn is never followed"
     );
     assert!(

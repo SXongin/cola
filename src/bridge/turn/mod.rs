@@ -1,6 +1,11 @@
 mod flush;
 mod render;
-pub(crate) mod state;
+mod state;
+
+/// The one card-session type the coordinator's map holds. Its accumulator and
+/// identity chain stay private to the Turn module: every read/write goes
+/// through the interface above (spec #298, A3).
+pub(crate) use state::CardSession;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -963,9 +968,9 @@ pub(crate) struct TurnRetry {
     pub(crate) card_message_id: Option<String>,
 }
 
-/// How a resolution leaves its residue on the card ACCOUNT's timeline
-/// (ADR-0038, rule 4): one receipt per resolved block (a click), or ONE mode
-/// line for every block a mode change resolved.
+/// How a resolution leaves its residue on the card's timeline (ADR-0038,
+/// rule 4): one receipt per resolved block (a click), or ONE mode line for
+/// every block a mode change resolved.
 pub(crate) enum InlineResidue<'a> {
     /// One receipt per resolved block, naming that block's own target.
     PerBlock(&'a (dyn Fn(&str) -> String + Send + Sync)),
@@ -1358,6 +1363,11 @@ async fn release_inflight(handles: &TurnHandles, session_id: &str) {
 /// The accumulator's own internal-seam tests live next to it in `state.rs`.
 #[cfg(test)]
 impl Turn {
+    /// Drop the session's card session (a test teardown).
+    pub(crate) async fn drop_card(cards: &CardsHandle, session_id: &str) {
+        cards.cards.lock().await.remove(session_id);
+    }
+
     /// Seed an empty card session for `session_id`.
     pub(crate) async fn seed_card(cards: &CardsHandle, session_id: &str, card_message_id: Option<&str>) {
         cards.cards.lock().await.insert(
@@ -1566,6 +1576,22 @@ impl Turn {
             .await
             .get(session_id)
             .is_some_and(|c| !c.pending_split.is_empty())
+    }
+
+    /// The queued splits' `(reply_to, receipt_pushed)`, in arrival order.
+    pub(crate) async fn pending_splits(cards: &CardsHandle, session_id: &str) -> Vec<(String, bool)> {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .map(|c| {
+                c.pending_split
+                    .iter()
+                    .map(|s| (s.reply_to.clone(), s.receipt_pushed))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Whether any card carries a LIVE interaction block for `request_id`.

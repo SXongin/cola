@@ -34,7 +34,7 @@ fn question_request(id: &str, session_id: &str) -> opencode::types::QuestionRequ
 /// turn never got that far.
 async fn wait_for_turn_card(app: &Arc<App>, session_id: &str) {
     for _ in 0..200 {
-        if app.cards.lock().await.contains_key(session_id) {
+        if Turn::has_card(&app.cards_handle(), session_id).await {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;

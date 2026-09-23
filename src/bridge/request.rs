@@ -1761,11 +1761,8 @@ impl RequestFlow {
         let Some(host) = inline_host_session(core, req.session_id(), Some(dir)).await else {
             return;
         };
-        {
-            let cards = core.cards.lock().await;
-            if !cards.contains_key(&host) {
-                return;
-            }
+        if !Turn::has_card(&core.cards_handle(), &host).await {
+            return;
         }
         // The accumulator still carries the block (its own flush owns the
         // current card), or the handle already names that card: nothing to
