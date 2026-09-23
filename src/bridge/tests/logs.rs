@@ -189,6 +189,65 @@ async fn render_poll_and_final_render_lines_carry_the_session() {
     );
 }
 
+/// ADR-0048 level policy: the render poll is the per-Session liveness
+/// heartbeat, so it stays at INFO — but only the tick that rendered new
+/// content may log. Several ticks over one unchanged snapshot are silent.
+#[tokio::test]
+async fn the_render_poll_logs_at_info_only_on_progress() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut backend = MockBackend::new(realistic_parts());
+    // Park the prompt so the poll ticks several times over one snapshot.
+    backend.prompt_gate = Some(Arc::clone(&gate));
+    backend.message_scripts.lock().await.insert(
+        "ses_test".into(),
+        vec![vec![
+            msg(
+                "user",
+                "msg_cola_anchor",
+                1_000,
+                json!([{ "type": "text", "text": "hi" }]),
+            ),
+            msg("assistant", "msg_assist", 2_000, realistic_parts()),
+        ]],
+    );
+    let messages_calls = Arc::clone(&backend.messages_calls);
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
+    // Release the prompt only after several poll ticks have read the same
+    // snapshot: the first renders (and logs), the rest dedupe to nothing.
+    let releaser = tokio::spawn(async move {
+        while messages_calls.lock().await.len() < 4 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        gate.add_permits(1);
+    });
+
+    let (result, logs) = capture_logs(async { Turn::run(&app, prompt_context(lobby(), "hi")).await }).await;
+    result.unwrap();
+    releaser.await.unwrap();
+
+    let polls: Vec<&str> = logs
+        .lines()
+        .filter(|line| line.contains("render poll:"))
+        .collect();
+    assert_eq!(
+        polls.len(),
+        1,
+        "only the tick that rendered new content may log: {polls:?}\n{logs}"
+    );
+    assert_eq!(
+        line_level(polls[0]),
+        "INFO",
+        "the render poll stays INFO: {}",
+        polls[0]
+    );
+}
+
 /// A 404 recreate moves the Turn onto a fresh session: the retry and the
 /// finalization must be retrievable by the NEW id, while the warning that names
 /// what was missing stays on the stale one.

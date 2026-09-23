@@ -391,6 +391,50 @@ async fn stop_ends_the_drain_promptly() {
     assert_no_further_rendering(&backend, &platform).await;
 }
 
+/// ADR-0048: the stopped-finalization is one state transition per Turn. The
+/// post-prompt drain and its pre-finalization re-check both observe the same
+/// `/stop` marker, so the line must be logged once, not once per phase.
+#[tokio::test]
+async fn a_stopped_turn_logs_finalizing_once_per_turn() {
+    let _wd = test_work_dir();
+    let timeline = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一轮回答。"),
+        user("msg_cola_supp", 3_000, "补充一下"),
+    ];
+    let (_dir, app, _backend, platform) = scripted_app(vec![timeline], Some(SessionStatus::Idle)).await;
+
+    let (_, logs) = capture_logs(async {
+        let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+        wait_for_card_text(&platform, "第一轮回答。").await;
+        app.handle_message(incoming(
+            "msg_stop".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "/stop".into(),
+            None,
+        ))
+        .await;
+        let result = tokio::time::timeout(Duration::from_secs(5), turn)
+            .await
+            .expect("the drain must end on the stop")
+            .unwrap();
+        result.unwrap();
+    })
+    .await;
+
+    let finalizing: Vec<&str> = logs
+        .lines()
+        .filter(|line| line.contains("was stopped; finalizing"))
+        .collect();
+    assert_eq!(
+        finalizing.len(),
+        1,
+        "finalizing must be logged once per Turn: {finalizing:?}\n{logs}"
+    );
+}
+
 /// A session that stays busy runs the drain to its bound, then finalization
 /// proceeds normally: final card rendered, guard released, completion notice
 /// unchanged.
