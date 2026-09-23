@@ -1,10 +1,23 @@
+//! The Turn's render internals (spec #298, A2b).
+//!
+//! The render poll loop, the part rendering, and the session subtitle/title
+//! refresh live here, behind the Turn's interface (`Turn::session_subtitle` /
+//! `Turn::render_and_flush` in the parent module) and its private
+//! [`RenderPoll`] task. Nothing here is reachable from outside the Turn module.
+
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use tracing::Instrument;
 
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
-use crate::bridge::handles::{CardsHandle, SessionsHandle};
+use crate::bridge::handles::{CardsHandle, SessionsHandle, TurnHandles};
+use crate::bridge::span;
 use crate::bridge::streaming::StreamAccumulator;
-use crate::bridge::turn::Turn;
+use crate::config::ThreadKey;
 use crate::opencode;
+
+use super::Turn;
 
 /// The session/thread name shown as the card subtitle, formatted as
 /// `<title> · <id-tail>` (e.g. "你好 · 01ba0ed"). The OpenCode server's OWN
@@ -571,6 +584,42 @@ pub(crate) async fn render_poll_loop(
                 }
             }
         }
+    }
+}
+
+/// One attempt's incremental renderer: the poll loop plus its stop flag. Owns
+/// the spawn/stop pairing so an attempt cannot leak a running poll loop.
+pub(super) struct RenderPoll {
+    done: Arc<AtomicBool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl RenderPoll {
+    pub(super) fn spawn(handles: &TurnHandles, session_id: &str, thread_key: &ThreadKey) -> Self {
+        let done = Arc::new(AtomicBool::new(false));
+        let cards = handles.cards.clone();
+        let sessions = handles.sessions.clone();
+        let backend = Arc::clone(&handles.backend);
+        let sid = session_id.to_string();
+        let flag = Arc::clone(&done);
+        let poll_ms = handles.config.render_poll_ms();
+        // A spawn does not inherit the turn's span — the poll runs on its own
+        // task — so it is instrumented explicitly with the same fields: its
+        // lines must keep the session (ADR-0048). Rooted, because the ambient
+        // parent here is the turn's span.
+        let span = span::turn(session_id, thread_key, None);
+        let handle = tokio::spawn(
+            async move {
+                render_poll_loop(&cards, &sessions, &backend, sid, flag, poll_ms).await;
+            }
+            .instrument(span),
+        );
+        Self { done, handle }
+    }
+
+    pub(super) async fn stop(self) {
+        self.done.store(true, Ordering::SeqCst);
+        let _ = self.handle.await;
     }
 }
 

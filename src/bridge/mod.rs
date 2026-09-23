@@ -12,7 +12,6 @@ pub mod message_pins;
 pub mod pollers;
 pub mod question;
 pub mod reminder;
-pub mod render;
 pub mod request;
 pub mod session;
 pub mod snapshot;
