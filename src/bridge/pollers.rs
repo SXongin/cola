@@ -6,6 +6,7 @@ use crate::bridge::core::SharedCore;
 use crate::bridge::discovery::{self, ServerCandidate};
 use crate::bridge::handler::CardActionResult;
 use crate::bridge::request::SentCard;
+use crate::bridge::turn::Turn;
 use crate::config::ServerStartPolicy;
 use crate::opencode;
 
@@ -366,13 +367,7 @@ pub(crate) async fn resolve_card_target(
         let current = current.to_string();
         async move {
             // In-flight prompt for this session → reply to its streaming card.
-            let reply_to = {
-                let cards = core.cards.lock().await;
-                cards
-                    .get(&current)
-                    .and_then(|c| c.acc.reply_to_message_id.clone())
-            };
-            if let Some(msg_id) = reply_to {
+            if let Some(msg_id) = Turn::reply_target(&core.cards_handle(), &current).await {
                 return Some(CardTarget::ReplyTo(msg_id));
             }
             // Session mapped to a chat. A topic-backed session must be reached by
@@ -417,8 +412,7 @@ pub(crate) async fn inline_host_session(
     walk_parent_chain(&core.opencode, session_id, directory, |current| {
         let current = current.to_string();
         async move {
-            let cards = core.cards.lock().await;
-            if cards.contains_key(&current) {
+            if Turn::has_card(&core.cards_handle(), &current).await {
                 Some(current)
             } else {
                 None

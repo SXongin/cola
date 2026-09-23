@@ -2,6 +2,7 @@ mod flush;
 mod render;
 pub(crate) mod state;
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tracing::Instrument;
@@ -842,6 +843,17 @@ impl Turn {
 /// split gets one slot past the bound, so a Supplement is never refused by it.
 pub(crate) const MAX_CARD_CHAIN: usize = 8;
 
+/// Why a Card Chain split was requested: each cause writes its own receipt
+/// line on the continuation (ADR-0043).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SplitKind {
+    /// A Supplement landed below the live card (ADR-0043).
+    Supplement,
+    /// The user explicitly pulled the live card down with `/card`
+    /// (ADR-0043, 2026-09-22 amendment).
+    Pull,
+}
+
 /// The Turn's card-delivery interface (spec #298, A2a): the operations sibling
 /// flows invoke when they own the trigger moment — the render poll, the
 /// request poller surfacing an inline block, the external renderer finalizing
@@ -880,7 +892,7 @@ impl Turn {
         cards: &CardsHandle,
         session_id: &str,
         reply_to: &str,
-        kind: crate::bridge::turn::state::SplitKind,
+        kind: SplitKind,
     ) {
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
@@ -889,7 +901,7 @@ impl Turn {
             let Some(card) = live.get_mut(session_id) else {
                 return;
             };
-            card.pending_split.push(crate::bridge::turn::state::PendingSplit {
+            card.pending_split.push(state::PendingSplit {
                 reply_to: reply_to.to_string(),
                 kind,
                 receipt_pushed: false,
@@ -928,6 +940,407 @@ impl Turn {
         msgs: &[SessionMessage],
     ) -> Option<(usize, usize, usize)> {
         render::render_and_flush(cards, sessions, backend, session_id, msgs).await
+    }
+}
+
+/// The Instant Reminder facts a cola Turn's live card carries (ADR-0043): the
+/// turn generation, the requester, and whether the prompt came from a group.
+pub(crate) struct TurnPinSource {
+    pub(crate) generation: u64,
+    pub(crate) requester_open_id: String,
+    pub(crate) is_group: bool,
+}
+
+/// The error-card retry fixture a failed turn's card carries: the original
+/// prompt, its reply target, and the identity/thread facts a retry reuses.
+pub(crate) struct TurnRetry {
+    pub(crate) prompt: String,
+    pub(crate) reply_to: String,
+    pub(crate) subtitle: String,
+    pub(crate) requester_open_id: Option<String>,
+    pub(crate) is_group: bool,
+    pub(crate) cola_message_id: Option<String>,
+    pub(crate) card_message_id: Option<String>,
+}
+
+/// How a resolution leaves its residue on the card ACCOUNT's timeline
+/// (ADR-0038, rule 4): one receipt per resolved block (a click), or ONE mode
+/// line for every block a mode change resolved.
+pub(crate) enum InlineResidue<'a> {
+    /// One receipt per resolved block, naming that block's own target.
+    PerBlock(&'a (dyn Fn(&str) -> String + Send + Sync)),
+    /// ONE receipt for the whole resolution.
+    Single(&'a str),
+}
+
+/// The Turn's card-state interface (spec #298, A3): the operations sibling
+/// flows invoke against a session's streaming card — identity, lifecycle,
+/// interaction blocks and the external renderer's arming. The accumulator and
+/// its card session are private to the `state` submodule; no bridge module
+/// outside the Turn reads their fields, and every card update below is the
+/// only path to the state behind them.
+impl Turn {
+    /// Whether the session currently has a card session at all.
+    pub(crate) async fn has_card(cards: &CardsHandle, session_id: &str) -> bool {
+        cards.cards.lock().await.contains_key(session_id)
+    }
+
+    /// Whether the session's card is still running (not Done/Error). The map's
+    /// key alone does not mean a live card — a completed turn stays until the
+    /// next Turn replaces it.
+    pub(crate) async fn is_running(cards: &CardsHandle, session_id: &str) -> bool {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(state::CardSession::is_running)
+    }
+
+    /// The session's tracked card message id, if a card has been sent.
+    pub(crate) async fn card_message_id(cards: &CardsHandle, session_id: &str) -> Option<String> {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|c| c.card_message_id.clone())
+    }
+
+    /// The message a card for this session should reply to, if a live turn owns
+    /// one.
+    pub(crate) async fn reply_target(cards: &CardsHandle, session_id: &str) -> Option<String> {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|c| c.acc.reply_to_message_id.clone())
+    }
+
+    /// The turn anchor of the session's armed renderer, if one is armed: the
+    /// renderer identity both external arming paths compare their own turn's
+    /// server time against.
+    pub(crate) async fn armed_turn_anchor(cards: &CardsHandle, session_id: &str) -> Option<i64> {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|c| c.acc.turn_started_ms)
+    }
+
+    /// Whether the session's card has rendered any part — the external
+    /// renderer's "partial reply" probe before it finalizes on timeout.
+    pub(crate) async fn has_rendered_content(cards: &CardsHandle, session_id: &str) -> bool {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|c| !c.acc.rendered_parts.is_empty() || !c.acc.rendered_tool_states.is_empty())
+    }
+
+    /// Mark the session's card Done in place (no flush).
+    pub(crate) async fn mark_done(cards: &CardsHandle, session_id: &str) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.card_state = crate::feishu::card::CardState::Done;
+        }
+    }
+
+    /// Re-point the live card identity at a new message (ADR-0028: a re-adopt
+    /// mid-turn sends a fresh snapshot; the follow renderer keeps updating the
+    /// new card instead of the old one). The content is untouched.
+    pub(crate) async fn repoint_card(cards: &CardsHandle, session_id: &str, message_id: &str) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.repoint(message_id);
+        }
+    }
+
+    /// Refresh the live card's work context at turn end (ADR-0019): re-read the
+    /// session directory's git state so the final card shows where the turn
+    /// landed.
+    pub(crate) async fn refresh_work_context(cards: &CardsHandle, session_id: &str) {
+        state::refresh_work_context(cards, session_id).await;
+    }
+
+    /// Finalize an externally-rendered card: refresh its work context, mark it
+    /// Done and flush it.
+    pub(crate) async fn finalize_done(cards: &CardsHandle, session_id: &str) {
+        Self::refresh_work_context(cards, session_id).await;
+        Self::mark_done(cards, session_id).await;
+        Self::flush_card(cards, session_id).await;
+    }
+
+    /// `request_id → card_message_id` for every live block a card session's
+    /// accumulator still owns. The sweep uses it to leave those blocks to their
+    /// own flush (ADR-0038, rule 2).
+    pub(crate) async fn flush_owned_blocks(cards: &CardsHandle) -> HashMap<String, String> {
+        let live = cards.cards.lock().await;
+        let mut owned = HashMap::new();
+        for card in live.values() {
+            let Some(message_id) = card.card_message_id.as_deref() else {
+                continue;
+            };
+            for id in card.acc.live_request_ids() {
+                owned.insert(id.to_string(), message_id.to_string());
+            }
+        }
+        owned
+    }
+
+    /// Whether ANY card session still carries a block for `request_id` (the
+    /// snapshot-claimability probe, ADR-0028).
+    pub(crate) async fn has_interaction(cards: &CardsHandle, request_id: &str) -> bool {
+        cards
+            .cards
+            .lock()
+            .await
+            .values()
+            .any(|c| c.acc.interaction(request_id).is_some())
+    }
+
+    /// Whether `session_id`'s card carries a block (live or tombstone) for
+    /// `request_id` — the re-host's "nothing to move" probe (ADR-0038, rule 1).
+    pub(crate) async fn has_interaction_in(cards: &CardsHandle, session_id: &str, request_id: &str) -> bool {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|c| c.acc.interaction(request_id).is_some())
+    }
+
+    /// The Instant Reminder source facts of a cola Turn's live card (ADR-0043).
+    /// `None` when no cola turn registered one — an external turn, or a request
+    /// pending across a restart.
+    pub(crate) async fn pin_source(cards: &CardsHandle, session_id: &str) -> Option<TurnPinSource> {
+        let live = cards.cards.lock().await;
+        let card = live.get(session_id)?;
+        let generation = card.acc.turn_generation?;
+        let requester_open_id = card.acc.requester_open_id.clone()?;
+        if requester_open_id.is_empty() {
+            return None;
+        }
+        Some(TurnPinSource {
+            generation,
+            requester_open_id,
+            is_group: card.acc.is_group,
+        })
+    }
+
+    /// The error-card retry fixture a session's card carries: the original
+    /// prompt, its reply target, subtitle, requester/chat facts and the card id
+    /// to reset. `None` when the session has no card.
+    pub(crate) async fn retry_request(cards: &CardsHandle, session_id: &str) -> Option<TurnRetry> {
+        let live = cards.cards.lock().await;
+        let card = live.get(session_id)?;
+        Some(TurnRetry {
+            prompt: card.acc.prompt.clone().unwrap_or_default(),
+            reply_to: card.acc.reply_to_message_id.clone().unwrap_or_default(),
+            subtitle: card.acc.title.clone(),
+            requester_open_id: card.acc.requester_open_id.clone(),
+            is_group: card.acc.is_group,
+            cola_message_id: card.acc.cola_message_id.clone(),
+            card_message_id: card.card_message_id.clone(),
+        })
+    }
+
+    /// Add a permission's inline block to `session_id`'s card. Returns false
+    /// when the card already carries the request, or the card session is gone.
+    pub(crate) async fn add_permission(
+        cards: &CardsHandle,
+        session_id: &str,
+        p: &opencode::types::PermissionRequest,
+        directory: &str,
+    ) -> bool {
+        let block = state::InteractionBlock::Permission(state::PendingPermission {
+            session_id: p.session_id.clone().unwrap_or_default(),
+            request_id: p.request_id.clone(),
+            body: crate::bridge::request::describe_permission(p),
+            target: crate::bridge::request::permission_target(p),
+            directory: directory.to_string(),
+        });
+        match cards.cards.lock().await.get_mut(session_id) {
+            Some(card) => card.acc.add_interaction(block),
+            None => false,
+        }
+    }
+
+    /// Add a question's inline block to `session_id`'s card, carrying the
+    /// display state the flow restored for it (ADR-0038, rule 1). Returns false
+    /// when the card already carries the request, or the card session is gone.
+    pub(crate) async fn add_question(
+        cards: &CardsHandle,
+        session_id: &str,
+        q: &opencode::types::QuestionRequest,
+        directory: &str,
+        answers: &[Option<Vec<String>>],
+        done: &[bool],
+    ) -> bool {
+        let block = state::InteractionBlock::Question(state::PendingQuestion {
+            request_id: q.id.clone(),
+            session_id: q.session_id.clone(),
+            questions: q.questions.clone(),
+            directory: directory.to_string(),
+            answers: answers.to_vec(),
+            done: done.to_vec(),
+        });
+        match cards.cards.lock().await.get_mut(session_id) {
+            Some(card) => card.acc.add_interaction(block),
+            None => false,
+        }
+    }
+
+    /// Replace a question block's display state (the live 已选/✅ markers) in
+    /// place. Returns false when the card has no question block for the request
+    /// or the card session is gone.
+    pub(crate) async fn update_question_state(
+        cards: &CardsHandle,
+        session_id: &str,
+        request_id: &str,
+        answers: &[Option<Vec<String>>],
+        done: &[bool],
+    ) -> bool {
+        match cards.cards.lock().await.get_mut(session_id) {
+            Some(card) => card.acc.update_question_state(request_id, answers, done),
+            None => false,
+        }
+    }
+
+    /// Resolve every live permission block whose request vanished (resolved by
+    /// another client) into its Interaction Receipt; an item owned by a
+    /// directory whose list failed, or that cola itself is answering, stays
+    /// live (#130, #144). Returns the affected session ids — the sweep repaints
+    /// each affected card so the receipt lands within one poll (ADR-0038).
+    pub(crate) async fn resolve_vanished_permissions(
+        cards: &CardsHandle,
+        pending: &HashSet<String>,
+        failed_dirs: &HashSet<String>,
+        cola_claimed: &HashSet<String>,
+    ) -> Vec<String> {
+        Self::resolve_vanished(cards, pending, failed_dirs, cola_claimed, |block| {
+            matches!(block, state::InteractionBlock::Permission(_))
+        })
+        .await
+    }
+
+    /// [`Self::resolve_vanished_permissions`] for the question kind.
+    pub(crate) async fn resolve_vanished_questions(
+        cards: &CardsHandle,
+        pending: &HashSet<String>,
+        failed_dirs: &HashSet<String>,
+        cola_claimed: &HashSet<String>,
+    ) -> Vec<String> {
+        Self::resolve_vanished(cards, pending, failed_dirs, cola_claimed, |block| {
+            matches!(block, state::InteractionBlock::Question(_))
+        })
+        .await
+    }
+
+    /// The shared sweep body: resolve every live block `own` accepts whose
+    /// request vanished, over every card session. Returns the affected session
+    /// ids.
+    async fn resolve_vanished(
+        cards: &CardsHandle,
+        pending: &HashSet<String>,
+        failed_dirs: &HashSet<String>,
+        cola_claimed: &HashSet<String>,
+        own: impl Fn(&state::InteractionBlock) -> bool,
+    ) -> Vec<String> {
+        let mut live = cards.cards.lock().await;
+        let mut affected = Vec::new();
+        for (session_id, card) in live.iter_mut() {
+            if state::resolve_vanished_blocks(&mut card.acc, pending, failed_dirs, cola_claimed, &own) > 0 {
+                affected.push(session_id.clone());
+            }
+        }
+        affected
+    }
+
+    /// Resolve `ids` on `session_id`'s accumulator (ADR-0038, rule 4): each
+    /// block becomes a tombstone and its receipt joins the timeline keyed at
+    /// the resolution moment; a mode change (`Single`) leaves ONE receipt for
+    /// everything it resolved. Returns the post-resolution header
+    /// `(title, template)` when a block was actually resolved here, so the
+    /// caller can restamp the cards it edits in the click's ack.
+    pub(crate) async fn resolve_interactions(
+        cards: &CardsHandle,
+        session_id: &str,
+        ids: &[String],
+        residue: &InlineResidue<'_>,
+    ) -> Option<(String, &'static str)> {
+        let mut live = cards.cards.lock().await;
+        let acc = &mut live.get_mut(session_id)?.acc;
+        let mut resolved_here = false;
+        for id in ids {
+            let resolved = match residue {
+                InlineResidue::PerBlock(line) => {
+                    acc.resolve_interaction(id, |block| line(&block.receipt_target()))
+                }
+                InlineResidue::Single(_) => acc.dismiss_interaction(id),
+            };
+            resolved_here |= resolved;
+        }
+        if let InlineResidue::Single(text) = residue
+            && resolved_here
+        {
+            acc.push_receipt(text);
+        }
+        resolved_here.then(|| acc.header_title_and_template())
+    }
+
+    /// The clicked card's updated JSON, built from a CLONE of the session's
+    /// accumulator — a split probe that cannot advance the live `render_from`
+    /// from inside a click handler (the flush owns that flow). `None` when the
+    /// card needs a split or no accumulator exists.
+    pub(crate) async fn ack_card(cards: &CardsHandle, session_id: &str) -> Option<serde_json::Value> {
+        cards
+            .cards
+            .lock()
+            .await
+            .get_mut(session_id)
+            .map(|card| {
+                let mut probe = card.acc.clone();
+                probe.build_card_with_split()
+            })
+            .and_then(|(card, full)| (!full).then_some(card))
+    }
+
+    /// Arm an external renderer's card: build the turn's accumulator, attach
+    /// the work context, push the anchor text (the message preview / snapshot
+    /// identity) just before the turn's server-time anchor so the reply's parts
+    /// always insert below it, and insert the card session the render loop
+    /// streams into. `variant` is the session's `/think` override captured at
+    /// ARM time (ADR-0019).
+    #[allow(clippy::too_many_arguments)] // the card's whole arming fixture
+    pub(crate) async fn arm_external_render(
+        cards: &CardsHandle,
+        session_id: &str,
+        card_id: &str,
+        turn_anchor_ms: i64,
+        subtitle: &str,
+        session_dir: &str,
+        variant: Option<String>,
+        anchor_text: Option<&str>,
+    ) {
+        let mut acc = state::StreamAccumulator::new(subtitle);
+        // The external message's server time is the turn's anchor: header date,
+        // turn filter and renderer replacement guard all read it — one
+        // server-clock value, and cola's clock is never part of the card
+        // (#183, #190).
+        acc.turn_started_ms = Some(turn_anchor_ms);
+        acc.session_id = Some(session_id.to_string());
+        acc.reply_to_message_id = Some(card_id.to_string());
+        acc.attach_work_context(session_dir).await;
+        acc.variant = variant;
+        if let Some(text) = anchor_text.filter(|text| !text.is_empty()) {
+            acc.push_text_at(Some(turn_anchor_ms - 1), text);
+        }
+        cards.cards.lock().await.insert(
+            session_id.to_string(),
+            state::CardSession::new(acc, Some(card_id.to_string())),
+        );
     }
 }
 

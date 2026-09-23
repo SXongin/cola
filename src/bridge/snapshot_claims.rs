@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::bridge::core::SharedCore;
 use crate::bridge::request::PendingRequest;
 use crate::bridge::snapshot::SnapshotData;
+use crate::bridge::turn::Turn;
 use crate::feishu::snapshot_card::SnapshotQuestionState;
 
 /// Which request kind a snapshot claim hosts (ADR-0028). One registry holds
@@ -276,8 +277,7 @@ pub(crate) async fn is_already_surfaced(core: &Arc<SharedCore>, req: &PendingReq
     if core.snapshot_claims.lock().await.contains(req.id()) {
         return true;
     }
-    let cards = core.cards.lock().await;
-    cards.values().any(|c| c.acc.interaction(req.id()).is_some())
+    Turn::has_interaction(&core.cards_handle(), req.id()).await
 }
 
 /// ADR-0028: restrict the gathered adopt-time state to the pendings the
