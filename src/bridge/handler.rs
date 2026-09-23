@@ -1,10 +1,13 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
+use tracing::Instrument;
+
 use crate::bridge::access::{Access, Decision, DenyReason};
 use crate::bridge::command;
 use crate::bridge::core::SharedCore;
 use crate::bridge::session::PendingEntry;
+use crate::bridge::span;
 use crate::bridge::turn::PromptContext;
 use crate::config::{Config, ConversationKind, SessionEntry, ThreadKey};
 use crate::feishu;
@@ -757,24 +760,78 @@ impl App {
     /// error-card retry). Returns the updated card showing the decision, so the
     /// caller can send it back in the ack, plus an optional Toast for instant
     /// client feedback. Dispatches to the flow that owns the action tag.
+    ///
+    /// The whole dispatch runs inside the click's [`span::action`] (ADR-0048):
+    /// every line the action and its awaits produce is then retrievable by the
+    /// Session it worked on.
     pub async fn handle_card_action(self: &Arc<Self>, value: serde_json::Value) -> Option<CardActionResult> {
         if let Some(refusal) = self.gate_card_action(&value).await {
             return Some(refusal);
         }
         let action = value.get("action").and_then(|v| v.as_str()).unwrap_or("");
-        match action {
-            "perm" => self.permission.handle_card_action(&self.core, &value).await,
-            "question" => self.question.handle_card_action(&self.core, &value).await,
-            "retry" => self.handle_retry_action(&value).await,
-            "switch" => self.handle_switch_card_action(&self.core, &value).await,
-            "dir" => self.handle_dir_card_action(&self.core, &value).await,
-            "agent" => self.handle_agent_card_action(&self.core, &value, false).await,
-            "agent_clear" => self.handle_agent_card_action(&self.core, &value, true).await,
-            "model" => self.handle_model_card_action(&self.core, &value).await,
-            "think" => self.handle_think_card_action(&self.core, &value, false).await,
-            "think_clear" => self.handle_think_card_action(&self.core, &value, true).await,
-            "autoaccept" => self.handle_autoaccept_card_action(&self.core, &value).await,
-            _ => None,
+        let (session_id, thread_key) = self.card_action_span_context(&value).await;
+        let action_span = span::action(session_id.as_deref(), thread_key.as_ref());
+        let dispatch = async {
+            match action {
+                "perm" => self.permission.handle_card_action(&self.core, &value).await,
+                "question" => self.question.handle_card_action(&self.core, &value).await,
+                "retry" => self.handle_retry_action(&value).await,
+                "switch" => self.handle_switch_card_action(&self.core, &value).await,
+                "dir" => self.handle_dir_card_action(&self.core, &value).await,
+                "agent" => self.handle_agent_card_action(&self.core, &value, false).await,
+                "agent_clear" => self.handle_agent_card_action(&self.core, &value, true).await,
+                "model" => self.handle_model_card_action(&self.core, &value).await,
+                "think" => self.handle_think_card_action(&self.core, &value, false).await,
+                "think_clear" => self.handle_think_card_action(&self.core, &value, true).await,
+                "autoaccept" => self.handle_autoaccept_card_action(&self.core, &value).await,
+                _ => None,
+            }
+        };
+        dispatch.instrument(action_span).await
+    }
+
+    /// The Session a card click works on, for its span (ADR-0048), plus the
+    /// Chat/Topic it lives in. The payload's `session_id` names the target
+    /// (permission, question, retry, a switch adoption); the picker cards name
+    /// only their Chat/Topic and read the thread's current Session (the active
+    /// one, or the Pending Session the first message will materialise) — the
+    /// same accessor the handlers themselves use. The other side is completed
+    /// from the SessionStore: a permission card carries the session but not the
+    /// chat, the picker cards carry the chat but not yet a session.
+    ///
+    /// Either side stays `None` when unknown — a Pending Session has no id
+    /// yet, a brand-new Chat/Topic has no Session — and its field is then
+    /// omitted from the fmt prefix rather than printed empty.
+    async fn card_action_span_context(
+        &self,
+        value: &serde_json::Value,
+    ) -> (Option<String>, Option<ThreadKey>) {
+        let payload_key = thread_key_from_value(value);
+        let payload_key = (!payload_key.chat_id.is_empty()).then_some(payload_key);
+        let session_id = value
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+        match (session_id, payload_key) {
+            (Some(session_id), Some(thread_key)) => (Some(session_id), Some(thread_key)),
+            (Some(session_id), None) => {
+                let thread_key = self
+                    .sessions
+                    .lock()
+                    .await
+                    .entry_for_session(&session_id)
+                    .map(|e| e.thread_key.clone());
+                (Some(session_id), thread_key)
+            }
+            (None, Some(thread_key)) => {
+                let session_id = self
+                    .session_settings(&thread_key)
+                    .await
+                    .and_then(|settings| settings.session_id);
+                (session_id, Some(thread_key))
+            }
+            (None, None) => (None, None),
         }
     }
 

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tracing::Instrument;
 
 use crate::bridge::core::SharedCore;
 use crate::bridge::handler::CardActionResult;
@@ -366,7 +367,9 @@ impl RequestKind for PermissionKind {
         };
         let cached = match reply_result {
             Ok(()) => {
-                tracing::info!("Permission reply sent: {} session={}", reply, req_id);
+                // The span already carries the session; the id here is the
+                // request's, so it is named as one.
+                tracing::info!("Permission reply sent: {} request={}", reply, req_id);
                 // ADR-0038 rules 3+4: the clicked block becomes its
                 // Interaction Receipt (rendered from the accumulator, so it
                 // survives later flushes) and the ack below carries the
@@ -1476,101 +1479,20 @@ impl RequestFlow {
                         if core.reminder.enabled() || core.message_pins.enabled() {
                             pin_candidates.push((req.clone(), dir.clone()));
                         }
-                        // ADR-0028: a claimed request is hosted by a
-                        // snapshot card — already surfaced, never a
-                        // standalone card, never re-inlined.
-                        if core.snapshot_claims.lock().await.contains(req.id()) {
-                            continue;
-                        }
-                        if seen.contains(req.id()) {
-                            // Already surfaced: if it outlived the turn that
-                            // hosted it, re-host it onto the session's current
-                            // card so the live controls follow the newest card
-                            // (ADR-0038, rule 1).
-                            self.rehost_block(core, req, dir).await;
-                            continue;
-                        }
-                        seen.insert(req.id().to_string());
-                        tracing::info!(
-                            "{} ({}): {} on session {}",
-                            self.kind.label(),
-                            dir,
-                            req.id(),
-                            req.session_id()
-                        );
-                        // Kind-specific pre-card handling (auto-accept /
-                        // remember). true → handled, no card needed.
-                        if self.kind.prepare(self, core, req, dir).await {
-                            auto_resolved.insert(req.id().to_string());
-                            continue;
-                        }
-                        // One-card-per-turn: surface the request INLINE on the
-                        // streaming card of the session that owns it — the
-                        // session itself, or (sub-task children) its nearest
-                        // ancestor with a live card. Only a separate card when
-                        // there is no active card (e.g. external turns or
-                        // restarts).
-                        if let Some(host) = inline_host_session(core, req.session_id(), Some(dir)).await {
-                            let Some(block) = self.kind.interaction_block(self, req, dir).await else {
-                                continue;
-                            };
-                            let pushed = {
-                                let mut cards = core.cards.lock().await;
-                                cards
-                                    .get_mut(&host)
-                                    .map(|c| c.acc.add_interaction(block))
-                                    .unwrap_or(false)
-                            };
-                            if pushed {
-                                tracing::info!(
-                                    "{} {} inlined on session {} card",
-                                    self.kind.label(),
-                                    req.id(),
-                                    host
-                                );
-                                // Flush so the inline section appears NOW — the
-                                // render loop only flushes on new parts, and a
-                                // blocked prompt produces none.
-                                crate::bridge::render::flush_card(core, &host).await;
-                            }
-                            continue;
-                        }
-                        let card = self.kind.build_card(req, dir);
-                        // Reply to the message that triggered the prompt for
-                        // this session; fall back to sending into the chat when
-                        // the accumulator is gone (e.g. after a cola restart).
-                        // Sub-task sessions resolve up the parent chain.
-                        let sent_id = match resolve_card_target(core, req.session_id(), dir).await {
-                            Some(CardTarget::ReplyTo(msg_id)) => {
-                                core.feishu.reply_card(&msg_id, &card).await.ok()
-                            }
-                            Some(CardTarget::Chat(chat_id)) => {
-                                core.feishu.send_card("chat_id", &chat_id, &card).await.ok()
-                            }
-                            None => {
-                                tracing::warn!(
-                                    "No reply target or chat for {} on session {}",
-                                    self.kind.label(),
-                                    req.session_id()
-                                );
-                                None
-                            }
+                        // One span per request (ADR-0048): its `prepare`, its
+                        // re-host and its card delivery are all retrievable by
+                        // the session it belongs to. `chat`/`topic` ride along
+                        // when the store maps that session — a sub-task child
+                        // is not mapped and carries `session` alone.
+                        let thread_key = {
+                            let store = core.sessions.lock().await;
+                            store
+                                .entry_for_session(req.session_id())
+                                .map(|e| e.thread_key.clone())
                         };
-                        if let Some(mid) = sent_id {
-                            self.sent_cards.lock().await.insert(
-                                req.id().to_string(),
-                                SentCard {
-                                    message_id: mid,
-                                    summary: self.kind.summary(req),
-                                    directory: dir.clone(),
-                                },
-                            );
-                        } else {
-                            tracing::warn!(
-                                "{} card send failed on session {}",
-                                self.kind.label(),
-                                req.session_id()
-                            );
+                        let span = crate::bridge::span::request(req.session_id(), thread_key.as_ref());
+                        if self.surface(core, req, dir, seen).instrument(span).await {
+                            auto_resolved.insert(req.id().to_string());
                         }
                     }
                 }
@@ -1769,6 +1691,113 @@ impl RequestFlow {
             .lock()
             .await
             .retain(|id, state| pending.contains(id) || failed_dirs.contains(state.dir()));
+    }
+
+    /// Everything one sweep does with ONE listed request, wrapped by the
+    /// caller in that request's session span (ADR-0048): the snapshot-claim
+    /// skip, the re-host for a request already surfaced, the kind's `prepare`
+    /// (auto-accept / remember), and the card delivery — inline on the
+    /// session's live card, else a standalone card. Returns whether `prepare`
+    /// handled the request (an auto-accept), which the sweep must exclude from
+    /// its reminder/pin reconciliation.
+    ///
+    /// `seen` records the requests this process has surfaced: a re-host needs
+    /// the record (`seen.contains`), a first surfacing inserts it — so the
+    /// poller never surfaces one request twice.
+    async fn surface(
+        &self,
+        core: &Arc<SharedCore>,
+        req: &PendingRequest,
+        dir: &str,
+        seen: &mut std::collections::HashSet<String>,
+    ) -> bool {
+        // ADR-0028: a claimed request is hosted by a snapshot card — already
+        // surfaced, never a standalone card, never re-inlined.
+        if core.snapshot_claims.lock().await.contains(req.id()) {
+            return false;
+        }
+        if seen.contains(req.id()) {
+            // Already surfaced: if it outlived the turn that hosted it,
+            // re-host it onto the session's current card so the live controls
+            // follow the newest card (ADR-0038, rule 1).
+            self.rehost_block(core, req, dir).await;
+            return false;
+        }
+        seen.insert(req.id().to_string());
+        tracing::info!(
+            "{} ({}): {} on session {}",
+            self.kind.label(),
+            dir,
+            req.id(),
+            req.session_id()
+        );
+        // Kind-specific pre-card handling (auto-accept / remember). true →
+        // handled, no card needed.
+        if self.kind.prepare(self, core, req, dir).await {
+            return true;
+        }
+        // One-card-per-turn: surface the request INLINE on the streaming card
+        // of the session that owns it — the session itself, or (sub-task
+        // children) its nearest ancestor with a live card. Only a separate card
+        // when there is no active card (e.g. external turns or restarts).
+        if let Some(host) = inline_host_session(core, req.session_id(), Some(dir)).await {
+            let Some(block) = self.kind.interaction_block(self, req, dir).await else {
+                return false;
+            };
+            let pushed = {
+                let mut cards = core.cards.lock().await;
+                cards
+                    .get_mut(&host)
+                    .map(|c| c.acc.add_interaction(block))
+                    .unwrap_or(false)
+            };
+            if pushed {
+                tracing::info!(
+                    "{} {} inlined on session {} card",
+                    self.kind.label(),
+                    req.id(),
+                    host
+                );
+                // Flush so the inline section appears NOW — the render loop
+                // only flushes on new parts, and a blocked prompt produces
+                // none.
+                crate::bridge::render::flush_card(core, &host).await;
+            }
+            return false;
+        }
+        let card = self.kind.build_card(req, dir);
+        // Reply to the message that triggered the prompt for this session; fall
+        // back to sending into the chat when the accumulator is gone (e.g.
+        // after a cola restart). Sub-task sessions resolve up the parent chain.
+        let sent_id = match resolve_card_target(core, req.session_id(), dir).await {
+            Some(CardTarget::ReplyTo(msg_id)) => core.feishu.reply_card(&msg_id, &card).await.ok(),
+            Some(CardTarget::Chat(chat_id)) => core.feishu.send_card("chat_id", &chat_id, &card).await.ok(),
+            None => {
+                tracing::warn!(
+                    "No reply target or chat for {} on session {}",
+                    self.kind.label(),
+                    req.session_id()
+                );
+                None
+            }
+        };
+        if let Some(mid) = sent_id {
+            self.sent_cards.lock().await.insert(
+                req.id().to_string(),
+                SentCard {
+                    message_id: mid,
+                    summary: self.kind.summary(req),
+                    directory: dir.to_string(),
+                },
+            );
+        } else {
+            tracing::warn!(
+                "{} card send failed on session {}",
+                self.kind.label(),
+                req.session_id()
+            );
+        }
+        false
     }
 
     /// Re-host a still-pending inline block onto the session's current card
