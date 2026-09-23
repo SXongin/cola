@@ -441,7 +441,7 @@ async fn subtitle_falls_back_to_id_tail_without_server_title() {
     // No server title → the id-tail alone identifies the session (no cola
     // side name to fall back on; the current prompt is never echoed).
     assert_eq!(
-        crate::bridge::turn::render::session_subtitle(
+        crate::bridge::turn::Turn::session_subtitle(
             &app.sessions_handle(),
             &app.opencode,
             &key,
@@ -451,7 +451,7 @@ async fn subtitle_falls_back_to_id_tail_without_server_title() {
         "01ba0ed"
     );
     assert_eq!(
-        crate::bridge::turn::render::session_subtitle(&app.sessions_handle(), &app.opencode, &key, "你好")
+        crate::bridge::turn::Turn::session_subtitle(&app.sessions_handle(), &app.opencode, &key, "你好")
             .await,
         "01ba0ed"
     );
@@ -490,7 +490,7 @@ async fn subtitle_degrades_when_session_info_hangs() {
     // only) within the bound instead of hanging the prompt flow.
     let subtitle = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        crate::bridge::turn::render::session_subtitle(&app.sessions_handle(), &app.opencode, &key, "问题"),
+        crate::bridge::turn::Turn::session_subtitle(&app.sessions_handle(), &app.opencode, &key, "问题"),
     )
     .await
     .expect("session_subtitle must not hang when session_info never returns");
@@ -562,7 +562,7 @@ async fn subtitle_ignores_server_default_title() {
     )
     .await;
     assert_eq!(
-        crate::bridge::turn::render::session_subtitle(
+        crate::bridge::turn::Turn::session_subtitle(
             &app.sessions_handle(),
             &app.opencode,
             &key,
@@ -604,7 +604,7 @@ async fn subtitle_prefers_server_title() {
     )
     .await;
     assert_eq!(
-        crate::bridge::turn::render::session_subtitle(&app.sessions_handle(), &app.opencode, &key, "问题")
+        crate::bridge::turn::Turn::session_subtitle(&app.sessions_handle(), &app.opencode, &key, "问题")
             .await,
         "OpenChamber 显示的标题 · test"
     );
@@ -696,7 +696,7 @@ async fn short_answer_stays_in_card_no_extra_message() {
 #[tokio::test]
 async fn render_poll_shows_live_context_and_memoizes_the_window() {
     use crate::bridge::streaming::{CardSession, StreamAccumulator};
-    use crate::bridge::turn::render::render_and_flush;
+    use crate::bridge::turn::Turn;
     use crate::opencode::types::{MessageInfo, MessageTime, MessageTokens, SessionMessage};
 
     let dir = tempfile::tempdir().unwrap();
@@ -732,7 +732,7 @@ async fn render_poll_shows_live_context_and_memoizes_the_window() {
         parts: serde_json::json!([{ "type": "text", "text": text }]),
     };
 
-    let _ = render_and_flush(
+    let _ = Turn::render_and_flush(
         &app.cards_handle(),
         &app.sessions_handle(),
         &app.opencode,
@@ -755,7 +755,7 @@ async fn render_poll_shows_live_context_and_memoizes_the_window() {
     // A later step's usage refreshes the segment; the memo serves the window.
     // The text is the SAME (deduped) and the header second has not moved, so
     // only the context signature can trigger this flush.
-    let _ = render_and_flush(
+    let _ = Turn::render_and_flush(
         &app.cards_handle(),
         &app.sessions_handle(),
         &app.opencode,

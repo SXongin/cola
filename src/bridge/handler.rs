@@ -550,7 +550,7 @@ impl App {
             self.feishu.reply_text(&message_id, GROUP_LOBBY_GUIDANCE).await?;
         }
 
-        let subtitle = crate::bridge::turn::render::session_subtitle(
+        let subtitle = crate::bridge::turn::Turn::session_subtitle(
             &self.sessions_handle(),
             &self.opencode,
             &thread_key,
