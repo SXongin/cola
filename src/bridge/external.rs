@@ -59,54 +59,61 @@ impl ExternalFlow {
     /// poller still recognises it as cola's own on the first poll after a heal
     /// — it can never be mistaken for an external message.
     pub(crate) async fn poll_loop(&self, handles: &FlowHandles) -> crate::error::Result<()> {
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(
-                self.poll_interval_ms.load(std::sync::atomic::Ordering::Relaxed),
-            ))
-            .await;
-            // Serverless (Lazy Start hasn't attached/spawned yet): nothing to
-            // watch on the store — skip quietly.
-            if handles.backend.base_url().is_empty() {
-                continue;
-            }
-            // Only each thread's ACTIVE session is synced (ADR-0017): a lobby
-            // (p2p/group) can stack several sessions via /new and /switch, and
-            // notifying for a historical one would interleave its cards with the
-            // current conversation's. Historical sessions are skipped AND their
-            // Sync Watermark cleared, so switching back to one re-syncs its
-            // watermark silently (external messages received while it was
-            // inactive are marked read, not replayed).
-            //
-            // `active` and `sessions` are derived from ONE store snapshot so a
-            // session activated mid-poll can't slip through as active-but-unchecked.
-            let (active, sessions): (
-                std::collections::HashSet<String>,
-                Vec<(String, crate::config::ThreadKey, String)>,
-            ) = {
-                let store = handles.sessions.store.lock().await;
-                let mut active = std::collections::HashSet::new();
-                let mut sessions = Vec::new();
-                for e in store.all_entries() {
-                    if store
-                        .get_active(&e.thread_key)
-                        .map(|a| a.session_id == e.session_id)
-                        .unwrap_or(false)
-                    {
-                        active.insert(e.session_id.clone());
-                    }
-                    sessions.push((e.session_id.clone(), e.thread_key.clone(), e.directory.clone()));
+        let mut poll = crate::bridge::poll::PollLoop::new(&self.poll_interval_ms, "external message sync");
+        // The seam owns the cadence ([`Self::poll_interval_ms`], injectable),
+        // the sleep and the serverless guard (Lazy Start hasn't attached or
+        // spawned a server yet — nothing to watch on the store, so the pass is
+        // skipped quietly). The pass is one sync over the active sessions.
+        poll.poll(
+            || !handles.backend.base_url().is_empty(),
+            move || async move {
+                self.sync_sessions(handles).await;
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// One sync pass: snapshot the sessions from ONE store view, then run each
+    /// active one through [`Self::poll_session`].
+    async fn sync_sessions(&self, handles: &FlowHandles) {
+        // Only each thread's ACTIVE session is synced (ADR-0017): a lobby
+        // (p2p/group) can stack several sessions via /new and /switch, and
+        // notifying for a historical one would interleave its cards with the
+        // current conversation's. Historical sessions are skipped AND their
+        // Sync Watermark cleared, so switching back to one re-syncs its
+        // watermark silently (external messages received while it was
+        // inactive are marked read, not replayed).
+        //
+        // `active` and `sessions` are derived from ONE store snapshot so a
+        // session activated mid-poll can't slip through as active-but-unchecked.
+        let (active, sessions): (
+            std::collections::HashSet<String>,
+            Vec<(String, crate::config::ThreadKey, String)>,
+        ) = {
+            let store = handles.sessions.store.lock().await;
+            let mut active = std::collections::HashSet::new();
+            let mut sessions = Vec::new();
+            for e in store.all_entries() {
+                if store
+                    .get_active(&e.thread_key)
+                    .map(|a| a.session_id == e.session_id)
+                    .unwrap_or(false)
+                {
+                    active.insert(e.session_id.clone());
                 }
-                (active, sessions)
-            };
-            for (sid, thread_key, directory) in sessions {
-                // One `external` span per Session (ADR-0048): the observation,
-                // the notification and the renderer it arms are all retrievable
-                // by `rg 'session=ses_x'`.
-                let span = crate::bridge::span::external(&sid, Some(&thread_key));
-                self.poll_session(handles, &active, &sid, &thread_key, &directory)
-                    .instrument(span)
-                    .await;
+                sessions.push((e.session_id.clone(), e.thread_key.clone(), e.directory.clone()));
             }
+            (active, sessions)
+        };
+        for (sid, thread_key, directory) in sessions {
+            // One `external` span per Session (ADR-0048): the observation,
+            // the notification and the renderer it arms are all retrievable
+            // by `rg 'session=ses_x'`.
+            let span = crate::bridge::span::external(&sid, Some(&thread_key));
+            self.poll_session(handles, &active, &sid, &thread_key, &directory)
+                .instrument(span)
+                .await;
         }
     }
 
