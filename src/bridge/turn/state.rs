@@ -1426,7 +1426,7 @@ pub(super) fn resolve_vanished_blocks(
                 && !cola_claimed.contains(block.request_id())
                 && !failed_dirs.contains(block.directory())
         },
-        |block| crate::bridge::request::handled_elsewhere_receipt(&block.receipt_target()),
+        |block| crate::bridge::request::delivery::handled_elsewhere_receipt(&block.receipt_target()),
     )
 }
 

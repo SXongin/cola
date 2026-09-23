@@ -730,7 +730,7 @@ pub(crate) async fn handle_command(
                         && let Some(s) = settings.as_ref()
                         && let Some(id) = s.session_id.as_deref()
                     {
-                        approved = crate::bridge::request::approve_pending_for_session(
+                        approved = crate::bridge::request::kind::approve_pending_for_session(
                             &handles.flow.sessions,
                             &handles.flow.requests,
                             &handles.flow.backend,
@@ -746,16 +746,16 @@ pub(crate) async fn handle_command(
                             // approved them (#193 follow-up). No clicked card,
                             // so `resolve_blocks` patches every card that
                             // renders one of the blocks.
-                            crate::bridge::request::resolve_blocks(
+                            crate::bridge::request::delivery::resolve_blocks(
                                 &handles.flow.requests.permission,
                                 &handles.flow.cards,
                                 &handles.flow.requests,
                                 &Some(id.to_string()),
                                 id,
-                                crate::bridge::request::Origin::Command,
+                                crate::bridge::request::delivery::Origin::Command,
                                 &approved,
-                                crate::bridge::request::Residue::Single(
-                                    crate::bridge::request::AUTOACCEPT_RECEIPT,
+                                crate::bridge::request::delivery::Residue::Single(
+                                    crate::bridge::request::kind::AUTOACCEPT_RECEIPT,
                                 ),
                             )
                             .await;

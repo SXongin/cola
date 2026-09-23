@@ -23,7 +23,7 @@ pub struct SnapshotData {
     /// Pending permission/question requests whose `sessionID` is the adopted
     /// session (never another session's in the same directory, and never a
     /// sub-task child's — ADR-0028 keeps those on today's standalone flow).
-    pub pending: Vec<crate::bridge::request::PendingRequest>,
+    pub pending: Vec<crate::bridge::request::kind::PendingRequest>,
     /// The 最近对话 tail: the last text-bearing user/assistant messages,
     /// newest last, verbatim `text` parts only.
     pub tail: Vec<TailEntry>,
@@ -143,15 +143,15 @@ pub(crate) async fn gather_snapshot(
     // Only the adopted session's own requests belong on the snapshot — never a
     // sibling session's in the same directory, and never a sub-task child's
     // (ADR-0028 keeps child-session pendings on today's standalone flow).
-    let pending: Vec<crate::bridge::request::PendingRequest> = permissions
+    let pending: Vec<crate::bridge::request::kind::PendingRequest> = permissions
         .into_iter()
         .filter(|p| p.session_id.as_deref() == Some(session_id))
-        .map(crate::bridge::request::PendingRequest::Permission)
+        .map(crate::bridge::request::kind::PendingRequest::Permission)
         .chain(
             questions
                 .into_iter()
                 .filter(|q| q.session_id == session_id)
-                .map(crate::bridge::request::PendingRequest::Question),
+                .map(crate::bridge::request::kind::PendingRequest::Question),
         )
         .collect();
 

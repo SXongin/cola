@@ -287,11 +287,9 @@ async fn aborted_turn_leaves_a_claimed_request() {
             session_id: "ses_test".into(),
             directory: "/work".into(),
             status: None,
-            pending: vec![crate::bridge::request::PendingRequest::Permission(perm_request(
-                "per_claimed",
-                "ses_test",
-                "ls -la",
-            ))],
+            pending: vec![crate::bridge::request::kind::PendingRequest::Permission(
+                perm_request("per_claimed", "ses_test", "ls -la"),
+            )],
             tail: Vec::new(),
             newest_user_epoch: None,
             newest_user_is_cola_authored: false,

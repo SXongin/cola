@@ -896,7 +896,7 @@ async fn autoaccept_command_keeps_the_standalone_card_for_the_sweep() {
     // The poller surfaced this one as a standalone card (no live turn).
     app.permission.sent_cards.lock().await.insert(
         "per_1".into(),
-        crate::bridge::request::SentCard {
+        crate::bridge::request::flow::SentCard {
             message_id: "om_sent".into(),
             summary: "bash ls -la".into(),
             directory: "/work".into(),
@@ -1116,7 +1116,7 @@ async fn stale_permission_card_marked_handled_when_resolved_elsewhere() {
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
     app.permission.sent_cards.lock().await.insert(
         "per_stale".into(),
-        crate::bridge::request::SentCard {
+        crate::bridge::request::flow::SentCard {
             message_id: "om_sent_card".into(),
             summary: "bash ls -la".into(),
             directory: "/work".into(),
@@ -1177,12 +1177,12 @@ async fn failed_directory_list_keeps_permission_surfaces() {
             card_message_id: "om_card",
             inline_id: "per_inline",
             snapshot_message_id: "om_snapshot",
-            inline_request: crate::bridge::request::PendingRequest::Permission(perm_request(
+            inline_request: crate::bridge::request::kind::PendingRequest::Permission(perm_request(
                 "per_inline",
                 "ses_1",
                 "ls -la",
             )),
-            claim: crate::bridge::request::PendingRequest::Permission(perm_request(
+            claim: crate::bridge::request::kind::PendingRequest::Permission(perm_request(
                 "per_claim",
                 "ses_1",
                 "ls -la",

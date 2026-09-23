@@ -1556,15 +1556,17 @@ impl App {
         if let Some((id, _)) = &active
             && !approved.is_empty()
         {
-            crate::bridge::request::resolve_blocks(
+            crate::bridge::request::delivery::resolve_blocks(
                 &core.permission,
                 &core.cards_handle(),
                 &core.requests_handle(),
                 &Some(id.clone()),
                 id,
-                crate::bridge::request::Origin::Command,
+                crate::bridge::request::delivery::Origin::Command,
                 &approved,
-                crate::bridge::request::Residue::Single(crate::bridge::request::AUTOACCEPT_RECEIPT),
+                crate::bridge::request::delivery::Residue::Single(
+                    crate::bridge::request::kind::AUTOACCEPT_RECEIPT,
+                ),
             )
             .await;
         }

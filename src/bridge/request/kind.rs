@@ -52,6 +52,52 @@ impl PendingRequest {
             PendingRequest::Question(_) => ClaimKind::Question,
         }
     }
+
+    /// The inline block elements this request contributes to a Session
+    /// Snapshot (ADR-0028): the same controls the standalone card shows, so
+    /// the snapshot looks and behaves like today's inline sections. Lives with
+    /// the payload's adapters — a third kind adds one arm here, never a
+    /// variant branch in the card layer.
+    pub(crate) fn snapshot_block_elements(
+        &self,
+        directory: &str,
+        question_state: &crate::feishu::snapshot_card::SnapshotQuestionState,
+    ) -> Vec<serde_json::Value> {
+        match self {
+            PendingRequest::Permission(p) => {
+                let body = describe_permission(p);
+                let sid = p.session_id.as_deref().unwrap_or("");
+                let body = crate::feishu::card::sanitize::CardMarkdown::new().clean(&body);
+                let mut els = vec![
+                    serde_json::json!({ "tag": "markdown", "content": format!("🔐 **权限请求**\n{body}") }),
+                ];
+                els.extend(crate::feishu::card::question::permission_buttons(
+                    sid,
+                    &p.request_id,
+                    &body,
+                    directory,
+                ));
+                els
+            }
+            PendingRequest::Question(q) => {
+                let n = q.questions.len();
+                let state = question_state.get(&q.id).cloned().unwrap_or(
+                    crate::feishu::snapshot_card::QuestionBlockState {
+                        display: vec![None; n],
+                        done: vec![false; n],
+                    },
+                );
+                crate::feishu::card::question::question_elements(
+                    &q.id,
+                    &q.session_id,
+                    &q.questions,
+                    directory,
+                    &state.display,
+                    &state.done,
+                )
+            }
+        }
+    }
 }
 
 /// The deltas that make a permission request and a question request different.
@@ -71,6 +117,17 @@ pub trait RequestKind: Send + Sync {
         backend: &Arc<dyn opencode::DirectoryBackend>,
     ) -> crate::error::Result<Vec<PendingRequest>>;
 
+    /// Reject one of this kind's pending requests on the server — the #187
+    /// turn-end leftover path — and settle any kind-side in-flight state the
+    /// landed rejection leaves behind. `backend` is already scoped to the
+    /// request's directory.
+    async fn reject(
+        &self,
+        flow: &RequestFlow,
+        backend: &Arc<dyn opencode::DirectoryBackend>,
+        req: &PendingRequest,
+    ) -> crate::error::Result<()>;
+
     /// Runs once per newly-seen request before it becomes a card. Permissions
     /// answer `/autoaccept` sessions here and return true (no card); questions
     /// remember the full request (via the flow) for later card rebuilds and
@@ -82,6 +139,12 @@ pub trait RequestKind: Send + Sync {
         req: &PendingRequest,
         dir: &str,
     ) -> bool;
+
+    /// Remember a request that reached a card WITHOUT the poll loop surfacing
+    /// it (a Session Snapshot claim, a busy-follow host), so its block's
+    /// buttons still resolve — `prepare` never runs for those. Defaults to
+    /// nothing: a kind with no in-flight state has nothing to remember.
+    async fn remember_surfaced(&self, _flow: &RequestFlow, _req: &PendingRequest, _dir: &str) {}
 
     /// Add this kind's inline block to the `host` card (the poller path and
     /// the cross-turn re-host). Permissions rebuild deterministically from the
@@ -97,6 +160,22 @@ pub trait RequestKind: Send + Sync {
         req: &PendingRequest,
         dir: &str,
     ) -> bool;
+
+    /// Seed this kind's inline block on a NEW host card with the request's
+    /// initial (adopt-time) state — the busy-follow host path, which
+    /// reproduces the static snapshot's blocks before the renderer takes over
+    /// and remembers the request right after. Defaults to [`Self::add_inline`]:
+    /// a kind with no remembered state has nothing to restore anyway.
+    async fn add_initial_inline(
+        &self,
+        flow: &RequestFlow,
+        cards: &CardsHandle,
+        host: &str,
+        req: &PendingRequest,
+        dir: &str,
+    ) -> bool {
+        self.add_inline(flow, cards, host, req, dir).await
+    }
 
     /// Build the standalone interactive card (used when no streaming card hosts
     /// the request inline).
@@ -120,6 +199,17 @@ pub trait RequestKind: Send + Sync {
         failed_dirs: &std::collections::HashSet<String>,
         cola_claimed: &std::collections::HashSet<String>,
     ) -> Vec<String>;
+
+    /// The live state this kind contributes to a Session Snapshot re-render
+    /// (ADR-0028). Defaults to nothing: only the question kind has snapshot
+    /// state (its 已选/✅ markers), which `rebuild`/`resolve` paint in place.
+    async fn snapshot_state(
+        &self,
+        _flow: &RequestFlow,
+        _pending: &[PendingRequest],
+    ) -> crate::feishu::snapshot_card::SnapshotQuestionState {
+        crate::feishu::snapshot_card::SnapshotQuestionState::new()
+    }
 
     /// The snapshot-claim kind of this flow's requests (ADR-0028): each flow's
     /// poll sweep only drops claims of its own kind.
@@ -163,6 +253,18 @@ impl RequestKind for PermissionKind {
             .list_permissions()
             .await
             .map(|v| v.into_iter().map(PendingRequest::Permission).collect())
+    }
+
+    async fn reject(
+        &self,
+        _flow: &RequestFlow,
+        backend: &Arc<dyn opencode::DirectoryBackend>,
+        req: &PendingRequest,
+    ) -> crate::error::Result<()> {
+        let PendingRequest::Permission(p) = req else {
+            return Ok(());
+        };
+        backend.reply_permission(&p.request_id, "reject").await
     }
 
     async fn prepare(
@@ -684,6 +786,22 @@ impl RequestKind for QuestionKind {
             .map(|v| v.into_iter().map(PendingRequest::Question).collect())
     }
 
+    async fn reject(
+        &self,
+        flow: &RequestFlow,
+        backend: &Arc<dyn opencode::DirectoryBackend>,
+        req: &PendingRequest,
+    ) -> crate::error::Result<()> {
+        let PendingRequest::Question(q) = req else {
+            return Ok(());
+        };
+        backend.reject_question(&q.id).await?;
+        // The reply landed: drop the in-flight state like a reject click does,
+        // so nothing serves stale answers.
+        flow.remove_question(&q.id).await;
+        Ok(())
+    }
+
     async fn prepare(
         &self,
         flow: &RequestFlow,
@@ -695,6 +813,12 @@ impl RequestKind for QuestionKind {
             flow.remember_question(q, dir).await;
         }
         false
+    }
+
+    async fn remember_surfaced(&self, flow: &RequestFlow, req: &PendingRequest, dir: &str) {
+        if let PendingRequest::Question(q) = req {
+            flow.remember_question(q, dir).await;
+        }
     }
 
     async fn add_inline(
@@ -718,6 +842,31 @@ impl RequestKind for QuestionKind {
             .await
             .unwrap_or_else(|| (vec![None; q.questions.len()], vec![false; q.questions.len()]));
         Turn::add_question(cards, host, q, dir, &answers, &done).await
+    }
+
+    async fn add_initial_inline(
+        &self,
+        _flow: &RequestFlow,
+        cards: &CardsHandle,
+        host: &str,
+        req: &PendingRequest,
+        dir: &str,
+    ) -> bool {
+        let PendingRequest::Question(q) = req else {
+            return false;
+        };
+        // The follow seeds the adopt-time block before anything was
+        // remembered, so it starts open; the remembered state is recorded
+        // right after (`remember_surfaced`).
+        Turn::add_question(
+            cards,
+            host,
+            q,
+            dir,
+            &vec![None; q.questions.len()],
+            &vec![false; q.questions.len()],
+        )
+        .await
     }
 
     fn build_card(&self, req: &PendingRequest, dir: &str) -> serde_json::Value {
@@ -749,6 +898,30 @@ impl RequestKind for QuestionKind {
         cola_claimed: &std::collections::HashSet<String>,
     ) -> Vec<String> {
         Turn::resolve_vanished_questions(cards, pending, failed_dirs, cola_claimed).await
+    }
+
+    async fn snapshot_state(
+        &self,
+        flow: &RequestFlow,
+        pending: &[PendingRequest],
+    ) -> crate::feishu::snapshot_card::SnapshotQuestionState {
+        flow.with_question_states(|states| {
+            let mut out = crate::feishu::snapshot_card::SnapshotQuestionState::new();
+            for req in pending {
+                if let PendingRequest::Question(q) = req {
+                    let (_, display, done) = match states.get(&q.id) {
+                        Some(state) => state.merge(),
+                        None => (0, vec![None; q.questions.len()], vec![false; q.questions.len()]),
+                    };
+                    out.insert(
+                        q.id.clone(),
+                        crate::feishu::snapshot_card::QuestionBlockState { display, done },
+                    );
+                }
+            }
+            out
+        })
+        .await
     }
 
     fn claim_kind(&self) -> ClaimKind {

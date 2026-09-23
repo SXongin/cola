@@ -37,9 +37,9 @@ use crate::bridge::core::{CoverTitle, SESSION_INFO_TIMEOUT, SETTLING_CLAIM_TTL, 
 use crate::bridge::external::ExternalFlow;
 use crate::bridge::message_pins::MessagePins;
 use crate::bridge::reminder::ReminderState;
-use crate::bridge::request::RequestFlow;
+use crate::bridge::request::flow::RequestFlow;
 use crate::bridge::session::{PendingEntry, SessionSettings, SessionStore};
-use crate::bridge::snapshot_claims::SnapshotClaims;
+use crate::bridge::snapshot_claims::{ClaimKind, SnapshotClaims};
 use crate::bridge::turn::CardSession;
 use crate::config::{ServerStartPolicy, SessionEntry, ThreadKey};
 use crate::{feishu, opencode};
@@ -491,6 +491,15 @@ pub(crate) struct RequestsHandle {
 }
 
 impl RequestsHandle {
+    /// The flow that owns requests of `kind` — the registry pairing every
+    /// snapshot-claim kind with its poller and settlement state.
+    pub(crate) fn flow_for(&self, kind: ClaimKind) -> &Arc<RequestFlow> {
+        match kind {
+            ClaimKind::Permission => &self.permission,
+            ClaimKind::Question => &self.question,
+        }
+    }
+
     /// The requests cola itself is answering or has answered — `answered_requests`
     /// plus the live `settling_requests` claims. The sweep's vanished passes
     /// take one snapshot of this per pass: a request that disappeared from the
