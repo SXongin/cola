@@ -1538,6 +1538,21 @@ pub(crate) async fn seed_entry(app: &Arc<App>, entry: crate::config::SessionEntr
         .expect("seed_entry: persisting the seeded store failed");
 }
 
+/// Seed a mapped session carrying the per-session overrides the re-adoption
+/// tests assert on: `provider/model-a`, variant `high`, Auto-Accept on.
+pub(crate) async fn seed_overridden_entry(
+    app: &Arc<App>,
+    thread_key: crate::config::ThreadKey,
+    session_id: &str,
+    directory: &str,
+) {
+    let mut entry = crate::config::SessionEntry::new(thread_key, session_id, directory);
+    entry.model = Some("provider/model-a".into());
+    entry.variant = Some("high".into());
+    entry.auto_accept = true;
+    seed_entry(app, entry).await;
+}
+
 /// Seed a Pending Session for a thread (ADR-0041): the `set_pending` write,
 /// with the same persist-failure panic policy as [`seed_entry`].
 pub(crate) async fn seed_pending(app: &Arc<App>, pending: crate::bridge::session::PendingEntry) {

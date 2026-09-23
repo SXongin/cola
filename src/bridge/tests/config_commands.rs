@@ -560,6 +560,19 @@ async fn autoaccept_card_toggles_flag() {
     assert!(result.card.is_some(), "refreshed card returned");
     let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
     assert!(entry.auto_accept, "flag should flip on");
+
+    // ... and back off. Clearing writes through the settings path (`update`),
+    // never through activation, so the re-adoption carry-over rule (which
+    // reads `false` as "unspecified") can never resurrect it.
+    let value = serde_json::json!({
+        "action": "autoaccept",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "value": "off",
+    });
+    app.host_action(value).await.expect("autoaccept off card action");
+    let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
+    assert!(!entry.auto_accept, "flag should flip off");
 }
 
 #[tokio::test]

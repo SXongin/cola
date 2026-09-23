@@ -1386,11 +1386,7 @@ async fn switch_card_readopt_keeps_per_session_overrides() {
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     // The target is mapped but NOT active (a stacked session); its cola-side
     // overrides are set.
-    let mut own = crate::config::SessionEntry::new(key.clone(), "ses_own1", "/work/cola");
-    own.model = Some("provider/model-a".into());
-    own.variant = Some("high".into());
-    own.auto_accept = true;
-    seed_entry(&app, own).await;
+    seed_overridden_entry(&app, key.clone(), "ses_own1", "/work/cola").await;
     seed_entry(
         &app,
         crate::config::SessionEntry::new(key.clone(), "ses_active", "/work/active"),
@@ -1436,11 +1432,7 @@ async fn attach_readopt_keeps_per_session_overrides() {
     backend.session_list = vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)];
     let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-    let mut own = crate::config::SessionEntry::new(key.clone(), "ses_own1", "/work/cola");
-    own.model = Some("provider/model-a".into());
-    own.variant = Some("high".into());
-    own.auto_accept = true;
-    seed_entry(&app, own).await;
+    seed_overridden_entry(&app, key.clone(), "ses_own1", "/work/cola").await;
     seed_entry(
         &app,
         crate::config::SessionEntry::new(key.clone(), "ses_active", "/work/active"),

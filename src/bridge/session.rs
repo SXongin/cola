@@ -206,10 +206,12 @@ impl SessionStore {
         // mapping fields but never sets model/variant/auto_accept, so
         // re-adopting (switch card, `/switch <id>`, `/attach`, `/topic
         // --adopt`, force adopt) must not reset the settings the session
-        // already had. An override the new entry set explicitly still wins —
-        // only fields left at their defaults are carried. Everything the flow
-        // owns — thread key, directory, agent, topic anchors — stays as the
-        // new entry set it.
+        // already had. An override the new entry set explicitly wins — only
+        // fields left at their default are carried; `auto_accept: false` reads
+        // as "unspecified" here, because a bool has no unset state and OFF is
+        // written through the settings path (`update`), never activation.
+        // Everything the flow owns — thread key, directory, agent, topic
+        // anchors — stays as the new entry set it.
         if let Some(pos) = self.entries.iter().position(|e| e.session_id == entry.session_id) {
             let previous = self.entries.remove(pos);
             if entry.model.is_none() {
