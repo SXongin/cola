@@ -262,3 +262,81 @@ async fn capture_logs_never_installs_a_global_subscriber() {
         "capture_logs must never install a global subscriber: {logs}"
     );
 }
+
+/// A permission surfaced by a sweep enters its own `request` span (ADR-0048):
+/// the surfacing line is retrievable by the Session that waits, and by its
+/// Chat/Topic when the store maps it.
+#[tokio::test]
+async fn a_surfaced_permission_carries_its_session_chat_and_topic() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.permissions = vec![opencode::types::PermissionRequest {
+        request_id: "per_1".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("bash".into()),
+        patterns: vec!["ls -la".into()],
+        metadata: None,
+        always: Vec::new(),
+    }];
+    let (app, _platform) = build_app(cfg, backend).await;
+    let topic = ThreadKey::new("oc_chat".into(), "omt_topic".into());
+    seed_entry(&app, SessionEntry::new(topic, "ses_test", "/work/project")).await;
+
+    let mut seen = std::collections::HashSet::new();
+    let (_, logs) = capture_logs(async { app.permission.sweep(&app.core, &mut seen).await }).await;
+
+    let surfaced = line_with(&logs, "权限");
+    assert!(
+        surfaced.contains("session=ses_test"),
+        "the surfacing line carries the session: {surfaced}"
+    );
+    assert!(
+        surfaced.contains("chat=oc_chat"),
+        "the surfacing line carries the chat: {surfaced}"
+    );
+    assert!(
+        surfaced.contains("topic=omt_topic"),
+        "the surfacing line carries the topic: {surfaced}"
+    );
+}
+
+/// A card click is session-scoped once its Session is resolved (ADR-0048): a
+/// permission reply carries the session even though the card payload has no
+/// chat — the span completes chat/topic from the store.
+#[tokio::test]
+async fn a_permission_card_action_carries_the_session() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let topic = ThreadKey::new("oc_chat".into(), "omt_topic".into());
+    seed_entry(&app, SessionEntry::new(topic, "ses_test", "/work/project")).await;
+
+    let value = json!({
+        "action": "perm",
+        "reply": "once",
+        "session_id": "ses_test",
+        "request_id": "per_1",
+        "perm_label": "✅ 已允许一次",
+        "perm_color": "green",
+        "perm_body": "bash",
+    });
+    let (result, logs) = capture_logs(async { app.host_action(value).await }).await;
+    assert!(result.is_some(), "the click settles with a result card");
+
+    let reply = line_with(&logs, "Permission reply sent");
+    assert!(
+        reply.contains("session=ses_test"),
+        "the reply line carries the session: {reply}"
+    );
+    assert!(
+        reply.contains("chat=oc_chat"),
+        "the reply line carries the chat: {reply}"
+    );
+    assert!(
+        !reply.contains("session=per_1"),
+        "the request id must not be labelled a session: {reply}"
+    );
+}
