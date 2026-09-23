@@ -387,10 +387,10 @@ pub fn command_help(name: &str) -> Option<String> {
 
 // ===== Command execution (the Command flow) =====
 // Moved out of handler.rs so the bridge coordinator stays thin; these methods
-// run the parsed slash commands against the shared core.
+// run the parsed slash commands against the shared handles.
 
-use crate::bridge::core::SharedCore;
 use crate::bridge::display::{id_tail, title_or_id_tail};
+use crate::bridge::handles::CommandHandles;
 use crate::config::{ConversationKind, SessionEntry, ThreadKey};
 use crate::feishu;
 use std::sync::Arc;
@@ -515,12 +515,12 @@ pub(crate) fn is_reset_flag(name: &str) -> bool {
     name == "--reset"
 }
 
-/// Execute a parsed slash command against the shared core. Unrecognized
+/// Execute a parsed slash command against the shared handles. Unrecognized
 /// `/command`s are intercepted by the message coordinator (which owns the
 /// prompt pipeline), so this never forwards — the `Command::Forward` arm below
 /// is unreachable and kept only for exhaustiveness.
 pub(crate) async fn handle_command(
-    core: &Arc<SharedCore>,
+    handles: &CommandHandles,
     cmd: Command,
     thread_key: ThreadKey,
     message_id: &str,
@@ -530,16 +530,23 @@ pub(crate) async fn handle_command(
     // `Command::topic_rejection`, so every command — including future ones —
     // is restricted by one table from this single call site.
     if kind == ConversationKind::Topic {
-        let has_session = core.sessions.lock().await.get_active(&thread_key).is_some();
+        let has_session = handles
+            .flow
+            .sessions
+            .store
+            .lock()
+            .await
+            .get_active(&thread_key)
+            .is_some();
         if let Some(reason) = cmd.topic_rejection(has_session) {
-            core.feishu.reply_text(message_id, reason).await?;
+            handles.flow.platform.reply_text(message_id, reason).await?;
             return Ok(());
         }
     }
     match cmd {
         Command::Dir(path) => {
             let Some(dir_str) = resolve_directory_or_reply(
-                &*core.feishu,
+                &*handles.flow.platform,
                 message_id,
                 &path,
                 "`/dir`；或先用 `/new` 在默认目录新建会话。",
@@ -554,8 +561,14 @@ pub(crate) async fn handle_command(
             // Repeating the command (or `/new`, `/switch`, `/topic`) before
             // that replaces the pending, so a corrected directory leaves no
             // trace in the shared store.
-            let pending = core.declare_pending(&thread_key, dir_str, None).await?;
-            core.feishu
+            let pending = handles
+                .flow
+                .sessions
+                .declare_pending(&thread_key, dir_str, None)
+                .await?;
+            handles
+                .flow
+                .platform
                 .reply_text(
                     message_id,
                     &format!("下一条消息将在目录 `{}` 创建会话。", pending.directory),
@@ -563,10 +576,10 @@ pub(crate) async fn handle_command(
                 .await?;
         }
         Command::DirCard => {
-            send_dir_card(core, &thread_key, message_id).await?;
+            send_dir_card(handles, &thread_key, message_id).await?;
         }
         Command::Switch(action) => {
-            handle_switch_action(core, &thread_key, action, message_id, kind).await?;
+            handle_switch_action(handles, &thread_key, action, message_id, kind).await?;
         }
         Command::New(name) => {
             // Lazy Session Creation (ADR-0041): `/new` records a Pending
@@ -575,14 +588,14 @@ pub(crate) async fn handle_command(
             // session; the first non-command message materialises it. A
             // mistaken `/new` therefore leaves nothing in the shared store.
             // The creation-title policy (ADR-0007) applies at materialisation.
-            let pending = core
+            let pending = handles
                 .declare_pending_in_current_project(&thread_key, name.clone())
                 .await?;
             let reply = match &pending.title {
                 Some(n) => format!("下一条消息将创建会话「{}」（目录 `{}`）。", n, pending.directory),
                 None => format!("下一条消息将创建会话（目录 `{}`）。", pending.directory),
             };
-            core.feishu.reply_text(message_id, &reply).await?;
+            handles.flow.platform.reply_text(message_id, &reply).await?;
         }
         Command::Topic { directory, name } => {
             // Bare `/topic` (directory: None) inherits the conversation's
@@ -591,20 +604,21 @@ pub(crate) async fn handle_command(
             let dir_str = match directory {
                 Some(dir) => {
                     let Some(d) =
-                        resolve_directory_or_reply(&*core.feishu, message_id, &dir, "`/topic`。").await?
+                        resolve_directory_or_reply(&*handles.flow.platform, message_id, &dir, "`/topic`。")
+                            .await?
                     else {
                         return Ok(());
                     };
                     d
                 }
-                None => core.current_project_directory(&thread_key).await,
+                None => handles.current_project_directory(&thread_key).await,
             };
             // Open the topic in one transaction (ADR-0041): the cover card
             // (ADR-0023), in-topic seed and Pending Session all live in
             // `bridge::topic`; no server session is created here — the topic's
             // first non-command message materialises the pending.
             match crate::bridge::topic::open_topic(
-                core,
+                &handles.topic_handles(),
                 &thread_key.chat_id,
                 message_id,
                 crate::bridge::topic::TopicOpening::Fresh {
@@ -622,7 +636,7 @@ pub(crate) async fn handle_command(
                     );
                 }
                 Err(crate::bridge::topic::OpenTopicError::NoThreadId) => {
-                    core.feishu
+                    handles.flow.platform
                         .reply_text(
                             message_id,
                             "⚠️ 当前会话不支持创建话题（未返回 thread_id）。请改用 `/dir <目录>` 或在飞书里手动创建话题。",
@@ -633,13 +647,13 @@ pub(crate) async fn handle_command(
             }
         }
         Command::TopicAdopt { keyword, force } => {
-            handle_topic_adopt(core, &thread_key, &keyword, force, message_id).await?;
+            handle_topic_adopt(handles, &thread_key, &keyword, force, message_id).await?;
         }
         Command::TopicAdoptCard => {
             // Reuse the `/switch` session card, whose per-row button now also
             // offers "建话题接管" (ADR-0016). The card action handler creates
             // the topic via the card's own `open_message_id`.
-            send_switch_card(core, &thread_key, "", SwitchScope::Directory, message_id).await?;
+            send_switch_card(handles, &thread_key, "", SwitchScope::Directory, message_id).await?;
         }
         Command::Name(name) => {
             // `/name` renames the conversation's session (ADR-0007). An active
@@ -649,35 +663,44 @@ pub(crate) async fn handle_command(
             // (the chat-list topic entry is its content, ADR-0023). On a
             // Pending Session (ADR-0041) there is nothing to PATCH yet: the
             // name becomes the creation title the first message applies.
-            if let Some(id) = core.get_session_id(&thread_key).await {
-                core.opencode.update_session_title(&id, &name).await?;
-                core.invalidate_session_list_cache().await;
+            if let Some(id) = handles.flow.sessions.get_session_id(&thread_key).await {
+                handles.flow.backend.update_session_title(&id, &name).await?;
+                handles.flow.sessions.invalidate_cache().await;
                 crate::bridge::topic::sync_topic_cover_title(
-                    &core.cards_handle(),
-                    &core.sessions_handle(),
-                    &core.opencode,
+                    &handles.flow.cards,
+                    &handles.flow.sessions,
+                    &handles.flow.backend,
                     &id,
                 )
                 .await;
-                core.feishu
+                handles
+                    .flow
+                    .platform
                     .reply_text(message_id, &format!("Renamed to \"{}\".", name))
                     .await?;
-            } else if core
+            } else if handles
+                .flow
+                .sessions
                 .update_pending(&thread_key, |p| p.title = Some(name.clone()))
                 .await?
             {
                 // ADR-0023 + ADR-0041: on a pending topic the cover card is
                 // patched now — no server session exists to sync from yet. The
                 // created session gets this title at materialisation.
-                crate::bridge::topic::rename_pending_cover(core, &thread_key, &name).await;
-                core.feishu
+                crate::bridge::topic::rename_pending_cover(&handles.topic_handles(), &thread_key, &name)
+                    .await;
+                handles
+                    .flow
+                    .platform
                     .reply_text(
                         message_id,
                         &format!("已记下标题「{}」——下一条消息创建会话时使用。", name),
                     )
                     .await?;
             } else {
-                core.feishu
+                handles
+                    .flow
+                    .platform
                     .reply_text(
                         message_id,
                         &format!(
@@ -697,17 +720,24 @@ pub(crate) async fn handle_command(
             // configured too, it just has no requests to approve yet.
             match action {
                 crate::bridge::command::AutoAcceptAction::Status => {
-                    send_autoaccept_card(core, &thread_key, message_id).await?;
+                    send_autoaccept_card(handles, &thread_key, message_id).await?;
                     return Ok(());
                 }
                 crate::bridge::command::AutoAcceptAction::Set(on) => {
-                    let settings = core.session_settings(&thread_key).await;
+                    let settings = handles.flow.sessions.session_settings(&thread_key).await;
                     let mut approved = Vec::new();
                     if on
                         && let Some(s) = settings.as_ref()
                         && let Some(id) = s.session_id.as_deref()
                     {
-                        approved = core.approve_pending_for_session(id, &s.directory).await;
+                        approved = crate::bridge::request::approve_pending_for_session(
+                            &handles.flow.sessions,
+                            &handles.flow.requests,
+                            &handles.flow.backend,
+                            id,
+                            &s.directory,
+                        )
+                        .await;
                         if !approved.is_empty() {
                             // The same residue the card toggle leaves: ONE mode
                             // receipt and the approved blocks dismissed. Without
@@ -717,9 +747,9 @@ pub(crate) async fn handle_command(
                             // so `resolve_blocks` patches every card that
                             // renders one of the blocks.
                             crate::bridge::request::resolve_blocks(
-                                &core.permission,
-                                &core.cards_handle(),
-                                &core.requests_handle(),
+                                &handles.flow.requests.permission,
+                                &handles.flow.cards,
+                                &handles.flow.requests,
                                 &Some(id.to_string()),
                                 id,
                                 crate::bridge::request::Origin::Command,
@@ -733,7 +763,7 @@ pub(crate) async fn handle_command(
                     }
                     if let Some(mut s) = settings {
                         s.auto_accept = on;
-                        core.set_session_settings(&thread_key, s).await?;
+                        handles.flow.sessions.set_session_settings(&thread_key, s).await?;
                     }
                     let state = if on { "开" } else { "关" };
                     let extra = if on && !approved.is_empty() {
@@ -741,33 +771,47 @@ pub(crate) async fn handle_command(
                     } else {
                         String::new()
                     };
-                    core.feishu
+                    handles
+                        .flow
+                        .platform
                         .reply_text(message_id, &format!("🔁 已将会话自动审批{state}。{}", extra))
                         .await?;
                 }
             }
         }
         Command::Stop => {
-            if let Some(id) = core.get_session_id(&thread_key).await {
-                core.opencode.interrupt(&id).await?;
+            if let Some(id) = handles.flow.sessions.get_session_id(&thread_key).await {
+                handles.flow.backend.interrupt(&id).await?;
                 // Mark the session stopped so a running post-prompt drain
                 // (ADR-0043) finalizes promptly instead of waiting out its
                 // bound on a Supplement the abort left unanswered. The next
                 // Turn clears the marker when it starts.
-                core.stopped_sessions.lock().await.insert(id);
-                core.feishu.reply_text(message_id, "Interrupted.").await?;
+                handles.flow.waits.stopped_sessions.lock().await.insert(id);
+                handles
+                    .flow
+                    .platform
+                    .reply_text(message_id, "Interrupted.")
+                    .await?;
             } else {
-                core.feishu
+                handles
+                    .flow
+                    .platform
                     .reply_text(message_id, "当前没有正在执行的会话。")
                     .await?;
             }
         }
         Command::Compact => {
-            if let Some(id) = core.get_session_id(&thread_key).await {
-                core.opencode.compact(&id).await?;
-                core.feishu.reply_text(message_id, "Compacting...").await?;
+            if let Some(id) = handles.flow.sessions.get_session_id(&thread_key).await {
+                handles.flow.backend.compact(&id).await?;
+                handles
+                    .flow
+                    .platform
+                    .reply_text(message_id, "Compacting...")
+                    .await?;
             } else {
-                core.feishu
+                handles
+                    .flow
+                    .platform
                     .reply_text(
                         message_id,
                         &format!("{}还没有会话，无需压缩。", feishu_side_label(&thread_key)),
@@ -780,18 +824,18 @@ pub(crate) async fn handle_command(
             // chain" (ADR-0043, 2026-09-22 amendment): mid-turn, command
             // replies bury the live card above them, and this command moves
             // the chain's live continuation back to the newest message.
-            let Some(session_id) = core.get_session_id(&thread_key).await else {
-                core.feishu.reply_text(message_id, NO_LIVE_CARD).await?;
+            let Some(session_id) = handles.flow.sessions.get_session_id(&thread_key).await else {
+                handles.flow.platform.reply_text(message_id, NO_LIVE_CARD).await?;
                 return Ok(());
             };
-            let running = crate::bridge::turn::Turn::is_running(&core.cards_handle(), &session_id).await;
+            let running = crate::bridge::turn::Turn::is_running(&handles.flow.cards, &session_id).await;
             if !running {
-                core.feishu.reply_text(message_id, NO_LIVE_CARD).await?;
+                handles.flow.platform.reply_text(message_id, NO_LIVE_CARD).await?;
                 return Ok(());
             }
             tracing::info!("card pull: session {session_id} live card split requested");
             crate::bridge::turn::Turn::split_card_chain(
-                &core.cards_handle(),
+                &handles.flow.cards,
                 &session_id,
                 message_id,
                 crate::bridge::turn::SplitKind::Pull,
@@ -799,7 +843,7 @@ pub(crate) async fn handle_command(
             .await;
         }
         Command::AgentCard => {
-            send_agent_card(core, &thread_key, message_id).await?;
+            send_agent_card(handles, &thread_key, message_id).await?;
         }
         Command::Agent(name) => {
             // The OpenCode server has no agent-switch endpoint (the legacy
@@ -813,8 +857,10 @@ pub(crate) async fn handle_command(
             // clear error on the next prompt's card. `--reset` clears the
             // override (the server's default agent applies); an agent literally
             // named `default`/`off`/`reset` is a normal pick, never a clear word.
-            let Some(mut settings) = core.session_settings(&thread_key).await else {
-                core.feishu
+            let Some(mut settings) = handles.flow.sessions.session_settings(&thread_key).await else {
+                handles
+                    .flow
+                    .platform
                     .reply_text(
                         message_id,
                         &format!(
@@ -827,16 +873,20 @@ pub(crate) async fn handle_command(
             };
             let cleared = is_reset_flag(&name);
             settings.agent = if cleared { None } else { Some(name.clone()) };
-            core.set_session_settings(&thread_key, settings).await?;
+            handles
+                .flow
+                .sessions
+                .set_session_settings(&thread_key, settings)
+                .await?;
             let msg = if cleared {
                 "已清除 Agent（回到服务器默认）。".to_string()
             } else {
                 format!("Agent: {}（下一条消息开始生效）", name)
             };
-            core.feishu.reply_text(message_id, &msg).await?;
+            handles.flow.platform.reply_text(message_id, &msg).await?;
         }
         Command::ModelCard => {
-            send_model_card(core, &thread_key, message_id).await?;
+            send_model_card(handles, &thread_key, message_id).await?;
         }
         Command::Model(name) => {
             // The OpenCode server has NO model-switch endpoint (the legacy
@@ -847,7 +897,7 @@ pub(crate) async fn handle_command(
             // Pending Session the override is recorded on the pending and
             // lands on the created session at materialisation (ADR-0041).
             let Some(_) = crate::opencode::parsing::parse_model(&name) else {
-                core.feishu
+                handles.flow.platform
                         .reply_text(
                             message_id,
                             &format!(
@@ -858,8 +908,10 @@ pub(crate) async fn handle_command(
                         .await?;
                 return Ok(());
             };
-            let Some(mut settings) = core.session_settings(&thread_key).await else {
-                core.feishu
+            let Some(mut settings) = handles.flow.sessions.session_settings(&thread_key).await else {
+                handles
+                    .flow
+                    .platform
                     .reply_text(
                         message_id,
                         &format!(
@@ -873,12 +925,22 @@ pub(crate) async fn handle_command(
             settings.model = Some(name.clone());
             // Auto-clear the `/think` variant when the new model doesn't
             // declare it (ADR-0020), shared with the `/model` picker card.
-            let cleared_variant = core.clear_variant_for_model(&mut settings.variant, &name).await;
-            core.set_session_settings(&thread_key, settings).await?;
+            let cleared_variant = handles
+                .flow
+                .sessions
+                .clear_variant_for_model(&handles.flow.backend, &mut settings.variant, &name)
+                .await;
+            handles
+                .flow
+                .sessions
+                .set_session_settings(&thread_key, settings)
+                .await?;
             let extra = cleared_variant
                 .map(|v| format!("（已清除思考等级 `{v}`：新模型不支持）"))
                 .unwrap_or_default();
-            core.feishu
+            handles
+                .flow
+                .platform
                 .reply_text(
                     message_id,
                     &format!("Model: {}（下一条消息开始生效）{}", name, extra),
@@ -886,7 +948,7 @@ pub(crate) async fn handle_command(
                 .await?;
         }
         Command::ThinkCard => {
-            send_think_card(core, &thread_key, message_id).await?;
+            send_think_card(handles, &thread_key, message_id).await?;
         }
         Command::Think(name) => {
             // The OpenCode server has no thinking-level endpoint either —
@@ -897,8 +959,10 @@ pub(crate) async fn handle_command(
             // the override (the server's default for the model); a variant
             // literally named `default`/`off`/`reset` is a normal pick, never
             // a clear word.
-            let Some(mut settings) = core.session_settings(&thread_key).await else {
-                core.feishu
+            let Some(mut settings) = handles.flow.sessions.session_settings(&thread_key).await else {
+                handles
+                    .flow
+                    .platform
                     .reply_text(
                         message_id,
                         &format!(
@@ -911,8 +975,16 @@ pub(crate) async fn handle_command(
             };
             let cleared = is_reset_flag(&name);
             if !cleared
-                && let Some((provider, model)) = core.effective_model(&settings).await
-                && let Some(variants) = core.model_variants(&provider, &model).await
+                && let Some((provider, model)) = handles
+                    .flow
+                    .sessions
+                    .effective_model(&handles.flow.backend, &settings)
+                    .await
+                && let Some(variants) = handles
+                    .flow
+                    .sessions
+                    .model_variants(&handles.flow.backend, &provider, &model)
+                    .await
                 && !variants.iter().any(|v| v == &name)
             {
                 let available = if variants.is_empty() {
@@ -920,7 +992,7 @@ pub(crate) async fn handle_command(
                 } else {
                     variants.join("、")
                 };
-                core.feishu
+                handles.flow.platform
                     .reply_text(
                         message_id,
                         &format!(
@@ -931,26 +1003,30 @@ pub(crate) async fn handle_command(
                 return Ok(());
             }
             settings.variant = if cleared { None } else { Some(name.clone()) };
-            core.set_session_settings(&thread_key, settings).await?;
+            handles
+                .flow
+                .sessions
+                .set_session_settings(&thread_key, settings)
+                .await?;
             let msg = if cleared {
                 "已清除思考等级（回到模型默认）。".to_string()
             } else {
                 format!("Thinking: {}（下一条消息开始生效）", name)
             };
-            core.feishu.reply_text(message_id, &msg).await?;
+            handles.flow.platform.reply_text(message_id, &msg).await?;
         }
         Command::Help(target) => {
             match target {
                 // No target: the buttonless reference card (ADR-0012, issue 05).
                 None => {
-                    send_help_card(core, message_id).await?;
+                    send_help_card(handles, message_id).await?;
                 }
                 Some(name) => {
                     let text = match command_help(&name) {
                         Some(h) => h,
                         None => format!("未知命令 `{}`。\n\n{}", name, help_text()),
                     };
-                    core.feishu.reply_text(message_id, &text).await?;
+                    handles.flow.platform.reply_text(message_id, &text).await?;
                 }
             }
         }
@@ -958,7 +1034,11 @@ pub(crate) async fn handle_command(
             // Reply BEFORE exiting, then re-exec ourselves with the SAME
             // startup args and inherited stdio (so the log redirect to
             // test.log keeps working in the new process).
-            core.feishu.reply_text(message_id, "♻️ 正在重启，稍候…").await?;
+            handles
+                .flow
+                .platform
+                .reply_text(message_id, "♻️ 正在重启，稍候…")
+                .await?;
             // Remember where to announce the restart: the chat, plus the
             // command message/thread so an in-Topic command announces back
             // inside its topic.
@@ -974,7 +1054,9 @@ pub(crate) async fn handle_command(
                 Ok(()) => std::process::exit(0),
                 Err(e) => {
                     tracing::error!("restart spawn failed: {}", e);
-                    core.feishu
+                    handles
+                        .flow
+                        .platform
                         .reply_text(message_id, &format!("重启失败：{}", e))
                         .await?;
                 }
@@ -987,12 +1069,16 @@ pub(crate) async fn handle_command(
             // down another application's runtime.
             match crate::bridge::discovery::restart_self_spawned_server().await {
                 Ok(crate::bridge::discovery::RestartOutcome::Restarted) => {
-                    core.feishu
+                    handles
+                        .flow
+                        .platform
                         .reply_text(message_id, "♻️ 已重启 OpenCode 服务器。")
                         .await?;
                 }
                 Ok(crate::bridge::discovery::RestartOutcome::NotOwned) => {
-                    core.feishu
+                    handles
+                        .flow
+                        .platform
                         .reply_text(
                             message_id,
                             "这个 OpenCode 服务器不是 cola 启动的，需要你手动重启它。",
@@ -1000,13 +1086,17 @@ pub(crate) async fn handle_command(
                         .await?;
                 }
                 Ok(crate::bridge::discovery::RestartOutcome::NoServer) => {
-                    core.feishu
+                    handles
+                        .flow
+                        .platform
                         .reply_text(message_id, "当前没有正在运行的 OpenCode 服务器。")
                         .await?;
                 }
                 Err(e) => {
                     tracing::error!("restart opencode failed: {}", e);
-                    core.feishu
+                    handles
+                        .flow
+                        .platform
                         .reply_text(message_id, &format!("重启 OpenCode 失败：{}", e))
                         .await?;
                 }
@@ -1017,13 +1107,13 @@ pub(crate) async fn handle_command(
             // replies; on success write the announce file (the new process
             // announces "已更新到 X" in this chat) and restart.
             let reporter = FeishuUpdateReporter {
-                feishu: &core.feishu,
+                feishu: &handles.flow.platform,
                 message_id,
             };
             if let crate::update::UpdateOutcome::Updated(new_version) =
                 crate::update::run_update(&reporter, crate::update::UpdateMode::Apply).await
             {
-                core.feishu.reply_text(message_id, "正在重启…").await?;
+                handles.flow.platform.reply_text(message_id, "正在重启…").await?;
                 let mut notify = RestartNotify::new(&thread_key, message_id);
                 notify.kind = RestartKind::Update;
                 notify.version = Some(new_version.to_string());
@@ -1034,7 +1124,9 @@ pub(crate) async fn handle_command(
         Command::Version => {
             // Version identity (ADR-0027): a local text reply, never a network
             // call — it must work on any instance at any time.
-            core.feishu
+            handles
+                .flow
+                .platform
                 .reply_text(message_id, &crate::version::feishu_reply())
                 .await?;
         }
@@ -1050,7 +1142,7 @@ pub(crate) async fn handle_command(
 /// Dispatch a `/switch` action (ADR-0012). The text-direct forms share the
 /// old command handlers; the no-arg form pops the interactive session card.
 async fn handle_switch_action(
-    core: &Arc<SharedCore>,
+    handles: &CommandHandles,
     thread_key: &ThreadKey,
     action: SwitchAction,
     message_id: &str,
@@ -1058,19 +1150,25 @@ async fn handle_switch_action(
 ) -> crate::error::Result<()> {
     match action {
         SwitchAction::Card => {
-            send_switch_card(core, thread_key, "", SwitchScope::Directory, message_id).await?;
+            send_switch_card(handles, thread_key, "", SwitchScope::Directory, message_id).await?;
             Ok(())
         }
-        SwitchAction::Match(keyword) => handle_switch(core, thread_key, &keyword, message_id, kind).await,
+        SwitchAction::Match(keyword) => handle_switch(handles, thread_key, &keyword, message_id, kind).await,
         SwitchAction::List { keyword, all } => {
-            handle_list(core, thread_key, keyword.as_deref(), all, message_id).await
+            handle_list(handles, thread_key, keyword.as_deref(), all, message_id).await
         }
         SwitchAction::Forget => {
-            let removed = core.remove_thread_sessions(thread_key).await?;
+            let removed = handles.flow.sessions.remove_thread_sessions(thread_key).await?;
             if removed.is_empty() {
-                core.feishu.reply_text(message_id, "当前没有映射的会话。").await?;
+                handles
+                    .flow
+                    .platform
+                    .reply_text(message_id, "当前没有映射的会话。")
+                    .await?;
             } else {
-                core.feishu
+                handles
+                    .flow
+                    .platform
                     .reply_text(
                         message_id,
                         &format!(
@@ -1083,7 +1181,7 @@ async fn handle_switch_action(
             Ok(())
         }
         SwitchAction::Attach { query, force } => {
-            handle_attach(core, thread_key, &query, force, message_id, kind).await
+            handle_attach(handles, thread_key, &query, force, message_id, kind).await
         }
     }
 }
@@ -1139,7 +1237,7 @@ pub(crate) fn feishu_side_label(thread_key: &ThreadKey) -> &'static str {
 /// and the card ack refresh (`App::build_switch_card_for`) so both render from
 /// one source of truth.
 pub(crate) async fn switch_card_data(
-    core: &Arc<SharedCore>,
+    handles: &CommandHandles,
     thread_key: &ThreadKey,
     keyword: &str,
     scope: SwitchScope,
@@ -1150,10 +1248,21 @@ pub(crate) async fn switch_card_data(
     SwitchScope,
     Option<String>,
 ) {
-    let sessions = core.cached_session_list().await.unwrap_or_default();
+    let sessions = handles
+        .flow
+        .sessions
+        .cached_session_list(&handles.flow.backend)
+        .await
+        .unwrap_or_default();
     // Pending-first (ADR-0041): a declared Pending Session defines the current
     // directory even though `get_active` is `None` for the thread.
-    let current_dir = core.sessions.lock().await.current_directory(thread_key);
+    let current_dir = handles
+        .flow
+        .sessions
+        .store
+        .lock()
+        .await
+        .current_directory(thread_key);
     // Directory scope only holds when there IS a current directory; a fresh
     // conversation (no active session) falls back to the whole store.
     let scope = if scope == SwitchScope::Directory && current_dir.is_some() {
@@ -1181,7 +1290,7 @@ pub(crate) async fn switch_card_data(
         ub.cmp(&ua)
     });
     let (active_id, mapped_ids) = {
-        let store = core.sessions.lock().await;
+        let store = handles.flow.sessions.store.lock().await;
         let active = store.get_active(thread_key).map(|e| e.session_id.clone());
         let mapped: Vec<String> = store
             .list_thread(thread_key)
@@ -1197,14 +1306,14 @@ pub(crate) async fn switch_card_data(
 /// ADR-0022). Renders the filtered session list (via `switch_card_data`) and
 /// replies with the card.
 async fn send_switch_card(
-    core: &Arc<SharedCore>,
+    handles: &CommandHandles,
     thread_key: &ThreadKey,
     keyword: &str,
     scope: SwitchScope,
     message_id: &str,
 ) -> crate::error::Result<()> {
     let (shown, active_id, mapped_ids, scope, current_dir) =
-        switch_card_data(core, thread_key, keyword, scope).await;
+        switch_card_data(handles, thread_key, keyword, scope).await;
     let card = crate::feishu::card::session::build_switch_card(
         thread_key,
         &shown,
@@ -1214,7 +1323,7 @@ async fn send_switch_card(
         active_id.as_deref(),
         &mapped_ids,
     );
-    core.feishu.reply_card(message_id, &card).await?;
+    handles.flow.platform.reply_card(message_id, &card).await?;
     Ok(())
 }
 
@@ -1228,10 +1337,15 @@ async fn send_switch_card(
 /// the text send path (`send_dir_card`) and the card ack refresh
 /// (`App::build_dir_card_for`) so both render from one source of truth.
 pub(crate) async fn dir_card_data(
-    core: &Arc<SharedCore>,
+    handles: &CommandHandles,
     thread_key: &ThreadKey,
 ) -> (Vec<String>, Option<String>) {
-    let sessions = core.cached_session_list().await.unwrap_or_default();
+    let sessions = handles
+        .flow
+        .sessions
+        .cached_session_list(&handles.flow.backend)
+        .await
+        .unwrap_or_default();
     // Directory -> latest activity. A directory's freshness is its most
     // recently active session's `time.updated`.
     let mut by_dir: Vec<(String, i64)> = Vec::new();
@@ -1250,7 +1364,7 @@ pub(crate) async fn dir_card_data(
     let mut dirs: Vec<String> = by_dir.into_iter().map(|(d, _)| d).collect();
     // Pending-first (ADR-0041): `get_active` is `None` while a pending exists.
     let (mapped_dirs, current_dir) = {
-        let store = core.sessions.lock().await;
+        let store = handles.flow.sessions.store.lock().await;
         (store.directories(), store.current_directory(thread_key))
     };
     // The store lists directories most recently mapped first — the sensible
@@ -1275,13 +1389,13 @@ pub(crate) async fn dir_card_data(
 /// Build and send the interactive `/dir` Recent Directories card. Renders the
 /// deduped directory list (via `dir_card_data`) and replies with the card.
 async fn send_dir_card(
-    core: &Arc<SharedCore>,
+    handles: &CommandHandles,
     thread_key: &ThreadKey,
     message_id: &str,
 ) -> crate::error::Result<()> {
-    let (dirs, current_dir) = dir_card_data(core, thread_key).await;
+    let (dirs, current_dir) = dir_card_data(handles, thread_key).await;
     let card = crate::feishu::card::session::build_dir_card(thread_key, &dirs, current_dir.as_deref());
-    core.feishu.reply_card(message_id, &card).await?;
+    handles.flow.platform.reply_card(message_id, &card).await?;
     Ok(())
 }
 
@@ -1304,10 +1418,10 @@ pub(crate) fn server_default_agent(agents: &[crate::opencode::types::AgentInfo])
 /// active SessionEntry (ADR-0041). Shared by the text send path and the
 /// card-ack refresh so both render the current agent from one source of truth.
 pub(crate) async fn agent_card(
-    core: &Arc<SharedCore>,
+    handles: &CommandHandles,
     thread_key: &ThreadKey,
 ) -> (Option<serde_json::Value>, Option<String>) {
-    let Some(settings) = core.session_settings(thread_key).await else {
+    let Some(settings) = handles.flow.sessions.session_settings(thread_key).await else {
         return (
             None,
             Some(format!(
@@ -1316,7 +1430,7 @@ pub(crate) async fn agent_card(
             )),
         );
     };
-    let agents = core.opencode.list_agents().await;
+    let agents = handles.flow.backend.list_agents().await;
     let default = server_default_agent(&agents);
     let card = crate::feishu::card::picker::build_agent_card(
         thread_key,
@@ -1330,15 +1444,17 @@ pub(crate) async fn agent_card(
 /// Send the `/agent` picker card, or a text explanation when there is no
 /// active session.
 async fn send_agent_card(
-    core: &Arc<SharedCore>,
+    handles: &CommandHandles,
     thread_key: &ThreadKey,
     message_id: &str,
 ) -> crate::error::Result<()> {
-    let (card, error) = agent_card(core, thread_key).await;
+    let (card, error) = agent_card(handles, thread_key).await;
     if let Some(c) = card {
-        core.feishu.reply_card(message_id, &c).await?;
+        handles.flow.platform.reply_card(message_id, &c).await?;
     } else {
-        core.feishu
+        handles
+            .flow
+            .platform
             .reply_text(message_id, &error.unwrap_or_default())
             .await?;
     }
@@ -1350,16 +1466,16 @@ async fn send_agent_card(
 /// Feishu's card limits. The intro carries the CURRENT model
 /// ([`current_model_label`]) so the user sees what a pick would replace.
 async fn send_model_card(
-    core: &Arc<SharedCore>,
+    handles: &CommandHandles,
     thread_key: &ThreadKey,
     message_id: &str,
 ) -> crate::error::Result<()> {
-    let current = current_model_label(core, thread_key).await;
-    let providers = core.opencode.list_models().await;
+    let current = current_model_label(handles, thread_key).await;
+    let providers = handles.flow.backend.list_models().await;
     let cards =
         crate::feishu::card::picker::build_model_provider_cards(thread_key, &providers, current.as_deref());
     for card in cards {
-        core.feishu.reply_card(message_id, &card).await?;
+        handles.flow.platform.reply_card(message_id, &card).await?;
     }
     Ok(())
 }
@@ -1371,9 +1487,13 @@ async fn send_model_card(
 /// (ADR-0041). `None` when the thread has no target or no rung resolves — the
 /// picker then omits its current-model line. Shared by the text send path and
 /// the card-ack rebuild so both show one source of truth.
-pub(crate) async fn current_model_label(core: &Arc<SharedCore>, thread_key: &ThreadKey) -> Option<String> {
-    let settings = core.session_settings(thread_key).await?;
-    let (provider, model) = core.effective_model(&settings).await?;
+pub(crate) async fn current_model_label(handles: &CommandHandles, thread_key: &ThreadKey) -> Option<String> {
+    let settings = handles.flow.sessions.session_settings(thread_key).await?;
+    let (provider, model) = handles
+        .flow
+        .sessions
+        .effective_model(&handles.flow.backend, &settings)
+        .await?;
     let variant = settings
         .variant
         .as_deref()
@@ -1392,10 +1512,10 @@ pub(crate) async fn current_model_label(core: &Arc<SharedCore>, thread_key: &Thr
 /// text send path and the card-ack refresh so both render the current selection
 /// from one source of truth.
 pub(crate) async fn think_card(
-    core: &Arc<SharedCore>,
+    handles: &CommandHandles,
     thread_key: &ThreadKey,
 ) -> (Option<serde_json::Value>, Option<String>) {
-    let Some(settings) = core.session_settings(thread_key).await else {
+    let Some(settings) = handles.flow.sessions.session_settings(thread_key).await else {
         return (
             None,
             Some(format!(
@@ -1404,13 +1524,23 @@ pub(crate) async fn think_card(
             )),
         );
     };
-    let Some((provider, model)) = core.effective_model(&settings).await else {
+    let Some((provider, model)) = handles
+        .flow
+        .sessions
+        .effective_model(&handles.flow.backend, &settings)
+        .await
+    else {
         return (
             None,
             Some("无法确定当前模型，请先用 `/model` 选择模型。".to_string()),
         );
     };
-    let variants = core.model_variants(&provider, &model).await.unwrap_or_default();
+    let variants = handles
+        .flow
+        .sessions
+        .model_variants(&handles.flow.backend, &provider, &model)
+        .await
+        .unwrap_or_default();
     if variants.is_empty() {
         return (
             None,
@@ -1431,15 +1561,17 @@ pub(crate) async fn think_card(
 /// Send the `/think` variant-picker card, or a text explanation when no card
 /// applies (no session / no resolvable model / the model declares no variants).
 async fn send_think_card(
-    core: &Arc<SharedCore>,
+    handles: &CommandHandles,
     thread_key: &ThreadKey,
     message_id: &str,
 ) -> crate::error::Result<()> {
-    let (card, error) = think_card(core, thread_key).await;
+    let (card, error) = think_card(handles, thread_key).await;
     if let Some(c) = card {
-        core.feishu.reply_card(message_id, &c).await?;
+        handles.flow.platform.reply_card(message_id, &c).await?;
     } else {
-        core.feishu
+        handles
+            .flow
+            .platform
             .reply_text(message_id, &error.unwrap_or_default())
             .await?;
     }
@@ -1449,17 +1581,19 @@ async fn send_think_card(
 /// Send the `/autoaccept` toggle card (ADR-0012, issue 05). The shown state is
 /// the settings target's (Pending first, else active — ADR-0041).
 async fn send_autoaccept_card(
-    core: &Arc<SharedCore>,
+    handles: &CommandHandles,
     thread_key: &ThreadKey,
     message_id: &str,
 ) -> crate::error::Result<()> {
-    let current_on = core
+    let current_on = handles
+        .flow
+        .sessions
         .session_settings(thread_key)
         .await
         .map(|s| s.auto_accept)
         .unwrap_or(false);
     let card = crate::feishu::card::picker::build_autoaccept_card(thread_key, current_on);
-    core.feishu.reply_card(message_id, &card).await?;
+    handles.flow.platform.reply_card(message_id, &card).await?;
     Ok(())
 }
 
@@ -1467,13 +1601,13 @@ async fn send_autoaccept_card(
 /// stays text via `/help <command>`). If the card fails to send (e.g. Feishu
 /// rejects the schema), fall back to the plain-text `help_text()` so the user
 /// always gets something instead of a silent dead `/help`.
-async fn send_help_card(core: &Arc<SharedCore>, message_id: &str) -> crate::error::Result<()> {
+async fn send_help_card(handles: &CommandHandles, message_id: &str) -> crate::error::Result<()> {
     let card = crate::feishu::card::help::build_help_card();
-    match core.feishu.reply_card(message_id, &card).await {
+    match handles.flow.platform.reply_card(message_id, &card).await {
         Ok(_) => Ok(()),
         Err(e) => {
             tracing::warn!("help card failed ({}), falling back to text", e);
-            core.feishu.reply_text(message_id, &help_text()).await?;
+            handles.flow.platform.reply_text(message_id, &help_text()).await?;
             Ok(())
         }
     }
@@ -1489,18 +1623,22 @@ async fn send_help_card(core: &Arc<SharedCore>, message_id: &str) -> crate::erro
 ///    into the current thread and becomes active.
 /// 3. Multiple hits: list up to 8 candidates and point at `/attach`.
 async fn handle_switch(
-    core: &Arc<SharedCore>,
+    handles: &CommandHandles,
     thread_key: &ThreadKey,
     keyword: &str,
     message_id: &str,
     kind: ConversationKind,
 ) -> crate::error::Result<()> {
-    let sessions = core.cached_session_list().await?;
+    let sessions = handles
+        .flow
+        .sessions
+        .cached_session_list(&handles.flow.backend)
+        .await?;
     let lower = keyword.to_lowercase();
 
     // 1. Current thread's mapped sessions first.
     let thread_ids: Vec<String> = {
-        let store = core.sessions.lock().await;
+        let store = handles.flow.sessions.store.lock().await;
         store
             .list_thread(thread_key)
             .into_iter()
@@ -1514,7 +1652,7 @@ async fn handle_switch(
     if thread_hits.len() == 1 {
         let hit = thread_hits[0];
         let entry = {
-            let store = core.sessions.lock().await;
+            let store = handles.flow.sessions.store.lock().await;
             store
                 .list_thread(thread_key)
                 .into_iter()
@@ -1522,7 +1660,7 @@ async fn handle_switch(
                 .cloned()
         };
         if let Some(entry) = entry {
-            core.activate_session(entry).await?;
+            handles.flow.sessions.activate(entry).await?;
         }
         // ADR-0028 suppression: re-activating a session already mapped to
         // this thread reports a snapshot only when there is content to show —
@@ -1533,7 +1671,7 @@ async fn handle_switch(
         // this thread's mapped-session list. The gather and the 切换 card's
         // build run inside the Session's `snapshot` span (ADR-0048).
         match crate::bridge::snapshot::re_switch_snapshot(
-            core,
+            &handles.snapshot_handles(),
             thread_key,
             &hit.id,
             &hit.directory,
@@ -1544,12 +1682,21 @@ async fn handle_switch(
             crate::bridge::snapshot::ReSwitchSnapshot::Full { card, data } => {
                 // Claim the snapshot's embedded pendings against the sent card
                 // so the poll loop never duplicates them.
-                let mid = core.feishu.reply_card(message_id, &card).await?;
-                crate::bridge::external::settle_snapshot_after_send(core, &mid, "切换", &hit.title, &data)
-                    .await;
+                let mid = handles.flow.platform.reply_card(message_id, &card).await?;
+                crate::bridge::external::settle_snapshot_after_send(
+                    &handles.external,
+                    &handles.flow,
+                    &mid,
+                    "切换",
+                    &hit.title,
+                    &data,
+                )
+                .await;
             }
             crate::bridge::snapshot::ReSwitchSnapshot::Suppressed => {
-                core.feishu
+                handles
+                    .flow
+                    .platform
                     .reply_text(message_id, &format!("Switched to \"{}\".", hit.title))
                     .await?;
             }
@@ -1564,7 +1711,7 @@ async fn handle_switch(
             ),
             &thread_hits,
         );
-        core.feishu.reply_text(message_id, &list).await?;
+        handles.flow.platform.reply_text(message_id, &list).await?;
         return Ok(());
     }
 
@@ -1575,12 +1722,12 @@ async fn handle_switch(
         .collect();
     if global_hits.len() == 1 {
         let hit = global_hits[0].clone();
-        adopt_session(core, thread_key, &hit, message_id, kind, false).await?;
+        adopt_session(handles, thread_key, &hit, message_id, kind, false).await?;
         return Ok(());
     }
     if global_hits.len() > 1 {
         let list = candidates_list("找到多个会话，请用 `/switch <完整ID>` 指定：", &global_hits);
-        core.feishu.reply_text(message_id, &list).await?;
+        handles.flow.platform.reply_text(message_id, &list).await?;
         return Ok(());
     }
     // No match: send the interactive card pre-filtered by the keyword, so the
@@ -1588,7 +1735,7 @@ async fn handle_switch(
     // text `/switch <kw>` searches the whole store (ADR-0022), so the card
     // opens in the `All` scope — a directory-scoped card would hide the
     // candidates the user was just shown.
-    send_switch_card(core, thread_key, keyword, SwitchScope::All, message_id).await?;
+    send_switch_card(handles, thread_key, keyword, SwitchScope::All, message_id).await?;
     Ok(())
 }
 
@@ -1597,13 +1744,17 @@ async fn handle_switch(
 /// Feishu become visible. Sorted by last activity (client-side), capped at
 /// 15; children and archived hidden unless `--all`.
 async fn handle_list(
-    core: &Arc<SharedCore>,
+    handles: &CommandHandles,
     thread_key: &ThreadKey,
     keyword: Option<&str>,
     all: bool,
     message_id: &str,
 ) -> crate::error::Result<()> {
-    let sessions = core.cached_session_list().await?;
+    let sessions = handles
+        .flow
+        .sessions
+        .cached_session_list(&handles.flow.backend)
+        .await?;
     let lower = keyword.map(|k| k.to_lowercase());
     let mut shown: Vec<crate::opencode::types::SessionListInfo> = sessions
         .into_iter()
@@ -1625,14 +1776,16 @@ async fn handle_list(
     shown.truncate(15);
 
     if shown.is_empty() {
-        core.feishu
+        handles
+            .flow
+            .platform
             .reply_text(message_id, "No sessions matching the filter.")
             .await?;
         return Ok(());
     }
 
     let active_id = {
-        let store = core.sessions.lock().await;
+        let store = handles.flow.sessions.store.lock().await;
         store.get_active(thread_key).map(|e| e.session_id.clone())
     };
     let mut list = String::from("**Recent sessions:**\n");
@@ -1662,7 +1815,7 @@ async fn handle_list(
     if !all {
         list.push_str("\n`/list --all` 显示子任务会话（当前隐藏）。");
     }
-    core.feishu.reply_text(message_id, &list).await?;
+    handles.flow.platform.reply_text(message_id, &list).await?;
     Ok(())
 }
 
@@ -1751,23 +1904,29 @@ fn decide_id_hits<'a>(
 /// into the current thread (ADR-0008). Resolution: exact id → unique
 /// id-prefix → unique title substring; multiple hits list candidates.
 async fn handle_attach(
-    core: &Arc<SharedCore>,
+    handles: &CommandHandles,
     thread_key: &ThreadKey,
     query: &str,
     force: bool,
     message_id: &str,
     kind: ConversationKind,
 ) -> crate::error::Result<()> {
-    let sessions = core.cached_session_list().await?;
+    let sessions = handles
+        .flow
+        .sessions
+        .cached_session_list(&handles.flow.backend)
+        .await?;
     match resolve_session(&sessions, query) {
-        SessionResolution::Hit(s) => adopt_session(core, thread_key, s, message_id, kind, force).await,
+        SessionResolution::Hit(s) => adopt_session(handles, thread_key, s, message_id, kind, force).await,
         SessionResolution::Ambiguous(hits) => {
             let list = candidates_list("找到多个会话，请用完整 ID：", &hits);
-            core.feishu.reply_text(message_id, &list).await?;
+            handles.flow.platform.reply_text(message_id, &list).await?;
             Ok(())
         }
         SessionResolution::None => {
-            core.feishu
+            handles
+                .flow
+                .platform
                 .reply_text(message_id, &format!("No session matching \"{}\"", query))
                 .await?;
             Ok(())
@@ -1782,22 +1941,28 @@ async fn handle_attach(
 /// via `reply_in_thread` on the command message and maps the adopted session
 /// to the NEW topic's `ThreadKey` (anchor = the in-topic confirmation).
 async fn handle_topic_adopt(
-    core: &Arc<SharedCore>,
+    handles: &CommandHandles,
     thread_key: &ThreadKey,
     keyword: &str,
     force: bool,
     message_id: &str,
 ) -> crate::error::Result<()> {
-    let sessions = core.cached_session_list().await?;
+    let sessions = handles
+        .flow
+        .sessions
+        .cached_session_list(&handles.flow.backend)
+        .await?;
     let info = match resolve_session(&sessions, keyword) {
         SessionResolution::Hit(s) => s.clone(),
         SessionResolution::Ambiguous(hits) => {
             let list = candidates_list("找到多个会话，请用完整 ID：", &hits);
-            core.feishu.reply_text(message_id, &list).await?;
+            handles.flow.platform.reply_text(message_id, &list).await?;
             return Ok(());
         }
         SessionResolution::None => {
-            core.feishu
+            handles
+                .flow
+                .platform
                 .reply_text(message_id, &format!("No session matching \"{}\"", keyword))
                 .await?;
             return Ok(());
@@ -1807,7 +1972,9 @@ async fn handle_topic_adopt(
     // server allows POSTing to them, but OpenChamber does not either and the
     // task-derived temporary context is meaningless to drive.
     if info.is_child() {
-        core.feishu
+        handles
+            .flow
+            .platform
             .reply_text(
                 message_id,
                 &format!("⚠️ 会话 `{}` 是子任务会话，不支持接管。", info.title),
@@ -1817,15 +1984,16 @@ async fn handle_topic_adopt(
     }
     // Mapped to another thread: reject unless --force (mirrors adopt_session).
     let owner = {
-        let store = core.sessions.lock().await;
+        let store = handles.flow.sessions.store.lock().await;
         store.thread_for_session(&info.id)
     };
     if let Some(owner_key) = owner
         && owner_key != *thread_key
     {
         if !force {
-            let chat_name = core
-                .feishu
+            let chat_name = handles
+                .flow
+                .platform
                 .chat_name(&owner_key.chat_id)
                 .await
                 .unwrap_or(None)
@@ -1835,7 +2003,7 @@ async fn handle_topic_adopt(
             } else {
                 "主对话"
             };
-            core.feishu
+            handles.flow.platform
                     .reply_text(
                         message_id,
                         &format!(
@@ -1852,13 +2020,13 @@ async fn handle_topic_adopt(
             return Ok(());
         }
         // --force: steal the mapping; the other thread becomes sessionless.
-        core.remove_session(&info.id).await?;
+        handles.flow.sessions.remove_session(&info.id).await?;
     }
     // Open the topic in one transaction (ADR-0016): the pre-mapping snapshot,
     // cover card (ADR-0023), in-topic seed, Session Mapping and the snapshot
     // claim all live in `bridge::topic`.
     match crate::bridge::topic::open_topic(
-        core,
+        &handles.topic_handles(),
         &thread_key.chat_id,
         message_id,
         crate::bridge::topic::TopicOpening::Adopt { info },
@@ -1876,7 +2044,9 @@ async fn handle_topic_adopt(
         }
         Err(crate::bridge::topic::OpenTopicError::NoThreadId) => {
             // No thread_id from the platform — report and point at the fallback.
-            core.feishu
+            handles
+                .flow
+                .platform
                 .reply_text(
                     message_id,
                     "⚠️ 当前会话不支持创建话题（未返回 thread_id）。请改用 `/switch <id>` 接管到当前会话。",
@@ -1898,7 +2068,7 @@ async fn handle_topic_adopt(
 /// fallback-card anchor (`reply_card_in_thread`, ADR-0006); in the lobby it
 /// is the reply replacing the old 「已接管…」 text.
 async fn adopt_session(
-    core: &Arc<SharedCore>,
+    handles: &CommandHandles,
     thread_key: &ThreadKey,
     info: &crate::opencode::types::SessionListInfo,
     message_id: &str,
@@ -1907,11 +2077,13 @@ async fn adopt_session(
 ) -> crate::error::Result<()> {
     // Idempotent: already the active session of this thread.
     {
-        let store = core.sessions.lock().await;
+        let store = handles.flow.sessions.store.lock().await;
         if let Some(e) = store.get_active(thread_key)
             && e.session_id == info.id
         {
-            core.feishu
+            handles
+                .flow
+                .platform
                 .reply_text(message_id, &format!("Already active: \"{}\".", info.title))
                 .await?;
             return Ok(());
@@ -1919,15 +2091,16 @@ async fn adopt_session(
     }
     // Mapped to another thread: reject unless --force.
     let owner = {
-        let store = core.sessions.lock().await;
+        let store = handles.flow.sessions.store.lock().await;
         store.thread_for_session(&info.id)
     };
     if let Some(owner_key) = owner
         && owner_key != *thread_key
     {
         if !force {
-            let chat_name = core
-                .feishu
+            let chat_name = handles
+                .flow
+                .platform
                 .chat_name(&owner_key.chat_id)
                 .await
                 .unwrap_or(None)
@@ -1937,7 +2110,7 @@ async fn adopt_session(
             } else {
                 "主对话"
             };
-            core.feishu
+            handles.flow.platform
                     .reply_text(
                         message_id,
                         &format!(
@@ -1954,7 +2127,7 @@ async fn adopt_session(
             return Ok(());
         }
         // --force: steal the mapping; the other thread becomes sessionless.
-        core.remove_session(&info.id).await?;
+        handles.flow.sessions.remove_session(&info.id).await?;
     }
 
     // ADR-0028: every adoption ends in exactly ONE Session Snapshot card
@@ -1962,13 +2135,19 @@ async fn adopt_session(
     // nothing. Gathered BEFORE the mapping write below, so the card reflects
     // the session's pre-adoption state; each field is best-effort, so a read
     // failure degrades that field rather than blocking the adoption.
-    let (card, data) = crate::bridge::snapshot::snapshot_card_for(core, "接管", info).await;
+    let (card, data) =
+        crate::bridge::snapshot::snapshot_card_for(&handles.snapshot_handles(), "接管", info).await;
 
     let anchor = if kind == ConversationKind::Topic {
         // The snapshot is sent inside the topic and doubles as the fallback-card
         // anchor (ADR-0023): permission/question cards reply to it and land
         // inside the topic. Its message id is persisted as `topic_anchor`.
-        match core.feishu.reply_card_in_thread(message_id, &card).await {
+        match handles
+            .flow
+            .platform
+            .reply_card_in_thread(message_id, &card)
+            .await
+        {
             Ok((anchor, _)) => Some(anchor),
             Err(e) => {
                 tracing::warn!("attach: snapshot in-thread send failed: {}", e);
@@ -1983,22 +2162,38 @@ async fn adopt_session(
     // adopted entry — the quote-injection guard and the cover record must not
     // be lost with the pending.
     let pending_topic_root = {
-        let store = core.sessions.lock().await;
+        let store = handles.flow.sessions.store.lock().await;
         store.pending_for(thread_key).and_then(|p| p.topic_root.clone())
     };
     let mut entry = SessionEntry::new(thread_key.clone(), info.id.clone(), info.directory.clone());
     entry.agent = info.agent.clone();
     entry.topic_anchor = anchor.clone();
     entry.topic_root = pending_topic_root;
-    core.activate_session(entry).await?;
-    crate::bridge::topic::claim_pending_cover(core, thread_key, &info.id).await;
+    handles.flow.sessions.activate(entry).await?;
+    crate::bridge::topic::claim_pending_cover(&handles.topic_handles(), thread_key, &info.id).await;
     // In a topic the snapshot was already sent inside it (the in-thread send
     // above); don't reply twice.
     if kind != ConversationKind::Topic {
-        let mid = core.feishu.reply_card(message_id, &card).await?;
-        crate::bridge::external::settle_snapshot_after_send(core, &mid, "接管", &info.title, &data).await;
+        let mid = handles.flow.platform.reply_card(message_id, &card).await?;
+        crate::bridge::external::settle_snapshot_after_send(
+            &handles.external,
+            &handles.flow,
+            &mid,
+            "接管",
+            &info.title,
+            &data,
+        )
+        .await;
     } else if let Some(anchor) = &anchor {
-        crate::bridge::external::settle_snapshot_after_send(core, anchor, "接管", &info.title, &data).await;
+        crate::bridge::external::settle_snapshot_after_send(
+            &handles.external,
+            &handles.flow,
+            anchor,
+            "接管",
+            &info.title,
+            &data,
+        )
+        .await;
     }
     Ok(())
 }

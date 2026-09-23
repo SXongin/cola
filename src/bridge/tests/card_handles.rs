@@ -71,7 +71,7 @@ async fn seed_old_turn_card_with_permission(app: &Arc<App>) -> std::collections:
     Turn::set_reply_target(&cards, "ses_old", "msg_1").await;
 
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
 
     Turn::seed_card(&cards, "ses_old", Some("om_new")).await;
     Turn::set_title(&cards, "ses_old", "新回合").await;
@@ -138,7 +138,7 @@ async fn click_with_open_message_id_acks_the_cached_card() {
     Turn::push_text(&cards, "ses_live", "回合的内容。").await;
     Turn::set_reply_target(&cards, "ses_live", "msg_1").await;
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     assert_eq!(
         app.card_handles.lock().await.message_of("per_live"),
         Some("om_live"),
@@ -279,7 +279,7 @@ async fn sweep_repaints_a_non_current_card_from_its_cache() {
     // Resolved by another client: the request leaves the pending list.
     backend.permission_resolved_by_another("per_old").await;
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
 
     let calls = platform.calls.lock().await.clone();
     let repaint = calls
@@ -394,7 +394,7 @@ async fn a_split_registers_the_continuation_card() {
     let filled_patches = patches_of(&platform, "om_filled").await;
     Turn::drop_card(&app.cards_handle(), "ses_split").await;
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
 
     let calls = platform.calls.lock().await.clone();
     assert!(
@@ -526,7 +526,7 @@ async fn sweep_rehosts_a_pending_block_onto_the_new_turn_card() {
         "precondition: the old card carries the block before the re-host"
     );
 
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
 
     assert_eq!(
         app.card_handles.lock().await.message_of("per_old"),
@@ -629,7 +629,7 @@ async fn rehost_preserves_a_questions_partial_answers() {
     // The poll loop has seen the request: the sweep re-hosts instead of
     // surfacing it anew.
     let mut seen: std::collections::HashSet<String> = ["que_old".to_string()].into_iter().collect();
-    app.question.sweep(&app.core, &mut seen).await;
+    app.question.sweep(&app.flow_handles(), &mut seen).await;
 
     assert_eq!(
         app.card_handles.lock().await.message_of("que_old"),
@@ -794,7 +794,7 @@ async fn a_resolution_racing_an_in_flight_flush_is_not_resurrected() {
     Turn::push_text(&cards, "ses_live", "回合的内容。").await;
     Turn::set_reply_target(&cards, "ses_live", "msg_1").await;
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
 
     // A render-poll flush takes its snapshot (the block is live) and parks in
     // the PATCH.
@@ -838,7 +838,7 @@ async fn a_resolution_racing_an_in_flight_flush_is_not_resurrected() {
     // The request left the pending list when cola replied: the next sweep must
     // NOT read that as another client's resolution and stamp the neutral line.
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     let neutral = platform.calls.lock().await.iter().any(|c| {
         matches!(
             c,

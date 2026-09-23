@@ -85,7 +85,7 @@ async fn question_poller_recovers_when_a_list_call_hangs() {
             app.question
                 .list_timeout_ms
                 .store(50, std::sync::atomic::Ordering::Relaxed);
-            let _ = app.question.poll_loop(&app.core).await;
+            let _ = app.question.poll_loop(&app.flow_handles()).await;
         }
     });
 
@@ -1083,7 +1083,7 @@ async fn inline_question_answered_on_streaming_card() {
             app.question
                 .poll_interval_ms
                 .store(50, std::sync::atomic::Ordering::Relaxed);
-            let _ = app.question.poll_loop(&app.core).await;
+            let _ = app.question.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1182,7 +1182,7 @@ async fn sweep_prunes_state_of_requests_resolved_elsewhere() {
         .await;
 
     let mut seen = std::collections::HashSet::new();
-    app.question.sweep(&app.core, &mut seen).await;
+    app.question.sweep(&app.flow_handles(), &mut seen).await;
 
     assert!(
         !app.question.has_question("que_gone").await,
@@ -1218,7 +1218,7 @@ async fn sweep_keeps_state_when_the_directory_list_fails() {
         .await;
 
     let mut seen = std::collections::HashSet::new();
-    app.question.sweep(&app.core, &mut seen).await;
+    app.question.sweep(&app.flow_handles(), &mut seen).await;
 
     assert!(
         app.question.has_question("que_1").await,
@@ -1313,7 +1313,7 @@ async fn sweep_keeps_partial_multi_select_toggles() {
     );
 
     let mut seen = std::collections::HashSet::new();
-    app.question.sweep(&app.core, &mut seen).await;
+    app.question.sweep(&app.flow_handles(), &mut seen).await;
 
     // The live selection survived: confirming locks it and submits with it.
     app.host_action(value("confirm", ""))
@@ -1345,13 +1345,13 @@ async fn vanished_directory_is_no_longer_treated_as_known() {
 
     // First sweep: the request is pending → state kept, /work known.
     let mut seen = std::collections::HashSet::new();
-    app.question.sweep(&app.core, &mut seen).await;
+    app.question.sweep(&app.flow_handles(), &mut seen).await;
     assert!(app.question.has_question("que_1").await);
 
     // The session mapping is forgotten: /work is no longer polled, so the
     // sweep has no evidence the request resolved — it only drops the state.
     app.core.sessions.lock().await.remove_persist("ses_1").unwrap();
-    app.question.sweep(&app.core, &mut seen).await;
+    app.question.sweep(&app.flow_handles(), &mut seen).await;
     assert!(
         !app.question.has_question("que_1").await,
         "state of an unpolled directory is dropped"
@@ -1396,7 +1396,7 @@ async fn late_inline_click_is_cardless_and_classified() {
         .remember_question(&question_request("que_1"), "/work")
         .await;
     let mut seen = std::collections::HashSet::new();
-    app.question.sweep(&app.core, &mut seen).await;
+    app.question.sweep(&app.flow_handles(), &mut seen).await;
 
     let value = |id: &str, directory: &str| {
         serde_json::json!({
@@ -1447,7 +1447,7 @@ async fn late_click_on_pruned_request_is_neutral_and_stateless() {
 
     // A successful sweep with nothing pending prunes the state.
     let mut seen = std::collections::HashSet::new();
-    app.question.sweep(&app.core, &mut seen).await;
+    app.question.sweep(&app.flow_handles(), &mut seen).await;
     assert!(!app.question.has_question("que_1").await);
 
     let result = app
@@ -1672,7 +1672,7 @@ async fn inline_question_submit_and_reject_leave_receipts() {
             app.question
                 .poll_interval_ms
                 .store(50, std::sync::atomic::Ordering::Relaxed);
-            let _ = app.question.poll_loop(&app.core).await;
+            let _ = app.question.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1820,7 +1820,7 @@ async fn inline_question_click_after_remote_resolution_gets_receipt() {
             app.question
                 .poll_interval_ms
                 .store(50, std::sync::atomic::Ordering::Relaxed);
-            let _ = app.question.poll_loop(&app.core).await;
+            let _ = app.question.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;

@@ -80,7 +80,9 @@ pub struct SharedCore {
     /// External-message flow: owns `last_user_msg_epoch`, notifies Feishu when
     /// another shared-store client posts while cola is idle, and arms the
     /// external-reply renderers (including the busy-adopt follow, ADR-0028).
-    pub external: crate::bridge::external::ExternalFlow,
+    /// Shared (`Arc`) because the topic/command bundles carry it to settle a
+    /// sent snapshot through `ExternalFlow::settle_snapshot_after_send`.
+    pub external: Arc<crate::bridge::external::ExternalFlow>,
     /// ADR-0028 snapshot claim registry: which snapshot card hosts which
     /// adopt-time pending block, what each snapshot was built from, and the
     /// tombstones for late second clicks. One Mutex keeps claim/host/tombstone
@@ -194,7 +196,7 @@ impl SharedCore {
             question: Arc::new(crate::bridge::request::RequestFlow::new(Box::new(
                 crate::bridge::request::QuestionKind,
             ))),
-            external: crate::bridge::external::ExternalFlow::new(),
+            external: Arc::new(crate::bridge::external::ExternalFlow::new()),
             snapshot_claims: Arc::new(Mutex::new(
                 crate::bridge::snapshot_claims::SnapshotClaims::default(),
             )),
@@ -250,6 +252,54 @@ impl SharedCore {
         }
     }
 
+    /// The common flow bundle (spec #298, B): the four per-concern handles plus
+    /// the backend and the platform. The request and external flows run on it.
+    pub(crate) fn flow_handles(&self) -> crate::bridge::handles::FlowHandles {
+        crate::bridge::handles::FlowHandles {
+            sessions: self.sessions_handle(),
+            cards: self.cards_handle(),
+            requests: self.requests_handle(),
+            waits: self.waits_handle(),
+            backend: Arc::clone(&self.opencode),
+            platform: Arc::clone(&self.feishu),
+        }
+    }
+
+    /// The poller bundle: the flow handles plus the server-ownership state the
+    /// reconcile loop mutates.
+    pub(crate) fn poll_handles(&self) -> crate::bridge::handles::PollHandles {
+        crate::bridge::handles::PollHandles {
+            flow: self.flow_handles(),
+            server: crate::bridge::handles::ServerHandle {
+                start_policy: self.server_start,
+                preferred_port: self.preferred_port,
+                lock: Arc::clone(&self.server_lock),
+            },
+        }
+    }
+
+    /// The read-side bundle a Session Snapshot gather needs.
+    pub(crate) fn snapshot_handles(&self) -> crate::bridge::handles::SnapshotHandles {
+        crate::bridge::handles::SnapshotHandles::from_flow(&self.flow_handles())
+    }
+
+    /// The topic-opening bundle.
+    pub(crate) fn topic_handles(&self) -> crate::bridge::handles::TopicHandles {
+        crate::bridge::handles::TopicHandles {
+            flow: self.flow_handles(),
+            external: Arc::clone(&self.external),
+        }
+    }
+
+    /// The command bundle.
+    pub(crate) fn command_handles(&self) -> crate::bridge::handles::CommandHandles {
+        crate::bridge::handles::CommandHandles {
+            flow: self.flow_handles(),
+            config: self.turn_config(),
+            external: Arc::clone(&self.external),
+        }
+    }
+
     /// The session map + list cache as a narrow handle.
     pub(crate) fn sessions_handle(&self) -> crate::bridge::handles::SessionsHandle {
         crate::bridge::handles::SessionsHandle::new(
@@ -287,6 +337,7 @@ impl SharedCore {
             inflight: Arc::clone(&self.inflight),
             stopped_sessions: Arc::clone(&self.stopped_sessions),
             reminder: Arc::clone(&self.reminder),
+            message_pins: Arc::clone(&self.message_pins),
         }
     }
 
@@ -302,40 +353,10 @@ impl SharedCore {
         )
     }
 
-    /// The requests cola itself is answering or has answered — `answered_requests`
-    /// plus the live `settling_requests` claims. The sweep's vanished passes
-    /// take one snapshot of this per pass: a request that disappeared from the
-    /// pending list because cola handled it must never be read as another
-    /// client's resolution. A settlement claim older than
-    /// [`SETTLING_CLAIM_TTL`] is dropped here: its task died before rendering
-    /// the receipt, and suppressing the request forever would strand its card.
-    pub(crate) async fn claimed_requests(&self) -> HashSet<String> {
-        let mut claimed = self.answered_requests.lock().await.clone();
-        let mut settling = self.settling_requests.lock().await;
-        let now = std::time::Instant::now();
-        settling.retain(|_, at| now.duration_since(*at) < SETTLING_CLAIM_TTL);
-        claimed.extend(settling.keys().cloned());
-        claimed
-    }
-
     /// The directory a brand-new session starts in (see
     /// [`crate::bridge::handles::TurnConfig::default_session_directory`]).
     pub fn default_session_directory(&self) -> String {
         self.turn_config().default_session_directory()
-    }
-
-    /// The conversation's current project (ADR-0012): the Pending Session's
-    /// directory when one is declared, else the active session's, falling back
-    /// to the default directory only when the conversation has neither.
-    /// Single definition of "current project", shared by `/new`, the bare
-    /// `/topic` form, and the `/switch` card's "new session" action.
-    pub async fn current_project_directory(&self, thread_key: &ThreadKey) -> String {
-        self.sessions
-            .lock()
-            .await
-            .current_directory(thread_key)
-            .filter(|d| !d.is_empty())
-            .unwrap_or_else(|| self.default_session_directory())
     }
 
     /// The per-session agent override set by `/agent` (from the persisted
@@ -368,29 +389,9 @@ impl SharedCore {
     /// `(provider, model)`. A Pending Session has no server-recorded rung
     /// (nothing exists on the server yet, ADR-0041).
     pub async fn effective_model(&self, settings: &SessionSettings) -> Option<(String, String)> {
-        // 1. The `/model` override in the snapshot.
-        if let Some(m) = settings.model.as_deref().and_then(opencode::parsing::parse_model) {
-            return Some((m.provider_id, m.id));
-        }
-        // 2. The configured default (`[opencode] model`).
-        if let Some(m) = self.opencode.configured_default_model() {
-            return Some((m.provider_id, m.id));
-        }
-        // 3. What the server actually recorded for the session. Bounded: a
-        //    hung server degrades the ladder (no current-model line / a
-        //    `/think` "pick a model" prompt), never the card send.
-        let session_id = settings.session_id.as_deref()?;
-        if !settings.directory.is_empty()
-            && let Ok(Ok(info)) = tokio::time::timeout(
-                SESSION_INFO_TIMEOUT,
-                self.opencode.session_info(session_id, Some(&settings.directory)),
-            )
+        self.sessions_handle()
+            .effective_model(&self.opencode, settings)
             .await
-            && let Some(m) = info.model
-        {
-            return Some((m.provider_id, m.id));
-        }
-        None
     }
 
     /// The declared variants of a provider/model, per `GET /provider`.
@@ -398,13 +399,9 @@ impl SharedCore {
     /// catalog (callers then leave a stored variant in place rather than
     /// destroying it on an unknown).
     pub async fn model_variants(&self, provider: &str, model: &str) -> Option<Vec<String>> {
-        self.opencode
-            .list_models()
+        self.sessions_handle()
+            .model_variants(&self.opencode, provider, model)
             .await
-            .into_iter()
-            .find(|p| p.provider == provider)
-            .and_then(|p| p.models.into_iter().find(|m| m.id == model))
-            .map(|m| m.variants)
     }
 
     /// Auto-clear a `/think` variant when switching to a model that doesn't
@@ -420,25 +417,14 @@ impl SharedCore {
         variant: &mut Option<String>,
         model_spec: &str,
     ) -> Option<String> {
-        if let Some(v) = variant.clone()
-            && let Some(m) = crate::opencode::parsing::parse_model(model_spec)
-            && let Some(variants) = self.model_variants(&m.provider_id, &m.id).await
-            && !variants.iter().any(|x| x == &v)
-        {
-            *variant = None;
-            Some(v)
-        } else {
-            None
-        }
+        self.sessions_handle()
+            .clear_variant_for_model(&self.opencode, variant, model_spec)
+            .await
     }
 
     /// The session mapped to a thread (if any).
     pub async fn get_session_id(&self, thread_key: &ThreadKey) -> Option<String> {
-        self.sessions
-            .lock()
-            .await
-            .get_active(thread_key)
-            .map(|e| e.session_id.clone())
+        self.sessions_handle().get_session_id(thread_key).await
     }
 
     /// The current `GET /session` snapshot, fetching (and caching for 30 s) when
@@ -447,27 +433,13 @@ impl SharedCore {
     pub(crate) async fn cached_session_list(
         &self,
     ) -> crate::error::Result<Vec<opencode::types::SessionListInfo>> {
-        let now = std::time::Instant::now();
-        {
-            let cache = self.session_list_cache.lock().await;
-            if let Some(c) = cache.as_ref()
-                && c.fresh()
-            {
-                return Ok(c.sessions.clone());
-            }
-        }
-        let sessions = self.opencode.list_sessions().await?;
-        *self.session_list_cache.lock().await = Some(SessionListCache {
-            fetched_at: now,
-            sessions: sessions.clone(),
-        });
-        Ok(sessions)
+        self.sessions_handle().cached_session_list(&self.opencode).await
     }
 
     /// Drop the `/list` cache. Called whenever cola creates, adopts, forgets or
     /// renames a session, so the next `/list`/`/switch`/`/attach` is fresh.
     pub(crate) async fn invalidate_session_list_cache(&self) {
-        *self.session_list_cache.lock().await = None;
+        self.sessions_handle().invalidate_cache().await;
     }
 
     /// Persist `entry` as its thread's active session and drop the session-list
@@ -476,16 +448,6 @@ impl SharedCore {
     /// in-memory mapping already changed.
     pub(crate) async fn activate_session(&self, entry: SessionEntry) -> crate::error::Result<()> {
         self.sessions_handle().activate(entry).await
-    }
-
-    /// Declare (or replace) the conversation's Pending Session and persist
-    /// (ADR-0041). The session-list cache is untouched: a pending is not a
-    /// server session, so `/list`/`/switch` have nothing new to show.
-    pub(crate) async fn set_pending_session(
-        &self,
-        pending: crate::bridge::session::PendingEntry,
-    ) -> crate::error::Result<()> {
-        self.sessions.lock().await.set_pending(pending)
     }
 
     /// Declare (or replace) a Pending Session rooted at an explicit
@@ -502,17 +464,9 @@ impl SharedCore {
         directory: impl Into<String>,
         title: Option<String>,
     ) -> crate::error::Result<PendingEntry> {
-        let mut pending = PendingEntry::new(thread_key.clone(), directory);
-        pending.title = title;
-        {
-            let store = self.sessions.lock().await;
-            if let Some(replaced) = store.pending_for(thread_key) {
-                pending.topic_anchor = replaced.topic_anchor.clone();
-                pending.topic_root = replaced.topic_root.clone();
-            }
-        }
-        self.set_pending_session(pending.clone()).await?;
-        Ok(pending)
+        self.sessions_handle()
+            .declare_pending(thread_key, directory, title)
+            .await
     }
 
     /// Declare (or replace) the conversation's Pending Session in its current
@@ -523,18 +477,9 @@ impl SharedCore {
         thread_key: &ThreadKey,
         title: Option<String>,
     ) -> crate::error::Result<PendingEntry> {
-        let directory = self.current_project_directory(thread_key).await;
-        self.declare_pending(thread_key, directory, title).await
-    }
-
-    /// Mutate the conversation's Pending Session and persist (ADR-0041:
-    /// `/name` and the settings commands configure a pending). `false` when
-    /// the thread has none.
-    pub(crate) async fn update_pending<F>(&self, thread_key: &ThreadKey, f: F) -> crate::error::Result<bool>
-    where
-        F: FnOnce(&mut PendingEntry),
-    {
-        self.sessions.lock().await.update_pending(thread_key, f)
+        self.command_handles()
+            .declare_pending_in_current_project(thread_key, title)
+            .await
     }
 
     /// The settings the conversation's next prompt will use (ADR-0041): the
@@ -543,7 +488,7 @@ impl SharedCore {
     /// (`/agent` `/model` `/think` `/autoaccept`), their cards and the
     /// effective-model ladder all read through this one accessor.
     pub(crate) async fn session_settings(&self, thread_key: &ThreadKey) -> Option<SessionSettings> {
-        self.sessions.lock().await.settings(thread_key)
+        self.sessions_handle().session_settings(thread_key).await
     }
 
     /// Write a [`SessionSettings`] snapshot back to its target (a real session
@@ -554,80 +499,9 @@ impl SharedCore {
         thread_key: &ThreadKey,
         settings: SessionSettings,
     ) -> crate::error::Result<bool> {
-        self.sessions.lock().await.set_settings(thread_key, settings)
-    }
-
-    /// Mutate the mapped session in place and persist, returning the updated
-    /// entry (`None` when `session_id` is not mapped). The session-list cache
-    /// is untouched: per-session overrides are not server-list state.
-    pub(crate) async fn update_session<F>(
-        &self,
-        session_id: &str,
-        f: F,
-    ) -> crate::error::Result<Option<SessionEntry>>
-    where
-        F: FnOnce(&mut SessionEntry),
-    {
-        self.sessions.lock().await.update(session_id, f)
-    }
-
-    /// Remove a mapping and persist, dropping the session-list cache (the
-    /// `/list`/`/switch` view may no longer mention it).
-    pub(crate) async fn remove_session(
-        &self,
-        session_id: &str,
-    ) -> crate::error::Result<Option<SessionEntry>> {
-        self.sessions_handle().remove_session(session_id).await
-    }
-
-    /// Remove every mapping of a thread and persist, dropping the
-    /// session-list cache (`/switch forget`).
-    pub(crate) async fn remove_thread_sessions(
-        &self,
-        key: &ThreadKey,
-    ) -> crate::error::Result<Vec<SessionEntry>> {
-        let result = self.sessions.lock().await.remove_thread_persist(key);
-        self.invalidate_session_list_cache().await;
-        result
-    }
-
-    /// Turn a session's Auto-Accept flag on/off, resolving the owning session
-    /// (which may be a parent of a sub-task child) and approving any
-    /// already-pending permissions when turning on. Mirrors `/autoaccept` and is
-    /// shared by the permission-card toggle so both paths stay in lockstep.
-    /// Returns the ids of the pending requests that were approved (empty when
-    /// `on` is false), so the caller can drop their inline card sections.
-    pub(crate) async fn set_auto_accept(&self, session_id: &str, directory: &str, on: bool) -> Vec<String> {
-        let approved = if on {
-            self.approve_pending_for_session(session_id, directory).await
-        } else {
-            Vec::new()
-        };
-        // Resolve the SessionStore entry that owns the flag: `session_id`
-        // itself, or its nearest ancestor (sub-task children are not in the
-        // store, ADR-0010). Walking the chain makes a child's card flip the
-        // parent's flag, consistent with `should_auto_accept`.
-        let owner = crate::bridge::pollers::walk_parent_chain(
-            &self.opencode,
-            session_id,
-            Some(directory),
-            |current| {
-                let current = current.to_string();
-                async move {
-                    let sessions = self.sessions.lock().await;
-                    sessions.entry_for_session(&current).cloned()
-                }
-            },
-        )
-        .await;
-        if let Some(entry) = owner
-            && let Err(e) = self
-                .update_session(&entry.session_id, |e| e.auto_accept = on)
-                .await
-        {
-            tracing::warn!("set_auto_accept: persist failed: {}", e);
-        }
-        approved
+        self.sessions_handle()
+            .set_session_settings(thread_key, settings)
+            .await
     }
 
     /// After `/autoaccept on`: answer every permission request that is ALREADY
@@ -636,68 +510,14 @@ impl SharedCore {
     /// surfaced, so enabling autoaccept would otherwise leave old cards hanging
     /// forever. Returns the ids of the requests that were approved.
     pub(crate) async fn approve_pending_for_session(&self, session_id: &str, directory: &str) -> Vec<String> {
-        let Ok(perms) = self
-            .opencode
-            .clone()
-            .for_directory(directory)
-            .list_permissions()
-            .await
-        else {
-            return Vec::new();
-        };
-        let mut approved = Vec::new();
-        for p in &perms {
-            // Match the session itself or a sub-task child (its parent chain).
-            let sid = p.session_id.clone().unwrap_or_default();
-            if !crate::bridge::request::session_belongs_to(
-                &self.sessions_handle(),
-                &self.opencode,
-                &sid,
-                session_id,
-                directory,
-            )
-            .await
-            {
-                continue;
-            }
-            // Take the settlement claim BEFORE the reply lands: the request
-            // leaves the server's pending list the moment it is applied, and a
-            // sweep landing in that window would otherwise read the
-            // disappearance as another client's resolution and stamp
-            // `⏱ 已由其他客户端处理` on the card — the lie the Host saw when
-            // enabling auto-accept. `resolve_blocks` clears the claim once the
-            // true receipt rendered; a failed reply releases it right here.
-            let claimed_here = self
-                .settling_requests
-                .lock()
-                .await
-                .insert(p.request_id.clone(), std::time::Instant::now())
-                .is_none();
-            match self
-                .opencode
-                .clone()
-                .for_directory(directory)
-                .reply_permission(&p.request_id, "once")
-                .await
-            {
-                Ok(()) => {
-                    tracing::info!(
-                        "Auto-accepted pending permission {} on session {} ({})",
-                        p.request_id,
-                        sid,
-                        p.permission.as_deref().unwrap_or("?")
-                    );
-                    approved.push(p.request_id.clone());
-                }
-                Err(e) => {
-                    if claimed_here {
-                        self.settling_requests.lock().await.remove(&p.request_id);
-                    }
-                    tracing::warn!("auto-accept pending {} on session {}: {}", p.request_id, sid, e);
-                }
-            }
-        }
-        approved
+        crate::bridge::request::approve_pending_for_session(
+            &self.sessions_handle(),
+            &self.requests_handle(),
+            &self.opencode,
+            session_id,
+            directory,
+        )
+        .await
     }
 }
 
@@ -735,7 +555,8 @@ mod tests {
         assert_eq!(sessions_fetches.load(Ordering::SeqCst), 2, "activate invalidates");
 
         let updated = app
-            .update_session("ses_x", |e| e.agent = Some("build".into()))
+            .sessions_handle()
+            .update("ses_x", |e| e.agent = Some("build".into()))
             .await
             .unwrap()
             .expect("mapped session");
@@ -747,7 +568,13 @@ mod tests {
             "update keeps the cache"
         );
 
-        assert!(app.remove_session("ses_x").await.unwrap().is_some());
+        assert!(
+            app.sessions_handle()
+                .remove_session("ses_x")
+                .await
+                .unwrap()
+                .is_some()
+        );
         app.cached_session_list().await.unwrap();
         assert_eq!(sessions_fetches.load(Ordering::SeqCst), 3, "remove invalidates");
     }
@@ -766,7 +593,7 @@ mod tests {
             .checked_sub(SETTLING_CLAIM_TTL + std::time::Duration::from_secs(1))
             .unwrap();
         app.settling_requests.lock().await.insert("per_old".into(), stale);
-        let claimed = app.claimed_requests().await;
+        let claimed = app.requests_handle().claimed_requests().await;
 
         assert!(!claimed.contains("per_old"));
         assert!(
@@ -779,7 +606,7 @@ mod tests {
             .lock()
             .await
             .insert("per_new".into(), std::time::Instant::now());
-        assert!(app.claimed_requests().await.contains("per_new"));
+        assert!(app.requests_handle().claimed_requests().await.contains("per_new"));
     }
 
     /// The override write path must not silently switch the Active Session:
@@ -803,7 +630,15 @@ mod tests {
             .unwrap();
         assert_eq!(app.get_session_id(&key).await.as_deref(), Some("ses_a"));
 
-        app.set_auto_accept("ses_b", "/work/b", true).await;
+        crate::bridge::request::set_auto_accept(
+            &app.sessions_handle(),
+            &app.requests_handle(),
+            &app.opencode,
+            "ses_b",
+            "/work/b",
+            true,
+        )
+        .await;
 
         assert_eq!(
             app.get_session_id(&key).await.as_deref(),

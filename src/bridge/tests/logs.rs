@@ -342,7 +342,7 @@ async fn a_surfaced_permission_carries_its_session_chat_and_topic() {
     seed_entry(&app, SessionEntry::new(topic, "ses_test", "/work/project")).await;
 
     let mut seen = std::collections::HashSet::new();
-    let (_, logs) = capture_logs(async { app.permission.sweep(&app.core, &mut seen).await }).await;
+    let (_, logs) = capture_logs(async { app.permission.sweep(&app.flow_handles(), &mut seen).await }).await;
 
     let surfaced = line_with(&logs, "权限");
     assert!(
@@ -445,7 +445,7 @@ async fn an_external_message_observation_carries_its_session_chat_and_topic() {
     let (_, logs) = capture_logs(async {
         let poller = Arc::clone(&app);
         tokio::spawn(async move {
-            let _ = poller.external.poll_loop(&poller.core).await;
+            let _ = poller.external.poll_loop(&poller.flow_handles()).await;
         });
         tokio::time::sleep(Duration::from_millis(200)).await;
     })
@@ -497,7 +497,7 @@ async fn an_external_reply_render_carries_its_session() {
     let (_, logs) = capture_logs(async {
         let poller = Arc::clone(&app);
         tokio::spawn(async move {
-            let _ = poller.external.poll_loop(&poller.core).await;
+            let _ = poller.external.poll_loop(&poller.flow_handles()).await;
         });
         // The notification arms the renderer; only then does the reply exist.
         wait_for_card(&platform, "有新消息").await;
@@ -539,7 +539,15 @@ async fn a_snapshot_settle_carries_the_session() {
         newest_user_is_cola_authored: false,
     };
     let (_, logs) = capture_logs(async {
-        crate::bridge::external::settle_snapshot_after_send(&app.core, "om_snap", "接管", "标题", &data).await
+        crate::bridge::external::settle_snapshot_after_send(
+            &app.external,
+            &app.flow_handles(),
+            "om_snap",
+            "接管",
+            "标题",
+            &data,
+        )
+        .await
     })
     .await;
 

@@ -2160,7 +2160,7 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
     // The list call hangs: /work said nothing this sweep.
     hang.store(1, std::sync::atomic::Ordering::SeqCst);
     let mut seen = std::collections::HashSet::new();
-    flow.sweep(&app.core, &mut seen).await;
+    flow.sweep(&app.flow_handles(), &mut seen).await;
 
     assert!(
         flow.sent_cards.lock().await.contains_key(surfaces.card_id),
@@ -2187,7 +2187,7 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
 
     // The next sweep lists /work successfully with the requests gone: every
     // cleanup fires.
-    flow.sweep(&app.core, &mut seen).await;
+    flow.sweep(&app.flow_handles(), &mut seen).await;
 
     assert!(
         !flow.sent_cards.lock().await.contains_key(surfaces.card_id),
@@ -2228,14 +2228,14 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
 /// the #144 rig's surface probe. A resolved block left its receipt tombstone in
 /// the section, which is not live (ADR-0038).
 async fn inline_surface_live(app: &Arc<App>, id: &str) -> bool {
-    Turn::has_live_interaction(&app.core.cards_handle(), id).await
+    Turn::has_live_interaction(&app.cards_handle(), id).await
 }
 
 /// #175: whether any card carries an Interaction Receipt left by a sweep over a
 /// vanished inline block — the #144 rig proves it lands once a SUCCESSFUL list
 /// resolves the block.
 async fn inline_handled_elsewhere_receipt_present(app: &Arc<App>) -> bool {
-    Turn::has_receipt_prefix(&app.core.cards_handle(), "⏱ 已由其他客户端处理").await
+    Turn::has_receipt_prefix(&app.cards_handle(), "⏱ 已由其他客户端处理").await
 }
 
 // ===== Session discovery & adoption (ADR-0008) =====

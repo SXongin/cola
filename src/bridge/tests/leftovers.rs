@@ -84,7 +84,7 @@ async fn aborted_turn_rejects_its_pending_permission() {
     // The poller inlines the permission on the live card, exactly as it does
     // while the server blocks the prompt.
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     assert!(
         !Turn::live_permissions(&app.cards_handle(), "ses_test")
             .await
@@ -143,7 +143,7 @@ async fn aborted_turn_rejects_its_pending_permission() {
     ))
     .await;
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     assert!(
         Turn::live_permissions(&app.cards_handle(), "ses_test")
             .await
@@ -208,7 +208,7 @@ async fn aborted_turn_rejects_its_pending_question() {
     let turn = gated_abort(&app);
     wait_for_turn_card(&app, "ses_test").await;
     let mut seen = std::collections::HashSet::new();
-    app.question.sweep(&app.core, &mut seen).await;
+    app.question.sweep(&app.flow_handles(), &mut seen).await;
 
     gate.add_permits(1);
     turn.await.unwrap();

@@ -3,9 +3,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
-use crate::bridge::core::SharedCore;
 use crate::bridge::handler::CardActionResult;
-use crate::bridge::handles::{CardsHandle, RequestsHandle, SessionsHandle};
+use crate::bridge::handles::{CardsHandle, FlowHandles, RequestsHandle, SessionsHandle};
 use crate::bridge::pollers::{
     CardTarget, inline_host_session, mark_stale_cards, resolve_card_target, result_card,
 };
@@ -71,7 +70,7 @@ pub trait RequestKind: Send + Sync {
     async fn prepare(
         &self,
         flow: &RequestFlow,
-        core: &Arc<SharedCore>,
+        handles: &FlowHandles,
         req: &PendingRequest,
         dir: &str,
     ) -> bool;
@@ -126,7 +125,7 @@ pub trait RequestKind: Send + Sync {
     async fn handle_action(
         &self,
         flow: &RequestFlow,
-        core: &Arc<SharedCore>,
+        handles: &FlowHandles,
         session_id: &str,
         req_id: &str,
         reply: &str,
@@ -161,7 +160,7 @@ impl RequestKind for PermissionKind {
     async fn prepare(
         &self,
         _flow: &RequestFlow,
-        core: &Arc<SharedCore>,
+        handles: &FlowHandles,
         req: &PendingRequest,
         dir: &str,
     ) -> bool {
@@ -172,12 +171,12 @@ impl RequestKind for PermissionKind {
         // `/autoaccept` sessions: answer the request automatically instead of
         // showing a card (mirrors OpenChamber's toggle). Resolves sub-task child
         // sessions up their parent chain so they inherit the parent's flag.
-        let auto = should_auto_accept(core, &sid, dir).await;
+        let auto = should_auto_accept(&handles.sessions, &handles.backend, &sid, dir).await;
         if !auto {
             return false;
         }
-        match core
-            .opencode
+        match handles
+            .backend
             .clone()
             .for_directory(dir)
             .reply_permission(&p.request_id, "once")
@@ -245,7 +244,7 @@ impl RequestKind for PermissionKind {
     async fn handle_action(
         &self,
         flow: &RequestFlow,
-        core: &Arc<SharedCore>,
+        handles: &FlowHandles,
         session_id: &str,
         req_id: &str,
         reply: &str,
@@ -270,16 +269,25 @@ impl RequestKind for PermissionKind {
         if reply == "autoaccept" {
             let dir = match directory {
                 Some(d) => d.to_string(),
-                None => core
+                None => handles
                     .sessions
+                    .store
                     .lock()
                     .await
                     .directory_for_session(session_id)
                     .unwrap_or_default(),
             };
             let mut cached = None;
-            if flow.try_mark_answered(&core.requests_handle(), req_id).await {
-                let mut approved = core.set_auto_accept(session_id, &dir, true).await;
+            if flow.try_mark_answered(&handles.requests, req_id).await {
+                let mut approved = set_auto_accept(
+                    &handles.sessions,
+                    &handles.requests,
+                    &handles.backend,
+                    session_id,
+                    &dir,
+                    true,
+                )
+                .await;
                 // The clicked request is always resolved by the toggle, even
                 // if the backend list raced past it.
                 if !approved.iter().any(|id| id == req_id) {
@@ -292,8 +300,8 @@ impl RequestKind for PermissionKind {
                 // the requests vanished (ADR-0038, rule 4).
                 cached = resolve_blocks(
                     flow,
-                    &core.cards_handle(),
-                    &core.requests_handle(),
+                    &handles.cards,
+                    &handles.requests,
                     host,
                     session_id,
                     Origin::Click { clicked },
@@ -309,7 +317,7 @@ impl RequestKind for PermissionKind {
             }
             let mut r = result_card("✅ 已开启自动授权", "blue", "该会话后续权限请求将自动批准。");
             r.toast = Some("已开启自动授权".to_string());
-            settle_ack(core, host, session_id, inline, cached, &mut r).await;
+            settle_ack(&handles.cards, host, session_id, inline, cached, &mut r).await;
             // Re-served verbatim to a losing double-click.
             flow.remember_answered_result(req_id, &r).await;
             return Some(r);
@@ -318,7 +326,7 @@ impl RequestKind for PermissionKind {
         // Double-click guard: the atomic claim decides who replies. A click
         // that loses the race re-serves the winning click's result; only the
         // winner may reach the backend.
-        if !flow.try_mark_answered(&core.requests_handle(), req_id).await {
+        if !flow.try_mark_answered(&handles.requests, req_id).await {
             return flow.answered_result(req_id).await;
         }
         // Route the reply to the instance owning the session. The card
@@ -327,7 +335,8 @@ impl RequestKind for PermissionKind {
         // the server cwd instance.
         let reply_result = match directory {
             Some(dir) => {
-                core.opencode
+                handles
+                    .backend
                     .clone()
                     .for_directory(dir)
                     .reply_permission(req_id, reply)
@@ -349,8 +358,8 @@ impl RequestKind for PermissionKind {
                 // on which card is current.
                 resolve_blocks(
                     flow,
-                    &core.cards_handle(),
-                    &core.requests_handle(),
+                    &handles.cards,
+                    &handles.requests,
                     host,
                     session_id,
                     Origin::Click { clicked },
@@ -367,8 +376,8 @@ impl RequestKind for PermissionKind {
                 tracing::info!("Permission already resolved: {}", e);
                 let cached = resolve_blocks(
                     flow,
-                    &core.cards_handle(),
-                    &core.requests_handle(),
+                    &handles.cards,
+                    &handles.requests,
                     host,
                     session_id,
                     Origin::Click { clicked },
@@ -377,7 +386,7 @@ impl RequestKind for PermissionKind {
                 )
                 .await;
                 let mut r = already_handled_result(self.label(), inline, "该权限已处理");
-                settle_ack(core, host, session_id, inline, cached, &mut r).await;
+                settle_ack(&handles.cards, host, session_id, inline, cached, &mut r).await;
                 flow.remember_answered_result(req_id, &r).await;
                 return Some(r);
             }
@@ -385,7 +394,7 @@ impl RequestKind for PermissionKind {
             // retry can reply again.
             Err(e) => {
                 tracing::error!("perm reply failed: {}", e);
-                flow.unmark_answered(core, req_id).await;
+                flow.unmark_answered(&handles.requests, req_id).await;
                 return Some(failed_result_card(
                     inline,
                     "该权限请求处理失败，请重试。",
@@ -407,7 +416,7 @@ impl RequestKind for PermissionKind {
         };
         let mut r = result_card(label, perm_color, &body);
         r.toast = Some(toast);
-        settle_ack(core, host, session_id, inline, cached, &mut r).await;
+        settle_ack(&handles.cards, host, session_id, inline, cached, &mut r).await;
         flow.remember_answered_result(req_id, &r).await;
         Some(r)
     }
@@ -420,16 +429,122 @@ impl RequestKind for PermissionKind {
 /// direct lookup misses it and it would surface a card even though its parent
 /// session has autoaccept on. Walking the parent chain makes the child inherit
 /// the parent's flag, consistent with `approve_pending_for_session`.
-async fn should_auto_accept(core: &Arc<SharedCore>, session_id: &str, directory: &str) -> bool {
-    crate::bridge::pollers::walk_parent_chain(&core.opencode, session_id, Some(directory), |current| {
+async fn should_auto_accept(
+    sessions: &SessionsHandle,
+    backend: &Arc<dyn opencode::Backend>,
+    session_id: &str,
+    directory: &str,
+) -> bool {
+    crate::bridge::pollers::walk_parent_chain(backend, session_id, Some(directory), |current| {
         let current = current.to_string();
         async move {
-            let sessions = core.sessions.lock().await;
-            sessions.entry_for_session(&current).map(|e| e.auto_accept)
+            sessions
+                .store
+                .lock()
+                .await
+                .entry_for_session(&current)
+                .map(|e| e.auto_accept)
         }
     })
     .await
     .unwrap_or(false)
+}
+
+/// Turn a session's Auto-Accept flag on/off, resolving the owning session
+/// (which may be a parent of a sub-task child) and approving any already-pending
+/// permissions when turning on. Mirrors `/autoaccept` and is shared by the
+/// permission-card toggle and the coordinator's wrapper so both paths stay in
+/// lockstep. Returns the ids of the pending requests that were approved (empty
+/// when `on` is false), so the caller can drop their inline card sections.
+pub(crate) async fn set_auto_accept(
+    sessions: &SessionsHandle,
+    requests: &RequestsHandle,
+    backend: &Arc<dyn opencode::Backend>,
+    session_id: &str,
+    directory: &str,
+    on: bool,
+) -> Vec<String> {
+    let approved = if on {
+        approve_pending_for_session(sessions, requests, backend, session_id, directory).await
+    } else {
+        Vec::new()
+    };
+    // Resolve the SessionStore entry that owns the flag: `session_id`
+    // itself, or its nearest ancestor (sub-task children are not in the
+    // store, ADR-0010). Walking the chain makes a child's card flip the
+    // parent's flag, consistent with `should_auto_accept`.
+    let owner = crate::bridge::pollers::walk_parent_chain(backend, session_id, Some(directory), |current| {
+        let current = current.to_string();
+        async move { sessions.entry_for_session(&current).await }
+    })
+    .await;
+    if let Some(entry) = owner
+        && let Err(e) = sessions.update(&entry.session_id, |e| e.auto_accept = on).await
+    {
+        tracing::warn!("set_auto_accept: persist failed: {}", e);
+    }
+    approved
+}
+
+/// After `/autoaccept on`: answer every permission request that is ALREADY
+/// pending for `session_id` (or one of its sub-task child sessions) with
+/// "once". The permission poller's `seen` set skips requests it has already
+/// surfaced, so enabling autoaccept would otherwise leave old cards hanging
+/// forever. Returns the ids of the requests that were approved.
+pub(crate) async fn approve_pending_for_session(
+    sessions: &SessionsHandle,
+    requests: &RequestsHandle,
+    backend: &Arc<dyn opencode::Backend>,
+    session_id: &str,
+    directory: &str,
+) -> Vec<String> {
+    let Ok(perms) = backend.clone().for_directory(directory).list_permissions().await else {
+        return Vec::new();
+    };
+    let mut approved = Vec::new();
+    for p in &perms {
+        // Match the session itself or a sub-task child (its parent chain).
+        let sid = p.session_id.clone().unwrap_or_default();
+        if !session_belongs_to(sessions, backend, &sid, session_id, directory).await {
+            continue;
+        }
+        // Take the settlement claim BEFORE the reply lands: the request
+        // leaves the server's pending list the moment it is applied, and a
+        // sweep landing in that window would otherwise read the
+        // disappearance as another client's resolution and stamp
+        // `⏱ 已由其他客户端处理` on the card — the lie the Host saw when
+        // enabling auto-accept. `resolve_blocks` clears the claim once the
+        // true receipt rendered; a failed reply releases it right here.
+        let claimed_here = requests
+            .settling_requests
+            .lock()
+            .await
+            .insert(p.request_id.clone(), std::time::Instant::now())
+            .is_none();
+        match backend
+            .clone()
+            .for_directory(directory)
+            .reply_permission(&p.request_id, "once")
+            .await
+        {
+            Ok(()) => {
+                tracing::info!(
+                    "Auto-accepted pending permission {} on session {} ({})",
+                    p.request_id,
+                    sid,
+                    p.permission.as_deref().unwrap_or("?")
+                );
+                approved.push(p.request_id.clone());
+            }
+            Err(e) => {
+                if claimed_here {
+                    requests.settling_requests.lock().await.remove(&p.request_id);
+                }
+                tracing::warn!("auto-accept pending {} on session {}: {}", p.request_id, sid, e);
+            }
+        }
+    }
+    approved
 }
 
 /// Prefix of the receipt left when a click discovers the request was already
@@ -598,7 +713,7 @@ impl RequestKind for QuestionKind {
     async fn prepare(
         &self,
         flow: &RequestFlow,
-        _core: &Arc<SharedCore>,
+        _handles: &FlowHandles,
         req: &PendingRequest,
         dir: &str,
     ) -> bool {
@@ -669,7 +784,7 @@ impl RequestKind for QuestionKind {
     async fn handle_action(
         &self,
         flow: &RequestFlow,
-        core: &Arc<SharedCore>,
+        handles: &FlowHandles,
         session_id: &str,
         req_id: &str,
         reply: &str,
@@ -708,7 +823,7 @@ impl RequestKind for QuestionKind {
                 }
                 // A request is submitted ONLY when every question has an answer
                 // (`reply_question` expects all of them).
-                if flow.is_answered(&core.requests_handle(), req_id).await {
+                if flow.is_answered(&handles.requests, req_id).await {
                     // Finalized before (double-click): re-serve the winning
                     // click's result, falling back to the generic ack while it
                     // is still in flight.
@@ -790,7 +905,7 @@ impl RequestKind for QuestionKind {
                     // All questions answered → claim the request and submit.
                     // The claim is atomic: a click that loses the race re-serves
                     // the winning result instead of replying again.
-                    if !flow.try_mark_answered(&core.requests_handle(), req_id).await {
+                    if !flow.try_mark_answered(&handles.requests, req_id).await {
                         return Some(
                             flow.answered_result(req_id)
                                 .await
@@ -800,14 +915,18 @@ impl RequestKind for QuestionKind {
                     // The claim does not pin the state: re-validate so a sweep
                     // racing the claim cannot submit an empty snapshot.
                     let Some((questions, answers)) = flow.question_snapshot(req_id).await else {
-                        return Some(flow.missing_after_claim(core, req_id, directory, inline).await);
+                        return Some(
+                            flow.missing_after_claim(&handles.requests, req_id, directory, inline)
+                                .await,
+                        );
                     };
                     if let Some(r) = settle_question_reply(
                         flow,
-                        core,
+                        &handles.cards,
+                        &handles.requests,
                         req_id,
                         self.label(),
-                        reply_question_scoped(core, req_id, Some(&answers), directory).await,
+                        reply_question_scoped(&handles.backend, req_id, Some(&answers), directory).await,
                         inline,
                         host,
                         session_id,
@@ -825,8 +944,8 @@ impl RequestKind for QuestionKind {
                     );
                     let cached = resolve_blocks(
                         flow,
-                        &core.cards_handle(),
-                        &core.requests_handle(),
+                        &handles.cards,
+                        &handles.requests,
                         host,
                         session_id,
                         Origin::Click { clicked },
@@ -836,7 +955,7 @@ impl RequestKind for QuestionKind {
                     .await;
                     let mut r = result_card("✅ 已回答", "green", &qa_completion_body(&questions, &answers));
                     r.toast = Some("已回答".to_string());
-                    settle_ack(core, host, session_id, inline, cached, &mut r).await;
+                    settle_ack(&handles.cards, host, session_id, inline, cached, &mut r).await;
                     // Re-served verbatim to a losing double-click.
                     flow.remember_answered_result(req_id, &r).await;
                     Some(r)
@@ -855,7 +974,7 @@ impl RequestKind for QuestionKind {
                     let card = match req {
                         Some(req) => {
                             refresh_question_block(
-                                core,
+                                &handles.cards,
                                 host,
                                 session_id,
                                 clicked,
@@ -872,7 +991,7 @@ impl RequestKind for QuestionKind {
                     let r = CardActionResult {
                         card: match card {
                             Some(card) => Some(card),
-                            None => ack_inline_card(core, host, session_id).await,
+                            None => ack_inline_card(&handles.cards, host, session_id).await,
                         },
                         toast: Some(action_toast(reply, n - answered_count, outcome)),
                     };
@@ -906,7 +1025,7 @@ impl RequestKind for QuestionKind {
             }
             "submit" => {
                 // Finalize with whatever was answered (empty for the rest).
-                if flow.is_answered(&core.requests_handle(), req_id).await {
+                if flow.is_answered(&handles.requests, req_id).await {
                     return Some(
                         flow.answered_result(req_id)
                             .await
@@ -921,7 +1040,7 @@ impl RequestKind for QuestionKind {
                 }
                 // Atomic claim: a click that loses the race re-serves the
                 // winning result.
-                if !flow.try_mark_answered(&core.requests_handle(), req_id).await {
+                if !flow.try_mark_answered(&handles.requests, req_id).await {
                     return Some(
                         flow.answered_result(req_id)
                             .await
@@ -931,14 +1050,18 @@ impl RequestKind for QuestionKind {
                 // The claim does not pin the state: re-validate so a sweep
                 // racing the claim cannot turn this into a blind reply.
                 let Some((questions, answers)) = flow.question_snapshot(req_id).await else {
-                    return Some(flow.missing_after_claim(core, req_id, directory, inline).await);
+                    return Some(
+                        flow.missing_after_claim(&handles.requests, req_id, directory, inline)
+                            .await,
+                    );
                 };
                 if let Some(r) = settle_question_reply(
                     flow,
-                    core,
+                    &handles.cards,
+                    &handles.requests,
                     req_id,
                     self.label(),
-                    reply_question_scoped(core, req_id, Some(&answers), directory).await,
+                    reply_question_scoped(&handles.backend, req_id, Some(&answers), directory).await,
                     inline,
                     host,
                     session_id,
@@ -956,8 +1079,8 @@ impl RequestKind for QuestionKind {
                 );
                 let cached = resolve_blocks(
                     flow,
-                    &core.cards_handle(),
-                    &core.requests_handle(),
+                    &handles.cards,
+                    &handles.requests,
                     host,
                     session_id,
                     Origin::Click { clicked },
@@ -967,13 +1090,13 @@ impl RequestKind for QuestionKind {
                 .await;
                 let mut r = result_card("✅ 已回答", "green", &qa_completion_body(&questions, &answers));
                 r.toast = Some("已提交".to_string());
-                settle_ack(core, host, session_id, inline, cached, &mut r).await;
+                settle_ack(&handles.cards, host, session_id, inline, cached, &mut r).await;
                 // Re-served verbatim to a losing double-click.
                 flow.remember_answered_result(req_id, &r).await;
                 Some(r)
             }
             "reject" => {
-                if flow.is_answered(&core.requests_handle(), req_id).await {
+                if flow.is_answered(&handles.requests, req_id).await {
                     return Some(flow.answered_result(req_id).await.unwrap_or_else(|| {
                         let mut r = result_card("🚫 已拒绝回答", "red", "已拒绝回答 AI 的问题。");
                         if inline {
@@ -990,7 +1113,7 @@ impl RequestKind for QuestionKind {
                 }
                 // Atomic claim: a click that loses the race re-serves the
                 // winning result.
-                if !flow.try_mark_answered(&core.requests_handle(), req_id).await {
+                if !flow.try_mark_answered(&handles.requests, req_id).await {
                     return Some(flow.answered_result(req_id).await.unwrap_or_else(|| {
                         let mut r = result_card("🚫 已拒绝回答", "red", "已拒绝回答 AI 的问题。");
                         if inline {
@@ -1002,14 +1125,18 @@ impl RequestKind for QuestionKind {
                 // The claim does not pin the state: re-validate so a sweep
                 // racing the claim cannot reject against a vanished request.
                 if !flow.question_state_live(req_id).await {
-                    return Some(flow.missing_after_claim(core, req_id, directory, inline).await);
+                    return Some(
+                        flow.missing_after_claim(&handles.requests, req_id, directory, inline)
+                            .await,
+                    );
                 }
                 if let Some(r) = settle_question_reply(
                     flow,
-                    core,
+                    &handles.cards,
+                    &handles.requests,
                     req_id,
                     self.label(),
-                    reply_question_scoped(core, req_id, None, directory).await,
+                    reply_question_scoped(&handles.backend, req_id, None, directory).await,
                     inline,
                     host,
                     session_id,
@@ -1022,8 +1149,8 @@ impl RequestKind for QuestionKind {
                 tracing::info!("Question rejected: {}", req_id);
                 let cached = resolve_blocks(
                     flow,
-                    &core.cards_handle(),
-                    &core.requests_handle(),
+                    &handles.cards,
+                    &handles.requests,
                     host,
                     session_id,
                     Origin::Click { clicked },
@@ -1033,7 +1160,7 @@ impl RequestKind for QuestionKind {
                 .await;
                 let mut r = result_card("🚫 已拒绝回答", "red", "已拒绝回答 AI 的问题。");
                 r.toast = Some("已拒绝回答".to_string());
-                settle_ack(core, host, session_id, inline, cached, &mut r).await;
+                settle_ack(&handles.cards, host, session_id, inline, cached, &mut r).await;
                 // Re-served verbatim to a losing double-click.
                 flow.remember_answered_result(req_id, &r).await;
                 Some(r)
@@ -1089,7 +1216,7 @@ pub struct RequestFlow {
     /// instead of rendering its own decision — otherwise a rapid second click
     /// on a different button (允许一次 vs 总是允许) would flip the card to a
     /// decision the backend never received. In-memory like the claim set on
-    /// `core.answered_requests`, and one card per answered request.
+    /// `handles.requests.answered_requests`, and one card per answered request.
     answered_results: Arc<Mutex<HashMap<String, CardActionResult>>>,
 }
 
@@ -1126,8 +1253,8 @@ impl RequestFlow {
     /// Roll back a claim made by [`Self::try_mark_answered`] after a GENUINE
     /// reply failure, so the user can retry. A benign 404 ("already resolved")
     /// keeps the claim — the request really is gone.
-    pub(crate) async fn unmark_answered(&self, core: &Arc<SharedCore>, req_id: &str) {
-        core.answered_requests.lock().await.remove(req_id);
+    pub(crate) async fn unmark_answered(&self, requests: &RequestsHandle, req_id: &str) {
+        requests.answered_requests.lock().await.remove(req_id);
     }
 
     /// Record the winning click's result so a click that loses the guard race
@@ -1275,12 +1402,12 @@ impl RequestFlow {
     /// fresh card can still answer.
     async fn missing_after_claim(
         &self,
-        core: &Arc<SharedCore>,
+        requests: &RequestsHandle,
         req_id: &str,
         directory: Option<&str>,
         inline: bool,
     ) -> CardActionResult {
-        self.unmark_answered(core, req_id).await;
+        self.unmark_answered(requests, req_id).await;
         self.missing_question_result(directory, inline).await
     }
 
@@ -1290,7 +1417,7 @@ impl RequestFlow {
     /// prompt error). The tool fiber behind such a request is dead, so
     /// approving it is meaningless; leaving it alive only lets the next turn
     /// re-host a ghost block (ADR-0038, rule 1). Mirrors
-    /// `SharedCore::approve_pending_for_session`'s session/descendant filter.
+    /// [`approve_pending_for_session`]'s session/descendant filter.
     ///
     /// Only a KNOWN state is resolved: a failed/timed-out list, an empty
     /// session id, another session, and a snapshot claim all stay untouched —
@@ -1380,14 +1507,14 @@ impl RequestFlow {
     /// streaming card when possible, else a separate card), auto-resolves where
     /// the kind says so, and marks stale cards when another client resolves a
     /// request. Spawned once per kind at App startup.
-    pub(crate) async fn poll_loop(&self, core: &Arc<SharedCore>) -> crate::error::Result<()> {
+    pub(crate) async fn poll_loop(&self, handles: &FlowHandles) -> crate::error::Result<()> {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         loop {
             tokio::time::sleep(tokio::time::Duration::from_millis(
                 self.poll_interval_ms.load(std::sync::atomic::Ordering::Relaxed),
             ))
             .await;
-            self.sweep(core, &mut seen).await;
+            self.sweep(handles, &mut seen).await;
         }
     }
 
@@ -1396,17 +1523,17 @@ impl RequestFlow {
     /// (stale standalone cards, inline sections, snapshot claims, and the
     /// remembered question state). Extracted from the loop so tests can drive
     /// one deterministic sweep.
-    pub(crate) async fn sweep(&self, core: &Arc<SharedCore>, seen: &mut std::collections::HashSet<String>) {
+    pub(crate) async fn sweep(&self, handles: &FlowHandles, seen: &mut std::collections::HashSet<String>) {
         // Serverless (Lazy Start hasn't attached/spawned yet): there is
         // nothing to poll — skip quietly until a server appears.
-        if core.opencode.base_url().is_empty() {
+        if handles.backend.base_url().is_empty() {
             return;
         }
         // Pending requests live in the server instance for the session's
         // directory; `GET /permission` / `GET /question` must be scoped with
         // `?directory=` or they only see the server cwd instance. Check every
         // known session directory.
-        let directories = { core.sessions.lock().await.directories() };
+        let directories = { handles.sessions.store.lock().await.directories() };
         let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
         // Feishu's Instant Reminder (ADR-0043): this kind's pin candidates,
         // collected here and resolved after the sweep. Collected (not resolved
@@ -1422,7 +1549,7 @@ impl RequestFlow {
         // flow so a later late click can classify a missing state entry.
         let mut listed_now: std::collections::HashSet<String> = std::collections::HashSet::new();
         for dir in &directories {
-            let backend = core.opencode.clone().for_directory(dir);
+            let backend = handles.backend.clone().for_directory(dir);
             // Bound the list call: a server restart can leave an in-flight
             // request on a half-open connection, and without a timeout the
             // poller would sit on it forever (no cards, no auto-accept).
@@ -1448,7 +1575,7 @@ impl RequestFlow {
                         // Both pin surfaces need the listed candidates: the
                         // reminder's chat-level target and the waiting-card
                         // registry's host message.
-                        if core.reminder.enabled() || core.message_pins.enabled() {
+                        if handles.waits.reminder.enabled() || handles.waits.message_pins.enabled() {
                             pin_candidates.push((req.clone(), dir.clone()));
                         }
                         // One span per request (ADR-0048): its `prepare`, its
@@ -1457,13 +1584,13 @@ impl RequestFlow {
                         // when the store maps that session — a sub-task child
                         // is not mapped and carries `session` alone.
                         let thread_key = {
-                            let store = core.sessions.lock().await;
+                            let store = handles.sessions.store.lock().await;
                             store
                                 .entry_for_session(req.session_id())
                                 .map(|e| e.thread_key.clone())
                         };
                         let span = crate::bridge::span::request(req.session_id(), thread_key.as_ref());
-                        if self.surface(core, req, dir, seen).instrument(span).await {
+                        if self.surface(handles, req, dir, seen).instrument(span).await {
                             auto_resolved.insert(req.id().to_string());
                         }
                     }
@@ -1480,7 +1607,7 @@ impl RequestFlow {
         // resolved (#130) — so the pin survives until a complete sweep. A
         // request auto-resolved in this sweep (prepare said handled) is not a
         // wait, so it never pins.
-        if core.reminder.enabled() && failed_dirs.is_empty() {
+        if handles.waits.reminder.enabled() && failed_dirs.is_empty() {
             let mut pin_targets: Vec<crate::bridge::reminder::ReminderTarget> = Vec::new();
             for (req, dir) in &pin_candidates {
                 if auto_resolved.contains(req.id()) {
@@ -1488,26 +1615,42 @@ impl RequestFlow {
                 }
                 // `None` (an external turn, or a request pending across a
                 // restart) cannot be pinned — there is no requester to target.
-                if let Some(target) =
-                    crate::bridge::reminder::reminder_target(core, req.session_id(), dir).await
+                if let Some(target) = crate::bridge::reminder::reminder_target(
+                    &handles.sessions,
+                    &handles.cards,
+                    &handles.backend,
+                    req.session_id(),
+                    dir,
+                )
+                .await
                 {
                     pin_targets.push(target);
                 }
             }
-            core.reminder
-                .sync(&core.feishu, self.kind.claim_kind(), &pin_targets)
+            handles
+                .waits
+                .reminder
+                .sync(&handles.platform, self.kind.claim_kind(), &pin_targets)
                 .await;
         }
         // Mark stale: a card cola sent whose request is no longer pending
         // (resolved by another client) and was NOT answered by cola. A card
         // owned by a directory whose list failed stays live (#144).
-        mark_stale_cards(core, &pending, &self.sent_cards, &failed_dirs, self.kind.label()).await;
+        mark_stale_cards(
+            &handles.requests,
+            &handles.platform,
+            &pending,
+            &self.sent_cards,
+            &failed_dirs,
+            self.kind.label(),
+        )
+        .await;
         // Requests cola itself is answering or has answered (a click's claim,
         // an auto-accept approval): their block belongs to the settlement
         // writing the true receipt, so the sweep must not read their
         // disappearance from the pending list as another client's work.
         // Snapshot once — every pass below must judge the same moment.
-        let cola_claimed = core.claimed_requests().await;
+        let cola_claimed = handles.requests.claimed_requests().await;
         // Card handles (ADR-0038, rule 2): a live block on a card whose
         // accumulator is gone (a replaced/aborted turn) is repainted from the
         // cached JSON — the accumulator pass below only reaches the card its
@@ -1515,8 +1658,8 @@ impl RequestFlow {
         // block to that card, so a block whose handle already names it is left
         // to the flush (never resolved twice), while one whose handle names an
         // older card still gets that stale card repainted.
-        let flush_owned = Turn::flush_owned_blocks(&core.cards_handle()).await;
-        let dropped = core.card_handles.lock().await.drop_vanished(
+        let flush_owned = Turn::flush_owned_blocks(&handles.cards).await;
+        let dropped = handles.cards.card_handles.lock().await.drop_vanished(
             self.kind.claim_kind(),
             &pending,
             &failed_dirs,
@@ -1525,7 +1668,7 @@ impl RequestFlow {
             handled_elsewhere_receipt,
         );
         for (message_id, card) in dropped {
-            if let Err(e) = core.feishu.update_message(&message_id, &card).await {
+            if let Err(e) = handles.platform.update_message(&message_id, &card).await {
                 tracing::warn!("vanished block repaint failed on {}: {}", message_id, e);
             } else {
                 tracing::info!(
@@ -1542,10 +1685,10 @@ impl RequestFlow {
         // failed directory stay (#144).
         let repaint = self
             .kind
-            .resolve_vanished_inline(&core.cards_handle(), &pending, &failed_dirs, &cola_claimed)
+            .resolve_vanished_inline(&handles.cards, &pending, &failed_dirs, &cola_claimed)
             .await;
         for session_id in &repaint {
-            Turn::flush_card(&core.cards_handle(), session_id).await;
+            Turn::flush_card(&handles.cards, session_id).await;
         }
         // ADR-0028: a claimed request that left the pending list was
         // resolved — by the snapshot's own buttons (the click handler
@@ -1556,13 +1699,13 @@ impl RequestFlow {
         // stays: that directory said nothing (#144). The registry returns the
         // rebuilt cards; the flow patches them (never holding the registry
         // lock across the Feishu call).
-        let dropped =
-            core.snapshot_claims
-                .lock()
-                .await
-                .drop_vanished(self.kind.claim_kind(), &pending, &failed_dirs);
+        let dropped = handles.requests.snapshot_claims.lock().await.drop_vanished(
+            self.kind.claim_kind(),
+            &pending,
+            &failed_dirs,
+        );
         for (message_id, card) in dropped {
-            if let Err(e) = core.feishu.update_message(&message_id, &card).await {
+            if let Err(e) = handles.platform.update_message(&message_id, &card).await {
                 tracing::warn!("snapshot claim drop: card update failed: {}", e);
             } else {
                 tracing::info!("snapshot {} re-rendered without resolved claims", message_id);
@@ -1579,9 +1722,9 @@ impl RequestFlow {
         // answering or one auto-resolved in this sweep is not a wait and never
         // pins. Best-effort, like the reminder; a failed directory's tracked
         // pin stays (#130).
-        if core.message_pins.enabled() {
+        if handles.waits.message_pins.enabled() {
             let claimed_hosts: std::collections::HashMap<String, String> = {
-                let claims = core.snapshot_claims.lock().await;
+                let claims = handles.requests.snapshot_claims.lock().await;
                 pin_candidates
                     .iter()
                     .filter_map(|(req, _)| {
@@ -1601,7 +1744,7 @@ impl RequestFlow {
                 .map(|(id, card)| (id.clone(), card.message_id.clone()))
                 .collect();
             let waiting: Vec<crate::bridge::message_pins::WaitingCard> = {
-                let handles = core.card_handles.lock().await;
+                let handles = handles.cards.card_handles.lock().await;
                 pin_candidates
                     .iter()
                     .filter(|(req, _)| !auto_resolved.contains(req.id()) && !cola_claimed.contains(req.id()))
@@ -1619,8 +1762,10 @@ impl RequestFlow {
                     })
                     .collect()
             };
-            core.message_pins
-                .sync(&core.feishu, self.kind.claim_kind(), &waiting, &failed_dirs)
+            handles
+                .waits
+                .message_pins
+                .sync(&handles.platform, self.kind.claim_kind(), &waiting, &failed_dirs)
                 .await;
         }
         // #130: remember which directories listed successfully — with that
@@ -1656,21 +1801,21 @@ impl RequestFlow {
     /// poller never surfaces one request twice.
     async fn surface(
         &self,
-        core: &Arc<SharedCore>,
+        handles: &FlowHandles,
         req: &PendingRequest,
         dir: &str,
         seen: &mut std::collections::HashSet<String>,
     ) -> bool {
         // ADR-0028: a claimed request is hosted by a snapshot card — already
         // surfaced, never a standalone card, never re-inlined.
-        if core.snapshot_claims.lock().await.contains(req.id()) {
+        if handles.requests.snapshot_claims.lock().await.contains(req.id()) {
             return false;
         }
         if seen.contains(req.id()) {
             // Already surfaced: if it outlived the turn that hosted it,
             // re-host it onto the session's current card so the live controls
             // follow the newest card (ADR-0038, rule 1).
-            self.rehost_block(core, req, dir).await;
+            self.rehost_block(handles, req, dir).await;
             return false;
         }
         seen.insert(req.id().to_string());
@@ -1683,18 +1828,17 @@ impl RequestFlow {
         );
         // Kind-specific pre-card handling (auto-accept / remember). true →
         // handled, no card needed.
-        if self.kind.prepare(self, core, req, dir).await {
+        if self.kind.prepare(self, handles, req, dir).await {
             return true;
         }
         // One-card-per-turn: surface the request INLINE on the streaming card
         // of the session that owns it — the session itself, or (sub-task
         // children) its nearest ancestor with a live card. Only a separate card
         // when there is no active card (e.g. external turns or restarts).
-        if let Some(host) = inline_host_session(core, req.session_id(), Some(dir)).await {
-            let pushed = self
-                .kind
-                .add_inline(self, &core.cards_handle(), &host, req, dir)
-                .await;
+        if let Some(host) =
+            inline_host_session(&handles.cards, &handles.backend, req.session_id(), Some(dir)).await
+        {
+            let pushed = self.kind.add_inline(self, &handles.cards, &host, req, dir).await;
             if pushed {
                 tracing::info!(
                     "{} {} inlined on session {} card",
@@ -1705,7 +1849,7 @@ impl RequestFlow {
                 // Flush so the inline section appears NOW — the render loop
                 // only flushes on new parts, and a blocked prompt produces
                 // none.
-                Turn::flush_card(&core.cards_handle(), &host).await;
+                Turn::flush_card(&handles.cards, &host).await;
             }
             return false;
         }
@@ -1713,9 +1857,20 @@ impl RequestFlow {
         // Reply to the message that triggered the prompt for this session; fall
         // back to sending into the chat when the accumulator is gone (e.g.
         // after a cola restart). Sub-task sessions resolve up the parent chain.
-        let sent_id = match resolve_card_target(core, req.session_id(), dir).await {
-            Some(CardTarget::ReplyTo(msg_id)) => core.feishu.reply_card(&msg_id, &card).await.ok(),
-            Some(CardTarget::Chat(chat_id)) => core.feishu.send_card("chat_id", &chat_id, &card).await.ok(),
+        let sent_id = match resolve_card_target(
+            &handles.sessions,
+            &handles.cards,
+            &handles.backend,
+            &handles.platform,
+            req.session_id(),
+            dir,
+        )
+        .await
+        {
+            Some(CardTarget::ReplyTo(msg_id)) => handles.platform.reply_card(&msg_id, &card).await.ok(),
+            Some(CardTarget::Chat(chat_id)) => {
+                handles.platform.send_card("chat_id", &chat_id, &card).await.ok()
+            }
             None => {
                 tracing::warn!(
                     "No reply target or chat for {} on session {}",
@@ -1750,41 +1905,44 @@ impl RequestFlow {
     /// without the controls — so a live block lives on exactly one card. Called
     /// from the sweep for requests already in `seen` (the poller would
     /// otherwise never touch them again).
-    async fn rehost_block(&self, core: &Arc<SharedCore>, req: &PendingRequest, dir: &str) {
+    async fn rehost_block(&self, handles: &FlowHandles, req: &PendingRequest, dir: &str) {
         let id = req.id();
         // Only a block the flush recorded (an inline card) follows the card:
         // a standalone card and a snapshot claim keep their lifecycles
         // (ADR-0038, rule 6).
-        let Some(old_message) = core.card_handles.lock().await.message_of(id).map(str::to_string) else {
+        let Some(old_message) = handles
+            .cards
+            .card_handles
+            .lock()
+            .await
+            .message_of(id)
+            .map(str::to_string)
+        else {
             return;
         };
-        let Some(host) = inline_host_session(core, req.session_id(), Some(dir)).await else {
+        let Some(host) =
+            inline_host_session(&handles.cards, &handles.backend, req.session_id(), Some(dir)).await
+        else {
             return;
         };
-        if !Turn::has_card(&core.cards_handle(), &host).await {
+        if !Turn::has_card(&handles.cards, &host).await {
             return;
         }
         // The accumulator still carries the block (its own flush owns the
         // current card), or the handle already names that card: nothing to
         // move.
-        if Turn::has_interaction_in(&core.cards_handle(), &host, id).await
-            || Turn::card_message_id(&core.cards_handle(), &host)
-                .await
-                .as_deref()
-                == Some(old_message.as_str())
+        if Turn::has_interaction_in(&handles.cards, &host, id).await
+            || Turn::card_message_id(&handles.cards, &host).await.as_deref() == Some(old_message.as_str())
         {
             return;
         }
-        let pushed = self
-            .kind
-            .add_inline(self, &core.cards_handle(), &host, req, dir)
-            .await;
+        let pushed = self.kind.add_inline(self, &handles.cards, &host, req, dir).await;
         if !pushed {
             return;
         }
         // Flush first: the current card renders the block and the handle moves
         // with it.
-        Turn::flush_card(&core.cards_handle(), &host).await;
+        Turn::flush_card(&handles.cards, &host).await;
         tracing::info!(
             "{} {} re-hosted on session {} card (old {})",
             self.kind.label(),
@@ -1794,8 +1952,13 @@ impl RequestFlow {
         );
         // Then strip the old card's copy through its handle. The block moved,
         // not resolved: no receipt — the controls simply leave that card.
-        if let Some(card) = core.card_handles.lock().await.remove_on(&old_message, id)
-            && let Err(e) = core.feishu.update_message(&old_message, &card).await
+        if let Some(card) = handles
+            .cards
+            .card_handles
+            .lock()
+            .await
+            .remove_on(&old_message, id)
+            && let Err(e) = handles.platform.update_message(&old_message, &card).await
         {
             tracing::warn!("re-host old-card repaint failed on {}: {}", old_message, e);
         }
@@ -1806,7 +1969,7 @@ impl RequestFlow {
     /// the kind applies its own semantics.
     pub(crate) async fn handle_card_action(
         &self,
-        core: &Arc<SharedCore>,
+        handles: &FlowHandles,
         value: &serde_json::Value,
     ) -> Option<CardActionResult> {
         let session_id = value.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -1819,7 +1982,12 @@ impl RequestFlow {
         let directory = match directory {
             Some(d) => Some(d),
             None => {
-                let from_store = core.sessions.lock().await.directory_for_session(session_id);
+                let from_store = handles
+                    .sessions
+                    .store
+                    .lock()
+                    .await
+                    .directory_for_session(session_id);
                 if from_store.is_some() {
                     from_store
                 } else {
@@ -1839,7 +2007,7 @@ impl RequestFlow {
         // patch the snapshot (block updated or dropped), never a standalone
         // card.
         let claimed_message = {
-            let registry = core.snapshot_claims.lock().await;
+            let registry = handles.requests.snapshot_claims.lock().await;
             registry.claim_of(req_id).map(|(m, _)| m.to_string())
         };
         // Inline interaction: the session (or its sub-task parent chain) has a
@@ -1847,17 +2015,17 @@ impl RequestFlow {
         // card — the streaming card re-renders itself on the next poll.
         let host = if claimed_message.is_some() {
             None
-        } else if Turn::has_card(&core.cards_handle(), session_id).await {
+        } else if Turn::has_card(&handles.cards, session_id).await {
             Some(session_id.to_string())
         } else {
-            inline_host_session(core, session_id, directory).await
+            inline_host_session(&handles.cards, &handles.backend, session_id, directory).await
         };
         let inline = host.is_some();
 
         let mut r = self
             .kind
             .handle_action(
-                self, core, session_id, req_id, reply, value, directory, inline, &host, clicked,
+                self, handles, session_id, req_id, reply, value, directory, inline, &host, clicked,
             )
             .await;
 
@@ -1866,7 +2034,12 @@ impl RequestFlow {
         // flight): keep patching the snapshot — never replace the whole card
         // with a standalone result card.
         if claimed_message.is_none()
-            && core.snapshot_claims.lock().await.is_tombstoned(req_id)
+            && handles
+                .requests
+                .snapshot_claims
+                .lock()
+                .await
+                .is_tombstoned(req_id)
             && let Some(result) = &mut r
         {
             result.card = None;
@@ -1882,7 +2055,7 @@ impl RequestFlow {
             let still_pending = match directory {
                 Some(dir) => self
                     .kind
-                    .list(&core.opencode.clone().for_directory(dir))
+                    .list(&handles.backend.clone().for_directory(dir))
                     .await
                     .map(|reqs| reqs.iter().any(|r| r.id() == req_id))
                     .unwrap_or(true),
@@ -1893,24 +2066,32 @@ impl RequestFlow {
                 // (double-click): keep the block and show the live answer
                 // state, so the snapshot mirrors the standalone card's
                 // 已选/✅ markers.
-                let pending = core
+                let pending = handles
+                    .requests
                     .snapshot_claims
                     .lock()
                     .await
                     .host_pending(&message_id)
                     .unwrap_or_default();
-                let state = core.question.live_snapshot_state(&pending).await;
-                result.card = core.snapshot_claims.lock().await.rebuild(&message_id, &state);
+                let state = handles.requests.question.live_snapshot_state(&pending).await;
+                result.card = handles
+                    .requests
+                    .snapshot_claims
+                    .lock()
+                    .await
+                    .rebuild(&message_id, &state);
             } else {
                 // Resolved: drop the block from the snapshot and patch it in
                 // place — no new message. `resolve` does the whole transition
                 // (unclaim → tombstone → rebuild → prune) under one lock.
                 let state = crate::feishu::snapshot_card::SnapshotQuestionState::new();
-                result.card = core
-                    .snapshot_claims
-                    .lock()
-                    .await
-                    .resolve(req_id, &message_id, &state);
+                result.card =
+                    handles
+                        .requests
+                        .snapshot_claims
+                        .lock()
+                        .await
+                        .resolve(req_id, &message_id, &state);
             }
         }
         r
@@ -1956,7 +2137,8 @@ fn already_handled_result(kind: &str, inline: bool, toast: &str) -> CardActionRe
 #[allow(clippy::too_many_arguments)] // the click context is what the helper settles
 async fn settle_question_reply(
     flow: &RequestFlow,
-    core: &Arc<SharedCore>,
+    cards: &CardsHandle,
+    requests: &RequestsHandle,
     req_id: &str,
     kind: &str,
     result: crate::error::Result<()>,
@@ -1980,8 +2162,8 @@ async fn settle_question_reply(
             // any other resolution (ADR-0038, rules 3+4).
             let cached = resolve_blocks(
                 flow,
-                &core.cards_handle(),
-                &core.requests_handle(),
+                cards,
+                requests,
                 host,
                 session_id,
                 Origin::Click { clicked },
@@ -1990,13 +2172,13 @@ async fn settle_question_reply(
             )
             .await;
             let mut r = already_handled_result(kind, inline, "该问题已处理");
-            settle_ack(core, host, session_id, inline, cached, &mut r).await;
+            settle_ack(cards, host, session_id, inline, cached, &mut r).await;
             flow.remember_answered_result(req_id, &r).await;
             Some(r)
         }
         Err(e) => {
             tracing::error!("question reply failed: {}", e);
-            flow.unmark_answered(core, req_id).await;
+            flow.unmark_answered(requests, req_id).await;
             Some(failed_result_card(
                 inline,
                 "该问题处理失败，请重试。",
@@ -2330,7 +2512,7 @@ fn restamped_header(
 /// an inline click re-renders the accumulator's current card and a standalone
 /// click keeps its result card.
 async fn settle_ack(
-    core: &Arc<SharedCore>,
+    cards: &CardsHandle,
     host: &Option<String>,
     session_id: &str,
     inline: bool,
@@ -2340,7 +2522,7 @@ async fn settle_ack(
     if let Some(card) = cached {
         result.card = Some(card);
     } else if inline {
-        result.card = ack_inline_card(core, host, session_id).await;
+        result.card = ack_inline_card(cards, host, session_id).await;
     }
 }
 
@@ -2352,7 +2534,7 @@ async fn settle_ack(
 /// handle carries the block.
 #[allow(clippy::too_many_arguments)] // the display state is what the seam keeps in step
 async fn refresh_question_block(
-    core: &Arc<SharedCore>,
+    cards: &CardsHandle,
     host: &Option<String>,
     session_id: &str,
     clicked: Option<&str>,
@@ -2363,7 +2545,7 @@ async fn refresh_question_block(
     done: &[bool],
 ) -> Option<serde_json::Value> {
     Turn::update_question_state(
-        &core.cards_handle(),
+        cards,
         host.as_deref().unwrap_or(session_id),
         req_id,
         display,
@@ -2379,7 +2561,8 @@ async fn refresh_question_block(
         display,
         done,
     );
-    core.card_handles
+    cards
+        .card_handles
         .lock()
         .await
         .refresh_on(message_id, req_id, elements)
@@ -2390,11 +2573,11 @@ async fn refresh_question_block(
 /// click handler (`flush_card` owns that flow). `None` when the card needs a
 /// split or no accumulator exists; the caller falls back to the PATCH flush.
 async fn inline_ack_card(
-    core: &Arc<SharedCore>,
+    cards: &CardsHandle,
     host: &Option<String>,
     session_id: &str,
 ) -> Option<serde_json::Value> {
-    Turn::ack_card(&core.cards_handle(), host.as_deref().unwrap_or(session_id)).await
+    Turn::ack_card(cards, host.as_deref().unwrap_or(session_id)).await
 }
 
 /// Deliver the clicked card's updated card in the callback ack (ADR-0038,
@@ -2404,13 +2587,13 @@ async fn inline_ack_card(
 /// card needs a split or the accumulator is gone (the turn ended between the
 /// click and now).
 async fn ack_inline_card(
-    core: &Arc<SharedCore>,
+    cards: &CardsHandle,
     host: &Option<String>,
     session_id: &str,
 ) -> Option<serde_json::Value> {
-    let card = inline_ack_card(core, host, session_id).await;
+    let card = inline_ack_card(cards, host, session_id).await;
     if card.is_none() {
-        flush_inline_card(core, host, session_id).await;
+        flush_inline_card(cards, host, session_id).await;
     }
     card
 }
@@ -2420,15 +2603,15 @@ async fn ack_inline_card(
 /// produces no new parts, so without an explicit flush the render poll never
 /// fires until the AI resumes — the card would stay frozen on the pre-answer
 /// state. Same reason the question paths flush explicitly.
-async fn flush_inline_card(core: &Arc<SharedCore>, host: &Option<String>, session_id: &str) {
-    Turn::flush_card(&core.cards_handle(), host.as_deref().unwrap_or(session_id)).await;
+async fn flush_inline_card(cards: &CardsHandle, host: &Option<String>, session_id: &str) {
+    Turn::flush_card(cards, host.as_deref().unwrap_or(session_id)).await;
 }
 
 /// Route a question reply/reject to the instance owning the session. The card
 /// carries the owning directory (ADR-0010); without it the reply can't be
 /// routed, so surface the failure instead of guessing at the server cwd instance.
 async fn reply_question_scoped(
-    core: &Arc<SharedCore>,
+    backend: &Arc<dyn opencode::Backend>,
     req_id: &str,
     answers: Option<&[Vec<String>]>,
     directory: Option<&str>,
@@ -2438,7 +2621,7 @@ async fn reply_question_scoped(
             "question card carries no directory".into(),
         ));
     };
-    let backend = core.opencode.clone().for_directory(dir);
+    let backend = backend.clone().for_directory(dir);
     match answers {
         Some(a) => backend.reply_question(req_id, a).await,
         None => backend.reject_question(req_id).await,

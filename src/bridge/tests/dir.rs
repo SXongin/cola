@@ -150,7 +150,7 @@ async fn dir_card_data_dedupes_sorts_and_filters() {
     let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
 
-    let (dirs, current) = crate::bridge::command::dir_card_data(&app.core, &key).await;
+    let (dirs, current) = crate::bridge::command::dir_card_data(&app.command_handles(), &key).await;
     assert_eq!(dirs, vec!["/work/a".to_string(), "/work/b".to_string()]);
     assert_eq!(current, None);
 }
@@ -181,7 +181,7 @@ async fn dir_card_data_unions_store_directories_dropped_by_the_server() {
     seed_session(&app, "ses_arch", "/work/arch").await;
 
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-    let (dirs, current) = crate::bridge::command::dir_card_data(&app.core, &key).await;
+    let (dirs, current) = crate::bridge::command::dir_card_data(&app.command_handles(), &key).await;
     assert_eq!(
         dirs,
         vec![
@@ -207,7 +207,7 @@ async fn dir_card_data_shows_store_directories_with_an_empty_session_list() {
     seed_session(&app, "ses_x", "/work/x").await;
 
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-    let (dirs, current) = crate::bridge::command::dir_card_data(&app.core, &key).await;
+    let (dirs, current) = crate::bridge::command::dir_card_data(&app.command_handles(), &key).await;
     assert_eq!(dirs, vec!["/work/x".to_string()]);
     assert_eq!(current, Some("/work/x".to_string()));
 }
@@ -229,7 +229,7 @@ async fn dir_card_data_shows_a_pending_only_directory() {
     )
     .await;
 
-    let (dirs, current) = crate::bridge::command::dir_card_data(&app.core, &key).await;
+    let (dirs, current) = crate::bridge::command::dir_card_data(&app.command_handles(), &key).await;
     assert_eq!(dirs, vec!["/work/pending".to_string()]);
     assert_eq!(current, Some("/work/pending".to_string()));
 }

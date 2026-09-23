@@ -34,7 +34,7 @@ async fn permission_poller_sends_card_and_card_action_replies() {
             app.permission
                 .poll_interval_ms
                 .store(50, std::sync::atomic::Ordering::Relaxed);
-            let _ = app.permission.poll_loop(&app.core).await;
+            let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -142,7 +142,7 @@ async fn inline_permission_click_carries_the_receipt_in_the_ack() {
             app.permission
                 .poll_interval_ms
                 .store(50, std::sync::atomic::Ordering::Relaxed);
-            let _ = app.permission.poll_loop(&app.core).await;
+            let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -418,7 +418,7 @@ async fn permission_poller_recovers_when_a_list_call_hangs() {
             app.permission
                 .list_timeout_ms
                 .store(50, std::sync::atomic::Ordering::Relaxed);
-            let _ = app.permission.poll_loop(&app.core).await;
+            let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
 
@@ -492,7 +492,7 @@ async fn autoaccept_toggle_on_permission_card_flips_flag_and_approves() {
             app.permission
                 .poll_interval_ms
                 .store(50, std::sync::atomic::Ordering::Relaxed);
-            let _ = app.permission.poll_loop(&app.core).await;
+            let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -702,7 +702,7 @@ async fn autoaccept_command_leaves_the_mode_receipt_on_the_card() {
     // The sweep after the command finds nothing left to resolve: no second
     // receipt may appear on the card.
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     let after = platform
         .calls
         .lock()
@@ -783,7 +783,7 @@ async fn autoaccept_toggle_card_settles_pending_permissions() {
 
     // The sweep after the toggle finds nothing left to resolve.
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     let after = platform
         .calls
         .lock()
@@ -829,7 +829,7 @@ async fn sweep_leaves_a_claimed_approval_to_its_settlement() {
     backend.permission_resolved_by_another("per_1").await;
 
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
 
     // The sweep left it alone: no neutral receipt reached the card, the handle
     // and the accumulator still carry the block for the in-flight settlement.
@@ -913,7 +913,7 @@ async fn autoaccept_command_keeps_the_standalone_card_for_the_sweep() {
     );
 
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     let stale = platform
         .calls
         .lock()
@@ -976,7 +976,7 @@ async fn auto_accept_session_answers_permission_without_card() {
             app.permission
                 .poll_interval_ms
                 .store(50, std::sync::atomic::Ordering::Relaxed);
-            let _ = app.permission.poll_loop(&app.core).await;
+            let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1129,7 +1129,7 @@ async fn stale_permission_card_marked_handled_when_resolved_elsewhere() {
             app.permission
                 .poll_interval_ms
                 .store(50, std::sync::atomic::Ordering::Relaxed);
-            let _ = app.permission.poll_loop(&app.core).await;
+            let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1237,7 +1237,7 @@ async fn separate_permission_card_sent_into_topic_for_topic_session() {
             app.permission
                 .poll_interval_ms
                 .store(50, std::sync::atomic::Ordering::Relaxed);
-            let _ = app.permission.poll_loop(&app.core).await;
+            let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1328,7 +1328,7 @@ async fn permission_click_variants_leave_their_receipts() {
             app.permission
                 .poll_interval_ms
                 .store(50, std::sync::atomic::Ordering::Relaxed);
-            let _ = app.permission.poll_loop(&app.core).await;
+            let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1498,7 +1498,7 @@ async fn inline_permission_click_after_remote_resolution_gets_receipt() {
             app.permission
                 .poll_interval_ms
                 .store(50, std::sync::atomic::Ordering::Relaxed);
-            let _ = app.permission.poll_loop(&app.core).await;
+            let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1560,7 +1560,7 @@ async fn seed_inline_permission_card(app: &Arc<App>, session_id: &str, request_i
 /// that can have done it.
 async fn sweep_and_assert_receipt_on_the_card(app: &Arc<App>, platform: &Arc<RecordingPlatform>) {
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
 
     let calls = platform.calls.lock().await.clone();
     let patched = calls

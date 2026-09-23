@@ -1071,7 +1071,7 @@ async fn supplement_split_migrates_a_pending_permission() {
     Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
     app.inflight.lock().await.insert("ses_test".to_string());
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     assert_eq!(
         app.card_handles.lock().await.message_of("per_live"),
         Some("om_live"),

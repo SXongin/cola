@@ -22,7 +22,10 @@ async fn current_project_directory_reads_pending_first() {
     .await;
     seed_pending(&app, PendingEntry::new(key(), "/work/pending")).await;
 
-    assert_eq!(app.core.current_project_directory(&key()).await, "/work/pending");
+    assert_eq!(
+        app.command_handles().current_project_directory(&key()).await,
+        "/work/pending"
+    );
 }
 
 /// The `/dir` card's 当前 directory follows the pending, not the superseded
@@ -39,7 +42,7 @@ async fn dir_card_current_reads_pending() {
 
     seed_pending(&app, PendingEntry::new(key(), "/work/pending")).await;
 
-    let (dirs, current) = crate::bridge::command::dir_card_data(&app.core, &key()).await;
+    let (dirs, current) = crate::bridge::command::dir_card_data(&app.command_handles(), &key()).await;
     assert_eq!(
         dirs,
         vec!["/work/pending".to_string(), "/work/a".to_string()],
@@ -255,7 +258,7 @@ async fn switch_card_current_reads_pending_and_marks_no_active_row() {
     seed_pending(&app, PendingEntry::new(key(), "/work/pending")).await;
 
     let (shown, active_id, mapped_ids, scope, current_dir) = crate::bridge::command::switch_card_data(
-        &app.core,
+        &app.command_handles(),
         &key(),
         "",
         crate::bridge::command::SwitchScope::All,

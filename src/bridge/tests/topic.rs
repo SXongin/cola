@@ -959,7 +959,7 @@ async fn topic_gate_rejects_the_unparseable_topic_shape() {
     .await;
 
     crate::bridge::command::handle_command(
-        &app.core,
+        &app.command_handles(),
         Command::Topic {
             directory: None,
             name: Some("n".into()),

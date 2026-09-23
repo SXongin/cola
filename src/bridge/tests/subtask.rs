@@ -39,7 +39,7 @@ async fn subtask_permission_routes_to_mapped_parent_and_reply_carries_directory(
             app.permission
                 .poll_interval_ms
                 .store(50, std::sync::atomic::Ordering::Relaxed);
-            let _ = app.permission.poll_loop(&app.core).await;
+            let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -157,7 +157,7 @@ async fn subtask_permission_without_streaming_card_sends_card_to_parent_chat() {
             app.permission
                 .poll_interval_ms
                 .store(50, std::sync::atomic::Ordering::Relaxed);
-            let _ = app.permission.poll_loop(&app.core).await;
+            let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
