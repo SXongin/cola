@@ -255,7 +255,7 @@ async fn a_recreated_turn_traces_under_the_fresh_session() {
     // The mapped session is gone from the server: its prompt 404s, and the
     // recreate's `create_session` serves `ses_fresh`.
     backend.with_session_id("ses_fresh");
-    backend.stale_session_404 = true;
+    backend.stale_session_mapping();
     let (app, _platform) = build_app(cfg, backend).await;
     seed_session(&app, "ses_test", "/work").await;
     // Both attempts await their poll's stop, which waits out one cadence.
