@@ -12,6 +12,8 @@
 
 use std::sync::Arc;
 
+use tracing::Instrument;
+
 use crate::bridge::core::SharedCore;
 use crate::bridge::display::{dir_basename, id_tail, model_display};
 use crate::bridge::session::PendingEntry;
@@ -69,7 +71,37 @@ pub(crate) enum OpenTopicError {
 /// the session's pre-adoption state), map the session to the new topic's
 /// `ThreadKey`, and claim its embedded pendings against the in-topic snapshot
 /// after the send (ADR-0028).
+///
+/// The whole transaction runs inside the opening's `topic` span (ADR-0048):
+/// the adopted Session — a fresh `/topic` has none yet — plus the Chat it is
+/// opened in (and the session's current Topic, when it already has one).
 pub(crate) async fn open_topic(
+    core: &Arc<SharedCore>,
+    chat_id: &str,
+    fallback_root: &str,
+    opening: TopicOpening,
+) -> Result<OpenedTopic, OpenTopicError> {
+    let span_session = match &opening {
+        TopicOpening::Fresh { .. } => None,
+        TopicOpening::Adopt { info } => Some(info.id.as_str()),
+    };
+    // The Topic being opened does not exist yet, so the span can only carry
+    // the Chat — plus whatever Topic the adopted Session is already mapped to.
+    let chat_key = ThreadKey::new(chat_id.to_string(), chat_id.to_string());
+    let thread_key = match span_session {
+        Some(id) => crate::bridge::span::thread_key_of(core, id)
+            .await
+            .unwrap_or(chat_key),
+        None => chat_key,
+    };
+    let span = crate::bridge::span::topic(span_session, Some(&thread_key));
+    open_topic_inner(core, chat_id, fallback_root, opening)
+        .instrument(span)
+        .await
+}
+
+/// [`open_topic`]'s transaction body, run inside its `topic` span.
+async fn open_topic_inner(
     core: &Arc<SharedCore>,
     chat_id: &str,
     fallback_root: &str,
@@ -345,7 +377,19 @@ async fn open_cover_topic(
 /// topic, already synced, or patched) and `false` when the server title is
 /// not (yet) available or the patch failed — callers like the post-turn retry
 /// ladder use this to decide whether to try again later.
+///
+/// The sync runs inside the Session's `topic` span (ADR-0048): the line that
+/// records the retitle is the state transition a topic trace is read for.
 pub(crate) async fn sync_topic_cover_title(core: &Arc<SharedCore>, session_id: &str) -> bool {
+    let thread_key = crate::bridge::span::thread_key_of(core, session_id).await;
+    let span = crate::bridge::span::topic(Some(session_id), thread_key.as_ref());
+    sync_topic_cover_title_inner(core, session_id)
+        .instrument(span)
+        .await
+}
+
+/// [`sync_topic_cover_title`]'s body, run inside its Session's `topic` span.
+async fn sync_topic_cover_title_inner(core: &Arc<SharedCore>, session_id: &str) -> bool {
     let (root_id, directory, agent, recorded) = {
         let store = core.sessions.lock().await;
         match store.entry_for_session(session_id) {
@@ -520,7 +564,18 @@ pub(crate) async fn claim_pending_cover(core: &Arc<SharedCore>, key: &ThreadKey,
 /// compares against what the card shows. A fallback-rooted topic (cover send
 /// failed) recorded nothing and is left alone: its root is the user's command
 /// message and cannot be patched.
+///
+/// The retitle runs inside the pending topic's `topic` span (ADR-0048) — no
+/// Session exists yet, so the span carries the Chat/Topic alone.
 pub(crate) async fn rename_pending_cover(core: &Arc<SharedCore>, key: &ThreadKey, title: &str) {
+    let span = crate::bridge::span::topic(None, Some(key));
+    rename_pending_cover_inner(core, key, title)
+        .instrument(span)
+        .await
+}
+
+/// [`rename_pending_cover`]'s body, run inside the pending topic's `topic` span.
+async fn rename_pending_cover_inner(core: &Arc<SharedCore>, key: &ThreadKey, title: &str) {
     let pending_root = {
         let store = core.sessions.lock().await;
         store

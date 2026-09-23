@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tracing::Instrument;
 
 use crate::bridge::core::SharedCore;
 use crate::bridge::render::{flush_card, render_and_flush};
@@ -99,102 +100,124 @@ impl ExternalFlow {
                 (active, sessions)
             };
             for (sid, thread_key, directory) in sessions {
-                if !active.contains(&sid) {
-                    // Historical (non-active) session: stop syncing it and drop
-                    // its Sync Watermark so a later /switch back re-syncs it
-                    // silently (first observation, no replay).
-                    self.last_user_msg_epoch.lock().await.remove(&sid);
-                    continue;
+                // One `external` span per Session (ADR-0048): the observation,
+                // the notification and the renderer it arms are all retrievable
+                // by `rg 'session=ses_x'`.
+                let span = crate::bridge::span::external(&sid, Some(&thread_key));
+                self.poll_session(core, &active, &sid, &thread_key, &directory)
+                    .instrument(span)
+                    .await;
+            }
+        }
+    }
+
+    /// One Session's pass through the poll loop, run inside that Session's
+    /// `external` span (ADR-0048): skip historical and in-flight sessions, read
+    /// the newest user message, advance the Sync Watermark and — for a new
+    /// External Message — notify Feishu and arm the reply renderer. Split out
+    /// of [`Self::poll_loop`] so the whole pass is instrumented in one place.
+    async fn poll_session(
+        &self,
+        core: &Arc<SharedCore>,
+        active: &std::collections::HashSet<String>,
+        sid: &str,
+        thread_key: &crate::config::ThreadKey,
+        directory: &str,
+    ) {
+        if !active.contains(sid) {
+            // Historical (non-active) session: stop syncing it and drop
+            // its Sync Watermark so a later /switch back re-syncs it
+            // silently (first observation, no replay).
+            self.last_user_msg_epoch.lock().await.remove(sid);
+            return;
+        }
+        // While cola is answering this session, any new message is cola's own.
+        if core.inflight.lock().await.contains(sid) {
+            return;
+        }
+        let Some(Ok(msgs)) = crate::bridge::bounded_call(
+            "external poll messages",
+            self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
+            core.opencode.messages(sid),
+        )
+        .await
+        else {
+            return;
+        };
+        // The newest user message overall decides this poll. Its author
+        // is authoritative (ADR-0026): a `msg_cola_` id means cola sent
+        // it — advance the watermark, never notify. Only a message
+        // written by another shared-store client and newer than the
+        // watermark is an External Message.
+        let newest = msgs
+            .iter()
+            .filter(|m| m.info.role.as_deref() == Some("user"))
+            .filter_map(|m| {
+                let id = m.info.id.as_str();
+                m.info.time.as_ref().map(|t| (t.created, id))
+            })
+            .max_by_key(|(created, _)| *created);
+        let Some((latest, latest_id)) = newest else {
+            return;
+        };
+        let cola_authored = crate::opencode::parsing::is_cola_message_id(latest_id);
+        let mut map = self.last_user_msg_epoch.lock().await;
+        let watermark = map.get(sid).copied();
+        if cola_authored {
+            // cola's own message: never notify; just make sure the
+            // watermark covers it so later external messages compare
+            // against it.
+            if watermark.is_none_or(|w| latest > w) {
+                map.insert(sid.to_string(), latest);
+            }
+            return;
+        }
+        // First observation: establish the watermark, don't notify.
+        // External messages received before cola ever polled are marked
+        // read, not replayed (ADR-0017).
+        let Some(prev) = watermark else {
+            map.insert(sid.to_string(), latest);
+            return;
+        };
+        if latest > prev {
+            map.insert(sid.to_string(), latest);
+            let preview = user_message_preview(&msgs, latest);
+            drop(map);
+            tracing::info!("External message on session {}: {}", sid, preview);
+            // The card title is the server's session title (ADR-0007)
+            // — fetched on demand, never a cola-side name. Bounded like
+            // the poll's other calls so a hung read cannot freeze the
+            // notify path either.
+            let title = crate::bridge::bounded_call(
+                "external poll session_info",
+                self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
+                core.opencode.clone().for_directory(directory).session_info(sid),
+            )
+            .await
+            .and_then(|r| r.ok())
+            .and_then(|i| i.title)
+            .unwrap_or_default();
+            let card = crate::feishu::card::notify::build_external_message_card(&title, &preview);
+            // A topic session must be reached by replying to a
+            // message INSIDE the topic (the create API rejects
+            // `receive_id_type=thread_id`). Resolve an in-topic
+            // anchor — the persisted `/topic` confirmation card, or
+            // the newest bot message in the thread. Non-topic
+            // sessions fall back to the chat top level.
+            let anchor = crate::bridge::pollers::resolve_topic_anchor(core, thread_key).await;
+            let sent = match anchor {
+                Some(anchor) => core.feishu.reply_card(&anchor, &card).await,
+                None => core.feishu.send_card("chat_id", &thread_key.chat_id, &card).await,
+            };
+            match sent {
+                Ok(card_id) => {
+                    // Now render the model's reply INTO that card, so
+                    // the Feishu side sees the answer, not just the
+                    // notification.
+                    self.start_reply_render(core, sid, latest, &card_id, &preview)
+                        .await;
                 }
-                // While cola is answering this session, any new message is cola's own.
-                if core.inflight.lock().await.contains(&sid) {
-                    continue;
-                }
-                let Some(Ok(msgs)) = crate::bridge::bounded_call(
-                    "external poll messages",
-                    self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
-                    core.opencode.messages(&sid),
-                )
-                .await
-                else {
-                    continue;
-                };
-                // The newest user message overall decides this poll. Its author
-                // is authoritative (ADR-0026): a `msg_cola_` id means cola sent
-                // it — advance the watermark, never notify. Only a message
-                // written by another shared-store client and newer than the
-                // watermark is an External Message.
-                let newest = msgs
-                    .iter()
-                    .filter(|m| m.info.role.as_deref() == Some("user"))
-                    .filter_map(|m| {
-                        let id = m.info.id.as_str();
-                        m.info.time.as_ref().map(|t| (t.created, id))
-                    })
-                    .max_by_key(|(created, _)| *created);
-                let Some((latest, latest_id)) = newest else {
-                    continue;
-                };
-                let cola_authored = crate::opencode::parsing::is_cola_message_id(latest_id);
-                let mut map = self.last_user_msg_epoch.lock().await;
-                let watermark = map.get(&sid).copied();
-                if cola_authored {
-                    // cola's own message: never notify; just make sure the
-                    // watermark covers it so later external messages compare
-                    // against it.
-                    if watermark.is_none_or(|w| latest > w) {
-                        map.insert(sid.clone(), latest);
-                    }
-                    continue;
-                }
-                // First observation: establish the watermark, don't notify.
-                // External messages received before cola ever polled are marked
-                // read, not replayed (ADR-0017).
-                let Some(prev) = watermark else {
-                    map.insert(sid.clone(), latest);
-                    continue;
-                };
-                if latest > prev {
-                    map.insert(sid.clone(), latest);
-                    let preview = user_message_preview(&msgs, latest);
-                    drop(map);
-                    tracing::info!("External message on session {}: {}", sid, preview);
-                    // The card title is the server's session title (ADR-0007)
-                    // — fetched on demand, never a cola-side name. Bounded like
-                    // the poll's other calls so a hung read cannot freeze the
-                    // notify path either.
-                    let title = crate::bridge::bounded_call(
-                        "external poll session_info",
-                        self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
-                        core.opencode.clone().for_directory(&directory).session_info(&sid),
-                    )
-                    .await
-                    .and_then(|r| r.ok())
-                    .and_then(|i| i.title)
-                    .unwrap_or_default();
-                    let card = crate::feishu::card::notify::build_external_message_card(&title, &preview);
-                    // A topic session must be reached by replying to a
-                    // message INSIDE the topic (the create API rejects
-                    // `receive_id_type=thread_id`). Resolve an in-topic
-                    // anchor — the persisted `/topic` confirmation card, or
-                    // the newest bot message in the thread. Non-topic
-                    // sessions fall back to the chat top level.
-                    let anchor = crate::bridge::pollers::resolve_topic_anchor(core, &thread_key).await;
-                    let sent = match anchor {
-                        Some(anchor) => core.feishu.reply_card(&anchor, &card).await,
-                        None => core.feishu.send_card("chat_id", &thread_key.chat_id, &card).await,
-                    };
-                    match sent {
-                        Ok(card_id) => {
-                            // Now render the model's reply INTO that card, so
-                            // the Feishu side sees the answer, not just the
-                            // notification.
-                            self.start_reply_render(core, &sid, latest, &card_id, &preview)
-                                .await;
-                        }
-                        Err(e) => tracing::warn!("external message notify: {}", e),
-                    }
-                }
+                Err(e) => tracing::warn!("external message notify: {}", e),
             }
         }
     }
@@ -220,12 +243,12 @@ impl ExternalFlow {
         if armed_turn_anchor(core, session_id).await == Some(turn_anchor_ms) {
             return;
         }
-        let session_dir = {
+        let (session_dir, session_thread_key) = {
             let store = core.sessions.lock().await;
-            store
-                .entry_for_session(session_id)
-                .map(|e| e.directory.clone())
-                .unwrap_or_default()
+            match store.entry_for_session(session_id) {
+                Some(e) => (e.directory.clone(), Some(e.thread_key.clone())),
+                None => (String::new(), None),
+            }
         };
         // Card subtitle: the server's live title (ADR-0007), or the id-tail.
         let title = crate::bridge::bounded_call(
@@ -292,9 +315,16 @@ impl ExternalFlow {
         let sid = session_id.to_string();
         let poll_ms = self.render_poll_ms.load(std::sync::atomic::Ordering::Relaxed);
         let timeout_ms = self.render_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
-        tokio::spawn(async move {
-            external_render_loop(&core, sid, turn_anchor_ms, poll_ms, timeout_ms).await;
-        });
+        // A spawn inherits no span, so the render loop is instrumented
+        // explicitly with this Session's `external` span (ADR-0048) — rooted, so
+        // its lines do not repeat the ambient chain of whoever armed it.
+        let span = crate::bridge::span::external(session_id, session_thread_key.as_ref());
+        tokio::spawn(
+            async move {
+                external_render_loop(&core, sid, turn_anchor_ms, poll_ms, timeout_ms).await;
+            }
+            .instrument(span),
+        );
     }
 
     /// ADR-0028 busy-adopt follow: the adopted session's in-flight EXTERNAL
@@ -365,12 +395,12 @@ impl ExternalFlow {
             );
             return true;
         }
-        let session_dir = {
+        let (session_dir, session_thread_key) = {
             let store = core.sessions.lock().await;
-            store
-                .entry_for_session(session_id)
-                .map(|e| e.directory.clone())
-                .unwrap_or_default()
+            match store.entry_for_session(session_id) {
+                Some(e) => (e.directory.clone(), Some(e.thread_key.clone())),
+                None => (String::new(), None),
+            }
         };
         let mut acc = StreamAccumulator::new("");
         // The adopted turn's user message is the server-time anchor for the
@@ -461,9 +491,16 @@ impl ExternalFlow {
         let sid = session_id.to_string();
         let poll_ms = self.render_poll_ms.load(std::sync::atomic::Ordering::Relaxed);
         let timeout_ms = self.render_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
-        tokio::spawn(async move {
-            external_render_loop(&core, sid, turn_anchor_ms, poll_ms, timeout_ms).await;
-        });
+        // The follow's render loop is its own task, so it is instrumented
+        // explicitly with the adopted Session's `external` span (ADR-0048),
+        // rooted like the plain reply renderer's.
+        let span = crate::bridge::span::external(session_id, session_thread_key.as_ref());
+        tokio::spawn(
+            async move {
+                external_render_loop(&core, sid, turn_anchor_ms, poll_ms, timeout_ms).await;
+            }
+            .instrument(span),
+        );
         true
     }
 }
@@ -487,7 +524,9 @@ async fn armed_turn_anchor(core: &Arc<SharedCore>, session_id: &str) -> Option<i
 /// (the busy→idle race: the turn already finished) falls back to the static
 /// claim path, so the embedded pendings are never left unclaimed. Shared by
 /// every adoption surface so the busy/static decision cannot drift between
-/// them.
+/// them. The settle runs inside the adopted Session's `snapshot` span
+/// (ADR-0048), so its follow/claim lines are retrievable by it; the follow's
+/// own render task is instrumented at its spawn with the `external` span.
 pub(crate) async fn settle_snapshot_after_send(
     core: &Arc<SharedCore>,
     snapshot_message_id: &str,
@@ -495,15 +534,27 @@ pub(crate) async fn settle_snapshot_after_send(
     title: &str,
     data: &crate::bridge::snapshot::SnapshotData,
 ) {
-    let followed = data.status == Some(crate::opencode::types::SessionStatus::Busy)
-        && core
-            .external
-            .start_snapshot_follow(core, &data.session_id, snapshot_message_id, verb, title, data)
+    let thread_key = crate::bridge::span::thread_key_of(core, &data.session_id).await;
+    let span = crate::bridge::span::snapshot(&data.session_id, thread_key.as_ref());
+    async {
+        let followed = data.status == Some(crate::opencode::types::SessionStatus::Busy)
+            && core
+                .external
+                .start_snapshot_follow(core, &data.session_id, snapshot_message_id, verb, title, data)
+                .await;
+        if !followed {
+            crate::bridge::snapshot_claims::claim_snapshot_pendings(
+                core,
+                snapshot_message_id,
+                verb,
+                title,
+                data,
+            )
             .await;
-    if !followed {
-        crate::bridge::snapshot_claims::claim_snapshot_pendings(core, snapshot_message_id, verb, title, data)
-            .await;
+        }
     }
+    .instrument(span)
+    .await;
 }
 
 /// Incremental renderer for an external message's reply: poll the session,

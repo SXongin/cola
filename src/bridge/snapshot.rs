@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use tracing::Instrument;
+
 use crate::bridge::core::SharedCore;
 use crate::opencode;
 
@@ -182,15 +184,23 @@ pub(crate) async fn gather_snapshot(
 /// claimable ones (the session's own, not already surfaced elsewhere), and
 /// build its card with the given takeover verb (接管/切换). Shared by every
 /// adoption surface so the gather-before-mapping sequence cannot drift between
-/// them. Returns the card together with the filtered data — the caller sends
+/// them. The whole gather+build runs inside the adopted Session's `snapshot`
+/// span (ADR-0048), so its best-effort read warnings are retrievable by it.
+/// Returns the card together with the filtered data — the caller sends
 /// the card and then claims the pendings with its message id.
 pub(crate) async fn snapshot_card_for(
     core: &Arc<SharedCore>,
     verb: &str,
     info: &crate::opencode::types::SessionListInfo,
 ) -> (serde_json::Value, SnapshotData) {
-    let data = gather_snapshot(&core.opencode, &info.id, &info.directory).await;
-    snapshot_card_from_data(core, verb, &info.title, data).await
+    let thread_key = crate::bridge::span::thread_key_of(core, &info.id).await;
+    let span = crate::bridge::span::snapshot(&info.id, thread_key.as_ref());
+    async move {
+        let data = gather_snapshot(&core.opencode, &info.id, &info.directory).await;
+        snapshot_card_from_data(core, verb, &info.title, data).await
+    }
+    .instrument(span)
+    .await
 }
 
 /// ADR-0028: the filter+build half of [`snapshot_card_for`] — restrict the
