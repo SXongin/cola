@@ -214,7 +214,7 @@ async fn supplement_splits_the_chain_and_the_continuation_takes_over() {
         let mut cards = app.cards.lock().await;
         cards.get_mut("ses_test").unwrap().acc.push_text("后续进度。");
     }
-    crate::bridge::render::flush_card(&app.cards_handle(), "ses_test").await;
+    crate::bridge::turn::flush::flush_card(&app.cards_handle(), "ses_test").await;
     let calls = platform.calls.lock().await.clone();
     let last_update = calls
         .iter()
@@ -347,7 +347,7 @@ async fn a_tool_completing_after_the_split_renders_on_the_continuation() {
             ]),
         );
     }
-    crate::bridge::render::flush_card(&app.cards_handle(), "ses_test").await;
+    crate::bridge::turn::flush::flush_card(&app.cards_handle(), "ses_test").await;
 
     // The completion renders on the continuation, in its live tail...
     let updated = last_update_of(&platform, "msg_reply").await;
@@ -639,7 +639,7 @@ async fn supplements_queued_in_the_startup_window_share_one_continuation() {
     );
 
     // The chain re-anchors at the continuation: later flushes target it.
-    crate::bridge::render::flush_card(&app.cards_handle(), "ses_test").await;
+    crate::bridge::turn::flush::flush_card(&app.cards_handle(), "ses_test").await;
     let calls = platform.calls.lock().await.clone();
     let (message_id, later) = calls
         .iter()
@@ -886,7 +886,7 @@ async fn a_failed_continuation_send_retries_without_duplicating_receipts() {
         let mut cards = app.cards.lock().await;
         cards.get_mut("ses_test").unwrap().acc.push_text("后续进度。");
     }
-    crate::bridge::render::flush_card(&app.cards_handle(), "ses_test").await;
+    crate::bridge::turn::flush::flush_card(&app.cards_handle(), "ses_test").await;
     let calls = platform.calls.lock().await.clone();
     let (message_id, later) = calls
         .iter()
@@ -962,7 +962,7 @@ async fn a_failed_full_continuation_send_retries_the_same_slice() {
 
     // The retry re-renders S01, then continues with S02 + the receipt: nothing
     // is skipped or duplicated.
-    crate::bridge::render::flush_card(&app.cards_handle(), "ses_test").await;
+    crate::bridge::turn::flush::flush_card(&app.cards_handle(), "ses_test").await;
     let calls = platform.calls.lock().await.clone();
     let cards = supplement_continuations(&calls);
     assert_eq!(cards.len(), 2, "the failed slice then the remainder: {calls:?}");
@@ -1171,7 +1171,7 @@ async fn supplement_split_migrates_a_pending_question() {
         .await
         .insert("ses_test".into(), CardSession::new(acc, Some("om_live".into())));
     app.inflight.lock().await.insert("ses_test".to_string());
-    crate::bridge::render::flush_card(&app.cards_handle(), "ses_test").await;
+    crate::bridge::turn::flush::flush_card(&app.cards_handle(), "ses_test").await;
     app.question
         .remember_question(&question_request("que_live", "ses_test"), "/work")
         .await;
@@ -1360,7 +1360,7 @@ async fn the_chain_bound_never_refuses_a_supplement_split() {
 
     // The remaining slice is reconciled on the next flush: the full text
     // eventually renders across the chain.
-    crate::bridge::render::flush_card(&app.cards_handle(), "ses_test").await;
+    crate::bridge::turn::flush::flush_card(&app.cards_handle(), "ses_test").await;
     let delivered: String = platform
         .calls
         .lock()
@@ -1422,7 +1422,7 @@ async fn bound_exhaustion_does_not_overwrite_the_finalized_continuation() {
     let before = supplement_continuations(&calls);
     assert_eq!(
         before.len(),
-        crate::bridge::render::MAX_CARD_CHAIN,
+        crate::bridge::turn::flush::MAX_CARD_CHAIN,
         "the supplement flush ends at the chain bound: {:?}",
         platform.calls.lock().await
     );
@@ -1437,12 +1437,12 @@ async fn bound_exhaustion_does_not_overwrite_the_finalized_continuation() {
     );
 
     // The follow-up flush reconciles S09 on a NEW continuation.
-    crate::bridge::render::flush_card(&app.cards_handle(), "ses_test").await;
+    crate::bridge::turn::flush::flush_card(&app.cards_handle(), "ses_test").await;
     let calls = platform.calls.lock().await.clone();
     let after = supplement_continuations(&calls);
     assert_eq!(
         after.len(),
-        crate::bridge::render::MAX_CARD_CHAIN + 1,
+        crate::bridge::turn::flush::MAX_CARD_CHAIN + 1,
         "the remainder must land on a new continuation: {calls:?}"
     );
     let last = after.last().unwrap();

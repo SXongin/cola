@@ -5,15 +5,16 @@ use tracing::Instrument;
 
 use crate::bridge::handler::image_inputs;
 use crate::bridge::handles::TurnHandles;
-use crate::bridge::render::{
-    flush_card, render_and_flush, render_new_turn_parts, render_parts, render_poll_loop,
-};
+use crate::bridge::render::{render_and_flush, render_new_turn_parts, render_parts, render_poll_loop};
 use crate::bridge::span;
 use crate::bridge::streaming::StreamAccumulator;
+use crate::bridge::turn::flush::flush_card;
 use crate::config::ThreadKey;
 use crate::feishu::client::ImageAttachment;
 use crate::opencode;
 use crate::opencode::types::{SessionMessage, SessionStatus};
+
+pub(crate) mod flush;
 
 /// How long one Backend read in the post-prompt drain may take before it is
 /// abandoned. The drain's own bound caps this further per call: a hung

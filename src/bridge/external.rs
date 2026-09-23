@@ -4,8 +4,9 @@ use tokio::sync::Mutex;
 use tracing::Instrument;
 
 use crate::bridge::core::SharedCore;
-use crate::bridge::render::{flush_card, render_and_flush};
+use crate::bridge::render::render_and_flush;
 use crate::bridge::streaming::StreamAccumulator;
+use crate::bridge::turn::flush::flush_card;
 
 /// The external-message flow: watches for user messages that were NOT sent by
 /// cola (someone posted from OpenChamber or another client on the shared store)
