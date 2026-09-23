@@ -12,6 +12,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tracing::Instrument;
 
 const MAX_RECONNECT_DELAY_SECS: u64 = 30;
 
@@ -576,71 +577,94 @@ async fn handle_binary_frame(
             let Some(msg_data) = event_data.message else {
                 return Ok(());
             };
-            let payload = &frame.payload;
-            let payload_str = String::from_utf8_lossy(payload);
-            tracing::info!(
-                "WS event payload: {}",
-                &payload_str.chars().take(300).collect::<String>()
-            );
-            tracing::info!("WS event: type=im.message.receive_v1");
+            // The Event id only names the bot-mention line below; taken out
+            // before `event` is consumed so the handling block can take the
+            // event body by value.
+            let event_id = event.header.as_ref().and_then(|h| h.event_id.clone());
+            // ADR-0048: the inbound message path enters its chat/topic span at
+            // receipt. No Session exists yet, so the span carries only those
+            // fields — a lobby message records no topic, its thread id is its
+            // chat id — and the Turn's own span nests under it once a Session
+            // is chosen. The background image download runs on the spawned
+            // handler task, which inherits no span, so that task is
+            // instrumented explicitly with the same span.
+            let span = crate::bridge::span::message(&crate::config::ThreadKey::from_message(
+                &msg_data.chat_id,
+                msg_data.thread_id.as_deref(),
+            ));
+            let handler_span = span.clone();
+            async move {
+                let payload = &frame.payload;
+                let payload_str = String::from_utf8_lossy(payload);
+                tracing::info!(
+                    "WS event payload: {}",
+                    &payload_str.chars().take(300).collect::<String>()
+                );
+                tracing::info!("WS event: type=im.message.receive_v1");
 
-            let mut text = parse_message_content(&msg_data);
-            // Replace @mention placeholders (`@_user_N`) with real names so the
-            // AI sees who was referenced; the bot's own mention is dropped.
-            // Feishu otherwise leaks opaque `@_user_1` tokens into the prompt.
-            if !msg_data.mentions.is_empty() {
-                let bot_id = state.bot_open_id(feishu).await.unwrap_or_default();
-                if let Some(eid) = event.header.as_ref().and_then(|h| h.event_id.clone())
-                    && is_mentioned(&msg_data.mentions, &bot_id)
-                {
-                    tracing::info!("event {} mentions bot", eid);
-                }
-                text = strip_mentions(&text, &msg_data.mentions, &bot_id);
-            }
-            let thread_id = msg_data.thread_id.clone();
-            // Who sent the message: needed for the group completion notice.
-            let sender_open_id = event_data
-                .sender
-                .as_ref()
-                .and_then(|s| s.sender_id.as_ref())
-                .and_then(|i| i.open_id.clone());
-            tracing::info!(
-                "Message: chat={} type={} thread={} text={}",
-                msg_data.chat_id,
-                msg_data.chat_type,
-                thread_id.as_deref().unwrap_or("-"),
-                &text.chars().take(50).collect::<String>()
-            );
-            // Images embedded in this message (image/post) are downloaded on the
-            // spawned task so the WS read loop keeps reading (heartbeats, new
-            // messages, card actions) while a download is in flight.
-            let image_keys = extract_image_keys(&msg_data.content, &msg_data.message_type);
-            let msg_id = msg_data.message_id.clone();
-            let chat_id = msg_data.chat_id.clone();
-            let chat_type = msg_data.chat_type.clone();
-            let parent_id = msg_data.parent_id.clone();
-            let sink = sink.clone();
-            let feishu = feishu.clone();
-            tokio::spawn(async move {
-                let mut images = Vec::new();
-                for key in &image_keys {
-                    match feishu.download_image(&msg_id, key).await {
-                        Ok(img) => images.push(img),
-                        Err(e) => tracing::warn!("download image {} failed: {}", key, e),
+                let mut text = parse_message_content(&msg_data);
+                // Replace @mention placeholders (`@_user_N`) with real names so the
+                // AI sees who was referenced; the bot's own mention is dropped.
+                // Feishu otherwise leaks opaque `@_user_1` tokens into the prompt.
+                if !msg_data.mentions.is_empty() {
+                    let bot_id = state.bot_open_id(feishu).await.unwrap_or_default();
+                    if let Some(eid) = event_id.as_deref()
+                        && is_mentioned(&msg_data.mentions, &bot_id)
+                    {
+                        tracing::info!("event {} mentions bot", eid);
                     }
+                    text = strip_mentions(&text, &msg_data.mentions, &bot_id);
                 }
-                sink.handle_message(crate::bridge::IncomingMessage {
-                    message_id: msg_id,
-                    chat_id,
-                    chat_type,
-                    thread_id,
-                    parent_id,
-                    text,
-                    images,
-                    requester_open_id: sender_open_id,
-                })
-                .await;
-            });
+                let thread_id = msg_data.thread_id.clone();
+                // Who sent the message: needed for the group completion notice.
+                let sender_open_id = event_data
+                    .sender
+                    .as_ref()
+                    .and_then(|s| s.sender_id.as_ref())
+                    .and_then(|i| i.open_id.clone());
+                tracing::info!(
+                    "Message: chat={} type={} thread={} text={}",
+                    msg_data.chat_id,
+                    msg_data.chat_type,
+                    thread_id.as_deref().unwrap_or("-"),
+                    &text.chars().take(50).collect::<String>()
+                );
+                // Images embedded in this message (image/post) are downloaded on the
+                // spawned task so the WS read loop keeps reading (heartbeats, new
+                // messages, card actions) while a download is in flight.
+                let image_keys = extract_image_keys(&msg_data.content, &msg_data.message_type);
+                let msg_id = msg_data.message_id.clone();
+                let chat_id = msg_data.chat_id.clone();
+                let chat_type = msg_data.chat_type.clone();
+                let parent_id = msg_data.parent_id.clone();
+                let sink = sink.clone();
+                let feishu = feishu.clone();
+                tokio::spawn(
+                    async move {
+                        let mut images = Vec::new();
+                        for key in &image_keys {
+                            match feishu.download_image(&msg_id, key).await {
+                                Ok(img) => images.push(img),
+                                Err(e) => tracing::warn!("download image {} failed: {}", key, e),
+                            }
+                        }
+                        sink.handle_message(crate::bridge::IncomingMessage {
+                            message_id: msg_id,
+                            chat_id,
+                            chat_type,
+                            thread_id,
+                            parent_id,
+                            text,
+                            images,
+                            requester_open_id: sender_open_id,
+                        })
+                        .await;
+                    }
+                    .instrument(handler_span),
+                );
+            }
+            .instrument(span)
+            .await;
         }
         FrameAction::CardAction(value) => {
             // Ack ALWAYS — even an unparseable card action must be acked,
@@ -1457,6 +1481,16 @@ mod transport_tests {
         )
     }
 
+    /// A group-topic `im.message.receive_v1` payload: the message carries a
+    /// `thread_id`, so the inbound path's span must record both chat and topic.
+    fn topic_receive_payload(event_id: &str, create_time_ms: i64) -> Vec<u8> {
+        format!(
+            r#"{{"header":{{"event_id":"{}","event_type":"im.message.receive_v1","create_time":"{}"}},"event":{{"sender":{{"sender_id":{{"open_id":"ou_1"}}}},"message":{{"message_id":"om_topic","chat_id":"oc_topic","chat_type":"group","thread_id":"omt_topic","message_type":"text","content":"{{\"text\":\"hi\"}}"}}}}}}"#,
+            event_id, create_time_ms
+        )
+        .into_bytes()
+    }
+
     fn card_action_payload() -> Vec<u8> {
         serde_json::json!({
             "header": { "event_type": "card.action.trigger", "event_id": "e_card" },
@@ -1561,6 +1595,59 @@ mod transport_tests {
             .expect("listener task did not finish after close")
             .expect("listener task panicked");
         assert!(result.is_ok(), "a clean close should end the loop with Ok");
+    }
+
+    /// ADR-0048: the inbound message path enters its chat/topic span at receipt
+    /// — before any Session exists (this sink resolves none) — so even the
+    /// transport lines are retrievable by the conversation. The receipt lines
+    /// carry no chat of their own: their fields can only come from the span.
+    #[tokio::test]
+    async fn inbound_message_receipt_carries_chat_and_topic() {
+        let rig = rig().await;
+        let recorder = Arc::new(RecordingSink::default());
+        let sink: Arc<dyn EventSink> = recorder.clone();
+
+        let (_, logs) = crate::bridge::test_support::capture_logs(async {
+            let listener = tokio::spawn({
+                let sink = Arc::clone(&sink);
+                let feishu = Arc::clone(&rig.feishu);
+                let state = Arc::clone(&rig.state);
+                async move { connect_and_listen(&sink, &feishu, &state).await }
+            });
+
+            let mut socket = rig.ws.accept().await;
+            socket
+                .send_binary(event_bytes(&topic_receive_payload(
+                    "e_topic",
+                    chrono::Utc::now().timestamp_millis(),
+                )))
+                .await;
+            let ack = Frame::decode(&socket.next_binary(Duration::from_secs(5)).await).expect("ack decodes");
+            let ack_json: serde_json::Value = serde_json::from_slice(&ack.payload).expect("ack json");
+            assert_eq!(ack_json["code"], 200);
+            wait_for_texts(&recorder, 1).await;
+
+            socket.close().await;
+            let result = tokio::time::timeout(Duration::from_secs(5), listener)
+                .await
+                .expect("listener task did not finish after close")
+                .expect("listener task panicked");
+            assert!(result.is_ok(), "a clean close should end the loop with Ok");
+        })
+        .await;
+
+        let receipt = logs
+            .lines()
+            .find(|line| line.contains("WS event: type=im.message.receive_v1"))
+            .unwrap_or_else(|| panic!("no inbound receipt line was captured:\n{logs}"));
+        assert!(
+            receipt.contains("chat=oc_topic"),
+            "the receipt carries the chat: {receipt}"
+        );
+        assert!(
+            receipt.contains("topic=omt_topic"),
+            "the receipt carries the topic: {receipt}"
+        );
     }
 
     /// A card action stuck in its handler must still be answered before Feishu's
