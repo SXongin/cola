@@ -302,7 +302,7 @@ async fn card_command_splits_the_chain_and_the_continuation_takes_over() {
         let mut cards = app.cards.lock().await;
         cards.get_mut("ses_test").unwrap().acc.push_text("后续进度。");
     }
-    crate::bridge::turn::flush::flush_card(&app.cards_handle(), "ses_test").await;
+    crate::bridge::turn::Turn::flush_card(&app.cards_handle(), "ses_test").await;
     let calls = platform.calls.lock().await.clone();
     let last_update = calls
         .iter()

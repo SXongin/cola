@@ -1,20 +1,19 @@
+mod flush;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::Instrument;
 
 use crate::bridge::handler::image_inputs;
-use crate::bridge::handles::TurnHandles;
+use crate::bridge::handles::{CardsHandle, TurnHandles};
 use crate::bridge::render::{render_and_flush, render_new_turn_parts, render_parts, render_poll_loop};
 use crate::bridge::span;
 use crate::bridge::streaming::StreamAccumulator;
-use crate::bridge::turn::flush::flush_card;
 use crate::config::ThreadKey;
 use crate::feishu::client::ImageAttachment;
 use crate::opencode;
 use crate::opencode::types::{SessionMessage, SessionStatus};
-
-pub(crate) mod flush;
 
 /// How long one Backend read in the post-prompt drain may take before it is
 /// abandoned. The drain's own bound caps this further per call: a hung
@@ -119,8 +118,9 @@ pub(crate) struct Turn {
 
 impl Turn {
     /// Run one prompt end-to-end: `start` → `attempt` (→ `recreate` + `attempt`
-    /// on a stale mapping) → `finish`. The only public entry; the phases are
-    /// internal seams.
+    /// on a stale mapping) → `finish`. The lifecycle entry; the phases are
+    /// internal seams, and the module's other surface is the card-delivery
+    /// interface below.
     ///
     /// `handles` is the narrow bundle the coordinator built for this turn
     /// (spec #298, A1): sessions, cards, the request and wait state, the
@@ -542,7 +542,7 @@ impl Turn {
         // on a failed prompt too — the card already carries that usage.
         crate::bridge::streaming::refresh_context_window(&handles.cards, &handles.backend, &self.session_id)
             .await;
-        flush_card(&handles.cards, &self.session_id).await;
+        Self::flush_card(&handles.cards, &self.session_id).await;
 
         // Topic cover card (ADR-0023): once the server holds a real title for
         // the session — auto-generated after the first exchange, or set by
@@ -830,6 +830,68 @@ impl Turn {
             }
             None => None,
         }
+    }
+}
+
+/// Upper bound on continuation cards sent for one flush (each is a new
+/// message): content beyond it is reconciled on the next flush. A pending
+/// split gets one slot past the bound, so a Supplement is never refused by it.
+pub(crate) const MAX_CARD_CHAIN: usize = 8;
+
+/// The Turn's card-delivery interface (spec #298, A2a): the operations sibling
+/// flows invoke when they own the trigger moment — the render poll, the
+/// request poller surfacing an inline block, the external renderer finalizing
+/// a card, a Supplement arriving mid-turn, or an explicit `/card` pull. The
+/// flush/split state machine behind them is private to the `flush` submodule.
+impl Turn {
+    /// Flush `session_id`'s live card to Feishu now, under the session's
+    /// card-write lock.
+    ///
+    /// One card writer per session at a time. A flush is a read-send-record
+    /// sequence, and callers are concurrent (the render poll, the request
+    /// poller surfacing a block, a click's ack fallback); interleaved, the
+    /// second writer still names the card the first just finalized and PATCHes
+    /// its continuation slice onto it — two identical messages, only one
+    /// tracked and repaintable. The resolution paths take the same lock
+    /// (`resolve_blocks`), so a click cannot be overwritten by a stale flush.
+    pub(crate) async fn flush_card(cards: &CardsHandle, session_id: &str) {
+        let write_lock = cards.write_lock(session_id).await;
+        let _guard = write_lock.lock().await;
+        flush::flush_card_locked(cards, session_id).await;
+    }
+
+    /// Split `session_id`'s Card Chain at a user message (ADR-0043): append the
+    /// split to the chain's split queue and flush. The flush finalizes the live
+    /// card with the standard split header (keeping everything before the split)
+    /// and sends a continuation that replies to the NEWEST queued split, carrying
+    /// one receipt per queued split plus only the content that arrives after the
+    /// split — so the live card stays the newest message and no supplement is
+    /// coalesced away. `kind` selects the receipt line and nothing else: a
+    /// Supplement and an explicit `/card` pull follow the same finalize-and-handoff
+    /// path. Runs under the session's card-write lock, so concurrent requests
+    /// queue in arrival order and the finalization reuses the size-split path (the
+    /// live Interaction Blocks migrate to the continuation; the previous card's
+    /// controls are settled). No-op when the session has no live card.
+    pub(crate) async fn split_card_chain(
+        cards: &CardsHandle,
+        session_id: &str,
+        reply_to: &str,
+        kind: crate::bridge::streaming::SplitKind,
+    ) {
+        let write_lock = cards.write_lock(session_id).await;
+        let _guard = write_lock.lock().await;
+        {
+            let mut live = cards.cards.lock().await;
+            let Some(card) = live.get_mut(session_id) else {
+                return;
+            };
+            card.pending_split.push(crate::bridge::streaming::PendingSplit {
+                reply_to: reply_to.to_string(),
+                kind,
+                receipt_pushed: false,
+            });
+        }
+        flush::flush_card_locked(cards, session_id).await;
     }
 }
 

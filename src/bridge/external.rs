@@ -6,7 +6,7 @@ use tracing::Instrument;
 use crate::bridge::core::SharedCore;
 use crate::bridge::render::render_and_flush;
 use crate::bridge::streaming::StreamAccumulator;
-use crate::bridge::turn::flush::flush_card;
+use crate::bridge::turn::Turn;
 
 /// The external-message flow: watches for user messages that were NOT sent by
 /// cola (someone posted from OpenChamber or another client on the shared store)
@@ -659,7 +659,7 @@ async fn finalize_done(core: &Arc<SharedCore>, session_id: &str) {
             card.acc.card_state = crate::feishu::card::CardState::Done;
         }
     }
-    flush_card(&core.cards_handle(), session_id).await;
+    Turn::flush_card(&core.cards_handle(), session_id).await;
 }
 
 /// Whether the model has finished answering the external message: an assistant

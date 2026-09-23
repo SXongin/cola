@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
 use crate::bridge::handles::{CardsHandle, SessionsHandle};
 use crate::bridge::streaming::StreamAccumulator;
-use crate::bridge::turn::flush::flush_card;
+use crate::bridge::turn::Turn;
 use crate::opencode;
 
 /// The session/thread name shown as the card subtitle, formatted as
@@ -95,7 +95,7 @@ pub(crate) async fn refresh_session_title(
     );
     card.acc.title = fresh;
     drop(live);
-    flush_card(cards, session_id).await;
+    Turn::flush_card(cards, session_id).await;
     // The topic cover card is the chat-list topic entry — sync it the MOMENT
     // the server title changes mid-turn (not only at turn end), so the list
     // entry updates as early as the title agent finishes (ADR-0023). Only
@@ -525,7 +525,7 @@ pub(crate) async fn render_and_flush(
         }
     };
     if changed || header_changed || context_changed {
-        flush_card(cards, session_id).await;
+        Turn::flush_card(cards, session_id).await;
     }
     Some((new_parts, text_len, reasoning_len))
 }

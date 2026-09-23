@@ -793,7 +793,7 @@ pub(crate) async fn handle_command(
                 return Ok(());
             }
             tracing::info!("card pull: session {session_id} live card split requested");
-            crate::bridge::turn::flush::split_card_chain(
+            crate::bridge::turn::Turn::split_card_chain(
                 &core.cards_handle(),
                 &session_id,
                 message_id,

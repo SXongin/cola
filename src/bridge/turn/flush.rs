@@ -1,20 +1,15 @@
-//! The Turn's card flush path and the Card Chain split (spec #298, A2a).
+//! The Turn's card flush/split state machine (spec #298, A2a).
 //!
-//! A flush is the read-send-record sequence over one session's live card; a
-//! split finalizes that card at a user message and hands the delta to a
-//! continuation. Both are internals of the Turn module. The card-delivery
-//! helpers other flows genuinely use (target resolution, stale marking) stay in
-//! their owning modules; the request poller, external rendering, the supplement
-//! handler and the `/card` pull reach card delivery through [`flush_card`] and
-//! [`split_card_chain`].
+//! The operations sibling flows invoke live on `Turn` (`Turn::flush_card` /
+//! `Turn::split_card_chain`) in the parent module; this module owns how a card
+//! is built, sent, advanced and degraded, and nothing here is reachable from
+//! outside the Turn module. The card-delivery helpers other flows genuinely use
+//! (target resolution, stale marking) stay in their owning modules.
+
+use super::MAX_CARD_CHAIN;
 
 use crate::bridge::card_handles::RenderedBlock;
 use crate::bridge::handles::CardsHandle;
-
-/// Push the accumulator's current card to Feishu as an update of the loading
-/// card, so the user sees reasoning/tool/text appear incrementally.
-/// Upper bound on continuation cards sent for one flush (each is a new message).
-pub(crate) const MAX_CARD_CHAIN: usize = 8;
 
 /// The one-line receipt a supplement leaves on its continuation card (ADR-0043)
 /// — the same visual form as an Interaction Receipt, keyed in timeline order.
@@ -24,40 +19,6 @@ const SUPPLEMENT_RECEIPT: &str = "📨 已收到补充";
 /// 2026-09-22 amendment) — the pull's acknowledgement, same visual form as an
 /// Interaction Receipt.
 const PULL_RECEIPT: &str = "⏬ 实时卡片已移到底部";
-
-/// Split `session_id`'s Card Chain at a user message (ADR-0043): append the
-/// split to the chain's split queue and flush. The flush finalizes the live
-/// card with the standard split header (keeping everything before the split)
-/// and sends a continuation that replies to the NEWEST queued split, carrying
-/// one receipt per queued split plus only the content that arrives after the
-/// split — so the live card stays the newest message and no supplement is
-/// coalesced away. `kind` selects the receipt line and nothing else: a
-/// Supplement and an explicit `/card` pull follow the same finalize-and-handoff
-/// path. Runs under the session's card-write lock, so concurrent requests
-/// queue in arrival order and the finalization reuses the size-split path (the
-/// live Interaction Blocks migrate to the continuation; the previous card's
-/// controls are settled). No-op when the session has no live card.
-pub(crate) async fn split_card_chain(
-    cards: &CardsHandle,
-    session_id: &str,
-    reply_to: &str,
-    kind: crate::bridge::streaming::SplitKind,
-) {
-    let write_lock = cards.write_lock(session_id).await;
-    let _guard = write_lock.lock().await;
-    {
-        let mut live = cards.cards.lock().await;
-        let Some(card) = live.get_mut(session_id) else {
-            return;
-        };
-        card.pending_split.push(crate::bridge::streaming::PendingSplit {
-            reply_to: reply_to.to_string(),
-            kind,
-            receipt_pushed: false,
-        });
-    }
-    flush_card_locked(cards, session_id).await;
-}
 
 /// Whether `e` is Feishu's deterministic card-content rejection (`230099`).
 /// The same card JSON fails on every retry, so the flush degrades instead.
@@ -93,20 +54,10 @@ async fn advance_card_fallback(cards: &CardsHandle, session_id: &str) -> Fallbac
     }
 }
 
-pub(crate) async fn flush_card(cards: &CardsHandle, session_id: &str) {
-    // One card writer per session at a time. A flush is a read-send-record
-    // sequence, and callers are concurrent (the render poll, the request
-    // poller surfacing a block, a click's ack fallback); interleaved, the
-    // second writer still names the card the first just finalized and PATCHes
-    // its continuation slice onto it — two identical messages, only one
-    // tracked and repaintable. The resolution paths take the same lock
-    // (`resolve_blocks`), so a click cannot be overwritten by a stale flush.
-    let write_lock = cards.write_lock(session_id).await;
-    let _guard = write_lock.lock().await;
-    flush_card_locked(cards, session_id).await;
-}
-
-async fn flush_card_locked(cards: &CardsHandle, session_id: &str) {
+/// The flush machine proper, entered with the session's card-write lock
+/// already held by [`Turn::flush_card`](super::Turn::flush_card) or
+/// [`Turn::split_card_chain`](super::Turn::split_card_chain).
+pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str) {
     // The card-chain state a flush resumes from: a pending Supplement split
     // (ADR-0043) and whether the tracked card is still the live (growing) one.
     // Both survive the flush — a chain that exhausted the size bound, or died
@@ -401,11 +352,11 @@ mod tests {
     //! degrade every model-markdown element to a code fence (the one form the
     //! parser accepts unconditionally), and retry the same slice once.
 
-    use super::*;
     use std::sync::Arc;
 
     use crate::bridge::streaming::{CardFallback, CardSession, StreamAccumulator};
     use crate::bridge::test_support::*;
+    use crate::bridge::turn::Turn;
     use crate::feishu::card::CardState;
 
     /// The markdown content of the first body element.
@@ -487,7 +438,7 @@ mod tests {
             .fail_update_card_content_count
             .store(1, std::sync::atomic::Ordering::SeqCst);
 
-        flush_card(&app.cards_handle(), "ses_test").await;
+        Turn::flush_card(&app.cards_handle(), "ses_test").await;
 
         let updates = updates_of(&platform, "om_live").await;
         assert_eq!(
@@ -538,7 +489,7 @@ mod tests {
             .fail_update_card_content_count
             .store(1, std::sync::atomic::Ordering::SeqCst);
 
-        flush_card(&app.cards_handle(), "ses_test").await;
+        Turn::flush_card(&app.cards_handle(), "ses_test").await;
 
         let updates = updates_of(&platform, "om_live").await;
         assert_eq!(
@@ -588,7 +539,7 @@ mod tests {
             .fail_reply_card_content_count
             .store(1, std::sync::atomic::Ordering::SeqCst);
 
-        flush_card(&app.cards_handle(), "ses_test").await;
+        Turn::flush_card(&app.cards_handle(), "ses_test").await;
 
         let cards = sent_cards(&platform).await;
         assert_eq!(
@@ -616,7 +567,7 @@ mod tests {
             .fail_update_card_content_count
             .store(2, std::sync::atomic::Ordering::SeqCst);
 
-        flush_card(&app.cards_handle(), "ses_test").await;
+        Turn::flush_card(&app.cards_handle(), "ses_test").await;
         assert_eq!(
             updates_of(&platform, "om_live").await.len(),
             2,
@@ -628,7 +579,7 @@ mod tests {
         );
 
         // A later poll must not PATCH the suspended card again.
-        flush_card(&app.cards_handle(), "ses_test").await;
+        Turn::flush_card(&app.cards_handle(), "ses_test").await;
         assert_eq!(
             updates_of(&platform, "om_live").await.len(),
             2,
