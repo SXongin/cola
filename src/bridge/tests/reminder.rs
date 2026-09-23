@@ -467,7 +467,7 @@ async fn a_long_p2p_turn_sends_a_completion_notice() {
 
     let turn = {
         let app = Arc::clone(&app);
-        tokio::spawn(async move { Turn::run(&app, turn_ctx("ses_test")).await })
+        tokio::spawn(async move { Turn::run(&app.turn_handles(), turn_ctx("ses_test")).await })
     };
     tokio::time::sleep(Duration::from_millis(30)).await;
     gate.add_permits(1);
@@ -500,7 +500,9 @@ async fn a_short_p2p_turn_sends_no_completion_notice() {
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
     app.long_task_notice_ms.store(60_000, Ordering::Relaxed);
 
-    Turn::run(&app, turn_ctx("ses_test")).await.unwrap();
+    Turn::run(&app.turn_handles(), turn_ctx("ses_test"))
+        .await
+        .unwrap();
 
     assert!(
         platform.completion_notices().await.is_empty(),
@@ -528,7 +530,7 @@ async fn a_long_p2p_turn_without_the_opt_in_sends_nothing() {
 
     let turn = {
         let app = Arc::clone(&app);
-        tokio::spawn(async move { Turn::run(&app, turn_ctx("ses_test")).await })
+        tokio::spawn(async move { Turn::run(&app.turn_handles(), turn_ctx("ses_test")).await })
     };
     tokio::time::sleep(Duration::from_millis(30)).await;
     gate.add_permits(1);

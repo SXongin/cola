@@ -1,7 +1,8 @@
-use crate::bridge::core::SharedCore;
+use crate::bridge::handles::CardsHandle;
 use crate::feishu::card::shell::CardBuilder;
 use crate::feishu::card::tool_render::ToolPanel;
 use crate::feishu::card::{AwaitingAction, CardState};
+use crate::opencode;
 use indexmap::IndexMap;
 use std::sync::Arc;
 
@@ -1440,15 +1441,15 @@ impl StreamAccumulator {
 /// work. The read shells out to git, so it runs OUTSIDE the cards lock; the
 /// lock only wraps the field swap. Best effort: a missing card or directory is
 /// a no-op, and a failed read keeps the start capture (`apply_git_state`).
-pub(crate) async fn refresh_work_context(core: &Arc<SharedCore>, session_id: &str) {
+pub(crate) async fn refresh_work_context(cards: &CardsHandle, session_id: &str) {
     let dir = {
-        let cards = core.cards.lock().await;
-        cards.get(session_id).and_then(|c| c.acc.directory.clone())
+        let live = cards.cards.lock().await;
+        live.get(session_id).and_then(|c| c.acc.directory.clone())
     };
     let Some(dir) = dir else { return };
     let state = crate::git::read_state(&dir).await;
-    let mut cards = core.cards.lock().await;
-    if let Some(card) = cards.get_mut(session_id) {
+    let mut live = cards.cards.lock().await;
+    if let Some(card) = live.get_mut(session_id) {
         card.acc.apply_git_state(state);
     }
 }
@@ -1461,10 +1462,14 @@ pub(crate) async fn refresh_work_context(core: &Arc<SharedCore>, session_id: &st
 /// (network); the lock only wraps the memo swap. Best effort: a missing card,
 /// no usage yet, or a failed request leaves the memo unset so a later poll
 /// retries.
-pub(crate) async fn refresh_context_window(core: &Arc<SharedCore>, session_id: &str) {
+pub(crate) async fn refresh_context_window(
+    cards: &CardsHandle,
+    backend: &Arc<dyn opencode::Backend>,
+    session_id: &str,
+) {
     let key = {
-        let cards = core.cards.lock().await;
-        let Some(acc) = cards.get(session_id).map(|c| &c.acc) else {
+        let live = cards.cards.lock().await;
+        let Some(acc) = live.get(session_id).map(|c| &c.acc) else {
             return;
         };
         // Before the first usage there is nothing any card could show.
@@ -1480,11 +1485,11 @@ pub(crate) async fn refresh_context_window(core: &Arc<SharedCore>, session_id: &
         }
         key
     };
-    let Ok(window) = core.opencode.model_context_window(&key.0, &key.1).await else {
+    let Ok(window) = backend.model_context_window(&key.0, &key.1).await else {
         return;
     };
-    let mut cards = core.cards.lock().await;
-    if let Some(acc) = cards.get_mut(session_id).map(|c| &mut c.acc)
+    let mut live = cards.cards.lock().await;
+    if let Some(acc) = live.get_mut(session_id).map(|c| &mut c.acc)
         // A concurrent refresh may have moved the memo to a newer model while
         // this request was in flight; never clobber it with a stale answer.
         && acc

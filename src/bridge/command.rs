@@ -652,7 +652,13 @@ pub(crate) async fn handle_command(
             if let Some(id) = core.get_session_id(&thread_key).await {
                 core.opencode.update_session_title(&id, &name).await?;
                 core.invalidate_session_list_cache().await;
-                crate::bridge::topic::sync_topic_cover_title(core, &id).await;
+                crate::bridge::topic::sync_topic_cover_title(
+                    &core.cards_handle(),
+                    &core.sessions_handle(),
+                    &core.opencode,
+                    &id,
+                )
+                .await;
                 core.feishu
                     .reply_text(message_id, &format!("Renamed to \"{}\".", name))
                     .await?;
@@ -712,7 +718,8 @@ pub(crate) async fn handle_command(
                             // renders one of the blocks.
                             crate::bridge::request::resolve_blocks(
                                 &core.permission,
-                                core,
+                                &core.cards_handle(),
+                                &core.requests_handle(),
                                 &Some(id.to_string()),
                                 id,
                                 crate::bridge::request::Origin::Command,
@@ -787,7 +794,7 @@ pub(crate) async fn handle_command(
             }
             tracing::info!("card pull: session {session_id} live card split requested");
             crate::bridge::render::split_card_chain(
-                core,
+                &core.cards_handle(),
                 &session_id,
                 message_id,
                 crate::bridge::streaming::SplitKind::Pull,

@@ -16,9 +16,11 @@ use tracing::Instrument;
 
 use crate::bridge::core::SharedCore;
 use crate::bridge::display::{dir_basename, id_tail, model_display};
+use crate::bridge::handles::{CardsHandle, SessionsHandle};
 use crate::bridge::session::PendingEntry;
 use crate::config::{SessionEntry, ThreadKey};
 use crate::error::BridgeError;
+use crate::opencode;
 use crate::opencode::types::SessionListInfo;
 
 /// What kind of topic to open: one around a brand-new session (`/topic`, the
@@ -89,7 +91,7 @@ pub(crate) async fn open_topic(
     // the Chat — plus whatever Topic the adopted Session is already mapped to.
     let chat_key = ThreadKey::new(chat_id.to_string(), chat_id.to_string());
     let thread_key = match span_session {
-        Some(id) => crate::bridge::span::thread_key_of(core, id)
+        Some(id) => crate::bridge::span::thread_key_of(&core.sessions_handle(), id)
             .await
             .unwrap_or(chat_key),
         None => chat_key,
@@ -380,21 +382,30 @@ async fn open_cover_topic(
 ///
 /// The sync runs inside the Session's `topic` span (ADR-0048): the line that
 /// records the retitle is the state transition a topic trace is read for.
-pub(crate) async fn sync_topic_cover_title(core: &Arc<SharedCore>, session_id: &str) -> bool {
-    let thread_key = crate::bridge::span::thread_key_of(core, session_id).await;
+pub(crate) async fn sync_topic_cover_title(
+    cards: &CardsHandle,
+    sessions: &SessionsHandle,
+    backend: &Arc<dyn opencode::Backend>,
+    session_id: &str,
+) -> bool {
+    let thread_key = crate::bridge::span::thread_key_of(sessions, session_id).await;
     let span = crate::bridge::span::topic(Some(session_id), thread_key.as_ref());
-    sync_topic_cover_title_inner(core, session_id)
+    sync_topic_cover_title_inner(cards, sessions, backend, session_id)
         .instrument(span)
         .await
 }
 
 /// [`sync_topic_cover_title`]'s body, run inside its Session's `topic` span.
-async fn sync_topic_cover_title_inner(core: &Arc<SharedCore>, session_id: &str) -> bool {
+async fn sync_topic_cover_title_inner(
+    cards: &CardsHandle,
+    sessions: &SessionsHandle,
+    backend: &Arc<dyn opencode::Backend>,
+    session_id: &str,
+) -> bool {
     let (root_id, directory, agent, recorded) = {
-        let store = core.sessions.lock().await;
-        match store.entry_for_session(session_id) {
+        match sessions.entry_for_session(session_id).await {
             Some(e) => {
-                let recorded = core.cover_titles.lock().await.get(session_id).cloned();
+                let recorded = cards.cover_titles.lock().await.get(session_id).cloned();
                 (
                     e.topic_root.clone(),
                     e.directory.clone(),
@@ -408,7 +419,7 @@ async fn sync_topic_cover_title_inner(core: &Arc<SharedCore>, session_id: &str) 
     let (Some(root_id), Some(recorded)) = (root_id, recorded) else {
         return true;
     };
-    let Ok(info) = core.opencode.session_info(session_id, Some(&directory)).await else {
+    let Ok(info) = backend.session_info(session_id, Some(&directory)).await else {
         return false;
     };
     // Never patch a default title over the recorded one: the server's initial
@@ -434,10 +445,10 @@ async fn sync_topic_cover_title_inner(core: &Arc<SharedCore>, session_id: &str) 
     )
     .await;
     let card = crate::feishu::client::markdown_card(&text);
-    match core.feishu.update_message(&root_id, &card).await {
+    match cards.feishu.update_message(&root_id, &card).await {
         Ok(()) => {
             tracing::info!("topic cover card updated for session {}: {}", session_id, title);
-            core.cover_titles.lock().await.insert(
+            cards.cover_titles.lock().await.insert(
                 session_id.to_string(),
                 crate::bridge::core::CoverTitle {
                     title,
@@ -463,9 +474,16 @@ async fn sync_topic_cover_title_inner(core: &Arc<SharedCore>, session_id: &str) 
 /// minutes, leaving later turns' hooks to catch up. Detached task: holds no
 /// locks across sleeps. Only meaningful when the initial sync did not settle —
 /// callers gate on its return value.
-pub(crate) fn spawn_cover_title_retry(core: &Arc<SharedCore>, session_id: &str) {
+pub(crate) fn spawn_cover_title_retry(
+    cards: &CardsHandle,
+    sessions: &SessionsHandle,
+    backend: &Arc<dyn opencode::Backend>,
+    session_id: &str,
+) {
     spawn_cover_title_retry_at(
-        core,
+        cards,
+        sessions,
+        backend,
         session_id,
         &[
             std::time::Duration::from_secs(10),
@@ -480,11 +498,15 @@ pub(crate) fn spawn_cover_title_retry(core: &Arc<SharedCore>, session_id: &str) 
 /// millisecond delays). `delays` are ABSOLUTE offsets from the call: attempts
 /// happen at each listed time after spawn, not after the previous attempt.
 pub(crate) fn spawn_cover_title_retry_at(
-    core: &Arc<SharedCore>,
+    cards: &CardsHandle,
+    sessions: &SessionsHandle,
+    backend: &Arc<dyn opencode::Backend>,
     session_id: &str,
     delays: &[std::time::Duration],
 ) {
-    let core = Arc::clone(core);
+    let cards = cards.clone();
+    let sessions = sessions.clone();
+    let backend = Arc::clone(backend);
     let sid = session_id.to_string();
     let delays = delays.to_vec();
     tokio::spawn(async move {
@@ -494,7 +516,7 @@ pub(crate) fn spawn_cover_title_retry_at(
             if delay > elapsed {
                 tokio::time::sleep(delay - elapsed).await;
             }
-            if sync_topic_cover_title(&core, &sid).await {
+            if sync_topic_cover_title(&cards, &sessions, &backend, &sid).await {
                 return;
             }
         }
@@ -554,7 +576,13 @@ pub(crate) async fn claim_pending_cover(core: &Arc<SharedCore>, key: &ThreadKey,
         }
     };
     if claimed {
-        sync_topic_cover_title(core, session_id).await;
+        sync_topic_cover_title(
+            &core.cards_handle(),
+            &core.sessions_handle(),
+            &core.opencode,
+            session_id,
+        )
+        .await;
     }
 }
 

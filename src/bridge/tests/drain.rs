@@ -104,7 +104,7 @@ async fn scripted_app(
 /// Start the turn on its own task (the test drives the Backend while it drains).
 fn spawn_turn(app: &Arc<App>, context: PromptContext) -> tokio::task::JoinHandle<crate::error::Result<()>> {
     let app = Arc::clone(app);
-    tokio::spawn(async move { Turn::run(&app, context).await })
+    tokio::spawn(async move { Turn::run(&app.turn_handles(), context).await })
 }
 
 /// Await a card update carrying `needle`, or panic after 5 s.
@@ -453,7 +453,7 @@ async fn the_drain_bound_exits_cleanly_and_finishes_the_turn() {
     context.is_group = true;
     context.requester_open_id = Some(TEST_HOST.to_string());
 
-    Turn::run(&app, context).await.unwrap();
+    Turn::run(&app.turn_handles(), context).await.unwrap();
 
     assert!(
         backend.messages_calls.lock().await.len() > 1,
@@ -491,7 +491,9 @@ async fn a_message_after_the_release_becomes_a_normal_new_turn() {
     ];
     let (_dir, app, backend, platform) = scripted_app(vec![timeline], Some(SessionStatus::Idle)).await;
 
-    Turn::run(&app, ctx("ses_test", "第一条消息")).await.unwrap();
+    Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
+        .await
+        .unwrap();
     assert!(
         !app.inflight.lock().await.contains("ses_test"),
         "the guard is released"
@@ -767,7 +769,9 @@ async fn an_idle_session_exits_the_drain_without_waiting() {
     let (_dir, app, _backend, platform) = scripted_app(vec![timeline], Some(SessionStatus::Idle)).await;
 
     let started = std::time::Instant::now();
-    Turn::run(&app, ctx("ses_test", "第一条消息")).await.unwrap();
+    Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
+        .await
+        .unwrap();
 
     assert!(
         started.elapsed() < Duration::from_secs(1),

@@ -533,7 +533,7 @@ pub(crate) async fn reminder_target(
     directory: &str,
 ) -> Option<ReminderTarget> {
     let (host, is_group, requester, generation) =
-        crate::bridge::pollers::walk_parent_chain(core, session_id, Some(directory), |current| {
+        crate::bridge::pollers::walk_parent_chain(&core.opencode, session_id, Some(directory), |current| {
             let current = current.to_string();
             async move {
                 let cards = core.cards.lock().await;

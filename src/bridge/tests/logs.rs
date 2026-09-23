@@ -70,7 +70,8 @@ async fn turn_start_anchor_carries_session_chat_topic_directory_and_prompt_chars
 
     // Four CJK characters: a byte length would read 12, so this pins `chars()`.
     let prompt = "分析目录";
-    let (result, logs) = capture_logs(async { Turn::run(&app, prompt_context(topic, prompt)).await }).await;
+    let (result, logs) =
+        capture_logs(async { Turn::run(&app.turn_handles(), prompt_context(topic, prompt)).await }).await;
     result.unwrap();
 
     let anchor = line_with(&logs, "turn start:");
@@ -109,7 +110,8 @@ async fn a_lobby_turn_omits_the_topic_field() {
     let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
     seed_session(&app, "ses_test", "/work").await;
 
-    let (result, logs) = capture_logs(async { Turn::run(&app, prompt_context(lobby(), "hi")).await }).await;
+    let (result, logs) =
+        capture_logs(async { Turn::run(&app.turn_handles(), prompt_context(lobby(), "hi")).await }).await;
     result.unwrap();
 
     let anchor = line_with(&logs, "turn start:");
@@ -166,7 +168,8 @@ async fn render_poll_and_final_render_lines_carry_the_session() {
         gate.add_permits(1);
     });
 
-    let (result, logs) = capture_logs(async { Turn::run(&app, prompt_context(lobby(), "hi")).await }).await;
+    let (result, logs) =
+        capture_logs(async { Turn::run(&app.turn_handles(), prompt_context(lobby(), "hi")).await }).await;
     result.unwrap();
     releaser.await.unwrap();
 
@@ -220,7 +223,8 @@ async fn the_render_poll_logs_at_info_only_on_progress() {
         gate.add_permits(1);
     });
 
-    let (result, logs) = capture_logs(async { Turn::run(&app, prompt_context(lobby(), "hi")).await }).await;
+    let (result, logs) =
+        capture_logs(async { Turn::run(&app.turn_handles(), prompt_context(lobby(), "hi")).await }).await;
     result.unwrap();
     releaser.await.unwrap();
 
@@ -259,7 +263,8 @@ async fn a_recreated_turn_traces_under_the_fresh_session() {
     // Both attempts await their poll's stop, which waits out one cadence.
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
 
-    let (result, logs) = capture_logs(async { Turn::run(&app, prompt_context(lobby(), "hi")).await }).await;
+    let (result, logs) =
+        capture_logs(async { Turn::run(&app.turn_handles(), prompt_context(lobby(), "hi")).await }).await;
     result.unwrap();
 
     let anchor = line_with(&logs, "turn start:");
@@ -580,9 +585,16 @@ async fn a_topic_cover_retitle_carries_the_session_chat_and_topic() {
     .await;
     seed_cover_title(&app, "ses_test", "旧名字").await;
 
-    let (settled, logs) =
-        capture_logs(async { crate::bridge::topic::sync_topic_cover_title(&app.core, "ses_test").await })
-            .await;
+    let (settled, logs) = capture_logs(async {
+        crate::bridge::topic::sync_topic_cover_title(
+            &app.cards_handle(),
+            &app.sessions_handle(),
+            &app.opencode,
+            "ses_test",
+        )
+        .await
+    })
+    .await;
     assert!(settled, "the retitle must settle");
 
     let retitled = line_with(&logs, "topic cover card updated");

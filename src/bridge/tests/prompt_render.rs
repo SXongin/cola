@@ -441,11 +441,12 @@ async fn subtitle_falls_back_to_id_tail_without_server_title() {
     // No server title → the id-tail alone identifies the session (no cola
     // side name to fall back on; the current prompt is never echoed).
     assert_eq!(
-        crate::bridge::render::session_subtitle(&app.core, &key, "另一个问题").await,
+        crate::bridge::render::session_subtitle(&app.sessions_handle(), &app.opencode, &key, "另一个问题")
+            .await,
         "01ba0ed"
     );
     assert_eq!(
-        crate::bridge::render::session_subtitle(&app.core, &key, "你好").await,
+        crate::bridge::render::session_subtitle(&app.sessions_handle(), &app.opencode, &key, "你好").await,
         "01ba0ed"
     );
 }
@@ -483,7 +484,7 @@ async fn subtitle_degrades_when_session_info_hangs() {
     // only) within the bound instead of hanging the prompt flow.
     let subtitle = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        crate::bridge::render::session_subtitle(&app.core, &key, "问题"),
+        crate::bridge::render::session_subtitle(&app.sessions_handle(), &app.opencode, &key, "问题"),
     )
     .await
     .expect("session_subtitle must not hang when session_info never returns");
@@ -555,7 +556,8 @@ async fn subtitle_ignores_server_default_title() {
     )
     .await;
     assert_eq!(
-        crate::bridge::render::session_subtitle(&app.core, &key, "另一个问题").await,
+        crate::bridge::render::session_subtitle(&app.sessions_handle(), &app.opencode, &key, "另一个问题")
+            .await,
         "00ea4e7"
     );
 }
@@ -591,7 +593,7 @@ async fn subtitle_prefers_server_title() {
     )
     .await;
     assert_eq!(
-        crate::bridge::render::session_subtitle(&app.core, &key, "问题").await,
+        crate::bridge::render::session_subtitle(&app.sessions_handle(), &app.opencode, &key, "问题").await,
         "OpenChamber 显示的标题 · test"
     );
 }
@@ -646,18 +648,38 @@ async fn refresh_session_title_updates_live_card_on_server_rename() {
     }
 
     // The server's live title differs → refresh must update the card subtitle.
-    let refreshed = crate::bridge::render::refresh_session_title(&app.core, "ses_test").await;
+    let refreshed = crate::bridge::render::refresh_session_title(
+        &app.cards_handle(),
+        &app.sessions_handle(),
+        &app.opencode,
+        "ses_test",
+    )
+    .await;
     assert!(refreshed, "a server rename must refresh the card title");
     let title = app.cards.lock().await.get("ses_test").unwrap().acc.title.clone();
     assert_eq!(title, "修复登录鉴权问题 · test");
     // A second refresh with no further change must be a no-op (no churn).
     assert!(
-        !crate::bridge::render::refresh_session_title(&app.core, "ses_test").await,
+        !crate::bridge::render::refresh_session_title(
+            &app.cards_handle(),
+            &app.sessions_handle(),
+            &app.opencode,
+            "ses_test"
+        )
+        .await,
         "no change when the title already matches"
     );
     // No accumulator (a finished turn) → refresh is a no-op.
     app.cards.lock().await.remove("ses_test");
-    assert!(!crate::bridge::render::refresh_session_title(&app.core, "ses_test").await);
+    assert!(
+        !crate::bridge::render::refresh_session_title(
+            &app.cards_handle(),
+            &app.sessions_handle(),
+            &app.opencode,
+            "ses_test"
+        )
+        .await
+    );
 }
 
 /// ADR-0023: when the server auto-titles a session MID-TURN, the render
@@ -706,7 +728,13 @@ async fn refresh_session_title_syncs_cover_card_mid_turn() {
         );
     }
 
-    let refreshed = crate::bridge::render::refresh_session_title(&app.core, "ses_test").await;
+    let refreshed = crate::bridge::render::refresh_session_title(
+        &app.cards_handle(),
+        &app.sessions_handle(),
+        &app.opencode,
+        "ses_test",
+    )
+    .await;
     assert!(refreshed, "the mid-turn title change must refresh the card");
 
     let calls = platform.calls.lock().await.clone();
@@ -930,7 +958,14 @@ async fn render_poll_shows_live_context_and_memoizes_the_window() {
         parts: serde_json::json!([{ "type": "text", "text": text }]),
     };
 
-    let _ = render_and_flush(&app.core, sid, &[message(42_000, "回答")]).await;
+    let _ = render_and_flush(
+        &app.cards_handle(),
+        &app.sessions_handle(),
+        &app.opencode,
+        sid,
+        &[message(42_000, "回答")],
+    )
+    .await;
     let updates = platform.updated_cards().await;
     let text = updates.last().expect("a live flush").to_string();
     assert!(
@@ -946,7 +981,14 @@ async fn render_poll_shows_live_context_and_memoizes_the_window() {
     // A later step's usage refreshes the segment; the memo serves the window.
     // The text is the SAME (deduped) and the header second has not moved, so
     // only the context signature can trigger this flush.
-    let _ = render_and_flush(&app.core, sid, &[message(55_000, "回答")]).await;
+    let _ = render_and_flush(
+        &app.cards_handle(),
+        &app.sessions_handle(),
+        &app.opencode,
+        sid,
+        &[message(55_000, "回答")],
+    )
+    .await;
     let updates = platform.updated_cards().await;
     assert!(
         updates

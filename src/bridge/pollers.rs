@@ -281,7 +281,7 @@ pub enum CardTarget {
 /// every call site (card-target resolution, inline-host resolution, the
 /// auto-accept flag walk, the descendant check) shares them.
 pub(crate) async fn walk_parent_chain<F, Fut, T>(
-    core: &SharedCore,
+    backend: &Arc<dyn opencode::Backend>,
     start: &str,
     directory: Option<&str>,
     mut predicate: F,
@@ -296,8 +296,7 @@ where
             return Some(t);
         }
         let dir = directory?;
-        let info = core
-            .opencode
+        let info = backend
             .clone()
             .for_directory(dir)
             .session_info(&current)
@@ -363,7 +362,7 @@ pub(crate) async fn resolve_card_target(
     session_id: &str,
     directory: &str,
 ) -> Option<CardTarget> {
-    walk_parent_chain(core, session_id, Some(directory), |current| {
+    walk_parent_chain(&core.opencode, session_id, Some(directory), |current| {
         let current = current.to_string();
         async move {
             // In-flight prompt for this session → reply to its streaming card.
@@ -415,7 +414,7 @@ pub(crate) async fn inline_host_session(
     session_id: &str,
     directory: Option<&str>,
 ) -> Option<String> {
-    walk_parent_chain(core, session_id, directory, |current| {
+    walk_parent_chain(&core.opencode, session_id, directory, |current| {
         let current = current.to_string();
         async move {
             let cards = core.cards.lock().await;
@@ -539,7 +538,7 @@ mod tests {
     async fn walker_matches_the_starting_session_without_a_hop() {
         let core = core_with_parents(vec![]).await;
         // Predicate matches the start id directly — no session_info call.
-        let found = walk_parent_chain(&core, "s0", Some("/w"), |current| {
+        let found = walk_parent_chain(&core.opencode, "s0", Some("/w"), |current| {
             let current = current.to_string();
             async move { (current == "s0").then_some(current) }
         })
@@ -550,7 +549,7 @@ mod tests {
     #[tokio::test]
     async fn walker_follows_the_chain_until_the_predicate_matches() {
         let core = core_with_parents(vec![("child".into(), "parent".into())]).await;
-        let found = walk_parent_chain(&core, "child", Some("/w"), |current| {
+        let found = walk_parent_chain(&core.opencode, "child", Some("/w"), |current| {
             let current = current.to_string();
             async move { (current == "parent").then_some(current) }
         })
@@ -561,7 +560,8 @@ mod tests {
     #[tokio::test]
     async fn walker_stops_at_a_self_parent_loop() {
         let core = core_with_parents(vec![("a".into(), "a".into())]).await;
-        let found = walk_parent_chain(&core, "a", Some("/w"), |_| async move { None::<String> }).await;
+        let found =
+            walk_parent_chain(&core.opencode, "a", Some("/w"), |_| async move { None::<String> }).await;
         assert_eq!(found, None);
     }
 
@@ -573,7 +573,13 @@ mod tests {
             .map(|i| (format!("s{}", i), format!("s{}", i + 1)))
             .collect();
         let core = core_with_parents(parents).await;
-        let found = walk_parent_chain(&core, "s0", Some("/w"), |_| async move { None::<String> }).await;
+        let found = walk_parent_chain(
+            &core.opencode,
+            "s0",
+            Some("/w"),
+            |_| async move { None::<String> },
+        )
+        .await;
         assert_eq!(found, None);
     }
 
@@ -581,7 +587,7 @@ mod tests {
     async fn walker_without_a_directory_checks_only_the_start_session() {
         // No directory handle → the parent chain can't be walked (ADR-0010).
         let core = core_with_parents(vec![("child".into(), "parent".into())]).await;
-        let found = walk_parent_chain(&core, "child", None, |current| {
+        let found = walk_parent_chain(&core.opencode, "child", None, |current| {
             let current = current.to_string();
             async move { (current == "parent").then_some(current) }
         })

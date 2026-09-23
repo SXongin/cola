@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use crate::bridge::card_handles::RenderedBlock;
-use crate::bridge::core::{SESSION_INFO_TIMEOUT, SharedCore};
+use crate::bridge::core::SESSION_INFO_TIMEOUT;
+use crate::bridge::handles::{CardsHandle, SessionsHandle};
 use crate::bridge::streaming::StreamAccumulator;
+use crate::opencode;
 
 /// The session/thread name shown as the card subtitle, formatted as
 /// `<title> · <id-tail>` (e.g. "你好 · 01ba0ed"). The OpenCode server's OWN
@@ -12,23 +14,20 @@ use crate::bridge::streaming::StreamAccumulator;
 /// the id-tail alone identifies the session; the current prompt is never
 /// echoed (the reply context already shows it).
 pub(crate) async fn session_subtitle(
-    core: &SharedCore,
+    sessions: &SessionsHandle,
+    backend: &Arc<dyn opencode::Backend>,
     thread_key: &crate::config::ThreadKey,
     text: &str,
 ) -> String {
     let prompt_preview: String = text.chars().take(50).collect();
-    let entry = {
-        let store = core.sessions.lock().await;
-        store.get_active(thread_key).cloned()
-    };
-    let Some(entry) = entry else {
+    let Some(entry) = sessions.active_entry(thread_key).await else {
         return String::new();
     };
     let session_id = entry.session_id.clone();
     let mut name = String::new();
     if let Ok(Ok(info)) = tokio::time::timeout(
         SESSION_INFO_TIMEOUT,
-        core.opencode
+        backend
             .clone()
             .for_directory(&entry.directory)
             .session_info(&session_id),
@@ -60,24 +59,29 @@ pub(crate) async fn session_subtitle(
 /// would otherwise stay on the "new session" default title until restart.
 /// Called periodically from the render poll loop, so the title follows the
 /// server within a poll interval.
-pub(crate) async fn refresh_session_title(core: &Arc<SharedCore>, session_id: &str) -> bool {
+pub(crate) async fn refresh_session_title(
+    cards: &CardsHandle,
+    sessions: &SessionsHandle,
+    backend: &Arc<dyn opencode::Backend>,
+    session_id: &str,
+) -> bool {
     // Only meaningful while a turn is actively streaming on a live card.
-    let acc_present = core.cards.lock().await.contains_key(session_id);
+    let acc_present = cards.cards.lock().await.contains_key(session_id);
     if !acc_present {
         return false;
     }
-    let thread_key = core.sessions.lock().await.thread_for_session(session_id);
+    let thread_key = sessions.thread_for_session(session_id).await;
     let Some(thread_key) = thread_key else {
         return false;
     };
     // The subtitle is formatted with the session id-tail; recompute it now
     // and keep whatever the server currently reports.
-    let fresh = session_subtitle(core, &thread_key, "").await;
+    let fresh = session_subtitle(sessions, backend, &thread_key, "").await;
     if fresh.is_empty() {
         return false;
     }
-    let mut cards = core.cards.lock().await;
-    let Some(card) = cards.get_mut(session_id) else {
+    let mut live = cards.cards.lock().await;
+    let Some(card) = live.get_mut(session_id) else {
         return false;
     };
     if card.acc.title == fresh {
@@ -90,13 +94,13 @@ pub(crate) async fn refresh_session_title(core: &Arc<SharedCore>, session_id: &s
         fresh
     );
     card.acc.title = fresh;
-    drop(cards);
-    flush_card(core, session_id).await;
+    drop(live);
+    flush_card(cards, session_id).await;
     // The topic cover card is the chat-list topic entry — sync it the MOMENT
     // the server title changes mid-turn (not only at turn end), so the list
     // entry updates as early as the title agent finishes (ADR-0023). Only
     // fires on this change tick; the per-tick cost is unchanged.
-    crate::bridge::topic::sync_topic_cover_title(core, session_id).await;
+    crate::bridge::topic::sync_topic_cover_title(cards, sessions, backend, session_id).await;
     true
 }
 
@@ -487,16 +491,16 @@ const PULL_RECEIPT: &str = "⏬ 实时卡片已移到底部";
 /// live Interaction Blocks migrate to the continuation; the previous card's
 /// controls are settled). No-op when the session has no live card.
 pub(crate) async fn split_card_chain(
-    core: &Arc<SharedCore>,
+    cards: &CardsHandle,
     session_id: &str,
     reply_to: &str,
     kind: crate::bridge::streaming::SplitKind,
 ) {
-    let write_lock = core.card_write_lock(session_id).await;
+    let write_lock = cards.write_lock(session_id).await;
     let _guard = write_lock.lock().await;
     {
-        let mut cards = core.cards.lock().await;
-        let Some(card) = cards.get_mut(session_id) else {
+        let mut live = cards.cards.lock().await;
+        let Some(card) = live.get_mut(session_id) else {
             return;
         };
         card.pending_split.push(crate::bridge::streaming::PendingSplit {
@@ -505,7 +509,7 @@ pub(crate) async fn split_card_chain(
             receipt_pushed: false,
         });
     }
-    flush_card_locked(core, session_id).await;
+    flush_card_locked(cards, session_id).await;
 }
 
 /// Whether `e` is Feishu's deterministic card-content rejection (`230099`).
@@ -524,10 +528,10 @@ enum FallbackAdvance {
 }
 
 /// Advance the turn's [`CardFallback`] after Feishu rejected a card it built.
-async fn advance_card_fallback(core: &Arc<SharedCore>, session_id: &str) -> FallbackAdvance {
+async fn advance_card_fallback(cards: &CardsHandle, session_id: &str) -> FallbackAdvance {
     use crate::bridge::streaming::CardFallback;
-    let mut cards = core.cards.lock().await;
-    let Some(card) = cards.get_mut(session_id) else {
+    let mut live = cards.cards.lock().await;
+    let Some(card) = live.get_mut(session_id) else {
         return FallbackAdvance::Stop;
     };
     match card.acc.card_fallback {
@@ -542,7 +546,7 @@ async fn advance_card_fallback(core: &Arc<SharedCore>, session_id: &str) -> Fall
     }
 }
 
-pub(crate) async fn flush_card(core: &Arc<SharedCore>, session_id: &str) {
+pub(crate) async fn flush_card(cards: &CardsHandle, session_id: &str) {
     // One card writer per session at a time. A flush is a read-send-record
     // sequence, and callers are concurrent (the render poll, the request
     // poller surfacing a block, a click's ack fallback); interleaved, the
@@ -550,19 +554,19 @@ pub(crate) async fn flush_card(core: &Arc<SharedCore>, session_id: &str) {
     // its continuation slice onto it — two identical messages, only one
     // tracked and repaintable. The resolution paths take the same lock
     // (`resolve_blocks`), so a click cannot be overwritten by a stale flush.
-    let write_lock = core.card_write_lock(session_id).await;
+    let write_lock = cards.write_lock(session_id).await;
     let _guard = write_lock.lock().await;
-    flush_card_locked(core, session_id).await;
+    flush_card_locked(cards, session_id).await;
 }
 
-async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
+async fn flush_card_locked(cards: &CardsHandle, session_id: &str) {
     // The card-chain state a flush resumes from: a pending Supplement split
     // (ADR-0043) and whether the tracked card is still the live (growing) one.
     // Both survive the flush — a chain that exhausted the size bound, or died
     // between a finalize and its continuation, must be picked up where it
     // stopped, never restarted by overwriting the finalized slice.
     let (pending_split, mut card_is_live, suspended) = {
-        let cards = core.cards.lock().await;
+        let cards = cards.cards.lock().await;
         let Some(card) = cards.get(session_id) else {
             return;
         };
@@ -591,7 +595,7 @@ async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
     // finalizing flush applies its receipts after the previous card's final
     // build instead (see the live branch), keeping them off that card.
     if !card_is_live {
-        push_queued_receipts(core, session_id).await;
+        push_queued_receipts(cards, session_id).await;
     }
     for _ in 0..flush_limit {
         // The tracked card id, read BEFORE the build: while the loading card's
@@ -601,13 +605,13 @@ async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
         // flush after the id lands serve it — including a Supplement split
         // requested in that window.
         let card_id = {
-            let cards = core.cards.lock().await;
+            let cards = cards.cards.lock().await;
             cards.get(session_id).and_then(|c| c.card_message_id.clone())
         };
         let Some(card_id) = card_id else { return };
 
         let (built, rendered, slice_from, slice_to) = {
-            let mut cards = core.cards.lock().await;
+            let mut cards = cards.cards.lock().await;
             let Some(card) = cards.get_mut(session_id) else {
                 return;
             };
@@ -634,10 +638,10 @@ async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
             let supplement_split_requested = !pending_split.is_empty();
             if !supplement_split_requested && !built.full {
                 // The live card still fits: a plain update.
-                if let Err(e) = core.feishu.update_message(&card_id, &built.card).await {
+                if let Err(e) = cards.feishu.update_message(&card_id, &built.card).await {
                     tracing::warn!("Card update failed: {}", e);
                     if is_card_content_rejected(&e) {
-                        match advance_card_fallback(core, session_id).await {
+                        match advance_card_fallback(cards, session_id).await {
                             // Feishu refused the content: rebuild the SAME
                             // slice with every markdown element fenced and
                             // PATCH again. `render_from` did not advance, so
@@ -650,7 +654,8 @@ async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
                     }
                 }
                 // Record what this card now renders: the live blocks.
-                core.card_handles
+                cards
+                    .card_handles
                     .lock()
                     .await
                     .record(&card_id, &built.card, rendered);
@@ -666,7 +671,7 @@ async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
                 // anyway: finalize the slice here and HAND IT OFF — the
                 // continuation carries only the receipts queued below and the
                 // content that arrives after them, exactly like a size split.
-                let mut cards = core.cards.lock().await;
+                let mut cards = cards.cards.lock().await;
                 let Some(card) = cards.get_mut(session_id) else {
                     return;
                 };
@@ -678,7 +683,7 @@ async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
             // send must not leave the next flush thinking this card still
             // grows — it would overwrite the finalized slice.
             {
-                let mut cards = core.cards.lock().await;
+                let mut cards = cards.cards.lock().await;
                 if let Some(card) = cards.get_mut(session_id) {
                     card.card_is_live = false;
                 }
@@ -690,19 +695,19 @@ async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
                 // and BEFORE the continuation's, so they ride the continuation
                 // only. The per-entry flag keeps a retried flush from doubling
                 // them.
-                push_queued_receipts(core, session_id).await;
+                push_queued_receipts(cards, session_id).await;
             }
-            if let Err(e) = core.feishu.update_message(&card_id, &finalized).await {
+            if let Err(e) = cards.feishu.update_message(&card_id, &finalized).await {
                 tracing::warn!("Card update failed: {}", e);
                 if is_card_content_rejected(&e) {
                     if matches!(
-                        advance_card_fallback(core, session_id).await,
+                        advance_card_fallback(cards, session_id).await,
                         FallbackAdvance::RetryFenced
                     ) {
                         // The finalized slice never reached Feishu: restore it
                         // and re-send it fenced on the same card, instead of
                         // losing it to a rejection that would repeat verbatim.
-                        let mut cards = core.cards.lock().await;
+                        let mut cards = cards.cards.lock().await;
                         if let Some(card) = cards.get_mut(session_id)
                             && card.acc.render_from == slice_to
                         {
@@ -715,14 +720,16 @@ async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
                     // The fenced retry was rejected too: the card is
                     // suspended, so stop the chain instead of building the
                     // next card out of content the platform may refuse too.
-                    core.card_handles
+                    cards
+                        .card_handles
                         .lock()
                         .await
                         .record(&card_id, &finalized, Vec::new());
                     return;
                 }
             }
-            core.card_handles
+            cards
+                .card_handles
                 .lock()
                 .await
                 .record(&card_id, &finalized, Vec::new());
@@ -740,17 +747,17 @@ async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
             // one continuation serves the whole queued batch.
             Some(split) => Some(split.reply_to.clone()),
             None => {
-                let cards = core.cards.lock().await;
+                let cards = cards.cards.lock().await;
                 cards
                     .get(session_id)
                     .and_then(|c| c.acc.reply_to_message_id.clone())
             }
         };
         let Some(reply_to) = reply_to else { return };
-        match core.feishu.reply_card(&reply_to, &built.card).await {
+        match cards.feishu.reply_card(&reply_to, &built.card).await {
             Ok(new_id) => {
                 {
-                    let mut cards = core.cards.lock().await;
+                    let mut cards = cards.cards.lock().await;
                     if let Some(card) = cards.get_mut(session_id) {
                         card.card_message_id = Some(new_id.clone());
                         // A continuation that fits becomes the live card; one
@@ -773,7 +780,8 @@ async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
                 card_is_live = !built.full;
                 // The continuation takes the blocks over from the finalized
                 // slice it follows (its spans are the tail this card renders).
-                core.card_handles
+                cards
+                    .card_handles
                     .lock()
                     .await
                     .record(&new_id, &built.card, rendered);
@@ -787,7 +795,7 @@ async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
                 tracing::warn!("Card continuation send failed: {}", e);
                 let retry_fenced = is_card_content_rejected(&e)
                     && matches!(
-                        advance_card_fallback(core, session_id).await,
+                        advance_card_fallback(cards, session_id).await,
                         FallbackAdvance::RetryFenced
                     );
                 // The failed send's slice reached no card, but its build
@@ -796,7 +804,7 @@ async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
                 // silently skipping it. The equality check keeps a boundary
                 // moved elsewhere (defensive; the card-write lock serializes
                 // flushes) from being rewound.
-                let mut cards = core.cards.lock().await;
+                let mut cards = cards.cards.lock().await;
                 if let Some(card) = cards.get_mut(session_id)
                     && card.acc.render_from == slice_to
                 {
@@ -818,8 +826,8 @@ async fn flush_card_locked(core: &Arc<SharedCore>, session_id: &str) {
 /// arrival order. Exactly once per supplement: the per-entry flag travels with
 /// the queue, so a flush retried after a failed continuation send re-applies
 /// nothing — and a supplement queued after that attempt still gets its line.
-async fn push_queued_receipts(core: &Arc<SharedCore>, session_id: &str) {
-    let mut cards = core.cards.lock().await;
+async fn push_queued_receipts(cards: &CardsHandle, session_id: &str) {
+    let mut cards = cards.cards.lock().await;
     let Some(card) = cards.get_mut(session_id) else {
         return;
     };
@@ -845,16 +853,18 @@ async fn push_queued_receipts(core: &Arc<SharedCore>, session_id: &str) {
 /// still present (the statistics are for logging); `None` when it vanished (the
 /// caller should stop).
 pub(crate) async fn render_and_flush(
-    core: &Arc<SharedCore>,
+    cards: &CardsHandle,
+    sessions: &SessionsHandle,
+    backend: &Arc<dyn opencode::Backend>,
     session_id: &str,
     msgs: &[crate::opencode::types::SessionMessage],
 ) -> Option<(usize, usize, usize)> {
     // OpenCode auto-renames sessions after a turn; follow the server's live
     // title so the card subtitle doesn't stay on the "new session" default.
-    refresh_session_title(core, session_id).await;
+    refresh_session_title(cards, sessions, backend, session_id).await;
     let (changed, header_changed, new_parts, text_len, reasoning_len) = {
-        let mut cards = core.cards.lock().await;
-        let card = cards.get_mut(session_id)?;
+        let mut live = cards.cards.lock().await;
+        let card = live.get_mut(session_id)?;
         let before = card.acc.rendered_parts.len();
         let changed = render_new_turn_parts(&mut card.acc, msgs);
         // Re-flush when the header changed even without new content: the
@@ -878,13 +888,13 @@ pub(crate) async fn render_and_flush(
     // landed in the render above, and the window lookup is memoized per
     // (provider, model) for the turn, so later polls are a field swap. Runs
     // outside the cards lock (network).
-    crate::bridge::streaming::refresh_context_window(core, session_id).await;
+    crate::bridge::streaming::refresh_context_window(cards, backend, session_id).await;
     // A usage (or window) change must flush even when no part and no header
     // second changed: the 📊 segment is footer state the header signature
     // cannot see, and a silently-stale percentage is the bug this fixes.
     let context_changed = {
-        let mut cards = core.cards.lock().await;
-        match cards.get_mut(session_id) {
+        let mut live = cards.cards.lock().await;
+        match live.get_mut(session_id) {
             Some(card) => {
                 let sig = card.acc.context_sig();
                 let changed = card.last_context_sig != sig;
@@ -895,7 +905,7 @@ pub(crate) async fn render_and_flush(
         }
     };
     if changed || header_changed || context_changed {
-        flush_card(core, session_id).await;
+        flush_card(cards, session_id).await;
     }
     Some((new_parts, text_len, reasoning_len))
 }
@@ -903,10 +913,12 @@ pub(crate) async fn render_and_flush(
 /// Incremental renderer: while the synchronous prompt is in flight, poll the
 /// session's messages and flush the card as parts complete (reasoning, tools,
 /// text). `done` stops the loop once the prompt returns. `poll_ms` is the
-/// injected cadence (`SharedCore::turn_render_poll_ms`), so tests never wait
+/// injected cadence (`TurnConfig::turn_render_poll_ms`), so tests never wait
 /// on the production 1.5 s.
 pub(crate) async fn render_poll_loop(
-    core: &Arc<SharedCore>,
+    cards: &CardsHandle,
+    sessions: &SessionsHandle,
+    backend: &Arc<dyn opencode::Backend>,
     session_id: String,
     done: std::sync::Arc<std::sync::atomic::AtomicBool>,
     poll_ms: u64,
@@ -917,14 +929,14 @@ pub(crate) async fn render_poll_loop(
         if done.load(Ordering::SeqCst) {
             return;
         }
-        let msgs = match core.opencode.messages(&session_id).await {
+        let msgs = match backend.messages(&session_id).await {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!("render poll messages: {}", e);
                 continue;
             }
         };
-        match render_and_flush(core, &session_id, &msgs).await {
+        match render_and_flush(cards, sessions, backend, &session_id, &msgs).await {
             // Accumulator gone (turn completed and was cleaned up); keep polling
             // until the prompt returns so late parts are still caught.
             None => continue,

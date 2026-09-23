@@ -5,6 +5,7 @@ use tracing::Instrument;
 
 use crate::bridge::core::SharedCore;
 use crate::bridge::handler::CardActionResult;
+use crate::bridge::handles::{CardsHandle, RequestsHandle, SessionsHandle};
 use crate::bridge::pollers::{
     CardTarget, inline_host_session, mark_stale_cards, resolve_card_target, result_card,
 };
@@ -307,7 +308,7 @@ impl RequestKind for PermissionKind {
                     .unwrap_or_default(),
             };
             let mut cached = None;
-            if flow.try_mark_answered(core, req_id).await {
+            if flow.try_mark_answered(&core.requests_handle(), req_id).await {
                 let mut approved = core.set_auto_accept(session_id, &dir, true).await;
                 // The clicked request is always resolved by the toggle, even
                 // if the backend list raced past it.
@@ -321,7 +322,8 @@ impl RequestKind for PermissionKind {
                 // the requests vanished (ADR-0038, rule 4).
                 cached = resolve_blocks(
                     flow,
-                    core,
+                    &core.cards_handle(),
+                    &core.requests_handle(),
                     host,
                     session_id,
                     Origin::Click { clicked },
@@ -346,7 +348,7 @@ impl RequestKind for PermissionKind {
         // Double-click guard: the atomic claim decides who replies. A click
         // that loses the race re-serves the winning click's result; only the
         // winner may reach the backend.
-        if !flow.try_mark_answered(core, req_id).await {
+        if !flow.try_mark_answered(&core.requests_handle(), req_id).await {
             return flow.answered_result(req_id).await;
         }
         // Route the reply to the instance owning the session. The card
@@ -377,7 +379,8 @@ impl RequestKind for PermissionKind {
                 // on which card is current.
                 resolve_blocks(
                     flow,
-                    core,
+                    &core.cards_handle(),
+                    &core.requests_handle(),
                     host,
                     session_id,
                     Origin::Click { clicked },
@@ -394,7 +397,8 @@ impl RequestKind for PermissionKind {
                 tracing::info!("Permission already resolved: {}", e);
                 let cached = resolve_blocks(
                     flow,
-                    core,
+                    &core.cards_handle(),
+                    &core.requests_handle(),
                     host,
                     session_id,
                     Origin::Click { clicked },
@@ -447,7 +451,7 @@ impl RequestKind for PermissionKind {
 /// session has autoaccept on. Walking the parent chain makes the child inherit
 /// the parent's flag, consistent with `approve_pending_for_session`.
 async fn should_auto_accept(core: &Arc<SharedCore>, session_id: &str, directory: &str) -> bool {
-    crate::bridge::pollers::walk_parent_chain(core, session_id, Some(directory), |current| {
+    crate::bridge::pollers::walk_parent_chain(&core.opencode, session_id, Some(directory), |current| {
         let current = current.to_string();
         async move {
             let sessions = core.sessions.lock().await;
@@ -741,7 +745,7 @@ impl RequestKind for QuestionKind {
                 }
                 // A request is submitted ONLY when every question has an answer
                 // (`reply_question` expects all of them).
-                if flow.is_answered(core, req_id).await {
+                if flow.is_answered(&core.requests_handle(), req_id).await {
                     // Finalized before (double-click): re-serve the winning
                     // click's result, falling back to the generic ack while it
                     // is still in flight.
@@ -823,7 +827,7 @@ impl RequestKind for QuestionKind {
                     // All questions answered → claim the request and submit.
                     // The claim is atomic: a click that loses the race re-serves
                     // the winning result instead of replying again.
-                    if !flow.try_mark_answered(core, req_id).await {
+                    if !flow.try_mark_answered(&core.requests_handle(), req_id).await {
                         return Some(
                             flow.answered_result(req_id)
                                 .await
@@ -858,7 +862,8 @@ impl RequestKind for QuestionKind {
                     );
                     let cached = resolve_blocks(
                         flow,
-                        core,
+                        &core.cards_handle(),
+                        &core.requests_handle(),
                         host,
                         session_id,
                         Origin::Click { clicked },
@@ -938,7 +943,7 @@ impl RequestKind for QuestionKind {
             }
             "submit" => {
                 // Finalize with whatever was answered (empty for the rest).
-                if flow.is_answered(core, req_id).await {
+                if flow.is_answered(&core.requests_handle(), req_id).await {
                     return Some(
                         flow.answered_result(req_id)
                             .await
@@ -953,7 +958,7 @@ impl RequestKind for QuestionKind {
                 }
                 // Atomic claim: a click that loses the race re-serves the
                 // winning result.
-                if !flow.try_mark_answered(core, req_id).await {
+                if !flow.try_mark_answered(&core.requests_handle(), req_id).await {
                     return Some(
                         flow.answered_result(req_id)
                             .await
@@ -988,7 +993,8 @@ impl RequestKind for QuestionKind {
                 );
                 let cached = resolve_blocks(
                     flow,
-                    core,
+                    &core.cards_handle(),
+                    &core.requests_handle(),
                     host,
                     session_id,
                     Origin::Click { clicked },
@@ -1004,7 +1010,7 @@ impl RequestKind for QuestionKind {
                 Some(r)
             }
             "reject" => {
-                if flow.is_answered(core, req_id).await {
+                if flow.is_answered(&core.requests_handle(), req_id).await {
                     return Some(flow.answered_result(req_id).await.unwrap_or_else(|| {
                         let mut r = result_card("🚫 已拒绝回答", "red", "已拒绝回答 AI 的问题。");
                         if inline {
@@ -1021,7 +1027,7 @@ impl RequestKind for QuestionKind {
                 }
                 // Atomic claim: a click that loses the race re-serves the
                 // winning result.
-                if !flow.try_mark_answered(core, req_id).await {
+                if !flow.try_mark_answered(&core.requests_handle(), req_id).await {
                     return Some(flow.answered_result(req_id).await.unwrap_or_else(|| {
                         let mut r = result_card("🚫 已拒绝回答", "red", "已拒绝回答 AI 的问题。");
                         if inline {
@@ -1053,7 +1059,8 @@ impl RequestKind for QuestionKind {
                 tracing::info!("Question rejected: {}", req_id);
                 let cached = resolve_blocks(
                     flow,
-                    core,
+                    &core.cards_handle(),
+                    &core.requests_handle(),
                     host,
                     session_id,
                     Origin::Click { clicked },
@@ -1139,8 +1146,8 @@ impl RequestFlow {
     /// The double-click guard's read-only check: whether `req_id` was already
     /// answered. Used to re-serve a result to a late click; the atomic
     /// [`Self::try_mark_answered`] is what decides who may reply.
-    pub(crate) async fn is_answered(&self, core: &Arc<SharedCore>, req_id: &str) -> bool {
-        core.answered_requests.lock().await.contains(req_id)
+    pub(crate) async fn is_answered(&self, requests: &RequestsHandle, req_id: &str) -> bool {
+        requests.answered_requests.lock().await.contains(req_id)
     }
 
     /// Atomically claim `req_id` for this click: `true` when it was not yet
@@ -1149,8 +1156,8 @@ impl RequestFlow {
     /// check-and-insert happens under ONE lock, so two near-simultaneous clicks
     /// cannot both win the way the old `is_answered` + `mark_answered` pair
     /// could.
-    pub(crate) async fn try_mark_answered(&self, core: &Arc<SharedCore>, req_id: &str) -> bool {
-        core.answered_requests.lock().await.insert(req_id.to_string())
+    pub(crate) async fn try_mark_answered(&self, requests: &RequestsHandle, req_id: &str) -> bool {
+        requests.answered_requests.lock().await.insert(req_id.to_string())
     }
 
     /// Roll back a claim made by [`Self::try_mark_answered`] after a GENUINE
@@ -1329,17 +1336,19 @@ impl RequestFlow {
     /// blocks into `🚫 已拒绝` receipts through `resolve_blocks`.
     pub(crate) async fn reject_pending_for_session(
         &self,
-        core: &Arc<SharedCore>,
+        requests: &RequestsHandle,
+        sessions: &SessionsHandle,
+        backend: &Arc<dyn opencode::Backend>,
         session_id: &str,
         directory: &str,
     ) -> Vec<String> {
-        let backend = core.opencode.clone().for_directory(directory);
+        let dir_backend = backend.clone().for_directory(directory);
         // Bounded like the sweep's list: a half-open connection must not stall
         // the turn's finish behind a request that will never answer.
         let listed = match crate::bridge::bounded_call(
             &format!("turn end {} ({}) list", self.kind.label(), directory),
             self.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
-            self.kind.list(&backend),
+            self.kind.list(&dir_backend),
         )
         .await
         {
@@ -1353,22 +1362,22 @@ impl RequestFlow {
         let mut rejected = Vec::new();
         for req in &listed {
             let sid = req.session_id();
-            if !session_belongs_to(core, sid, session_id, directory).await {
+            if !session_belongs_to(sessions, backend, sid, session_id, directory).await {
                 continue;
             }
             // An answered request was already resolved (or is being resolved)
             // by its click: never reply a second time.
-            if self.is_answered(core, req.id()).await {
+            if self.is_answered(requests, req.id()).await {
                 continue;
             }
             // A claimed request's block lives on a snapshot card, whose
             // lifecycle is its own (ADR-0038, rule 6).
-            if core.snapshot_claims.lock().await.contains(req.id()) {
+            if requests.snapshot_claims.lock().await.contains(req.id()) {
                 continue;
             }
             let result = match req {
-                PendingRequest::Permission(p) => backend.reply_permission(&p.request_id, "reject").await,
-                PendingRequest::Question(q) => backend.reject_question(&q.id).await,
+                PendingRequest::Permission(p) => dir_backend.reply_permission(&p.request_id, "reject").await,
+                PendingRequest::Question(q) => dir_backend.reject_question(&q.id).await,
             };
             match result {
                 Ok(()) => {
@@ -1595,7 +1604,7 @@ impl RequestFlow {
             affected
         };
         for session_id in &repaint {
-            crate::bridge::render::flush_card(core, session_id).await;
+            crate::bridge::render::flush_card(&core.cards_handle(), session_id).await;
         }
         // ADR-0028: a claimed request that left the pending list was
         // resolved — by the snapshot's own buttons (the click handler
@@ -1761,7 +1770,7 @@ impl RequestFlow {
                 // Flush so the inline section appears NOW — the render loop
                 // only flushes on new parts, and a blocked prompt produces
                 // none.
-                crate::bridge::render::flush_card(core, &host).await;
+                crate::bridge::render::flush_card(&core.cards_handle(), &host).await;
             }
             return false;
         }
@@ -1844,7 +1853,7 @@ impl RequestFlow {
         }
         // Flush first: the current card renders the block and the handle moves
         // with it.
-        crate::bridge::render::flush_card(core, &host).await;
+        crate::bridge::render::flush_card(&core.cards_handle(), &host).await;
         tracing::info!(
             "{} {} re-hosted on session {} card (old {})",
             self.kind.label(),
@@ -2040,7 +2049,8 @@ async fn settle_question_reply(
             // any other resolution (ADR-0038, rules 3+4).
             let cached = resolve_blocks(
                 flow,
-                core,
+                &core.cards_handle(),
+                &core.requests_handle(),
                 host,
                 session_id,
                 Origin::Click { clicked },
@@ -2157,9 +2167,11 @@ fn repaint_card(
 /// `origin` decides how the cards are settled and `residue` what each block
 /// leaves behind (ADR-0038, rules 3+4). Returns the clicked card's edited
 /// JSON, when the click landed on a card carrying one of the blocks.
+#[allow(clippy::too_many_arguments)] // the resolution seam: flow + the two handles it settles on + origin/residue
 pub(crate) async fn resolve_blocks(
     flow: &RequestFlow,
-    core: &Arc<SharedCore>,
+    cards: &CardsHandle,
+    requests: &RequestsHandle,
     host: &Option<String>,
     session_id: &str,
     origin: Origin<'_>,
@@ -2171,7 +2183,7 @@ pub(crate) async fn resolve_blocks(
     // snapshotted before it must not record its stale copy after — the block
     // would come back to life and the sweep would report cola's own decision
     // as another client's.
-    let write_lock = core.card_write_lock(host.as_deref().unwrap_or(session_id)).await;
+    let write_lock = cards.write_lock(host.as_deref().unwrap_or(session_id)).await;
     let _guard = write_lock.lock().await;
     // A click settles the standalone surface too, so its `sent_cards` entry
     // goes. A COMMAND does not: an id with no inline block and no card handle
@@ -2201,7 +2213,7 @@ pub(crate) async fn resolve_blocks(
     //    card without this block's span, so `resolve_on` finds nothing and
     //    the ack falls back to a fresh rebuild.
     let post_resolution_header = {
-        let mut cards = core.cards.lock().await;
+        let mut cards = cards.cards.lock().await;
         if let Some(acc) = cards
             .get_mut(host.as_deref().unwrap_or(session_id))
             .map(|c| &mut c.acc)
@@ -2236,7 +2248,7 @@ pub(crate) async fn resolve_blocks(
     // without one (see `residue_edit`).
     let mut stamped_cards: std::collections::HashSet<String> = std::collections::HashSet::new();
     {
-        let mut handles = core.card_handles.lock().await;
+        let mut handles = cards.card_handles.lock().await;
         for id in ids {
             match origin {
                 Origin::Click {
@@ -2299,7 +2311,7 @@ pub(crate) async fn resolve_blocks(
         }
     }
     for (message_id, card) in patches {
-        if let Err(e) = core.feishu.update_message(&message_id, &card).await {
+        if let Err(e) = cards.feishu.update_message(&message_id, &card).await {
             tracing::warn!("resolved block repaint failed on {}: {}", message_id, e);
         }
     }
@@ -2307,7 +2319,7 @@ pub(crate) async fn resolve_blocks(
     // in-flight claim, so a standalone copy of the same request is left to
     // `mark_stale_cards` again.
     {
-        let mut settling = core.settling_requests.lock().await;
+        let mut settling = requests.settling_requests.lock().await;
         for id in ids {
             settling.remove(id);
         }
@@ -2320,13 +2332,17 @@ pub(crate) async fn resolve_blocks(
 /// `/autoaccept`'s pending approval and the turn-end leftover rejection (#187)
 /// share; an empty id matches nothing.
 pub(crate) async fn session_belongs_to(
-    core: &SharedCore,
+    sessions: &SessionsHandle,
+    backend: &Arc<dyn opencode::Backend>,
     candidate: &str,
     session_id: &str,
     directory: &str,
 ) -> bool {
     !candidate.is_empty()
-        && (candidate == session_id || core.session_descends_from(candidate, session_id, directory).await)
+        && (candidate == session_id
+            || sessions
+                .descends_from(backend, candidate, session_id, directory)
+                .await)
 }
 
 /// #187: settle what a turn that ended without completing left behind. Reject
@@ -2336,18 +2352,21 @@ pub(crate) async fn session_belongs_to(
 /// neutral `⏱ 已由其他客户端处理` line would be a lie. A no-op without a mapped
 /// directory and on a failed list (unknown is never resolved). Returns how
 /// many requests were rejected.
-pub(crate) async fn reject_leftovers_for_turn(core: &Arc<SharedCore>, session_id: &str) -> usize {
-    let directory = {
-        let store = core.sessions.lock().await;
-        store.entry_for_session(session_id).map(|e| e.directory.clone())
-    };
+pub(crate) async fn reject_leftovers_for_turn(
+    requests: &RequestsHandle,
+    cards: &CardsHandle,
+    sessions: &SessionsHandle,
+    backend: &Arc<dyn opencode::Backend>,
+    session_id: &str,
+) -> usize {
+    let directory = sessions.directory_for_session(session_id).await;
     let Some(directory) = directory.filter(|d| !d.is_empty()) else {
         return 0;
     };
     let mut rejected = 0;
-    for flow in [&core.permission, &core.question] {
+    for flow in [&requests.permission, &requests.question] {
         let ids = flow
-            .reject_pending_for_session(core, session_id, &directory)
+            .reject_pending_for_session(requests, sessions, backend, session_id, &directory)
             .await;
         if ids.is_empty() {
             continue;
@@ -2355,7 +2374,8 @@ pub(crate) async fn reject_leftovers_for_turn(core: &Arc<SharedCore>, session_id
         rejected += ids.len();
         resolve_blocks(
             flow,
-            core,
+            cards,
+            requests,
             &Some(session_id.to_string()),
             session_id,
             Origin::Command,
@@ -2499,7 +2519,7 @@ async fn ack_inline_card(
 /// fires until the AI resumes — the card would stay frozen on the pre-answer
 /// state. Same reason the question paths flush explicitly.
 async fn flush_inline_card(core: &Arc<SharedCore>, host: &Option<String>, session_id: &str) {
-    crate::bridge::render::flush_card(core, host.as_deref().unwrap_or(session_id)).await;
+    crate::bridge::render::flush_card(&core.cards_handle(), host.as_deref().unwrap_or(session_id)).await;
 }
 
 /// Route a question reply/reject to the instance owning the session. The card
