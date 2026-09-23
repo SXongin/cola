@@ -774,6 +774,67 @@ mod tests {
         assert_eq!(acc.tools["call_2"].output.as_deref(), Some("fn main() {}"));
     }
 
+    /// The extracted output joins `state.content` with `state.result` (and an
+    /// error message after it) on its OWN line: the pieces are separate blocks,
+    /// so a missing separator runs them together. The mutation audit
+    /// (render.rs:144/158) found both separators surviving the suite.
+    #[test]
+    fn tool_output_joins_content_result_and_error_on_separate_lines() {
+        let completed = serde_json::json!({
+            "type": "tool", "tool": "bash", "callID": "call_1",
+            "state": { "status": "completed",
+                       "content": [{ "type": "text", "text": "first block" }],
+                       "result": "second block" }
+        });
+        assert_eq!(
+            extract_tool_output(&completed, "completed").as_deref(),
+            Some("first block\nsecond block")
+        );
+
+        let failed = serde_json::json!({
+            "type": "tool", "tool": "bash", "callID": "call_2",
+            "state": { "status": "error",
+                       "content": [{ "type": "text", "text": "before the error" }],
+                       "error": { "message": "boom" } }
+        });
+        assert_eq!(
+            extract_tool_output(&failed, "error").as_deref(),
+            Some("before the error\n❌ boom")
+        );
+    }
+
+    /// A tool part's `running` status marks the card Streaming; a completed one
+    /// leaves the state alone. The mutation audit (render.rs:291) found the
+    /// status comparison surviving the suite.
+    #[test]
+    fn a_running_tool_marks_the_card_streaming() {
+        let running = serde_json::json!([
+            {"type": "tool", "tool": "bash", "callID": "call_running",
+             "state": {"status": "running", "input": {"command": "sleep 1"}}},
+        ]);
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Done;
+        render_parts(&mut acc, &running);
+        assert_eq!(
+            acc.card_state,
+            CardState::Streaming,
+            "a running tool must keep the card Streaming"
+        );
+
+        let completed = serde_json::json!([
+            {"type": "tool", "tool": "bash", "callID": "call_done",
+             "state": {"status": "completed", "output": "ok"}},
+        ]);
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Done;
+        render_parts(&mut acc, &completed);
+        assert_eq!(
+            acc.card_state,
+            CardState::Done,
+            "a completed tool must not flip the card state"
+        );
+    }
+
     /// #202: an `apply_patch` records its real change in `metadata.diff` (like
     /// `edit`), while `state.output` is only the success summary. The panel
     /// must show the diff, keep an LSP note as its tail, and drop the summary.
@@ -1290,7 +1351,10 @@ Index: /x/src/main.rs
 
     /// A todowrite update whose state has the same byte length as the previous
     /// one (任务 A → 任务 B) must still refresh the panel: length alone is not a
-    /// change signal for a re-written list.
+    /// change signal for a re-written list. The same-callID case is the
+    /// in-place update the accumulator must never skip — the mutation audit
+    /// (render.rs:372) found the todowrite branch surviving a different-callID
+    /// test alone.
     #[test]
     fn todowrite_same_length_update_still_refreshes() {
         let mut acc = StreamAccumulator::new("test");
@@ -1312,6 +1376,21 @@ Index: /x/src/main.rs
             "the stale list must be replaced: {card}"
         );
         assert!(acc.todo_panel.is_some(), "the tail holds the panel");
+
+        // The SAME call re-streams with new, equal-length content: the panel
+        // must follow it, not dedupe on the length-only signature.
+        let mut acc = StreamAccumulator::new("test");
+        render_parts(&mut acc, &part("call_same", "任务 C"));
+        render_parts(&mut acc, &part("call_same", "任务 D"));
+        let card = acc.build_card().to_string();
+        assert!(
+            card.contains("任务 D"),
+            "an in-place equal-length update must refresh: {card}"
+        );
+        assert!(
+            !card.contains("任务 C"),
+            "the stale in-place list must be replaced: {card}"
+        );
     }
 
     /// Every collapsible panel carries a stable `element_id`, derived from the
@@ -1692,6 +1771,108 @@ Index: /x/src/main.rs
         assert_eq!(acc.text, "The answer.");
         assert_eq!(acc.reasoning, "Let me check");
         assert_eq!(acc.tools["call_1"].output.as_deref(), Some("src"));
+    }
+
+    /// A header change alone must re-flush the card: the progress timer keeps
+    /// ticking, so an idle turn still proves it is alive (ADR-0014). The
+    /// mutation audit (render.rs:508) found the inverted header comparison
+    /// surviving the suite.
+    #[tokio::test]
+    async fn render_and_flush_flushes_on_a_header_change_alone() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let sid = "ses_header";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_header")).await;
+        Turn::set_turn_anchor(&cards, sid, 0).await;
+
+        // No parts at all: only the header signature can trigger a flush.
+        let msgs: Vec<crate::opencode::types::SessionMessage> = Vec::new();
+        let _ = render_and_flush(&cards, &app.sessions_handle(), &app.opencode, sid, &msgs).await;
+        assert_eq!(
+            platform.updated_cards().await.len(),
+            1,
+            "the seeded header must flush once"
+        );
+
+        // The header signature moves (the state label flips) with no new parts.
+        Turn::set_card_state(&cards, sid, CardState::Reasoning).await;
+        let _ = render_and_flush(&cards, &app.sessions_handle(), &app.opencode, sid, &msgs).await;
+        let updates = platform.updated_cards().await;
+        assert_eq!(
+            updates.len(),
+            2,
+            "a header change alone must re-flush the card: {updates:?}"
+        );
+        assert!(
+            updates.last().unwrap().to_string().contains("推理中"),
+            "the re-flush carries the new header: {}",
+            updates.last().unwrap()
+        );
+    }
+
+    /// New content must flush immediately, without waiting for the header's
+    /// whole-second tick: the mutation audit (render.rs:540) found the content
+    /// disjunct surviving because most tests' content changes also move the
+    /// header signature.
+    #[tokio::test]
+    async fn render_and_flush_flushes_on_new_parts_without_a_header_tick() {
+        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
+
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        let sid = "ses_content";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_content")).await;
+        Turn::set_turn_anchor(&cards, sid, 0).await;
+
+        let message = |text: &str| SessionMessage {
+            info: MessageInfo {
+                id: "a1".into(),
+                role: Some("assistant".into()),
+                parent_id: None,
+                time: Some(MessageTime { created: 1_000 }),
+                model_id: None,
+                provider_id: None,
+                tokens: None,
+            },
+            parts: serde_json::json!([{ "type": "text", "text": text }]),
+        };
+
+        let _ = render_and_flush(
+            &cards,
+            &app.sessions_handle(),
+            &app.opencode,
+            sid,
+            &[message("第一段")],
+        )
+        .await;
+        assert_eq!(platform.updated_cards().await.len(), 1);
+
+        // Same second, same state, no usage: only the new text differs.
+        let _ = render_and_flush(
+            &cards,
+            &app.sessions_handle(),
+            &app.opencode,
+            sid,
+            &[message("第二段")],
+        )
+        .await;
+        let updates = platform.updated_cards().await;
+        assert_eq!(
+            updates.len(),
+            2,
+            "new content must flush without waiting for the header tick: {updates:?}"
+        );
+        assert!(
+            updates.last().unwrap().to_string().contains("第二段"),
+            "the flushed card carries the new text: {}",
+            updates.last().unwrap()
+        );
     }
 
     /// The card subtitle follows the server's live session title during a turn:

@@ -9,3 +9,5 @@ SURVEY.md
 test.log
 # CodeGraph local index (regenerable via `codegraph init`)
 .codegraph/
+# Local cargo-mutants audit output (one-off; never committed)
+mutants.out*/
