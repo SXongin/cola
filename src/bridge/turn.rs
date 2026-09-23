@@ -121,8 +121,9 @@ pub(crate) struct Turn {
 /// `parent` is the span the trace hangs from: `Span::current().id()` for the
 /// Turn's own span, `None` to root one. Rooting is for a span whose ambient
 /// context is the WRONG one — the render poll (its own task, spawned under the
-/// turn's span): a default parent would print the whole chain twice on every
-/// one of its lines (`turn{…}:turn{…}:`).
+/// turn's span) and the fresh-session era after a recreate (spawned under the
+/// stale turn's span): a default parent would print the whole chain twice on
+/// every one of their lines (`turn{…}:turn{…}:`).
 fn session_span(session_id: &str, thread_key: &ThreadKey, parent: Option<tracing::Id>) -> tracing::Span {
     let span = tracing::info_span!(
         parent: parent,
@@ -151,7 +152,8 @@ impl Turn {
     /// The whole lifecycle runs inside a [`session_span`], so every awaited
     /// Backend call inherits the session's fields (ADR-0048); the render poll
     /// runs on its own task and is instrumented where it is spawned
-    /// ([`RenderPoll`]).
+    /// ([`RenderPoll`]). A 404 recreate changes the session under the turn, so
+    /// `run_inner` re-scopes the rest of the trace to the fresh session.
     pub(crate) async fn run(app: &Arc<App>, ctx: PromptContext) -> crate::error::Result<()> {
         let span = session_span(&ctx.session_id, &ctx.thread_key, tracing::Span::current().id());
         Self::run_inner(app, ctx).instrument(span).await
@@ -179,7 +181,17 @@ impl Turn {
         if prompt_resp.as_ref().is_err_and(|e| e.is_session_not_found()) {
             tracing::warn!("session {} not found on the server; recreating", turn.session_id);
             turn.recreate(app).await?;
-            prompt_resp = turn.attempt(app).await;
+            // The Turn now works on the fresh session: re-scope the rest of its
+            // trace so the retry, the finalization and the drain are
+            // retrievable by the session they belong to (the stale id stays on
+            // the lines above, including the warning that names what was
+            // missing). Rooted and not re-recorded on the stale span: the fmt
+            // layer appends a re-recorded field, which would print both ids on
+            // every line.
+            let span = session_span(&turn.session_id, &turn.thread_key, None);
+            prompt_resp = turn.attempt(app).instrument(span.clone()).await;
+            turn.finish(app, &prompt_resp).instrument(span).await;
+            return Ok(());
         }
         turn.finish(app, &prompt_resp).await;
         Ok(())

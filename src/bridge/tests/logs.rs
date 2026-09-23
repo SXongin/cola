@@ -36,7 +36,7 @@ fn lobby() -> ThreadKey {
 
 /// A Turn context for `ses_test` carrying the fixed `msg_cola_anchor` id, so a
 /// scripted Backend timeline can name this turn's own user message.
-fn ctx(thread_key: ThreadKey, text: &str) -> PromptContext {
+fn prompt_context(thread_key: ThreadKey, text: &str) -> PromptContext {
     PromptContext {
         session_id: "ses_test".into(),
         thread_key,
@@ -75,7 +75,7 @@ async fn turn_start_anchor_carries_session_chat_topic_directory_and_prompt_chars
 
     // Four CJK characters: a byte length would read 12, so this pins `chars()`.
     let prompt = "分析目录";
-    let (result, logs) = capture_logs(async { Turn::run(&app, ctx(topic, prompt)).await }).await;
+    let (result, logs) = capture_logs(async { Turn::run(&app, prompt_context(topic, prompt)).await }).await;
     result.unwrap();
 
     let anchor = line_with(&logs, "turn start:");
@@ -114,7 +114,7 @@ async fn a_lobby_turn_omits_the_topic_field() {
     let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
     seed_session(&app, "ses_test", "/work").await;
 
-    let (result, logs) = capture_logs(async { Turn::run(&app, ctx(lobby(), "hi")).await }).await;
+    let (result, logs) = capture_logs(async { Turn::run(&app, prompt_context(lobby(), "hi")).await }).await;
     result.unwrap();
 
     let anchor = line_with(&logs, "turn start:");
@@ -171,7 +171,7 @@ async fn render_poll_and_final_render_lines_carry_the_session() {
         gate.add_permits(1);
     });
 
-    let (result, logs) = capture_logs(async { Turn::run(&app, ctx(lobby(), "hi")).await }).await;
+    let (result, logs) = capture_logs(async { Turn::run(&app, prompt_context(lobby(), "hi")).await }).await;
     result.unwrap();
     releaser.await.unwrap();
 
@@ -184,6 +184,48 @@ async fn render_poll_and_final_render_lines_carry_the_session() {
     assert!(
         final_line.contains("session=ses_test"),
         "the final-render line carries the session: {final_line}"
+    );
+}
+
+/// A 404 recreate moves the Turn onto a fresh session: the retry and the
+/// finalization must be retrievable by the NEW id, while the warning that names
+/// what was missing stays on the stale one.
+#[tokio::test]
+async fn a_recreated_turn_traces_under_the_fresh_session() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    // The mapped session is gone from the server: its prompt 404s, and the
+    // recreate's `create_session` serves `ses_fresh`.
+    backend.session_id = "ses_fresh".into();
+    backend.stale_session_404 = true;
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+    // Both attempts await their poll's stop, which waits out one cadence.
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+
+    let (result, logs) = capture_logs(async { Turn::run(&app, prompt_context(lobby(), "hi")).await }).await;
+    result.unwrap();
+
+    let anchor = line_with(&logs, "turn start:");
+    assert!(
+        anchor.contains("session=ses_test"),
+        "the pre-recreate anchor names the session that was mapped: {anchor}"
+    );
+    let warn = line_with(&logs, "not found on the server; recreating");
+    assert!(
+        warn.contains("session=ses_test"),
+        "the warning names the session that was missing: {warn}"
+    );
+    let final_line = line_with(&logs, "final render:");
+    assert!(
+        final_line.contains("session=ses_fresh"),
+        "post-recreate lines carry the fresh session: {final_line}"
+    );
+    assert!(
+        !final_line.contains("session=ses_test"),
+        "post-recreate lines must not carry the stale session: {final_line}"
     );
 }
 
