@@ -6,7 +6,7 @@ async fn external_message_from_shared_store_notifies_feishu() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
-    mock.external_user_message = Some("OpenChamber 里发的消息".to_string());
+    mock.external_message("OpenChamber 里发的消息");
     let (app, platform) = build_app(cfg, mock).await;
 
     // A known session whose chat the notification goes to.
@@ -66,7 +66,7 @@ async fn external_poller_recovers_when_messages_hangs() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
-    mock.external_user_message = Some("OpenChamber 里发的消息".to_string());
+    mock.external_message("OpenChamber 里发的消息");
     // The first `messages` call hangs forever, like a request in flight
     // when the server was SIGTERM'd; later calls serve normally.
     mock.hang_message_reads(1);
@@ -143,10 +143,7 @@ async fn cola_own_message_after_heal_is_never_notified_external() {
     let mut mock = MockBackend::new(realistic_parts());
     // cola's own prompt persisted on the store before the crash (a
     // `msg_cola_` id, exactly what the real server echoes back).
-    mock.cola_user_messages.insert(
-        "ses_ext".into(),
-        "可以把我本地的 openchamber serve 杀掉吗？".to_string(),
-    );
+    mock.cola_message("ses_ext", "可以把我本地的 openchamber serve 杀掉吗？");
     let (app, platform) = build_app(cfg, mock).await;
 
     seed_entry(
@@ -219,9 +216,8 @@ async fn newer_external_message_after_cola_own_still_notifies() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
-    mock.cola_user_messages
-        .insert("ses_ext".into(), "cola 自己的一轮".to_string());
-    mock.external_user_message = Some("OpenChamber 后来发的消息".to_string());
+    mock.cola_message("ses_ext", "cola 自己的一轮");
+    mock.external_message("OpenChamber 后来发的消息");
     let (app, platform) = build_app(cfg, mock).await;
 
     seed_entry(
@@ -479,7 +475,7 @@ async fn external_message_to_topic_session_notifies_into_thread() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
-    mock.external_user_message = Some("话题里的外部消息".to_string());
+    mock.external_message("话题里的外部消息");
     let (app, platform) = build_app(cfg, mock).await;
 
     // A TOPIC-backed session (thread_id != chat_id) with NO persisted
@@ -547,9 +543,9 @@ async fn external_message_reply_renders_into_notification_card() {
     let repo = git_repo();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
-    mock.external_user_message = Some("OpenChamber 里发的消息".to_string());
+    mock.external_message("OpenChamber 里发的消息");
     // OpenCode's reply to that message: reasoning → tool → text → stop.
-    mock.external_reply_parts = Some(serde_json::json!([
+    let reply_ready = mock.external_reply(serde_json::json!([
         { "type": "step-start", "snapshot": "x" },
         { "type": "reasoning", "text": "我来看看目录。" },
         { "type": "tool", "tool": "bash", "callID": "call_1",
@@ -557,7 +553,6 @@ async fn external_message_reply_renders_into_notification_card() {
         { "type": "text", "text": "目录里有 src。" },
         { "type": "step-finish", "reason": "stop" },
     ]));
-    let reply_ready = mock.external_reply_ready.clone();
     let (app, platform) = build_app(cfg, mock).await;
 
     // A known session whose chat the notification goes to.
@@ -673,7 +668,7 @@ async fn external_reply_render_guard_replaces_only_newer_messages() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
     // No reply parts: the armed loops just idle/exit; we assert state only.
-    mock.external_user_message = Some("外部消息".to_string());
+    mock.external_message("外部消息");
     let (app, _platform) = build_app(cfg, mock).await;
 
     // Arm once for the first external message.
@@ -732,16 +727,15 @@ async fn external_reply_render_times_out_and_finalizes_partial_content() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
-    mock.external_user_message = Some("OpenChamber 里发的消息".to_string());
+    mock.external_message("OpenChamber 里发的消息");
     // A partial reply: reasoning + text, but NO step-finish — the turn never
     // completes, so the loop must be stopped by the timeout.
-    mock.external_reply_parts = Some(serde_json::json!([
+    mock.external_reply(serde_json::json!([
         { "type": "step-start", "snapshot": "x" },
         { "type": "reasoning", "text": "我在想。" },
         { "type": "text", "text": "部分回答。" },
-    ]));
-    mock.external_reply_ready
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+    ]))
+    .store(true, std::sync::atomic::Ordering::SeqCst);
     let (app, platform) = build_app(cfg, mock).await;
 
     // A known session whose chat the notification goes to.
@@ -824,11 +818,11 @@ async fn external_reply_keeps_the_user_message_above_it() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let now = chrono::Utc::now().timestamp_millis();
     let mut mock = MockBackend::new(realistic_parts());
-    mock.external_user_message = Some("OpenChamber 里发的消息".to_string());
+    mock.external_message("OpenChamber 里发的消息");
     // The external message was posted half a minute ago; the reply's parts
     // carry real server times after it but well before cola renders them.
-    mock.external_user_created.lock().unwrap().replace(now - 30_000);
-    mock.external_reply_parts = Some(serde_json::json!([
+    mock.external_message_created_at(now - 30_000);
+    let reply_ready = mock.external_reply(serde_json::json!([
         { "type": "step-start", "snapshot": "x" },
         { "type": "reasoning", "text": "我来看看目录。",
           "time": { "start": now - 20_000, "end": now - 19_000 } },
@@ -836,7 +830,6 @@ async fn external_reply_keeps_the_user_message_above_it() {
           "time": { "start": now - 18_000, "end": now - 17_000 } },
         { "type": "step-finish", "reason": "stop" },
     ]));
-    let reply_ready = mock.external_reply_ready.clone();
     let (app, platform) = build_app(cfg, mock).await;
     seed_entry(
         &app,
@@ -917,7 +910,7 @@ async fn new_pending_stops_syncing_and_switch_back_resyncs_silently() {
     // An external message on the superseded session, written after /new.
     mock.external_message_for("ses_old", "离开期间的外部消息");
     // The /switch back resolves through the shared session list.
-    mock.session_list = vec![list_session("ses_old", "旧会话", "/work/proj", 100)];
+    mock.given_sessions(vec![list_session("ses_old", "旧会话", "/work/proj", 100)]);
     let (app, platform) = build_app(cfg, mock).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     seed_entry(

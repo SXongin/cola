@@ -479,12 +479,11 @@ mod tests {
         use crate::opencode::types::{PermissionRequest, QuestionInfo, QuestionRequest};
 
         let mut mock = MockBackend::new(text("你好"));
-        mock.session_statuses
-            .insert("ses_adopted".into(), Some(opencode::types::SessionStatus::Busy));
+        mock.with_session_status("ses_adopted", Some(opencode::types::SessionStatus::Busy));
         // A permission and a question for the ADOPTED session, plus one of each
         // for a sibling session in the SAME directory — only the former belong
         // on the snapshot.
-        mock.permissions = vec![
+        mock.ask_permissions(vec![
             PermissionRequest {
                 request_id: "req_adopted".into(),
                 session_id: Some("ses_adopted".into()),
@@ -501,8 +500,8 @@ mod tests {
                 metadata: None,
                 always: vec![],
             },
-        ];
-        mock.questions = vec![
+        ]);
+        mock.ask_questions(vec![
             QuestionRequest {
                 id: "q_adopted".into(),
                 session_id: "ses_adopted".into(),
@@ -519,7 +518,7 @@ mod tests {
                 session_id: "ses_sibling".into(),
                 questions: vec![],
             },
-        ];
+        ]);
         let backend: Arc<dyn opencode::Backend> = Arc::new(mock);
         let snap = gather_snapshot(&backend, "ses_adopted", "/work/proj").await;
 
@@ -538,7 +537,7 @@ mod tests {
         use crate::bridge::test_support::MockBackend;
 
         let mut mock = MockBackend::new(text("你好"));
-        mock.session_status_error = Some("simulated failure".into());
+        mock.status_read_fails("simulated failure");
         let backend: Arc<dyn opencode::Backend> = Arc::new(mock);
         let snap = gather_snapshot(&backend, "ses_adopted", "/work/proj").await;
         assert_eq!(snap.status, None, "a failed status read must not guess a status");
@@ -551,7 +550,7 @@ mod tests {
         // The server reported an entry for the session whose status type cola
         // does not recognise (`Ok(None)` at the seam) — unknown, never guessed.
         let mut mock = MockBackend::new(text("你好"));
-        mock.session_statuses.insert("ses_adopted".into(), None);
+        mock.with_session_status("ses_adopted", None);
         let backend: Arc<dyn opencode::Backend> = Arc::new(mock);
         let snap = gather_snapshot(&backend, "ses_adopted", "/work/proj").await;
         assert_eq!(snap.status, None, "an unknown status type must not be guessed");

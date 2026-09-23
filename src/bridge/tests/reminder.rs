@@ -99,7 +99,7 @@ async fn a_pending_permission_pins_and_resolution_unpins_without_duplicates() {
     );
 
     // Resolved elsewhere: the next complete sweep clears the pin.
-    backend.replied_permissions.lock().await.insert("per_1".into());
+    backend.permission_resolved_by_another("per_1").await;
     app.permission.sweep(&app.core, &mut seen).await;
     let calls = platform.reminders().await;
     assert_eq!(calls.len(), 2, "one pin, one clear: {calls:?}");
@@ -140,7 +140,7 @@ async fn a_pending_question_pins_and_resolution_unpins() {
         "a pending question pins the Chat/Topic"
     );
 
-    backend.replied_questions.lock().await.insert("que_1".into());
+    backend.question_resolved_by_another("que_1").await;
     app.question.sweep(&app.core, &mut seen).await;
     let calls = platform.reminders().await;
     assert_eq!(calls.len(), 2, "one pin, one clear: {calls:?}");
@@ -192,7 +192,7 @@ async fn pin_off_records_no_reminder_calls() {
         "the permission still surfaces without pinning"
     );
 
-    backend.replied_permissions.lock().await.insert("per_1".into());
+    backend.permission_resolved_by_another("per_1").await;
     app.permission.sweep(&app.core, &mut seen).await;
 
     assert!(
@@ -230,7 +230,7 @@ async fn a_failed_pin_never_affects_the_turn_and_does_not_clear() {
         "the turn/card is unaffected by the pin failure"
     );
 
-    backend.replied_permissions.lock().await.insert("per_1".into());
+    backend.permission_resolved_by_another("per_1").await;
     app.permission.sweep(&app.core, &mut seen).await;
     assert_eq!(
         platform.reminders().await.len(),
@@ -343,7 +343,7 @@ async fn the_newest_pending_owns_the_pin_and_hands_over_on_resolution() {
 
     // The newer wait resolves: the older pending takes the pin back in the
     // same sweep — no pause, no gap where the chat is silently unpinned.
-    backend.replied_questions.lock().await.insert("que_1".into());
+    backend.question_resolved_by_another("que_1").await;
     app.question.sweep(&app.core, &mut seen).await;
     let calls = platform.reminders().await;
     assert_eq!(calls.len(), 5, "handover: {calls:?}");
@@ -351,7 +351,7 @@ async fn the_newest_pending_owns_the_pin_and_hands_over_on_resolution() {
     assert!(calls[4].3 && calls[4].2 == vec!["ou_perm".to_string()]);
 
     // The last wait resolves: the reminder clears.
-    backend.replied_permissions.lock().await.insert("per_1".into());
+    backend.permission_resolved_by_another("per_1").await;
     app.permission.sweep(&app.core, &mut seen).await;
     let calls = platform.reminders().await;
     assert_eq!(calls.len(), 6, "the resolution unpins: {calls:?}");
@@ -381,7 +381,7 @@ async fn the_pin_set_is_persisted_beside_the_session_file() {
     );
 
     // Resolution drops the record.
-    backend.replied_permissions.lock().await.insert("per_1".into());
+    backend.permission_resolved_by_another("per_1").await;
     app.permission.sweep(&app.core, &mut seen).await;
     assert!(!pins_file.exists(), "the confirmed clear removes the record");
 

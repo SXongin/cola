@@ -83,7 +83,7 @@ async fn a_standalone_waiting_card_pins_and_resolution_unpins() {
     assert_eq!(platform.message_pins().await.len(), 1);
 
     // Resolved elsewhere: the next complete sweep unpins exactly once.
-    backend.replied_permissions.lock().await.insert("per_1".into());
+    backend.permission_resolved_by_another("per_1").await;
     app.permission.sweep(&app.core, &mut seen).await;
     let calls = platform.message_pins().await;
     assert_eq!(
@@ -120,7 +120,7 @@ async fn an_inlined_waiting_card_pins_the_live_card() {
         "the live card carrying the question block is pinned"
     );
 
-    backend.replied_questions.lock().await.insert("que_1".into());
+    backend.question_resolved_by_another("que_1").await;
     app.question.sweep(&app.core, &mut seen).await;
     let calls = platform.message_pins().await;
     assert_eq!(calls.len(), 2, "one pin, one unpin: {calls:?}");
@@ -176,7 +176,7 @@ async fn a_snapshot_claimed_wait_pins_the_snapshot_card() {
         "the claim moves the pin to the snapshot card: {calls:?}"
     );
 
-    backend.replied_permissions.lock().await.insert("per_1".into());
+    backend.permission_resolved_by_another("per_1").await;
     app.permission.sweep(&app.core, &mut seen).await;
     let calls = platform.message_pins().await;
     assert_eq!(
@@ -262,7 +262,7 @@ async fn a_failed_pin_does_not_fabricate_an_unpin() {
         "the attempt was made and failed"
     );
 
-    backend.replied_permissions.lock().await.insert("per_1".into());
+    backend.permission_resolved_by_another("per_1").await;
     app.permission.sweep(&app.core, &mut seen).await;
     let calls = platform.message_pins().await;
     assert_eq!(

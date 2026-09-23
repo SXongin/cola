@@ -49,13 +49,13 @@ async fn turn_footer_shows_the_branch_the_ai_landed_on() {
     cfg.bridge.work_dir = Some(repo_path.clone());
 
     let mut mock = MockBackend::new(realistic_parts());
-    mock.on_prompt = Some(Box::new(move || {
+    mock.on_prompt(move || {
         // The AI's work: branch off and commit — the tree ends clean.
         git_in(&repo_path, &["switch", "-c", "feat/ai-work"]);
         std::fs::write(repo_path.join("b.txt"), "done").unwrap();
         git_in(&repo_path, &["add", "b.txt"]);
         git_in(&repo_path, &["commit", "-m", "ai work"]);
-    }));
+    });
     let (app, platform) = build_app(cfg, mock).await;
 
     app.handle_message(incoming(
@@ -94,9 +94,9 @@ async fn turn_footer_shows_dirty_left_by_the_ai() {
     cfg.bridge.work_dir = Some(repo_path.clone());
 
     let mut mock = MockBackend::new(realistic_parts());
-    mock.on_prompt = Some(Box::new(move || {
+    mock.on_prompt(move || {
         std::fs::write(repo_path.join("uncommitted.txt"), "left behind").unwrap();
-    }));
+    });
     let (app, platform) = build_app(cfg, mock).await;
 
     app.handle_message(incoming(
@@ -131,13 +131,13 @@ async fn turn_footer_keeps_start_capture_when_the_end_status_read_fails() {
     cfg.bridge.work_dir = Some(repo_path.clone());
 
     let mut mock = MockBackend::new(realistic_parts());
-    mock.on_prompt = Some(Box::new(move || {
+    mock.on_prompt(move || {
         // Break the index mid-turn: `rev-parse` reads HEAD and still
         // resolves `main`, while `git status --porcelain` fails.
         let index = repo_path.join(".git/index");
         std::fs::remove_file(&index).unwrap();
         std::fs::create_dir(&index).unwrap();
-    }));
+    });
     let (app, platform) = build_app(cfg, mock).await;
 
     app.handle_message(incoming(
@@ -200,9 +200,8 @@ async fn error_card_retry_reuses_card_and_reruns_prompt() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     // First prompt fails (provider hiccup); the retry must succeed.
-    let mock = MockBackend::new(realistic_parts());
-    mock.fail_prompt_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.fail_prompts(1, "Simulated provider failure");
     let prompt_calls = mock.prompt_calls.clone();
     let prompt_ids = mock.prompt_message_ids.clone();
     let backend = Arc::new(mock);
@@ -467,8 +466,7 @@ async fn subtitle_degrades_when_session_info_hangs() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mock = MockBackend::new(realistic_parts());
-    mock.hang_session_info
-        .store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
+    mock.hang_session_info_reads(usize::MAX);
     let (app, _) = build_app(cfg, mock).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     seed_entry(
@@ -503,8 +501,7 @@ async fn subtitle_degrades_when_session_info_hangs() {
 #[tokio::test]
 async fn readiness_wait_recovers_after_wedged_attempts() {
     let mock = MockBackend::new(realistic_parts());
-    mock.hang_list_sessions
-        .store(2, std::sync::atomic::Ordering::SeqCst);
+    mock.hang_session_lists(2);
     let backend: Arc<dyn crate::opencode::Backend> = Arc::new(mock);
     let result =
         crate::bridge::pollers::wait_for_server_ready(&backend, std::time::Duration::from_secs(10)).await;
@@ -520,8 +517,7 @@ async fn readiness_wait_recovers_after_wedged_attempts() {
 #[tokio::test]
 async fn readiness_wait_fails_when_server_never_serves() {
     let mock = MockBackend::new(realistic_parts());
-    mock.hang_list_sessions
-        .store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
+    mock.hang_session_lists(usize::MAX);
     let backend: Arc<dyn crate::opencode::Backend> = Arc::new(mock);
     let result =
         crate::bridge::pollers::wait_for_server_ready(&backend, std::time::Duration::from_secs(2)).await;
