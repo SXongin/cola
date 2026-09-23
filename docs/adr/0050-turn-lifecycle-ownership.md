@@ -24,10 +24,21 @@ companion narrow-handles decision is ADR-0049 and is not re-litigated here.
   (`turn/render.rs`); the flush/split state machine is `turn/flush.rs`; the
   accumulator, its card session and their value types are `turn/state.rs`,
   which outside the module is only ever named as the opaque `CardSession`.
-- **Outside flows reach card delivery only through `Turn::flush_card` /
-  `Turn::split_card_chain` / `Turn::render_and_flush` / `Turn::session_subtitle`.**
-  Everything behind those calls — the slice split, the continuation send, the
-  card-handle recording, the accumulator edit — is the Turn's implementation.
+- **Card delivery goes through the Turn's four delivery operations:
+  `Turn::flush_card` / `Turn::split_card_chain` / `Turn::render_and_flush` /
+  `Turn::session_subtitle`.** Everything behind those calls — the slice split,
+  the continuation send, the card-handle recording, the accumulator edit — is
+  the Turn's implementation. Outside flows also drive the Turn's other
+  interface operations, for state and lifecycle rather than delivery:
+  interaction registration and settlement (`add_permission`, `add_question`,
+  `update_question_state`, `resolve_interactions`,
+  `resolve_vanished_permissions`/`_questions`, `ack_card`), external-follow
+  arming and finalization (`arm_external_render`, `finalize_done`,
+  `repoint_card`), and the read probes a flow decides on (`has_card`,
+  `is_running`, `card_message_id`, `reply_target`, `armed_turn_anchor`,
+  `has_rendered_content`, `pin_source`, `retry_request`, `flush_owned_blocks`,
+  `has_interaction`/`has_interaction_in`). Any card delivery those operations
+  trigger still lands on the four calls above.
 - **The Turn receives narrow handles (`TurnHandles`), never `SharedCore`**
   (ADR-0049).
 
@@ -40,8 +51,8 @@ companion narrow-handles decision is ADR-0049 and is not re-litigated here.
   the same card-write lock; keeping the spawn/stop pairing next to the state it
   serves is what makes an attempt unable to leak a running poll.
 - Sibling flows — a request click's ack, a snapshot re-render, a command — need
-  renders and flushes, not turn internals: the four-method surface is where
-  their reach stops.
+  renders, flushes and the interaction-state operations above, never turn
+  internals: the delivery calls are where their card writes stop.
 
 ## Considered options
 
@@ -59,7 +70,7 @@ companion narrow-handles decision is ADR-0049 and is not re-litigated here.
 ## Consequences
 
 - A rendering change has one owner; the coordinator and sibling flows call the
-  four-method delivery surface and never the internals.
+  delivery operations and the state interface above, never the internals.
 - `Turn::run` is the external test seam; accumulator/render internals have
   private tests inside the module (allowed for a deep module).
 - The narrow-handle shape is ADR-0049's decision; the Turn simply never sees
