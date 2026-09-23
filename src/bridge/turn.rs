@@ -8,6 +8,7 @@ use crate::bridge::handler::image_inputs;
 use crate::bridge::render::{
     flush_card, render_and_flush, render_new_turn_parts, render_parts, render_poll_loop,
 };
+use crate::bridge::span;
 use crate::bridge::streaming::StreamAccumulator;
 use crate::config::ThreadKey;
 use crate::feishu::client::ImageAttachment;
@@ -112,50 +113,18 @@ pub(crate) struct Turn {
     started_at: std::time::Instant,
 }
 
-/// The span wrapping one Turn's trace: `session` and `chat` always, `topic`
-/// only when the conversation lives inside a Topic (a lobby's thread id is its
-/// chat id — that is not a topic). The default fmt layer renders it as
-/// `turn{session=ses_x chat=oc_x}: …`; the span prefix IS the rendering, so no
-/// custom formatter is involved (ADR-0048).
-///
-/// `parent` is the span the trace hangs from: `Span::current().id()` for the
-/// Turn's own span, `None` to root one. Rooting is for a span whose ambient
-/// context is the WRONG one — the render poll (its own task, spawned under the
-/// turn's span) and the fresh-session era after a recreate (spawned under the
-/// stale turn's span): a default parent would print the whole chain twice on
-/// every one of their lines (`turn{…}:turn{…}:`).
-fn session_span(session_id: &str, thread_key: &ThreadKey, parent: Option<tracing::Id>) -> tracing::Span {
-    let span = tracing::info_span!(
-        parent: parent,
-        "turn",
-        session = %session_id,
-        chat = %thread_key.chat_id,
-        topic = tracing::field::Empty,
-    );
-    record_topic(&span, thread_key);
-    span
-}
-
-/// Record `topic` only for a real Topic: an unrecorded [`tracing::field::Empty`]
-/// field is omitted from the fmt prefix entirely (not printed empty).
-fn record_topic(span: &tracing::Span, thread_key: &ThreadKey) {
-    if thread_key.thread_id != thread_key.chat_id {
-        span.record("topic", tracing::field::display(&thread_key.thread_id));
-    }
-}
-
 impl Turn {
     /// Run one prompt end-to-end: `start` → `attempt` (→ `recreate` + `attempt`
     /// on a stale mapping) → `finish`. The only public entry; the phases are
     /// internal seams.
     ///
-    /// The whole lifecycle runs inside a [`session_span`], so every awaited
+    /// The whole lifecycle runs inside a [`span::turn`], so every awaited
     /// Backend call inherits the session's fields (ADR-0048); the render poll
     /// runs on its own task and is instrumented where it is spawned
     /// ([`RenderPoll`]). A 404 recreate changes the session under the turn, so
     /// `run_inner` re-scopes the rest of the trace to the fresh session.
     pub(crate) async fn run(app: &Arc<App>, ctx: PromptContext) -> crate::error::Result<()> {
-        let span = session_span(&ctx.session_id, &ctx.thread_key, tracing::Span::current().id());
+        let span = span::turn(&ctx.session_id, &ctx.thread_key, tracing::Span::current().id());
         Self::run_inner(app, ctx).instrument(span).await
     }
 
@@ -188,7 +157,7 @@ impl Turn {
             // missing). Rooted and not re-recorded on the stale span: the fmt
             // layer appends a re-recorded field, which would print both ids on
             // every line.
-            let span = session_span(&turn.session_id, &turn.thread_key, None);
+            let span = span::turn(&turn.session_id, &turn.thread_key, None);
             prompt_resp = turn.attempt(app).instrument(span.clone()).await;
             turn.finish(app, &prompt_resp).instrument(span).await;
             return Ok(());
@@ -836,7 +805,7 @@ impl RenderPoll {
         // task — so it is instrumented explicitly with the same fields: its
         // lines must keep the session (ADR-0048). Rooted, because the ambient
         // parent here is the turn's span.
-        let span = session_span(session_id, thread_key, None);
+        let span = span::turn(session_id, thread_key, None);
         let handle = tokio::spawn(
             async move {
                 render_poll_loop(&core, sid, flag, poll_ms).await;
