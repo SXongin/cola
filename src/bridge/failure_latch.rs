@@ -20,18 +20,37 @@ pub(crate) struct FailureLatch {
     warned: HashMap<String, String>,
 }
 
+/// The line prefix for a condition: `what key` when the condition has a finer
+/// key (a message, a Chat/Topic), `what` alone when the operation IS the
+/// condition (a background poll loop passes an empty key).
+fn condition_label(what: &str, key: &str) -> String {
+    if key.is_empty() {
+        what.to_string()
+    } else {
+        format!("{what} {key}")
+    }
+}
+
 impl FailureLatch {
     /// Record a failed attempt for `key`: WARN — with the cause and `scope`,
     /// the Feishu scope that makes the failure actionable — when this error has
     /// not been warned for the key yet, DEBUG for an identical repeat. `what`
-    /// names the operation; the key is appended to it in the line.
+    /// names the operation; the key is appended to it in the line. An empty key
+    /// means the operation is its own condition (one background loop), and an
+    /// empty scope means no Feishu scope makes it actionable: both segments are
+    /// left out of the line rather than rendered empty.
     pub(crate) fn failed(&mut self, key: &str, what: &str, scope: &str, error: impl std::fmt::Display) {
         let error = error.to_string();
+        let condition = condition_label(what, key);
         if self.warned.get(key).is_some_and(|warned| warned == &error) {
-            tracing::debug!("{what} {key} still failing: {error}");
+            tracing::debug!("{condition} still failing: {error}");
             return;
         }
-        tracing::warn!("{what} {key} failed (best-effort; scope {scope}; repeats log at DEBUG): {error}");
+        if scope.is_empty() {
+            tracing::warn!("{condition} failed (best-effort; repeats log at DEBUG): {error}");
+        } else {
+            tracing::warn!("{condition} failed (best-effort; scope {scope}; repeats log at DEBUG): {error}");
+        }
         self.warned.insert(key.to_string(), error);
     }
 
@@ -39,7 +58,7 @@ impl FailureLatch {
     /// latched failure, silence when nothing was latched.
     pub(crate) fn succeeded(&mut self, key: &str, what: &str) {
         if self.warned.remove(key).is_some() {
-            tracing::info!("{what} {key} recovered");
+            tracing::info!("{} recovered", condition_label(what, key));
         }
     }
 }
@@ -120,6 +139,40 @@ mod tests {
             level_count(&logs, "recovered", "INFO"),
             1,
             "recovery logs once, a later success is silent:\n{logs}"
+        );
+    }
+
+    /// A loop-level condition has no finer key and no Feishu scope: the
+    /// operation name labels the line and the scope segment is left out (the
+    /// shape `PollLoop` uses for the background flows).
+    #[tokio::test]
+    async fn a_keyless_condition_renders_its_name_alone() {
+        let mut latch = FailureLatch::default();
+        let (_, logs) = capture_logs(async {
+            latch.failed("", "server reconcile", "", "boom");
+            latch.failed("", "server reconcile", "", "boom");
+            latch.succeeded("", "server reconcile");
+        })
+        .await;
+
+        assert_eq!(
+            level_count(&logs, "server reconcile failed", "WARN"),
+            1,
+            "one WARN for the loop's condition:\n{logs}"
+        );
+        assert_eq!(
+            level_count(&logs, "server reconcile still failing", "DEBUG"),
+            1,
+            "the repeat is DEBUG:\n{logs}"
+        );
+        assert_eq!(
+            level_count(&logs, "server reconcile recovered", "INFO"),
+            1,
+            "a success clears the latch at INFO:\n{logs}"
+        );
+        assert!(
+            !logs.contains("scope ;"),
+            "no empty scope segment is rendered:\n{logs}"
         );
     }
 
