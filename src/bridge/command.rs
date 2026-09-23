@@ -387,7 +387,11 @@ pub fn command_help(name: &str) -> Option<String> {
 
 // ===== Command execution (the Command flow) =====
 // Moved out of handler.rs so the bridge coordinator stays thin; these methods
-// run the parsed slash commands against the shared handles.
+// run the parsed slash commands against the shared handles. The card forms the
+// commands pop live in the card layer (`feishu::card::command` over the
+// structured-input → card-JSON builders in `card::session`, `card::picker` and
+// `card::help`); this module keeps the parser, the dispatch match and the
+// text-command behavior (spec #298, ticket D).
 
 use crate::bridge::display::{id_tail, title_or_id_tail};
 use crate::bridge::handles::CommandHandles;

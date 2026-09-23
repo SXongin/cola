@@ -1,9 +1,19 @@
-//! The command card forms (spec #298, ticket D): the fetch → build → send path
-//! for the cards the slash commands pop — `/switch`, `/dir`, `/agent`,
-//! `/model`, `/think`, `/autoaccept` and `/help`. The pure JSON builders live
-//! with their card families ([`super::session`], [`super::picker`],
-//! [`super::help`]); this module owns the state access and delivery around
-//! them, so `bridge::command` keeps only the parser and the dispatch match.
+//! The command card forms (spec #298, ticket D): the state access and delivery
+//! around the command cards, joining the structured-input → card-JSON builders
+//! the card layer already owns.
+//!
+//! The JSON builders keep their card families and their contract — structured
+//! inputs in, card JSON out: [`super::session::build_switch_card`] and
+//! [`super::session::build_dir_card`], [`super::picker::build_agent_card`],
+//! [`super::picker::build_model_provider_cards`],
+//! [`super::picker::build_think_card`],
+//! [`super::picker::build_autoaccept_card`], and
+//! [`super::help::build_help_card`]. This module is the form layer over them:
+//! it fetches the state each builder takes as its input, hands it over, and
+//! sends the result — the fetch → build → send path for the cards the slash
+//! commands pop (`/switch`, `/dir`, `/agent`, `/model`, `/think`,
+//! `/autoaccept`, `/help`). `bridge::command` keeps the parser, the dispatch
+//! match and the text-command behavior.
 //!
 //! The fetch-and-shape functions ([`switch_card_data`], [`dir_card_data`],
 //! [`agent_card`], [`think_card`], [`current_model_label`]) are shared with the
