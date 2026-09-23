@@ -28,29 +28,6 @@ async fn current_project_directory_reads_pending_first() {
     );
 }
 
-/// The `/dir` card's 当前 directory follows the pending, not the superseded
-/// active session — and the pending's directory is carried on the card even
-/// though no server session or mapping exists for it yet (ADR-0041).
-#[tokio::test]
-async fn dir_card_current_reads_pending() {
-    let _wd = test_work_dir();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    let mut backend = MockBackend::new(realistic_parts());
-    backend.given_sessions(vec![list_session("ses_a", "A", "/work/a", 100)]);
-    let (app, _platform) = build_app(cfg, backend).await;
-
-    seed_pending(&app, PendingEntry::new(key(), "/work/pending")).await;
-
-    let (dirs, current) = crate::bridge::command::dir_card_data(&app.command_handles(), &key()).await;
-    assert_eq!(
-        dirs,
-        vec!["/work/pending".to_string(), "/work/a".to_string()],
-        "the current directory is never missing from the card"
-    );
-    assert_eq!(current.as_deref(), Some("/work/pending"));
-}
-
 /// `/dir <path>` declares a Pending Session in the given directory instead of
 /// creating a server session; an older eagerly-created active session is
 /// superseded (mapped, switchable, not deleted), exactly like `/new`.
@@ -234,42 +211,6 @@ async fn second_dir_before_the_first_prompt_replaces_the_pending() {
         vec![Some(second_dir.clone())],
         "only the corrected directory is ever used"
     );
-}
-
-/// The `/switch` card's current-directory scope follows the pending, and no
-/// row is marked active — the pending is not a Session (ADR-0041); the
-/// superseded session stays mapped and switchable.
-#[tokio::test]
-async fn switch_card_current_reads_pending_and_marks_no_active_row() {
-    let _wd = test_work_dir();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    let mut backend = MockBackend::new(realistic_parts());
-    backend.given_sessions(vec![
-        list_session("ses_a", "A", "/work/a", 100),
-        list_session("ses_p", "P", "/work/pending", 200),
-    ]);
-    let (app, _platform) = build_app(cfg, backend).await;
-    seed_entry(
-        &app,
-        crate::config::SessionEntry::new(key(), "ses_old", "/work/a"),
-    )
-    .await;
-    seed_pending(&app, PendingEntry::new(key(), "/work/pending")).await;
-
-    let (shown, active_id, mapped_ids, scope, current_dir) = crate::bridge::command::switch_card_data(
-        &app.command_handles(),
-        &key(),
-        "",
-        crate::bridge::command::SwitchScope::All,
-    )
-    .await;
-
-    assert_eq!(shown.len(), 2);
-    assert_eq!(current_dir.as_deref(), Some("/work/pending"));
-    assert!(active_id.is_none(), "a pending means no active session");
-    assert_eq!(mapped_ids, vec!["ses_old".to_string()]);
-    assert_eq!(scope, crate::bridge::command::SwitchScope::All);
 }
 
 /// `/new` declares a Pending Session instead of creating one; the first

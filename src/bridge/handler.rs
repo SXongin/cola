@@ -871,7 +871,7 @@ impl App {
             .unwrap_or("")
             .trim()
             .to_string();
-        let scope = crate::bridge::command::SwitchScope::parse(
+        let scope = crate::feishu::card::session::SwitchScope::parse(
             value.get("scope").and_then(|v| v.as_str()).unwrap_or(""),
         );
 
@@ -1053,11 +1053,16 @@ impl App {
         core: &Arc<SharedCore>,
         thread_key: &ThreadKey,
         keyword: &str,
-        scope: crate::bridge::command::SwitchScope,
+        scope: crate::feishu::card::session::SwitchScope,
     ) -> serde_json::Value {
         let (shown, active_id, mapped_ids, scope, current_dir) =
-            crate::bridge::command::switch_card_data(&core.command_handles(), thread_key, keyword, scope)
-                .await;
+            crate::feishu::card::command::switch_card_data(
+                &core.command_handles(),
+                thread_key,
+                keyword,
+                scope,
+            )
+            .await;
         crate::feishu::card::session::build_switch_card(
             thread_key,
             &shown,
@@ -1178,7 +1183,7 @@ impl App {
         target: &crate::opencode::types::SessionListInfo,
         open_message_id: &str,
         keyword: &str,
-        scope: crate::bridge::command::SwitchScope,
+        scope: crate::feishu::card::session::SwitchScope,
     ) -> CardActionResult {
         let new_thread_id = match crate::bridge::topic::open_topic(
             &core.topic_handles(),
@@ -1222,7 +1227,7 @@ impl App {
         thread_key: &ThreadKey,
     ) -> serde_json::Value {
         let (dirs, current_dir) =
-            crate::bridge::command::dir_card_data(&core.command_handles(), thread_key).await;
+            crate::feishu::card::command::dir_card_data(&core.command_handles(), thread_key).await;
         crate::feishu::card::session::build_dir_card(thread_key, &dirs, current_dir.as_deref())
     }
 
@@ -1360,7 +1365,7 @@ impl App {
                 card: None,
                 toast: Some(format!(
                     "{}还没有会话",
-                    crate::bridge::command::feishu_side_label(&thread_key)
+                    crate::bridge::display::feishu_side_label(&thread_key)
                 )),
             });
         };
@@ -1368,7 +1373,8 @@ impl App {
         if let Err(e) = core.set_session_settings(&thread_key, settings).await {
             tracing::warn!("agent card: persist failed: {}", e);
         }
-        let (card, _error) = crate::bridge::command::agent_card(&core.command_handles(), &thread_key).await;
+        let (card, _error) =
+            crate::feishu::card::command::agent_card(&core.command_handles(), &thread_key).await;
         Some(CardActionResult {
             card,
             toast: Some(if clear {
@@ -1402,7 +1408,8 @@ impl App {
             let providers = core.opencode.list_models().await;
             let cards = if picked == crate::feishu::card::picker::PICKER_BACK_TO_PROVIDERS {
                 let current =
-                    crate::bridge::command::current_model_label(&core.command_handles(), &thread_key).await;
+                    crate::feishu::card::command::current_model_label(&core.command_handles(), &thread_key)
+                        .await;
                 crate::feishu::card::picker::build_model_provider_cards(
                     &thread_key,
                     &providers,
@@ -1431,7 +1438,7 @@ impl App {
                 card: None,
                 toast: Some(format!(
                     "{}还没有会话",
-                    crate::bridge::command::feishu_side_label(&thread_key)
+                    crate::bridge::display::feishu_side_label(&thread_key)
                 )),
             });
         };
@@ -1477,7 +1484,7 @@ impl App {
                 card: None,
                 toast: Some(format!(
                     "{}还没有会话",
-                    crate::bridge::command::feishu_side_label(&thread_key)
+                    crate::bridge::display::feishu_side_label(&thread_key)
                 )),
             });
         };
@@ -1495,7 +1502,8 @@ impl App {
         if let Err(e) = core.set_session_settings(&thread_key, settings).await {
             tracing::warn!("think card: persist failed: {}", e);
         }
-        let (card, _error) = crate::bridge::command::think_card(&core.command_handles(), &thread_key).await;
+        let (card, _error) =
+            crate::feishu::card::command::think_card(&core.command_handles(), &thread_key).await;
         Some(CardActionResult {
             card,
             toast: Some(if clear {

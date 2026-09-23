@@ -2,6 +2,34 @@ use serde_json::json;
 
 use super::shell::card_shell;
 
+/// The `/switch` card's list scope (ADR-0022). `Directory` filters the list to
+/// the active session's directory (the card's default view); `All` shows the
+/// whole shared store. The scope round-trips through the card's button values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwitchScope {
+    Directory,
+    All,
+}
+
+impl SwitchScope {
+    /// The payload string (`"dir"` / `"all"`) carried on card buttons.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SwitchScope::Directory => "dir",
+            SwitchScope::All => "all",
+        }
+    }
+
+    /// Parse a payload string; anything other than `"dir"` reads as `All`.
+    pub fn parse(s: &str) -> SwitchScope {
+        if s == "dir" {
+            SwitchScope::Directory
+        } else {
+            SwitchScope::All
+        }
+    }
+}
+
 /// One session entry of the `/switch` card: a full-width text row followed by
 /// a button row underneath. The text row is its own `column_set` column (not a
 /// weighted column squeezed beside the buttons), so the session label and
@@ -42,7 +70,7 @@ fn switch_card_row(
     btn_text: &str,
     thread_key: &crate::config::ThreadKey,
     session_id: &str,
-    scope: crate::bridge::command::SwitchScope,
+    scope: SwitchScope,
 ) -> Vec<serde_json::Value> {
     let btn_column = |op: &str, content: &str| {
         json!({
@@ -88,7 +116,7 @@ pub fn build_switch_card(
     thread_key: &crate::config::ThreadKey,
     sessions: &[crate::opencode::types::SessionListInfo],
     keyword: &str,
-    scope: crate::bridge::command::SwitchScope,
+    scope: SwitchScope,
     current_dir: Option<&str>,
     active_id: Option<&str>,
     mapped_ids: &[String],
@@ -152,7 +180,7 @@ pub fn build_switch_card(
     // the 本目录 button is hidden there. The keyword rides along so a scoped
     // search survives the toggle.
     let toggle_btn = match scope {
-        crate::bridge::command::SwitchScope::Directory => json!({
+        SwitchScope::Directory => json!({
             "tag": "button",
             "text": { "tag": "plain_text", "content": "全部" },
             "type": "default",
@@ -165,7 +193,7 @@ pub fn build_switch_card(
                 "thread_id": thread_key.thread_id,
             },
         }),
-        crate::bridge::command::SwitchScope::All => json!({
+        SwitchScope::All => json!({
             "tag": "button",
             "text": { "tag": "plain_text", "content": "本目录" },
             "type": "default",
@@ -179,7 +207,7 @@ pub fn build_switch_card(
             },
         }),
     };
-    if scope == crate::bridge::command::SwitchScope::Directory || current_dir.is_some() {
+    if scope == SwitchScope::Directory || current_dir.is_some() {
         elements.push(toggle_btn);
     }
 
@@ -188,7 +216,7 @@ pub fn build_switch_card(
     } else {
         let header = if keyword.is_empty() {
             match scope {
-                crate::bridge::command::SwitchScope::Directory => {
+                SwitchScope::Directory => {
                     format!(
                         "**{} 的会话**",
                         current_dir
@@ -196,7 +224,7 @@ pub fn build_switch_card(
                             .unwrap_or_default()
                     )
                 }
-                crate::bridge::command::SwitchScope::All => "**最近会话**".to_string(),
+                SwitchScope::All => "**最近会话**".to_string(),
             }
         } else {
             format!("**匹配 `{keyword}` 的会话**")
@@ -262,7 +290,7 @@ pub fn build_force_confirm_card(
     owner_name: &str,
     force_op: &str,
     force_label: &str,
-    scope: crate::bridge::command::SwitchScope,
+    scope: SwitchScope,
 ) -> serde_json::Value {
     let label = crate::bridge::display::title_or_id_tail(target);
     let back_btn = json!({
@@ -479,7 +507,7 @@ mod tests {
             &key,
             &sessions,
             "",
-            crate::bridge::command::SwitchScope::Directory,
+            SwitchScope::Directory,
             Some("/work/auth"),
             None,
             &[],
@@ -523,7 +551,7 @@ mod tests {
             &key,
             &[],
             "重写登录\n任务",
-            crate::bridge::command::SwitchScope::Directory,
+            SwitchScope::Directory,
             Some("/work/auth"),
             None,
             &[],
