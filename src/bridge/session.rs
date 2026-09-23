@@ -199,11 +199,28 @@ impl SessionStore {
     /// Pending Session of the thread is resolved in the same in-memory step:
     /// a thread cannot have both (ADR-0041). Centralised here so no activation
     /// path can leave a pending behind to supersede the session it activated.
-    fn promote(&mut self, entry: SessionEntry) {
+    fn promote(&mut self, mut entry: SessionEntry) {
         self.pending.retain(|p| p.thread_key != entry.thread_key);
-        // Remove any existing entry with the same session_id
+        // Replace any existing mapping of this session. ADR-0041 keeps the
+        // per-session overrides on the session: an adoption flow rebuilds the
+        // mapping fields but never sets model/variant/auto_accept, so
+        // re-adopting (switch card, `/switch <id>`, `/attach`, `/topic
+        // --adopt`, force adopt) must not reset the settings the session
+        // already had. An override the new entry set explicitly still wins —
+        // only fields left at their defaults are carried. Everything the flow
+        // owns — thread key, directory, agent, topic anchors — stays as the
+        // new entry set it.
         if let Some(pos) = self.entries.iter().position(|e| e.session_id == entry.session_id) {
-            self.entries.remove(pos);
+            let previous = self.entries.remove(pos);
+            if entry.model.is_none() {
+                entry.model = previous.model;
+            }
+            if entry.variant.is_none() {
+                entry.variant = previous.variant;
+            }
+            if !entry.auto_accept {
+                entry.auto_accept = previous.auto_accept;
+            }
         }
         self.entries.insert(0, entry);
     }
@@ -957,5 +974,89 @@ mod tests {
                 .settings(&ThreadKey::new("chat9".into(), "root9".into()))
                 .is_none()
         );
+    }
+
+    /// Re-adopting an already-mapped session keeps its per-session overrides:
+    /// they belong to the session, not to one mapping. The mapping fields the
+    /// adoption flow owns (thread, directory, agent, anchors) are overwritten.
+    #[test]
+    fn re_activation_keeps_per_session_overrides() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path).unwrap();
+
+        let mut first = make_entry("chat1", "root1", "ses_abc", "/tmp/old");
+        first.model = Some("provider/model-a".into());
+        first.variant = Some("high".into());
+        first.auto_accept = true;
+        store.set_active(first);
+
+        // A fresh entry for the same session under another mapping: the flow
+        // only sets the mapping fields.
+        let mut second = make_entry("chat2", "root2", "ses_abc", "/tmp/new");
+        second.agent = Some("build".into());
+        store.set_active(second);
+
+        let found = store
+            .get_active(&ThreadKey::new("chat2".into(), "root2".into()))
+            .expect("re-activated entry exists");
+        assert_eq!(found.directory, "/tmp/new", "flow-owned directory updates");
+        assert_eq!(found.agent.as_deref(), Some("build"), "flow-owned agent updates");
+        assert_eq!(found.model.as_deref(), Some("provider/model-a"));
+        assert_eq!(found.variant.as_deref(), Some("high"));
+        assert!(found.auto_accept, "auto-accept survives the re-adoption");
+        assert!(
+            store
+                .get_active(&ThreadKey::new("chat1".into(), "root1".into()))
+                .is_none(),
+            "the old mapping is replaced, not stacked"
+        );
+    }
+
+    /// An override the activating entry sets explicitly wins over the carried
+    /// one; only fields left at their defaults are inherited from the session.
+    #[test]
+    fn explicit_overrides_win_over_carried_ones() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path).unwrap();
+
+        let mut first = make_entry("chat1", "root1", "ses_abc", "/tmp/old");
+        first.model = Some("provider/model-a".into());
+        first.variant = Some("high".into());
+        store.set_active(first);
+
+        let mut second = make_entry("chat2", "root2", "ses_abc", "/tmp/new");
+        second.model = Some("provider/model-b".into());
+        store.set_active(second);
+
+        let found = store.entry_for_session("ses_abc").unwrap();
+        assert_eq!(
+            found.model.as_deref(),
+            Some("provider/model-b"),
+            "the explicitly set model wins"
+        );
+        assert_eq!(
+            found.variant.as_deref(),
+            Some("high"),
+            "the unset variant is carried"
+        );
+    }
+
+    /// A session never seen before still starts from defaults.
+    #[test]
+    fn first_activation_starts_from_defaults() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path).unwrap();
+        store
+            .activate(make_entry("chat1", "root1", "ses_new", "/tmp/proj"))
+            .unwrap();
+
+        let found = store.entry_for_session("ses_new").expect("entry exists");
+        assert!(!found.auto_accept);
+        assert!(found.model.is_none());
+        assert!(found.variant.is_none());
+        assert!(found.agent.is_none());
     }
 }

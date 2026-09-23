@@ -1367,3 +1367,111 @@ async fn switch_card_new_action_declares_pending_in_current_project() {
         .expect("a pending is declared");
     assert_eq!(pending.directory, "/work/proj", "inherits the current project");
 }
+
+/// Re-adopting an already-mapped session through the switch card must not
+/// reset its per-session overrides (ADR-0041 settings belong to the session):
+/// auto-accept survived `/new` + a card re-switch in production, then a
+/// permission surfaced as a card instead of being auto-accepted.
+#[tokio::test]
+async fn switch_card_readopt_keeps_per_session_overrides() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.session_list = vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)];
+    backend
+        .external_user_messages
+        .insert("ses_own1".into(), "OpenChamber 里的问题".into());
+    let (app, _platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    // The target is mapped but NOT active (a stacked session); its cola-side
+    // overrides are set.
+    let mut own = crate::config::SessionEntry::new(key.clone(), "ses_own1", "/work/cola");
+    own.model = Some("provider/model-a".into());
+    own.variant = Some("high".into());
+    own.auto_accept = true;
+    seed_entry(&app, own).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key.clone(), "ses_active", "/work/active"),
+    )
+    .await;
+
+    let value = serde_json::json!({
+        "action": "switch",
+        "op": "adopt",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "session_id": "ses_own1",
+    });
+    app.host_action(value)
+        .await
+        .expect("switch on a mapped row should return a result");
+
+    let entry = app
+        .sessions
+        .lock()
+        .await
+        .entry_for_session("ses_own1")
+        .cloned()
+        .expect("the re-adopted entry exists");
+    assert!(entry.auto_accept, "auto-accept survives the re-adoption");
+    assert_eq!(entry.model.as_deref(), Some("provider/model-a"));
+    assert_eq!(entry.variant.as_deref(), Some("high"));
+    assert_eq!(
+        app.sessions.lock().await.get_active(&key).unwrap().session_id,
+        "ses_own1",
+        "the mapping still moves to the adopted session"
+    );
+}
+
+/// The text `/attach` path (`adopt_session`) re-adopts through the same
+/// rebuild: per-session overrides must survive there too.
+#[tokio::test]
+async fn attach_readopt_keeps_per_session_overrides() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.session_list = vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)];
+    let (app, _platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    let mut own = crate::config::SessionEntry::new(key.clone(), "ses_own1", "/work/cola");
+    own.model = Some("provider/model-a".into());
+    own.variant = Some("high".into());
+    own.auto_accept = true;
+    seed_entry(&app, own).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key.clone(), "ses_active", "/work/active"),
+    )
+    .await;
+
+    crate::bridge::command::handle_command(
+        &app.core,
+        Command::Switch(SwitchAction::Attach {
+            query: "ses_own1".into(),
+            force: false,
+        }),
+        key.clone(),
+        "msg_attach",
+        crate::config::ConversationKind::P2p,
+    )
+    .await
+    .unwrap();
+
+    let entry = app
+        .sessions
+        .lock()
+        .await
+        .entry_for_session("ses_own1")
+        .cloned()
+        .expect("the re-adopted entry exists");
+    assert!(entry.auto_accept, "auto-accept survives the re-adoption");
+    assert_eq!(entry.model.as_deref(), Some("provider/model-a"));
+    assert_eq!(entry.variant.as_deref(), Some("high"));
+    assert_eq!(
+        app.sessions.lock().await.get_active(&key).unwrap().session_id,
+        "ses_own1"
+    );
+}
