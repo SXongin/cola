@@ -122,3 +122,16 @@ satisfies the `main: CI` ruleset, so the PR stays mergeable. `Dependency audit`
 keeps running (the lockfile changed) and CodeQL keeps running (the amendment
 above), so the cut still blocks on both. The admin bypass remains what covers
 the missing review approval.
+
+## Amendment (2026-09-23): the Test matrix job dispatches on release PRs too
+
+The release-PR-scope amendment above said `Test` skips on `release/*` "and still
+satisfies the ruleset". That held for the single-job checks (`Format`, `Check`,
+`Coverage`) but not for the `Test` matrix: a job-level skip leaves the matrix
+unexpanded (`Test (${{ matrix.os }})`), so the required `Test (macos-latest)`
+and `Test (windows-latest)` checks never report and the strict `main: CI`
+ruleset blocks the release PR — 0.9.1's first cut hit exactly this. The `Test`
+job now always dispatches and its **steps** carry the release/docs-only gate
+(the pattern the docs-only path already used), so both required checks report
+success with no test work. `Format`, `Check` and `Coverage` still skip at job
+level, and `Dependency audit` and CodeQL still gate the cut.

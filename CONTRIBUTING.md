@@ -131,11 +131,11 @@ that makes it required (its watch covers every check).
 Release PRs (`release/*`) and docs-only PRs skip the code-dependent work
 (Format, Check, Coverage, and the Test steps): a skipped job or step reports
 success, so the required checks still satisfy the `main: CI` ruleset and the PR
-stays mergeable without spending runner time on code that did not change. The
-Test job itself still dispatches on both platforms — a job-level skip leaves
-its matrix unexpanded and the two required `Test (…)` checks never report, so
-only its steps are gated. `Dependency audit` always runs, and the release cut
-keeps its CodeQL gate.
+stays mergeable without running the code-dependent gates. The Test job itself
+still dispatches on both platforms (idling for a few seconds) — a job-level
+skip leaves its matrix unexpanded and the two required `Test (…)` checks never
+report, so only its steps are gated. `Dependency audit` always runs, and the
+release cut keeps its CodeQL gate.
 
 Description template:
 
