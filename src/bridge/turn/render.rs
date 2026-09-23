@@ -26,7 +26,7 @@ use super::Turn;
 /// still has the default `New session - ...` title (or the title is empty),
 /// the id-tail alone identifies the session; the current prompt is never
 /// echoed (the reply context already shows it).
-pub(crate) async fn session_subtitle(
+pub(super) async fn session_subtitle(
     sessions: &SessionsHandle,
     backend: &Arc<dyn opencode::Backend>,
     thread_key: &crate::config::ThreadKey,
@@ -72,7 +72,7 @@ pub(crate) async fn session_subtitle(
 /// would otherwise stay on the "new session" default title until restart.
 /// Called periodically from the render poll loop, so the title follows the
 /// server within a poll interval.
-pub(crate) async fn refresh_session_title(
+async fn refresh_session_title(
     cards: &CardsHandle,
     sessions: &SessionsHandle,
     backend: &Arc<dyn opencode::Backend>,
@@ -304,7 +304,7 @@ fn render_part(acc: &mut StreamAccumulator, part: &serde_json::Value) {
 /// Render a batch of parts into the accumulator, skipping anything already
 /// rendered (same dedup as the poll loop). Returns true if anything new was
 /// rendered. Used as the final fallback when the incremental poll missed parts.
-pub(crate) fn render_parts(acc: &mut StreamAccumulator, parts: &serde_json::Value) -> bool {
+pub(super) fn render_parts(acc: &mut StreamAccumulator, parts: &serde_json::Value) -> bool {
     let Some(arr) = parts.as_array() else { return false };
     let mut rendered_any = false;
     for part in arr {
@@ -401,7 +401,7 @@ fn render_part_once(acc: &mut StreamAccumulator, part: &serde_json::Value) -> bo
 /// turn's, and cola's clock cannot. Shared with the post-prompt drain
 /// (ADR-0043), whose Backend snapshot must capture the anchor before it can
 /// judge an unanswered supplement.
-pub(crate) fn capture_turn_anchor(
+pub(super) fn capture_turn_anchor(
     acc: &mut StreamAccumulator,
     msgs: &[crate::opencode::types::SessionMessage],
 ) {
@@ -431,7 +431,7 @@ pub(crate) fn capture_turn_anchor(
 /// bled the previous turn's parts into the new card when it ran ahead. Until
 /// the anchor is observed nothing renders: with two skewed clocks there is no
 /// threshold that tells the two turns apart.
-pub(crate) fn render_new_turn_parts(
+pub(super) fn render_new_turn_parts(
     acc: &mut StreamAccumulator,
     msgs: &[crate::opencode::types::SessionMessage],
 ) -> bool {
@@ -485,7 +485,7 @@ pub(crate) fn render_new_turn_parts(
 /// Returns `Some((new_parts, text_len, reasoning_len))` when the accumulator is
 /// still present (the statistics are for logging); `None` when it vanished (the
 /// caller should stop).
-pub(crate) async fn render_and_flush(
+pub(super) async fn render_and_flush(
     cards: &CardsHandle,
     sessions: &SessionsHandle,
     backend: &Arc<dyn opencode::Backend>,
@@ -548,7 +548,7 @@ pub(crate) async fn render_and_flush(
 /// text). `done` stops the loop once the prompt returns. `poll_ms` is the
 /// injected cadence (`TurnConfig::turn_render_poll_ms`), so tests never wait
 /// on the production 1.5 s.
-pub(crate) async fn render_poll_loop(
+async fn render_poll_loop(
     cards: &CardsHandle,
     sessions: &SessionsHandle,
     backend: &Arc<dyn opencode::Backend>,

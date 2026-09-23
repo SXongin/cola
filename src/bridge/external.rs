@@ -6,7 +6,6 @@ use tracing::Instrument;
 use crate::bridge::core::SharedCore;
 use crate::bridge::streaming::StreamAccumulator;
 use crate::bridge::turn::Turn;
-use crate::bridge::turn::render::render_and_flush;
 
 /// The external-message flow: watches for user messages that were NOT sent by
 /// cola (someone posted from OpenChamber or another client on the shared store)
@@ -594,7 +593,7 @@ async fn external_render_loop(
             break;
         }
         // Stream the reply's reasoning/tools/text into the notification card.
-        let Some((new_parts, _, _)) = render_and_flush(
+        let Some((new_parts, _, _)) = Turn::render_and_flush(
             &core.cards_handle(),
             &core.sessions_handle(),
             &core.opencode,

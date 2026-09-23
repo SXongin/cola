@@ -316,6 +316,7 @@ async fn a_tool_completing_after_the_split_renders_on_the_continuation() {
         },
     );
     acc.reply_to_message_id = Some("msg_1".into());
+    acc.turn_started_ms = Some(0);
     app.cards
         .lock()
         .await
@@ -334,20 +335,31 @@ async fn a_tool_completing_after_the_split_renders_on_the_continuation() {
 
     // The tool settles through the render path the poll uses: `sleep 30`
     // completes and its output lands.
-    {
-        let mut cards = app.cards.lock().await;
-        let acc = &mut cards.get_mut("ses_test").unwrap().acc;
-        crate::bridge::turn::render::render_parts(
-            acc,
-            &serde_json::json!([
-                { "type": "tool", "tool": "bash", "callID": "call_bash",
-                  "state": { "status": "completed",
-                             "input": { "command": "sleep 30" },
-                             "output": "done" } },
-            ]),
-        );
-    }
-    crate::bridge::turn::Turn::flush_card(&app.cards_handle(), "ses_test").await;
+    let msgs = vec![crate::opencode::types::SessionMessage {
+        info: crate::opencode::types::MessageInfo {
+            id: "a1".into(),
+            role: Some("assistant".into()),
+            parent_id: None,
+            time: Some(crate::opencode::types::MessageTime { created: 1 }),
+            model_id: None,
+            provider_id: None,
+            tokens: None,
+        },
+        parts: serde_json::json!([
+            { "type": "tool", "tool": "bash", "callID": "call_bash",
+              "state": { "status": "completed",
+                         "input": { "command": "sleep 30" },
+                         "output": "done" } },
+        ]),
+    }];
+    crate::bridge::turn::Turn::render_and_flush(
+        &app.cards_handle(),
+        &app.sessions_handle(),
+        &app.opencode,
+        "ses_test",
+        &msgs,
+    )
+    .await;
 
     // The completion renders on the continuation, in its live tail...
     let updated = last_update_of(&platform, "msg_reply").await;

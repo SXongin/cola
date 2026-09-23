@@ -1,10 +1,12 @@
 mod flush;
-pub(crate) mod render;
+mod render;
+
+use std::sync::Arc;
 
 use tracing::Instrument;
 
 use crate::bridge::handler::image_inputs;
-use crate::bridge::handles::{CardsHandle, TurnHandles};
+use crate::bridge::handles::{CardsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
 use crate::bridge::streaming::StreamAccumulator;
 use crate::config::ThreadKey;
@@ -892,6 +894,38 @@ impl Turn {
     }
 }
 
+/// The Turn's render interface (spec #298, A2b): the two operations sibling
+/// flows invoke — the card subtitle built before a prompt, and the shared
+/// render-and-flush a polled snapshot goes through. The poll loop, the part
+/// rendering and the title refresh behind them are private to the `render`
+/// submodule.
+impl Turn {
+    /// The session/thread name shown as the card subtitle, formatted as
+    /// `<title> · <id-tail>` from the OpenCode server's own live session title
+    /// (ADR-0007), fetched on demand.
+    pub(crate) async fn session_subtitle(
+        sessions: &SessionsHandle,
+        backend: &Arc<dyn opencode::Backend>,
+        thread_key: &ThreadKey,
+        text: &str,
+    ) -> String {
+        render::session_subtitle(sessions, backend, thread_key, text).await
+    }
+
+    /// Render a polled message snapshot into `session_id`'s live card, flushing
+    /// when the content, header or context footer changed. Returns `None` when
+    /// the session's accumulator vanished (the caller should stop).
+    pub(crate) async fn render_and_flush(
+        cards: &CardsHandle,
+        sessions: &SessionsHandle,
+        backend: &Arc<dyn opencode::Backend>,
+        session_id: &str,
+        msgs: &[SessionMessage],
+    ) -> Option<(usize, usize, usize)> {
+        render::render_and_flush(cards, sessions, backend, session_id, msgs).await
+    }
+}
+
 /// Release a session's busy guard. A free function so the phases' error paths
 /// can release before any [`Turn`] state is settled; idempotent.
 async fn release_inflight(handles: &TurnHandles, session_id: &str) {
@@ -901,8 +935,6 @@ async fn release_inflight(handles: &TurnHandles, session_id: &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
     use crate::bridge::App;
     use crate::bridge::test_support::{
