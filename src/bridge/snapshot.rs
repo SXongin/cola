@@ -204,8 +204,8 @@ pub(crate) async fn snapshot_card_for(
 }
 
 /// ADR-0028: the filter+build half of [`snapshot_card_for`] — restrict the
-/// gathered data to the claimable pendings and build the card. Shared by the
-/// switch-card 切换 op, which gathers first (the suppression decision needs
+/// gathered data to the claimable pendings and build the card. Shared by
+/// [`re_switch_snapshot`], which gathers first (the suppression decision needs
 /// the raw data) and then filters, so the two surfaces cannot drift.
 pub(crate) async fn snapshot_card_from_data(
     core: &Arc<SharedCore>,
@@ -216,6 +216,49 @@ pub(crate) async fn snapshot_card_from_data(
     let data = crate::bridge::snapshot_claims::claimable_pendings(core, data).await;
     let card = crate::feishu::snapshot_card::build_snapshot_card(verb, title, &data);
     (card, data)
+}
+
+/// What a re-activation's snapshot produced (ADR-0028).
+pub(crate) enum ReSwitchSnapshot {
+    /// Content to report: the full 切换 card plus the filtered data the caller
+    /// claims against the message it sends.
+    Full {
+        card: serde_json::Value,
+        data: SnapshotData,
+    },
+    /// Nothing to report (the suppression predicate fired): the caller renders
+    /// its own compact state instead.
+    Suppressed,
+}
+
+/// ADR-0028: a re-activation's snapshot — a session already mapped to this
+/// thread, so the `thread_key` is known at the call site rather than resolved
+/// from the store. Gathers the session's data, decides the emit, and on `Full`
+/// restricts the pendings and builds the 切换 card. The whole gather+decide+
+/// build sequence runs inside the Session's `snapshot` span (ADR-0048), so the
+/// gather's best-effort read warnings are retrievable by the Session being
+/// re-activated. Shared by the text `/switch` mapped-hit path and the switch
+/// card's 切换 op so the span and the sequence cannot drift.
+pub(crate) async fn re_switch_snapshot(
+    core: &Arc<SharedCore>,
+    thread_key: &crate::config::ThreadKey,
+    session_id: &str,
+    directory: &str,
+    title: &str,
+) -> ReSwitchSnapshot {
+    let span = crate::bridge::span::snapshot(session_id, Some(thread_key));
+    async move {
+        let data = gather_snapshot(&core.opencode, session_id, directory).await;
+        match re_switch_emit(&data) {
+            SnapshotEmit::Full => {
+                let (card, data) = snapshot_card_from_data(core, "切换", title, data).await;
+                ReSwitchSnapshot::Full { card, data }
+            }
+            SnapshotEmit::Suppressed => ReSwitchSnapshot::Suppressed,
+        }
+    }
+    .instrument(span)
+    .await
 }
 
 /// The newest user message (by created time), if any — `(created, id)`. A

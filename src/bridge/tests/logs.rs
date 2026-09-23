@@ -547,3 +547,45 @@ async fn a_topic_cover_retitle_carries_the_session_chat_and_topic() {
         "the retitle carries the topic: {retitled}"
     );
 }
+
+/// A re-switch — a session already mapped to this thread — runs its snapshot
+/// gather inside the Session's `snapshot` span (ADR-0048), so the gather's
+/// best-effort read warning is retrievable by the Session being re-activated.
+#[tokio::test]
+async fn a_re_switch_snapshot_gather_carries_the_session() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
+    // The gather's status read fails: its warning is the line under test.
+    backend.session_status_error = Some("boom".into());
+    let (app, _platform) = build_app(cfg, backend).await;
+    let lobby = ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(&app, SessionEntry::new(lobby.clone(), "ses_alpha01", "/work/ext")).await;
+
+    let (_, logs) = capture_logs(async {
+        crate::bridge::command::handle_command(
+            &app.core,
+            crate::bridge::command::Command::Switch(crate::bridge::command::SwitchAction::Match(
+                "唯一外部标题".into(),
+            )),
+            lobby,
+            "msg_switch",
+            crate::config::ConversationKind::P2p,
+        )
+        .await
+        .unwrap();
+    })
+    .await;
+
+    let failed = line_with(&logs, "snapshot: session status for");
+    assert!(
+        failed.contains("session=ses_alpha01"),
+        "the gather warning carries the session: {failed}"
+    );
+    assert!(
+        failed.contains("chat=chat_1"),
+        "the gather warning carries the chat: {failed}"
+    );
+}

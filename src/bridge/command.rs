@@ -1526,20 +1526,25 @@ async fn handle_switch(
         // idle, pending-free, cola-authored session keeps today's one-line
         // text ack (its recent life is already visible in this thread). The
         // `already_mapped` input is true by construction: the hit came from
-        // this thread's mapped-session list.
-        let data = crate::bridge::snapshot::gather_snapshot(&core.opencode, &hit.id, &hit.directory).await;
-        match crate::bridge::snapshot::re_switch_emit(&data) {
-            crate::bridge::snapshot::SnapshotEmit::Full => {
-                // Restrict to the claimable pendings (an already-surfaced one
-                // stays authoritative) and claim the rest against the sent
-                // snapshot so the poll loop never duplicates them.
-                let data = crate::bridge::snapshot_claims::claimable_pendings(core, data).await;
-                let card = crate::feishu::snapshot_card::build_snapshot_card("切换", &hit.title, &data);
+        // this thread's mapped-session list. The gather and the 切换 card's
+        // build run inside the Session's `snapshot` span (ADR-0048).
+        match crate::bridge::snapshot::re_switch_snapshot(
+            core,
+            thread_key,
+            &hit.id,
+            &hit.directory,
+            &hit.title,
+        )
+        .await
+        {
+            crate::bridge::snapshot::ReSwitchSnapshot::Full { card, data } => {
+                // Claim the snapshot's embedded pendings against the sent card
+                // so the poll loop never duplicates them.
                 let mid = core.feishu.reply_card(message_id, &card).await?;
                 crate::bridge::external::settle_snapshot_after_send(core, &mid, "切换", &hit.title, &data)
                     .await;
             }
-            crate::bridge::snapshot::SnapshotEmit::Suppressed => {
+            crate::bridge::snapshot::ReSwitchSnapshot::Suppressed => {
                 core.feishu
                     .reply_text(message_id, &format!("Switched to \"{}\".", hit.title))
                     .await?;
