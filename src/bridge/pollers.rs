@@ -235,9 +235,11 @@ async fn reconcile(
 /// died while a turn was in flight (`heal_when_busy`), so a mid-stream
 /// generation's next poll finds a live server.
 ///
-/// The [`PollLoop`] seam owns the cadence; the loop has no serverless guard —
-/// a server must be able to APPEAR (attach) as well as disappear, so every
-/// tick reconciles.
+/// The [`PollLoop`] seam owns the cadence and the failure policy: a failing
+/// reconcile WARNs once per distinct error instead of on every tick, identical
+/// repeats are DEBUG, and a pass that recovers logs INFO (ADR-0048). The loop
+/// has no serverless guard — a server must be able to APPEAR (attach) as well
+/// as disappear, so every tick reconciles.
 ///
 /// [`PollLoop`]: crate::bridge::poll::PollLoop
 pub(crate) async fn reconnect_poll_loop(handles: &PollHandles) -> crate::error::Result<()> {
@@ -247,18 +249,19 @@ pub(crate) async fn reconnect_poll_loop(handles: &PollHandles) -> crate::error::
         || true,
         move || async move {
             let _guard = handles.server.lock.lock().await;
-            if let Err(e) = reconcile(handles, false, true).await {
-                tracing::warn!("server reconcile failed: {}", e);
-            }
-            Ok(())
+            reconcile(handles, false, true)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         },
     )
     .await
 }
 
 /// The reconnect loop's [`PollLoop`]: the production condition name, wired to
-/// the injected cadence. Split out so the loop's construction is named once
-/// and its ticks can be driven without scanning the real process table.
+/// the injected cadence. Split out so the loop's failure policy is testable at
+/// the seam — a reconcile pass scans the real process table and cannot be
+/// driven with a fake.
 ///
 /// [`PollLoop`]: crate::bridge::poll::PollLoop
 fn reconnect_loop(cadence_ms: &std::sync::atomic::AtomicU64) -> crate::bridge::poll::PollLoop<'_> {
@@ -545,6 +548,40 @@ mod tests {
         assert!(want_to_spawn(false, true, true));
         assert!(!want_to_spawn(false, false, false));
         assert!(!want_to_spawn(false, false, true));
+    }
+
+    /// The reconnect loop's failure policy (ADR-0048): a failing reconcile
+    /// WARNs once with the cause, the identical repeat is DEBUG at the
+    /// production 5 s cadence (injected as 1 ms here) — not a WARN every tick.
+    /// Driven at the seam because `reconcile` scans the real process table and
+    /// cannot be faked.
+    #[tokio::test]
+    async fn the_reconnect_loop_latches_its_failures() {
+        let cadence = std::sync::atomic::AtomicU64::new(1);
+        let mut poll = reconnect_loop(&cadence);
+        let (_, logs) = crate::bridge::test_support::capture_logs(async {
+            let mut pass = || async { Err("connection refused".to_string()) };
+            poll.tick(|| true, &mut pass).await;
+            poll.tick(|| true, &mut pass).await;
+        })
+        .await;
+
+        use crate::bridge::test_support::level_count;
+        assert_eq!(
+            level_count(&logs, "server reconcile failed", "WARN"),
+            1,
+            "one warning, not one per tick:\n{logs}"
+        );
+        assert_eq!(
+            level_count(&logs, "server reconcile still failing", "DEBUG"),
+            1,
+            "the identical repeat is DEBUG:\n{logs}"
+        );
+        assert!(
+            logs.contains("connection refused"),
+            "the warning carries the cause:\n{logs}"
+        );
+        assert!(!logs.contains("scope ;"), "no empty scope segment:\n{logs}");
     }
 
     /// A shared core whose `session_info` serves the given parent map, so the
