@@ -1,4 +1,3 @@
-use crate::bridge::command::*;
 use crate::bridge::test_support::*;
 
 /// `/model` (no args) sends the provider-picker card (step 1 of the
@@ -11,13 +10,13 @@ async fn model_no_arg_sends_picker_card() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.provider_models = vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::opencode::types::ProviderModels {
         provider: "opencode".into(),
         models: vec![
             model_option("deepseek-v4-flash", &[]),
             model_option("gpt-4o", &[]),
         ],
-    }];
+    }]);
     let (app, platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     seed_entry(
@@ -36,15 +35,14 @@ async fn model_no_arg_sends_picker_card() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::ModelCard,
+    send_command_in(
+        &app,
+        "/model",
         key,
         "msg_model_card",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
 
     let calls = platform.calls.lock().await.clone();
     let card = calls
@@ -62,9 +60,15 @@ async fn model_no_arg_sends_picker_card() {
         text.contains("当前模型") && text.contains("opencode/deepseek-v4-flash@low"),
         "current model line: {text}"
     );
-    assert!(text.contains("\"value\":\"opencode\""), "provider button: {text}");
+    let buttons = card_buttons(&card);
     assert!(
-        !text.contains("\"value\":\"opencode/deepseek-v4-flash\""),
+        buttons.iter().any(|b| b["value"]["value"] == "opencode"),
+        "provider button: {text}"
+    );
+    assert!(
+        !buttons
+            .iter()
+            .any(|b| b["value"]["value"] == "opencode/deepseek-v4-flash"),
         "step 1 must not show models as options: {text}"
     );
 }
@@ -77,11 +81,11 @@ async fn model_card_falls_back_to_the_configured_default_model() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.provider_models = vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::opencode::types::ProviderModels {
         provider: "opencode".into(),
         models: vec![model_option("gpt-4o", &[])],
-    }];
-    backend.default_model = Some(crate::opencode::types::ModelInfo {
+    }]);
+    backend.with_default_model(crate::opencode::types::ModelInfo {
         id: "gpt-4o".into(),
         provider_id: "opencode".into(),
         variant: None,
@@ -104,15 +108,14 @@ async fn model_card_falls_back_to_the_configured_default_model() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::ModelCard,
+    send_command_in(
+        &app,
+        "/model",
         key,
         "msg_model_card",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
     let text = platform
         .calls
         .lock()
@@ -137,11 +140,11 @@ async fn model_card_falls_back_to_the_server_recorded_model() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.provider_models = vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::opencode::types::ProviderModels {
         provider: "opencode".into(),
         models: vec![model_option("gpt-4o", &[])],
-    }];
-    backend.session_model = Some(crate::opencode::types::SessionModel {
+    }]);
+    backend.with_session_model(crate::opencode::types::SessionModel {
         provider_id: "opencode".into(),
         id: "gpt-4o".into(),
     });
@@ -163,15 +166,14 @@ async fn model_card_falls_back_to_the_server_recorded_model() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::ModelCard,
+    send_command_in(
+        &app,
+        "/model",
         key,
         "msg_model_card",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
     let text = platform
         .calls
         .lock()
@@ -197,13 +199,13 @@ async fn model_card_button_records_override() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.provider_models = vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::opencode::types::ProviderModels {
         provider: "opencode".into(),
         models: vec![
             model_option("deepseek-v4-flash", &[]),
             model_option("gpt-4o", &[]),
         ],
-    }];
+    }]);
     let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     seed_entry(
@@ -263,7 +265,7 @@ async fn model_picker_back_button_returns_to_providers() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.provider_models = vec![
+    backend.with_models(vec![
         crate::opencode::types::ProviderModels {
             provider: "opencode".into(),
             models: vec![model_option("deepseek-v4-flash", &[])],
@@ -272,7 +274,7 @@ async fn model_picker_back_button_returns_to_providers() {
             provider: "openrouter".into(),
             models: vec![model_option("gpt-4o", &[])],
         },
-    ];
+    ]);
     let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     seed_entry(
@@ -322,7 +324,7 @@ async fn agent_card_picker_and_button() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.agents = vec![
+    backend.with_agents(vec![
         crate::opencode::types::AgentInfo {
             name: "sec-agent".into(),
             description: Some("a subagent".into()),
@@ -341,7 +343,7 @@ async fn agent_card_picker_and_button() {
             mode: Some("primary".into()),
             hidden: Some(false),
         },
-    ];
+    ]);
     let (app, platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     seed_entry(
@@ -360,15 +362,14 @@ async fn agent_card_picker_and_button() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::AgentCard,
+    send_command_in(
+        &app,
+        "/agent",
         key.clone(),
         "msg_agent_card",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
     let calls = platform.calls.lock().await.clone();
     let card = calls
         .iter()
@@ -383,12 +384,13 @@ async fn agent_card_picker_and_button() {
     // The subagent sorts first in the fixture but is skipped: `build` is
     // the derived server default.
     assert!(text.contains("`build`（默认）"), "default agent: {text}");
+    let buttons = card_buttons(&card);
     assert!(
-        text.contains("\"action\":\"agent_clear\""),
+        buttons.iter().any(|b| b["value"]["action"] == "agent_clear"),
         "clear action: {text}"
     );
     assert!(
-        text.contains("\"value\":\"default\""),
+        buttons.iter().any(|b| b["value"]["value"] == "default"),
         "an agent named `default` is a selectable value: {text}"
     );
 
@@ -463,15 +465,14 @@ async fn agent_text_reset_flag_clears_override() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Agent("--reset".into()),
+    send_command_in(
+        &app,
+        "/agent --reset",
         key.clone(),
         "msg_agent_reset",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
     assert!(
         app.sessions
             .lock()
@@ -485,15 +486,14 @@ async fn agent_text_reset_flag_clears_override() {
     assert!(text.contains("已清除 Agent"), "clear reply: {text}");
 
     // A bare name never clears — it records the override.
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Agent("build".into()),
+    send_command_in(
+        &app,
+        "/agent build",
         key.clone(),
         "msg_agent_set",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
     assert_eq!(
         app.sessions
             .lock()
@@ -530,15 +530,14 @@ async fn autoaccept_card_toggles_flag() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::AutoAccept(crate::bridge::command::AutoAcceptAction::Status),
+    send_command_in(
+        &app,
+        "/autoaccept",
         key.clone(),
         "msg_aa",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
     let calls = platform.calls.lock().await.clone();
     let card = calls
         .iter()
@@ -548,7 +547,7 @@ async fn autoaccept_card_toggles_flag() {
         })
         .next()
         .expect("an autoaccept card should be sent");
-    assert!(card.to_string().contains("自动审批"), "toggle card: {card}");
+    assert!(card_text(&card).contains("自动审批"), "toggle card: {card}");
 
     let value = serde_json::json!({
         "action": "autoaccept",
@@ -599,15 +598,7 @@ async fn name_patches_server_title() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Name("新名字".into()),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_name",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/name 新名字", "msg_name").await;
 
     assert_eq!(
         title_calls.lock().await.as_slice(),
@@ -649,15 +640,14 @@ async fn name_patches_cover_card_in_cover_rooted_topic() {
     .await;
     seed_cover_title(&app, "ses_test", "旧标题").await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Name("新名字".into()),
+    send_command_in(
+        &app,
+        "/name 新名字",
         crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
         "msg_name",
         crate::config::ConversationKind::Topic,
     )
-    .await
-    .unwrap();
+    .await;
 
     let calls = platform.calls.lock().await.clone();
     let patched = calls
@@ -849,15 +839,7 @@ async fn model_command_records_override_used_on_next_prompt() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Model("opencode-go/deepseek-v4-flash".into()),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_model",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/model opencode-go/deepseek-v4-flash", "msg_model").await;
 
     // The override is recorded on the session's persisted entry.
     let stored = {
@@ -912,15 +894,14 @@ async fn think_command_records_variant_used_on_next_prompt() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Think("high".into()),
+    send_command_in(
+        &app,
+        "/think high",
         key.clone(),
         "msg_think",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
 
     let stored = {
         let store = app.sessions.lock().await;
@@ -954,10 +935,10 @@ async fn think_command_rejects_undeclared_variant() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.provider_models = vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::opencode::types::ProviderModels {
         provider: "opencode-go".into(),
         models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
-    }];
+    }]);
     let (app, platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     seed_entry(
@@ -976,15 +957,14 @@ async fn think_command_rejects_undeclared_variant() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Think("medium".into()),
+    send_command_in(
+        &app,
+        "/think medium",
         key.clone(),
         "msg_think",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
 
     let calls = platform.calls.lock().await.clone();
     let text = calls
@@ -1032,15 +1012,14 @@ async fn think_reset_flag_clears_variant() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Think("--reset".into()),
+    send_command_in(
+        &app,
+        "/think --reset",
         key.clone(),
         "msg_think",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
 
     assert!(
         app.sessions
@@ -1062,10 +1041,10 @@ async fn think_bare_default_undeclared_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.provider_models = vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::opencode::types::ProviderModels {
         provider: "opencode-go".into(),
         models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
-    }];
+    }]);
     let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     seed_entry(
@@ -1084,15 +1063,14 @@ async fn think_bare_default_undeclared_is_rejected() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Think("default".into()),
+    send_command_in(
+        &app,
+        "/think default",
         key.clone(),
         "msg_think",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
     assert!(
         app.sessions
             .lock()
@@ -1113,10 +1091,10 @@ async fn think_bare_default_declared_is_stored() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.provider_models = vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::opencode::types::ProviderModels {
         provider: "opencode-go".into(),
         models: vec![model_option("deepseek-v4-flash", &["low", "default"])],
-    }];
+    }]);
     let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     seed_entry(
@@ -1135,15 +1113,14 @@ async fn think_bare_default_declared_is_stored() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Think("default".into()),
+    send_command_in(
+        &app,
+        "/think default",
         key.clone(),
         "msg_think",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
     assert_eq!(
         app.sessions
             .lock()
@@ -1164,10 +1141,10 @@ async fn think_no_arg_sends_variant_card() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.provider_models = vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::opencode::types::ProviderModels {
         provider: "opencode-go".into(),
         models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
-    }];
+    }]);
     let (app, platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     seed_entry(
@@ -1186,15 +1163,14 @@ async fn think_no_arg_sends_variant_card() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::ThinkCard,
+    send_command_in(
+        &app,
+        "/think",
         key.clone(),
         "msg_think_card",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
 
     let calls = platform.calls.lock().await.clone();
     let card = calls
@@ -1209,8 +1185,15 @@ async fn think_no_arg_sends_variant_card() {
     assert!(text.contains("思考等级"), "header: {text}");
     assert!(text.contains("opencode-go/deepseek-v4-flash"), "model: {text}");
     assert!(text.contains("默认（清除）"), "default option: {text}");
-    assert!(text.contains("\"value\":\"low\""), "variant low: {text}");
-    assert!(text.contains("\"value\":\"high\""), "variant high: {text}");
+    let buttons = card_buttons(&card);
+    assert!(
+        buttons.iter().any(|b| b["value"]["value"] == "low"),
+        "variant low: {text}"
+    );
+    assert!(
+        buttons.iter().any(|b| b["value"]["value"] == "high"),
+        "variant high: {text}"
+    );
     assert!(text.contains("当前思考等级"), "current label: {text}");
 }
 
@@ -1224,10 +1207,10 @@ async fn think_card_button_records_variant() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.provider_models = vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::opencode::types::ProviderModels {
         provider: "opencode-go".into(),
         models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
-    }];
+    }]);
     let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     seed_entry(
@@ -1308,7 +1291,7 @@ async fn model_switch_clears_undeclared_variant() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.provider_models = vec![
+    backend.with_models(vec![
         crate::opencode::types::ProviderModels {
             provider: "opencode-go".into(),
             models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
@@ -1317,7 +1300,7 @@ async fn model_switch_clears_undeclared_variant() {
             provider: "openrouter".into(),
             models: vec![model_option("other-model", &["low"])],
         },
-    ];
+    ]);
     let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     seed_entry(
@@ -1337,15 +1320,14 @@ async fn model_switch_clears_undeclared_variant() {
     .await;
 
     // Switching to the SAME model (declares high) keeps the variant.
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Model("opencode-go/deepseek-v4-flash".into()),
+    send_command_in(
+        &app,
+        "/model opencode-go/deepseek-v4-flash",
         key.clone(),
         "msg_model",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
     assert_eq!(
         app.sessions
             .lock()
@@ -1358,15 +1340,14 @@ async fn model_switch_clears_undeclared_variant() {
     );
 
     // A model that positively lacks the variant clears it.
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Model("openrouter/other-model".into()),
+    send_command_in(
+        &app,
+        "/model openrouter/other-model",
         key.clone(),
         "msg_model2",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
     assert!(
         app.sessions
             .lock()
@@ -1387,10 +1368,10 @@ async fn model_switch_keeps_variant_when_new_model_unknown() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.provider_models = vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::opencode::types::ProviderModels {
         provider: "opencode-go".into(),
         models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
-    }];
+    }]);
     let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     seed_entry(
@@ -1409,15 +1390,14 @@ async fn model_switch_keeps_variant_when_new_model_unknown() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Model("openrouter/other-model".into()),
+    send_command_in(
+        &app,
+        "/model openrouter/other-model",
         key.clone(),
         "msg_model",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
     assert_eq!(
         app.sessions
             .lock()
@@ -1454,15 +1434,7 @@ async fn model_command_rejects_malformed_value() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Model("not-a-model".into()),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_model",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/model not-a-model", "msg_model").await;
 
     let text = platform.texts().await.join("\n");
     assert!(
@@ -1560,15 +1532,7 @@ async fn agent_command_records_override_used_on_next_prompt() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Agent("primary".into()),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_agent",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/agent primary", "msg_agent").await;
 
     // The override is recorded on the session's persisted entry.
     let stored = {
@@ -1667,15 +1631,7 @@ async fn model_override_persists_across_store_reload() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Model("opencode-go/deepseek-v4-flash".into()),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_model",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/model opencode-go/deepseek-v4-flash", "msg_model").await;
 
     // A freshly-loaded store (as after a restart) still has the override.
     let reloaded = crate::bridge::session::SessionStore::new(dir.path().join("sessions.json")).unwrap();

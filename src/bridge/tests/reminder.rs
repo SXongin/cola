@@ -64,7 +64,7 @@ fn pinned_permission_app(
 ) -> (Arc<App>, Arc<RecordingPlatform>, Arc<MockBackend>) {
     cfg.bridge.instant_reminder = true;
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![permission("per_1", "ses_1")];
+    backend.ask_permission(permission("per_1", "ses_1"));
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg.clone(), backend.clone(), platform.clone()).unwrap());
@@ -125,7 +125,7 @@ async fn a_pending_question_pins_and_resolution_unpins() {
     let mut cfg = test_config(&dir.path().join("sessions.json"));
     cfg.bridge.instant_reminder = true;
     let mut backend = MockBackend::new(realistic_parts());
-    backend.questions = vec![question("que_1", "ses_1")];
+    backend.ask_question(question("que_1", "ses_1"));
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -177,7 +177,7 @@ async fn pin_off_records_no_reminder_calls() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     assert!(!cfg.bridge.instant_reminder, "test_config is the off default");
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![permission("per_1", "ses_1")];
+    backend.ask_permission(permission("per_1", "ses_1"));
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -211,7 +211,7 @@ async fn a_failed_pin_never_affects_the_turn_and_does_not_clear() {
     let mut cfg = test_config(&dir.path().join("sessions.json"));
     cfg.bridge.instant_reminder = true;
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![permission("per_1", "ses_1")];
+    backend.ask_permission(permission("per_1", "ses_1"));
     let backend = Arc::new(backend);
     let platform = RecordingPlatform::new();
     platform.fail_instant_reminder.store(true, Ordering::SeqCst);
@@ -315,8 +315,8 @@ async fn the_newest_pending_owns_the_pin_and_hands_over_on_resolution() {
     let mut cfg = test_config(&dir.path().join("sessions.json"));
     cfg.bridge.instant_reminder = true;
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![permission("per_1", "ses_perm")];
-    backend.questions = vec![question("que_1", "ses_ques")];
+    backend.ask_permission(permission("per_1", "ses_perm"));
+    backend.ask_question(question("que_1", "ses_ques"));
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -436,9 +436,8 @@ async fn a_long_p2p_turn_sends_a_completion_notice() {
     let mut cfg = test_config(&dir.path().join("sessions.json"));
     cfg.bridge.long_task_notice = true;
     // The gate holds the prompt in flight past the injected threshold.
-    let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.prompt_gate = Some(gate.clone());
+    let gate = backend.hold_prompts();
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -499,9 +498,8 @@ async fn a_long_p2p_turn_without_the_opt_in_sends_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     assert!(!cfg.bridge.long_task_notice, "test_config is the off default");
-    let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.prompt_gate = Some(gate.clone());
+    let gate = backend.hold_prompts();
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());

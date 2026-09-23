@@ -1,4 +1,3 @@
-use crate::bridge::command::*;
 use crate::bridge::test_support::*;
 
 #[tokio::test]
@@ -7,10 +6,10 @@ async fn list_shows_global_sessions_marking_own() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![
+    backend.given_sessions(vec![
         list_session("ses_alpha01", "外部会话", "/tmp/ext", 100),
         list_session("ses_beta02", "本地会话", "/work/cola", 300),
-    ];
+    ]);
     let (app, platform) = build_app(cfg, backend).await;
     // Our own lobby session, so /list marks it active (ADR-0022: only the
     // active session is marked; the 本会话 ownership marker is gone).
@@ -30,18 +29,7 @@ async fn list_shows_global_sessions_marking_own() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::List {
-            keyword: None,
-            all: false,
-        }),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_list",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch list", "msg_list").await;
 
     let text = platform.texts().await.join("\n");
     assert!(text.contains("外部会话"), "external session visible: {text}");
@@ -60,64 +48,31 @@ async fn list_filters_by_keyword_and_hides_children() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![
+    backend.given_sessions(vec![
         list_session("ses_alpha01", "重写登录模块", "/work/auth", 100),
         list_session("ses_beta02", "修 bug", "/work/cola", 300),
         opencode::types::SessionListInfo {
             parent_id: Some("ses_alpha01".into()),
             ..list_session("ses_child09", "Child session - x", "/work/auth", 400)
         },
-    ];
+    ]);
     let (app, platform) = build_app(cfg, backend).await;
 
     // Keyword filters by title.
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::List {
-            keyword: Some("登录".into()),
-            all: false,
-        }),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_list",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch list 登录", "msg_list").await;
     let text = platform.texts().await.join("\n");
     assert!(text.contains("重写登录模块"), "keyword match: {text}");
     assert!(!text.contains("修 bug"), "non-matching title filtered: {text}");
 
     // Without --all the child is hidden even though it is newest.
     platform.calls.lock().await.clear();
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::List {
-            keyword: None,
-            all: false,
-        }),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_list2",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch list", "msg_list2").await;
     let text = platform.texts().await.join("\n");
     assert!(!text.contains("Child session"), "child hidden by default: {text}");
 
     // --all reveals the child.
     platform.calls.lock().await.clear();
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::List {
-            keyword: None,
-            all: true,
-        }),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_list3",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch list --all", "msg_list3").await;
     let text = platform.texts().await.join("\n");
     assert!(text.contains("child09"), "child shown with --all: {text}");
 }
@@ -130,7 +85,7 @@ async fn list_is_cached_within_ttl_and_invalidated_on_rename() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "标题 A", "/work/a", 100)];
+    backend.given_sessions(vec![list_session("ses_alpha01", "标题 A", "/work/a", 100)]);
     let calls_counter = backend.list_sessions_calls.clone();
     let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
@@ -151,54 +106,41 @@ async fn list_is_cached_within_ttl_and_invalidated_on_rename() {
     .await;
 
     // Two /list in a row → one server fetch.
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::List {
-            keyword: None,
-            all: false,
-        }),
+    send_command_in(
+        &app,
+        "/switch list",
         key.clone(),
         "m1",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::List {
-            keyword: None,
-            all: false,
-        }),
+    .await;
+    send_command_in(
+        &app,
+        "/switch list",
         key.clone(),
         "m2",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
     assert_eq!(calls_counter.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     // A rename invalidates the cache → next /list refetches.
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Name("新名字".into()),
+    send_command_in(
+        &app,
+        "/name 新名字",
         key.clone(),
         "m3",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::List {
-            keyword: None,
-            all: false,
-        }),
+    .await;
+    send_command_in(
+        &app,
+        "/switch list",
         key,
         "m4",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
     assert_eq!(calls_counter.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
@@ -208,26 +150,15 @@ async fn attach_adopts_foreign_session_by_id() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session(
+    backend.given_sessions(vec![list_session(
         "ses_foreign123abc",
         "OpenChamber 里的任务",
         "/work/foreign",
         100,
-    )];
+    )]);
     let (app, _platform) = build_app(cfg, backend).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Attach {
-            query: "ses_foreign123abc".into(),
-            force: false,
-        }),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_attach",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch ses_foreign123abc", "msg_attach").await;
 
     // The thread now maps to the foreign session with its directory.
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
@@ -242,12 +173,12 @@ async fn attach_rejects_session_owned_by_another_thread_without_force() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session(
+    backend.given_sessions(vec![list_session(
         "ses_foreign123abc",
         "OpenChamber 里的任务",
         "/work/foreign",
         100,
-    )];
+    )]);
     let mut platform = RecordingPlatform::new();
     platform
         .chat_names
@@ -271,18 +202,7 @@ async fn attach_rejects_session_owned_by_another_thread_without_force() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Attach {
-            query: "ses_foreign123abc".into(),
-            force: false,
-        }),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_attach",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch ses_foreign123abc", "msg_attach").await;
 
     // Rejected: the current thread still has no session.
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
@@ -298,12 +218,12 @@ async fn attach_force_steals_mapping_from_other_thread() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session(
+    backend.given_sessions(vec![list_session(
         "ses_foreign123abc",
         "OpenChamber 里的任务",
         "/work/foreign",
         100,
-    )];
+    )]);
     let (app, _platform) = build_app(cfg, backend).await;
     seed_entry(
         &app,
@@ -321,18 +241,7 @@ async fn attach_force_steals_mapping_from_other_thread() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Attach {
-            query: "ses_foreign123abc".into(),
-            force: true,
-        }),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_attach",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch ses_foreign123abc --force", "msg_attach").await;
 
     // Stolen: current thread owns it, other thread is sessionless.
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
@@ -366,15 +275,7 @@ async fn forget_unmaps_thread_keeping_server_session() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Forget),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_forget",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch forget", "msg_forget").await;
 
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     assert!(app.sessions.lock().await.get_active(&key).is_none());
@@ -386,18 +287,15 @@ async fn switch_adopts_unique_foreign_session() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
     let (app, _platform) = build_app(cfg, backend).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Match("唯一外部标题".into())),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
 
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
@@ -415,18 +313,15 @@ async fn switch_lobby_adopt_ends_in_one_snapshot_card() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
     let (app, platform) = build_app(cfg, backend).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Match("唯一外部标题".into())),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
 
     let calls = platform.calls.lock().await.clone();
     let cards: Vec<_> = calls
@@ -479,15 +374,7 @@ async fn switch_reeswitch_suppressed_when_nothing_to_report() {
         .insert("ses_own1".into(), "上次的问题".into());
     let (app, platform, _dir) = build_reeswitch_app(backend).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Match("本项目".into())),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch 本项目", "msg_switch").await;
 
     let calls = platform.calls.lock().await.clone();
     let text = platform.texts().await.join("\n");
@@ -510,15 +397,7 @@ async fn switch_reeswitch_snapshots_on_external_newest_message() {
         .insert("ses_own1".into(), "OpenChamber 里的问题".into());
     let (app, platform, _dir) = build_reeswitch_app(backend).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Match("本项目".into())),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch 本项目", "msg_switch").await;
 
     let calls = platform.calls.lock().await.clone();
     let card = calls
@@ -550,15 +429,7 @@ async fn switch_reeswitch_snapshots_on_busy_status() {
         .insert("ses_own1".into(), "上次的问题".into());
     let (app, platform, _dir) = build_reeswitch_app(backend).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Match("本项目".into())),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch 本项目", "msg_switch").await;
 
     let card = platform
         .replied_cards()
@@ -583,25 +454,17 @@ async fn switch_reeswitch_snapshots_on_pending_permission() {
     backend
         .cola_user_messages
         .insert("ses_own1".into(), "上次的问题".into());
-    backend.permissions = vec![opencode::types::PermissionRequest {
+    backend.ask_permissions(vec![opencode::types::PermissionRequest {
         request_id: "req_own".into(),
         session_id: Some("ses_own1".into()),
         permission: Some("bash".into()),
         patterns: vec!["ls".into()],
         metadata: None,
         always: vec![],
-    }];
+    }]);
     let (app, platform, _dir) = build_reeswitch_app(backend).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Match("本项目".into())),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch 本项目", "msg_switch").await;
 
     let card = platform
         .replied_cards()
@@ -622,21 +485,13 @@ async fn switch_ambiguous_global_match_lists_candidates() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![
+    backend.given_sessions(vec![
         list_session("ses_alpha01", "任务 A", "/work/a", 100),
         list_session("ses_beta02", "任务 B", "/work/b", 200),
-    ];
+    ]);
     let (app, platform) = build_app(cfg, backend).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Match("任务".into())),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch 任务", "msg_switch").await;
 
     // Ambiguous → no adoption, candidates listed.
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
@@ -651,10 +506,10 @@ async fn switch_prefers_threads_own_sessions() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![
+    backend.given_sessions(vec![
         list_session("ses_own1", "本项目会话", "/work/cola", 500),
         list_session("ses_foreign", "本项目会话", "/other/place", 100),
-    ];
+    ]);
     let (app, _platform) = build_app(cfg, backend).await;
     seed_entry(
         &app,
@@ -687,15 +542,7 @@ async fn switch_prefers_threads_own_sessions() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Match("本项目".into())),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch 本项目", "msg_switch").await;
 
     // The thread's own session wins (mapping unchanged, just active).
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
@@ -713,21 +560,13 @@ async fn switch_no_arg_sends_session_card() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![
+    backend.given_sessions(vec![
         list_session("ses_alpha01", "重写登录", "/work/auth", 100),
         list_session("ses_beta02", "修 bug", "/work/cola", 300),
-    ];
+    ]);
     let (app, platform) = build_app(cfg, backend).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Card),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch_card",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch", "msg_switch_card").await;
 
     let card = platform
         .replied_cards()
@@ -762,10 +601,10 @@ async fn switch_card_defaults_to_current_directory_scope() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![
+    backend.given_sessions(vec![
         list_session("ses_alpha01", "重写登录", "/work/auth", 100),
         list_session("ses_beta02", "修 bug", "/work/cola", 300),
-    ];
+    ]);
     let (app, platform) = build_app(cfg, backend).await;
     seed_entry(
         &app,
@@ -783,15 +622,7 @@ async fn switch_card_defaults_to_current_directory_scope() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Card),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch_card",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch", "msg_switch_card").await;
 
     let calls = platform.calls.lock().await.clone();
     let card = calls
@@ -802,7 +633,7 @@ async fn switch_card_defaults_to_current_directory_scope() {
         })
         .next()
         .expect("a switch card should be sent");
-    let text = card.to_string();
+    let text = card_text(&card);
     assert!(text.contains("cola 的会话"), "header names the directory: {text}");
     assert!(text.contains("修 bug"), "own-directory session shown: {text}");
     assert!(
@@ -811,7 +642,7 @@ async fn switch_card_defaults_to_current_directory_scope() {
     );
     assert!(text.contains("全部"), "scope-widen toggle present: {text}");
     assert!(
-        text.contains("\"scope\":\"dir\""),
+        card_buttons(&card).iter().any(|b| b["value"]["scope"] == "dir"),
         "search carries dir scope: {text}"
     );
 }
@@ -824,10 +655,10 @@ async fn switch_card_scope_toggle_shows_whole_store() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![
+    backend.given_sessions(vec![
         list_session("ses_alpha01", "重写登录", "/work/auth", 100),
         list_session("ses_beta02", "修 bug", "/work/cola", 300),
-    ];
+    ]);
     let (app, _platform) = build_app(cfg, backend).await;
     seed_entry(
         &app,
@@ -875,21 +706,13 @@ async fn switch_card_falls_back_to_global_without_active_session() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![
+    backend.given_sessions(vec![
         list_session("ses_alpha01", "重写登录", "/work/auth", 100),
         list_session("ses_beta02", "修 bug", "/work/cola", 300),
-    ];
+    ]);
     let (app, platform) = build_app(cfg, backend).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Card),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch_card",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch", "msg_switch_card").await;
 
     let calls = platform.calls.lock().await.clone();
     let card = calls
@@ -920,7 +743,7 @@ async fn switch_card_adopt_action_maps_session() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "重写登录", "/work/auth", 100)];
+    backend.given_sessions(vec![list_session("ses_alpha01", "重写登录", "/work/auth", 100)]);
     let (app, _platform) = build_app(cfg, backend).await;
 
     let value = serde_json::json!({
@@ -970,7 +793,7 @@ async fn switch_card_adopt_occupied_offers_force_confirm() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_owned", "被占用的会话", "/work/auth", 100)];
+    backend.given_sessions(vec![list_session("ses_owned", "被占用的会话", "/work/auth", 100)]);
     let mut platform = RecordingPlatform::new();
     platform
         .chat_names
@@ -1033,7 +856,7 @@ async fn switch_card_force_adopt_steals_owned_session() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_owned", "被占用的会话", "/work/auth", 100)];
+    backend.given_sessions(vec![list_session("ses_owned", "被占用的会话", "/work/auth", 100)]);
     let mut platform = RecordingPlatform::new();
     platform
         .chat_names
@@ -1067,7 +890,7 @@ async fn switch_card_force_adopt_steals_owned_session() {
     let result = app.host_action(value).await.expect("force_adopt result");
     let card = result.card.clone().expect("force_adopt returns the snapshot");
     assert!(
-        card.to_string().contains("已接管 被占用的会话"),
+        card_text(&card).contains("已接管 被占用的会话"),
         "snapshot header: {card}"
     );
     let lobby = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
@@ -1088,7 +911,7 @@ async fn switch_card_back_rebuilds_list() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "重写登录", "/work/auth", 100)];
+    backend.given_sessions(vec![list_session("ses_alpha01", "重写登录", "/work/auth", 100)]);
     let (app, _platform) = build_app(cfg, backend).await;
 
     let value = serde_json::json!({
@@ -1114,7 +937,7 @@ async fn switch_card_switch_on_mapped_session_patches_to_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)];
+    backend.given_sessions(vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)]);
     // External newness → content to report → full snapshot, not suppressed.
     backend
         .external_user_messages
@@ -1197,7 +1020,7 @@ async fn switch_card_switch_suppressed_patches_to_compact_state() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)];
+    backend.given_sessions(vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)]);
     backend
         .cola_user_messages
         .insert("ses_own1".into(), "上次的问题".into());
@@ -1274,7 +1097,7 @@ async fn switch_card_adopt_in_topic_persists_anchor() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "重写登录", "/work/auth", 100)];
+    backend.given_sessions(vec![list_session("ses_alpha01", "重写登录", "/work/auth", 100)]);
     let (app, _platform) = build_app(cfg, backend).await;
 
     let value = serde_json::json!({
@@ -1291,7 +1114,7 @@ async fn switch_card_adopt_in_topic_persists_anchor() {
         .expect("topic adopt should return a result");
     let card = result.card.expect("adopt patches the card in place");
     assert!(
-        card.to_string().contains("已接管"),
+        card_text(&card).contains("已接管"),
         "snapshot in the topic: {card}"
     );
     let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_fresh".into());
@@ -1378,7 +1201,7 @@ async fn switch_card_readopt_keeps_per_session_overrides() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)];
+    backend.given_sessions(vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)]);
     backend
         .external_user_messages
         .insert("ses_own1".into(), "OpenChamber 里的问题".into());
@@ -1429,7 +1252,7 @@ async fn attach_readopt_keeps_per_session_overrides() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)];
+    backend.given_sessions(vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)]);
     let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     seed_overridden_entry(&app, key.clone(), "ses_own1", "/work/cola").await;
@@ -1439,18 +1262,14 @@ async fn attach_readopt_keeps_per_session_overrides() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Attach {
-            query: "ses_own1".into(),
-            force: false,
-        }),
+    send_command_in(
+        &app,
+        "/switch ses_own1",
         key.clone(),
         "msg_attach",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
 
     let entry = app
         .sessions

@@ -137,12 +137,11 @@ async fn render_poll_and_final_render_lines_carry_the_session() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let mut backend = MockBackend::new(realistic_parts());
     // Park the prompt so the render poll has to be the first renderer.
-    backend.prompt_gate = Some(Arc::clone(&gate));
-    backend.message_scripts.lock().await.insert(
-        "ses_test".into(),
+    let gate = backend.hold_prompts();
+    backend.given_timeline(
+        "ses_test",
         vec![vec![
             msg(
                 "user",
@@ -193,12 +192,11 @@ async fn the_render_poll_logs_at_info_only_on_progress() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let mut backend = MockBackend::new(realistic_parts());
     // Park the prompt so the poll ticks several times over one snapshot.
-    backend.prompt_gate = Some(Arc::clone(&gate));
-    backend.message_scripts.lock().await.insert(
-        "ses_test".into(),
+    let gate = backend.hold_prompts();
+    backend.given_timeline(
+        "ses_test",
         vec![vec![
             msg(
                 "user",
@@ -256,7 +254,7 @@ async fn a_recreated_turn_traces_under_the_fresh_session() {
     let mut backend = MockBackend::new(realistic_parts());
     // The mapped session is gone from the server: its prompt 404s, and the
     // recreate's `create_session` serves `ses_fresh`.
-    backend.session_id = "ses_fresh".into();
+    backend.with_session_id("ses_fresh");
     backend.stale_session_404 = true;
     let (app, _platform) = build_app(cfg, backend).await;
     seed_session(&app, "ses_test", "/work").await;
@@ -331,14 +329,14 @@ async fn a_surfaced_permission_carries_its_session_chat_and_topic() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![opencode::types::PermissionRequest {
+    backend.ask_permissions(vec![opencode::types::PermissionRequest {
         request_id: "per_1".into(),
         session_id: Some("ses_test".into()),
         permission: Some("bash".into()),
         patterns: vec!["ls -la".into()],
         metadata: None,
         always: Vec::new(),
-    }];
+    }]);
     let (app, _platform) = build_app(cfg, backend).await;
     let topic = ThreadKey::new("oc_chat".into(), "omt_topic".into());
     seed_entry(&app, SessionEntry::new(topic, "ses_test", "/work/project")).await;
@@ -408,7 +406,7 @@ async fn wait_for_card(platform: &Arc<RecordingPlatform>, needle: &str) {
         let seen = platform.calls.lock().await.iter().any(|call| match call {
             PlatformCall::SendCard { card, .. }
             | PlatformCall::UpdateMessage { card, .. }
-            | PlatformCall::ReplyCard { card, .. } => card.to_string().contains(needle),
+            | PlatformCall::ReplyCard { card, .. } => card_text(card).contains(needle),
             _ => false,
         });
         if seen {
@@ -431,7 +429,7 @@ async fn an_external_message_observation_carries_its_session_chat_and_topic() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.external_user_message = Some("OpenChamber 里发的消息".to_string());
+    backend.external_message("OpenChamber 里发的消息");
     let (app, _platform) = build_app(cfg, backend).await;
     let topic = ThreadKey::new("oc_group_1".into(), "omt_topic".into());
     seed_entry(&app, SessionEntry::new(topic, "ses_ext", "/tmp/ext")).await;
@@ -477,14 +475,13 @@ async fn an_external_reply_render_carries_its_session() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.external_user_message = Some("OpenChamber 里发的消息".to_string());
+    backend.external_message("OpenChamber 里发的消息");
     // A reply that finishes in one step, so the renderer reaches Done.
-    backend.external_reply_parts = Some(json!([
+    let reply_ready = backend.external_reply(json!([
         { "type": "step-start", "snapshot": "x" },
         { "type": "text", "text": "目录里有 src。" },
         { "type": "step-finish", "reason": "stop" },
     ]));
-    let reply_ready = Arc::clone(&backend.external_reply_ready);
     let (app, platform) = build_app(cfg, backend).await;
     let topic = ThreadKey::new("oc_group_1".into(), "omt_topic".into());
     seed_entry(&app, SessionEntry::new(topic, "ses_ext", "/tmp/ext")).await;
@@ -621,25 +618,27 @@ async fn a_re_switch_snapshot_gather_carries_the_session() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
     // The gather's status read fails: its warning is the line under test.
-    backend.session_status_error = Some("boom".into());
+    backend.status_read_fails("boom");
     let (app, _platform) = build_app(cfg, backend).await;
     let lobby = ThreadKey::new("chat_1".into(), "chat_1".into());
     seed_entry(&app, SessionEntry::new(lobby.clone(), "ses_alpha01", "/work/ext")).await;
 
     let (_, logs) = capture_logs(async {
-        crate::bridge::command::handle_command(
-            &app.core,
-            crate::bridge::command::Command::Switch(crate::bridge::command::SwitchAction::Match(
-                "唯一外部标题".into(),
-            )),
+        send_command_in(
+            &app,
+            "/switch 唯一外部标题",
             lobby,
             "msg_switch",
             crate::config::ConversationKind::P2p,
         )
-        .await
-        .unwrap();
+        .await;
     })
     .await;
 

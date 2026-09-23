@@ -12,15 +12,13 @@ async fn session_commands_reply_hint_without_mapped_session() {
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     let kind = crate::config::ConversationKind::P2p;
 
-    for (cmd, msg) in [
-        (Command::Model("opencode-go/deepseek-v4-flash".into()), "msg_m"),
-        (Command::Agent("build".into()), "msg_a"),
-        (Command::Stop, "msg_s"),
-        (Command::Compact, "msg_c"),
+    for (text, msg) in [
+        ("/model opencode-go/deepseek-v4-flash", "msg_m"),
+        ("/agent build", "msg_a"),
+        ("/stop", "msg_s"),
+        ("/compact", "msg_c"),
     ] {
-        crate::bridge::command::handle_command(&app.core, cmd, key.clone(), msg, kind)
-            .await
-            .unwrap();
+        send_command_in(&app, text, key.clone(), msg, kind).await;
     }
 
     let text = platform.texts().await.join("\n");
@@ -222,7 +220,7 @@ async fn restart_announce_lobby_sends_to_the_chat() {
     match &calls[0] {
         PlatformCall::SendCard { receive_id, card } => {
             assert_eq!(receive_id, "oc_1");
-            assert!(card.to_string().contains("已重启完成"));
+            assert!(card_text(card).contains("已重启完成"));
         }
         other => panic!("expected a chat card, got {other:?}"),
     }

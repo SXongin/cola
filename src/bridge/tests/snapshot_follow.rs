@@ -1,4 +1,3 @@
-use crate::bridge::command::*;
 use crate::bridge::test_support::*;
 
 /// A lobby adopt of a session that carries a pending permission ends in ONE
@@ -10,19 +9,16 @@ async fn snapshot_claim_prevents_poller_duplicate() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
-    backend.permissions = vec![perm_request("per_1", "ses_alpha01", "ls -la")];
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
+    backend.ask_permission(perm_request("per_1", "ses_alpha01", "ls -la"));
     let (app, platform) = build_app(cfg, backend).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Match("唯一外部标题".into())),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
 
     // The adopt claimed the embedded pending against the sent snapshot.
     let claims = app.core.snapshot_claims.lock().await;
@@ -63,21 +59,18 @@ async fn snapshot_block_answer_patches_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
-    backend.permissions = vec![perm_request("per_1", "ses_alpha01", "ls -la")];
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
+    backend.ask_permission(perm_request("per_1", "ses_alpha01", "ls -la"));
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Match("唯一外部标题".into())),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
 
     // Click 允许一次 on the snapshot's embedded block.
     let value = serde_json::json!({
@@ -125,21 +118,18 @@ async fn snapshot_block_resolved_elsewhere_leaves_a_receipt() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
-    backend.permissions = vec![perm_request("per_1", "ses_alpha01", "ls -la")];
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
+    backend.ask_permission(perm_request("per_1", "ses_alpha01", "ls -la"));
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Match("唯一外部标题".into())),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
     // Another client answers the request server-side.
     backend
         .replied_permissions
@@ -194,22 +184,19 @@ async fn post_adopt_requests_keep_standalone_flow() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
     // One adopt-time pending (claimed by the snapshot)…
-    backend.permissions = vec![perm_request("per_1", "ses_alpha01", "ls -la")];
+    backend.ask_permission(perm_request("per_1", "ses_alpha01", "ls -la"));
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Match("唯一外部标题".into())),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
     // …and a SECOND request arriving after the snapshot was sent.
     backend
         .extra_permissions
@@ -259,8 +246,13 @@ async fn adopt_skips_already_surfaced_pending() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
-    backend.permissions = vec![perm_request("per_1", "ses_alpha01", "ls -la")];
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
+    backend.ask_permission(perm_request("per_1", "ses_alpha01", "ls -la"));
     let (app, platform) = build_app(cfg, backend).await;
     // The request was already surfaced as a standalone card.
     app.permission.sent_cards.lock().await.insert(
@@ -272,15 +264,7 @@ async fn adopt_skips_already_surfaced_pending() {
         },
     );
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Match("唯一外部标题".into())),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
 
     let calls = platform.calls.lock().await.clone();
     let card = calls
@@ -310,31 +294,20 @@ async fn reeswitch_does_not_reclaim_snapshot_pending() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
-    backend.permissions = vec![perm_request("per_1", "ses_alpha01", "ls -la")];
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
+    backend.ask_permission(perm_request("per_1", "ses_alpha01", "ls -la"));
     let (app, platform) = build_app(cfg, backend).await;
 
     // First adopt: the snapshot claims the pending block.
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Match("唯一外部标题".into())),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
 
     // Re-`/switch` to the now-mapped session (mapped-hit branch).
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Match("唯一外部标题".into())),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch_2",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch 唯一外部标题", "msg_switch_2").await;
 
     let calls = platform.calls.lock().await.clone();
     let cards: Vec<String> = calls
@@ -368,8 +341,13 @@ async fn snapshot_question_block_answers_and_patches() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
-    backend.questions = vec![opencode::types::QuestionRequest {
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
+    backend.ask_questions(vec![opencode::types::QuestionRequest {
         id: "q_1".into(),
         session_id: "ses_alpha01".into(),
         questions: vec![
@@ -400,20 +378,12 @@ async fn snapshot_question_block_answers_and_patches() {
                 custom: Some(false),
             },
         ],
-    }];
+    }]);
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Match("唯一外部标题".into())),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
 
     // The claim remembered the full question request (the poll loop never
     // saw it, so prepare() never ran).
@@ -485,14 +455,19 @@ async fn busy_adopt_streams_turn_into_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
     backend
         .session_statuses
         .insert("ses_alpha01".into(), Some(opencode::types::SessionStatus::Busy));
     backend
         .external_user_messages
         .insert("ses_alpha01".into(), "帮我重构这个模块".into());
-    backend.external_reply_parts = Some(realistic_parts());
+    backend.external_reply(realistic_parts());
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -501,15 +476,7 @@ async fn busy_adopt_streams_turn_into_snapshot() {
         .render_poll_ms
         .store(50, std::sync::atomic::Ordering::Relaxed);
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Match("唯一外部标题".into())),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
 
     // The follow armed: the snapshot card hosts a live accumulator for the
     // external turn (epoch = the newest user message's created time).
@@ -573,15 +540,20 @@ async fn busy_follow_permission_approved_resumes() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
     backend
         .session_statuses
         .insert("ses_alpha01".into(), Some(opencode::types::SessionStatus::Busy));
     backend
         .external_user_messages
         .insert("ses_alpha01".into(), "帮我重构这个模块".into());
-    backend.permissions = vec![perm_request("per_1", "ses_alpha01", "ls -la")];
-    backend.external_reply_parts = Some(realistic_parts());
+    backend.ask_permission(perm_request("per_1", "ses_alpha01", "ls -la"));
+    backend.external_reply(realistic_parts());
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -590,15 +562,7 @@ async fn busy_follow_permission_approved_resumes() {
         .render_poll_ms
         .store(50, std::sync::atomic::Ordering::Relaxed);
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Match("唯一外部标题".into())),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
 
     // The adopt-time pending block is pre-seeded as the host's inline
     // section (not claimed — the inline dedupe prevents duplicates).
@@ -675,19 +639,16 @@ async fn idle_adopt_does_not_arm_follow() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
-    backend.permissions = vec![perm_request("per_1", "ses_alpha01", "ls -la")];
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
+    backend.ask_permission(perm_request("per_1", "ses_alpha01", "ls -la"));
     let (app, _platform) = build_app(cfg, backend).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Match("唯一外部标题".into())),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
 
     assert!(
         !Turn::has_card(&app.core.cards_handle(), "ses_alpha01").await,
@@ -708,25 +669,22 @@ async fn busy_then_idle_race_stays_static() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
     backend
         .external_user_messages
         .insert("ses_alpha01".into(), "帮我重构这个模块".into());
-    backend.permissions = vec![perm_request("per_1", "ses_alpha01", "ls -la")];
+    backend.ask_permission(perm_request("per_1", "ses_alpha01", "ls -la"));
     backend
         .status_busy_once
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let (app, platform) = build_app(cfg, backend).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Match("唯一外部标题".into())),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
 
     assert!(
         !Turn::has_card(&app.core.cards_handle(), "ses_alpha01").await,
@@ -756,7 +714,12 @@ async fn busy_follow_skips_cola_authored_turn() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
     backend
         .session_statuses
         .insert("ses_alpha01".into(), Some(opencode::types::SessionStatus::Busy));
@@ -764,18 +727,10 @@ async fn busy_follow_skips_cola_authored_turn() {
     backend
         .cola_user_messages
         .insert("ses_alpha01".into(), "我在问的问题".into());
-    backend.permissions = vec![perm_request("per_1", "ses_alpha01", "ls -la")];
+    backend.ask_permission(perm_request("per_1", "ses_alpha01", "ls -la"));
     let (app, _platform) = build_app(cfg, backend).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Match("唯一外部标题".into())),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
 
     assert!(
         !Turn::has_card(&app.core.cards_handle(), "ses_alpha01").await,
@@ -796,14 +751,19 @@ async fn busy_follow_question_block_resolves() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
     backend
         .session_statuses
         .insert("ses_alpha01".into(), Some(opencode::types::SessionStatus::Busy));
     backend
         .external_user_messages
         .insert("ses_alpha01".into(), "帮我重构这个模块".into());
-    backend.questions = vec![opencode::types::QuestionRequest {
+    backend.ask_questions(vec![opencode::types::QuestionRequest {
         id: "q_1".into(),
         session_id: "ses_alpha01".into(),
         questions: vec![opencode::types::QuestionInfo {
@@ -816,22 +776,14 @@ async fn busy_follow_question_block_resolves() {
             multiple: Some(false),
             custom: Some(false),
         }],
-    }];
+    }]);
     let (app, _platform) = build_app(cfg, backend).await;
     app.core
         .external
         .render_poll_ms
         .store(50, std::sync::atomic::Ordering::Relaxed);
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Match("唯一外部标题".into())),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
 
     // The follow pre-seeded the inline section AND remembered the request.
     let cards = app.core.cards_handle();
@@ -871,7 +823,12 @@ async fn user_prompt_during_follow_takes_over() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100)];
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
     backend
         .session_statuses
         .insert("ses_alpha01".into(), Some(opencode::types::SessionStatus::Busy));
@@ -890,15 +847,7 @@ async fn user_prompt_during_follow_takes_over() {
         .turn_drain_timeout_ms
         .store(0, std::sync::atomic::Ordering::Relaxed);
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::Switch(SwitchAction::Match("唯一外部标题".into())),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_switch",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
     let follow_epoch = Turn::armed_turn_anchor(&app.core.cards_handle(), "ses_alpha01").await;
     assert!(follow_epoch.is_some(), "follow armed");
 

@@ -1,4 +1,3 @@
-use crate::bridge::command::*;
 use crate::bridge::test_support::*;
 
 #[tokio::test]
@@ -7,14 +6,14 @@ async fn permission_poller_sends_card_and_card_action_replies() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![opencode::types::PermissionRequest {
+    backend.ask_permissions(vec![opencode::types::PermissionRequest {
         request_id: "per_1".into(),
         session_id: Some("ses_test".into()),
         permission: Some("bash".into()),
         patterns: vec!["ls -la".into()],
         metadata: None,
         always: Vec::new(),
-    }];
+    }]);
     let (app, _platform) = build_app(cfg, backend).await;
 
     // Seed a session + accumulator so the poller has a reply target.
@@ -117,14 +116,14 @@ async fn inline_permission_click_carries_the_receipt_in_the_ack() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![opencode::types::PermissionRequest {
+    backend.ask_permissions(vec![opencode::types::PermissionRequest {
         request_id: "per_1".into(),
         session_id: Some("ses_test".into()),
         permission: Some("bash".into()),
         patterns: vec!["ls -la".into()],
         metadata: None,
         always: Vec::new(),
-    }];
+    }]);
     let (app, platform) = build_app(cfg, backend).await;
 
     app.handle_message(incoming(
@@ -259,7 +258,7 @@ async fn permission_reply_404_renders_neutral_already_handled() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.reply_permission_not_found = true;
+    backend.permission_resolved_elsewhere();
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
@@ -388,14 +387,14 @@ async fn permission_poller_recovers_when_a_list_call_hangs() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![opencode::types::PermissionRequest {
+    backend.ask_permissions(vec![opencode::types::PermissionRequest {
         request_id: "per_hung".into(),
         session_id: Some("ses_test".into()),
         permission: Some("bash".into()),
         patterns: vec!["ls -la".into()],
         metadata: None,
         always: Vec::new(),
-    }];
+    }]);
     // The first list call hangs forever, like a request in flight when the
     // server was SIGTERM'd; later calls serve normally.
     backend
@@ -453,7 +452,7 @@ async fn autoaccept_toggle_on_permission_card_flips_flag_and_approves() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![
+    backend.ask_permissions(vec![
         opencode::types::PermissionRequest {
             request_id: "per_aa_toggle".into(),
             session_id: Some("ses_test".into()),
@@ -475,7 +474,7 @@ async fn autoaccept_toggle_on_permission_card_flips_flag_and_approves() {
             metadata: Some(serde_json::json!({ "filepath": "src/main.rs" })),
             always: Vec::new(),
         },
-    ];
+    ]);
     let perm_calls = backend.reply_permission_calls.clone();
     let (app, platform) = build_app(cfg, backend).await;
 
@@ -604,7 +603,7 @@ async fn autoaccept_command_leaves_the_mode_receipt_on_the_card() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![perm_request("per_1", "ses_1", "ls -la")];
+    backend.ask_permission(perm_request("per_1", "ses_1", "ls -la"));
     let (app, platform) = build_app(cfg, backend).await;
     seed_session(&app, "ses_1", "/work").await;
     seed_inline_permission_card(&app, "ses_1", "per_1").await;
@@ -644,15 +643,7 @@ async fn autoaccept_command_leaves_the_mode_receipt_on_the_card() {
         );
     }
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::AutoAccept(crate::bridge::command::AutoAcceptAction::Set(true)),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_cmd",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/autoaccept on", "msg_cmd").await;
 
     let patches: Vec<String> = platform
         .calls
@@ -736,7 +727,7 @@ async fn autoaccept_toggle_card_settles_pending_permissions() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![perm_request("per_1", "ses_1", "ls -la")];
+    backend.ask_permission(perm_request("per_1", "ses_1", "ls -la"));
     let (app, platform) = build_app(cfg, backend).await;
     seed_session(&app, "ses_1", "/work").await;
     seed_inline_permission_card(&app, "ses_1", "per_1").await;
@@ -818,7 +809,7 @@ async fn sweep_leaves_a_claimed_approval_to_its_settlement() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![perm_request("per_1", "ses_1", "ls -la")];
+    backend.ask_permission(perm_request("per_1", "ses_1", "ls -la"));
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -850,7 +841,7 @@ async fn sweep_leaves_a_claimed_approval_to_its_settlement() {
         matches!(
             c,
             PlatformCall::UpdateMessage { card, .. }
-                if card.to_string().contains("⏱ 已由其他客户端处理")
+                if card_text(card).contains("⏱ 已由其他客户端处理")
         )
     });
     assert!(!neutral, "a claimed approval must not be settled by the sweep");
@@ -877,7 +868,7 @@ async fn autoaccept_approval_claims_the_requests_it_answers() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![perm_request("per_1", "ses_1", "ls -la")];
+    backend.ask_permission(perm_request("per_1", "ses_1", "ls -la"));
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -903,7 +894,7 @@ async fn autoaccept_command_keeps_the_standalone_card_for_the_sweep() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![perm_request("per_1", "ses_1", "ls -la")];
+    backend.ask_permission(perm_request("per_1", "ses_1", "ls -la"));
     let (app, platform) = build_app(cfg, backend).await;
     seed_session(&app, "ses_1", "/work").await;
     // The poller surfaced this one as a standalone card (no live turn).
@@ -916,15 +907,7 @@ async fn autoaccept_command_keeps_the_standalone_card_for_the_sweep() {
         },
     );
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::AutoAccept(crate::bridge::command::AutoAcceptAction::Set(true)),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_cmd",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/autoaccept on", "msg_cmd").await;
 
     // Approved server-side, but this seam has nothing inline to settle: the
     // entry survives so the sweep can repaint the card.
@@ -1013,7 +996,7 @@ async fn auto_accept_session_answers_permission_without_card() {
     assert!(
         !sent.iter().any(|c| {
             if let PlatformCall::ReplyCard { card, .. } = c {
-                card.to_string().contains("权限请求")
+                card_text(card).contains("权限请求")
             } else {
                 false
             }
@@ -1062,15 +1045,7 @@ async fn autoaccept_on_approves_already_pending_permission() {
     .await;
 
     // Now the user turns autoaccept on via the command.
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::AutoAccept(crate::bridge::command::AutoAcceptAction::Set(true)),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_cmd",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/autoaccept on", "msg_cmd").await;
 
     // The already-pending request was approved with "once" immediately.
     let calls = perm_calls.lock().await.clone();
@@ -1126,15 +1101,7 @@ async fn autoaccept_on_approves_child_session_permission() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        Command::AutoAccept(crate::bridge::command::AutoAcceptAction::Set(true)),
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_cmd",
-        crate::config::ConversationKind::P2p,
-    )
-    .await
-    .unwrap();
+    send_command(&app, "/autoaccept on", "msg_cmd").await;
 
     let calls = perm_calls.lock().await.clone();
     assert_eq!(
@@ -1180,12 +1147,12 @@ async fn stale_permission_card_marked_handled_when_resolved_elsewhere() {
     });
     let stale = stale.expect("stale permission card should be marked");
     assert!(
-        stale.to_string().contains("已处理"),
+        card_text(&stale).contains("已处理"),
         "stale card should show as handled: {}",
         stale
     );
     assert!(
-        stale.to_string().contains("bash ls -la"),
+        card_text(&stale).contains("bash ls -la"),
         "stale card should keep the original request text: {}",
         stale
     );
@@ -1240,14 +1207,14 @@ async fn separate_permission_card_sent_into_topic_for_topic_session() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![opencode::types::PermissionRequest {
+    backend.ask_permissions(vec![opencode::types::PermissionRequest {
         request_id: "per_topic".into(),
         session_id: Some("ses_topic".into()),
         permission: Some("bash".into()),
         patterns: vec!["cargo build".into()],
         metadata: None,
         always: Vec::new(),
-    }];
+    }]);
     let (app, platform) = build_app(cfg, backend).await;
 
     // Map the session to a TOPIC (thread_id != chat_id) with an anchor
@@ -1284,7 +1251,7 @@ async fn separate_permission_card_sent_into_topic_for_topic_session() {
     let calls = platform.calls.lock().await.clone();
     let perm_card = calls.iter().find_map(|c| match c {
         PlatformCall::ReplyCard { reply_to, card }
-            if reply_to == "msg_in_topic_anchor" && card.to_string().contains("cargo build") =>
+            if reply_to == "msg_in_topic_anchor" && card_text(card).contains("cargo build") =>
         {
             Some(card.clone())
         }
@@ -1343,11 +1310,11 @@ async fn permission_click_variants_leave_their_receipts() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![
+    backend.ask_permissions(vec![
         perm_req("per_once", "ses_test", "ls -la"),
         perm_req("per_always", "ses_test", "cargo build"),
         perm_req("per_deny", "ses_test", "rm -rf target"),
-    ];
+    ]);
     let perm_calls = backend.reply_permission_calls.clone();
     let (app, _platform) = build_app(cfg, backend).await;
     app.handle_message(incoming(
@@ -1488,7 +1455,7 @@ async fn interaction_receipt_survives_later_flushes() {
         calls.iter().any(|c| matches!(
             c,
             PlatformCall::UpdateMessage { card, .. } | PlatformCall::ReplyCard { card, .. }
-                if card.to_string().contains("已允许一次")
+                if card_text(card).contains("已允许一次")
         )),
         "the receipt must survive the split on the card that owns its anchor: {:?}",
         calls
@@ -1517,8 +1484,8 @@ async fn inline_permission_click_after_remote_resolution_gets_receipt() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![perm_req("per_1", "ses_test", "ls -la")];
-    backend.reply_permission_not_found = true;
+    backend.ask_permission(perm_req("per_1", "ses_test", "ls -la"));
+    backend.permission_resolved_elsewhere();
     let (app, _platform) = build_app(cfg, backend).await;
     app.handle_message(incoming(
         "msg_1".into(),
@@ -1886,7 +1853,7 @@ async fn late_rendered_command_lands_above_the_receipt() {
     // renders on the live card, below the timeline — the receipt included.
     let live = final_card(&platform).await;
     assert!(
-        live.to_string().contains("ls -la"),
+        card_text(&live).contains("ls -la"),
         "the running panel must ride the live card: {live}"
     );
 

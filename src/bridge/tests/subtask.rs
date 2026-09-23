@@ -12,14 +12,14 @@ async fn subtask_permission_routes_to_mapped_parent_and_reply_carries_directory(
     backend
         .session_parents
         .insert(child.into(), backend.session_id.clone());
-    backend.permissions = vec![opencode::types::PermissionRequest {
+    backend.ask_permissions(vec![opencode::types::PermissionRequest {
         request_id: "per_child".into(),
         session_id: Some(child.into()),
         permission: Some("bash".into()),
         patterns: vec!["git status".into()],
         metadata: None,
         always: Vec::new(),
-    }];
+    }]);
     let parent_id = backend.session_id.clone();
     let (app, _platform) = build_app(cfg, backend).await;
 
@@ -125,14 +125,14 @@ async fn subtask_permission_without_streaming_card_sends_card_to_parent_chat() {
     backend
         .session_parents
         .insert(child.into(), backend.session_id.clone());
-    backend.permissions = vec![opencode::types::PermissionRequest {
+    backend.ask_permissions(vec![opencode::types::PermissionRequest {
         request_id: "per_child".into(),
         session_id: Some(child.into()),
         permission: Some("bash".into()),
         patterns: vec!["git status".into()],
         metadata: None,
         always: Vec::new(),
-    }];
+    }]);
     let (app, platform) = build_app(cfg, backend).await;
 
     // Map the parent session to a chat WITHOUT an active accumulator (no
@@ -169,7 +169,7 @@ async fn subtask_permission_without_streaming_card_sends_card_to_parent_chat() {
     let calls = platform.calls.lock().await.clone();
     let perm_card = calls.iter().find_map(|c| match c {
         PlatformCall::SendCard { receive_id, card }
-            if receive_id == "chat_1" && card.to_string().contains("git status") =>
+            if receive_id == "chat_1" && card_text(card).contains("git status") =>
         {
             Some(card.clone())
         }

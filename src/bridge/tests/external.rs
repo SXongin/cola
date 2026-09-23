@@ -46,14 +46,12 @@ async fn external_message_from_shared_store_notifies_feishu() {
 
     let calls = platform.calls.lock().await.clone();
     let notify = calls.iter().find_map(|c| match c {
-        PlatformCall::SendCard { card, .. } if card.to_string().contains("有新消息") => {
-            Some(card.clone())
-        }
+        PlatformCall::SendCard { card, .. } if card_text(card).contains("有新消息") => Some(card.clone()),
         _ => None,
     });
     let notify = notify.expect("external message should produce a notification card");
     assert!(
-        notify.to_string().contains("OpenChamber 里发的消息"),
+        card_text(&notify).contains("OpenChamber 里发的消息"),
         "notification should preview the message: {}",
         notify
     );
@@ -118,7 +116,7 @@ async fn external_poller_recovers_when_messages_hangs() {
             matches!(
                 c,
                 PlatformCall::SendCard { card, .. }
-                    if card.to_string().contains("有新消息")
+                    if card_text(card).contains("有新消息")
             )
         });
         if notified {
@@ -191,7 +189,7 @@ async fn cola_own_message_after_heal_is_never_notified_external() {
     assert!(
         !calls.iter().any(|c| match c {
             PlatformCall::SendCard { card, .. } | PlatformCall::ReplyCard { card, .. } => {
-                card.to_string().contains("有新消息")
+                card_text(card).contains("有新消息")
             }
             _ => false,
         }),
@@ -261,14 +259,12 @@ async fn newer_external_message_after_cola_own_still_notifies() {
 
     let calls = platform.calls.lock().await.clone();
     let notify = calls.iter().find_map(|c| match c {
-        PlatformCall::SendCard { card, .. } if card.to_string().contains("有新消息") => {
-            Some(card.clone())
-        }
+        PlatformCall::SendCard { card, .. } if card_text(card).contains("有新消息") => Some(card.clone()),
         _ => None,
     });
     let notify = notify.expect("the genuine external message should be notified");
     assert!(
-        notify.to_string().contains("OpenChamber 后来发的消息"),
+        card_text(&notify).contains("OpenChamber 后来发的消息"),
         "notification should preview the external message: {}",
         notify
     );
@@ -358,7 +354,7 @@ async fn external_message_to_historical_session_is_not_notified() {
     assert!(
         !calls.iter().any(|c| match c {
             PlatformCall::SendCard { card, .. } | PlatformCall::ReplyCard { card, .. } => {
-                card.to_string().contains("有新消息")
+                card_text(card).contains("有新消息")
             }
             _ => false,
         }),
@@ -457,7 +453,7 @@ async fn reactivated_session_resyncs_silently() {
     assert!(
         !calls.iter().any(|c| match c {
             PlatformCall::SendCard { card, .. } | PlatformCall::ReplyCard { card, .. } => {
-                card.to_string().contains("有新消息")
+                card_text(card).contains("有新消息")
             }
             _ => false,
         }),
@@ -528,7 +524,7 @@ async fn external_message_to_topic_session_notifies_into_thread() {
     assert!(
         calls.iter().any(|c| matches!(
             c,
-            PlatformCall::ReplyCard { reply_to, card } if reply_to == "msg_in_topic_anchor" && card.to_string().contains("有新消息")
+            PlatformCall::ReplyCard { reply_to, card } if reply_to == "msg_in_topic_anchor" && card_text(card).contains("有新消息")
         )),
         "topic external notification should reply into the topic (resolved anchor): {calls:?}"
     );
@@ -666,7 +662,7 @@ async fn external_message_reply_renders_into_notification_card() {
         "only the notification card should be sent, got: {calls:?}"
     );
     // Sanity: the notification card was NOT replaced by a different one.
-    assert!(sent_card.to_string().contains("有新消息"));
+    assert!(card_text(&sent_card).contains("有新消息"));
 }
 
 /// The renderer guard: arming a renderer for the SAME external message must
@@ -806,7 +802,7 @@ async fn external_reply_render_times_out_and_finalizes_partial_content() {
         .collect();
     let last = updates.last().expect("card was updated at least once");
     assert!(
-        last.to_string().contains("部分回答"),
+        card_text(last).contains("部分回答"),
         "partial text must render: {}",
         last
     );
@@ -940,15 +936,14 @@ async fn new_pending_stops_syncing_and_switch_back_resyncs_silently() {
         .await
         .insert("ses_old".into(), chrono::Utc::now().timestamp_millis());
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        crate::bridge::command::Command::New(None),
+    send_command_in(
+        &app,
+        "/new",
         key.clone(),
         "msg_new",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
     assert!(
         app.sessions.lock().await.get_active(&key).is_none(),
         "the pending means no active session"
@@ -970,7 +965,7 @@ async fn new_pending_stops_syncing_and_switch_back_resyncs_silently() {
     assert!(
         !calls.iter().any(|c| match c {
             PlatformCall::SendCard { card, .. } | PlatformCall::ReplyCard { card, .. } => {
-                card.to_string().contains("有新消息")
+                card_text(card).contains("有新消息")
             }
             _ => false,
         }),
@@ -987,17 +982,14 @@ async fn new_pending_stops_syncing_and_switch_back_resyncs_silently() {
 
     // Switch back: the pending is replaced, and the first poll re-baselines
     // silently instead of replaying the stale external message.
-    crate::bridge::command::handle_command(
-        &app.core,
-        crate::bridge::command::Command::Switch(crate::bridge::command::SwitchAction::Match(
-            "ses_old".into(),
-        )),
+    send_command_in(
+        &app,
+        "/switch ses_old",
         key.clone(),
         "msg_switch",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
     assert_eq!(
         app.sessions.lock().await.get_active(&key).unwrap().session_id,
         "ses_old",
@@ -1009,7 +1001,7 @@ async fn new_pending_stops_syncing_and_switch_back_resyncs_silently() {
     assert!(
         !calls.iter().any(|c| match c {
             PlatformCall::SendCard { card, .. } | PlatformCall::ReplyCard { card, .. } => {
-                card.to_string().contains("有新消息")
+                card_text(card).contains("有新消息")
             }
             _ => false,
         }),

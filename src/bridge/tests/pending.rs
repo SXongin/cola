@@ -34,7 +34,7 @@ async fn dir_card_current_reads_pending() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_a", "A", "/work/a", 100)];
+    backend.given_sessions(vec![list_session("ses_a", "A", "/work/a", 100)]);
     let (app, _platform) = build_app(cfg, backend).await;
 
     seed_pending(&app, PendingEntry::new(key(), "/work/pending")).await;
@@ -70,15 +70,14 @@ async fn dir_declares_a_pending_and_supersedes_the_active_session() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        crate::bridge::command::Command::Dir(proj_dir.clone()),
+    send_command_in(
+        &app,
+        &format!("/dir {}", proj_dir.clone()),
         key(),
         "msg_dir",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
 
     assert!(created.lock().await.is_empty(), "/dir creates no server session");
     {
@@ -194,26 +193,12 @@ async fn second_dir_before_the_first_prompt_replaces_the_pending() {
         .to_string_lossy()
         .to_string();
 
-    for (msg, cmd) in [
-        (
-            "msg_new",
-            crate::bridge::command::Command::New(Some("wrong".into())),
-        ),
-        ("msg_dir", crate::bridge::command::Command::Dir(first_dir.clone())),
-        (
-            "msg_dir2",
-            crate::bridge::command::Command::Dir(second_dir.clone()),
-        ),
+    for (msg, text) in [
+        ("msg_new", "/new wrong".to_string()),
+        ("msg_dir", format!("/dir {first_dir}")),
+        ("msg_dir2", format!("/dir {second_dir}")),
     ] {
-        crate::bridge::command::handle_command(
-            &app.core,
-            cmd,
-            key(),
-            msg,
-            crate::config::ConversationKind::P2p,
-        )
-        .await
-        .unwrap();
+        send_command_in(&app, &text, key(), msg, crate::config::ConversationKind::P2p).await;
     }
 
     assert!(created.lock().await.is_empty(), "corrections create nothing");
@@ -257,10 +242,10 @@ async fn switch_card_current_reads_pending_and_marks_no_active_row() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![
+    backend.given_sessions(vec![
         list_session("ses_a", "A", "/work/a", 100),
         list_session("ses_p", "P", "/work/pending", 200),
-    ];
+    ]);
     let (app, _platform) = build_app(cfg, backend).await;
     seed_entry(
         &app,
@@ -305,15 +290,14 @@ async fn new_defers_creation_to_the_first_message() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        crate::bridge::command::Command::New(None),
+    send_command_in(
+        &app,
+        "/new",
         key(),
         "msg_new",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
 
     assert!(created.lock().await.is_empty(), "/new creates no server session");
     {
@@ -391,15 +375,14 @@ async fn new_name_becomes_the_session_title_at_materialisation() {
     let titles = backend.update_title_calls.clone();
     let (app, _platform) = build_app(cfg, backend).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        crate::bridge::command::Command::New(Some("api-refactor".into())),
+    send_command_in(
+        &app,
+        "/new api-refactor",
         key(),
         "msg_new",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
     assert!(
         titles.lock().await.is_empty(),
         "no title PATCH before materialisation"
@@ -434,15 +417,14 @@ async fn command_first_message_does_not_materialise() {
     let created = backend.created_session_dirs.clone();
     let (app, _platform) = build_app(cfg, backend).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        crate::bridge::command::Command::New(None),
+    send_command_in(
+        &app,
+        "/new",
         key(),
         "msg_new",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
 
     app.handle_message(incoming(
         "msg_help".into(),
@@ -486,19 +468,18 @@ async fn failed_materialisation_keeps_the_pending_and_retries() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.fail_create_session_count = std::sync::atomic::AtomicUsize::new(1).into();
+    backend.fail_create_sessions(1);
     let created = backend.created_session_dirs.clone();
     let (app, platform) = build_app(cfg, backend).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        crate::bridge::command::Command::New(None),
+    send_command_in(
+        &app,
+        "/new",
         key(),
         "msg_new",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
 
     app.handle_message(incoming(
         "msg_1".into(),
@@ -589,7 +570,7 @@ async fn switch_back_after_new_clears_the_pending() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.session_list = vec![list_session("ses_old", "旧会话", "/work/proj", 100)];
+    backend.given_sessions(vec![list_session("ses_old", "旧会话", "/work/proj", 100)]);
     let (app, _platform) = build_app(cfg, backend).await;
     seed_entry(
         &app,
@@ -597,28 +578,24 @@ async fn switch_back_after_new_clears_the_pending() {
     )
     .await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        crate::bridge::command::Command::New(None),
+    send_command_in(
+        &app,
+        "/new",
         key(),
         "msg_new",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
     assert!(app.sessions.lock().await.pending_for(&key()).is_some());
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        crate::bridge::command::Command::Switch(crate::bridge::command::SwitchAction::Match(
-            "ses_old".into(),
-        )),
+    send_command_in(
+        &app,
+        "/switch ses_old",
         key(),
         "msg_switch",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
 
     let store = app.sessions.lock().await;
     assert!(
@@ -694,19 +671,18 @@ async fn failed_title_patch_still_materialises_and_warns() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.fail_title_patch = true;
+    backend.title_patch_fails();
     let created = backend.created_session_dirs.clone();
     let (app, platform) = build_app(cfg, backend).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        crate::bridge::command::Command::New(Some("api-refactor".into())),
+    send_command_in(
+        &app,
+        "/new api-refactor",
         key(),
         "msg_new",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
 
     app.handle_message(incoming(
         "msg_1".into(),
@@ -779,24 +755,22 @@ async fn name_on_a_pending_sets_the_creation_title() {
     let titles = backend.update_title_calls.clone();
     let (app, platform) = build_app(cfg, backend).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        crate::bridge::command::Command::New(None),
+    send_command_in(
+        &app,
+        "/new",
         key(),
         "msg_new",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
-    crate::bridge::command::handle_command(
-        &app.core,
-        crate::bridge::command::Command::Name("api-refactor".into()),
+    .await;
+    send_command_in(
+        &app,
+        "/name api-refactor",
         key(),
         "msg_name",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
 
     assert!(
         titles.lock().await.is_empty(),
@@ -841,15 +815,14 @@ async fn name_without_a_session_replies_no_session() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        crate::bridge::command::Command::Name("api-refactor".into()),
+    send_command_in(
+        &app,
+        "/name api-refactor",
         key(),
         "msg_name",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
 
     let texts = platform.texts().await;
     assert!(
@@ -871,31 +844,18 @@ async fn settings_commands_write_the_pending_and_materialise() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.provider_models = vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::opencode::types::ProviderModels {
         provider: "p".into(),
         models: vec![model_option("test", &["high"])],
-    }];
+    }]);
     let prompt_models = backend.prompt_models.clone();
     let prompt_agents = backend.prompt_agents.clone();
     let prompt_variants = backend.prompt_variants.clone();
     let (app, _platform) = build_app(cfg, backend).await;
     seed_pending(&app, PendingEntry::new(key(), "/work/proj")).await;
 
-    for cmd in [
-        crate::bridge::command::Command::Agent("build".into()),
-        crate::bridge::command::Command::Model("p/test".into()),
-        crate::bridge::command::Command::Think("high".into()),
-        crate::bridge::command::Command::AutoAccept(crate::bridge::command::AutoAcceptAction::Set(true)),
-    ] {
-        crate::bridge::command::handle_command(
-            &app.core,
-            cmd,
-            key(),
-            "msg_cfg",
-            crate::config::ConversationKind::P2p,
-        )
-        .await
-        .unwrap();
+    for text in ["/agent build", "/model p/test", "/think high", "/autoaccept on"] {
+        send_command_in(&app, text, key(), "msg_cfg", crate::config::ConversationKind::P2p).await;
     }
 
     {
@@ -959,7 +919,7 @@ async fn model_switch_on_a_pending_clears_an_undeclared_variant() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.provider_models = vec![
+    backend.with_models(vec![
         crate::opencode::types::ProviderModels {
             provider: "p".into(),
             models: vec![model_option("test", &["low", "high"])],
@@ -968,7 +928,7 @@ async fn model_switch_on_a_pending_clears_an_undeclared_variant() {
             provider: "q".into(),
             models: vec![model_option("other", &[])],
         },
-    ];
+    ]);
     let (app, _platform) = build_app(cfg, backend).await;
     let mut pending = PendingEntry::new(key(), "/work/proj");
     pending.model = Some("p/test".into());
@@ -976,15 +936,14 @@ async fn model_switch_on_a_pending_clears_an_undeclared_variant() {
     seed_pending(&app, pending).await;
 
     // A model that still declares `high` keeps the variant.
-    crate::bridge::command::handle_command(
-        &app.core,
-        crate::bridge::command::Command::Model("p/test".into()),
+    send_command_in(
+        &app,
+        "/model p/test",
         key(),
         "msg_model_1",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
     assert_eq!(
         app.sessions
             .lock()
@@ -995,15 +954,14 @@ async fn model_switch_on_a_pending_clears_an_undeclared_variant() {
     );
 
     // A model that lacks it clears the pending's variant.
-    crate::bridge::command::handle_command(
-        &app.core,
-        crate::bridge::command::Command::Model("q/other".into()),
+    send_command_in(
+        &app,
+        "/model q/other",
         key(),
         "msg_model_2",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
     let store = app.sessions.lock().await;
     let pending = store.pending_for(&key()).unwrap();
     assert_eq!(pending.model.as_deref(), Some("q/other"));
@@ -1018,24 +976,23 @@ async fn think_on_a_pending_validates_against_the_pending_model() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.provider_models = vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::opencode::types::ProviderModels {
         provider: "p".into(),
         models: vec![model_option("test", &["low", "high"])],
-    }];
+    }]);
     let (app, platform) = build_app(cfg, backend).await;
     let mut pending = PendingEntry::new(key(), "/work/proj");
     pending.model = Some("p/test".into());
     seed_pending(&app, pending).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        crate::bridge::command::Command::Think("medium".into()),
+    send_command_in(
+        &app,
+        "/think medium",
         key(),
         "msg_think_1",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
     let texts = platform.texts().await;
     assert!(
         texts.iter().any(|t| t.contains("不支持思考等级")),
@@ -1051,15 +1008,14 @@ async fn think_on_a_pending_validates_against_the_pending_model() {
         "a rejected variant writes nothing"
     );
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        crate::bridge::command::Command::Think("high".into()),
+    send_command_in(
+        &app,
+        "/think high",
         key(),
         "msg_think_2",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
     assert_eq!(
         app.sessions
             .lock()
@@ -1078,37 +1034,31 @@ async fn settings_cards_render_and_configure_a_pending() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.provider_models = vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::opencode::types::ProviderModels {
         provider: "p".into(),
         models: vec![model_option("test", &["low", "high"])],
-    }];
-    backend.agents = vec![crate::opencode::types::AgentInfo {
+    }]);
+    backend.with_agents(vec![crate::opencode::types::AgentInfo {
         name: "build".into(),
         description: None,
         mode: Some("primary".into()),
         hidden: Some(false),
-    }];
+    }]);
     let (app, platform) = build_app(cfg, backend).await;
     let mut pending = PendingEntry::new(key(), "/work/proj");
     pending.model = Some("p/test".into());
     pending.variant = Some("high".into());
     seed_pending(&app, pending).await;
 
-    for cmd in [
-        crate::bridge::command::Command::AgentCard,
-        crate::bridge::command::Command::ModelCard,
-        crate::bridge::command::Command::ThinkCard,
-        crate::bridge::command::Command::AutoAccept(crate::bridge::command::AutoAcceptAction::Status),
-    ] {
-        crate::bridge::command::handle_command(
-            &app.core,
-            cmd,
+    for text in ["/agent", "/model", "/think", "/autoaccept"] {
+        send_command_in(
+            &app,
+            text,
             key(),
             "msg_card",
             crate::config::ConversationKind::P2p,
         )
-        .await
-        .unwrap();
+        .await;
     }
 
     let calls = platform.calls.lock().await.clone();
@@ -1192,19 +1142,15 @@ async fn compact_and_stop_on_a_pending_do_not_reach_the_backend() {
     let (app, platform) = build_app(cfg, backend).await;
     seed_pending(&app, PendingEntry::new(key(), "/work/proj")).await;
 
-    for cmd in [
-        crate::bridge::command::Command::Compact,
-        crate::bridge::command::Command::Stop,
-    ] {
-        crate::bridge::command::handle_command(
-            &app.core,
-            cmd,
+    for text in ["/compact", "/stop"] {
+        send_command_in(
+            &app,
+            text,
             key(),
             "msg_lifecycle",
             crate::config::ConversationKind::P2p,
         )
-        .await
-        .unwrap();
+        .await;
     }
 
     let texts = platform.texts().await.join("\n");
@@ -1237,15 +1183,14 @@ async fn switch_forget_clears_the_pending_too() {
     .await;
     seed_pending(&app, PendingEntry::new(key(), "/work/proj")).await;
 
-    crate::bridge::command::handle_command(
-        &app.core,
-        crate::bridge::command::Command::Switch(crate::bridge::command::SwitchAction::Forget),
+    send_command_in(
+        &app,
+        "/switch forget",
         key(),
         "msg_forget",
         crate::config::ConversationKind::P2p,
     )
-    .await
-    .unwrap();
+    .await;
 
     let store = app.sessions.lock().await;
     assert!(store.pending_for(&key()).is_none(), "the pending is forgotten");

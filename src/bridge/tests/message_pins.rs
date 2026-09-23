@@ -52,7 +52,7 @@ fn pinned_permission_app(
 ) -> (Arc<App>, Arc<RecordingPlatform>, Arc<MockBackend>) {
     cfg.bridge.instant_reminder = true;
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![permission("per_1", "ses_1")];
+    backend.ask_permission(permission("per_1", "ses_1"));
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg.clone(), backend.clone(), platform.clone()).unwrap());
@@ -105,7 +105,7 @@ async fn an_inlined_waiting_card_pins_the_live_card() {
     let mut cfg = test_config(&dir.path().join("sessions.json"));
     cfg.bridge.instant_reminder = true;
     let mut backend = MockBackend::new(realistic_parts());
-    backend.questions = vec![question("que_1", "ses_1")];
+    backend.ask_question(question("que_1", "ses_1"));
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -221,7 +221,7 @@ async fn pin_off_records_no_message_pins() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     assert!(!cfg.bridge.instant_reminder, "test_config is the off default");
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![permission("per_1", "ses_1")];
+    backend.ask_permission(permission("per_1", "ses_1"));
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -246,7 +246,7 @@ async fn a_failed_pin_does_not_fabricate_an_unpin() {
     let mut cfg = test_config(&dir.path().join("sessions.json"));
     cfg.bridge.instant_reminder = true;
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![permission("per_1", "ses_1")];
+    backend.ask_permission(permission("per_1", "ses_1"));
     let backend = Arc::new(backend);
     let platform = RecordingPlatform::new();
     platform.fail_pin.store(true, Ordering::SeqCst);

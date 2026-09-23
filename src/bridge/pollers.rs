@@ -521,7 +521,9 @@ mod tests {
     /// walker hops over scripted parent chains.
     async fn core_with_parents(parents: Vec<(String, String)>) -> Arc<SharedCore> {
         let mut backend = MockBackend::new(serde_json::json!([]));
-        backend.session_parents = parents.into_iter().collect();
+        for (child, parent) in parents {
+            backend.with_session_parent(&child, &parent);
+        }
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
         let platform = Arc::new(RecordingPlatform::new());

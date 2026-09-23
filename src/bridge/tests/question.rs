@@ -46,7 +46,7 @@ async fn question_poller_recovers_when_a_list_call_hangs() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.questions = vec![opencode::types::QuestionRequest {
+    backend.ask_questions(vec![opencode::types::QuestionRequest {
         id: "que_hung".into(),
         session_id: "ses_test".into(),
         questions: vec![opencode::types::QuestionInfo {
@@ -59,7 +59,7 @@ async fn question_poller_recovers_when_a_list_call_hangs() {
             multiple: None,
             custom: None,
         }],
-    }];
+    }]);
     // The first list call hangs forever, like a request in flight when the
     // server was SIGTERM'd; later calls serve normally.
     backend
@@ -406,7 +406,7 @@ async fn question_reply_404_renders_neutral_already_handled() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.reply_question_not_found = true;
+    backend.question_resolved_elsewhere();
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
@@ -590,13 +590,16 @@ async fn multi_select_question_toggles_until_submit() {
     // Click 苹果 → NOT submitted (multi-select toggles, never auto-submits).
     let r1 = app.host_action(value("苹果")).await.expect("result");
     assert_eq!(r1.toast.as_deref(), Some("已添加选项"));
-    let c1 = r1.card.as_ref().expect("re-rendered card").to_string();
+    let c1_card = r1.card.as_ref().expect("re-rendered card");
+    let c1 = card_text(c1_card);
     assert!(c1.contains("已选：苹果"), "marker missing: {}", c1);
     assert!(c1.contains("可多选"), "multi hint missing: {}", c1);
     assert!(c1.contains("✅ 确定该题"), "confirm button missing: {}", c1);
     // The selected button shows its ✅/checked state in the card JSON.
     assert!(
-        c1.contains("\"content\":\"✅ 苹果\""),
+        card_buttons(c1_card)
+            .iter()
+            .any(|b| b["value"]["answer"] == "苹果" && b["text"]["content"] == "✅ 苹果"),
         "selected button state missing: {}",
         c1
     );
@@ -973,12 +976,15 @@ async fn multi_select_custom_answer_appends_dedupes_and_removes() {
     // Append raw text: the newline stays inside the single entry (no split).
     let r1 = app.host_action(custom("自定\n答案")).await.expect("result");
     assert_eq!(r1.toast.as_deref(), Some("已添加自定义答案"));
-    let c1 = r1.card.as_ref().expect("re-rendered card").to_string();
+    let c1_card = r1.card.as_ref().expect("re-rendered card");
+    let c1 = card_text(c1_card);
     assert!(c1.contains("已选：自定"), "custom not in selection: {}", c1);
     // The removable chip keeps the RAW answer in its value; only the display
     // label collapses the newline.
     assert!(
-        c1.contains("\"answer\":\"自定\\n答案\""),
+        card_buttons(c1_card)
+            .iter()
+            .any(|b| b["value"]["answer"] == "自定\n答案"),
         "raw answer lost: {}",
         c1
     );
@@ -1164,7 +1170,7 @@ async fn sweep_prunes_state_of_requests_resolved_elsewhere() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     // que_live is still pending; que_gone was resolved elsewhere meanwhile.
-    backend.questions = vec![question_request("que_live")];
+    backend.ask_question(question_request("que_live"));
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
@@ -1283,7 +1289,7 @@ async fn sweep_keeps_partial_multi_select_toggles() {
     };
     let mut backend = MockBackend::new(realistic_parts());
     // The request is still pending, so the sweep refreshes instead of pruning.
-    backend.questions = vec![multi.clone()];
+    backend.ask_question(multi.clone());
     let backend = Arc::new(backend);
     let app = Arc::new(App::new(cfg, backend.clone(), Arc::new(RecordingPlatform::new())).unwrap());
     seed_work_dir(&app).await;
@@ -1331,7 +1337,7 @@ async fn vanished_directory_is_no_longer_treated_as_known() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.questions = vec![question_request("que_1")];
+    backend.ask_question(question_request("que_1"));
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
@@ -1610,7 +1616,7 @@ async fn inline_question_submit_and_reject_leave_receipts() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.questions = vec![
+    backend.ask_questions(vec![
         opencode::types::QuestionRequest {
             id: "que_submit".into(),
             session_id: "ses_test".into(),
@@ -1651,7 +1657,7 @@ async fn inline_question_submit_and_reject_leave_receipts() {
                 custom: None,
             }],
         },
-    ];
+    ]);
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
@@ -1693,12 +1699,7 @@ async fn inline_question_submit_and_reject_leave_receipts() {
         .await
         .expect("a card-action result");
     assert!(
-        partial
-            .card
-            .as_ref()
-            .expect("partial answers carry the card")
-            .to_string()
-            .contains("已选：/a"),
+        card_text(partial.card.as_ref().expect("partial answers carry the card")).contains("已选：/a"),
         "partial markers must stay live"
     );
     let submitted = app
@@ -1711,18 +1712,21 @@ async fn inline_question_submit_and_reject_leave_receipts() {
         .await
         .expect("a card-action result");
     assert_eq!(submitted.toast.as_deref(), Some("已提交"));
-    let ack = submitted
+    let ack_card = submitted
         .card
         .as_ref()
-        .expect("submit must carry the updated card in the ack")
-        .to_string();
+        .expect("submit must carry the updated card in the ack");
+    let ack = card_text(ack_card);
     assert!(
         ack.contains("✅ 已回答：目录 /a、分支 （未作答）"),
         "submit receipt missing: {}",
         ack
     );
     assert!(
-        !ack.contains("\"request_id\":\"que_submit\"") && !ack.contains("已选："),
+        !card_buttons(ack_card)
+            .iter()
+            .any(|b| b["value"]["request_id"] == "que_submit")
+            && !ack.contains("已选："),
         "the submitted block (and its controls) is gone: {}",
         ack
     );
@@ -1740,18 +1744,21 @@ async fn inline_question_submit_and_reject_leave_receipts() {
         .await
         .expect("a card-action result");
     assert_eq!(rejected.toast.as_deref(), Some("已拒绝回答"));
-    let ack = rejected
+    let ack_card = rejected
         .card
         .as_ref()
-        .expect("reject must carry the updated card in the ack")
-        .to_string();
+        .expect("reject must carry the updated card in the ack");
+    let ack = card_text(ack_card);
     assert!(
         ack.contains("🚫 已拒绝：下一步"),
         "reject receipt missing: {}",
         ack
     );
     assert!(
-        !ack.contains("\"request_id\":\"que_reject\"") && !ack.contains("继续吗？"),
+        !card_buttons(ack_card)
+            .iter()
+            .any(|b| b["value"]["request_id"] == "que_reject")
+            && !ack.contains("继续吗？"),
         "the rejected block (and its controls) is gone: {}",
         ack
     );
@@ -1784,7 +1791,7 @@ async fn inline_question_click_after_remote_resolution_gets_receipt() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.questions = vec![opencode::types::QuestionRequest {
+    backend.ask_questions(vec![opencode::types::QuestionRequest {
         id: "que_gone".into(),
         session_id: "ses_test".into(),
         questions: vec![opencode::types::QuestionInfo {
@@ -1797,8 +1804,8 @@ async fn inline_question_click_after_remote_resolution_gets_receipt() {
             multiple: None,
             custom: None,
         }],
-    }];
-    backend.reply_question_not_found = true;
+    }]);
+    backend.question_resolved_elsewhere();
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());

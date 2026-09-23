@@ -771,6 +771,16 @@ pub struct MockBackend {
     /// Scripts the ADR-0028 busy→idle race: the first `session_status` read
     /// returns Busy (and clears the flag), later reads serve the map.
     pub status_busy_once: std::sync::atomic::AtomicBool,
+    /// Scenario state for [`MockBackend::given_prompt`]: `(needle, parts)`
+    /// pairs matched against the prompt text, first match wins.
+    prompt_scripts: Vec<(String, serde_json::Value)>,
+    /// The parts the last matched prompt script streamed. `messages` serves
+    /// them instead of `parts` once set, so the scripted prompt's own turn
+    /// renders consistently through both read paths.
+    last_prompt_parts: std::sync::Mutex<Option<serde_json::Value>>,
+    /// The message counted `prompt` failures report (see
+    /// [`MockBackend::fail_prompts`]); `None` keeps the generic one.
+    fail_prompt_message: Option<String>,
 }
 
 impl MockBackend {
@@ -839,7 +849,196 @@ impl MockBackend {
             session_statuses: std::collections::HashMap::new(),
             session_status_error: None,
             status_busy_once: std::sync::atomic::AtomicBool::new(false),
+            prompt_scripts: Vec::new(),
+            last_prompt_parts: std::sync::Mutex::new(None),
+            fail_prompt_message: None,
         }
+    }
+
+    // ===== Scenario vocabulary =====
+    //
+    // The methods below script the common flows without the test reaching into
+    // the fields above: "given a prompt, stream these parts / ask these
+    // permissions / fail this call". Fields stay public for the exotic axes;
+    // these are the front door for the flows tests actually build.
+
+    /// Scenario: the shared store holds exactly `sessions` (drives `/list`,
+    /// `/switch`, `/dir` and the external poller's discovery).
+    pub(crate) fn given_sessions(&mut self, sessions: Vec<opencode::types::SessionListInfo>) -> &mut Self {
+        self.session_list = sessions;
+        self
+    }
+
+    /// Scenario: `request` is pending on the server (appends to the pending
+    /// list `list_permissions` serves).
+    pub(crate) fn ask_permission(&mut self, request: opencode::types::PermissionRequest) -> &mut Self {
+        self.permissions.push(request);
+        self
+    }
+
+    /// Scenario: exactly these permissions are pending.
+    pub(crate) fn ask_permissions(&mut self, requests: Vec<opencode::types::PermissionRequest>) -> &mut Self {
+        self.permissions = requests;
+        self
+    }
+
+    /// Scenario: `request` is pending on the server (appends to the pending
+    /// list `list_questions` serves).
+    pub(crate) fn ask_question(&mut self, request: opencode::types::QuestionRequest) -> &mut Self {
+        self.questions.push(request);
+        self
+    }
+
+    /// Scenario: exactly these questions are pending.
+    pub(crate) fn ask_questions(&mut self, requests: Vec<opencode::types::QuestionRequest>) -> &mut Self {
+        self.questions = requests;
+        self
+    }
+
+    /// Scenario: every `prompt` fails with `message`.
+    pub(crate) fn fail_prompt(&mut self, message: &str) -> &mut Self {
+        self.prompt_error = Some(message.to_string());
+        self
+    }
+
+    /// Scenario: the next `count` `prompt` calls fail with `message`; the
+    /// scripted failure is consumed, so later prompts succeed.
+    pub(crate) fn fail_prompts(&mut self, count: usize, message: &str) -> &mut Self {
+        self.fail_prompt_count
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+        self.fail_prompt_message = Some(message.to_string());
+        self
+    }
+
+    /// Scenario: `prompt` streams `parts` when the prompt text contains
+    /// `needle` (first match wins; `""` matches any prompt).
+    pub(crate) fn given_prompt(&mut self, needle: &str, parts: serde_json::Value) -> &mut Self {
+        self.prompt_scripts.push((needle.to_string(), parts));
+        self
+    }
+
+    /// Scenario: `list_models` serves `models`.
+    pub(crate) fn with_models(&mut self, models: Vec<opencode::types::ProviderModels>) -> &mut Self {
+        self.provider_models = models;
+        self
+    }
+
+    /// Scenario: `list_agents` serves `agents`.
+    pub(crate) fn with_agents(&mut self, agents: Vec<opencode::types::AgentInfo>) -> &mut Self {
+        self.agents = agents;
+        self
+    }
+
+    /// Scenario: `configured_default_model` serves `model`.
+    pub(crate) fn with_default_model(&mut self, model: opencode::types::ModelInfo) -> &mut Self {
+        self.default_model = Some(model);
+        self
+    }
+
+    /// Scenario: the server records `model` for the session (`session_info`).
+    pub(crate) fn with_session_model(&mut self, model: opencode::types::SessionModel) -> &mut Self {
+        self.session_model = Some(model);
+        self
+    }
+
+    /// Scenario: `create_session` returns `id`.
+    pub(crate) fn with_session_id(&mut self, id: &str) -> &mut Self {
+        self.session_id = id.to_string();
+        self
+    }
+
+    /// Scenario: `messages` serves `snapshots` for `session_id`, one per call
+    /// (the last repeating) — the test's complete message history.
+    pub(crate) fn given_timeline(
+        &mut self,
+        session_id: &str,
+        snapshots: Vec<Vec<opencode::types::SessionMessage>>,
+    ) -> &mut Self {
+        self.message_scripts
+            .try_lock()
+            .expect("given_timeline before the app is built")
+            .insert(session_id.to_string(), snapshots);
+        self
+    }
+
+    /// Scenario: hold every `prompt` until the returned semaphore is released
+    /// — the test can keep a turn in flight and interleave state through the
+    /// normal seams.
+    pub(crate) fn hold_prompts(&mut self) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        self.prompt_gate = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// Scenario: the addressed permission was resolved elsewhere — a reply
+    /// reports it gone (404) instead of succeeding.
+    pub(crate) fn permission_resolved_elsewhere(&mut self) -> &mut Self {
+        self.reply_permission_not_found = true;
+        self
+    }
+
+    /// Scenario: the addressed question was resolved elsewhere — a reply
+    /// reports it gone (404) instead of succeeding.
+    pub(crate) fn question_resolved_elsewhere(&mut self) -> &mut Self {
+        self.reply_question_not_found = true;
+        self
+    }
+
+    /// Scenario: another client (e.g. OpenChamber) posts `text` into the
+    /// session; the external poller sees it as a new user message.
+    pub(crate) fn external_message(&mut self, text: &str) -> &mut Self {
+        self.external_user_message = Some(text.to_string());
+        self
+    }
+
+    /// Scenario: the model answers the external message with `parts`. Returns
+    /// the gate the test flips once the notification card has been sent.
+    pub(crate) fn external_reply(&mut self, parts: serde_json::Value) -> Arc<std::sync::atomic::AtomicBool> {
+        self.external_reply_parts = Some(parts);
+        Arc::clone(&self.external_reply_ready)
+    }
+
+    /// Scenario: `child` is a sub-task session whose parent is `parent`
+    /// (`session_info` serves the parent chain).
+    pub(crate) fn with_session_parent(&mut self, child: &str, parent: &str) -> &mut Self {
+        self.session_parents.insert(child.to_string(), parent.to_string());
+        self
+    }
+
+    /// Scenario: the mapped session no longer exists on the server — `prompt`
+    /// 404s for any session other than the one `create_session` returns.
+    pub(crate) fn stale_session_mapping(&mut self) -> &mut Self {
+        self.stale_session_404 = true;
+        self
+    }
+
+    /// Scenario: the next `count` `create_session` calls fail (materialisation
+    /// must keep the pending and retry on the next message).
+    pub(crate) fn fail_create_sessions(&mut self, count: usize) -> &mut Self {
+        self.fail_create_session_count
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    /// Scenario: `update_session_title` fails (materialisation must keep the
+    /// created session and warn).
+    pub(crate) fn title_patch_fails(&mut self) -> &mut Self {
+        self.fail_title_patch = true;
+        self
+    }
+
+    /// Scenario: `prompt_async` fails with `message` (a Supplement whose send
+    /// failed).
+    pub(crate) fn fail_supplement(&mut self, message: &str) -> &mut Self {
+        self.prompt_async_error = Some(message.to_string());
+        self
+    }
+
+    /// Scenario: `session_status` fails with `message` (the caller must not
+    /// guess a status).
+    pub(crate) fn status_read_fails(&mut self, message: &str) -> &mut Self {
+        self.session_status_error = Some(message.to_string());
+        self
     }
 
     /// Shared recording/error policy for the question reply endpoints: record
@@ -984,7 +1183,9 @@ impl opencode::Backend for MockBackend {
             self.fail_prompt_count
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             return Err(crate::error::BridgeError::OpenCode(
-                "Simulated provider failure".into(),
+                self.fail_prompt_message
+                    .clone()
+                    .unwrap_or_else(|| "Simulated provider failure".into()),
             ));
         }
         if let Some(err) = &self.prompt_error {
@@ -993,13 +1194,26 @@ impl opencode::Backend for MockBackend {
         if let Some(hook) = &self.on_prompt {
             hook();
         }
+        // A prompt script wins over the construction-time `parts`: the prompt
+        // that matches streams its own parts, and `messages` serves them too.
+        let parts = match self
+            .prompt_scripts
+            .iter()
+            .find(|(needle, _)| needle.is_empty() || text.contains(needle.as_str()))
+        {
+            Some((_, parts)) => {
+                *self.last_prompt_parts.lock().unwrap() = Some(parts.clone());
+                parts.clone()
+            }
+            None => self.parts.clone(),
+        };
         Ok(opencode::types::PromptResponse {
             id: "msg_assist".into(),
             session_id: Some(session_id.to_string()),
             admitted_seq: None,
             parent_id: Some("msg_user".into()),
             error: None,
-            parts: self.parts.clone(),
+            parts,
         })
     }
 
@@ -1152,6 +1366,14 @@ impl opencode::Backend for MockBackend {
         if !msgs.is_empty() {
             return Ok(msgs);
         }
+        // A matched prompt script's parts win over the construction-time
+        // `parts`: the render poll must see the same turn the prompt streamed.
+        let parts = self
+            .last_prompt_parts
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| self.parts.clone());
         Ok(vec![opencode::types::SessionMessage {
             info: opencode::types::MessageInfo {
                 id: "msg_assist".into(),
@@ -1162,7 +1384,7 @@ impl opencode::Backend for MockBackend {
                 provider_id: None,
                 tokens: None,
             },
-            parts: self.parts.clone(),
+            parts,
         }])
     }
 
@@ -1439,6 +1661,54 @@ pub(crate) fn incoming_anonymous(
     }
 }
 
+/// Drive a slash command through the coordinator's message entry point — the
+/// production parse → gate → route path — instead of calling the dispatcher
+/// directly. The routing is what a test at this level is about; the
+/// dispatcher's own unit concerns live in `command.rs`. `text` must round-trip
+/// through [`crate::bridge::command::parse_command`] to the same command the
+/// test means.
+pub(crate) async fn send_command(app: &Arc<App>, text: &str, message_id: &str) {
+    send_command_in(
+        app,
+        text,
+        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+        message_id,
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+}
+
+/// [`send_command`] for an explicit conversation: the helper rebuilds the
+/// `IncomingMessage` from `thread_key` and `kind`, so the coordinator derives
+/// exactly the routing the direct call used to pass by hand. A
+/// [`Topic`](crate::config::ConversationKind::Topic) carries `thread_key`'s
+/// thread id; the other kinds are the chat's top level.
+pub(crate) async fn send_command_in(
+    app: &Arc<App>,
+    text: &str,
+    thread_key: crate::config::ThreadKey,
+    message_id: &str,
+    kind: crate::config::ConversationKind,
+) {
+    let chat_type = match kind {
+        crate::config::ConversationKind::GroupLobby => "group",
+        _ => "p2p",
+    };
+    let thread_id = match kind {
+        crate::config::ConversationKind::Topic => Some(thread_key.thread_id.clone()),
+        _ => None,
+    };
+    app.handle_message(incoming(
+        message_id.into(),
+        thread_key.chat_id,
+        chat_type.into(),
+        thread_id,
+        text.into(),
+        None,
+    ))
+    .await;
+}
+
 /// Dispatch a card action as the Host (ADR-0035). A real click carries the
 /// clicking user's `open_id` on the value (the platform threads it in) and the
 /// bridge's gate refuses a click without one, so tests that mean "the Host
@@ -1498,6 +1768,72 @@ pub(crate) fn git_repo() -> tempfile::TempDir {
     git_in(dir.path(), &["add", "a.txt"]);
     git_in(dir.path(), &["commit", "-m", "init"]);
     dir
+}
+
+/// Every visible text string on a card, in walk order: `content` fields
+/// (markdown / plain_text, including nested panels) and `text` fields. Button
+/// payloads (`value`) are not visible text and stay out, so an assertion on
+/// rendered copy reads the card's structure instead of its JSON dump.
+pub(crate) fn card_texts(card: &serde_json::Value) -> Vec<String> {
+    fn walk(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, v) in map {
+                    match (key.as_str(), v.as_str()) {
+                        ("content" | "text", Some(s)) => out.push(s.to_string()),
+                        _ => walk(v, out),
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for v in items {
+                    walk(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(card, &mut out);
+    out
+}
+
+/// A card's visible text joined by newlines — the structural counterpart of
+/// `card.to_string()` for copy assertions.
+pub(crate) fn card_text(card: &serde_json::Value) -> String {
+    card_texts(card).join("\n")
+}
+
+/// Every button element on a card, in walk order (buttons nest in column sets
+/// and action blocks) — for assertions on a button's `value` payload or label
+/// without string-matching the card's JSON dump.
+pub(crate) fn card_buttons(card: &serde_json::Value) -> Vec<&serde_json::Value> {
+    fn walk<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.get("tag").and_then(|t| t.as_str()) == Some("button") {
+                    out.push(value);
+                }
+                for v in map.values() {
+                    walk(v, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for v in items {
+                    walk(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(card, &mut out);
+    out
+}
+
+/// A card's header title, for Done/Streaming/topic assertions.
+pub(crate) fn card_header(card: &serde_json::Value) -> &str {
+    card["header"]["title"]["content"].as_str().unwrap_or("")
 }
 
 /// The last card the app flushed in place — the finalized card.

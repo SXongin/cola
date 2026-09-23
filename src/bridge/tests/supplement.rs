@@ -96,7 +96,7 @@ async fn last_update_of(platform: &RecordingPlatform, message_id: &str) -> Strin
 }
 
 fn has(card: &serde_json::Value, needle: &str) -> bool {
-    card.to_string().contains(needle)
+    card_text(card).contains(needle)
 }
 
 /// Every continuation card that replied to a supplement message, in call order.
@@ -746,7 +746,7 @@ async fn failed_supplement_send_splits_after_the_failure_notice() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.prompt_async_error = Some("provider 503".into());
+    backend.fail_supplement("provider 503");
     let (app, platform) = build_app(cfg, backend).await;
     seed_session(&app, "ses_test", "/work").await;
     seed_live_turn(&app, "ses_test", "第一段进度。").await;
@@ -1034,7 +1034,7 @@ async fn command_mid_turn_does_not_split_the_chain() {
         !calls.iter().any(|c| matches!(
             c,
             PlatformCall::UpdateMessage { message_id, card }
-                if message_id == "om_live" && card.to_string().contains("部分完成，继续中")
+                if message_id == "om_live" && card_text(card).contains("部分完成，继续中")
         )),
         "a command must never split the chain: {calls:?}"
     );
@@ -1056,7 +1056,7 @@ async fn supplement_split_migrates_a_pending_permission() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![perm_request("per_live", "ses_test", "ls -la")];
+    backend.ask_permission(perm_request("per_live", "ses_test", "ls -la"));
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());

@@ -68,15 +68,12 @@ async fn aborted_turn_rejects_its_pending_permission() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let mut backend = MockBackend::new(realistic_parts());
     // The first turn aborts (the mock's scripted stand-in for the server
     // returning the AbortedError), the second one runs normally.
-    backend
-        .fail_prompt_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
-    backend.prompt_gate = Some(Arc::clone(&gate));
-    backend.permissions = vec![perm_request("per_1", "ses_test", "ls -la")];
+    backend.fail_prompts(1, "Aborted");
+    let gate = backend.hold_prompts();
+    backend.ask_permission(perm_request("per_1", "ses_test", "ls -la"));
     let replies = backend.reply_permission_calls.clone();
     let replied = backend.replied_permissions.clone();
     let interrupts = backend.interrupt_calls.clone();
@@ -170,8 +167,8 @@ async fn aborted_turn_rejects_a_child_sessions_request() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.prompt_error = Some("Aborted".into());
-    backend.permissions = vec![perm_request("per_child", "ses_child", "ls -la")];
+    backend.fail_prompt("Aborted");
+    backend.ask_permission(perm_request("per_child", "ses_child", "ls -la"));
     backend
         .session_parents
         .insert("ses_child".into(), "ses_test".into());
@@ -202,11 +199,10 @@ async fn aborted_turn_rejects_its_pending_question() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.prompt_error = Some("Aborted".into());
-    backend.prompt_gate = Some(Arc::clone(&gate));
-    backend.questions = vec![question_request("que_1", "ses_test")];
+    backend.fail_prompt("Aborted");
+    let gate = backend.hold_prompts();
+    backend.ask_question(question_request("que_1", "ses_test"));
     let replies = backend.reply_question_calls.clone();
     let replied = backend.replied_questions.clone();
     let (app, platform) = build_app(cfg, backend).await;
@@ -248,11 +244,11 @@ async fn aborted_turn_leaves_another_sessions_request() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.prompt_error = Some("Aborted".into());
-    backend.permissions = vec![
+    backend.fail_prompt("Aborted");
+    backend.ask_permissions(vec![
         perm_request("per_mine", "ses_test", "ls -la"),
         perm_request("per_other", "ses_other", "rm -rf /"),
-    ];
+    ]);
     let replies = backend.reply_permission_calls.clone();
     let (app, _platform) = build_app(cfg, backend).await;
 
@@ -281,8 +277,8 @@ async fn aborted_turn_leaves_a_claimed_request() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.prompt_error = Some("Aborted".into());
-    backend.permissions = vec![perm_request("per_claimed", "ses_test", "ls -la")];
+    backend.fail_prompt("Aborted");
+    backend.ask_permission(perm_request("per_claimed", "ses_test", "ls -la"));
     let replies = backend.reply_permission_calls.clone();
     let (app, _platform) = build_app(cfg, backend).await;
     app.core.snapshot_claims.lock().await.claim(
@@ -328,8 +324,8 @@ async fn aborted_turn_keeps_requests_when_the_list_fails() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.prompt_error = Some("Aborted".into());
-    backend.permissions = vec![perm_request("per_1", "ses_test", "ls -la")];
+    backend.fail_prompt("Aborted");
+    backend.ask_permission(perm_request("per_1", "ses_test", "ls -la"));
     backend
         .hang_list_permissions
         .store(1, std::sync::atomic::Ordering::SeqCst);
@@ -363,7 +359,7 @@ async fn completed_turn_keeps_a_pending_request() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.permissions = vec![perm_request("per_1", "ses_test", "ls -la")];
+    backend.ask_permission(perm_request("per_1", "ses_test", "ls -la"));
     let replies = backend.reply_permission_calls.clone();
     let (app, _platform) = build_app(cfg, backend).await;
 
