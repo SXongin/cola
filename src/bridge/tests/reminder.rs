@@ -225,8 +225,8 @@ async fn a_failed_pin_never_affects_the_turn_and_does_not_clear() {
     let mut backend = MockBackend::new(realistic_parts());
     backend.permissions = vec![permission("per_1", "ses_1")];
     let backend = Arc::new(backend);
-    let mut platform = RecordingPlatform::new();
-    platform.fail_instant_reminder = true;
+    let platform = RecordingPlatform::new();
+    platform.fail_instant_reminder.store(true, Ordering::SeqCst);
     let platform = Arc::new(platform);
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_session(&app, "ses_1", "/work").await;

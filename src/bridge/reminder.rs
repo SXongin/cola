@@ -7,6 +7,8 @@
 //! instead (ADR-0043 amendment 2026-09-21). The pin is best-effort: every
 //! failure logs and the turn is unaffected (a missing
 //! `im:datasync.feed_card.time_sensitive:write` scope disables only pinning).
+//! A failing Chat/Topic is retried on every sweep but warns once — the
+//! repeats are DEBUG, and a recovery is INFO (ADR-0048; see [`FailureLatch`]).
 //!
 //! Pins are generation-scoped: every pin records the **turn generation** that
 //! owns it, and a clear from an older generation can never unpin a newer
@@ -31,8 +33,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::bridge::core::SharedCore;
+use crate::bridge::failure_latch::FailureLatch;
 use crate::bridge::snapshot_claims::ClaimKind;
 use crate::feishu::Platform;
+use crate::feishu::client::INSTANT_REMINDER_SCOPE;
 
 /// What a pending request needs to pin its Chat/Topic: the Feishu chat, the
 /// turn's requester (the pinned user) and the turn generation the pin belongs
@@ -131,6 +135,9 @@ struct Inner {
     /// sweep saw. Both flows update their own kind; the union selects the one
     /// deterministic owner (ADR-0043 amendment 2026-09-21, #247).
     pending: HashMap<String, HashMap<ClaimKind, ReminderTarget>>,
+    /// The warn-once policy for this state machine's best-effort calls, keyed
+    /// by Chat/Topic (ADR-0048).
+    latch: FailureLatch,
 }
 
 /// The Instant Reminder state machine: `[bridge] instant_reminder` opt-in,
@@ -192,12 +199,16 @@ impl ReminderState {
             {
                 Ok(()) => {
                     inner.confirmed_off.insert(chat_id.to_string());
+                    inner
+                        .latch
+                        .succeeded(chat_id, "instant reminder: startup-orphan clear");
                     tracing::debug!("instant reminder: startup-orphan clear sent for {}", chat_id);
                 }
-                Err(e) => tracing::warn!(
-                    "instant reminder: startup-orphan clear for {} failed (best-effort): {}",
+                Err(e) => inner.latch.failed(
                     chat_id,
-                    e
+                    "instant reminder: startup-orphan clear",
+                    INSTANT_REMINDER_SCOPE,
+                    &e,
                 ),
             }
         }
@@ -246,11 +257,16 @@ impl ReminderState {
                 .set_instant_reminder(&target.chat_id, old_is_group, &old_users, false)
                 .await
             {
-                tracing::warn!(
-                    "instant reminder: re-target clear for {} failed (best-effort): {}",
-                    target.chat_id,
-                    e
+                inner.latch.failed(
+                    &target.chat_id,
+                    "instant reminder: re-target clear",
+                    INSTANT_REMINDER_SCOPE,
+                    &e,
                 );
+            } else {
+                inner
+                    .latch
+                    .succeeded(&target.chat_id, "instant reminder: re-target clear");
             }
             inner.live.remove(&target.chat_id);
             let generation = old_generation.max(target.generation);
@@ -259,6 +275,7 @@ impl ReminderState {
                 .await
             {
                 Ok(()) => {
+                    inner.latch.succeeded(&target.chat_id, "instant reminder: pin");
                     inner.live.insert(
                         target.chat_id.clone(),
                         LiveReminder {
@@ -272,10 +289,11 @@ impl ReminderState {
                 }
                 // Best-effort: the turn is unaffected; a later sweep retries
                 // while the request is still pending.
-                Err(e) => tracing::warn!(
-                    "instant reminder: pin {} failed (best-effort; the turn is unaffected): {}",
-                    target.chat_id,
-                    e
+                Err(e) => inner.latch.failed(
+                    &target.chat_id,
+                    "instant reminder: pin",
+                    INSTANT_REMINDER_SCOPE,
+                    &e,
                 ),
             }
             return;
@@ -285,6 +303,7 @@ impl ReminderState {
             .await
         {
             Ok(()) => {
+                inner.latch.succeeded(&target.chat_id, "instant reminder: pin");
                 inner.live.insert(
                     target.chat_id.clone(),
                     LiveReminder {
@@ -298,10 +317,11 @@ impl ReminderState {
             }
             // Best-effort: the turn is unaffected; a later sweep retries
             // while the request is still pending.
-            Err(e) => tracing::warn!(
-                "instant reminder: pin {} failed (best-effort; the turn is unaffected): {}",
-                target.chat_id,
-                e
+            Err(e) => inner.latch.failed(
+                &target.chat_id,
+                "instant reminder: pin",
+                INSTANT_REMINDER_SCOPE,
+                &e,
             ),
         }
     }
@@ -341,17 +361,16 @@ impl ReminderState {
             .await
         {
             Ok(()) => {
+                inner.latch.succeeded(chat_id, "instant reminder: clear");
                 inner.live.remove(chat_id);
                 inner.confirmed_off.insert(chat_id.to_string());
                 self.persist_locked(inner);
             }
             // Keep the pin tracked so the next sweep retries; the failure is
             // logged and nothing else is affected.
-            Err(e) => tracing::warn!(
-                "instant reminder: clear {} failed (best-effort; kept for a later sweep): {}",
-                chat_id,
-                e
-            ),
+            Err(e) => inner
+                .latch
+                .failed(chat_id, "instant reminder: clear", INSTANT_REMINDER_SCOPE, &e),
         }
     }
 
@@ -480,13 +499,17 @@ impl ReminderState {
             {
                 Ok(()) => {
                     inner.confirmed_off.insert(entry.chat_id.clone());
+                    inner
+                        .latch
+                        .succeeded(&entry.chat_id, "instant reminder: startup-orphan clear");
                     tracing::debug!("instant reminder: cleared startup orphan in {}", entry.chat_id);
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "instant reminder: startup orphan clear for {} failed (kept for the next startup): {}",
-                        entry.chat_id,
-                        e
+                    inner.latch.failed(
+                        &entry.chat_id,
+                        "instant reminder: startup-orphan clear",
+                        INSTANT_REMINDER_SCOPE,
+                        &e,
                     );
                     remaining.push(entry);
                 }
@@ -543,7 +566,7 @@ pub(crate) async fn reminder_target(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::test_support::RecordingPlatform;
+    use crate::bridge::test_support::{RecordingPlatform, assert_line_level, capture_logs, level_count};
 
     fn target_for(chat_id: &str, generation: u64, requester: &str) -> ReminderTarget {
         ReminderTarget {
@@ -779,8 +802,10 @@ mod tests {
         )
         .unwrap();
 
-        let mut failing = RecordingPlatform::new();
-        failing.fail_instant_reminder = true;
+        let failing = RecordingPlatform::new();
+        failing
+            .fail_instant_reminder
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let failing: Arc<dyn Platform> = Arc::new(failing);
         let restarted = ReminderState::new(true, Some(path.clone()));
         restarted.clear_orphans(&failing).await;
@@ -826,5 +851,65 @@ mod tests {
         assert_eq!(calls.len(), 1, "only the re-pin: the orphan sweep makes no call");
         assert!(calls[0].1);
         assert!(!path.exists(), "the record is dropped for the live pin");
+    }
+
+    /// ADR-0048's warn-once policy for the reminder: a Chat/Topic whose pin
+    /// keeps failing warns once (with the cause and the actionable scope), the
+    /// identical repeats are DEBUG, and the sweep that lands the pin logs INFO
+    /// recovery — while every sweep still retries.
+    #[tokio::test]
+    async fn a_repeated_pin_failure_warns_once_and_recovery_logs_info() {
+        let platform = Arc::new(RecordingPlatform::new());
+        platform
+            .fail_instant_reminder
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let feishu: Arc<dyn Platform> = platform.clone();
+        let pins = ReminderState::new(true, None);
+        let pin_target = target("chat_1", 1);
+
+        let (_, logs) = capture_logs(async {
+            pins.sync(&feishu, ClaimKind::Permission, std::slice::from_ref(&pin_target))
+                .await;
+            pins.sync(&feishu, ClaimKind::Permission, std::slice::from_ref(&pin_target))
+                .await;
+        })
+        .await;
+
+        assert_eq!(
+            reminder_calls(&platform).await.len(),
+            2,
+            "the failed pin is still retried every sweep"
+        );
+        assert_line_level(&logs, "instant reminder: pin chat_1 failed", "WARN");
+        assert_eq!(
+            level_count(&logs, "instant reminder: pin chat_1", "WARN"),
+            1,
+            "one warning, not one per sweep:\n{logs}"
+        );
+        assert_eq!(
+            level_count(&logs, "instant reminder: pin chat_1", "DEBUG"),
+            1,
+            "the repeat is DEBUG:\n{logs}"
+        );
+        assert!(
+            logs.contains("im:datasync.feed_card.time_sensitive:write"),
+            "the warning names the actionable scope:\n{logs}"
+        );
+        assert!(
+            logs.contains("simulated set_instant_reminder failure"),
+            "the warning carries the cause:\n{logs}"
+        );
+
+        // The pin lands: INFO recovery, and the retry still happened.
+        platform
+            .fail_instant_reminder
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let (_, logs) = capture_logs(async {
+            pins.sync(&feishu, ClaimKind::Permission, std::slice::from_ref(&pin_target))
+                .await;
+        })
+        .await;
+        assert_eq!(reminder_calls(&platform).await.len(), 3);
+        assert_line_level(&logs, "instant reminder: pin chat_1 recovered", "INFO");
     }
 }
