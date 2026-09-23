@@ -461,20 +461,19 @@ mod tests {
         app.inflight.lock().await.insert("ses_test".to_string());
     }
 
-    async fn app_with_live_card(text: &str) -> (Arc<App>, Arc<RecordingPlatform>) {
+    /// A test app with `ses_test` seeded, plus its recording platform.
+    async fn app_with_session() -> (Arc<App>, Arc<RecordingPlatform>) {
         let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
-        let platform = Arc::new(RecordingPlatform::new());
-        let app = Arc::new(
-            App::new(
-                cfg,
-                Arc::new(MockBackend::new(realistic_parts())),
-                platform.clone(),
-            )
-            .unwrap(),
-        );
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
         seed_session(&app, "ses_test", "/work").await;
+        (app, platform)
+    }
+
+    /// The same, with a live card carrying `text` and the in-flight guard.
+    async fn app_with_live_card(text: &str) -> (Arc<App>, Arc<RecordingPlatform>) {
+        let (app, platform) = app_with_session().await;
         seed_live_card(&app, text).await;
         (app, platform)
     }
@@ -519,19 +518,7 @@ mod tests {
     /// same card — not lose it to a continuation that starts after it.
     #[tokio::test]
     async fn a_rejected_finalized_update_is_re_sent_fenced_on_the_same_card() {
-        let _wd = test_work_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = test_config(&dir.path().join("sessions.json"));
-        let platform = Arc::new(RecordingPlatform::new());
-        let app = Arc::new(
-            App::new(
-                cfg,
-                Arc::new(MockBackend::new(realistic_parts())),
-                platform.clone(),
-            )
-            .unwrap(),
-        );
-        seed_session(&app, "ses_test", "/work").await;
+        let (app, platform) = app_with_session().await;
 
         // Two exactly-full text slices: the first build fills the card and
         // finalizes it (advancing `render_from` to the second slice).
