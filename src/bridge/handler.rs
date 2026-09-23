@@ -1078,16 +1078,20 @@ impl App {
         // the patched card once the ack result is assembled, so the poll loop
         // never duplicates the embedded blocks.
         let (card, claim_data) = if mapped_to_this_thread {
-            let data =
-                crate::bridge::snapshot::gather_snapshot(&core.opencode, &target.id, &target.directory).await;
-            match crate::bridge::snapshot::re_switch_emit(&data) {
-                crate::bridge::snapshot::SnapshotEmit::Full => {
-                    let (card, data) =
-                        crate::bridge::snapshot::snapshot_card_from_data(core, "切换", &target.title, data)
-                            .await;
-                    (card, Some(data))
-                }
-                crate::bridge::snapshot::SnapshotEmit::Suppressed => (
+            // A re-activation: the session is already mapped to this thread, so
+            // its snapshot runs inside the Session's `snapshot` span with the
+            // thread key known here (ADR-0048).
+            match crate::bridge::snapshot::re_switch_snapshot(
+                core,
+                thread_key,
+                &target.id,
+                &target.directory,
+                &target.title,
+            )
+            .await
+            {
+                crate::bridge::snapshot::ReSwitchSnapshot::Full { card, data } => (card, Some(data)),
+                crate::bridge::snapshot::ReSwitchSnapshot::Suppressed => (
                     crate::feishu::snapshot_card::build_switched_state_card(
                         &target.title,
                         &target.id,
