@@ -451,14 +451,13 @@ async fn supplement_during_the_loading_card_round_trip_still_splits() {
 
     // The split could not be served yet (no card id), but it is not dropped.
     {
-        let cards = app.cards.lock().await;
-        let card = cards.get("ses_test").expect("the startup card session");
+        let cards = app.cards_handle();
         assert!(
-            card.card_message_id.is_none(),
+            Turn::card_message_id(&cards, "ses_test").await.is_none(),
             "the loading reply is still parked"
         );
         assert!(
-            !card.pending_split.is_empty(),
+            Turn::has_pending_split(&cards, "ses_test").await,
             "the split waits for the card id instead of being lost"
         );
     }
@@ -504,11 +503,16 @@ async fn supplement_during_the_loading_card_round_trip_still_splits() {
         matches!(calls.last(), Some(PlatformCall::ReplyCard { .. })),
         "the continuation stays the newest message: {calls:?}"
     );
-    let cards = app.cards.lock().await;
-    let card = cards.get("ses_test").expect("card session");
-    assert_eq!(card.card_message_id.as_deref(), Some("msg_reply"));
-    assert!(card.pending_split.is_empty());
-    assert!(card.card_is_live, "the continuation is the live card");
+    let cards = app.cards_handle();
+    assert_eq!(
+        Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+        Some("msg_reply")
+    );
+    assert!(!Turn::has_pending_split(&cards, "ses_test").await);
+    assert!(
+        Turn::card_is_live(&cards, "ses_test").await,
+        "the continuation is the live card"
+    );
 }
 
 /// Several supplements queued while the card id is still absent (the startup
@@ -563,17 +567,18 @@ async fn supplements_queued_in_the_startup_window_share_one_continuation() {
     ))
     .await;
     {
-        let cards = app.cards.lock().await;
-        let card = cards.get("ses_test").expect("the startup card session");
+        let cards = app.cards_handle();
         assert!(
-            card.card_message_id.is_none(),
+            Turn::card_message_id(&cards, "ses_test").await.is_none(),
             "the loading reply is still parked"
         );
+        let queued: Vec<String> = Turn::pending_splits(&cards, "ses_test")
+            .await
+            .into_iter()
+            .map(|(reply_to, _)| reply_to)
+            .collect();
         assert_eq!(
-            card.pending_split
-                .iter()
-                .map(|s| s.reply_to.as_str())
-                .collect::<Vec<_>>(),
+            queued,
             vec!["msg_sup_1", "msg_sup_2"],
             "both supplements queue, in arrival order"
         );
@@ -819,15 +824,12 @@ async fn a_failed_continuation_send_retries_without_duplicating_receipts() {
         "the failed send must not record a card"
     );
     {
-        let cards = app.cards.lock().await;
-        let card = cards.get("ses_test").expect("card session");
-        assert_eq!(card.pending_split.len(), 1, "the failed split stays queued");
+        let cards = app.cards_handle();
+        let queued = Turn::pending_splits(&cards, "ses_test").await;
+        assert_eq!(queued.len(), 1, "the failed split stays queued");
+        assert!(queued[0].1, "its receipt was written exactly once");
         assert!(
-            card.pending_split[0].receipt_pushed,
-            "its receipt was written exactly once"
-        );
-        assert!(
-            !card.card_is_live,
+            !Turn::card_is_live(&cards, "ses_test").await,
             "the card is finalized, owing its continuation"
         );
     }
@@ -1036,14 +1038,13 @@ async fn command_mid_turn_does_not_split_the_chain() {
         )),
         "a command must never split the chain: {calls:?}"
     );
-    let cards = app.cards.lock().await;
-    let session = cards.get("ses_test").expect("card session");
+    let cards = app.cards_handle();
     assert_eq!(
-        session.card_message_id.as_deref(),
+        Turn::card_message_id(&cards, "ses_test").await.as_deref(),
         Some("om_live"),
         "the command must not re-point the live card"
     );
-    assert!(session.pending_split.is_empty());
+    assert!(!Turn::has_pending_split(&cards, "ses_test").await);
 }
 
 /// A pending permission inlined on the live card migrates to the continuation:
@@ -1480,8 +1481,13 @@ async fn bound_exhaustion_does_not_overwrite_the_finalized_continuation() {
         let marker = format!("【S{i:02}】");
         assert!(delivered.contains(&marker), "{marker} vanished");
     }
-    let cards = app.cards.lock().await;
-    let session = cards.get("ses_test").expect("card session");
-    assert_eq!(session.card_message_id.as_deref(), Some("msg_reply"));
-    assert!(session.card_is_live, "the new continuation is the live card");
+    let cards = app.cards_handle();
+    assert_eq!(
+        Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+        Some("msg_reply")
+    );
+    assert!(
+        Turn::card_is_live(&cards, "ses_test").await,
+        "the new continuation is the live card"
+    );
 }

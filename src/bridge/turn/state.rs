@@ -1,3 +1,12 @@
+//! The Turn's streaming state (spec #298, A3).
+//!
+//! The accumulator, its card session and their value types live behind the
+//! Turn's interface (the `impl Turn` blocks in the parent module). Nothing
+//! here is reachable from outside the Turn module: the coordinator's card map
+//! only ever names [`CardSession`], whose fields are visible only inside the
+//! Turn module, and every read or write goes through a `Turn::` method. The
+//! accumulator's own tests are the module's internal seam.
+
 use crate::bridge::handles::CardsHandle;
 use crate::feishu::card::shell::CardBuilder;
 use crate::feishu::card::tool_render::ToolPanel;
@@ -13,16 +22,16 @@ use std::sync::Arc;
 /// truly has one, or `None` when the key is a synthetic ordering device — the
 /// card only ever shows server clocks (#183 follow-up).
 #[derive(Debug, Clone)]
-pub struct TimelineItem {
-    pub key: i64,
-    pub shown_at: Option<i64>,
+pub(super) struct TimelineItem {
+    pub(super) key: i64,
+    pub(super) shown_at: Option<i64>,
     /// Identity of this entry, assigned once at insertion and never reused.
     /// It names the entry's panel on the card (`tool_{seq}` / `reason_{seq}`);
     /// unlike the entry's position it survives timeline insertions and
     /// merges, so the client's local panel state can't drift to another panel
     /// when the card re-renders.
-    pub seq: u64,
-    pub kind: TimelineKind,
+    pub(super) seq: u64,
+    pub(super) kind: TimelineKind,
 }
 
 /// Bookkeeping for a Tool Panel that is still live (ADR-0045): the timeline
@@ -38,7 +47,7 @@ struct LiveTool {
 
 /// What a timeline entry renders.
 #[derive(Debug, Clone)]
-pub enum TimelineKind {
+pub(super) enum TimelineKind {
     Text(String),
     Reasoning(String),
     Tool(String),
@@ -53,10 +62,10 @@ pub enum TimelineKind {
 /// split (the caller then sends a continuation), and the element ranges of the
 /// live interaction blocks this card renders — empty on finalized slices, whose
 /// tail belongs to the newest card.
-pub struct BuiltCard {
-    pub card: serde_json::Value,
-    pub full: bool,
-    pub spans: Vec<crate::bridge::card_handles::BlockSpan>,
+pub(super) struct BuiltCard {
+    pub(super) card: serde_json::Value,
+    pub(super) full: bool,
+    pub(super) spans: Vec<crate::bridge::card_handles::BlockSpan>,
 }
 
 /// Estimated serialized size (bytes) of one collapsible tool panel, mirroring
@@ -82,33 +91,33 @@ fn panel_estimate(p: &ToolPanel) -> usize {
 /// A permission request surfaced inline on the streaming card (instead of a
 /// separate card), so the whole turn lives on ONE card.
 #[derive(Debug, Clone)]
-pub struct PendingPermission {
-    pub session_id: String,
-    pub request_id: String,
+pub(super) struct PendingPermission {
+    pub(super) session_id: String,
+    pub(super) request_id: String,
     /// The full markdown body the block renders (action, patterns/diff).
-    pub body: String,
+    pub(super) body: String,
     /// Compact one-line form of the same request (action + first pattern /
     /// edited file) for the Interaction Receipt — receipts name their target
     /// even where the position cannot (ADR-0038).
-    pub target: String,
-    pub directory: String,
+    pub(super) target: String,
+    pub(super) directory: String,
 }
 
 /// A `question` tool request surfaced inline on the streaming card. `answers[i]`
 /// tracks which questions are already answered (None = open), kept in sync with
 /// the flow's [`crate::bridge::question::QuestionState`].
 #[derive(Debug, Clone)]
-pub struct PendingQuestion {
-    pub request_id: String,
-    pub session_id: String,
-    pub questions: Vec<crate::opencode::types::QuestionInfo>,
-    pub directory: String,
+pub(super) struct PendingQuestion {
+    pub(super) request_id: String,
+    pub(super) session_id: String,
+    pub(super) questions: Vec<crate::opencode::types::QuestionInfo>,
+    pub(super) directory: String,
     /// Display selection per question (locked answer, or live multi-select
     /// toggles). Mirrors `question_elements`' `answered` slice.
-    pub answers: Vec<Option<Vec<String>>>,
+    pub(super) answers: Vec<Option<Vec<String>>>,
     /// Whether each question is finalized (single-select answered, multi-select
     /// confirmed) — its controls collapse to a static 已选 line.
-    pub done: Vec<bool>,
+    pub(super) done: Vec<bool>,
 }
 
 /// One entry in a card's interaction section: a live permission or question
@@ -119,7 +128,7 @@ pub struct PendingQuestion {
 /// goes through that seam, so what the card renders cannot drift from the
 /// accumulator's in-flight state (ADR-0038).
 #[derive(Debug, Clone)]
-pub enum InteractionBlock {
+pub(super) enum InteractionBlock {
     Permission(PendingPermission),
     Question(PendingQuestion),
     /// Tombstone for a resolved request (its id): the section keeps it so a
@@ -131,7 +140,7 @@ pub enum InteractionBlock {
 
 impl InteractionBlock {
     /// The request this block belongs to (unique across kinds).
-    pub fn request_id(&self) -> &str {
+    pub(super) fn request_id(&self) -> &str {
         match self {
             InteractionBlock::Permission(p) => &p.request_id,
             InteractionBlock::Question(q) => &q.request_id,
@@ -140,14 +149,14 @@ impl InteractionBlock {
     }
 
     /// Whether the block still awaits the Host (a receipt is settled).
-    pub fn is_live(&self) -> bool {
+    pub(super) fn is_live(&self) -> bool {
         !matches!(self, InteractionBlock::Receipt(_))
     }
 
     /// The directory that owns the block's request — the scope a sweep judges
     /// a vanished request in. Empty for a receipt tombstone, whose request is
     /// already settled.
-    pub fn directory(&self) -> &str {
+    pub(super) fn directory(&self) -> &str {
         match self {
             InteractionBlock::Permission(p) => &p.directory,
             InteractionBlock::Question(q) => &q.directory,
@@ -157,7 +166,7 @@ impl InteractionBlock {
 
     /// The session that owns the block's request (a sub-task child carries its
     /// own id). Empty for a receipt tombstone.
-    pub fn session_id(&self) -> &str {
+    pub(super) fn session_id(&self) -> &str {
         match self {
             InteractionBlock::Permission(p) => &p.session_id,
             InteractionBlock::Question(q) => &q.session_id,
@@ -171,7 +180,7 @@ impl InteractionBlock {
     /// clipped question text). Derived from the block itself, never from a
     /// click payload, so a malformed callback cannot write arbitrary markdown
     /// onto a card.
-    pub fn receipt_target(&self) -> String {
+    pub(super) fn receipt_target(&self) -> String {
         match self {
             InteractionBlock::Permission(p) => p.target.clone(),
             InteractionBlock::Question(q) => crate::feishu::card::question::question_target(&q.questions),
@@ -198,10 +207,10 @@ fn format_tokens(n: i64) -> String {
 /// halves the Turn Footer shows. Captured before the prompt runs, applied to
 /// the live card separately (see [`StreamAccumulator::capture_work_context`]).
 #[derive(Debug, Clone, Default)]
-pub struct WorkContext {
-    pub directory: String,
-    pub project_name: Option<String>,
-    pub git: crate::git::GitState,
+pub(super) struct WorkContext {
+    pub(super) directory: String,
+    pub(super) project_name: Option<String>,
+    pub(super) git: crate::git::GitState,
 }
 
 /// One queued Card Chain split (ADR-0043): the message its continuation must
@@ -209,10 +218,10 @@ pub struct WorkContext {
 /// been written into the accumulator. The flag keeps the receipt
 /// exactly-once when a continuation send fails and the split is retried.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PendingSplit {
-    pub reply_to: String,
-    pub kind: super::SplitKind,
-    pub receipt_pushed: bool,
+pub(super) struct PendingSplit {
+    pub(super) reply_to: String,
+    pub(super) kind: super::SplitKind,
+    pub(super) receipt_pushed: bool,
 }
 
 /// One live card per session: the streaming accumulator plus the card identity
@@ -221,16 +230,16 @@ pub struct PendingSplit {
 /// maps kept in lockstep; owned by [`SharedCore::cards`].
 #[derive(Clone)]
 pub struct CardSession {
-    pub acc: StreamAccumulator,
-    pub card_message_id: Option<String>,
+    pub(super) acc: StreamAccumulator,
+    pub(super) card_message_id: Option<String>,
     /// The header signature of the last flush, compared on each poll so the
     /// card is re-flushed when the progress timer / state changes even with no
     /// new content (ADR-0014).
-    pub last_header_sig: String,
+    pub(super) last_header_sig: String,
     /// The context segment's render inputs as of the last flush (ADR-0044),
     /// compared each poll so a step's usage change flushes even when no part
     /// and no header second changed.
-    pub last_context_sig: (i64, Option<i64>),
+    pub(super) last_context_sig: (i64, Option<i64>),
     /// The Supplement split queue (ADR-0043), in arrival order — never
     /// coalesced. The serving rule: the flush that finalizes the live card
     /// writes one receipt per queued supplement (arrival order) and sends
@@ -241,21 +250,21 @@ pub struct CardSession {
     /// stays the anchor and only supplements whose receipt was not written yet
     /// get one — so a retry duplicates nothing and a later arrival is still
     /// served.
-    pub pending_split: Vec<PendingSplit>,
+    pub(super) pending_split: Vec<PendingSplit>,
     /// Whether the tracked card is still the live (growing) card that flushes
     /// update in place. True until a split finalizes it; a continuation that
     /// fits becomes the new live card, while one that is itself over the size
     /// budget stays FINALIZED (and is never overwritten). Persisted so a flush
     /// that exhausted the chain bound — or died between a finalize and its
     /// continuation — resumes the chain instead of losing the slice it sent.
-    pub card_is_live: bool,
+    pub(super) card_is_live: bool,
 }
 
 impl CardSession {
     /// New session card: the header signature starts empty so the first poll
     /// always flushes (stamping the progress timer). `card_message_id` is the
     /// live card to update in place.
-    pub fn new(acc: StreamAccumulator, card_message_id: Option<String>) -> Self {
+    pub(super) fn new(acc: StreamAccumulator, card_message_id: Option<String>) -> Self {
         let last_context_sig = acc.context_sig();
         Self {
             acc,
@@ -272,7 +281,7 @@ impl CardSession {
     /// (Done) or failed (Error) card session stays in `SharedCore::cards` until
     /// the next Turn replaces it, so the map's key alone does not mean a live
     /// card.
-    pub fn is_running(&self) -> bool {
+    pub(super) fn is_running(&self) -> bool {
         !matches!(
             self.acc.card_state,
             crate::feishu::card::CardState::Done | crate::feishu::card::CardState::Error
@@ -282,7 +291,7 @@ impl CardSession {
     /// Re-point the live card identity at a new message (ADR-0028: a re-adopt
     /// mid-turn sends a fresh snapshot; the follow renderer keeps updating the
     /// new card instead of the old one). The accumulator content is untouched.
-    pub fn repoint(&mut self, message_id: &str) {
+    pub(super) fn repoint(&mut self, message_id: &str) {
         self.card_message_id = Some(message_id.to_string());
         self.acc.reply_to_message_id = Some(message_id.to_string());
         // The fresh snapshot is this chain's newest, growing card.
@@ -295,7 +304,7 @@ impl CardSession {
 /// reasoning / a running tool / streaming text) so the timer resets exactly
 /// when the visible phase changes (ADR-0014).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HeaderPhase {
+pub(super) enum HeaderPhase {
     Loading,
     Reasoning,
     Tool,
@@ -308,7 +317,7 @@ pub enum HeaderPhase {
 /// forever — so the flush escalates through these states instead of
 /// re-PATCHing the rejected content.
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
-pub enum CardFallback {
+pub(super) enum CardFallback {
     /// Normal rendering: model markdown is sanitized for the card parser.
     #[default]
     None,
@@ -323,23 +332,23 @@ pub enum CardFallback {
 
 impl CardFallback {
     /// Whether model markdown renders fenced.
-    pub fn fenced(self) -> bool {
+    pub(super) fn fenced(self) -> bool {
         matches!(self, Self::Fenced | Self::Suspended)
     }
 }
 
 /// Accumulates streaming state for one session.
 #[derive(Default, Clone)]
-pub struct StreamAccumulator {
-    pub card_state: CardState,
+pub(super) struct StreamAccumulator {
+    pub(super) card_state: CardState,
     /// This turn's card-content fallback (see [`CardFallback`]): starts at
     /// `None` and is advanced by the flush when Feishu rejects a card it
     /// built. A fresh turn starts clean and re-tries the normal rendering.
-    pub card_fallback: CardFallback,
-    pub text: String,
-    pub reasoning: String,
+    pub(super) card_fallback: CardFallback,
+    pub(super) text: String,
+    pub(super) reasoning: String,
     /// Tool panels keyed by call ID (current state; `timeline` keeps order).
-    pub tools: IndexMap<String, ToolPanel>,
+    pub(super) tools: IndexMap<String, ToolPanel>,
     /// Live (unfinished) Tool Panels keyed by call ID: the timeline key,
     /// server start time and element identity allocated when the call first
     /// appeared. A live panel renders in the card TAIL, so a split can never
@@ -352,15 +361,15 @@ pub struct StreamAccumulator {
     /// turn splits into several), later updates land on an already-sent card
     /// and stay invisible. The tail rides the live card, so every flush shows
     /// the current list. Each later call replaces it in place.
-    pub todo_panel: Option<ToolPanel>,
+    pub(super) todo_panel: Option<ToolPanel>,
     /// The server start time of the todowrite call that last refreshed
     /// [`Self::todo_panel`] — its panel header shows when the list was last
     /// written.
-    pub todo_shown_at: Option<i64>,
+    pub(super) todo_shown_at: Option<i64>,
     /// Text, reasoning, tool and receipt entries ordered by their key (the
     /// server-side part start time) — the card is built from this, so message ↔
     /// tool interleaving is preserved even when a part renders late.
-    pub timeline: Vec<TimelineItem>,
+    pub(super) timeline: Vec<TimelineItem>,
     /// Fallback key source for pushes without a server part time
     /// ([`Self::next_order`]).
     order_seq: i64,
@@ -372,75 +381,75 @@ pub struct StreamAccumulator {
     /// The card's interaction section: the live permission/question blocks
     /// (rendered in the tail) and the tombstones of resolved ones (their
     /// receipt is a timeline entry).
-    pub interactions: Vec<InteractionBlock>,
+    pub(super) interactions: Vec<InteractionBlock>,
     /// Timeline index the CURRENT card starts rendering from. When a card fills
     /// up (Feishu component limit) it is finalized with a "to be continued"
     /// marker and `render_from` advances — a fresh continuation card renders the
     /// remaining timeline from there.
-    pub render_from: usize,
+    pub(super) render_from: usize,
     /// Provider ID of the model answering this turn (e.g. "opencode-go").
-    pub provider_id: Option<String>,
+    pub(super) provider_id: Option<String>,
     /// Model ID of the model answering this turn (e.g. "deepseek-v4-flash").
-    pub model_id: Option<String>,
+    pub(super) model_id: Option<String>,
     /// The `/think` variant cola sent this turn (e.g. "high"), shown as
     /// `model@variant` on the footer. Sourced from the session store — the
     /// server reports the model but not the variant.
-    pub variant: Option<String>,
+    pub(super) variant: Option<String>,
     /// Context tokens the model consumed this turn (includes cached prefix), for
     /// the context-usage segment in the card footer.
-    pub context_tokens: i64,
+    pub(super) context_tokens: i64,
     /// The answering model's context-window size (tokens), fetched from
     /// `GET /provider` and memoized for the turn — `None` before the lookup or
     /// when the server reports none (ADR-0044).
-    pub context_window: Option<i64>,
+    pub(super) context_window: Option<i64>,
     /// The (provider, model) pair [`Self::context_window`] was fetched for; a
     /// mismatch triggers a re-fetch, since the answering model can change.
-    pub context_window_key: Option<(String, String)>,
+    pub(super) context_window_key: Option<(String, String)>,
     /// Working directory of the session, shown in the card footer.
-    pub directory: Option<String>,
+    pub(super) directory: Option<String>,
     /// Project name (directory basename) for the Turn Footer's 📁 segment.
-    pub project_name: Option<String>,
+    pub(super) project_name: Option<String>,
     /// Git branch: captured at turn start, refreshed at turn end (ADR-0019);
     /// the short commit hash when detached.
-    pub branch: Option<String>,
+    pub(super) branch: Option<String>,
     /// Working tree differs from HEAD, including untracked files: captured at
     /// turn start, refreshed at turn end. Only set alongside `branch`
     /// (ADR-0019: the halves are omitted together).
-    pub dirty: bool,
+    pub(super) dirty: bool,
     /// The session/thread name; shown as the card subtitle so the header can
     /// stay focused on state (the question is already in the reply context).
-    pub title: String,
-    pub error: Option<String>,
-    pub reply_to_message_id: Option<String>,
+    pub(super) title: String,
+    pub(super) error: Option<String>,
+    pub(super) reply_to_message_id: Option<String>,
     /// This turn's session id, carried on the error-card retry button so the
     /// card callback can find the accumulator + card to reuse.
-    pub session_id: Option<String>,
+    pub(super) session_id: Option<String>,
     /// The full original prompt text of this turn, kept so the error-card
     /// "retry" button can re-submit it without the user retyping.
-    pub prompt: Option<String>,
+    pub(super) prompt: Option<String>,
     /// The id this turn's user message carries (`msg_cola_…`, ADR-0026), so a
     /// later error-card retry reuses it and the server deduplicates by id.
-    pub cola_message_id: Option<String>,
+    pub(super) cola_message_id: Option<String>,
     /// Who sent the prompt (Feishu open_id), so the group completion notice can
     /// be replied to them / @-mention them.
-    pub requester_open_id: Option<String>,
+    pub(super) requester_open_id: Option<String>,
     /// Whether the prompt came from a group chat (completion notice is group-only).
-    pub is_group: bool,
+    pub(super) is_group: bool,
     /// The Chat/Topic's turn generation at this turn's start (ADR-0043),
     /// assigned by [`crate::bridge::reminder::ReminderState::begin_turn`]. The Instant
     /// Reminder pin lifecycle reads it so every pin carries the turn it
     /// belongs to and a stale clear cannot unpin a newer turn's pin.
-    pub turn_generation: Option<u64>,
+    pub(super) turn_generation: Option<u64>,
     /// Part ids already rendered into this card — dedupes incremental polling.
     /// Reasoning/text parts are written empty first and updated with full text,
     /// so they are only tracked once they have content. Tool parts are tracked
     /// separately in `rendered_tool_states` because they get re-rendered on
     /// status changes (running → completed).
-    pub rendered_parts: std::collections::HashSet<String>,
+    pub(super) rendered_parts: std::collections::HashSet<String>,
     /// callID → state signature for tool panels (status + output length; a
     /// todowrite's whole state, since its list can change without changing any
     /// length); a tool is re-rendered when its signature changes.
-    pub rendered_tool_states: std::collections::HashMap<String, String>,
+    pub(super) rendered_tool_states: std::collections::HashMap<String, String>,
     /// The turn's start on the SERVER's clock: the created time of the user
     /// message this turn answers. External renders arm with it directly; a
     /// cola-sent turn captures it from the stored user message on the first
@@ -448,18 +457,18 @@ pub struct StreamAccumulator {
     /// turn's single anchor: the header date, the turn filter
     /// (`created >= it`) and the renderer replacement guard all read it, so
     /// cola's own clock is never compared against the server's (#183, #190).
-    pub turn_started_ms: Option<i64>,
+    pub(super) turn_started_ms: Option<i64>,
     /// ADR-0014: progress/liveness signals for the header.
     /// The active header phase; None when the turn is not actively working
     /// (Done/Error/Continued show no timer).
-    pub current_phase: Option<HeaderPhase>,
+    pub(super) current_phase: Option<HeaderPhase>,
     /// When the current phase started (wall clock); the header timer counts up
     /// from here.
-    pub phase_started_at: Option<std::time::Instant>,
+    pub(super) phase_started_at: Option<std::time::Instant>,
 }
 
 impl StreamAccumulator {
-    pub fn new(title: &str) -> Self {
+    pub(super) fn new(title: &str) -> Self {
         Self {
             title: title.to_string(),
             reply_to_message_id: None,
@@ -482,7 +491,7 @@ impl StreamAccumulator {
     /// insert the live card first (a Supplement must always find one, ADR-0043)
     /// and attach the context after the card's own send, without holding the
     /// cards lock across the git read.
-    pub async fn capture_work_context(dir: &str) -> WorkContext {
+    pub(super) async fn capture_work_context(dir: &str) -> WorkContext {
         if dir.is_empty() {
             return WorkContext::default();
         }
@@ -494,7 +503,7 @@ impl StreamAccumulator {
     }
 
     /// Apply a context captured by [`Self::capture_work_context`].
-    pub fn apply_work_context(&mut self, ctx: WorkContext) {
+    pub(super) fn apply_work_context(&mut self, ctx: WorkContext) {
         if ctx.directory.is_empty() {
             self.directory = None;
             return;
@@ -509,7 +518,7 @@ impl StreamAccumulator {
     /// the state the AI operates on, not the changes it leaves behind. Best
     /// effort: an empty or non-git directory leaves the fields unset.
     /// `refresh_work_context` re-reads the git halves when the turn ends.
-    pub async fn attach_work_context(&mut self, dir: &str) {
+    pub(super) async fn attach_work_context(&mut self, dir: &str) {
         let ctx = Self::capture_work_context(dir).await;
         self.apply_work_context(ctx);
     }
@@ -518,7 +527,7 @@ impl StreamAccumulator {
     /// together and never regress: only a resolved branch overwrites them, so a
     /// failed or empty read (transient git failure, repo gone) keeps the last
     /// known state rather than dropping `branch ⚠` from the footer.
-    pub fn apply_git_state(&mut self, state: crate::git::GitState) {
+    pub(super) fn apply_git_state(&mut self, state: crate::git::GitState) {
         if let Some(branch) = state.branch {
             self.branch = Some(branch);
             self.dirty = state.dirty;
@@ -527,7 +536,7 @@ impl StreamAccumulator {
 
     /// The header phase for the current state: None when the turn finished or
     /// errored (no timer shown).
-    pub fn active_phase(&self) -> Option<HeaderPhase> {
+    pub(super) fn active_phase(&self) -> Option<HeaderPhase> {
         match self.card_state {
             CardState::Loading => Some(HeaderPhase::Loading),
             CardState::Reasoning => Some(HeaderPhase::Reasoning),
@@ -549,7 +558,7 @@ impl StreamAccumulator {
 
     /// Reset the phase timer whenever the active header phase changes.
     /// Idempotent — safe to call after every mutation.
-    pub fn refresh_phase(&mut self) {
+    pub(super) fn refresh_phase(&mut self) {
         let new = self.active_phase();
         if new != self.current_phase {
             self.current_phase = new;
@@ -561,7 +570,7 @@ impl StreamAccumulator {
     /// request is already present (the poll loop and the adopt-time snapshot
     /// both feed blocks in). Live blocks render in the card's tail; resolving
     /// one inserts its receipt into the timeline. Returns whether it was added.
-    pub fn add_interaction(&mut self, block: InteractionBlock) -> bool {
+    pub(super) fn add_interaction(&mut self, block: InteractionBlock) -> bool {
         if self.interaction(block.request_id()).is_some() {
             return false;
         }
@@ -570,7 +579,7 @@ impl StreamAccumulator {
     }
 
     /// The block for `request_id`, if the card carries one.
-    pub fn interaction(&self, request_id: &str) -> Option<&InteractionBlock> {
+    pub(super) fn interaction(&self, request_id: &str) -> Option<&InteractionBlock> {
         self.interactions.iter().find(|b| b.request_id() == request_id)
     }
 
@@ -593,7 +602,7 @@ impl StreamAccumulator {
     /// from the block being resolved, so the residue always names the target it
     /// actually resolved. Returns false when no live block matched (already
     /// resolved, or never on this card).
-    pub fn resolve_interaction(
+    pub(super) fn resolve_interaction(
         &mut self,
         request_id: &str,
         line: impl FnOnce(&InteractionBlock) -> String,
@@ -619,7 +628,7 @@ impl StreamAccumulator {
     /// receipt covering them all, so the others only need their tombstone.
     /// Returns false when no live block matched (already resolved, or never on
     /// this card).
-    pub fn dismiss_interaction(&mut self, request_id: &str) -> bool {
+    pub(super) fn dismiss_interaction(&mut self, request_id: &str) -> bool {
         let Some(idx) = self.live_index(request_id) else {
             return false;
         };
@@ -629,7 +638,7 @@ impl StreamAccumulator {
 
     /// Append one Interaction Receipt keyed at the resolution moment — the
     /// single residue a mode change leaves for every block it resolved.
-    pub fn push_receipt(&mut self, text: &str) {
+    pub(super) fn push_receipt(&mut self, text: &str) {
         let key = self.next_order();
         self.insert_kind(key, None, TimelineKind::Receipt(text.to_string()));
     }
@@ -637,7 +646,7 @@ impl StreamAccumulator {
     /// Replace a question block's display state (the live 已选/✅ markers) in
     /// place. Returns false when the card has no question block for the
     /// request.
-    pub fn update_question_state(
+    pub(super) fn update_question_state(
         &mut self,
         request_id: &str,
         answers: &[Option<Vec<String>>],
@@ -663,7 +672,7 @@ impl StreamAccumulator {
     /// the resolution moment and the tombstone keeps a racing poll from
     /// re-surfacing the block. Returns how many blocks were resolved; the
     /// caller repaints each affected card (ADR-0038, rule 5).
-    pub fn resolve_vanished(
+    pub(super) fn resolve_vanished(
         &mut self,
         vanished: impl Fn(&InteractionBlock) -> bool,
         line: impl Fn(&InteractionBlock) -> String,
@@ -684,7 +693,7 @@ impl StreamAccumulator {
     /// production paths mutate through the seam, and later tickets that need
     /// the view drop the `cfg` (ADR-0038 follow-ups).
     #[cfg(test)]
-    pub fn live_permissions(&self) -> Vec<PendingPermission> {
+    pub(super) fn live_permissions(&self) -> Vec<PendingPermission> {
         self.interactions
             .iter()
             .filter_map(|b| match b {
@@ -697,7 +706,7 @@ impl StreamAccumulator {
     /// The live question blocks, in render order. Test-only like
     /// [`Self::live_permissions`].
     #[cfg(test)]
-    pub fn live_questions(&self) -> Vec<PendingQuestion> {
+    pub(super) fn live_questions(&self) -> Vec<PendingQuestion> {
         self.interactions
             .iter()
             .filter_map(|b| match b {
@@ -710,7 +719,7 @@ impl StreamAccumulator {
     /// Which request kinds are live on the card — the header's awaiting state
     /// (ADR-0014). A permission and a question pending at once report `Both`,
     /// so the title names exactly what the operator must resolve.
-    pub fn awaiting_action(&self) -> AwaitingAction {
+    pub(super) fn awaiting_action(&self) -> AwaitingAction {
         let mut permission = false;
         let mut question = false;
         for block in &self.interactions {
@@ -732,7 +741,7 @@ impl StreamAccumulator {
     /// operator, phase timer, and reasoning length. Elapsed is whole seconds so
     /// the header signature changes at most once per second — the flush
     /// throttle.
-    pub fn header_progress(&self) -> crate::feishu::card::HeaderProgress {
+    pub(super) fn header_progress(&self) -> crate::feishu::card::HeaderProgress {
         crate::feishu::card::HeaderProgress {
             awaiting: self.awaiting_action(),
             elapsed: self.phase_started_at.map(|t| t.elapsed().as_secs()),
@@ -759,7 +768,7 @@ impl StreamAccumulator {
     /// running-tool hint. Exposed so a click's ack can restamp a card's header
     /// in the same response — resolving the last live block must lift the
     /// "等待你的授权/回答" title immediately, not a poll later.
-    pub fn header_title_and_template(&self) -> (String, &'static str) {
+    pub(super) fn header_title_and_template(&self) -> (String, &'static str) {
         crate::feishu::card::shell::header_title_and_template(
             &self.card_state,
             self.running_tool(),
@@ -769,7 +778,7 @@ impl StreamAccumulator {
 
     /// The card header's signature (title + template), compared across polls
     /// to decide whether the header changed enough to re-flush (ADR-0014).
-    pub fn header_sig(&self) -> String {
+    pub(super) fn header_sig(&self) -> String {
         let (title, template) = self.header_title_and_template();
         format!("{}|{}", title, template)
     }
@@ -791,7 +800,7 @@ impl StreamAccumulator {
     /// The context segment's render inputs `(used tokens, effective window)` —
     /// the signature the flush compares. [`Self::context_segment`] renders from
     /// exactly this, so the two cannot drift.
-    pub fn context_sig(&self) -> (i64, Option<i64>) {
+    pub(super) fn context_sig(&self) -> (i64, Option<i64>) {
         (self.context_tokens, self.current_context_window())
     }
 
@@ -799,7 +808,7 @@ impl StreamAccumulator {
     /// latest usage and the memoized window: `📊 上下文 84k/200k (42%)`, or the
     /// used tokens alone when the server reports no window. `None` until the
     /// first usage lands — a step that has not finished has no token data.
-    pub fn context_segment(&self) -> Option<String> {
+    pub(super) fn context_segment(&self) -> Option<String> {
         let (used, window) = self.context_sig();
         if used <= 0 {
             return None;
@@ -870,7 +879,7 @@ impl StreamAccumulator {
     /// never before the wall clock, and never behind a key already inserted —
     /// so it keeps call order and stays after everything already on the card
     /// even under clock skew between cola and the server.
-    pub fn next_order(&mut self) -> i64 {
+    pub(super) fn next_order(&mut self) -> i64 {
         self.order_seq = self
             .order_seq
             .saturating_add(1)
@@ -894,7 +903,7 @@ impl StreamAccumulator {
     /// [`Self::push_text_at`] for chunks with no server part time; this
     /// convenience form is test-only.
     #[cfg(test)]
-    pub fn push_text(&mut self, chunk: &str) {
+    pub(super) fn push_text(&mut self, chunk: &str) {
         self.push_text_at(None, chunk);
     }
 
@@ -902,7 +911,7 @@ impl StreamAccumulator {
     /// (the server's `time.start`), which also places it on the timeline.
     /// `None` for a payload with no server time: the item is then keyed by a
     /// monotonic fallback (call order) and shows no clock.
-    pub fn push_text_at(&mut self, at_ms: Option<i64>, chunk: &str) {
+    pub(super) fn push_text_at(&mut self, at_ms: Option<i64>, chunk: &str) {
         let key = at_ms.unwrap_or_else(|| self.next_order());
         self.text.push_str(chunk);
         let max = crate::feishu::card::MAX_CARD_TEXT_CHARS;
@@ -939,14 +948,14 @@ impl StreamAccumulator {
     /// its own panel). Production renders go through [`Self::push_reasoning_at`];
     /// this convenience form is for tests and synthetic content.
     #[cfg(test)]
-    pub fn push_reasoning(&mut self, chunk: &str) {
+    pub(super) fn push_reasoning(&mut self, chunk: &str) {
         self.push_reasoning_at(None, chunk);
     }
 
     /// [`Self::push_reasoning`] for a reasoning part that started at `at_ms`
     /// (the server's `time.start`); `None` keys it by fallback and shows no
     /// clock.
-    pub fn push_reasoning_at(&mut self, at_ms: Option<i64>, chunk: &str) {
+    pub(super) fn push_reasoning_at(&mut self, at_ms: Option<i64>, chunk: &str) {
         let key = at_ms.unwrap_or_else(|| self.next_order());
         self.reasoning.push_str(chunk);
         let idx = self.item_with_key(key);
@@ -963,7 +972,7 @@ impl StreamAccumulator {
     /// appearance (state updates re-render in place). Production renders go
     /// through [`Self::push_tool_at`]; this convenience form is test-only.
     #[cfg(test)]
-    pub fn push_tool(&mut self, call_id: &str, panel: ToolPanel) {
+    pub(super) fn push_tool(&mut self, call_id: &str, panel: ToolPanel) {
         self.push_tool_at(None, call_id, panel);
     }
 
@@ -973,7 +982,7 @@ impl StreamAccumulator {
     /// update: a live panel adopts it as its timeline key — nothing is placed
     /// yet — while a panel already in the timeline keeps its key and only
     /// gains the clock. A part with no server time keeps showing no clock.
-    pub fn push_tool_at(&mut self, at_ms: Option<i64>, call_id: &str, panel: ToolPanel) {
+    pub(super) fn push_tool_at(&mut self, at_ms: Option<i64>, call_id: &str, panel: ToolPanel) {
         let live = panel.is_live();
         let is_new = !self.tools.contains_key(call_id);
         self.tools.insert(call_id.to_string(), panel);
@@ -1034,7 +1043,7 @@ impl StreamAccumulator {
     /// Build the whole card (tests + simple callers). Assembles the full
     /// timeline with the tail sections (inline interactions, buttons, footer).
     #[cfg(test)]
-    pub fn build_card(&self) -> serde_json::Value {
+    pub(super) fn build_card(&self) -> serde_json::Value {
         self.build_card_inner(0, self.timeline.len(), true, None).0
     }
 
@@ -1046,7 +1055,7 @@ impl StreamAccumulator {
     /// and is the turn's final visible card. The spans name each live
     /// interaction block's element range, for the card handle (ADR-0038,
     /// rule 2).
-    pub fn build_card_with_info(&mut self) -> BuiltCard {
+    pub(super) fn build_card_with_info(&mut self) -> BuiltCard {
         // The slice that fits on its own. When items remain, it must hold at
         // least one: an empty slice would leave `render_from` frozen and the
         // flush loop would re-send empty "部分完成" cards forever.
@@ -1079,7 +1088,7 @@ impl StreamAccumulator {
 
     /// [`Self::build_card_with_info`] for callers that don't need the block
     /// spans (the click ack's split probe, tests).
-    pub fn build_card_with_split(&mut self) -> (serde_json::Value, bool) {
+    pub(super) fn build_card_with_split(&mut self) -> (serde_json::Value, bool) {
         let built = self.build_card_with_info();
         (built.card, built.full)
     }
@@ -1091,7 +1100,7 @@ impl StreamAccumulator {
     /// continuation renders only the delta appended afterwards — the same
     /// handoff a size split performs. Receipts queued after this build land
     /// past the new boundary, so they ride the continuation.
-    pub fn build_finalized_handoff(&mut self) -> serde_json::Value {
+    pub(super) fn build_finalized_handoff(&mut self) -> serde_json::Value {
         let end = self.timeline.len();
         let card = self
             .build_card_inner(self.render_from, end, false, Some(CardState::Continued))
@@ -1103,7 +1112,7 @@ impl StreamAccumulator {
     /// The request ids of every block the accumulator still awaits. A block
     /// resident here is the accumulator's own render source — the sweep
     /// resolves it through the timeline, not through the card handle.
-    pub fn live_request_ids(&self) -> Vec<&str> {
+    pub(super) fn live_request_ids(&self) -> Vec<&str> {
         self.interactions
             .iter()
             .filter(|b| b.is_live())
@@ -1427,7 +1436,7 @@ pub(super) fn resolve_vanished_blocks(
 /// work. The read shells out to git, so it runs OUTSIDE the cards lock; the
 /// lock only wraps the field swap. Best effort: a missing card or directory is
 /// a no-op, and a failed read keeps the start capture (`apply_git_state`).
-pub(crate) async fn refresh_work_context(cards: &CardsHandle, session_id: &str) {
+pub(super) async fn refresh_work_context(cards: &CardsHandle, session_id: &str) {
     let dir = {
         let live = cards.cards.lock().await;
         live.get(session_id).and_then(|c| c.acc.directory.clone())
@@ -1448,7 +1457,7 @@ pub(crate) async fn refresh_work_context(cards: &CardsHandle, session_id: &str) 
 /// (network); the lock only wraps the memo swap. Best effort: a missing card,
 /// no usage yet, or a failed request leaves the memo unset so a later poll
 /// retries.
-pub(crate) async fn refresh_context_window(
+pub(super) async fn refresh_context_window(
     cards: &CardsHandle,
     backend: &Arc<dyn opencode::Backend>,
     session_id: &str,

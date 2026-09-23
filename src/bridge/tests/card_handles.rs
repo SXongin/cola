@@ -392,7 +392,7 @@ async fn a_split_registers_the_continuation_card() {
     // The turn is gone (a replaced/aborted turn): the sweep resolves the block
     // from the continuation's cache, not the frozen slice.
     let filled_patches = patches_of(&platform, "om_filled").await;
-    app.cards.lock().await.remove("ses_split");
+    Turn::drop_card(&app.cards_handle(), "ses_split").await;
     let mut seen = std::collections::HashSet::new();
     app.permission.sweep(&app.core, &mut seen).await;
 

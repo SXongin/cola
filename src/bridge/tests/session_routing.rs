@@ -594,13 +594,10 @@ async fn message_during_inflight_goes_to_supplement_path() {
         "supplement must neither start a card nor reply text: {:?}",
         sent
     );
-    let cards = app.cards.lock().await;
-    let card = cards.get("ses_test").expect("the startup card session");
     assert!(
-        !card.pending_split.is_empty(),
+        Turn::has_pending_split(&app.cards_handle(), "ses_test").await,
         "the supplement split must survive the startup window"
     );
     // The in-flight marker is preserved (still running).
-    drop(cards);
     assert!(app.inflight.lock().await.contains("ses_test"));
 }
