@@ -1845,12 +1845,14 @@ where
     F: std::future::Future<Output = T>,
 {
     let buffer = CaptureBuffer::default();
-    // A second, sink-writing dispatcher stays registered for the capture's
-    // duration. `tracing` caches a callsite's `Interest` on its FIRST hit, and
-    // with only this capture registered a callsite first hit on a thread that
-    // has no subscriber of its own — a parallel test — is cached `never` from
-    // that thread's empty default, so the capture would never see the line.
-    // Two registered dispatchers make every new callsite's interest `always`.
+    // A second, sink-writing dispatcher, kept alive for the capture's duration.
+    // What defeats the callsite interest cache is REGISTRATION, not TLS
+    // installation: `Dispatch::new` registers the dispatch in tracing's
+    // dispatcher registry and rebuilds every cached `Interest` — `set_default`
+    // below registers this capture the same way. With two registered
+    // dispatchers a callsite first hit by a parallel test's thread no longer
+    // takes the `JustOne` shortcut (which consults that thread's own, empty,
+    // default) and caches `always` instead of `never`.
     let _interest_keepalive = tracing::Dispatch::new(
         tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)
