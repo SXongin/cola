@@ -2270,6 +2270,24 @@ mod tests {
             },
         );
         assert_eq!(acc.active_phase(), Some(HeaderPhase::Streaming));
+        // A running todowrite is a tail panel, not a timeline tool, but it is
+        // still a running tool: it gets the Tool phase too, and a completed one
+        // drops back. (Mutation audit, state.rs:548 — the todo_panel status
+        // comparison survived the tools-only coverage.)
+        acc.todo_panel = Some(ToolPanel {
+            name: "todowrite".into(),
+            status: "running".into(),
+            input: None,
+            output: None,
+        });
+        assert_eq!(acc.active_phase(), Some(HeaderPhase::Tool));
+        acc.todo_panel = Some(ToolPanel {
+            name: "todowrite".into(),
+            status: "completed".into(),
+            input: None,
+            output: None,
+        });
+        assert_eq!(acc.active_phase(), Some(HeaderPhase::Streaming));
         // Finished turns show no timer phase.
         acc.card_state = CardState::Done;
         acc.refresh_phase();
