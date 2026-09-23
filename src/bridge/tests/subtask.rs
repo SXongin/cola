@@ -9,9 +9,8 @@ async fn subtask_permission_routes_to_mapped_parent_and_reply_carries_directory(
     // A sub-task session cola never created; its permission must be routed
     // up to the parent session's chat.
     let child = "ses_child_task";
-    backend
-        .session_parents
-        .insert(child.into(), backend.session_id.clone());
+    let parent = backend.session_id.clone();
+    backend.with_session_parent(child, &parent);
     backend.ask_permissions(vec![opencode::types::PermissionRequest {
         request_id: "per_child".into(),
         session_id: Some(child.into()),
@@ -122,9 +121,8 @@ async fn subtask_permission_without_streaming_card_sends_card_to_parent_chat() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     let child = "ses_child_task";
-    backend
-        .session_parents
-        .insert(child.into(), backend.session_id.clone());
+    let parent = backend.session_id.clone();
+    backend.with_session_parent(child, &parent);
     backend.ask_permissions(vec![opencode::types::PermissionRequest {
         request_id: "per_child".into(),
         session_id: Some(child.into()),

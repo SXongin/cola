@@ -558,12 +558,8 @@ async fn a_topic_cover_retitle_carries_the_session_chat_and_topic() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let backend = MockBackend::new(realistic_parts());
-    backend
-        .session_titles
-        .lock()
-        .unwrap()
-        .insert("ses_test".into(), "新名字".into());
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_session_title("ses_test", "新名字");
     let (app, _platform) = build_app(cfg, backend).await;
     seed_entry(
         &app,

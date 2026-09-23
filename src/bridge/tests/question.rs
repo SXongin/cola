@@ -62,9 +62,7 @@ async fn question_poller_recovers_when_a_list_call_hangs() {
     }]);
     // The first list call hangs forever, like a request in flight when the
     // server was SIGTERM'd; later calls serve normally.
-    backend
-        .hang_list_questions
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    backend.hang_question_lists(1);
     let (app, _platform) = build_app(cfg, backend).await;
 
     // Seed a session + accumulator so the poller has a reply target.
@@ -1206,9 +1204,7 @@ async fn sweep_keeps_state_when_the_directory_list_fails() {
     let backend = MockBackend::new(realistic_parts());
     // The first list call hangs (half-open connection after a restart); later
     // calls would serve normally.
-    backend
-        .hang_list_questions
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    backend.hang_question_lists(1);
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());

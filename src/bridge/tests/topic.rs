@@ -298,11 +298,7 @@ async fn switch_inside_pending_topic_repoints_and_clears_the_pending() {
     let mut backend = MockBackend::new(realistic_parts());
     backend.with_session_id("ses_topic");
     backend.given_sessions(vec![list_session("ses_old", "旧会话", "/work/proj", 100)]);
-    backend
-        .session_titles
-        .lock()
-        .unwrap()
-        .insert("ses_old".into(), "旧会话".into());
+    backend.with_session_title("ses_old", "旧会话");
     let created = backend.created_session_dirs.clone();
     let (app, platform) = build_app(cfg, backend).await;
     let proj = tempfile::tempdir().unwrap();
@@ -540,12 +536,8 @@ async fn topic_cover_card_updated_with_auto_title_after_turn() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let backend = MockBackend::new(realistic_parts());
-    backend
-        .session_titles
-        .lock()
-        .unwrap()
-        .insert("ses_t1".into(), "修复登录 bug".into());
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_session_title("ses_t1", "修复登录 bug");
     let (app, platform) = build_app(cfg, backend).await;
 
     let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into());
@@ -1832,11 +1824,7 @@ async fn switch_card_adopt_inside_pending_topic_repoints_in_place() {
     let mut backend = MockBackend::new(realistic_parts());
     backend.with_session_id("ses_topic");
     backend.given_sessions(vec![list_session("ses_old", "旧会话", "/work/proj", 100)]);
-    backend
-        .session_titles
-        .lock()
-        .unwrap()
-        .insert("ses_old".into(), "旧会话".into());
+    backend.with_session_title("ses_old", "旧会话");
     let (app, platform) = build_app(cfg, backend).await;
     let proj = tempfile::tempdir().unwrap();
     let proj_dir = proj.path().to_string_lossy().to_string();

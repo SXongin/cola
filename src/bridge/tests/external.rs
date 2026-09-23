@@ -69,7 +69,7 @@ async fn external_poller_recovers_when_messages_hangs() {
     mock.external_user_message = Some("OpenChamber 里发的消息".to_string());
     // The first `messages` call hangs forever, like a request in flight
     // when the server was SIGTERM'd; later calls serve normally.
-    mock.hang_messages.store(1, std::sync::atomic::Ordering::SeqCst);
+    mock.hang_message_reads(1);
     let (app, platform) = build_app(cfg, mock).await;
 
     seed_entry(
@@ -282,8 +282,7 @@ async fn external_message_to_historical_session_is_not_notified() {
     // External message ONLY on the historical session; the active session
     // has none (otherwise BOTH would get an external message and the test
     // couldn't isolate the historical one being suppressed).
-    mock.external_user_messages
-        .insert("ses_historical".into(), "历史会话的外部消息".to_string());
+    mock.external_message_for("ses_historical", "历史会话的外部消息");
     let (app, platform) = build_app(cfg, mock).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
 
@@ -382,8 +381,7 @@ async fn reactivated_session_resyncs_silently() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
     // The external message is on the session that is being REACTIVATED.
-    mock.external_user_messages
-        .insert("ses_old".into(), "离开期间的外部消息".to_string());
+    mock.external_message_for("ses_old", "离开期间的外部消息");
     let (app, platform) = build_app(cfg, mock).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
 
@@ -917,8 +915,7 @@ async fn new_pending_stops_syncing_and_switch_back_resyncs_silently() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
     // An external message on the superseded session, written after /new.
-    mock.external_user_messages
-        .insert("ses_old".into(), "离开期间的外部消息".to_string());
+    mock.external_message_for("ses_old", "离开期间的外部消息");
     // The /switch back resolves through the shared session list.
     mock.session_list = vec![list_session("ses_old", "旧会话", "/work/proj", 100)];
     let (app, platform) = build_app(cfg, mock).await;

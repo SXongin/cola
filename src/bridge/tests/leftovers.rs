@@ -169,9 +169,7 @@ async fn aborted_turn_rejects_a_child_sessions_request() {
     let mut backend = MockBackend::new(realistic_parts());
     backend.fail_prompt("Aborted");
     backend.ask_permission(perm_request("per_child", "ses_child", "ls -la"));
-    backend
-        .session_parents
-        .insert("ses_child".into(), "ses_test".into());
+    backend.with_session_parent("ses_child", "ses_test");
     let replies = backend.reply_permission_calls.clone();
     let (app, _platform) = build_app(cfg, backend).await;
 
@@ -326,9 +324,7 @@ async fn aborted_turn_keeps_requests_when_the_list_fails() {
     let mut backend = MockBackend::new(realistic_parts());
     backend.fail_prompt("Aborted");
     backend.ask_permission(perm_request("per_1", "ses_test", "ls -la"));
-    backend
-        .hang_list_permissions
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    backend.hang_permission_lists(1);
     let replies = backend.reply_permission_calls.clone();
     let (app, _platform) = build_app(cfg, backend).await;
     app.permission
