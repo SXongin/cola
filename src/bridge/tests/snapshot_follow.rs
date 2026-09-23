@@ -131,11 +131,7 @@ async fn snapshot_block_resolved_elsewhere_leaves_a_receipt() {
 
     send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
     // Another client answers the request server-side.
-    backend
-        .replied_permissions
-        .lock()
-        .await
-        .insert("per_1".to_string());
+    backend.permission_resolved_by_another("per_1").await;
 
     tokio::spawn({
         let app = app.clone();
