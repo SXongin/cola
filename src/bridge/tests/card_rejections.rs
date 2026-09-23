@@ -92,7 +92,7 @@ async fn a_rejected_card_update_is_retried_fenced() {
         .fail_update_card_content_count
         .store(1, std::sync::atomic::Ordering::SeqCst);
 
-    crate::bridge::render::flush_card(&app.core, "ses_test").await;
+    crate::bridge::render::flush_card(&app.cards_handle(), "ses_test").await;
 
     let updates = updates_of(&platform, "om_live").await;
     assert_eq!(
@@ -155,7 +155,7 @@ async fn a_rejected_finalized_update_is_re_sent_fenced_on_the_same_card() {
         .fail_update_card_content_count
         .store(1, std::sync::atomic::Ordering::SeqCst);
 
-    crate::bridge::render::flush_card(&app.core, "ses_test").await;
+    crate::bridge::render::flush_card(&app.cards_handle(), "ses_test").await;
 
     let updates = updates_of(&platform, "om_live").await;
     assert_eq!(
@@ -205,7 +205,7 @@ async fn a_rejected_continuation_send_is_retried_fenced() {
         .fail_reply_card_content_count
         .store(1, std::sync::atomic::Ordering::SeqCst);
 
-    crate::bridge::render::flush_card(&app.core, "ses_test").await;
+    crate::bridge::render::flush_card(&app.cards_handle(), "ses_test").await;
 
     let cards = sent_cards(&platform).await;
     assert_eq!(
@@ -233,7 +233,7 @@ async fn a_second_rejection_suspends_the_card() {
         .fail_update_card_content_count
         .store(2, std::sync::atomic::Ordering::SeqCst);
 
-    crate::bridge::render::flush_card(&app.core, "ses_test").await;
+    crate::bridge::render::flush_card(&app.cards_handle(), "ses_test").await;
     assert_eq!(
         updates_of(&platform, "om_live").await.len(),
         2,
@@ -245,7 +245,7 @@ async fn a_second_rejection_suspends_the_card() {
     );
 
     // A later poll must not PATCH the suspended card again.
-    crate::bridge::render::flush_card(&app.core, "ses_test").await;
+    crate::bridge::render::flush_card(&app.cards_handle(), "ses_test").await;
     assert_eq!(
         updates_of(&platform, "om_live").await.len(),
         2,

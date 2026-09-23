@@ -9,7 +9,7 @@ use crate::bridge::core::SharedCore;
 use crate::bridge::session::PendingEntry;
 use crate::bridge::span;
 use crate::bridge::turn::PromptContext;
-use crate::config::{Config, ConversationKind, SessionEntry, ThreadKey};
+use crate::config::{Config, ConversationKind, ThreadKey};
 use crate::feishu;
 use crate::opencode;
 
@@ -45,8 +45,9 @@ pub(crate) fn image_inputs(
 
 /// The bridge coordinator. Owns the state shared by every flow ([`SharedCore`])
 /// plus the per-flow modules that hold their own private state. `Deref`s to the
-/// shared core so flows and callers can reach `app.sessions`, `app.opencode`,
-/// etc. without threading a separate handle.
+/// shared core so the coordinator's own code can reach the aggregate; flows
+/// receive narrow per-concern handles instead (`SharedCore::turn_handles` is
+/// the Turn's bundle, spec #298).
 pub struct App {
     pub(crate) core: Arc<SharedCore>,
     /// The Host gate (ADR-0035): every inbound message and card action is
@@ -549,7 +550,13 @@ impl App {
             self.feishu.reply_text(&message_id, GROUP_LOBBY_GUIDANCE).await?;
         }
 
-        let subtitle = crate::bridge::render::session_subtitle(&self.core, &thread_key, &text).await;
+        let subtitle = crate::bridge::render::session_subtitle(
+            &self.sessions_handle(),
+            &self.opencode,
+            &thread_key,
+            &text,
+        )
+        .await;
 
         // Supplement path: if this session already has a turn in flight, don't
         // start a competing run_prompt (it would overwrite the running turn's
@@ -607,7 +614,7 @@ impl App {
                 // arrives after it) and becomes the tracked live card. There is
                 // NO separate acknowledgement message.
                 crate::bridge::render::split_card_chain(
-                    &self.core,
+                    &self.cards_handle(),
                     &session_id,
                     &message_id,
                     crate::bridge::streaming::SplitKind::Supplement,
@@ -636,8 +643,12 @@ impl App {
     /// reset of an existing card when retrying), stream parts via the poll loop,
     /// then render the final Done/Error card. Shared by fresh messages and the
     /// error-card "retry" action.
+    ///
+    /// The coordinator builds the Turn's narrow handles here (spec #298, A1) —
+    /// the Turn itself never sees the aggregate.
     async fn run_prompt(self: &Arc<Self>, ctx: PromptContext) -> crate::error::Result<()> {
-        crate::bridge::turn::Turn::run(self, ctx).await
+        let handles = self.turn_handles();
+        crate::bridge::turn::Turn::run(&handles, ctx).await
     }
 
     async fn get_or_create_session(
@@ -745,15 +756,9 @@ impl App {
         topic_anchor: Option<String>,
         topic_root: Option<String>,
     ) -> crate::error::Result<String> {
-        let session = self
-            .opencode
-            .create_session(&self.opencode.new_session_input(Some(&directory)))
-            .await?;
-        let mut entry = SessionEntry::new(thread_key.clone(), session.id.clone(), directory);
-        entry.topic_anchor = topic_anchor;
-        entry.topic_root = topic_root;
-        self.activate_session(entry).await?;
-        Ok(session.id)
+        self.sessions_handle()
+            .create_fresh_session(&self.opencode, thread_key, directory, topic_anchor, topic_root)
+            .await
     }
 
     /// Handle a card action (permission Allow/Deny, question answer/reject,
@@ -1531,7 +1536,8 @@ impl App {
         {
             crate::bridge::request::resolve_blocks(
                 &core.permission,
-                core,
+                &core.cards_handle(),
+                &core.requests_handle(),
                 &Some(id.clone()),
                 id,
                 crate::bridge::request::Origin::Command,

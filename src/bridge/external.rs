@@ -534,7 +534,7 @@ pub(crate) async fn settle_snapshot_after_send(
     title: &str,
     data: &crate::bridge::snapshot::SnapshotData,
 ) {
-    let thread_key = crate::bridge::span::thread_key_of(core, &data.session_id).await;
+    let thread_key = crate::bridge::span::thread_key_of(&core.sessions_handle(), &data.session_id).await;
     let span = crate::bridge::span::snapshot(&data.session_id, thread_key.as_ref());
     async {
         let followed = data.status == Some(crate::opencode::types::SessionStatus::Busy)
@@ -593,7 +593,15 @@ async fn external_render_loop(
             break;
         }
         // Stream the reply's reasoning/tools/text into the notification card.
-        let Some((new_parts, _, _)) = render_and_flush(core, &session_id, &msgs).await else {
+        let Some((new_parts, _, _)) = render_and_flush(
+            &core.cards_handle(),
+            &core.sessions_handle(),
+            &core.opencode,
+            &session_id,
+            &msgs,
+        )
+        .await
+        else {
             break;
         };
         if new_parts > 0 {
@@ -643,14 +651,14 @@ async fn external_render_loop(
 /// is refreshed first (ADR-0019), so the final card shows where the turn
 /// landed (branch/dirty) rather than only where it started.
 async fn finalize_done(core: &Arc<SharedCore>, session_id: &str) {
-    crate::bridge::streaming::refresh_work_context(core, session_id).await;
+    crate::bridge::streaming::refresh_work_context(&core.cards_handle(), session_id).await;
     {
         let mut cards = core.cards.lock().await;
         if let Some(card) = cards.get_mut(session_id) {
             card.acc.card_state = crate::feishu::card::CardState::Done;
         }
     }
-    flush_card(core, session_id).await;
+    flush_card(&core.cards_handle(), session_id).await;
 }
 
 /// Whether the model has finished answering the external message: an assistant

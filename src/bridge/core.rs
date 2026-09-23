@@ -58,7 +58,9 @@ pub(crate) const SETTLING_CLAIM_TTL: std::time::Duration = std::time::Duration::
 /// snapshot claims and question remembering are reachable from the command
 /// layer, ADR-0028), the double-click guard, prompt serialization, and the two
 /// adapters. Owned by the bridge coordinator ([`super::App`]) and passed by
-/// handle to the flow modules that need it.
+/// handle to the flow modules that need it: a flow receives the narrow
+/// per-concern handles it uses ([`crate::bridge::handles`]), never the whole
+/// aggregate — [`SharedCore::turn_handles`] is the Turn's bundle (spec #298).
 pub struct SharedCore {
     pub sessions: Arc<Mutex<SessionStore>>,
     /// session_id → the session's one live card (accumulator + card id chain).
@@ -71,10 +73,10 @@ pub struct SharedCore {
     pub card_handles: Arc<Mutex<crate::bridge::card_handles::CardHandles>>,
     /// Permission flow: owns `sent_cards`, polls pending requests, auto-accepts
     /// for `/autoaccept` sessions, and handles the "perm" card action.
-    pub permission: crate::bridge::request::RequestFlow,
+    pub permission: Arc<crate::bridge::request::RequestFlow>,
     /// Question flow: owns `sent_cards` + the question kind's request/partial
     /// state, polls pending questions, and handles the "question" card action.
-    pub question: crate::bridge::request::RequestFlow,
+    pub question: Arc<crate::bridge::request::RequestFlow>,
     /// External-message flow: owns `last_user_msg_epoch`, notifies Feishu when
     /// another shared-store client posts while cola is idle, and arms the
     /// external-reply renderers (including the busy-adopt follow, ADR-0028).
@@ -118,12 +120,12 @@ pub struct SharedCore {
     /// Supplement's new Turn (ADR-0043). Defaults to 1.5 s; tests store a small
     /// value so the drain's branches run without real seconds (the
     /// external-poller atomics pattern).
-    pub turn_render_poll_ms: std::sync::atomic::AtomicU64,
+    pub turn_render_poll_ms: Arc<std::sync::atomic::AtomicU64>,
     /// Bound on a Turn's post-prompt drain (ms): how long the render poll (and
     /// the inflight guard) stays alive waiting for a Supplement's new Turn
     /// before finalization (ADR-0043). Defaults to the external renderer's
     /// 10 min; tests store a small value to exercise the bound.
-    pub turn_drain_timeout_ms: std::sync::atomic::AtomicU64,
+    pub turn_drain_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
     /// session_id → the cover card's current title for topics created with a
     /// bot cover card as their root (ADR-0023). In-memory only: the post-turn
     /// hook compares the server title and patches the cover card in place when
@@ -139,16 +141,16 @@ pub struct SharedCore {
     /// The long-task notice threshold (ms): a p2p Turn that ran at least this
     /// long notifies on completion. Injectable for tests (the external
     /// poller's interval-atomics pattern).
-    pub long_task_notice_ms: std::sync::atomic::AtomicU64,
+    pub long_task_notice_ms: Arc<std::sync::atomic::AtomicU64>,
     /// The Instant Reminder lifecycle (ADR-0043, from `[bridge] instant_reminder`): pins a
     /// Chat/Topic while a Permission/Question is pending. Off means every
     /// method is a no-op — no reminder call is ever made.
-    pub reminder: crate::bridge::reminder::ReminderState,
+    pub reminder: Arc<crate::bridge::reminder::ReminderState>,
     /// The waiting-card pin registry (ADR-0043 amendment): pins the exact card
     /// a pending Permission/Question lives on into its chat's pinned-message
     /// list, so the reminder's list-level nudge leads to the waiting message.
     /// Same `[bridge] instant_reminder` opt-in as the reminder itself.
-    pub message_pins: crate::bridge::message_pins::MessagePins,
+    pub message_pins: Arc<crate::bridge::message_pins::MessagePins>,
     /// Cached session-list snapshot for `/list`, `/switch`, `/attach`
     /// (30 s TTL; invalidated on create/adopt/rename). Private: the core's
     /// write wrappers and `invalidate_session_list_cache` own it.
@@ -186,12 +188,12 @@ impl SharedCore {
             sessions: Arc::new(Mutex::new(session_store)),
             cards: Arc::new(Mutex::new(HashMap::new())),
             card_handles: Arc::new(Mutex::new(crate::bridge::card_handles::CardHandles::default())),
-            permission: crate::bridge::request::RequestFlow::new(Box::new(
+            permission: Arc::new(crate::bridge::request::RequestFlow::new(Box::new(
                 crate::bridge::request::PermissionKind,
-            )),
-            question: crate::bridge::request::RequestFlow::new(Box::new(
+            ))),
+            question: Arc::new(crate::bridge::request::RequestFlow::new(Box::new(
                 crate::bridge::request::QuestionKind,
-            )),
+            ))),
             external: crate::bridge::external::ExternalFlow::new(),
             snapshot_claims: Arc::new(Mutex::new(
                 crate::bridge::snapshot_claims::SnapshotClaims::default(),
@@ -200,8 +202,8 @@ impl SharedCore {
             settling_requests: Arc::new(Mutex::new(HashMap::new())),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             stopped_sessions: Arc::new(Mutex::new(HashSet::new())),
-            turn_render_poll_ms: std::sync::atomic::AtomicU64::new(1_500),
-            turn_drain_timeout_ms: std::sync::atomic::AtomicU64::new(600_000),
+            turn_render_poll_ms: Arc::new(std::sync::atomic::AtomicU64::new(1_500)),
+            turn_drain_timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(600_000)),
             cover_titles: Arc::new(Mutex::new(HashMap::new())),
             work_dir: cfg
                 .bridge
@@ -210,14 +212,18 @@ impl SharedCore {
                 .map(|p| p.to_string_lossy().to_string()),
             group_completion_notice: cfg.bridge.group_completion_notice,
             long_task_notice: cfg.bridge.long_task_notice,
-            long_task_notice_ms: std::sync::atomic::AtomicU64::new(crate::bridge::turn::LONG_TASK_NOTICE_MS),
-            reminder: crate::bridge::reminder::ReminderState::new(
+            long_task_notice_ms: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::bridge::turn::LONG_TASK_NOTICE_MS,
+            )),
+            reminder: Arc::new(crate::bridge::reminder::ReminderState::new(
                 cfg.bridge.instant_reminder,
                 // The persisted pin set lives beside the session mapping
                 // (#249), so startup can clear reminders a crash orphaned.
                 Some(cfg.bridge.session_file.with_file_name("pinned_chats.json")),
-            ),
-            message_pins: crate::bridge::message_pins::MessagePins::new(cfg.bridge.instant_reminder),
+            )),
+            message_pins: Arc::new(crate::bridge::message_pins::MessagePins::new(
+                cfg.bridge.instant_reminder,
+            )),
             session_list_cache: Arc::new(Mutex::new(None)),
             opencode,
             feishu,
@@ -228,17 +234,72 @@ impl SharedCore {
         })
     }
 
-    /// The lock serializing card writes for `session_id` (see
-    /// `card_write_locks`). Every path that reads a session's card state, sends
-    /// the result to Feishu, and then records it must hold this across the
-    /// whole sequence: `flush_card` and `resolve_blocks` are the two.
-    pub(crate) async fn card_write_lock(&self, session_id: &str) -> Arc<Mutex<()>> {
-        self.card_write_locks
-            .lock()
-            .await
-            .entry(session_id.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+    /// The narrow handles a Turn runs on (spec #298, A1): sessions, cards, the
+    /// request and wait state, the backend, the platform and the turn config —
+    /// the concerns [`crate::bridge::turn::Turn`] uses. The coordinator builds
+    /// this and passes it to `Turn::run`; the Turn never sees the aggregate.
+    pub(crate) fn turn_handles(&self) -> crate::bridge::handles::TurnHandles {
+        crate::bridge::handles::TurnHandles {
+            sessions: self.sessions_handle(),
+            cards: self.cards_handle(),
+            requests: self.requests_handle(),
+            waits: self.waits_handle(),
+            backend: Arc::clone(&self.opencode),
+            platform: Arc::clone(&self.feishu),
+            config: self.turn_config(),
+        }
+    }
+
+    /// The session map + list cache as a narrow handle.
+    pub(crate) fn sessions_handle(&self) -> crate::bridge::handles::SessionsHandle {
+        crate::bridge::handles::SessionsHandle::new(
+            Arc::clone(&self.sessions),
+            Arc::clone(&self.session_list_cache),
+        )
+    }
+
+    /// The live cards, the card-handle registry, the card-write locks, the
+    /// cover records and the platform as a narrow handle.
+    pub(crate) fn cards_handle(&self) -> crate::bridge::handles::CardsHandle {
+        crate::bridge::handles::CardsHandle::new(
+            Arc::clone(&self.cards),
+            Arc::clone(&self.card_handles),
+            Arc::clone(&self.cover_titles),
+            Arc::clone(&self.feishu),
+            Arc::clone(&self.card_write_locks),
+        )
+    }
+
+    /// The two request flows and their claim state as a narrow handle.
+    pub(crate) fn requests_handle(&self) -> crate::bridge::handles::RequestsHandle {
+        crate::bridge::handles::RequestsHandle {
+            permission: Arc::clone(&self.permission),
+            question: Arc::clone(&self.question),
+            answered_requests: Arc::clone(&self.answered_requests),
+            settling_requests: Arc::clone(&self.settling_requests),
+            snapshot_claims: Arc::clone(&self.snapshot_claims),
+        }
+    }
+
+    /// The per-session wait state as a narrow handle.
+    pub(crate) fn waits_handle(&self) -> crate::bridge::handles::WaitsHandle {
+        crate::bridge::handles::WaitsHandle {
+            inflight: Arc::clone(&self.inflight),
+            stopped_sessions: Arc::clone(&self.stopped_sessions),
+            reminder: Arc::clone(&self.reminder),
+        }
+    }
+
+    /// The turn knobs as a narrow handle.
+    pub(crate) fn turn_config(&self) -> crate::bridge::handles::TurnConfig {
+        crate::bridge::handles::TurnConfig::new(
+            self.group_completion_notice,
+            self.long_task_notice,
+            Arc::clone(&self.long_task_notice_ms),
+            Arc::clone(&self.turn_render_poll_ms),
+            Arc::clone(&self.turn_drain_timeout_ms),
+            self.work_dir.clone(),
+        )
     }
 
     /// The requests cola itself is answering or has answered — `answered_requests`
@@ -257,19 +318,10 @@ impl SharedCore {
         claimed
     }
 
-    /// The directory a brand-new session starts in: `[bridge] work_dir` when
-    /// configured, else the process working directory. `/dir` still overrides
-    /// per session.
+    /// The directory a brand-new session starts in (see
+    /// [`crate::bridge::handles::TurnConfig::default_session_directory`]).
     pub fn default_session_directory(&self) -> String {
-        self.work_dir
-            .clone()
-            .filter(|d| !d.is_empty())
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string()
-            })
+        self.turn_config().default_session_directory()
     }
 
     /// The conversation's current project (ADR-0012): the Pending Session's
@@ -290,11 +342,7 @@ impl SharedCore {
     /// `SessionEntry`). `None` when the session has no override — the server
     /// then uses the session's own/default agent.
     pub async fn session_agent_override(&self, session_id: &str) -> Option<String> {
-        self.sessions
-            .lock()
-            .await
-            .entry_for_session(session_id)
-            .and_then(|e| e.agent.clone())
+        self.sessions_handle().agent_override(session_id).await
     }
 
     /// The per-session model override set by `/model`, parsed from the
@@ -302,23 +350,14 @@ impl SharedCore {
     /// override (the client then falls back to the configured default model, or
     /// the server's own default if none is configured).
     pub async fn session_model_override(&self, session_id: &str) -> Option<opencode::types::ModelInfo> {
-        self.sessions
-            .lock()
-            .await
-            .entry_for_session(session_id)
-            .and_then(|e| e.model.as_deref())
-            .and_then(opencode::parsing::parse_model)
+        self.sessions_handle().model_override(session_id).await
     }
 
     /// The per-session `/think` variant override (from the persisted
     /// `SessionEntry`). `None` when unset — the server's default for whatever
     /// model runs this turn.
     pub async fn session_variant_override(&self, session_id: &str) -> Option<String> {
-        self.sessions
-            .lock()
-            .await
-            .entry_for_session(session_id)
-            .and_then(|e| e.variant.clone())
+        self.sessions_handle().variant_override(session_id).await
     }
 
     /// The model the NEXT turn will actually run, resolved settings override →
@@ -436,9 +475,7 @@ impl SharedCore {
     /// should offer. The cache is dropped even when the save fails, because the
     /// in-memory mapping already changed.
     pub(crate) async fn activate_session(&self, entry: SessionEntry) -> crate::error::Result<()> {
-        let result = self.sessions.lock().await.activate(entry);
-        self.invalidate_session_list_cache().await;
-        result
+        self.sessions_handle().activate(entry).await
     }
 
     /// Declare (or replace) the conversation's Pending Session and persist
@@ -540,9 +577,7 @@ impl SharedCore {
         &self,
         session_id: &str,
     ) -> crate::error::Result<Option<SessionEntry>> {
-        let result = self.sessions.lock().await.remove_persist(session_id);
-        self.invalidate_session_list_cache().await;
-        result
+        self.sessions_handle().remove_session(session_id).await
     }
 
     /// Remove every mapping of a thread and persist, dropping the
@@ -572,13 +607,18 @@ impl SharedCore {
         // itself, or its nearest ancestor (sub-task children are not in the
         // store, ADR-0010). Walking the chain makes a child's card flip the
         // parent's flag, consistent with `should_auto_accept`.
-        let owner = crate::bridge::pollers::walk_parent_chain(self, session_id, Some(directory), |current| {
-            let current = current.to_string();
-            async move {
-                let sessions = self.sessions.lock().await;
-                sessions.entry_for_session(&current).cloned()
-            }
-        })
+        let owner = crate::bridge::pollers::walk_parent_chain(
+            &self.opencode,
+            session_id,
+            Some(directory),
+            |current| {
+                let current = current.to_string();
+                async move {
+                    let sessions = self.sessions.lock().await;
+                    sessions.entry_for_session(&current).cloned()
+                }
+            },
+        )
         .await;
         if let Some(entry) = owner
             && let Err(e) = self
@@ -609,7 +649,15 @@ impl SharedCore {
         for p in &perms {
             // Match the session itself or a sub-task child (its parent chain).
             let sid = p.session_id.clone().unwrap_or_default();
-            if !crate::bridge::request::session_belongs_to(self, &sid, session_id, directory).await {
+            if !crate::bridge::request::session_belongs_to(
+                &self.sessions_handle(),
+                &self.opencode,
+                &sid,
+                session_id,
+                directory,
+            )
+            .await
+            {
                 continue;
             }
             // Take the settlement claim BEFORE the reply lands: the request
@@ -650,19 +698,6 @@ impl SharedCore {
             }
         }
         approved
-    }
-
-    /// Whether `candidate` is `root` or a sub-task child reachable by walking
-    /// up its parent chain (sub-task child sessions carry their own sessionID).
-    /// Shared with the turn-end leftover rejection (#187), which filters the
-    /// same way when deciding whose requests a dead turn owns.
-    pub(crate) async fn session_descends_from(&self, candidate: &str, root: &str, directory: &str) -> bool {
-        crate::bridge::pollers::walk_parent_chain(self, candidate, Some(directory), |current| {
-            let current = current.to_string();
-            async move { (current == root).then_some(true) }
-        })
-        .await
-        .unwrap_or(false)
     }
 }
 

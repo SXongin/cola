@@ -358,7 +358,7 @@ async fn a_split_registers_the_continuation_card() {
         "ses_split".into(),
         CardSession::new(acc, Some("om_filled".into())),
     );
-    crate::bridge::render::flush_card(&app.core, "ses_split").await;
+    crate::bridge::render::flush_card(&app.cards_handle(), "ses_split").await;
 
     {
         let handles = app.card_handles.lock().await;
@@ -451,7 +451,7 @@ async fn partial_question_answer_refreshes_the_clicked_card() {
         .lock()
         .await
         .insert("ses_q".into(), CardSession::new(old, Some("om_q".into())));
-    crate::bridge::render::flush_card(&app.core, "ses_q").await;
+    crate::bridge::render::flush_card(&app.cards_handle(), "ses_q").await;
     app.question.remember_question(&request, "/work").await;
     app.cards.lock().await.insert(
         "ses_q".into(),
@@ -624,7 +624,7 @@ async fn rehost_preserves_a_questions_partial_answers() {
         .lock()
         .await
         .insert("ses_q".into(), CardSession::new(old, Some("om_q".into())));
-    crate::bridge::render::flush_card(&app.core, "ses_q").await;
+    crate::bridge::render::flush_card(&app.cards_handle(), "ses_q").await;
     app.question.remember_question(&request, "/work").await;
     let r1 = app
         .host_action(serde_json::json!({
@@ -741,7 +741,7 @@ async fn a_concurrent_flush_leaves_the_tail_on_one_card() {
     let (entered, release) = platform.pause("reply", "msg_1");
     let first = {
         let app = app.clone();
-        tokio::spawn(async move { crate::bridge::render::flush_card(&app.core, "ses_split").await })
+        tokio::spawn(async move { crate::bridge::render::flush_card(&app.cards_handle(), "ses_split").await })
     };
     entered.notified().await;
 
@@ -753,7 +753,7 @@ async fn a_concurrent_flush_leaves_the_tail_on_one_card() {
         let app = app.clone();
         let finished = finished.clone();
         tokio::spawn(async move {
-            crate::bridge::render::flush_card(&app.core, "ses_split").await;
+            crate::bridge::render::flush_card(&app.cards_handle(), "ses_split").await;
             finished.notify_one();
         })
     };
@@ -821,7 +821,7 @@ async fn a_resolution_racing_an_in_flight_flush_is_not_resurrected() {
     let (entered, release) = platform.pause("update", "om_live");
     let flush = {
         let app = app.clone();
-        tokio::spawn(async move { crate::bridge::render::flush_card(&app.core, "ses_live").await })
+        tokio::spawn(async move { crate::bridge::render::flush_card(&app.cards_handle(), "ses_live").await })
     };
     entered.notified().await;
 

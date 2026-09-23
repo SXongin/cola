@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::Instrument;
 
-use crate::bridge::App;
 use crate::bridge::handler::image_inputs;
+use crate::bridge::handles::TurnHandles;
 use crate::bridge::render::{
     flush_card, render_and_flush, render_new_turn_parts, render_parts, render_poll_loop,
 };
@@ -58,9 +58,8 @@ fn drain_request_timeout(deadline: tokio::time::Instant) -> u64 {
 /// every drain phase — the post-prompt drain and its single re-check — gets
 /// its own, so a tiny injected bound keeps the whole lifecycle short and a
 /// hung Backend can never fall back to the fixed request timeout.
-fn drain_deadline(app: &Arc<App>) -> tokio::time::Instant {
-    tokio::time::Instant::now()
-        + std::time::Duration::from_millis(app.turn_drain_timeout_ms.load(Ordering::Relaxed))
+fn drain_deadline(handles: &TurnHandles) -> tokio::time::Instant {
+    tokio::time::Instant::now() + std::time::Duration::from_millis(handles.config.drain_timeout_ms())
 }
 
 /// Everything [`Turn::run`] needs for one turn. Built by `handle_prompt` for a
@@ -122,21 +121,26 @@ impl Turn {
     /// on a stale mapping) → `finish`. The only public entry; the phases are
     /// internal seams.
     ///
+    /// `handles` is the narrow bundle the coordinator built for this turn
+    /// (spec #298, A1): sessions, cards, the request and wait state, the
+    /// backend, the platform and the turn config. The Turn never sees the
+    /// aggregate.
+    ///
     /// The whole lifecycle runs inside a [`span::turn`], so every awaited
     /// Backend call inherits the session's fields (ADR-0048); the render poll
     /// runs on its own task and is instrumented where it is spawned
     /// ([`RenderPoll`]). A 404 recreate changes the session under the turn, so
     /// `run_inner` re-scopes the rest of the trace to the fresh session.
-    pub(crate) async fn run(app: &Arc<App>, ctx: PromptContext) -> crate::error::Result<()> {
+    pub(crate) async fn run(handles: &TurnHandles, ctx: PromptContext) -> crate::error::Result<()> {
         let span = span::turn(&ctx.session_id, &ctx.thread_key, tracing::Span::current().id());
-        Self::run_inner(app, ctx).instrument(span).await
+        Self::run_inner(handles, ctx).instrument(span).await
     }
 
     /// The lifecycle body, wrapped by [`Turn::run`]'s span. A separate fn so
     /// the instrumentation wraps every phase — `start` included — and the span
     /// stays alive across each await.
-    async fn run_inner(app: &Arc<App>, ctx: PromptContext) -> crate::error::Result<()> {
-        let Some(mut turn) = Self::start(app, ctx).await? else {
+    async fn run_inner(handles: &TurnHandles, ctx: PromptContext) -> crate::error::Result<()> {
+        let Some(mut turn) = Self::start(handles, ctx).await? else {
             return Ok(()); // busy: start already answered
         };
         // The one INFO anchor per Turn (ADR-0048): session/chat/topic ride the
@@ -147,13 +151,13 @@ impl Turn {
             turn.directory,
             turn.text.chars().count()
         );
-        let mut prompt_resp = turn.attempt(app).await;
+        let mut prompt_resp = turn.attempt(handles).await;
         // The mapped session may not exist on the current server — e.g. it was
         // created in an old, now-abandoned store. Clear the mapping, create a
         // fresh session and retry once.
         if prompt_resp.as_ref().is_err_and(|e| e.is_session_not_found()) {
             tracing::warn!("session {} not found on the server; recreating", turn.session_id);
-            turn.recreate(app).await?;
+            turn.recreate(handles).await?;
             // The Turn now works on the fresh session: re-scope the rest of its
             // trace so the retry, the finalization and the drain are
             // retrievable by the session they belong to (the stale id stays on
@@ -162,18 +166,18 @@ impl Turn {
             // layer appends a re-recorded field, which would print both ids on
             // every line.
             let span = span::turn(&turn.session_id, &turn.thread_key, None);
-            prompt_resp = turn.attempt(app).instrument(span.clone()).await;
-            turn.finish(app, &prompt_resp).instrument(span).await;
+            prompt_resp = turn.attempt(handles).instrument(span.clone()).await;
+            turn.finish(handles, &prompt_resp).instrument(span).await;
             return Ok(());
         }
-        turn.finish(app, &prompt_resp).await;
+        turn.finish(handles, &prompt_resp).await;
         Ok(())
     }
 
     /// The busy guard, the Loading card (fresh reply or a reset of the retry's
     /// existing card) and the fresh accumulator this turn streams into.
     /// `Ok(None)` means another prompt holds the session — already answered.
-    async fn start(app: &Arc<App>, ctx: PromptContext) -> crate::error::Result<Option<Turn>> {
+    async fn start(handles: &TurnHandles, ctx: PromptContext) -> crate::error::Result<Option<Turn>> {
         let PromptContext {
             session_id,
             thread_key,
@@ -194,12 +198,12 @@ impl Turn {
         // a second message overwrite its accumulator (the two would race on the
         // same card). Reply with a notice only when we own a fresh message.
         {
-            let mut inflight = app.inflight.lock().await;
+            let mut inflight = handles.waits.inflight.lock().await;
             if inflight.contains(&session_id) {
                 drop(inflight);
                 if existing_card_id.is_none() {
-                    let _ = app
-                        .feishu
+                    let _ = handles
+                        .platform
                         .reply_text(&message_id, "⏳ 上一条消息还在处理中，请稍等它完成后重发。")
                         .await;
                 }
@@ -210,7 +214,7 @@ impl Turn {
         // A fresh Turn supersedes any `/stop` from an earlier one: the drain
         // marker (ADR-0043) is per-session and sticky until the next turn, so
         // clearing it here keeps a past stop from silencing this turn's drain.
-        app.stopped_sessions.lock().await.remove(&session_id);
+        handles.waits.stopped_sessions.lock().await.remove(&session_id);
 
         // Fresh accumulator per prompt: reuse leaks stale text/tools from the
         // previous turn into the next card. The card's IDENTITY (the message
@@ -238,11 +242,11 @@ impl Turn {
         // turn's requester and a stale clear from an earlier turn can never
         // unpin it. This is also where a pin orphaned by a crash or restart
         // is cleared once, on the Chat/Topic's next turn (self-healing).
-        let generation = app
-            .core
+        let generation = handles
+            .waits
             .reminder
             .begin_turn(
-                &app.core.feishu,
+                &handles.platform,
                 &thread_key.chat_id,
                 is_group,
                 requester_open_id.as_deref(),
@@ -250,7 +254,7 @@ impl Turn {
             .await;
         acc.turn_generation = Some(generation);
         {
-            let mut cards = app.cards.lock().await;
+            let mut cards = handles.cards.cards.lock().await;
             cards.insert(
                 session_id.clone(),
                 crate::bridge::streaming::CardSession::new(acc, None),
@@ -264,26 +268,26 @@ impl Turn {
         let new_card_id = match existing_card_id {
             Some(cid) => {
                 // Retry: reset the SAME card to Loading instead of replying a new one.
-                if let Err(e) = app.feishu.update_message(&cid, &loading).await {
+                if let Err(e) = handles.cards.feishu.update_message(&cid, &loading).await {
                     tracing::warn!("retry: reset card failed: {}", e);
                 }
                 Some(cid)
             }
-            None => match app.feishu.reply_card(&message_id, &loading).await {
+            None => match handles.cards.feishu.reply_card(&message_id, &loading).await {
                 Ok(id) => Some(id),
                 Err(e) => {
                     // The turn never started: drop the just-inserted card
                     // session and release the guard, so nothing leaks and the
                     // session does not look busy until a restart.
-                    app.cards.lock().await.remove(&session_id);
-                    release_inflight(app, &session_id).await;
+                    handles.cards.cards.lock().await.remove(&session_id);
+                    release_inflight(handles, &session_id).await;
                     return Err(e);
                 }
             },
         };
 
         if let Some(cid) = new_card_id {
-            let mut cards = app.cards.lock().await;
+            let mut cards = handles.cards.cards.lock().await;
             if let Some(card) = cards.get_mut(&session_id) {
                 card.card_message_id = Some(cid);
             }
@@ -293,16 +297,15 @@ impl Turn {
         // AFTER the card is live and its id known: the git read neither delays
         // the loading card nor keeps the session card-less, and it runs outside
         // the cards lock.
-        let session_dir = {
-            let store = app.sessions.lock().await;
-            store
-                .entry_for_session(&session_id)
-                .map(|e| e.directory.clone())
-                .unwrap_or_default()
-        };
+        let session_dir = handles
+            .sessions
+            .entry_for_session(&session_id)
+            .await
+            .map(|e| e.directory.clone())
+            .unwrap_or_default();
         let work_context = StreamAccumulator::capture_work_context(&session_dir).await;
         {
-            let mut cards = app.cards.lock().await;
+            let mut cards = handles.cards.cards.lock().await;
             if let Some(card) = cards.get_mut(&session_id) {
                 card.acc.apply_work_context(work_context);
             }
@@ -326,17 +329,20 @@ impl Turn {
     /// Send one attempt with the incremental renderer attached. The overrides
     /// are captured at send time (ADR-0019), and the renderer always stops
     /// before the response is returned so a retry starts its own cleanly.
-    async fn attempt(&mut self, app: &Arc<App>) -> crate::error::Result<opencode::types::PromptResponse> {
-        let render = RenderPoll::spawn(app, &self.session_id, &self.thread_key);
+    async fn attempt(
+        &mut self,
+        handles: &TurnHandles,
+    ) -> crate::error::Result<opencode::types::PromptResponse> {
+        let render = RenderPoll::spawn(handles, &self.session_id, &self.thread_key);
         // Capture the variant actually sent this turn AT SEND TIME, not at
         // finalization: a `/think` issued mid-generation must not retro-tag the
         // card of a turn that was sent without it (same "capture at turn start"
         // rule as the work-context 📁 half, ADR-0019).
-        self.turn_variant = app.session_variant_override(&self.session_id).await;
-        let model = app.session_model_override(&self.session_id).await;
-        let agent = app.session_agent_override(&self.session_id).await;
-        let prompt_resp = app
-            .opencode
+        self.turn_variant = handles.sessions.variant_override(&self.session_id).await;
+        let model = handles.sessions.model_override(&self.session_id).await;
+        let agent = handles.sessions.agent_override(&self.session_id).await;
+        let prompt_resp = handles
+            .backend
             .prompt(
                 &self.session_id,
                 &self.text,
@@ -361,22 +367,23 @@ impl Turn {
     /// keeps its topic creation messages (ADR-0023) so the injection guard
     /// survives, and carries the turn's live state (card accumulator, inflight
     /// guard, cover title) across to the fresh session.
-    async fn recreate(&mut self, app: &Arc<App>) -> crate::error::Result<()> {
-        let old_entry = match app.remove_session(&self.session_id).await {
+    async fn recreate(&mut self, handles: &TurnHandles) -> crate::error::Result<()> {
+        let old_entry = match handles.sessions.remove_session(&self.session_id).await {
             Ok(entry) => entry,
             Err(e) => {
-                release_inflight(app, &self.session_id).await;
+                release_inflight(handles, &self.session_id).await;
                 return Err(e);
             }
         };
         let directory = old_entry
             .as_ref()
             .and_then(|e| (!e.directory.is_empty()).then_some(e.directory.clone()))
-            .unwrap_or_else(|| app.default_session_directory());
-        let fresh_id = match app
+            .unwrap_or_else(|| handles.config.default_session_directory());
+        let fresh_id = match handles
+            .sessions
             .create_fresh_session(
+                &handles.backend,
                 &self.thread_key,
-                &self.text,
                 directory,
                 old_entry.as_ref().and_then(|e| e.topic_anchor.clone()),
                 old_entry.as_ref().and_then(|e| e.topic_root.clone()),
@@ -387,7 +394,7 @@ impl Turn {
             Err(e) => {
                 // The dead mapping is gone but the guard still names the old
                 // session: release it so the thread is not stuck busy.
-                release_inflight(app, &self.session_id).await;
+                release_inflight(handles, &self.session_id).await;
                 return Err(e);
             }
         };
@@ -398,14 +405,14 @@ impl Turn {
         // it, so a post-recreate error must still offer a retry that resolves
         // against the fresh mapping.
         {
-            let mut cards = app.cards.lock().await;
+            let mut cards = handles.cards.cards.lock().await;
             if let Some(mut card) = cards.remove(&self.session_id) {
                 card.acc.session_id = Some(fresh_id.clone());
                 cards.insert(fresh_id.clone(), card);
             }
         }
         {
-            let mut inflight = app.inflight.lock().await;
+            let mut inflight = handles.waits.inflight.lock().await;
             inflight.remove(&self.session_id);
             inflight.insert(fresh_id.clone());
         }
@@ -413,7 +420,7 @@ impl Turn {
         // recorded title to the fresh session so the title-sync hook keeps
         // patching the card after the recreate (ADR-0023).
         {
-            let mut covers = app.cover_titles.lock().await;
+            let mut covers = handles.cards.cover_titles.lock().await;
             if let Some(cover) = covers.remove(&self.session_id) {
                 covers.insert(fresh_id.clone(), cover);
             }
@@ -433,14 +440,14 @@ impl Turn {
     /// answered — then the card is marked Done and the guard released.
     async fn finish(
         &mut self,
-        app: &Arc<App>,
+        handles: &TurnHandles,
         prompt_resp: &crate::error::Result<opencode::types::PromptResponse>,
     ) {
         // Post-prompt drain + the pre-finalization re-check: a Supplement
         // racing the drain's exit is drained here rather than dropped, and one
         // that lands after the release becomes a normal new Turn on the
         // handler's not-busy path.
-        self.drain_after_prompt(app).await;
+        self.drain_after_prompt(handles).await;
 
         let prompt_err = match prompt_resp {
             Ok(r) => r.error.clone(),
@@ -455,14 +462,21 @@ impl Turn {
         // pending, and a request that outlived a healthy turn (external or
         // concurrent work) is not this turn's to deny.
         if prompt_err.is_some() {
-            crate::bridge::request::reject_leftovers_for_turn(&app.core, &self.session_id).await;
+            crate::bridge::request::reject_leftovers_for_turn(
+                &handles.requests,
+                &handles.cards,
+                &handles.sessions,
+                &handles.backend,
+                &self.session_id,
+            )
+            .await;
         }
 
         // Reconcile: render any parts the incremental poll missed, then mark the
         // card Done (or Error). Fall back to the response parts if the fetch fails.
-        let final_msgs = app.opencode.messages(&self.session_id).await.ok();
+        let final_msgs = handles.backend.messages(&self.session_id).await.ok();
         {
-            let mut cards = app.cards.lock().await;
+            let mut cards = handles.cards.cards.lock().await;
             if let Some(acc) = cards.get_mut(&self.session_id).map(|c| &mut c.acc) {
                 if let Ok(resp) = prompt_resp {
                     let mut rendered = false;
@@ -520,25 +534,37 @@ impl Turn {
         // may have created or switched branches, or committed, so re-read the
         // git state before the final flush — the footer shows where the turn
         // landed, not just where it started.
-        crate::bridge::streaming::refresh_work_context(&app.core, &self.session_id).await;
+        crate::bridge::streaming::refresh_work_context(&handles.cards, &self.session_id).await;
         // Refresh the Turn Footer's context window (ADR-0044) before the final
         // flush: the render-poll refresh usually covered it, but the reconcile
         // above may have just captured a final usage the polls never saw. Runs
         // on a failed prompt too — the card already carries that usage.
-        crate::bridge::streaming::refresh_context_window(&app.core, &self.session_id).await;
-        flush_card(&app.core, &self.session_id).await;
+        crate::bridge::streaming::refresh_context_window(&handles.cards, &handles.backend, &self.session_id)
+            .await;
+        flush_card(&handles.cards, &self.session_id).await;
 
         // Topic cover card (ADR-0023): once the server holds a real title for
         // the session — auto-generated after the first exchange, or set by
         // `/name` — patch the cover card (the thread root) in place, so the
         // chat-list topic entry stays current. Best effort; failures only log.
         if prompt_err.is_none() {
-            let settled = crate::bridge::topic::sync_topic_cover_title(&app.core, &self.session_id).await;
+            let settled = crate::bridge::topic::sync_topic_cover_title(
+                &handles.cards,
+                &handles.sessions,
+                &handles.backend,
+                &self.session_id,
+            )
+            .await;
             // The auto-title can still be in flight when a short turn ends
             // (the title agent races the turn); only then retry with backoff,
             // so the cover follows even if the user stops here (ADR-0023).
             if !settled {
-                crate::bridge::topic::spawn_cover_title_retry(&app.core, &self.session_id);
+                crate::bridge::topic::spawn_cover_title_retry(
+                    &handles.cards,
+                    &handles.sessions,
+                    &handles.backend,
+                    &self.session_id,
+                );
             }
         }
 
@@ -556,18 +582,16 @@ impl Turn {
         // (`[bridge] long_task_notice`, past the injected threshold), where
         // "long" is the one event worth surfacing even though the user was
         // presumably around.
-        if app.group_completion_notice || app.long_task_notice {
+        if handles.config.group_completion_notice || handles.config.long_task_notice {
             let notice = {
-                let cards = app.cards.lock().await;
+                let cards = handles.cards.cards.lock().await;
                 cards.get(&self.session_id).map(|c| &c.acc).and_then(|a| {
                     let requester = a.requester_open_id.clone()?;
                     let reply_to = a.reply_to_message_id.clone()?;
                     let long_task = self.started_at.elapsed()
-                        >= std::time::Duration::from_millis(
-                            app.long_task_notice_ms.load(std::sync::atomic::Ordering::Relaxed),
-                        );
-                    if !(a.is_group && app.group_completion_notice
-                        || !a.is_group && app.long_task_notice && long_task)
+                        >= std::time::Duration::from_millis(handles.config.long_task_notice_ms());
+                    if !(a.is_group && handles.config.group_completion_notice
+                        || !a.is_group && handles.config.long_task_notice && long_task)
                     {
                         return None;
                     }
@@ -590,12 +614,12 @@ impl Turn {
                 // a plain reply, which still notifies the message author. p2p
                 // needs no @ — the reply itself is the notification.
                 let name = if is_group {
-                    app.feishu.user_name(&requester).await.unwrap_or(None)
+                    handles.platform.user_name(&requester).await.unwrap_or(None)
                 } else {
                     None
                 };
-                if let Err(e) = app
-                    .feishu
+                if let Err(e) = handles
+                    .platform
                     .reply_completion_notice(&reply_to, &requester, name.as_deref(), text)
                     .await
                 {
@@ -604,14 +628,14 @@ impl Turn {
             }
         }
 
-        self.release(app).await;
+        self.release(handles).await;
         // Permissions are handled by the independent poller spawned in App::run,
         // so a prompt blocked on a permission still gets its card shown.
     }
 
     /// Release this turn's busy guard. Idempotent.
-    async fn release(&self, app: &Arc<App>) {
-        release_inflight(app, &self.session_id).await;
+    async fn release(&self, handles: &TurnHandles) {
+        release_inflight(handles, &self.session_id).await;
     }
 
     /// The post-prompt phase (ADR-0043): keep the renderer polling while the
@@ -629,10 +653,10 @@ impl Turn {
     /// a session that merely stays busy cannot extend finalization. A
     /// Supplement that lands after the release is seen by the handler's
     /// not-busy path and becomes a normal new Turn.
-    async fn drain_after_prompt(&mut self, app: &Arc<App>) {
-        self.drain(app).await;
+    async fn drain_after_prompt(&mut self, handles: &TurnHandles) {
+        self.drain(handles).await;
         if self
-            .drain_tick(app, drain_request_timeout(drain_deadline(app)))
+            .drain_tick(handles, drain_request_timeout(drain_deadline(handles)))
             .await
             == Some(DrainState::Supplement)
         {
@@ -640,7 +664,7 @@ impl Turn {
                 "turn drain: supplement racing the finish on session {}; draining",
                 self.session_id
             );
-            self.drain(app).await;
+            self.drain(handles).await;
         }
     }
 
@@ -650,14 +674,14 @@ impl Turn {
     /// dropping the drain on one transient error would lose the reply this
     /// phase exists to render. Each request is bounded by the remaining drain
     /// budget, so a hung Backend cannot hold the drain past the bound.
-    async fn drain(&mut self, app: &Arc<App>) {
-        let poll_ms = app.turn_render_poll_ms.load(Ordering::Relaxed);
-        let deadline = drain_deadline(app);
+    async fn drain(&mut self, handles: &TurnHandles) {
+        let poll_ms = handles.config.render_poll_ms();
+        let deadline = drain_deadline(handles);
         let mut observed_pending = false;
         loop {
             // The first check runs before any sleep: a Supplement that missed
             // the run is already on the Backend when the prompt returns.
-            match self.drain_tick(app, drain_request_timeout(deadline)).await {
+            match self.drain_tick(handles, drain_request_timeout(deadline)).await {
                 Some(DrainState::Settled) => return,
                 Some(_) => observed_pending = true,
                 None if !observed_pending => return,
@@ -675,12 +699,19 @@ impl Turn {
     /// and — when it must — render the very snapshot the decision was made
     /// from, so the live card follows the new Turn. `None` means the Backend
     /// read failed (unknown state).
-    async fn drain_tick(&mut self, app: &Arc<App>, timeout_ms: u64) -> Option<DrainState> {
-        let msgs = self.drain_messages(app, timeout_ms).await?;
-        match self.drain_state(app, &msgs, timeout_ms).await {
+    async fn drain_tick(&mut self, handles: &TurnHandles, timeout_ms: u64) -> Option<DrainState> {
+        let msgs = self.drain_messages(handles, timeout_ms).await?;
+        match self.drain_state(handles, &msgs, timeout_ms).await {
             DrainState::Settled => Some(DrainState::Settled),
             pending => {
-                render_and_flush(&app.core, &self.session_id, &msgs).await;
+                render_and_flush(
+                    &handles.cards,
+                    &handles.sessions,
+                    &handles.backend,
+                    &self.session_id,
+                    &msgs,
+                )
+                .await;
                 Some(pending)
             }
         }
@@ -692,14 +723,25 @@ impl Turn {
     /// assistant reply after it. `msgs` is the snapshot the caller just read.
     /// The Supplement is classified before the run state so the re-check can
     /// tell the racing Supplement apart from a session that is merely busy.
-    async fn drain_state(&mut self, app: &Arc<App>, msgs: &[SessionMessage], timeout_ms: u64) -> DrainState {
+    async fn drain_state(
+        &mut self,
+        handles: &TurnHandles,
+        msgs: &[SessionMessage],
+        timeout_ms: u64,
+    ) -> DrainState {
         // `/stop` interrupted this session's run: no answer is coming, so the
         // drain must end promptly instead of waiting out its bound on a
         // Supplement the abort left unanswered (no rendering may continue once
         // the session is stopped). The marker is cleared by the next Turn's
         // `start`. The finalization is logged once per Turn: the drain and the
         // re-check that follows it both read the same sticky marker.
-        if app.stopped_sessions.lock().await.contains(&self.session_id) {
+        if handles
+            .waits
+            .stopped_sessions
+            .lock()
+            .await
+            .contains(&self.session_id)
+        {
             if !self.stop_finalization_logged {
                 self.stop_finalization_logged = true;
                 tracing::info!("turn drain: session {} was stopped; finalizing", self.session_id);
@@ -711,7 +753,7 @@ impl Turn {
         // meaningless without it, and a short turn's first poll only ever
         // runs here.
         let anchor_ms = {
-            let mut cards = app.cards.lock().await;
+            let mut cards = handles.cards.cards.lock().await;
             match cards.get_mut(&self.session_id) {
                 Some(card) => {
                     crate::bridge::render::capture_turn_anchor(&mut card.acc, msgs);
@@ -754,7 +796,8 @@ impl Turn {
         match crate::bridge::bounded_call(
             "turn drain session status",
             timeout_ms,
-            app.opencode
+            handles
+                .backend
                 .session_status(&self.session_id, Some(&self.directory)),
         )
         .await
@@ -771,11 +814,11 @@ impl Turn {
     /// The drain's Backend read, bounded by the caller's per-call timeout so a
     /// hung Backend cannot hold the card (and the inflight guard) past the
     /// drain bound.
-    async fn drain_messages(&self, app: &Arc<App>, timeout_ms: u64) -> Option<Vec<SessionMessage>> {
+    async fn drain_messages(&self, handles: &TurnHandles, timeout_ms: u64) -> Option<Vec<SessionMessage>> {
         match crate::bridge::bounded_call(
             "turn drain messages",
             timeout_ms,
-            app.opencode.messages(&self.session_id),
+            handles.backend.messages(&self.session_id),
         )
         .await
         {
@@ -791,8 +834,8 @@ impl Turn {
 
 /// Release a session's busy guard. A free function so the phases' error paths
 /// can release before any [`Turn`] state is settled; idempotent.
-async fn release_inflight(app: &Arc<App>, session_id: &str) {
-    let mut inflight = app.inflight.lock().await;
+async fn release_inflight(handles: &TurnHandles, session_id: &str) {
+    let mut inflight = handles.waits.inflight.lock().await;
     inflight.remove(session_id);
 }
 
@@ -804,12 +847,14 @@ struct RenderPoll {
 }
 
 impl RenderPoll {
-    fn spawn(app: &Arc<App>, session_id: &str, thread_key: &ThreadKey) -> Self {
+    fn spawn(handles: &TurnHandles, session_id: &str, thread_key: &ThreadKey) -> Self {
         let done = Arc::new(AtomicBool::new(false));
-        let core = Arc::clone(&app.core);
+        let cards = handles.cards.clone();
+        let sessions = handles.sessions.clone();
+        let backend = Arc::clone(&handles.backend);
         let sid = session_id.to_string();
         let flag = Arc::clone(&done);
-        let poll_ms = app.turn_render_poll_ms.load(Ordering::Relaxed);
+        let poll_ms = handles.config.render_poll_ms();
         // A spawn does not inherit the turn's span — the poll runs on its own
         // task — so it is instrumented explicitly with the same fields: its
         // lines must keep the session (ADR-0048). Rooted, because the ambient
@@ -817,7 +862,7 @@ impl RenderPoll {
         let span = span::turn(session_id, thread_key, None);
         let handle = tokio::spawn(
             async move {
-                render_poll_loop(&core, sid, flag, poll_ms).await;
+                render_poll_loop(&cards, &sessions, &backend, sid, flag, poll_ms).await;
             }
             .instrument(span),
         );
@@ -833,6 +878,7 @@ impl RenderPoll {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::App;
     use crate::bridge::test_support::{
         MockBackend, RecordingPlatform, build_app, realistic_parts, seed_entry, test_config, test_work_dir,
     };
@@ -870,7 +916,7 @@ mod tests {
             .unwrap(),
         );
 
-        let err = Turn::run(&app, ctx("ses_a", "hi")).await;
+        let err = Turn::run(&app.turn_handles(), ctx("ses_a", "hi")).await;
 
         assert!(err.is_err(), "the failed Loading reply must surface");
         assert!(
@@ -890,7 +936,7 @@ mod tests {
         backend.prompt_error = Some("provider 503".into());
         let (app, _platform) = build_app(cfg, backend).await;
 
-        Turn::run(&app, ctx("ses_a", "hi")).await.unwrap();
+        Turn::run(&app.turn_handles(), ctx("ses_a", "hi")).await.unwrap();
 
         assert!(!app.inflight.lock().await.contains("ses_a"));
     }
@@ -913,7 +959,7 @@ mod tests {
         entry.variant = Some("high".into());
         seed_entry(&app, entry).await;
 
-        Turn::run(&app, ctx("ses_a", "hi")).await.unwrap();
+        Turn::run(&app.turn_handles(), ctx("ses_a", "hi")).await.unwrap();
 
         assert_eq!(
             sent_variants.lock().await.as_slice(),

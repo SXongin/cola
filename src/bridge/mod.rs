@@ -7,6 +7,7 @@ pub mod display;
 pub mod external;
 pub mod failure_latch;
 pub mod handler;
+pub(crate) mod handles;
 pub mod message_pins;
 pub mod pollers;
 pub mod question;

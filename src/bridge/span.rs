@@ -7,9 +7,6 @@
 //! callsite — so each flow gets its own constructor here, while the fields and
 //! their recording live once in [`record_session_fields`].
 
-use std::sync::Arc;
-
-use crate::bridge::core::SharedCore;
 use crate::config::ThreadKey;
 
 /// The Turn's span: `session` and `chat` always, `topic` only when the
@@ -133,12 +130,11 @@ pub(crate) fn message(thread_key: &ThreadKey) -> tracing::Span {
 /// only knows the Session completes its `chat`/`topic` fields from. `None` when
 /// the Session has no mapping (a first adoption, a sub-task child): the span
 /// then carries `session` alone rather than guessing.
-pub(crate) async fn thread_key_of(core: &Arc<SharedCore>, session_id: &str) -> Option<ThreadKey> {
-    core.sessions
-        .lock()
-        .await
-        .entry_for_session(session_id)
-        .map(|e| e.thread_key.clone())
+pub(crate) async fn thread_key_of(
+    sessions: &crate::bridge::handles::SessionsHandle,
+    session_id: &str,
+) -> Option<ThreadKey> {
+    sessions.thread_for_session(session_id).await
 }
 
 /// Record the three session fields on a span that declared them as

@@ -193,7 +193,7 @@ pub(crate) async fn snapshot_card_for(
     verb: &str,
     info: &crate::opencode::types::SessionListInfo,
 ) -> (serde_json::Value, SnapshotData) {
-    let thread_key = crate::bridge::span::thread_key_of(core, &info.id).await;
+    let thread_key = crate::bridge::span::thread_key_of(&core.sessions_handle(), &info.id).await;
     let span = crate::bridge::span::snapshot(&info.id, thread_key.as_ref());
     async move {
         let data = gather_snapshot(&core.opencode, &info.id, &info.directory).await;
