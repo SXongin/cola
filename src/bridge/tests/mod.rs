@@ -12,6 +12,7 @@ pub(crate) mod dir;
 pub(crate) mod drain;
 pub(crate) mod external;
 pub(crate) mod leftovers;
+pub(crate) mod logs;
 pub(crate) mod message_pins;
 pub(crate) mod misc;
 pub(crate) mod pending;
