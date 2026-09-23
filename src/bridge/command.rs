@@ -784,10 +784,7 @@ pub(crate) async fn handle_command(
                 core.feishu.reply_text(message_id, NO_LIVE_CARD).await?;
                 return Ok(());
             };
-            let running = {
-                let cards = core.cards.lock().await;
-                cards.get(&session_id).is_some_and(|card| card.is_running())
-            };
+            let running = crate::bridge::turn::Turn::is_running(&core.cards_handle(), &session_id).await;
             if !running {
                 core.feishu.reply_text(message_id, NO_LIVE_CARD).await?;
                 return Ok(());
@@ -797,7 +794,7 @@ pub(crate) async fn handle_command(
                 &core.cards_handle(),
                 &session_id,
                 message_id,
-                crate::bridge::turn::state::SplitKind::Pull,
+                crate::bridge::turn::SplitKind::Pull,
             )
             .await;
         }

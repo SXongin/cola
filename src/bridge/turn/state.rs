@@ -49,17 +49,6 @@ pub enum TimelineKind {
     Receipt(String),
 }
 
-/// The body-element range one live interaction block occupies on a built card.
-/// Recorded at render time so the card handle can resolve or refresh the block
-/// in place on the cached JSON, long after the accumulator that rendered it is
-/// gone (ADR-0038, rule 2).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlockSpan {
-    pub request_id: String,
-    pub start: usize,
-    pub end: usize,
-}
-
 /// A card as built for one message: the JSON, whether the timeline had to
 /// split (the caller then sends a continuation), and the element ranges of the
 /// live interaction blocks this card renders — empty on finalized slices, whose
@@ -67,7 +56,7 @@ pub struct BlockSpan {
 pub struct BuiltCard {
     pub card: serde_json::Value,
     pub full: bool,
-    pub spans: Vec<BlockSpan>,
+    pub spans: Vec<crate::bridge::card_handles::BlockSpan>,
 }
 
 /// Estimated serialized size (bytes) of one collapsible tool panel, mirroring
@@ -185,7 +174,7 @@ impl InteractionBlock {
     pub fn receipt_target(&self) -> String {
         match self {
             InteractionBlock::Permission(p) => p.target.clone(),
-            InteractionBlock::Question(q) => question_target(&q.questions),
+            InteractionBlock::Question(q) => crate::feishu::card::question::question_target(&q.questions),
             InteractionBlock::Receipt(_) => String::new(),
         }
     }
@@ -205,25 +194,6 @@ fn format_tokens(n: i64) -> String {
     }
 }
 
-/// Compact one-line target for a question's receipt: each question's header
-/// (or a clipped question text), joined, clipped to stay a residue.
-pub(crate) fn question_target(questions: &[crate::opencode::types::QuestionInfo]) -> String {
-    crate::feishu::card::truncate_md(
-        &questions
-            .iter()
-            .map(|qi| {
-                if qi.header.is_empty() {
-                    crate::feishu::card::truncate_md(&qi.question, 24)
-                } else {
-                    qi.header.clone()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("、"),
-        60,
-    )
-}
-
 /// The turn-start work context (ADR-0019): the session directory plus the git
 /// halves the Turn Footer shows. Captured before the prompt runs, applied to
 /// the live card separately (see [`StreamAccumulator::capture_work_context`]).
@@ -234,17 +204,6 @@ pub struct WorkContext {
     pub git: crate::git::GitState,
 }
 
-/// Why a Card Chain split was requested: each cause writes its own receipt
-/// line on the continuation (ADR-0043).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SplitKind {
-    /// A Supplement landed below the live card (ADR-0043).
-    Supplement,
-    /// The user explicitly pulled the live card down with `/card`
-    /// (ADR-0043, 2026-09-22 amendment).
-    Pull,
-}
-
 /// One queued Card Chain split (ADR-0043): the message its continuation must
 /// reply to, why it was requested, and whether its receipt line has already
 /// been written into the accumulator. The flag keeps the receipt
@@ -252,7 +211,7 @@ pub enum SplitKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingSplit {
     pub reply_to: String,
-    pub kind: SplitKind,
+    pub kind: super::SplitKind,
     pub receipt_pushed: bool,
 }
 
@@ -1237,7 +1196,7 @@ impl StreamAccumulator {
         end: usize,
         include_tail: bool,
         state_override: Option<CardState>,
-    ) -> (serde_json::Value, Vec<BlockSpan>) {
+    ) -> (serde_json::Value, Vec<crate::bridge::card_handles::BlockSpan>) {
         let state = state_override.unwrap_or_else(|| self.card_state.clone());
         // The header shows the Turn's running tool even when THIS slice has no
         // panel for it (a split continuation after `sleep 30` started): pass
@@ -1305,7 +1264,7 @@ impl StreamAccumulator {
             builder = builder.with_text(&pending);
         }
 
-        let mut spans: Vec<BlockSpan> = Vec::new();
+        let mut spans: Vec<crate::bridge::card_handles::BlockSpan> = Vec::new();
         if include_tail {
             // The live todo list opens the tail: it is the turn's current plan,
             // and the tail is the one section every flush re-renders, so the
@@ -1364,7 +1323,7 @@ impl StreamAccumulator {
                     }
                     InteractionBlock::Receipt(_) => continue,
                 }
-                spans.push(BlockSpan {
+                spans.push(crate::bridge::card_handles::BlockSpan {
                     request_id: block.request_id().to_string(),
                     start,
                     end: builder.body_len(),
@@ -1433,6 +1392,33 @@ impl StreamAccumulator {
 
         (builder.build(), spans)
     }
+}
+
+/// The shared sweep shape for both kinds (#175): resolve every LIVE block the
+/// kind owns (`own`) whose request vanished into its
+/// `⏱ 已由其他客户端处理` Interaction Receipt. A block owned by a directory
+/// whose list call failed stays: that directory said nothing, so its request
+/// may still be pending (#130, #144). A block cola itself is answering (or
+/// answered) also stays: its disappearance from the pending list is cola's own
+/// doing, and the sweep's neutral line would be a lie — the settlement leaves
+/// the true receipt. Returns how many were resolved — the caller repaints each
+/// affected card so the receipt lands within one poll.
+pub(super) fn resolve_vanished_blocks(
+    acc: &mut StreamAccumulator,
+    pending: &std::collections::HashSet<String>,
+    failed_dirs: &std::collections::HashSet<String>,
+    cola_claimed: &std::collections::HashSet<String>,
+    own: impl Fn(&InteractionBlock) -> bool,
+) -> usize {
+    acc.resolve_vanished(
+        |block| {
+            own(block)
+                && !pending.contains(block.request_id())
+                && !cola_claimed.contains(block.request_id())
+                && !failed_dirs.contains(block.directory())
+        },
+        |block| crate::bridge::request::handled_elsewhere_receipt(&block.receipt_target()),
+    )
 }
 
 /// Refresh the live card's work context at turn end (ADR-0019): re-read the

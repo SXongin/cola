@@ -536,15 +536,13 @@ pub(crate) async fn reminder_target(
         crate::bridge::pollers::walk_parent_chain(&core.opencode, session_id, Some(directory), |current| {
             let current = current.to_string();
             async move {
-                let cards = core.cards.lock().await;
-                cards.get(&current).and_then(|card| {
-                    let generation = card.acc.turn_generation?;
-                    let requester = card.acc.requester_open_id.clone()?;
-                    if requester.is_empty() {
-                        return None;
-                    }
-                    Some((current.clone(), card.acc.is_group, requester, generation))
-                })
+                let source = crate::bridge::turn::Turn::pin_source(&core.cards_handle(), &current).await?;
+                Some((
+                    current,
+                    source.is_group,
+                    source.requester_open_id,
+                    source.generation,
+                ))
             }
         })
         .await?;

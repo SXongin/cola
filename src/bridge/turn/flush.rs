@@ -26,6 +26,32 @@ fn is_card_content_rejected(e: &crate::error::BridgeError) -> bool {
     matches!(e, crate::error::BridgeError::CardContentRejected { .. })
 }
 
+/// The card-handle registry record of `span`'s block, or `None` for a resolved
+/// block's tombstone — nothing live to repaint. The block is the accumulator's
+/// own render source, so the registry facts (kind, owner, receipt target) are
+/// read off it at the one render seam.
+fn rendered_block(
+    span: &crate::bridge::card_handles::BlockSpan,
+    block: &super::state::InteractionBlock,
+) -> Option<RenderedBlock> {
+    use super::state::InteractionBlock;
+    use crate::bridge::snapshot_claims::ClaimKind;
+    let kind = match block {
+        InteractionBlock::Permission(_) => ClaimKind::Permission,
+        InteractionBlock::Question(_) => ClaimKind::Question,
+        InteractionBlock::Receipt(_) => return None,
+    };
+    Some(RenderedBlock {
+        request_id: span.request_id.clone(),
+        start: span.start,
+        end: span.end,
+        kind,
+        session_id: block.session_id().to_string(),
+        directory: block.directory().to_string(),
+        target: block.receipt_target(),
+    })
+}
+
 /// What a rejected card's flush should do next.
 enum FallbackAdvance {
     /// Retry the same slice once, with model markdown fenced.
@@ -124,9 +150,8 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str) {
                 .spans
                 .iter()
                 .filter_map(|span| {
-                    card.acc
-                        .interaction(&span.request_id)
-                        .and_then(|block| RenderedBlock::of(span, block))
+                    let block = card.acc.interaction(&span.request_id)?;
+                    rendered_block(span, block)
                 })
                 .collect();
             (built, rendered, slice_from, slice_to)
@@ -334,8 +359,8 @@ async fn push_queued_receipts(cards: &CardsHandle, session_id: &str) {
             continue;
         }
         let receipt = match card.pending_split[i].kind {
-            crate::bridge::turn::state::SplitKind::Supplement => SUPPLEMENT_RECEIPT,
-            crate::bridge::turn::state::SplitKind::Pull => PULL_RECEIPT,
+            crate::bridge::turn::SplitKind::Supplement => SUPPLEMENT_RECEIPT,
+            crate::bridge::turn::SplitKind::Pull => PULL_RECEIPT,
         };
         card.acc.push_receipt(receipt);
         card.pending_split[i].receipt_pushed = true;

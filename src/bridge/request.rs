@@ -13,7 +13,7 @@ use crate::bridge::question::{
     MultiOutcome, QuestionState, action_toast, qa_completion_body, question_replay_card, stale_question_card,
 };
 use crate::bridge::snapshot_claims::ClaimKind;
-use crate::bridge::turn::state::{InteractionBlock, PendingPermission, PendingQuestion, StreamAccumulator};
+use crate::bridge::turn::Turn;
 use crate::opencode;
 
 /// A pending request surfaced by a poll loop before it becomes a card. Carries
@@ -76,17 +76,20 @@ pub trait RequestKind: Send + Sync {
         dir: &str,
     ) -> bool;
 
-    /// Build the interaction block this flow renders for `req`. Permissions
-    /// rebuild deterministically from the request; questions restore their
-    /// remembered partial state (已选 / finalized slots), so a block that moves
-    /// onto a new turn's card keeps what the Host already answered (ADR-0038,
-    /// rule 1). `None` when the request does not belong to this kind.
-    async fn interaction_block(
+    /// Add this kind's inline block to the `host` card (the poller path and
+    /// the cross-turn re-host). Permissions rebuild deterministically from the
+    /// request; questions restore their remembered partial state (已选 /
+    /// finalized slots), so a block that moves onto a new turn's card keeps
+    /// what the Host already answered (ADR-0038, rule 1). Returns whether the
+    /// block was added (false when the card already carries it, or is gone).
+    async fn add_inline(
         &self,
         flow: &RequestFlow,
+        cards: &CardsHandle,
+        host: &str,
         req: &PendingRequest,
         dir: &str,
-    ) -> Option<InteractionBlock>;
+    ) -> bool;
 
     /// Build the standalone interactive card (used when no streaming card hosts
     /// the request inline).
@@ -101,15 +104,15 @@ pub trait RequestKind: Send + Sync {
     /// directory whose list call failed stays live: unknown must never be read
     /// as resolved (#130, #144). An item cola itself is answering (`answered`)
     /// also stays: the settlement owns its receipt, the sweep's neutral one
-    /// would be a lie. Returns how many blocks were resolved — the sweep
-    /// repaints each affected card so the receipt lands within one poll.
-    fn resolve_vanished_inline(
+    /// would be a lie. Returns the affected session ids — the sweep repaints
+    /// each affected card so the receipt lands within one poll.
+    async fn resolve_vanished_inline(
         &self,
-        acc: &mut StreamAccumulator,
+        cards: &CardsHandle,
         pending: &std::collections::HashSet<String>,
         failed_dirs: &std::collections::HashSet<String>,
         cola_claimed: &std::collections::HashSet<String>,
-    ) -> usize;
+    ) -> Vec<String>;
 
     /// The snapshot-claim kind of this flow's requests (ADR-0028): each flow's
     /// poll sweep only drops claims of its own kind.
@@ -133,33 +136,6 @@ pub trait RequestKind: Send + Sync {
         host: &Option<String>,
         clicked: Option<&str>,
     ) -> Option<CardActionResult>;
-}
-
-/// The shared sweep shape for both kinds (#175): resolve every LIVE block the
-/// kind owns (`own`) whose request vanished into its
-/// `⏱ 已由其他客户端处理` Interaction Receipt. A block owned by a directory
-/// whose list call failed stays: that directory said nothing, so its request
-/// may still be pending (#130, #144). A block cola itself is answering (or
-/// answered) also stays: its disappearance from the pending list is cola's own
-/// doing, and the sweep's neutral line would be a lie — the settlement leaves
-/// the true receipt. Returns how many were resolved — the sweep repaints each
-/// affected card so the receipt lands within one poll.
-fn resolve_vanished_blocks(
-    acc: &mut StreamAccumulator,
-    pending: &std::collections::HashSet<String>,
-    failed_dirs: &std::collections::HashSet<String>,
-    cola_claimed: &std::collections::HashSet<String>,
-    own: impl Fn(&InteractionBlock) -> bool,
-) -> usize {
-    acc.resolve_vanished(
-        |block| {
-            own(block)
-                && !pending.contains(block.request_id())
-                && !cola_claimed.contains(block.request_id())
-                && !failed_dirs.contains(block.directory())
-        },
-        |block| handled_elsewhere_receipt(&block.receipt_target()),
-    )
 }
 
 /// The permission kind: `/autoaccept` sessions are answered automatically, and
@@ -218,22 +194,18 @@ impl RequestKind for PermissionKind {
         true
     }
 
-    async fn interaction_block(
+    async fn add_inline(
         &self,
         _flow: &RequestFlow,
+        cards: &CardsHandle,
+        host: &str,
         req: &PendingRequest,
         dir: &str,
-    ) -> Option<InteractionBlock> {
+    ) -> bool {
         let PendingRequest::Permission(p) = req else {
-            return None;
+            return false;
         };
-        Some(InteractionBlock::Permission(PendingPermission {
-            session_id: p.session_id.clone().unwrap_or_default(),
-            request_id: p.request_id.clone(),
-            body: describe_permission(p),
-            target: permission_target(p),
-            directory: dir.to_string(),
-        }))
+        Turn::add_permission(cards, host, p, dir).await
     }
 
     fn build_card(&self, req: &PendingRequest, dir: &str) -> serde_json::Value {
@@ -256,16 +228,14 @@ impl RequestKind for PermissionKind {
         }
     }
 
-    fn resolve_vanished_inline(
+    async fn resolve_vanished_inline(
         &self,
-        acc: &mut StreamAccumulator,
+        cards: &CardsHandle,
         pending: &std::collections::HashSet<String>,
         failed_dirs: &std::collections::HashSet<String>,
         cola_claimed: &std::collections::HashSet<String>,
-    ) -> usize {
-        resolve_vanished_blocks(acc, pending, failed_dirs, cola_claimed, |block| {
-            matches!(block, InteractionBlock::Permission(_))
-        })
+    ) -> Vec<String> {
+        Turn::resolve_vanished_permissions(cards, pending, failed_dirs, cola_claimed).await
     }
 
     fn claim_kind(&self) -> ClaimKind {
@@ -500,7 +470,7 @@ fn receipt_line(prefix: &str, detail: &str) -> String {
 pub(crate) fn snapshot_handled_elsewhere_receipt(req: &PendingRequest) -> String {
     let target = match req {
         PendingRequest::Permission(p) => permission_target(p),
-        PendingRequest::Question(q) => crate::bridge::turn::state::question_target(&q.questions),
+        PendingRequest::Question(q) => crate::feishu::card::question::question_target(&q.questions),
     };
     receipt_line(HANDLED_ELSEWHERE_PREFIX, &target)
 }
@@ -638,14 +608,16 @@ impl RequestKind for QuestionKind {
         false
     }
 
-    async fn interaction_block(
+    async fn add_inline(
         &self,
         flow: &RequestFlow,
+        cards: &CardsHandle,
+        host: &str,
         req: &PendingRequest,
         dir: &str,
-    ) -> Option<InteractionBlock> {
+    ) -> bool {
         let PendingRequest::Question(q) = req else {
-            return None;
+            return false;
         };
         // Restore what the Host already answered: a re-hosted question keeps
         // its 已选 markers and finalized slots (ADR-0038, rule 1).
@@ -656,14 +628,7 @@ impl RequestKind for QuestionKind {
             }
             None => (vec![None; q.questions.len()], vec![false; q.questions.len()]),
         };
-        Some(InteractionBlock::Question(PendingQuestion {
-            request_id: q.id.clone(),
-            session_id: q.session_id.clone(),
-            questions: q.questions.clone(),
-            directory: dir.to_string(),
-            answers,
-            done,
-        }))
+        Turn::add_question(cards, host, q, dir, &answers, &done).await
     }
 
     fn build_card(&self, req: &PendingRequest, dir: &str) -> serde_json::Value {
@@ -687,16 +652,14 @@ impl RequestKind for QuestionKind {
         }
     }
 
-    fn resolve_vanished_inline(
+    async fn resolve_vanished_inline(
         &self,
-        acc: &mut StreamAccumulator,
+        cards: &CardsHandle,
         pending: &std::collections::HashSet<String>,
         failed_dirs: &std::collections::HashSet<String>,
         cola_claimed: &std::collections::HashSet<String>,
-    ) -> usize {
-        resolve_vanished_blocks(acc, pending, failed_dirs, cola_claimed, |block| {
-            matches!(block, InteractionBlock::Question(_))
-        })
+    ) -> Vec<String> {
+        Turn::resolve_vanished_questions(cards, pending, failed_dirs, cola_claimed).await
     }
 
     fn claim_kind(&self) -> ClaimKind {
@@ -1552,19 +1515,7 @@ impl RequestFlow {
         // block to that card, so a block whose handle already names it is left
         // to the flush (never resolved twice), while one whose handle names an
         // older card still gets that stale card repainted.
-        let flush_owned: std::collections::HashMap<String, String> = {
-            let cards = core.cards.lock().await;
-            let mut owned = std::collections::HashMap::new();
-            for card in cards.values() {
-                let Some(message_id) = card.card_message_id.as_deref() else {
-                    continue;
-                };
-                for id in card.acc.live_request_ids() {
-                    owned.insert(id.to_string(), message_id.to_string());
-                }
-            }
-            owned
-        };
+        let flush_owned = Turn::flush_owned_blocks(&core.cards_handle()).await;
         let dropped = core.card_handles.lock().await.drop_vanished(
             self.kind.claim_kind(),
             &pending,
@@ -1589,22 +1540,12 @@ impl RequestFlow {
         // host them — the receipt lands within this sweep, with no reliance on
         // the render tick (which stops when a turn ends). Blocks owned by a
         // failed directory stay (#144).
-        let repaint: Vec<String> = {
-            let mut cards = core.cards.lock().await;
-            let mut affected = Vec::new();
-            for (session_id, card) in cards.iter_mut() {
-                if self
-                    .kind
-                    .resolve_vanished_inline(&mut card.acc, &pending, &failed_dirs, &cola_claimed)
-                    > 0
-                {
-                    affected.push(session_id.clone());
-                }
-            }
-            affected
-        };
+        let repaint = self
+            .kind
+            .resolve_vanished_inline(&core.cards_handle(), &pending, &failed_dirs, &cola_claimed)
+            .await;
         for session_id in &repaint {
-            crate::bridge::turn::Turn::flush_card(&core.cards_handle(), session_id).await;
+            Turn::flush_card(&core.cards_handle(), session_id).await;
         }
         // ADR-0028: a claimed request that left the pending list was
         // resolved — by the snapshot's own buttons (the click handler
@@ -1750,16 +1691,10 @@ impl RequestFlow {
         // children) its nearest ancestor with a live card. Only a separate card
         // when there is no active card (e.g. external turns or restarts).
         if let Some(host) = inline_host_session(core, req.session_id(), Some(dir)).await {
-            let Some(block) = self.kind.interaction_block(self, req, dir).await else {
-                return false;
-            };
-            let pushed = {
-                let mut cards = core.cards.lock().await;
-                cards
-                    .get_mut(&host)
-                    .map(|c| c.acc.add_interaction(block))
-                    .unwrap_or(false)
-            };
+            let pushed = self
+                .kind
+                .add_inline(self, &core.cards_handle(), &host, req, dir)
+                .await;
             if pushed {
                 tracing::info!(
                     "{} {} inlined on session {} card",
@@ -1770,7 +1705,7 @@ impl RequestFlow {
                 // Flush so the inline section appears NOW — the render loop
                 // only flushes on new parts, and a blocked prompt produces
                 // none.
-                crate::bridge::turn::Turn::flush_card(&core.cards_handle(), &host).await;
+                Turn::flush_card(&core.cards_handle(), &host).await;
             }
             return false;
         }
@@ -1828,32 +1763,31 @@ impl RequestFlow {
         };
         {
             let cards = core.cards.lock().await;
-            let Some(card) = cards.get(&host) else { return };
-            // The accumulator still carries the block (its own flush owns the
-            // current card), or the handle already names that card: nothing to
-            // move.
-            if card.acc.interaction(id).is_some()
-                || card.card_message_id.as_deref() == Some(old_message.as_str())
-            {
+            if !cards.contains_key(&host) {
                 return;
             }
         }
-        let Some(block) = self.kind.interaction_block(self, req, dir).await else {
+        // The accumulator still carries the block (its own flush owns the
+        // current card), or the handle already names that card: nothing to
+        // move.
+        if Turn::has_interaction_in(&core.cards_handle(), &host, id).await
+            || Turn::card_message_id(&core.cards_handle(), &host)
+                .await
+                .as_deref()
+                == Some(old_message.as_str())
+        {
             return;
-        };
-        let pushed = {
-            let mut cards = core.cards.lock().await;
-            cards
-                .get_mut(&host)
-                .map(|c| c.acc.add_interaction(block))
-                .unwrap_or(false)
-        };
+        }
+        let pushed = self
+            .kind
+            .add_inline(self, &core.cards_handle(), &host, req, dir)
+            .await;
         if !pushed {
             return;
         }
         // Flush first: the current card renders the block and the handle moves
         // with it.
-        crate::bridge::turn::Turn::flush_card(&core.cards_handle(), &host).await;
+        Turn::flush_card(&core.cards_handle(), &host).await;
         tracing::info!(
             "{} {} re-hosted on session {} card (old {})",
             self.kind.label(),
@@ -1916,7 +1850,7 @@ impl RequestFlow {
         // card — the streaming card re-renders itself on the next poll.
         let host = if claimed_message.is_some() {
             None
-        } else if core.cards.lock().await.contains_key(session_id) {
+        } else if Turn::has_card(&core.cards_handle(), session_id).await {
             Some(session_id.to_string())
         } else {
             inline_host_session(core, session_id, directory).await
@@ -2212,33 +2146,12 @@ pub(crate) async fn resolve_blocks(
     //    card's header: a flush that ran after this resolution rebuilt the
     //    card without this block's span, so `resolve_on` finds nothing and
     //    the ack falls back to a fresh rebuild.
-    let post_resolution_header = {
-        let mut cards = cards.cards.lock().await;
-        if let Some(acc) = cards
-            .get_mut(host.as_deref().unwrap_or(session_id))
-            .map(|c| &mut c.acc)
-        {
-            let mut resolved_here = false;
-            for id in ids {
-                let resolved = match &residue {
-                    Residue::PerBlock(line) => {
-                        acc.resolve_interaction(id, |block| line(&block.receipt_target()))
-                    }
-                    Residue::Single(_) => acc.dismiss_interaction(id),
-                };
-                resolved_here |= resolved;
-            }
-            // A mode change leaves ONE line for every block it resolved.
-            if let Residue::Single(text) = &residue
-                && resolved_here
-            {
-                acc.push_receipt(text);
-            }
-            resolved_here.then(|| acc.header_title_and_template())
-        } else {
-            None
-        }
+    let residue_mode = match &residue {
+        Residue::PerBlock(line) => crate::bridge::turn::InlineResidue::PerBlock(*line),
+        Residue::Single(text) => crate::bridge::turn::InlineResidue::Single(text),
     };
+    let post_resolution_header =
+        Turn::resolve_interactions(cards, host.as_deref().unwrap_or(session_id), ids, &residue_mode).await;
     // 2. The card handles: every card that rendered one of the blocks is
     //    edited from its cache. The clicked card's edit is the ack; any other
     //    card's edit is patched so its controls do not linger.
@@ -2452,15 +2365,14 @@ async fn refresh_question_block(
     display: &[Option<Vec<String>>],
     done: &[bool],
 ) -> Option<serde_json::Value> {
-    if let Some(acc) = core
-        .cards
-        .lock()
-        .await
-        .get_mut(host.as_deref().unwrap_or(session_id))
-        .map(|c| &mut c.acc)
-    {
-        acc.update_question_state(req_id, display, done);
-    }
+    Turn::update_question_state(
+        &core.cards_handle(),
+        host.as_deref().unwrap_or(session_id),
+        req_id,
+        display,
+        done,
+    )
+    .await;
     let message_id = clicked?;
     let elements = crate::feishu::card::question::question_elements(
         req_id,
@@ -2485,14 +2397,7 @@ async fn inline_ack_card(
     host: &Option<String>,
     session_id: &str,
 ) -> Option<serde_json::Value> {
-    let mut cards = core.cards.lock().await;
-    cards
-        .get_mut(host.as_deref().unwrap_or(session_id))
-        .map(|c| {
-            let mut probe = c.acc.clone();
-            probe.build_card_with_split()
-        })
-        .and_then(|(card, full)| (!full).then_some(card))
+    Turn::ack_card(&core.cards_handle(), host.as_deref().unwrap_or(session_id)).await
 }
 
 /// Deliver the clicked card's updated card in the callback ack (ADR-0038,
@@ -2519,7 +2424,7 @@ async fn ack_inline_card(
 /// fires until the AI resumes — the card would stay frozen on the pre-answer
 /// state. Same reason the question paths flush explicitly.
 async fn flush_inline_card(core: &Arc<SharedCore>, host: &Option<String>, session_id: &str) {
-    crate::bridge::turn::Turn::flush_card(&core.cards_handle(), host.as_deref().unwrap_or(session_id)).await;
+    Turn::flush_card(&core.cards_handle(), host.as_deref().unwrap_or(session_id)).await;
 }
 
 /// Route a question reply/reject to the instance owning the session. The card

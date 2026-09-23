@@ -617,7 +617,7 @@ impl App {
                     &self.cards_handle(),
                     &session_id,
                     &message_id,
-                    crate::bridge::turn::state::SplitKind::Supplement,
+                    crate::bridge::turn::SplitKind::Supplement,
                 )
                 .await;
                 return Ok(());
@@ -1578,28 +1578,12 @@ impl App {
             return None;
         }
         let inflight = { self.inflight.lock().await.contains(&sid) };
-        let ctx = {
-            let cards = self.cards.lock().await;
-            cards.get(&sid).map(|c| {
-                (
-                    c.acc.prompt.clone().unwrap_or_default(),
-                    c.acc.reply_to_message_id.clone().unwrap_or_default(),
-                    c.acc.title.clone(),
-                    c.acc.requester_open_id.clone(),
-                    c.acc.is_group,
-                    c.acc.cola_message_id.clone(),
-                )
-            })
-        };
-        let card_id = {
-            let cards = self.cards.lock().await;
-            cards.get(&sid).and_then(|c| c.card_message_id.clone())
-        };
+        let ctx = crate::bridge::turn::Turn::retry_request(&self.cards_handle(), &sid).await;
         let thread_key = self.sessions.lock().await.thread_for_session(&sid);
         if !inflight
-            && let Some((text, reply_to, subtitle, requester, is_group, cola_message_id)) = ctx
-            && !text.is_empty()
-            && let Some(card_id) = card_id
+            && let Some(ctx) = ctx
+            && !ctx.prompt.is_empty()
+            && let Some(card_id) = ctx.card_message_id
             && let Some(thread_key) = thread_key
         {
             let app = Arc::clone(self);
@@ -1608,16 +1592,16 @@ impl App {
                     .run_prompt(PromptContext {
                         session_id: sid.to_string(),
                         thread_key,
-                        text,
-                        message_id: reply_to,
-                        subtitle,
+                        text: ctx.prompt,
+                        message_id: ctx.reply_to,
+                        subtitle: ctx.subtitle,
                         existing_card_id: Some(card_id),
-                        requester_open_id: requester,
-                        is_group,
+                        requester_open_id: ctx.requester_open_id,
+                        is_group: ctx.is_group,
                         // Reuse the failed attempt's id so the server
                         // deduplicates — the retry is the same logical user
                         // message (ADR-0026).
-                        cola_message_id,
+                        cola_message_id: ctx.cola_message_id,
                         images: Vec::new(),
                     })
                     .await

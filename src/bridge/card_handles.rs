@@ -1,7 +1,17 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::bridge::snapshot_claims::ClaimKind;
-use crate::bridge::turn::state::{BlockSpan, InteractionBlock};
+
+/// The body-element range one live interaction block occupies on a built card.
+/// Recorded at render time so the card handle can resolve or refresh the block
+/// in place on the cached JSON, long after the accumulator that rendered it is
+/// gone (ADR-0038, rule 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockSpan {
+    pub request_id: String,
+    pub start: usize,
+    pub end: usize,
+}
 
 /// One live interaction block as rendered onto a card: its element range plus
 /// what the registry must remember about it so it stays resolvable after the
@@ -15,26 +25,6 @@ pub struct RenderedBlock {
     pub directory: String,
     /// Compact one-line receipt target, recorded from the block at render time.
     pub target: String,
-}
-
-impl RenderedBlock {
-    /// The registry record of `block` for the span its elements occupy.
-    pub fn of(span: &BlockSpan, block: &InteractionBlock) -> Option<Self> {
-        let kind = match block {
-            InteractionBlock::Permission(_) => ClaimKind::Permission,
-            InteractionBlock::Question(_) => ClaimKind::Question,
-            InteractionBlock::Receipt(_) => return None,
-        };
-        Some(Self {
-            request_id: span.request_id.clone(),
-            start: span.start,
-            end: span.end,
-            kind,
-            session_id: block.session_id().to_string(),
-            directory: block.directory().to_string(),
-            target: block.receipt_target(),
-        })
-    }
 }
 
 /// A card handle: which card shows a live block, and what resolving it needs

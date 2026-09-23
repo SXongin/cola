@@ -62,6 +62,27 @@ pub fn build_permission_card(
     card_shell("🔐 权限请求", "orange", elements)
 }
 
+/// Compact one-line target for a question's Interaction Receipt: each
+/// question's header (or a clipped question text), joined, clipped to stay a
+/// residue (ADR-0038, rule 4). Shared by the inline block's receipt and the
+/// standalone-card path that names the same request.
+pub(crate) fn question_target(questions: &[crate::opencode::types::QuestionInfo]) -> String {
+    super::truncate_md(
+        &questions
+            .iter()
+            .map(|qi| {
+                if qi.header.is_empty() {
+                    super::truncate_md(&qi.question, 24)
+                } else {
+                    qi.header.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("、"),
+        60,
+    )
+}
+
 /// A one-line-per-question summary of a `question` request, for the stale card.
 pub fn question_summary(questions: &[crate::opencode::types::QuestionInfo]) -> String {
     let mut s = String::new();
