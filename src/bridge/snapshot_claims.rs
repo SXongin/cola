@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::bridge::handles::{CardsHandle, RequestsHandle};
-use crate::bridge::request::PendingRequest;
+use crate::bridge::request::kind::PendingRequest;
 use crate::bridge::snapshot::SnapshotData;
 use crate::bridge::turn::Turn;
 use crate::feishu::snapshot_card::SnapshotQuestionState;
@@ -13,6 +13,16 @@ use crate::feishu::snapshot_card::SnapshotQuestionState;
 pub enum ClaimKind {
     Permission,
     Question,
+}
+
+impl ClaimKind {
+    /// The kind's label for logs ("permission" / "question").
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            ClaimKind::Permission => "permission",
+            ClaimKind::Question => "question",
+        }
+    }
 }
 
 /// The rebuild state of one snapshot card that claims adopt-time pendings
@@ -107,11 +117,7 @@ impl SnapshotClaims {
                 "snapshot {} claims {} {} on session {}",
                 message_id,
                 req.id(),
-                if kind == ClaimKind::Permission {
-                    "permission"
-                } else {
-                    "question"
-                },
+                kind.label(),
                 req.session_id()
             );
         }
@@ -213,7 +219,7 @@ impl SnapshotClaims {
                 .pending
                 .iter()
                 .filter(|req| resolved.iter().any(|id| id == req.id()))
-                .map(crate::bridge::request::snapshot_handled_elsewhere_receipt)
+                .map(crate::bridge::request::kind::snapshot_handled_elsewhere_receipt)
                 .collect();
             if let Some(host) = self.hosts.get_mut(message_id) {
                 host.receipts.extend(lines);
@@ -259,23 +265,14 @@ pub(crate) async fn is_already_surfaced(
     cards: &CardsHandle,
     req: &PendingRequest,
 ) -> bool {
-    match req {
-        PendingRequest::Permission(p) => {
-            if requests
-                .permission
-                .sent_cards
-                .lock()
-                .await
-                .contains_key(&p.request_id)
-            {
-                return true;
-            }
-        }
-        PendingRequest::Question(q) => {
-            if requests.question.sent_cards.lock().await.contains_key(&q.id) {
-                return true;
-            }
-        }
+    if requests
+        .flow_for(req.claim_kind())
+        .sent_cards
+        .lock()
+        .await
+        .contains_key(req.id())
+    {
+        return true;
     }
     if requests.snapshot_claims.lock().await.contains(req.id()) {
         return true;
@@ -326,9 +323,10 @@ pub(crate) async fn claim_snapshot_pendings(
         .await
         .claim(snapshot_message_id, verb, title, data);
     for req in &data.pending {
-        if let PendingRequest::Question(q) = req {
-            requests.question.remember_question(q, &data.directory).await;
-        }
+        requests
+            .flow_for(req.claim_kind())
+            .remember_surfaced(req, &data.directory)
+            .await;
     }
 }
 

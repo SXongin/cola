@@ -1,6 +1,4 @@
-use crate::bridge::request::describe_permission;
 use crate::bridge::snapshot::{SnapshotData, TailEntry};
-use crate::feishu::card::question::{permission_buttons, question_elements};
 use crate::opencode;
 use serde_json::json;
 
@@ -61,41 +59,6 @@ pub struct QuestionBlockState {
 }
 
 pub type SnapshotQuestionState = std::collections::HashMap<String, QuestionBlockState>;
-
-/// The body elements for one adopt-time pending request, embedded on the
-/// snapshot so it looks and behaves like today's inline card sections
-/// (`🔐 权限请求` + its four buttons; question options) — nothing re-implemented.
-fn pending_block_elements(
-    req: &crate::bridge::request::PendingRequest,
-    directory: &str,
-    question_state: &SnapshotQuestionState,
-) -> Vec<serde_json::Value> {
-    match req {
-        crate::bridge::request::PendingRequest::Permission(p) => {
-            let body = describe_permission(p);
-            let sid = p.session_id.as_deref().unwrap_or("");
-            let body = crate::feishu::card::sanitize::CardMarkdown::new().clean(&body);
-            let mut els = vec![json!({ "tag": "markdown", "content": format!("🔐 **权限请求**\n{body}") })];
-            els.extend(permission_buttons(sid, &p.request_id, &body, directory));
-            els
-        }
-        crate::bridge::request::PendingRequest::Question(q) => {
-            let n = q.questions.len();
-            let state = question_state.get(&q.id).cloned().unwrap_or(QuestionBlockState {
-                display: vec![None; n],
-                done: vec![false; n],
-            });
-            question_elements(
-                &q.id,
-                &q.session_id,
-                &q.questions,
-                directory,
-                &state.display,
-                &state.done,
-            )
-        }
-    }
-}
 
 /// The 最近对话 panel: the last-four tail entries, each role-marked and shown
 /// folded — its header previews the entry briefly and expanding reveals the
@@ -206,7 +169,7 @@ pub fn build_snapshot_card_with_state(
         if i > 0 {
             elements.push(json!({ "tag": "hr" }));
         }
-        elements.extend(pending_block_elements(req, &data.directory, question_state));
+        elements.extend(req.snapshot_block_elements(&data.directory, question_state));
     }
     for line in receipts {
         elements.push(json!({ "tag": "markdown", "content": line }));
@@ -240,7 +203,7 @@ pub fn build_switched_state_card(title: &str, session_id: &str, directory: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::request::PendingRequest;
+    use crate::bridge::request::kind::PendingRequest;
     use crate::bridge::snapshot::SnapshotData;
     use crate::opencode::types::{PermissionRequest, QuestionInfo, QuestionOption, QuestionRequest};
 

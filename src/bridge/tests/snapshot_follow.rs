@@ -249,7 +249,7 @@ async fn adopt_skips_already_surfaced_pending() {
     // The request was already surfaced as a standalone card.
     app.permission.sent_cards.lock().await.insert(
         "per_1".into(),
-        crate::bridge::request::SentCard {
+        crate::bridge::request::flow::SentCard {
             message_id: "om_existing".into(),
             summary: "bash".into(),
             directory: "/work/ext".into(),

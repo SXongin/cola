@@ -2083,9 +2083,9 @@ pub(crate) struct FailedDirSurfaces {
     /// The snapshot host's Message id; the claim rides `claim`.
     pub snapshot_message_id: &'static str,
     /// The request inlined on the streaming card, seeded onto it by the rig.
-    pub inline_request: crate::bridge::request::PendingRequest,
+    pub inline_request: crate::bridge::request::kind::PendingRequest,
     /// The request embedded (and claimed) by the snapshot card.
-    pub claim: crate::bridge::request::PendingRequest,
+    pub claim: crate::bridge::request::kind::PendingRequest,
 }
 
 /// Seed `request` as an inline block on `session_id`'s card, kind-agnostically —
@@ -2093,10 +2093,10 @@ pub(crate) struct FailedDirSurfaces {
 async fn seed_inline_request(
     cards: &crate::bridge::handles::CardsHandle,
     session_id: &str,
-    request: &crate::bridge::request::PendingRequest,
+    request: &crate::bridge::request::kind::PendingRequest,
     directory: &str,
 ) {
-    use crate::bridge::request::PendingRequest;
+    use crate::bridge::request::kind::PendingRequest;
     match request {
         PendingRequest::Permission(p) => {
             Turn::add_permission(cards, session_id, p, directory).await;
@@ -2121,7 +2121,7 @@ async fn seed_inline_request(
 /// pick the kind; `surfaces` carries its kind-specific fixtures.
 pub(crate) async fn assert_failed_dir_keeps_surfaces(
     app: &Arc<App>,
-    flow: &crate::bridge::request::RequestFlow,
+    flow: &crate::bridge::request::flow::RequestFlow,
     hang: &std::sync::atomic::AtomicUsize,
     platform: &Arc<RecordingPlatform>,
     surfaces: FailedDirSurfaces,
@@ -2133,7 +2133,7 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
     // One live surface per request, all owned by the failing directory /work.
     flow.sent_cards.lock().await.insert(
         surfaces.card_id.into(),
-        crate::bridge::request::SentCard {
+        crate::bridge::request::flow::SentCard {
             message_id: surfaces.card_message_id.into(),
             summary: "待处理的请求".into(),
             directory: "/work".into(),

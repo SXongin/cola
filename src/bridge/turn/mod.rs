@@ -469,7 +469,7 @@ impl Turn {
         // pending, and a request that outlived a healthy turn (external or
         // concurrent work) is not this turn's to deny.
         if prompt_err.is_some() {
-            crate::bridge::request::reject_leftovers_for_turn(
+            crate::bridge::request::flow::reject_leftovers_for_turn(
                 &handles.requests,
                 &handles.cards,
                 &handles.sessions,
@@ -1162,8 +1162,8 @@ impl Turn {
         let block = state::InteractionBlock::Permission(state::PendingPermission {
             session_id: p.session_id.clone().unwrap_or_default(),
             request_id: p.request_id.clone(),
-            body: crate::bridge::request::describe_permission(p),
-            target: crate::bridge::request::permission_target(p),
+            body: crate::bridge::request::kind::describe_permission(p),
+            target: crate::bridge::request::kind::permission_target(p),
             directory: directory.to_string(),
         });
         match cards.cards.lock().await.get_mut(session_id) {

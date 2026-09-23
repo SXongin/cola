@@ -73,10 +73,10 @@ pub struct SharedCore {
     pub card_handles: Arc<Mutex<crate::bridge::card_handles::CardHandles>>,
     /// Permission flow: owns `sent_cards`, polls pending requests, auto-accepts
     /// for `/autoaccept` sessions, and handles the "perm" card action.
-    pub permission: Arc<crate::bridge::request::RequestFlow>,
+    pub permission: Arc<crate::bridge::request::flow::RequestFlow>,
     /// Question flow: owns `sent_cards` + the question kind's request/partial
     /// state, polls pending questions, and handles the "question" card action.
-    pub question: Arc<crate::bridge::request::RequestFlow>,
+    pub question: Arc<crate::bridge::request::flow::RequestFlow>,
     /// External-message flow: owns `last_user_msg_epoch`, notifies Feishu when
     /// another shared-store client posts while cola is idle, and arms the
     /// external-reply renderers (including the busy-adopt follow, ADR-0028).
@@ -190,11 +190,11 @@ impl SharedCore {
             sessions: Arc::new(Mutex::new(session_store)),
             cards: Arc::new(Mutex::new(HashMap::new())),
             card_handles: Arc::new(Mutex::new(crate::bridge::card_handles::CardHandles::default())),
-            permission: Arc::new(crate::bridge::request::RequestFlow::new(Box::new(
-                crate::bridge::request::PermissionKind,
+            permission: Arc::new(crate::bridge::request::flow::RequestFlow::new(Box::new(
+                crate::bridge::request::kind::PermissionKind,
             ))),
-            question: Arc::new(crate::bridge::request::RequestFlow::new(Box::new(
-                crate::bridge::request::QuestionKind,
+            question: Arc::new(crate::bridge::request::flow::RequestFlow::new(Box::new(
+                crate::bridge::request::kind::QuestionKind,
             ))),
             external: Arc::new(crate::bridge::external::ExternalFlow::new()),
             snapshot_claims: Arc::new(Mutex::new(
@@ -510,7 +510,7 @@ impl SharedCore {
     /// surfaced, so enabling autoaccept would otherwise leave old cards hanging
     /// forever. Returns the ids of the requests that were approved.
     pub(crate) async fn approve_pending_for_session(&self, session_id: &str, directory: &str) -> Vec<String> {
-        crate::bridge::request::approve_pending_for_session(
+        crate::bridge::request::kind::approve_pending_for_session(
             &self.sessions_handle(),
             &self.requests_handle(),
             &self.opencode,
@@ -630,7 +630,7 @@ mod tests {
             .unwrap();
         assert_eq!(app.get_session_id(&key).await.as_deref(), Some("ses_a"));
 
-        crate::bridge::request::set_auto_accept(
+        crate::bridge::request::kind::set_auto_accept(
             &app.sessions_handle(),
             &app.requests_handle(),
             &app.opencode,

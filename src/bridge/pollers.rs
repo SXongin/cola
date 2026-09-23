@@ -5,7 +5,7 @@ use tokio::sync::Mutex;
 use crate::bridge::discovery::{self, ServerCandidate};
 use crate::bridge::handler::CardActionResult;
 use crate::bridge::handles::{CardsHandle, PollHandles, RequestsHandle, SessionsHandle, WaitsHandle};
-use crate::bridge::request::SentCard;
+use crate::bridge::request::flow::SentCard;
 use crate::bridge::turn::Turn;
 use crate::config::ServerStartPolicy;
 use crate::opencode;

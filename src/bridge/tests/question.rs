@@ -1249,8 +1249,10 @@ async fn failed_directory_list_keeps_question_surfaces() {
             card_message_id: "om_card",
             inline_id: "que_inline",
             snapshot_message_id: "om_snapshot",
-            inline_request: crate::bridge::request::PendingRequest::Question(question_request("que_inline")),
-            claim: crate::bridge::request::PendingRequest::Question(question_request("que_claim")),
+            inline_request: crate::bridge::request::kind::PendingRequest::Question(question_request(
+                "que_inline",
+            )),
+            claim: crate::bridge::request::kind::PendingRequest::Question(question_request("que_claim")),
         },
     )
     .await;

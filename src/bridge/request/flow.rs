@@ -18,11 +18,10 @@ use crate::bridge::question::{QuestionState, stale_question_card};
 use crate::bridge::turn::Turn;
 use crate::opencode;
 
-use super::RequestKind;
 use super::delivery::{
     Origin, Residue, already_handled_result, denied_receipt, handled_elsewhere_receipt, resolve_blocks,
 };
-use super::kind::PendingRequest;
+use super::kind::{PendingRequest, RequestKind};
 
 /// A request card cola sent: the live Message id, the summary shown when the
 /// card is marked stale, and the owning directory. The directory lets the
@@ -155,6 +154,17 @@ impl RequestFlow {
         self.question_state.lock().await.get_mut(req_id).map(f)
     }
 
+    /// Read the whole question-state map under ONE lock — the question kind's
+    /// snapshot contribution needs a single consistent moment (ADR-0028), the
+    /// way the old inline loop held the lock across every pending block.
+    pub(crate) async fn with_question_states<R>(
+        &self,
+        f: impl FnOnce(&HashMap<String, QuestionState>) -> R,
+    ) -> R {
+        let states = self.question_state.lock().await;
+        f(&states)
+    }
+
     /// The remembered question request, cloned for a card rebuild.
     pub(crate) async fn question_request(&self, req_id: &str) -> Option<opencode::types::QuestionRequest> {
         self.question_state
@@ -210,28 +220,34 @@ impl RequestFlow {
         Some((state.request().questions.clone(), answers))
     }
 
-    /// The live answer state (display + done flags) of the question requests
-    /// among `pending`, for a snapshot re-render after an interaction — the
-    /// 已选/✅ markers the standalone question cards show.
+    /// The live state the kind contributes to a Session Snapshot re-render
+    /// after an interaction (ADR-0028) — the 已选/✅ markers the standalone
+    /// question cards show. The contribution is the kind's; a kind with no
+    /// snapshot state contributes nothing.
     pub(crate) async fn live_snapshot_state(
         &self,
         pending: &[PendingRequest],
     ) -> crate::feishu::snapshot_card::SnapshotQuestionState {
-        let states = self.question_state.lock().await;
-        let mut out = crate::feishu::snapshot_card::SnapshotQuestionState::new();
-        for req in pending {
-            if let PendingRequest::Question(q) = req {
-                let (_, display, done) = match states.get(&q.id) {
-                    Some(state) => state.merge(),
-                    None => (0, vec![None; q.questions.len()], vec![false; q.questions.len()]),
-                };
-                out.insert(
-                    q.id.clone(),
-                    crate::feishu::snapshot_card::QuestionBlockState { display, done },
-                );
-            }
-        }
-        out
+        self.kind.snapshot_state(self, pending).await
+    }
+
+    /// Let the kind remember a request surfaced without the poll loop (a
+    /// Session Snapshot claim or a busy-follow host), so its block's buttons
+    /// still resolve. A kind with no in-flight state has nothing to remember.
+    pub(crate) async fn remember_surfaced(&self, req: &PendingRequest, dir: &str) {
+        self.kind.remember_surfaced(self, req, dir).await;
+    }
+
+    /// Seed this kind's inline block on a new host card with its initial
+    /// state — the busy-follow host path (`start_snapshot_follow`).
+    pub(crate) async fn add_initial_inline(
+        &self,
+        cards: &CardsHandle,
+        host: &str,
+        req: &PendingRequest,
+        dir: &str,
+    ) -> bool {
+        self.kind.add_initial_inline(self, cards, host, req, dir).await
     }
 
     /// The result for a click whose question state is gone (#130). It never
@@ -344,10 +360,7 @@ impl RequestFlow {
             if requests.snapshot_claims.lock().await.contains(req.id()) {
                 continue;
             }
-            let result = match req {
-                PendingRequest::Permission(p) => dir_backend.reply_permission(&p.request_id, "reject").await,
-                PendingRequest::Question(q) => dir_backend.reject_question(&q.id).await,
-            };
+            let result = self.kind.reject(self, &dir_backend, req).await;
             match result {
                 Ok(()) => {
                     tracing::info!(
@@ -356,11 +369,6 @@ impl RequestFlow {
                         req.id(),
                         sid
                     );
-                    if let PendingRequest::Question(q) = req {
-                        // The reply landed: drop the in-flight state like a
-                        // reject click does, so nothing serves stale answers.
-                        self.remove_question(&q.id).await;
-                    }
                     rejected.push(req.id().to_string());
                 }
                 // Resolved elsewhere in the meantime: the sweep's next pass

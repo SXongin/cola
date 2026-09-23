@@ -453,31 +453,13 @@ impl ExternalFlow {
         // prevents a duplicate, and clicking one takes the normal inline path —
         // resolved sections are stripped and the run resumes into the same card.
         for req in &data.pending {
-            match req {
-                crate::bridge::request::PendingRequest::Permission(p) => {
-                    Turn::add_permission(&handles.cards, session_id, p, &data.directory).await;
-                }
-                crate::bridge::request::PendingRequest::Question(q) => {
-                    Turn::add_question(
-                        &handles.cards,
-                        session_id,
-                        q,
-                        &data.directory,
-                        &vec![None; q.questions.len()],
-                        &vec![false; q.questions.len()],
-                    )
-                    .await;
-                    // Remember the full question request (like the static
-                    // claim path): the poll loop never sees follow-hosted
-                    // requests, so `prepare()` never runs for them and the
-                    // block's buttons would resolve to nothing.
-                    handles
-                        .requests
-                        .question
-                        .remember_question(q, &data.directory)
-                        .await;
-                }
-            }
+            let flow = handles.requests.flow_for(req.claim_kind());
+            flow.add_initial_inline(&handles.cards, session_id, req, &data.directory)
+                .await;
+            // Remember the full request (like the static claim path): the poll
+            // loop never sees follow-hosted requests, so `prepare()` never runs
+            // for them and the block's buttons would resolve to nothing.
+            flow.remember_surfaced(req, &data.directory).await;
         }
         tracing::info!("snapshot follow armed for session {}", session_id);
 
