@@ -38,10 +38,14 @@ not re-open a full `SharedCore` teardown.
 - **Lock ownership is part of each handle's interface.** The type-level docs
   state which locks a handle owns and the ordering: the server lock is outermost
   and is never taken under a handle lock; a card write holds the session's
-  `write_lock` across the whole read-send-record sequence; `cards`,
-  `card_handles` and a flow's `sent_cards` are taken one at a time and never
-  nested; the claim sets are held briefly and never across a backend or Feishu
-  call.
+  `write_lock` across the whole read-send-record sequence (`flush_card`,
+  `split_card_chain`, `resolve_blocks`); `cards`, `card_handles` and a flow's
+  `sent_cards` are taken one at a time and never nested; the claim sets are held
+  briefly and never across a backend or Feishu call. The one deliberate
+  exception is the reminder and message-pin inner mutexes: each is held across
+  its own platform call (`set_instant_reminder`, `pin_message`/`unpin_message`)
+  because the decision, the call and the state update are one transition, with
+  the failure latch updated inside the guard.
 - **Behavior is unchanged.** The work is a mechanical re-plumbing of call sites;
   the test-name set is identical before and after.
 
