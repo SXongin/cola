@@ -24,7 +24,7 @@ keeps the plan size and status counts readable.
   operator's choice. Whatever state survives an update is the client's own.
 - **Position is not stable; identity is.** The timeline is ordered by server part
   time, and a part rendered late is inserted at its key's position
-  (`insert_kind`, `src/bridge/streaming.rs:641-661`) — an item's index can change
+  (`insert_kind`, `src/bridge/turn/state.rs:845`) — an item's index can change
   after it was first rendered. Each entry does have a stable identity:
   `TimelineItem::seq`, assigned once at insertion.
 - **Observed failure.** Expanding the todo tail collapsed it as soon as a new
@@ -38,7 +38,7 @@ keeps the plan size and status counts readable.
   element-level update API; the message-PATCH path remains the single
   card-update mechanism.
 - **Retry reuses a card.** A retry re-renders the same message from a fresh
-  `StreamAccumulator` (`src/bridge/turn.rs:117-146`), so `seq` restarts on it.
+  `StreamAccumulator` (`src/bridge/turn/state.rs:342`), so `seq` restarts on it.
 
 ## Decision
 
@@ -46,12 +46,12 @@ keeps the plan size and status counts readable.
 timeline entry it renders.**
 
 - Tool and reasoning panels: `tool_{seq}` / `reason_{seq}`
-  (`build_card_inner`, `src/bridge/streaming.rs:957-973`).
-- The todo tail: the fixed `todo` (`src/bridge/streaming.rs:1001`) — it renders
+  (`build_card_inner`, `src/bridge/turn/state.rs:1242-1256`).
+- The todo tail: the fixed `todo` (`src/bridge/turn/state.rs:1284`) — it renders
   once per card in the tail and is not a timeline entry.
 - The Session Snapshot's 最近对话 panels: `snap_{i}` — that card is sent once but
   rebuilt in place on a claim ack and on remote resolution
-  (`SnapshotClaims::rebuild`, `src/bridge/snapshot_claims.rs:123-139`), its tail
+  (`SnapshotClaims::rebuild`, `src/bridge/snapshot_claims.rs:129-144`), its tail
   order is fixed, so the entry index is a stable id.
 - `seq` is assigned once per accumulator, in `insert_kind`, and never reused or
   renumbered within it.
