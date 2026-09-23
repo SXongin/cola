@@ -234,14 +234,35 @@ async fn reconcile(
 /// for idle sessions — Lazy Start is the demand path — but heals a server that
 /// died while a turn was in flight (`heal_when_busy`), so a mid-stream
 /// generation's next poll finds a live server.
+///
+/// The [`PollLoop`] seam owns the cadence; the loop has no serverless guard —
+/// a server must be able to APPEAR (attach) as well as disappear, so every
+/// tick reconciles.
+///
+/// [`PollLoop`]: crate::bridge::poll::PollLoop
 pub(crate) async fn reconnect_poll_loop(handles: &PollHandles) -> crate::error::Result<()> {
-    loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(RECONNECT_POLL_INTERVAL_SECS)).await;
-        let _guard = handles.server.lock.lock().await;
-        if let Err(e) = reconcile(handles, false, true).await {
-            tracing::warn!("server reconcile failed: {}", e);
-        }
-    }
+    let cadence_ms = std::sync::atomic::AtomicU64::new(RECONNECT_POLL_INTERVAL_SECS * 1_000);
+    let mut poll = reconnect_loop(&cadence_ms);
+    poll.poll(
+        || true,
+        move || async move {
+            let _guard = handles.server.lock.lock().await;
+            if let Err(e) = reconcile(handles, false, true).await {
+                tracing::warn!("server reconcile failed: {}", e);
+            }
+            Ok(())
+        },
+    )
+    .await
+}
+
+/// The reconnect loop's [`PollLoop`]: the production condition name, wired to
+/// the injected cadence. Split out so the loop's construction is named once
+/// and its ticks can be driven without scanning the real process table.
+///
+/// [`PollLoop`]: crate::bridge::poll::PollLoop
+fn reconnect_loop(cadence_ms: &std::sync::atomic::AtomicU64) -> crate::bridge::poll::PollLoop<'_> {
+    crate::bridge::poll::PollLoop::new(cadence_ms, "server reconcile")
 }
 
 /// Lazy Start hook (ADR-0013): called at the moment a message needs a server.
