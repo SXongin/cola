@@ -1126,6 +1126,51 @@ async fn topic_adopt_opens_topic_around_existing_session() {
     assert!(app.sessions.lock().await.get_active(&lobby_key).is_none());
 }
 
+/// Re-mapping a session into a topic keeps its per-session overrides: the
+/// topic adopt rebuilds the entry, but auto-accept/model/variant belong to
+/// the session, not to the lobby mapping being left behind.
+#[tokio::test]
+async fn topic_adopt_keeps_per_session_overrides() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.session_list = vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)];
+    let (app, _platform) = build_app(cfg, backend).await;
+    let lobby_key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    let mut own = crate::config::SessionEntry::new(lobby_key.clone(), "ses_own1", "/work/cola");
+    own.model = Some("provider/model-a".into());
+    own.variant = Some("high".into());
+    own.auto_accept = true;
+    seed_entry(&app, own).await;
+
+    crate::bridge::command::handle_command(
+        &app.core,
+        Command::TopicAdopt {
+            keyword: "本项目".into(),
+            force: false,
+        },
+        lobby_key,
+        "msg_topic_adopt",
+        crate::config::ConversationKind::P2p,
+    )
+    .await
+    .unwrap();
+
+    let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
+    let entry = app
+        .sessions
+        .lock()
+        .await
+        .get_active(&topic_key)
+        .cloned()
+        .expect("topic thread_id should map to the adopted session");
+    assert_eq!(entry.session_id, "ses_own1");
+    assert!(entry.auto_accept, "auto-accept survives the topic adopt");
+    assert_eq!(entry.model.as_deref(), Some("provider/model-a"));
+    assert_eq!(entry.variant.as_deref(), Some("high"));
+}
+
 /// `/topic --adopt` rejects a child (sub-task) session.
 #[tokio::test]
 async fn topic_adopt_rejects_child_session() {
