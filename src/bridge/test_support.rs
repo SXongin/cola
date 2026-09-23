@@ -1829,6 +1829,13 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureBuffer {
     }
 }
 
+/// The level the fmt layer rendered on a captured line — the token after the
+/// timestamp (`INFO`, `DEBUG`, `WARN`, …). Lets a test pin a line's level,
+/// which the capture's TRACE-wide filter would otherwise hide.
+pub(crate) fn line_level(line: &str) -> &str {
+    line.split_whitespace().nth(1).unwrap_or("")
+}
+
 /// Run `body` under a captured subscriber and return its output plus every log
 /// line it emitted.
 ///

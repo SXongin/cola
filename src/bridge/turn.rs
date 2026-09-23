@@ -111,6 +111,10 @@ pub(crate) struct Turn {
     /// Notice: a turn that ran past the threshold notifies on completion even
     /// in p2p (ADR-0043 amendment 2026-09-21).
     started_at: std::time::Instant,
+    /// The stopped-finalization line is logged once per Turn (ADR-0048): both
+    /// the post-prompt drain and its pre-finalization re-check observe the
+    /// same sticky `/stop` marker, so the second observation must stay silent.
+    stop_finalization_logged: bool,
 }
 
 impl Turn {
@@ -315,6 +319,7 @@ impl Turn {
             directory: session_dir,
             turn_variant: None,
             started_at: std::time::Instant::now(),
+            stop_finalization_logged: false,
         }))
     }
 
@@ -670,7 +675,7 @@ impl Turn {
     /// and — when it must — render the very snapshot the decision was made
     /// from, so the live card follows the new Turn. `None` means the Backend
     /// read failed (unknown state).
-    async fn drain_tick(&self, app: &Arc<App>, timeout_ms: u64) -> Option<DrainState> {
+    async fn drain_tick(&mut self, app: &Arc<App>, timeout_ms: u64) -> Option<DrainState> {
         let msgs = self.drain_messages(app, timeout_ms).await?;
         match self.drain_state(app, &msgs, timeout_ms).await {
             DrainState::Settled => Some(DrainState::Settled),
@@ -687,14 +692,18 @@ impl Turn {
     /// assistant reply after it. `msgs` is the snapshot the caller just read.
     /// The Supplement is classified before the run state so the re-check can
     /// tell the racing Supplement apart from a session that is merely busy.
-    async fn drain_state(&self, app: &Arc<App>, msgs: &[SessionMessage], timeout_ms: u64) -> DrainState {
+    async fn drain_state(&mut self, app: &Arc<App>, msgs: &[SessionMessage], timeout_ms: u64) -> DrainState {
         // `/stop` interrupted this session's run: no answer is coming, so the
         // drain must end promptly instead of waiting out its bound on a
         // Supplement the abort left unanswered (no rendering may continue once
         // the session is stopped). The marker is cleared by the next Turn's
-        // `start`.
+        // `start`. The finalization is logged once per Turn: the drain and the
+        // re-check that follows it both read the same sticky marker.
         if app.stopped_sessions.lock().await.contains(&self.session_id) {
-            tracing::info!("turn drain: session {} was stopped; finalizing", self.session_id);
+            if !self.stop_finalization_logged {
+                self.stop_finalization_logged = true;
+                tracing::info!("turn drain: session {} was stopped; finalizing", self.session_id);
+            }
             return DrainState::Settled;
         }
         // Capture the turn's server-time anchor from this snapshot if the

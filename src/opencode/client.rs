@@ -303,7 +303,9 @@ impl Client {
             .await?;
         if resp.status().is_success() {
             let text_body = resp.text().await?;
-            tracing::info!("prompt response: {}", &text_body[..text_body.len().min(500)]);
+            // ADR-0048: the prompt-response body is a full payload dump — DEBUG
+            // only. The Turn's own lines are what an INFO trace reads for.
+            tracing::debug!("prompt response: {}", &text_body[..text_body.len().min(500)]);
             let parsed: serde_json::Value = serde_json::from_str(&text_body).map_err(|e| {
                 crate::error::BridgeError::OpenCode(format!(
                     "prompt decode: {e} — body: {}",
@@ -936,6 +938,50 @@ mod wire_tests {
         assert_eq!(body["variant"], "high");
         assert_eq!(body["agent"], "build");
         assert_eq!(body["messageID"], "msg_cola_abc");
+    }
+
+    /// ADR-0048: a successful prompt's response body is a full payload dump —
+    /// DEBUG, never INFO. The body still parses; only its level moved.
+    #[tokio::test]
+    async fn prompt_response_body_is_dumped_at_debug_not_info() {
+        let server = TestHttpServer::start().await;
+        server.route(
+            "POST",
+            "/session/ses_1/message",
+            200,
+            serde_json::json!({
+                "info": {"id": "msg_a1"},
+                "parts": [{"type": "text", "text": "response body marker"}],
+            })
+            .to_string(),
+        );
+        let client = wire_client(&server, None);
+        let (response, logs) = crate::bridge::test_support::capture_logs(async {
+            client.prompt("ses_1", "hi", &[], None, None, None, None).await
+        })
+        .await;
+        response.unwrap();
+
+        let dump = logs
+            .lines()
+            .find(|line| line.contains("prompt response:"))
+            .unwrap_or_else(|| panic!("no prompt-response dump was captured:\n{logs}"));
+        assert!(
+            dump.contains("response body marker"),
+            "the dump carries the response body: {dump}"
+        );
+        assert_eq!(
+            crate::bridge::test_support::line_level(dump),
+            "DEBUG",
+            "the response-body dump must be DEBUG: {dump}"
+        );
+        assert!(
+            !logs
+                .lines()
+                .any(|line| crate::bridge::test_support::line_level(line) == "INFO"
+                    && line.contains("prompt response:")),
+            "the response-body dump must never be INFO:\n{logs}"
+        );
     }
 
     #[tokio::test]

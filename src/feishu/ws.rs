@@ -596,7 +596,10 @@ async fn handle_binary_frame(
             async move {
                 let payload = &frame.payload;
                 let payload_str = String::from_utf8_lossy(payload);
-                tracing::info!(
+                // ADR-0048: the whole event is a payload dump — DEBUG only. The
+                // receipt line below stays INFO: it is the session trace's
+                // entry point.
+                tracing::debug!(
                     "WS event payload: {}",
                     &payload_str.chars().take(300).collect::<String>()
                 );
@@ -731,7 +734,10 @@ async fn handle_binary_frame(
             {
                 tracing::warn!("WS response send failed: {}", e);
             } else {
-                tracing::info!("Sent card action ack ({}ms)", started.elapsed().as_millis());
+                // ADR-0048: an ack-timing line is noise — DEBUG, while the
+                // "card action:" receipt above (which action was clicked)
+                // stays INFO (state transition).
+                tracing::debug!("Sent card action ack ({}ms)", started.elapsed().as_millis());
             }
         }
         FrameAction::None => {
@@ -1647,6 +1653,125 @@ mod transport_tests {
         assert!(
             receipt.contains("topic=omt_topic"),
             "the receipt carries the topic: {receipt}"
+        );
+    }
+
+    /// ADR-0048: the full WS event payload is a payload dump — DEBUG, never
+    /// INFO. The receipt line beside it stays INFO: it is the session trace's
+    /// entry point.
+    #[tokio::test]
+    async fn the_ws_event_payload_dump_is_debug_not_info() {
+        let rig = rig().await;
+        let recorder = Arc::new(RecordingSink::default());
+        let sink: Arc<dyn EventSink> = recorder.clone();
+
+        let (_, logs) = crate::bridge::test_support::capture_logs(async {
+            let listener = tokio::spawn({
+                let sink = Arc::clone(&sink);
+                let feishu = Arc::clone(&rig.feishu);
+                let state = Arc::clone(&rig.state);
+                async move { connect_and_listen(&sink, &feishu, &state).await }
+            });
+
+            let mut socket = rig.ws.accept().await;
+            socket
+                .send_binary(event_bytes(&topic_receive_payload(
+                    "e_payload",
+                    chrono::Utc::now().timestamp_millis(),
+                )))
+                .await;
+            let ack = Frame::decode(&socket.next_binary(Duration::from_secs(5)).await).expect("ack decodes");
+            let ack_json: serde_json::Value = serde_json::from_slice(&ack.payload).expect("ack json");
+            assert_eq!(ack_json["code"], 200);
+            wait_for_texts(&recorder, 1).await;
+
+            socket.close().await;
+            let result = tokio::time::timeout(Duration::from_secs(5), listener)
+                .await
+                .expect("listener task did not finish after close")
+                .expect("listener task panicked");
+            assert!(result.is_ok(), "a clean close should end the loop with Ok");
+        })
+        .await;
+
+        let dump = logs
+            .lines()
+            .find(|line| line.contains("WS event payload:"))
+            .unwrap_or_else(|| panic!("no WS payload dump was captured:\n{logs}"));
+        assert!(
+            dump.contains("im.message.receive_v1"),
+            "the dump carries the raw payload: {dump}"
+        );
+        assert_eq!(
+            crate::bridge::test_support::line_level(dump),
+            "DEBUG",
+            "the WS payload dump must be DEBUG: {dump}"
+        );
+        assert!(
+            !logs
+                .lines()
+                .any(|line| crate::bridge::test_support::line_level(line) == "INFO"
+                    && line.contains("WS event payload:")),
+            "the WS payload dump must never be INFO:\n{logs}"
+        );
+    }
+
+    /// ADR-0048: the card-action ack-timing line is noise — DEBUG. The receipt
+    /// that names the clicked action stays INFO (state transition).
+    #[tokio::test]
+    async fn the_card_action_ack_timing_is_debug_not_info() {
+        let rig = rig().await;
+        let recorder = Arc::new(RecordingSink::default());
+        let sink: Arc<dyn EventSink> = recorder.clone();
+
+        let (_, logs) = crate::bridge::test_support::capture_logs(async {
+            let listener = tokio::spawn({
+                let sink = Arc::clone(&sink);
+                let feishu = Arc::clone(&rig.feishu);
+                let state = Arc::clone(&rig.state);
+                async move { connect_and_listen(&sink, &feishu, &state).await }
+            });
+
+            let mut socket = rig.ws.accept().await;
+            socket.send_binary(event_bytes(&card_action_payload())).await;
+            let resp = Frame::decode(&socket.next_binary(Duration::from_secs(5)).await)
+                .expect("card response decodes");
+            let resp_json: serde_json::Value = serde_json::from_slice(&resp.payload).unwrap();
+            assert_eq!(resp_json["code"], 200);
+
+            socket.close().await;
+            let result = tokio::time::timeout(Duration::from_secs(5), listener)
+                .await
+                .expect("listener task did not finish after close")
+                .expect("listener task panicked");
+            assert!(result.is_ok(), "a clean close should end the loop with Ok");
+        })
+        .await;
+
+        let timing = logs
+            .lines()
+            .find(|line| line.contains("Sent card action ack"))
+            .unwrap_or_else(|| panic!("no card-action ack-timing line was captured:\n{logs}"));
+        assert_eq!(
+            crate::bridge::test_support::line_level(timing),
+            "DEBUG",
+            "the ack-timing line must be DEBUG: {timing}"
+        );
+        assert!(
+            !logs
+                .lines()
+                .any(|line| crate::bridge::test_support::line_level(line) == "INFO"
+                    && line.contains("Sent card action ack")),
+            "the ack-timing line must never be INFO:\n{logs}"
+        );
+        let receipt = logs
+            .lines()
+            .find(|line| line.contains("card action: action="))
+            .unwrap_or_else(|| panic!("no card-action receipt was captured:\n{logs}"));
+        assert_eq!(
+            crate::bridge::test_support::line_level(receipt),
+            "INFO",
+            "the card-action receipt stays INFO: {receipt}"
         );
     }
 
