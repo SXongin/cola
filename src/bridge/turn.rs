@@ -112,30 +112,20 @@ pub(crate) struct Turn {
     started_at: std::time::Instant,
 }
 
-/// The span wrapping one Turn's whole lifecycle: `session` and `chat` always,
-/// `topic` only when the conversation lives inside a Topic (a lobby's thread id
-/// is its chat id — that is not a topic). The default fmt layer renders it as
+/// The span wrapping one Turn's trace: `session` and `chat` always, `topic`
+/// only when the conversation lives inside a Topic (a lobby's thread id is its
+/// chat id — that is not a topic). The default fmt layer renders it as
 /// `turn{session=ses_x chat=oc_x}: …`; the span prefix IS the rendering, so no
 /// custom formatter is involved (ADR-0048).
-fn turn_span(session_id: &str, thread_key: &ThreadKey) -> tracing::Span {
+///
+/// `parent` is the span the trace hangs from: `Span::current().id()` for the
+/// Turn's own span, `None` to root one. Rooting is for a span whose ambient
+/// context is the WRONG one — the render poll (its own task, spawned under the
+/// turn's span): a default parent would print the whole chain twice on every
+/// one of its lines (`turn{…}:turn{…}:`).
+fn session_span(session_id: &str, thread_key: &ThreadKey, parent: Option<tracing::Id>) -> tracing::Span {
     let span = tracing::info_span!(
-        "turn",
-        session = %session_id,
-        chat = %thread_key.chat_id,
-        topic = tracing::field::Empty,
-    );
-    record_topic(&span, thread_key);
-    span
-}
-
-/// The render poll's span: the same fields as [`turn_span`], but rooted
-/// (`parent: None`). The poll is spawned while the turn's span is current on
-/// the spawning thread; taking it as the parent would make the fmt layer print
-/// the whole chain twice on every poll line (`turn{…}:turn{…}:`) — the poll is
-/// a separate task, not a nested step of the turn.
-fn render_poll_span(session_id: &str, thread_key: &ThreadKey) -> tracing::Span {
-    let span = tracing::info_span!(
-        parent: None,
+        parent: parent,
         "turn",
         session = %session_id,
         chat = %thread_key.chat_id,
@@ -158,11 +148,12 @@ impl Turn {
     /// on a stale mapping) → `finish`. The only public entry; the phases are
     /// internal seams.
     ///
-    /// The whole lifecycle runs inside [`turn_span`], so every awaited Backend
-    /// call inherits the session's fields (ADR-0048); the render poll runs on
-    /// its own task and is instrumented where it is spawned ([`RenderPoll`]).
+    /// The whole lifecycle runs inside a [`session_span`], so every awaited
+    /// Backend call inherits the session's fields (ADR-0048); the render poll
+    /// runs on its own task and is instrumented where it is spawned
+    /// ([`RenderPoll`]).
     pub(crate) async fn run(app: &Arc<App>, ctx: PromptContext) -> crate::error::Result<()> {
-        let span = turn_span(&ctx.session_id, &ctx.thread_key);
+        let span = session_span(&ctx.session_id, &ctx.thread_key, tracing::Span::current().id());
         Self::run_inner(app, ctx).instrument(span).await
     }
 
@@ -831,8 +822,9 @@ impl RenderPoll {
         let poll_ms = app.turn_render_poll_ms.load(Ordering::Relaxed);
         // A spawn does not inherit the turn's span — the poll runs on its own
         // task — so it is instrumented explicitly with the same fields: its
-        // lines must keep the session (ADR-0048).
-        let span = render_poll_span(session_id, thread_key);
+        // lines must keep the session (ADR-0048). Rooted, because the ambient
+        // parent here is the turn's span.
+        let span = session_span(session_id, thread_key, None);
         let handle = tokio::spawn(
             async move {
                 render_poll_loop(&core, sid, flag, poll_ms).await;
