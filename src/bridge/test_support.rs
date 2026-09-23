@@ -984,6 +984,32 @@ impl MockBackend {
         self
     }
 
+    /// Scenario: another client already resolved `request_id` — the server
+    /// filters it out of the pending list, like a replied request. Usable
+    /// mid-lifecycle (through the `Arc` the app holds).
+    pub(crate) async fn permission_resolved_by_another(&self, request_id: &str) {
+        self.replied_permissions
+            .lock()
+            .await
+            .insert(request_id.to_string());
+    }
+
+    /// Scenario: another client already resolved `question_id` — the server
+    /// filters it out of the pending list.
+    pub(crate) async fn question_resolved_by_another(&self, question_id: &str) {
+        self.replied_questions
+            .lock()
+            .await
+            .insert(question_id.to_string());
+    }
+
+    /// Scenario: the external message's server timestamp (captured on first
+    /// read otherwise) — lets a test place it in the past.
+    pub(crate) fn external_message_created_at(&self, ms: i64) -> &Self {
+        *self.external_user_created.lock().unwrap() = Some(ms);
+        self
+    }
+
     /// Scenario: another client (e.g. OpenChamber) posts `text` into the
     /// session; the external poller sees it as a new user message.
     pub(crate) fn external_message(&mut self, text: &str) -> &mut Self {
@@ -996,6 +1022,33 @@ impl MockBackend {
     pub(crate) fn external_message_for(&mut self, session_id: &str, text: &str) -> &mut Self {
         self.external_user_messages
             .insert(session_id.to_string(), text.to_string());
+        self
+    }
+
+    /// Scenario: cola's OWN prompt persisted on the store with a `msg_cola_`
+    /// id (ADR-0026) — e.g. after a server died mid-turn and healed. The
+    /// poller must recognise it as cola-authored, never as external traffic.
+    pub(crate) fn cola_message(&mut self, session_id: &str, text: &str) -> &mut Self {
+        self.cola_user_messages
+            .insert(session_id.to_string(), text.to_string());
+        self
+    }
+
+    /// Scenario: the next `count` `reply_permission` calls fail with a genuine
+    /// (non-404) error — the in-flight guard must roll back so the user can
+    /// retry.
+    pub(crate) fn fail_permission_replies(&self, count: usize) -> &Self {
+        self.fail_reply_permission_count
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    /// Scenario: run `hook` inside `prompt` just before it succeeds — lets a
+    /// test mutate the session's working tree mid-turn (e.g. switch branches
+    /// or leave an uncommitted file) to exercise the Turn Footer's turn-end
+    /// refresh (ADR-0019).
+    pub(crate) fn on_prompt(&mut self, hook: impl Fn() + Send + Sync + 'static) -> &mut Self {
+        self.on_prompt = Some(Box::new(hook));
         self
     }
 
@@ -1039,6 +1092,22 @@ impl MockBackend {
     /// per-session read).
     pub(crate) fn hang_message_reads(&self, count: usize) -> &Self {
         self.hang_messages
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    /// Scenario: the next `count` `session_info` calls hang forever (a wedged
+    /// subtitle fetch on a freshly spawned server).
+    pub(crate) fn hang_session_info_reads(&self, count: usize) -> &Self {
+        self.hang_session_info
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    /// Scenario: the next `count` `list_sessions` calls hang forever (the Lazy
+    /// Start readiness probe's wedged startup window).
+    pub(crate) fn hang_session_lists(&self, count: usize) -> &Self {
+        self.hang_list_sessions
             .store(count, std::sync::atomic::Ordering::SeqCst);
         self
     }

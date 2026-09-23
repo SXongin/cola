@@ -277,7 +277,7 @@ async fn sweep_repaints_a_non_current_card_from_its_cache() {
     seed_old_turn_card_with_permission(&app).await;
 
     // Resolved by another client: the request leaves the pending list.
-    backend.replied_permissions.lock().await.insert("per_old".into());
+    backend.permission_resolved_by_another("per_old").await;
     let mut seen = std::collections::HashSet::new();
     app.permission.sweep(&app.core, &mut seen).await;
 
@@ -759,7 +759,7 @@ async fn a_concurrent_flush_leaves_the_tail_on_one_card() {
     let continuations = platform.replied_cards().await;
     assert_eq!(continuations.len(), 1, "exactly one continuation card");
     assert!(
-        continuations[0].to_string().contains("🔐 **权限请求**"),
+        card_text(&continuations[0]).contains("🔐 **权限请求**"),
         "the continuation carries the block: {}",
         continuations[0]
     );

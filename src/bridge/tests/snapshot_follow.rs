@@ -459,7 +459,7 @@ async fn busy_adopt_streams_turn_into_snapshot() {
     )]);
     backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
     backend.external_message_for("ses_alpha01", "帮我重构这个模块");
-    backend.external_reply(realistic_parts());
+    let reply_ready = backend.external_reply(realistic_parts());
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -488,9 +488,7 @@ async fn busy_adopt_streams_turn_into_snapshot() {
 
     // The model answers: flip the reply ready → the parts stream into the
     // SAME snapshot message and finalize Done.
-    backend
-        .external_reply_ready
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+    reply_ready.store(true, std::sync::atomic::Ordering::SeqCst);
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
     let calls = platform.calls.lock().await.clone();
@@ -541,7 +539,7 @@ async fn busy_follow_permission_approved_resumes() {
     backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
     backend.external_message_for("ses_alpha01", "帮我重构这个模块");
     backend.ask_permission(perm_request("per_1", "ses_alpha01", "ls -la"));
-    backend.external_reply(realistic_parts());
+    let reply_ready = backend.external_reply(realistic_parts());
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -598,9 +596,7 @@ async fn busy_follow_permission_approved_resumes() {
     );
 
     // The resumed turn streams into the SAME snapshot message and finishes.
-    backend
-        .external_reply_ready
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+    reply_ready.store(true, std::sync::atomic::Ordering::SeqCst);
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     let calls = platform.calls.lock().await.clone();
     let updates: Vec<String> = calls
@@ -706,9 +702,7 @@ async fn busy_follow_skips_cola_authored_turn() {
     )]);
     backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
     // The newest user message is cola's OWN (a cola prompt mid-turn).
-    backend
-        .cola_user_messages
-        .insert("ses_alpha01".into(), "我在问的问题".into());
+    backend.cola_message("ses_alpha01", "我在问的问题");
     backend.ask_permission(perm_request("per_1", "ses_alpha01", "ls -la"));
     let (app, _platform) = build_app(cfg, backend).await;
 

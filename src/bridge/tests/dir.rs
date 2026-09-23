@@ -379,7 +379,7 @@ async fn dir_card_topic_opens_a_pending_topic() {
         "dir topic toasts the pending timing: {toast:?}"
     );
     assert!(
-        result.card.unwrap().to_string().contains("建话题"),
+        card_text(&result.card.unwrap()).contains("建话题"),
         "refreshed card keeps the 建话题 rows"
     );
     assert!(

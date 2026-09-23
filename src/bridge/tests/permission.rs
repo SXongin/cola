@@ -296,9 +296,7 @@ async fn permission_reply_failure_rolls_back_so_retry_replies() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let backend = MockBackend::new(realistic_parts());
-    backend
-        .fail_reply_permission_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    backend.fail_permission_replies(1);
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
@@ -828,7 +826,7 @@ async fn sweep_leaves_a_claimed_approval_to_its_settlement() {
             .try_mark_answered(&app.requests_handle(), "per_1")
             .await
     );
-    backend.replied_permissions.lock().await.insert("per_1".into());
+    backend.permission_resolved_by_another("per_1").await;
 
     let mut seen = std::collections::HashSet::new();
     app.permission.sweep(&app.core, &mut seen).await;
@@ -944,14 +942,14 @@ async fn auto_accept_session_answers_permission_without_card() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
-    mock.permissions = vec![opencode::types::PermissionRequest {
+    mock.ask_permissions(vec![opencode::types::PermissionRequest {
         request_id: "per_aa".into(),
         session_id: Some("ses_test".into()),
         permission: Some("bash".into()),
         patterns: vec!["ls".into()],
         metadata: None,
         always: Vec::new(),
-    }];
+    }]);
     let perm_calls = mock.reply_permission_calls.clone();
     let (app, platform) = build_app(cfg, mock).await;
 
@@ -1013,14 +1011,14 @@ async fn autoaccept_on_approves_already_pending_permission() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
-    mock.permissions = vec![opencode::types::PermissionRequest {
+    mock.ask_permissions(vec![opencode::types::PermissionRequest {
         request_id: "per_pending".into(),
         session_id: Some("ses_test".into()),
         permission: Some("bash".into()),
         patterns: vec!["ls -la".into()],
         metadata: None,
         always: Vec::new(),
-    }];
+    }]);
     let perm_calls = mock.reply_permission_calls.clone();
     let (app, _platform) = build_app(cfg, mock).await;
 
@@ -1071,14 +1069,14 @@ async fn autoaccept_on_approves_child_session_permission() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
-    mock.permissions = vec![opencode::types::PermissionRequest {
+    mock.ask_permissions(vec![opencode::types::PermissionRequest {
         request_id: "per_child".into(),
         session_id: Some("ses_child".into()),
         permission: Some("bash".into()),
         patterns: vec!["rm -rf x".into()],
         metadata: None,
         always: Vec::new(),
-    }];
+    }]);
     mock.with_session_parent("ses_child", "ses_test");
     let perm_calls = mock.reply_permission_calls.clone();
     let (app, _platform) = build_app(cfg, mock).await;

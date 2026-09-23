@@ -1031,7 +1031,7 @@ async fn inline_question_answered_on_streaming_card() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
-    mock.questions = vec![opencode::types::QuestionRequest {
+    mock.ask_questions(vec![opencode::types::QuestionRequest {
         id: "que_inline".into(),
         session_id: "ses_test".into(),
         questions: vec![
@@ -1056,7 +1056,7 @@ async fn inline_question_answered_on_streaming_card() {
                 custom: None,
             },
         ],
-    }];
+    }]);
     let backend = Arc::new(mock);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
@@ -1308,7 +1308,7 @@ async fn sweep_keeps_partial_multi_select_toggles() {
         .await
         .expect("toggle result");
     assert!(
-        toggled.card.unwrap().to_string().contains("已选：苹果"),
+        card_text(&toggled.card.unwrap()).contains("已选：苹果"),
         "toggle must be live before the sweep"
     );
 
