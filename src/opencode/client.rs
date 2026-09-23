@@ -962,25 +962,10 @@ mod wire_tests {
         .await;
         response.unwrap();
 
-        let dump = logs
-            .lines()
-            .find(|line| line.contains("prompt response:"))
-            .unwrap_or_else(|| panic!("no prompt-response dump was captured:\n{logs}"));
+        let dump = crate::bridge::test_support::assert_line_level(&logs, "prompt response:", "DEBUG");
         assert!(
             dump.contains("response body marker"),
             "the dump carries the response body: {dump}"
-        );
-        assert_eq!(
-            crate::bridge::test_support::line_level(dump),
-            "DEBUG",
-            "the response-body dump must be DEBUG: {dump}"
-        );
-        assert!(
-            !logs
-                .lines()
-                .any(|line| crate::bridge::test_support::line_level(line) == "INFO"
-                    && line.contains("prompt response:")),
-            "the response-body dump must never be INFO:\n{logs}"
         );
     }
 

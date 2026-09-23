@@ -1694,25 +1694,10 @@ mod transport_tests {
         })
         .await;
 
-        let dump = logs
-            .lines()
-            .find(|line| line.contains("WS event payload:"))
-            .unwrap_or_else(|| panic!("no WS payload dump was captured:\n{logs}"));
+        let dump = crate::bridge::test_support::assert_line_level(&logs, "WS event payload:", "DEBUG");
         assert!(
             dump.contains("im.message.receive_v1"),
             "the dump carries the raw payload: {dump}"
-        );
-        assert_eq!(
-            crate::bridge::test_support::line_level(dump),
-            "DEBUG",
-            "the WS payload dump must be DEBUG: {dump}"
-        );
-        assert!(
-            !logs
-                .lines()
-                .any(|line| crate::bridge::test_support::line_level(line) == "INFO"
-                    && line.contains("WS event payload:")),
-            "the WS payload dump must never be INFO:\n{logs}"
         );
     }
 
@@ -1748,31 +1733,8 @@ mod transport_tests {
         })
         .await;
 
-        let timing = logs
-            .lines()
-            .find(|line| line.contains("Sent card action ack"))
-            .unwrap_or_else(|| panic!("no card-action ack-timing line was captured:\n{logs}"));
-        assert_eq!(
-            crate::bridge::test_support::line_level(timing),
-            "DEBUG",
-            "the ack-timing line must be DEBUG: {timing}"
-        );
-        assert!(
-            !logs
-                .lines()
-                .any(|line| crate::bridge::test_support::line_level(line) == "INFO"
-                    && line.contains("Sent card action ack")),
-            "the ack-timing line must never be INFO:\n{logs}"
-        );
-        let receipt = logs
-            .lines()
-            .find(|line| line.contains("card action: action="))
-            .unwrap_or_else(|| panic!("no card-action receipt was captured:\n{logs}"));
-        assert_eq!(
-            crate::bridge::test_support::line_level(receipt),
-            "INFO",
-            "the card-action receipt stays INFO: {receipt}"
-        );
+        crate::bridge::test_support::assert_line_level(&logs, "Sent card action ack", "DEBUG");
+        crate::bridge::test_support::assert_line_level(&logs, "card action: action=", "INFO");
     }
 
     /// A card action stuck in its handler must still be answered before Feishu's

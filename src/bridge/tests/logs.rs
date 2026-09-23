@@ -53,13 +53,6 @@ fn prompt_context(thread_key: ThreadKey, text: &str) -> PromptContext {
     }
 }
 
-/// The first captured line containing `needle` — the line an assertion is about.
-fn line_with<'a>(logs: &'a str, needle: &str) -> &'a str {
-    logs.lines()
-        .find(|line| line.contains(needle))
-        .unwrap_or_else(|| panic!("no captured line contains {needle:?}:\n{logs}"))
-}
-
 /// The one INFO anchor per Turn carries the span's session/chat/topic fields,
 /// the session's directory and the prompt's character count — never its body.
 #[tokio::test]
