@@ -49,24 +49,19 @@ async fn subtask_permission_routes_to_mapped_parent_and_reply_carries_directory(
     // permission is INLINED on it (one-card-per-turn), not sent as a
     // separate card — the child itself has no accumulator, so it must be
     // hosted on the parent's card found by walking the parent chain.
-    let perm_inline = app
-        .cards
-        .lock()
-        .await
-        .get(&parent_id)
-        .expect("parent accumulator exists")
-        .acc
-        .live_permissions();
+    let perm_inline = Turn::live_permissions(&app.cards_handle(), &parent_id).await;
     assert_eq!(
         perm_inline.len(),
         1,
         "subtask permission should be inlined on the parent card"
     );
-    assert_eq!(perm_inline[0].request_id, "per_child");
-    assert_eq!(perm_inline[0].session_id, child);
+    assert_eq!(perm_inline[0].0, "per_child");
+    assert_eq!(perm_inline[0].1, child);
 
     // The streaming card renders the inline section with the child's buttons.
-    let card = app.cards.lock().await.get(&parent_id).unwrap().acc.build_card();
+    let card = Turn::rendered_card(&app.cards_handle(), &parent_id)
+        .await
+        .expect("parent card renders");
     let card_text = card.to_string();
     assert!(card_text.contains("权限请求"), "inline section missing");
     assert!(card_text.contains("git status"), "permission body missing");
@@ -109,13 +104,8 @@ async fn subtask_permission_routes_to_mapped_parent_and_reply_carries_directory(
         ack
     );
     assert!(
-        app.cards
-            .lock()
+        Turn::live_permissions(&app.cards_handle(), &parent_id)
             .await
-            .get(&parent_id)
-            .unwrap()
-            .acc
-            .live_permissions()
             .is_empty(),
         "inline permission section is resolved after answering"
     );

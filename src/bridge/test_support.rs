@@ -3,6 +3,7 @@
 pub(crate) use std::sync::Arc;
 
 pub(crate) use crate::bridge::handler::App;
+pub(crate) use crate::bridge::turn::Turn;
 pub(crate) use crate::feishu;
 pub(crate) use crate::opencode;
 
@@ -1606,10 +1607,37 @@ pub(crate) struct FailedDirSurfaces {
     pub inline_id: &'static str,
     /// The snapshot host's Message id; the claim rides `claim`.
     pub snapshot_message_id: &'static str,
-    /// A stream accumulator carrying the kind's inline section.
-    pub inline_acc: crate::bridge::turn::state::StreamAccumulator,
+    /// The request inlined on the streaming card, seeded onto it by the rig.
+    pub inline_request: crate::bridge::request::PendingRequest,
     /// The request embedded (and claimed) by the snapshot card.
     pub claim: crate::bridge::request::PendingRequest,
+}
+
+/// Seed `request` as an inline block on `session_id`'s card, kind-agnostically —
+/// the #144 rig's fixture builder.
+async fn seed_inline_request(
+    cards: &crate::bridge::handles::CardsHandle,
+    session_id: &str,
+    request: &crate::bridge::request::PendingRequest,
+    directory: &str,
+) {
+    use crate::bridge::request::PendingRequest;
+    match request {
+        PendingRequest::Permission(p) => {
+            Turn::add_permission(cards, session_id, p, directory).await;
+        }
+        PendingRequest::Question(q) => {
+            Turn::add_question(
+                cards,
+                session_id,
+                q,
+                directory,
+                &vec![None; q.questions.len()],
+                &vec![false; q.questions.len()],
+            )
+            .await;
+        }
+    }
 }
 
 /// #144: drive one hanging-list sweep and one successful-list sweep over the
@@ -1636,10 +1664,9 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
             directory: "/work".into(),
         },
     );
-    app.cards.lock().await.insert(
-        "ses_1".into(),
-        crate::bridge::turn::state::CardSession::new(surfaces.inline_acc, None),
-    );
+    let cards = app.core.cards_handle();
+    Turn::seed_card(&cards, "ses_1", None).await;
+    seed_inline_request(&cards, "ses_1", &surfaces.inline_request, "/work").await;
     app.core.snapshot_claims.lock().await.claim(
         surfaces.snapshot_message_id,
         "已接管",
@@ -1722,30 +1749,18 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
     );
 }
 
-/// Whether any card's accumulator still carries a LIVE inline section for `id`
-/// (either kind) — the #144 rig's surface probe. A resolved block left its
-/// receipt tombstone in the section, which is not live (ADR-0038).
+/// Whether any card still carries a LIVE inline block for `id` (either kind) —
+/// the #144 rig's surface probe. A resolved block left its receipt tombstone in
+/// the section, which is not live (ADR-0038).
 async fn inline_surface_live(app: &Arc<App>, id: &str) -> bool {
-    app.cards
-        .lock()
-        .await
-        .values()
-        .any(|c| c.acc.interaction(id).is_some_and(|b| b.is_live()))
+    Turn::has_live_interaction(&app.core.cards_handle(), id).await
 }
 
-/// #175: whether any card's accumulator carries an Interaction Receipt left by
-/// a sweep over a vanished inline block — the #144 rig proves it lands once a
-/// SUCCESSFUL list resolves the block.
+/// #175: whether any card carries an Interaction Receipt left by a sweep over a
+/// vanished inline block — the #144 rig proves it lands once a SUCCESSFUL list
+/// resolves the block.
 async fn inline_handled_elsewhere_receipt_present(app: &Arc<App>) -> bool {
-    app.cards.lock().await.values().any(|c| {
-        c.acc.timeline.iter().any(|item| {
-            matches!(
-                &item.kind,
-                crate::bridge::turn::state::TimelineKind::Receipt(text)
-                    if text.starts_with("⏱ 已由其他客户端处理")
-            )
-        })
-    })
+    Turn::has_receipt_prefix(&app.core.cards_handle(), "⏱ 已由其他客户端处理").await
 }
 
 // ===== Session discovery & adoption (ADR-0008) =====

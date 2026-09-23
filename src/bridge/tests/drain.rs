@@ -174,8 +174,8 @@ async fn drain_renders_the_new_turns_reply_on_the_live_card() {
         "the inflight guard must be held during the drain"
     );
     assert_eq!(
-        app.cards.lock().await.get("ses_test").unwrap().acc.card_state,
-        CardState::Streaming,
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Streaming),
         "the drain renders into the live card, not the final state"
     );
 

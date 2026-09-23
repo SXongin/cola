@@ -42,18 +42,13 @@ async fn permission_poller_sends_card_and_card_action_replies() {
 
     // The session has an active streaming card, so the permission is surfaced
     // INLINE on it (one-card-per-turn) — not as a separate card.
-    let perm_inline = app
-        .cards
-        .lock()
-        .await
-        .get("ses_test")
-        .expect("accumulator exists")
-        .acc
-        .live_permissions();
+    let perm_inline = Turn::live_permissions(&app.cards_handle(), "ses_test").await;
     assert_eq!(perm_inline.len(), 1, "permission should be inlined");
-    assert_eq!(perm_inline[0].request_id, "per_1");
+    assert_eq!(perm_inline[0].0, "per_1");
     // The streaming card itself renders the inline permission section.
-    let card = app.cards.lock().await.get("ses_test").unwrap().acc.build_card();
+    let card = Turn::rendered_card(&app.cards_handle(), "ses_test")
+        .await
+        .expect("card renders");
     let card_text = card.to_string();
     assert!(
         card_text.contains("权限请求"),
@@ -105,13 +100,8 @@ async fn permission_poller_sends_card_and_card_action_replies() {
     assert_eq!(result.toast.as_deref(), Some("已允许本次执行"));
     // The block is resolved in the accumulator too: not live, receipt kept.
     assert!(
-        app.cards
-            .lock()
+        Turn::live_permissions(&app.cards_handle(), "ses_test")
             .await
-            .get("ses_test")
-            .unwrap()
-            .acc
-            .live_permissions()
             .is_empty()
     );
 }
@@ -158,13 +148,8 @@ async fn inline_permission_click_carries_the_receipt_in_the_ack() {
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert!(
-        !app.cards
-            .lock()
+        !Turn::live_permissions(&app.cards_handle(), "ses_test")
             .await
-            .get("ses_test")
-            .unwrap()
-            .acc
-            .live_permissions()
             .is_empty(),
         "permission should be inlined on the streaming card"
     );
@@ -446,13 +431,7 @@ async fn permission_poller_recovers_when_a_list_call_hangs() {
     // call forever and the permission never surfaces.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
-        let surfaced = app
-            .cards
-            .lock()
-            .await
-            .get("ses_test")
-            .map(|c| c.acc.interaction("per_hung").is_some())
-            .unwrap_or(false);
+        let surfaced = Turn::has_interaction_in(&app.cards_handle(), "ses_test", "per_hung").await;
         if surfaced {
             break;
         }
@@ -525,13 +504,8 @@ async fn autoaccept_toggle_on_permission_card_flips_flag_and_approves() {
 
     // Permission inlined on the streaming card, auto_accept still off.
     assert_eq!(
-        app.cards
-            .lock()
+        Turn::live_permissions(&app.cards_handle(), "ses_test")
             .await
-            .get("ses_test")
-            .unwrap()
-            .acc
-            .live_permissions()
             .len(),
         2
     );
@@ -608,13 +582,8 @@ async fn autoaccept_toggle_on_permission_card_flips_flag_and_approves() {
         "auto_accept flag should flip on"
     );
     assert!(
-        app.cards
-            .lock()
+        Turn::live_permissions(&app.cards_handle(), "ses_test")
             .await
-            .get("ses_test")
-            .unwrap()
-            .acc
-            .live_permissions()
             .is_empty(),
         "ALL inline sections removed after the toggle, not just the clicked one"
     );
@@ -716,13 +685,8 @@ async fn autoaccept_command_leaves_the_mode_receipt_on_the_card() {
         "the approved block must be gone: {repaint}"
     );
     assert!(
-        app.cards
-            .lock()
+        Turn::live_permissions(&app.cards_handle(), "ses_1")
             .await
-            .get("ses_1")
-            .unwrap()
-            .acc
-            .live_permissions()
             .is_empty(),
         "the accumulator must not keep the block live"
     );
@@ -896,15 +860,10 @@ async fn sweep_leaves_a_claimed_approval_to_its_settlement() {
         "the handle still names the card the settlement will repaint"
     );
     assert!(
-        app.cards
-            .lock()
+        Turn::live_permissions(&app.cards_handle(), "ses_1")
             .await
-            .get("ses_1")
-            .unwrap()
-            .acc
-            .live_permissions()
             .iter()
-            .any(|p| p.request_id == "per_1"),
+            .any(|(id, _)| id == "per_1"),
         "the accumulator keeps the claimed block live for its own settlement"
     );
 }
@@ -1245,16 +1204,6 @@ async fn failed_directory_list_keeps_permission_surfaces() {
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_session(&app, "ses_1", "/work").await;
 
-    let mut inline_acc = crate::bridge::turn::state::StreamAccumulator::new("test");
-    inline_acc.add_interaction(crate::bridge::turn::state::InteractionBlock::Permission(
-        crate::bridge::turn::state::PendingPermission {
-            session_id: "ses_1".into(),
-            request_id: "per_inline".into(),
-            body: "bash ls -la".into(),
-            target: "⚡ 执行 Shell 命令 `ls -la`".into(),
-            directory: "/work".into(),
-        },
-    ));
     assert_failed_dir_keeps_surfaces(
         &app,
         &app.permission,
@@ -1265,7 +1214,11 @@ async fn failed_directory_list_keeps_permission_surfaces() {
             card_message_id: "om_card",
             inline_id: "per_inline",
             snapshot_message_id: "om_snapshot",
-            inline_acc,
+            inline_request: crate::bridge::request::PendingRequest::Permission(perm_request(
+                "per_inline",
+                "ses_1",
+                "ls -la",
+            )),
             claim: crate::bridge::request::PendingRequest::Permission(perm_request(
                 "per_claim",
                 "ses_1",
@@ -1417,13 +1370,8 @@ async fn permission_click_variants_leave_their_receipts() {
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert_eq!(
-        app.cards
-            .lock()
+        Turn::live_permissions(&app.cards_handle(), "ses_test")
             .await
-            .get("ses_test")
-            .unwrap()
-            .acc
-            .live_permissions()
             .len(),
         3,
         "all three permissions inlined"
@@ -1459,9 +1407,9 @@ async fn permission_click_variants_leave_their_receipts() {
 
     // The accumulator is the render source of truth: no live block, three
     // receipts.
-    let acc = app.cards.lock().await.get("ses_test").unwrap().acc.clone();
-    assert!(acc.live_permissions().is_empty());
-    let rendered = acc.build_card().to_string();
+    let cards = app.cards_handle();
+    assert!(Turn::live_permissions(&cards, "ses_test").await.is_empty());
+    let rendered = Turn::rendered_card(&cards, "ses_test").await.unwrap().to_string();
     assert_eq!(rendered.matches("已允许一次：").count(), 1, "{}", rendered);
     assert!(
         rendered.contains("✅ 已始终允许：⚡ 执行 Shell 命令 `cargo build`"),
@@ -1494,23 +1442,18 @@ async fn interaction_receipt_survives_later_flushes() {
     // A live card with two transcript items and an inlined permission (the
     // poll loop is what inlines in production; seeding it keeps this test
     // deterministic — no background render poll splitting underneath us).
-    let mut acc = crate::bridge::turn::state::StreamAccumulator::new("test");
-    acc.reply_to_message_id = Some("msg_1".into());
-    acc.push_reasoning("用户想让我分析目录。");
-    acc.push_text("当前目录有 src/ 和 Cargo.toml。");
-    acc.add_interaction(crate::bridge::turn::state::InteractionBlock::Permission(
-        crate::bridge::turn::state::PendingPermission {
-            session_id: "ses_test".into(),
-            request_id: "per_1".into(),
-            body: "bash ls -la".into(),
-            target: "⚡ 执行 Shell 命令 `ls -la`".into(),
-            directory: "/work".into(),
-        },
-    ));
-    app.cards.lock().await.insert(
-        "ses_test".to_string(),
-        crate::bridge::turn::state::CardSession::new(acc, Some("msg_live".into())),
-    );
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("msg_live")).await;
+    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
+    Turn::push_reasoning(&cards, "ses_test", "用户想让我分析目录。").await;
+    Turn::push_text(&cards, "ses_test", "当前目录有 src/ 和 Cargo.toml。").await;
+    Turn::add_permission(
+        &cards,
+        "ses_test",
+        &perm_request("per_1", "ses_test", "ls -la"),
+        "/work",
+    )
+    .await;
 
     let ack = click_perm(&app, "once", "per_1", "✅ 已允许一次").await;
     assert!(
@@ -1521,13 +1464,7 @@ async fn interaction_receipt_survives_later_flushes() {
 
     // A new part arrives: the flush re-renders the receipt from the
     // accumulator (the render source of truth), not just into the ack.
-    app.cards
-        .lock()
-        .await
-        .get_mut("ses_test")
-        .unwrap()
-        .acc
-        .push_text("新的进展。");
+    Turn::push_text(&app.cards_handle(), "ses_test", "新的进展。").await;
     crate::bridge::turn::Turn::flush_card(&app.cards_handle(), "ses_test").await;
     let flushed = latest_card(&platform).await.to_string();
     assert!(
@@ -1544,13 +1481,7 @@ async fn interaction_receipt_survives_later_flushes() {
     // Force a multi-card split: the receipt is anchored in the transcript, so
     // exactly one card of the chain carries it — and the split loop must not
     // overwrite that card with a later slice.
-    app.cards
-        .lock()
-        .await
-        .get_mut("ses_test")
-        .unwrap()
-        .acc
-        .push_text(&"很长的回答。".repeat(2000));
+    Turn::push_text(&app.cards_handle(), "ses_test", &"很长的回答。".repeat(2000)).await;
     crate::bridge::turn::Turn::flush_card(&app.cards_handle(), "ses_test").await;
     let calls = platform.calls.lock().await.clone();
     assert!(
@@ -1637,13 +1568,8 @@ async fn inline_permission_click_after_remote_resolution_gets_receipt() {
         ack
     );
     assert!(
-        app.cards
-            .lock()
+        Turn::live_permissions(&app.cards_handle(), "ses_test")
             .await
-            .get("ses_test")
-            .unwrap()
-            .acc
-            .live_permissions()
             .is_empty()
     );
 }
@@ -1653,21 +1579,16 @@ async fn inline_permission_click_after_remote_resolution_gets_receipt() {
 /// sweep by hand, so no background poll or render tick can repaint underneath
 /// them — the sweep alone must put the receipt on the card.
 async fn seed_inline_permission_card(app: &Arc<App>, session_id: &str, request_id: &str) {
-    let mut acc = crate::bridge::turn::state::StreamAccumulator::new("test");
-    acc.reply_to_message_id = Some("msg_trigger".into());
-    acc.add_interaction(crate::bridge::turn::state::InteractionBlock::Permission(
-        crate::bridge::turn::state::PendingPermission {
-            session_id: session_id.into(),
-            request_id: request_id.into(),
-            body: "bash ls -la".into(),
-            target: "⚡ 执行 Shell 命令 `ls -la`".into(),
-            directory: "/work".into(),
-        },
-    ));
-    app.cards.lock().await.insert(
-        session_id.to_string(),
-        crate::bridge::turn::state::CardSession::new(acc, Some("msg_live".into())),
-    );
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, session_id, Some("msg_live")).await;
+    Turn::set_reply_target(&cards, session_id, "msg_trigger").await;
+    Turn::add_permission(
+        &cards,
+        session_id,
+        &perm_request(request_id, session_id, "ls -la"),
+        "/work",
+    )
+    .await;
 }
 
 /// #175: drive one sweep over a session whose block vanished (resolved by
@@ -1698,13 +1619,8 @@ async fn sweep_and_assert_receipt_on_the_card(app: &Arc<App>, platform: &Arc<Rec
         "the live block must be gone from the card: {patched}"
     );
     assert!(
-        app.cards
-            .lock()
+        Turn::live_permissions(&app.cards_handle(), "ses_1")
             .await
-            .get("ses_1")
-            .unwrap()
-            .acc
-            .live_permissions()
             .is_empty(),
         "the accumulator must not keep the block live"
     );
@@ -1737,14 +1653,11 @@ async fn sweep_repaints_a_finished_turns_card_when_the_request_resolves_elsewher
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
     seed_session(&app, "ses_1", "/work").await;
     seed_inline_permission_card(&app, "ses_1", "per_1").await;
-    {
-        // The turn ended: the poll loop is gone and the card shows its final
-        // state. Nothing except the request sweep can still touch it.
-        let mut cards = app.cards.lock().await;
-        let acc = &mut cards.get_mut("ses_1").unwrap().acc;
-        acc.card_state = crate::feishu::card::CardState::Done;
-        acc.current_phase = None;
-    }
+    // The turn ended: the poll loop is gone and the card shows its final
+    // state. Nothing except the request sweep can still touch it.
+    let cards = app.cards_handle();
+    Turn::set_card_state(&cards, "ses_1", crate::feishu::card::CardState::Done).await;
+    Turn::clear_phase(&cards, "ses_1").await;
 
     sweep_and_assert_receipt_on_the_card(&app, &platform).await;
 }
@@ -1765,25 +1678,17 @@ async fn permission_click_at_the_split_limit_falls_back_to_the_flushed_receipt()
 
     // A live card carrying the block and a timeline already past the split
     // budget (a poll rendered parts, then the click raced the next flush).
-    let mut acc = crate::bridge::turn::state::StreamAccumulator::new("test");
-    acc.reply_to_message_id = Some("msg_1".into());
-    acc.add_interaction(crate::bridge::turn::state::InteractionBlock::Permission(
-        crate::bridge::turn::state::PendingPermission {
-            session_id: "ses_1".into(),
-            request_id: "per_1".into(),
-            body: "bash ls -la".into(),
-            target: "⚡ 执行 Shell 命令 `ls -la`".into(),
-            directory: "/work".into(),
-        },
-    ));
-    acc.push_text(&"很长的回答。".repeat(2000));
-    {
-        let mut cards = app.cards.lock().await;
-        cards.insert(
-            "ses_1".to_string(),
-            crate::bridge::turn::state::CardSession::new(acc, Some("msg_live".into())),
-        );
-    }
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_1", Some("msg_live")).await;
+    Turn::set_reply_target(&cards, "ses_1", "msg_1").await;
+    Turn::add_permission(
+        &cards,
+        "ses_1",
+        &perm_request("per_1", "ses_1", "ls -la"),
+        "/work",
+    )
+    .await;
+    Turn::push_text(&cards, "ses_1", &"很长的回答。".repeat(2000)).await;
 
     let result = app
         .host_action(serde_json::json!({
@@ -1835,13 +1740,8 @@ async fn permission_click_at_the_split_limit_falls_back_to_the_flushed_receipt()
         all_cards
     );
     assert!(
-        app.cards
-            .lock()
+        Turn::live_permissions(&app.cards_handle(), "ses_1")
             .await
-            .get("ses_1")
-            .unwrap()
-            .acc
-            .live_permissions()
             .is_empty()
     );
 }
@@ -1860,32 +1760,25 @@ async fn interaction_receipt_renders_at_the_interaction_position() {
     seed_session(&app, "ses_test", "/work").await;
 
     // 第一段 → [permission A] → a reasoning panel → [permission B]
-    let mut acc = crate::bridge::turn::state::StreamAccumulator::new("test");
-    acc.reply_to_message_id = Some("msg_1".into());
-    acc.push_text("第一段。");
-    acc.add_interaction(crate::bridge::turn::state::InteractionBlock::Permission(
-        crate::bridge::turn::state::PendingPermission {
-            session_id: "ses_test".into(),
-            request_id: "per_1".into(),
-            body: "bash ls -la".into(),
-            target: "⚡ 执行 Shell 命令 `ls -la`".into(),
-            directory: "/work".into(),
-        },
-    ));
-    acc.push_reasoning("正在思考。");
-    acc.add_interaction(crate::bridge::turn::state::InteractionBlock::Permission(
-        crate::bridge::turn::state::PendingPermission {
-            session_id: "ses_test".into(),
-            request_id: "per_2".into(),
-            body: "bash cargo build".into(),
-            target: "⚡ 执行 Shell 命令 `cargo build`".into(),
-            directory: "/work".into(),
-        },
-    ));
-    app.cards.lock().await.insert(
-        "ses_test".to_string(),
-        crate::bridge::turn::state::CardSession::new(acc, Some("msg_live".into())),
-    );
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("msg_live")).await;
+    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
+    Turn::push_text(&cards, "ses_test", "第一段。").await;
+    Turn::add_permission(
+        &cards,
+        "ses_test",
+        &perm_request("per_1", "ses_test", "ls -la"),
+        "/work",
+    )
+    .await;
+    Turn::push_reasoning(&cards, "ses_test", "正在思考。").await;
+    Turn::add_permission(
+        &cards,
+        "ses_test",
+        &perm_request("per_2", "ses_test", "cargo build"),
+        "/work",
+    )
+    .await;
 
     let ack = click_perm(&app, "once", "per_1", "✅ 已允许一次").await;
     assert!(
@@ -1901,13 +1794,7 @@ async fn interaction_receipt_renders_at_the_interaction_position() {
     );
 
     // ... then the AI keeps streaming: 第二段 must land BELOW both receipts.
-    app.cards
-        .lock()
-        .await
-        .get_mut("ses_test")
-        .unwrap()
-        .acc
-        .push_text("第二段。");
+    Turn::push_text(&app.cards_handle(), "ses_test", "第二段。").await;
     crate::bridge::turn::Turn::flush_card(&app.cards_handle(), "ses_test").await;
 
     let card = final_card(&platform).await;
@@ -1950,21 +1837,16 @@ async fn late_rendered_command_lands_above_the_receipt() {
 
     // The request poll surfaces the permission before ANY of the turn's parts
     // have been rendered (the race that put receipts above their command).
-    let mut acc = crate::bridge::turn::state::StreamAccumulator::new("test");
-    acc.reply_to_message_id = Some("msg_1".into());
-    acc.add_interaction(crate::bridge::turn::state::InteractionBlock::Permission(
-        crate::bridge::turn::state::PendingPermission {
-            session_id: "ses_test".into(),
-            request_id: "per_1".into(),
-            body: "bash ls -la".into(),
-            target: "⚡ 执行 Shell 命令 `ls -la`".into(),
-            directory: "/work".into(),
-        },
-    ));
-    app.cards.lock().await.insert(
-        "ses_test".to_string(),
-        crate::bridge::turn::state::CardSession::new(acc, Some("msg_live".into())),
-    );
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("msg_live")).await;
+    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
+    Turn::add_permission(
+        &cards,
+        "ses_test",
+        &perm_request("per_1", "ses_test", "ls -la"),
+        "/work",
+    )
+    .await;
 
     // The operator clicks Allow; the receipt is keyed at this moment.
     let clicked_at = chrono::Utc::now().timestamp_millis();
@@ -1978,29 +1860,26 @@ async fn late_rendered_command_lands_above_the_receipt() {
     // The render poll then catches up with the parts the server had already
     // written BEFORE the click: the reasoning behind the command, and the
     // command's own panel.
-    app.cards
-        .lock()
-        .await
-        .get_mut("ses_test")
-        .unwrap()
-        .acc
-        .push_reasoning_at(Some(clicked_at - 300), "先看一下目录里有什么。");
-    app.cards
-        .lock()
-        .await
-        .get_mut("ses_test")
-        .unwrap()
-        .acc
-        .push_tool_at(
-            Some(clicked_at - 200),
-            "call_1",
-            crate::feishu::card::tool_render::ToolPanel {
-                name: "bash".into(),
-                status: "running".into(),
-                input: Some(serde_json::json!({ "command": "ls -la" })),
-                output: None,
-            },
-        );
+    Turn::push_reasoning_at(
+        &app.cards_handle(),
+        "ses_test",
+        clicked_at - 300,
+        "先看一下目录里有什么。",
+    )
+    .await;
+    Turn::push_tool_at(
+        &app.cards_handle(),
+        "ses_test",
+        clicked_at - 200,
+        "call_1",
+        crate::feishu::card::tool_render::ToolPanel {
+            name: "bash".into(),
+            status: "running".into(),
+            input: Some(serde_json::json!({ "command": "ls -la" })),
+            output: None,
+        },
+    )
+    .await;
     crate::bridge::turn::Turn::flush_card(&app.cards_handle(), "ses_test").await;
 
     // While the command runs, its panel is live tail content (ADR-0045): it
@@ -2013,22 +1892,19 @@ async fn late_rendered_command_lands_above_the_receipt() {
 
     // Settling moves it into the timeline at its OWN start time, so it lands
     // above the receipt that resolved its permission despite rendering late.
-    app.cards
-        .lock()
-        .await
-        .get_mut("ses_test")
-        .unwrap()
-        .acc
-        .push_tool_at(
-            Some(clicked_at - 200),
-            "call_1",
-            crate::feishu::card::tool_render::ToolPanel {
-                name: "bash".into(),
-                status: "completed".into(),
-                input: Some(serde_json::json!({ "command": "ls -la" })),
-                output: Some("src".into()),
-            },
-        );
+    Turn::push_tool_at(
+        &app.cards_handle(),
+        "ses_test",
+        clicked_at - 200,
+        "call_1",
+        crate::feishu::card::tool_render::ToolPanel {
+            name: "bash".into(),
+            status: "completed".into(),
+            input: Some(serde_json::json!({ "command": "ls -la" })),
+            output: Some("src".into()),
+        },
+    )
+    .await;
     crate::bridge::turn::Turn::flush_card(&app.cards_handle(), "ses_test").await;
 
     let card = final_card(&platform).await;

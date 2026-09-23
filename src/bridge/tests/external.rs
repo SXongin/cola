@@ -687,19 +687,14 @@ async fn external_reply_render_guard_replaces_only_newer_messages() {
         .start_reply_render(&app.core, "ses_ext", 1000, "n1", "第一条")
         .await;
     {
-        let cards = app.cards.lock().await;
-        let acc = &cards.get("ses_ext").expect("renderer accumulator").acc;
-        assert_eq!(acc.turn_started_ms, Some(1000));
-        assert_eq!(acc.reply_to_message_id.as_deref(), Some("n1"));
+        let cards = app.cards_handle();
+        assert_eq!(Turn::armed_turn_anchor(&cards, "ses_ext").await, Some(1000));
+        assert_eq!(Turn::reply_target(&cards, "ses_ext").await.as_deref(), Some("n1"));
+        assert_eq!(
+            Turn::card_message_id(&cards, "ses_ext").await.as_deref(),
+            Some("n1")
+        );
     }
-    assert_eq!(
-        app.cards
-            .lock()
-            .await
-            .get("ses_ext")
-            .and_then(|c| c.card_message_id.as_deref()),
-        Some("n1")
-    );
 
     // Re-arming for the SAME message (e.g. a duplicate poll) is a no-op:
     // the armed card id and epoch must not be clobbered.
@@ -707,19 +702,14 @@ async fn external_reply_render_guard_replaces_only_newer_messages() {
         .start_reply_render(&app.core, "ses_ext", 1000, "n1b", "第一条")
         .await;
     {
-        let cards = app.cards.lock().await;
-        let acc = &cards.get("ses_ext").expect("renderer accumulator").acc;
-        assert_eq!(acc.turn_started_ms, Some(1000));
-        assert_eq!(acc.reply_to_message_id.as_deref(), Some("n1"));
+        let cards = app.cards_handle();
+        assert_eq!(Turn::armed_turn_anchor(&cards, "ses_ext").await, Some(1000));
+        assert_eq!(Turn::reply_target(&cards, "ses_ext").await.as_deref(), Some("n1"));
+        assert_eq!(
+            Turn::card_message_id(&cards, "ses_ext").await.as_deref(),
+            Some("n1")
+        );
     }
-    assert_eq!(
-        app.cards
-            .lock()
-            .await
-            .get("ses_ext")
-            .and_then(|c| c.card_message_id.as_deref()),
-        Some("n1")
-    );
 
     // A NEWER external message replaces the armed renderer (its card id and
     // epoch move to the new notification).
@@ -727,19 +717,14 @@ async fn external_reply_render_guard_replaces_only_newer_messages() {
         .start_reply_render(&app.core, "ses_ext", 2000, "n2", "第二条")
         .await;
     {
-        let cards = app.cards.lock().await;
-        let acc = &cards.get("ses_ext").expect("renderer accumulator").acc;
-        assert_eq!(acc.turn_started_ms, Some(2000));
-        assert_eq!(acc.reply_to_message_id.as_deref(), Some("n2"));
+        let cards = app.cards_handle();
+        assert_eq!(Turn::armed_turn_anchor(&cards, "ses_ext").await, Some(2000));
+        assert_eq!(Turn::reply_target(&cards, "ses_ext").await.as_deref(), Some("n2"));
+        assert_eq!(
+            Turn::card_message_id(&cards, "ses_ext").await.as_deref(),
+            Some("n2")
+        );
     }
-    assert_eq!(
-        app.cards
-            .lock()
-            .await
-            .get("ses_ext")
-            .and_then(|c| c.card_message_id.as_deref()),
-        Some("n2")
-    );
 }
 
 /// The external-reply renderer's hard-timeout branch: a partial reply is

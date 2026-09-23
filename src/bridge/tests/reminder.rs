@@ -53,14 +53,9 @@ async fn seed_turn(app: &Arc<App>, session_id: &str, is_group: bool, generation:
 /// Like [`seed_turn`], with an explicit requester — the multi-pending tests
 /// need distinct requesters in one Chat/Topic.
 async fn seed_turn_for(app: &Arc<App>, session_id: &str, is_group: bool, generation: u64, requester: &str) {
-    let mut acc = crate::bridge::turn::state::StreamAccumulator::new("test");
-    acc.requester_open_id = Some(requester.into());
-    acc.is_group = is_group;
-    acc.turn_generation = Some(generation);
-    app.cards.lock().await.insert(
-        session_id.to_string(),
-        crate::bridge::turn::state::CardSession::new(acc, Some("msg_card".into())),
-    );
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, session_id, Some("msg_card")).await;
+    Turn::set_turn_identity(&cards, session_id, requester, is_group, generation).await;
 }
 
 /// A `[bridge] instant_reminder = true` app whose MockBackend serves one permission.
@@ -193,14 +188,7 @@ async fn pin_off_records_no_reminder_calls() {
     app.permission.sweep(&app.core, &mut seen).await;
     // The request still surfaced: only the pin is off.
     assert!(
-        app.cards
-            .lock()
-            .await
-            .get("ses_1")
-            .unwrap()
-            .acc
-            .interaction("per_1")
-            .is_some(),
+        Turn::has_interaction_in(&app.cards_handle(), "ses_1", "per_1").await,
         "the permission still surfaces without pinning"
     );
 
@@ -238,14 +226,7 @@ async fn a_failed_pin_never_affects_the_turn_and_does_not_clear() {
     // The attempt was made and failed, but the card carries the live block.
     assert_eq!(platform.reminders().await.len(), 1);
     assert!(
-        app.cards
-            .lock()
-            .await
-            .get("ses_1")
-            .unwrap()
-            .acc
-            .interaction("per_1")
-            .is_some(),
+        Turn::has_interaction_in(&app.cards_handle(), "ses_1", "per_1").await,
         "the turn/card is unaffected by the pin failure"
     );
 

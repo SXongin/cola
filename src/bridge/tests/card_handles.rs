@@ -6,35 +6,31 @@
 use std::sync::Arc;
 
 use crate::bridge::test_support::*;
-use crate::bridge::turn::state::{
-    CardSession, InteractionBlock, PendingPermission, PendingQuestion, StreamAccumulator,
-};
 use crate::feishu::card::CardState;
 use crate::feishu::card::tool_render::ToolPanel;
 
-/// The permission block the poller would inline on the old turn's card.
-fn permission_block(request_id: &str, session_id: &str, directory: &str) -> InteractionBlock {
-    let p = perm_request(request_id, session_id, "ls -la");
-    InteractionBlock::Permission(PendingPermission {
-        session_id: session_id.into(),
-        request_id: request_id.into(),
-        body: crate::bridge::request::describe_permission(&p),
-        target: crate::bridge::request::permission_target(&p),
-        directory: directory.into(),
-    })
+/// Seed the permission block the poller would inline on the old turn's card.
+async fn add_permission_block(app: &Arc<App>, request_id: &str, session_id: &str, directory: &str) {
+    Turn::add_permission(
+        &app.cards_handle(),
+        session_id,
+        &perm_request(request_id, session_id, "ls -la"),
+        directory,
+    )
+    .await;
 }
 
-/// The question block the poller would inline on the old turn's card.
-fn question_block(request_id: &str, session_id: &str, directory: &str) -> InteractionBlock {
-    let q = question_request(request_id, session_id);
-    InteractionBlock::Question(PendingQuestion {
-        request_id: request_id.into(),
-        session_id: session_id.into(),
-        questions: q.questions,
-        directory: directory.into(),
-        answers: vec![None; 2],
-        done: vec![false; 2],
-    })
+/// Seed the question block the poller would inline on the old turn's card.
+async fn add_question_block(app: &Arc<App>, request_id: &str, session_id: &str, directory: &str) {
+    Turn::add_question(
+        &app.cards_handle(),
+        session_id,
+        &question_request(request_id, session_id),
+        directory,
+        &[None, None],
+        &[false; 2],
+    )
+    .await;
 }
 
 /// A two-question request the QUESTION flow can replay and reply to.
@@ -67,22 +63,18 @@ fn question_request(request_id: &str, session_id: &str) -> crate::opencode::type
 /// run the NEXT sweep with the poll loop's memory intact (a fresh set would
 /// surface the request as new instead of re-hosting it).
 async fn seed_old_turn_card_with_permission(app: &Arc<App>) -> std::collections::HashSet<String> {
-    let mut old = StreamAccumulator::new("旧回合");
-    old.card_state = CardState::Done;
-    old.push_text("旧回合的推理。");
-    old.reply_to_message_id = Some("msg_1".into());
-    app.cards
-        .lock()
-        .await
-        .insert("ses_old".into(), CardSession::new(old, Some("om_old".into())));
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_old", Some("om_old")).await;
+    Turn::set_title(&cards, "ses_old", "旧回合").await;
+    Turn::set_card_state(&cards, "ses_old", CardState::Done).await;
+    Turn::push_text(&cards, "ses_old", "旧回合的推理。").await;
+    Turn::set_reply_target(&cards, "ses_old", "msg_1").await;
 
     let mut seen = std::collections::HashSet::new();
     app.permission.sweep(&app.core, &mut seen).await;
 
-    app.cards.lock().await.insert(
-        "ses_old".into(),
-        CardSession::new(StreamAccumulator::new("新回合"), Some("om_new".into())),
-    );
+    Turn::seed_card(&cards, "ses_old", Some("om_new")).await;
+    Turn::set_title(&cards, "ses_old", "新回合").await;
     seen
 }
 
@@ -140,14 +132,11 @@ async fn click_with_open_message_id_acks_the_cached_card() {
     seed_session(&app, "ses_live", "/work").await;
 
     // The live card carries an inline permission (the poller path).
-    let mut acc = StreamAccumulator::new("回合");
-    acc.card_state = CardState::Done;
-    acc.push_text("回合的内容。");
-    acc.reply_to_message_id = Some("msg_1".into());
-    app.cards
-        .lock()
-        .await
-        .insert("ses_live".into(), CardSession::new(acc, Some("om_live".into())));
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_live", Some("om_live")).await;
+    Turn::set_card_state(&cards, "ses_live", CardState::Done).await;
+    Turn::push_text(&cards, "ses_live", "回合的内容。").await;
+    Turn::set_reply_target(&cards, "ses_live", "msg_1").await;
     let mut seen = std::collections::HashSet::new();
     app.permission.sweep(&app.core, &mut seen).await;
     assert_eq!(
@@ -339,10 +328,13 @@ async fn a_split_registers_the_continuation_card() {
     // A card far over the component budget with a live permission in its tail:
     // the flush finalizes the filled card and sends a continuation carrying the
     // block.
-    let mut acc = StreamAccumulator::new("test");
-    acc.card_state = CardState::Done;
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_split", Some("om_filled")).await;
+    Turn::set_card_state(&cards, "ses_split", CardState::Done).await;
     for i in 0..50 {
-        acc.push_tool(
+        Turn::push_tool(
+            &cards,
+            "ses_split",
             &format!("call_{i}"),
             ToolPanel {
                 name: format!("tool{i}"),
@@ -350,15 +342,12 @@ async fn a_split_registers_the_continuation_card() {
                 input: None,
                 output: None,
             },
-        );
+        )
+        .await;
     }
-    acc.add_interaction(permission_block("per_split", "ses_split", "/work"));
-    acc.reply_to_message_id = Some("msg_1".into());
-    app.cards.lock().await.insert(
-        "ses_split".into(),
-        CardSession::new(acc, Some("om_filled".into())),
-    );
-    crate::bridge::turn::Turn::flush_card(&app.cards_handle(), "ses_split").await;
+    add_permission_block(&app, "per_split", "ses_split", "/work").await;
+    Turn::set_reply_target(&cards, "ses_split", "msg_1").await;
+    Turn::flush_card(&app.cards_handle(), "ses_split").await;
 
     {
         let handles = app.card_handles.lock().await;
@@ -442,21 +431,17 @@ async fn partial_question_answer_refreshes_the_clicked_card() {
 
     // The old turn's card carries the question block (the poller path would
     // flush the same state); then a new turn replaces the accumulator.
-    let mut old = StreamAccumulator::new("旧问题回合");
-    old.card_state = CardState::Done;
-    old.push_text("旧问题回合的内容。");
-    old.reply_to_message_id = Some("msg_1".into());
-    old.add_interaction(question_block("que_old", "ses_q", "/work"));
-    app.cards
-        .lock()
-        .await
-        .insert("ses_q".into(), CardSession::new(old, Some("om_q".into())));
-    crate::bridge::turn::Turn::flush_card(&app.cards_handle(), "ses_q").await;
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_q", Some("om_q")).await;
+    Turn::set_title(&cards, "ses_q", "旧问题回合").await;
+    Turn::set_card_state(&cards, "ses_q", CardState::Done).await;
+    Turn::push_text(&cards, "ses_q", "旧问题回合的内容。").await;
+    Turn::set_reply_target(&cards, "ses_q", "msg_1").await;
+    add_question_block(&app, "que_old", "ses_q", "/work").await;
+    Turn::flush_card(&app.cards_handle(), "ses_q").await;
     app.question.remember_question(&request, "/work").await;
-    app.cards.lock().await.insert(
-        "ses_q".into(),
-        CardSession::new(StreamAccumulator::new("新回合"), Some("om_new".into())),
-    );
+    Turn::seed_card(&cards, "ses_q", Some("om_new")).await;
+    Turn::set_title(&cards, "ses_q", "新回合").await;
 
     let r1 = app
         .host_action(serde_json::json!({
@@ -615,16 +600,14 @@ async fn rehost_preserves_a_questions_partial_answers() {
     // The old turn's card carries the question block; the Host answers 目录
     // only (the block stays live with its 已选 marker), then a new turn
     // replaces the accumulator.
-    let mut old = StreamAccumulator::new("旧问题回合");
-    old.card_state = CardState::Done;
-    old.push_text("旧问题回合的内容。");
-    old.reply_to_message_id = Some("msg_1".into());
-    old.add_interaction(question_block("que_old", "ses_q", "/work"));
-    app.cards
-        .lock()
-        .await
-        .insert("ses_q".into(), CardSession::new(old, Some("om_q".into())));
-    crate::bridge::turn::Turn::flush_card(&app.cards_handle(), "ses_q").await;
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_q", Some("om_q")).await;
+    Turn::set_title(&cards, "ses_q", "旧问题回合").await;
+    Turn::set_card_state(&cards, "ses_q", CardState::Done).await;
+    Turn::push_text(&cards, "ses_q", "旧问题回合的内容。").await;
+    Turn::set_reply_target(&cards, "ses_q", "msg_1").await;
+    add_question_block(&app, "que_old", "ses_q", "/work").await;
+    Turn::flush_card(&app.cards_handle(), "ses_q").await;
     app.question.remember_question(&request, "/work").await;
     let r1 = app
         .host_action(serde_json::json!({
@@ -640,10 +623,8 @@ async fn rehost_preserves_a_questions_partial_answers() {
         .await
         .expect("a card-action result");
     assert!(ack_text(&r1).contains("已选：/a"), "partial answer recorded");
-    app.cards.lock().await.insert(
-        "ses_q".into(),
-        CardSession::new(StreamAccumulator::new("新回合"), Some("om_new".into())),
-    );
+    Turn::seed_card(&cards, "ses_q", Some("om_new")).await;
+    Turn::set_title(&cards, "ses_q", "新回合").await;
 
     // The poll loop has seen the request: the sweep re-hosts instead of
     // surfacing it anew.
@@ -716,10 +697,13 @@ async fn a_concurrent_flush_leaves_the_tail_on_one_card() {
 
     // A card far over the component budget with a live permission in its tail:
     // a flush finalizes it and sends the continuation that carries the block.
-    let mut acc = StreamAccumulator::new("test");
-    acc.card_state = CardState::Done;
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_split", Some("om_filled")).await;
+    Turn::set_card_state(&cards, "ses_split", CardState::Done).await;
     for i in 0..50 {
-        acc.push_tool(
+        Turn::push_tool(
+            &cards,
+            "ses_split",
             &format!("call_{i}"),
             ToolPanel {
                 name: format!("tool{i}"),
@@ -727,14 +711,11 @@ async fn a_concurrent_flush_leaves_the_tail_on_one_card() {
                 input: None,
                 output: None,
             },
-        );
+        )
+        .await;
     }
-    acc.add_interaction(permission_block("per_split", "ses_split", "/work"));
-    acc.reply_to_message_id = Some("msg_1".into());
-    app.cards.lock().await.insert(
-        "ses_split".into(),
-        CardSession::new(acc, Some("om_filled".into())),
-    );
+    add_permission_block(&app, "per_split", "ses_split", "/work").await;
+    Turn::set_reply_target(&cards, "ses_split", "msg_1").await;
 
     // Freeze the continuation send: the finalized patch has been sent, the
     // continuation is not yet registered as the session's card.
@@ -807,14 +788,11 @@ async fn a_resolution_racing_an_in_flight_flush_is_not_resurrected() {
     seed_session(&app, "ses_live", "/work").await;
 
     // The live card carries the inline permission (the poller path).
-    let mut acc = StreamAccumulator::new("回合");
-    acc.card_state = CardState::Done;
-    acc.push_text("回合的内容。");
-    acc.reply_to_message_id = Some("msg_1".into());
-    app.cards
-        .lock()
-        .await
-        .insert("ses_live".into(), CardSession::new(acc, Some("om_live".into())));
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_live", Some("om_live")).await;
+    Turn::set_card_state(&cards, "ses_live", CardState::Done).await;
+    Turn::push_text(&cards, "ses_live", "回合的内容。").await;
+    Turn::set_reply_target(&cards, "ses_live", "msg_1").await;
     let mut seen = std::collections::HashSet::new();
     app.permission.sweep(&app.core, &mut seen).await;
 

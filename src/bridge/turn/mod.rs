@@ -1351,6 +1351,242 @@ async fn release_inflight(handles: &TurnHandles, session_id: &str) {
     inflight.remove(session_id);
 }
 
+/// The Turn's test seam (spec #298, A3): the fixtures tests outside the Turn
+/// need to exercise a flow on a card — seed a card session, feed it parts, and
+/// read back what the flow rendered. The accumulator stays private; these
+/// helpers are the test side of the same interface the production flows use.
+/// The accumulator's own internal-seam tests live next to it in `state.rs`.
+#[cfg(test)]
+impl Turn {
+    /// Seed an empty card session for `session_id`.
+    pub(crate) async fn seed_card(cards: &CardsHandle, session_id: &str, card_message_id: Option<&str>) {
+        cards.cards.lock().await.insert(
+            session_id.to_string(),
+            state::CardSession::new(
+                state::StreamAccumulator::new("test"),
+                card_message_id.map(str::to_string),
+            ),
+        );
+    }
+
+    /// Set the card's display state.
+    pub(crate) async fn set_card_state(
+        cards: &CardsHandle,
+        session_id: &str,
+        state: crate::feishu::card::CardState,
+    ) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.card_state = state;
+        }
+    }
+
+    /// Clear the card's phase timer (a finalized-card fixture).
+    pub(crate) async fn clear_phase(cards: &CardsHandle, session_id: &str) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.current_phase = None;
+        }
+    }
+
+    /// Set the card's subtitle/title.
+    pub(crate) async fn set_title(cards: &CardsHandle, session_id: &str, title: &str) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.title = title.to_string();
+        }
+    }
+
+    /// Set the card's reply target.
+    pub(crate) async fn set_reply_target(cards: &CardsHandle, session_id: &str, reply_to: &str) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.reply_to_message_id = Some(reply_to.to_string());
+        }
+    }
+
+    /// Set the turn's server-time anchor.
+    pub(crate) async fn set_turn_anchor(cards: &CardsHandle, session_id: &str, anchor_ms: i64) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.turn_started_ms = Some(anchor_ms);
+        }
+    }
+
+    /// Record the turn's requester, chat type and generation.
+    pub(crate) async fn set_turn_identity(
+        cards: &CardsHandle,
+        session_id: &str,
+        requester_open_id: &str,
+        is_group: bool,
+        generation: u64,
+    ) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.requester_open_id = Some(requester_open_id.to_string());
+            card.acc.is_group = is_group;
+            card.acc.turn_generation = Some(generation);
+        }
+    }
+
+    /// Record the answering model and its provider.
+    pub(crate) async fn set_model(cards: &CardsHandle, session_id: &str, provider: &str, model: &str) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.provider_id = Some(provider.to_string());
+            card.acc.model_id = Some(model.to_string());
+        }
+    }
+
+    /// Append text to the card's timeline.
+    pub(crate) async fn push_text(cards: &CardsHandle, session_id: &str, text: &str) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.push_text(text);
+        }
+    }
+
+    /// Append reasoning to the card's timeline.
+    pub(crate) async fn push_reasoning(cards: &CardsHandle, session_id: &str, text: &str) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.push_reasoning(text);
+        }
+    }
+
+    /// Append reasoning keyed at a server time.
+    pub(crate) async fn push_reasoning_at(cards: &CardsHandle, session_id: &str, at_ms: i64, text: &str) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.push_reasoning_at(Some(at_ms), text);
+        }
+    }
+
+    /// Push a tool panel onto the card's timeline.
+    pub(crate) async fn push_tool(
+        cards: &CardsHandle,
+        session_id: &str,
+        call_id: &str,
+        panel: crate::feishu::card::tool_render::ToolPanel,
+    ) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.push_tool(call_id, panel);
+        }
+    }
+
+    /// Push a tool panel keyed at a server time.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn push_tool_at(
+        cards: &CardsHandle,
+        session_id: &str,
+        at_ms: i64,
+        call_id: &str,
+        panel: crate::feishu::card::tool_render::ToolPanel,
+    ) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.push_tool_at(Some(at_ms), call_id, panel);
+        }
+    }
+
+    /// The card's display state.
+    pub(crate) async fn card_state(
+        cards: &CardsHandle,
+        session_id: &str,
+    ) -> Option<crate::feishu::card::CardState> {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .map(|c| c.acc.card_state.clone())
+    }
+
+    /// The live permission blocks' `(request_id, session_id)`, in render order.
+    pub(crate) async fn live_permissions(cards: &CardsHandle, session_id: &str) -> Vec<(String, String)> {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .map(|c| {
+                c.acc
+                    .live_permissions()
+                    .into_iter()
+                    .map(|p| (p.request_id, p.session_id))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The live question blocks' `(request_id, answers)`, in render order.
+    pub(crate) async fn live_questions(
+        cards: &CardsHandle,
+        session_id: &str,
+    ) -> Vec<(String, Vec<Option<Vec<String>>>)> {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .map(|c| {
+                c.acc
+                    .live_questions()
+                    .into_iter()
+                    .map(|q| (q.request_id, q.answers))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The card as it would render now.
+    pub(crate) async fn rendered_card(cards: &CardsHandle, session_id: &str) -> Option<serde_json::Value> {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .map(|c| c.acc.build_card())
+    }
+
+    /// The timeline index the card currently renders from.
+    pub(crate) async fn render_from(cards: &CardsHandle, session_id: &str) -> Option<usize> {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .map(|c| c.acc.render_from)
+    }
+
+    /// Whether the card session is the growing live card.
+    pub(crate) async fn card_is_live(cards: &CardsHandle, session_id: &str) -> bool {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|c| c.card_is_live)
+    }
+
+    /// Whether the session owes a split continuation.
+    pub(crate) async fn has_pending_split(cards: &CardsHandle, session_id: &str) -> bool {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|c| !c.pending_split.is_empty())
+    }
+
+    /// Whether any card carries a LIVE interaction block for `request_id`.
+    pub(crate) async fn has_live_interaction(cards: &CardsHandle, request_id: &str) -> bool {
+        cards.cards.lock().await.values().any(|c| {
+            c.acc
+                .interaction(request_id)
+                .is_some_and(state::InteractionBlock::is_live)
+        })
+    }
+
+    /// Whether any card carries an Interaction Receipt starting with `prefix`.
+    pub(crate) async fn has_receipt_prefix(cards: &CardsHandle, prefix: &str) -> bool {
+        cards.cards.lock().await.values().any(|c| {
+            c.acc.timeline.iter().any(
+                |item| matches!(&item.kind, state::TimelineKind::Receipt(text) if text.starts_with(prefix)),
+            )
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
