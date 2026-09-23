@@ -1,13 +1,10 @@
 mod flush;
-
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+pub(crate) mod render;
 
 use tracing::Instrument;
 
 use crate::bridge::handler::image_inputs;
 use crate::bridge::handles::{CardsHandle, TurnHandles};
-use crate::bridge::render::{render_and_flush, render_new_turn_parts, render_parts, render_poll_loop};
 use crate::bridge::span;
 use crate::bridge::streaming::StreamAccumulator;
 use crate::config::ThreadKey;
@@ -334,7 +331,7 @@ impl Turn {
         &mut self,
         handles: &TurnHandles,
     ) -> crate::error::Result<opencode::types::PromptResponse> {
-        let render = RenderPoll::spawn(handles, &self.session_id, &self.thread_key);
+        let render = render::RenderPoll::spawn(handles, &self.session_id, &self.thread_key);
         // Capture the variant actually sent this turn AT SEND TIME, not at
         // finalization: a `/think` issued mid-generation must not retro-tag the
         // card of a turn that was sent without it (same "capture at turn start"
@@ -482,10 +479,10 @@ impl Turn {
                 if let Ok(resp) = prompt_resp {
                     let mut rendered = false;
                     if let Some(msgs) = &final_msgs {
-                        rendered = render_new_turn_parts(acc, msgs);
+                        rendered = render::render_new_turn_parts(acc, msgs);
                     }
                     if !rendered {
-                        render_parts(acc, &resp.parts);
+                        render::render_parts(acc, &resp.parts);
                     }
                 }
                 // Capture the answering model + token usage from the LATEST
@@ -705,7 +702,7 @@ impl Turn {
         match self.drain_state(handles, &msgs, timeout_ms).await {
             DrainState::Settled => Some(DrainState::Settled),
             pending => {
-                render_and_flush(
+                render::render_and_flush(
                     &handles.cards,
                     &handles.sessions,
                     &handles.backend,
@@ -757,7 +754,7 @@ impl Turn {
             let mut cards = handles.cards.cards.lock().await;
             match cards.get_mut(&self.session_id) {
                 Some(card) => {
-                    crate::bridge::render::capture_turn_anchor(&mut card.acc, msgs);
+                    render::capture_turn_anchor(&mut card.acc, msgs);
                     card.acc.turn_started_ms
                 }
                 None => None,
@@ -902,44 +899,10 @@ async fn release_inflight(handles: &TurnHandles, session_id: &str) {
     inflight.remove(session_id);
 }
 
-/// One attempt's incremental renderer: the poll loop plus its stop flag. Owns
-/// the spawn/stop pairing so an attempt cannot leak a running poll loop.
-struct RenderPoll {
-    done: Arc<AtomicBool>,
-    handle: tokio::task::JoinHandle<()>,
-}
-
-impl RenderPoll {
-    fn spawn(handles: &TurnHandles, session_id: &str, thread_key: &ThreadKey) -> Self {
-        let done = Arc::new(AtomicBool::new(false));
-        let cards = handles.cards.clone();
-        let sessions = handles.sessions.clone();
-        let backend = Arc::clone(&handles.backend);
-        let sid = session_id.to_string();
-        let flag = Arc::clone(&done);
-        let poll_ms = handles.config.render_poll_ms();
-        // A spawn does not inherit the turn's span — the poll runs on its own
-        // task — so it is instrumented explicitly with the same fields: its
-        // lines must keep the session (ADR-0048). Rooted, because the ambient
-        // parent here is the turn's span.
-        let span = span::turn(session_id, thread_key, None);
-        let handle = tokio::spawn(
-            async move {
-                render_poll_loop(&cards, &sessions, &backend, sid, flag, poll_ms).await;
-            }
-            .instrument(span),
-        );
-        Self { done, handle }
-    }
-
-    async fn stop(self) {
-        self.done.store(true, Ordering::SeqCst);
-        let _ = self.handle.await;
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::bridge::App;
     use crate::bridge::test_support::{

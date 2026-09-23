@@ -441,12 +441,18 @@ async fn subtitle_falls_back_to_id_tail_without_server_title() {
     // No server title → the id-tail alone identifies the session (no cola
     // side name to fall back on; the current prompt is never echoed).
     assert_eq!(
-        crate::bridge::render::session_subtitle(&app.sessions_handle(), &app.opencode, &key, "另一个问题")
-            .await,
+        crate::bridge::turn::render::session_subtitle(
+            &app.sessions_handle(),
+            &app.opencode,
+            &key,
+            "另一个问题"
+        )
+        .await,
         "01ba0ed"
     );
     assert_eq!(
-        crate::bridge::render::session_subtitle(&app.sessions_handle(), &app.opencode, &key, "你好").await,
+        crate::bridge::turn::render::session_subtitle(&app.sessions_handle(), &app.opencode, &key, "你好")
+            .await,
         "01ba0ed"
     );
 }
@@ -484,7 +490,7 @@ async fn subtitle_degrades_when_session_info_hangs() {
     // only) within the bound instead of hanging the prompt flow.
     let subtitle = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        crate::bridge::render::session_subtitle(&app.sessions_handle(), &app.opencode, &key, "问题"),
+        crate::bridge::turn::render::session_subtitle(&app.sessions_handle(), &app.opencode, &key, "问题"),
     )
     .await
     .expect("session_subtitle must not hang when session_info never returns");
@@ -556,8 +562,13 @@ async fn subtitle_ignores_server_default_title() {
     )
     .await;
     assert_eq!(
-        crate::bridge::render::session_subtitle(&app.sessions_handle(), &app.opencode, &key, "另一个问题")
-            .await,
+        crate::bridge::turn::render::session_subtitle(
+            &app.sessions_handle(),
+            &app.opencode,
+            &key,
+            "另一个问题"
+        )
+        .await,
         "00ea4e7"
     );
 }
@@ -593,7 +604,8 @@ async fn subtitle_prefers_server_title() {
     )
     .await;
     assert_eq!(
-        crate::bridge::render::session_subtitle(&app.sessions_handle(), &app.opencode, &key, "问题").await,
+        crate::bridge::turn::render::session_subtitle(&app.sessions_handle(), &app.opencode, &key, "问题")
+            .await,
         "OpenChamber 显示的标题 · test"
     );
 }
@@ -648,7 +660,7 @@ async fn refresh_session_title_updates_live_card_on_server_rename() {
     }
 
     // The server's live title differs → refresh must update the card subtitle.
-    let refreshed = crate::bridge::render::refresh_session_title(
+    let refreshed = crate::bridge::turn::render::refresh_session_title(
         &app.cards_handle(),
         &app.sessions_handle(),
         &app.opencode,
@@ -660,7 +672,7 @@ async fn refresh_session_title_updates_live_card_on_server_rename() {
     assert_eq!(title, "修复登录鉴权问题 · test");
     // A second refresh with no further change must be a no-op (no churn).
     assert!(
-        !crate::bridge::render::refresh_session_title(
+        !crate::bridge::turn::render::refresh_session_title(
             &app.cards_handle(),
             &app.sessions_handle(),
             &app.opencode,
@@ -672,7 +684,7 @@ async fn refresh_session_title_updates_live_card_on_server_rename() {
     // No accumulator (a finished turn) → refresh is a no-op.
     app.cards.lock().await.remove("ses_test");
     assert!(
-        !crate::bridge::render::refresh_session_title(
+        !crate::bridge::turn::render::refresh_session_title(
             &app.cards_handle(),
             &app.sessions_handle(),
             &app.opencode,
@@ -728,7 +740,7 @@ async fn refresh_session_title_syncs_cover_card_mid_turn() {
         );
     }
 
-    let refreshed = crate::bridge::render::refresh_session_title(
+    let refreshed = crate::bridge::turn::render::refresh_session_title(
         &app.cards_handle(),
         &app.sessions_handle(),
         &app.opencode,
@@ -854,8 +866,8 @@ async fn short_answer_stays_in_card_no_extra_message() {
 /// SERVER anchor (`turn_started_ms`), the accumulator's only clock (#190).
 #[test]
 fn panel_times_and_header_date_come_from_part_epochs() {
-    use crate::bridge::render::render_parts;
     use crate::bridge::streaming::StreamAccumulator;
+    use crate::bridge::turn::render::render_parts;
     use crate::feishu::card::CardState;
     use crate::feishu::card::test_local_ms;
 
@@ -921,8 +933,8 @@ fn panel_times_and_header_date_come_from_part_epochs() {
 /// (provider, model) for the turn, so later polls cost no extra request.
 #[tokio::test]
 async fn render_poll_shows_live_context_and_memoizes_the_window() {
-    use crate::bridge::render::render_and_flush;
     use crate::bridge::streaming::{CardSession, StreamAccumulator};
+    use crate::bridge::turn::render::render_and_flush;
     use crate::opencode::types::{MessageInfo, MessageTime, MessageTokens, SessionMessage};
 
     let dir = tempfile::tempdir().unwrap();

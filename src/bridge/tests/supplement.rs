@@ -337,7 +337,7 @@ async fn a_tool_completing_after_the_split_renders_on_the_continuation() {
     {
         let mut cards = app.cards.lock().await;
         let acc = &mut cards.get_mut("ses_test").unwrap().acc;
-        crate::bridge::render::render_parts(
+        crate::bridge::turn::render::render_parts(
             acc,
             &serde_json::json!([
                 { "type": "tool", "tool": "bash", "callID": "call_bash",
