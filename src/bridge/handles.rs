@@ -403,10 +403,14 @@ impl SessionsHandle {
 /// 1. A card write takes the session's [`Self::write_lock`] FIRST and holds it
 ///    across the whole read-send-record sequence (`flush_card`,
 ///    `split_card_chain`, `resolve_blocks`); everything else is taken inside
-///    that sequence.
-/// 2. Inside it, `cards` and `card_handles` are each taken for one step and
-///    released; the resolution path snapshots `sent_cards` (on the request
-///    flow) BEFORE taking `card_handles`, and never holds the two at once.
+///    that sequence. The `write_locks` map is only the lookup from a session id
+///    to its lock, held for that step alone.
+/// 2. Inside the sequence, `cards` and `card_handles` are each taken for one
+///    step and released. The resolution path (`resolve_blocks`) also snapshots
+///    the request flow's `sent_cards`, briefly, while it holds `write_lock`: the
+///    documented order is `write_lock` → `sent_cards` → `card_handles`, with no
+///    two of `cards`, `sent_cards` and `card_handles` ever held at the same
+///    time.
 /// 3. `cover_titles` is independent of both.
 #[derive(Clone)]
 pub(crate) struct CardsHandle {
