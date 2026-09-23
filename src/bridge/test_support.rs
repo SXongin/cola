@@ -1801,3 +1801,58 @@ pub(crate) fn perm_request(
         always: vec![],
     }
 }
+
+// ===== Session-scoped log capture (ADR-0048) =====
+
+/// An in-memory [`tracing_subscriber::fmt::MakeWriter`]: every formatted event
+/// appends to one shared byte buffer. Cloneable because `make_writer` hands a
+/// fresh writer to each event.
+#[derive(Clone, Default)]
+struct CaptureBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CaptureBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureBuffer {
+    type Writer = CaptureBuffer;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Run `body` under a captured subscriber and return its output plus every log
+/// line it emitted.
+///
+/// The subscriber writes production's plain-text, ANSI-free shape into an
+/// in-memory buffer ([`CaptureBuffer`]) and is installed with
+/// `tracing::subscriber::set_default`, i.e. THREAD-LOCAL: the global subscriber
+/// is never touched, so tests stay safe under the harness's parallel threads.
+/// No level filter is applied (production's `EnvFilter` default is `cola=info`),
+/// so a test can also pin a line's level. Run the body on a current-thread
+/// runtime (`#[tokio::test]`) — spawned tasks then share the capture thread and
+/// their instrumented spans still land in the buffer.
+pub(crate) async fn capture_logs<F, T>(body: F) -> (T, String)
+where
+    F: std::future::Future<Output = T>,
+{
+    let buffer = CaptureBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(buffer.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    let output = body.await;
+    drop(guard);
+    let text = String::from_utf8(buffer.0.lock().unwrap().clone()).expect("the fmt layer writes valid UTF-8");
+    (output, text)
+}
