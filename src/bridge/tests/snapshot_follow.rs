@@ -198,11 +198,7 @@ async fn post_adopt_requests_keep_standalone_flow() {
 
     send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
     // …and a SECOND request arriving after the snapshot was sent.
-    backend
-        .extra_permissions
-        .lock()
-        .await
-        .push(perm_request("per_2", "ses_alpha01", "rm -rf /tmp/x"));
+    backend.ask_permission_later(perm_request("per_2", "ses_alpha01", "rm -rf /tmp/x"));
 
     tokio::spawn({
         let app = app.clone();
@@ -461,12 +457,8 @@ async fn busy_adopt_streams_turn_into_snapshot() {
         "/work/ext",
         100,
     )]);
-    backend
-        .session_statuses
-        .insert("ses_alpha01".into(), Some(opencode::types::SessionStatus::Busy));
-    backend
-        .external_user_messages
-        .insert("ses_alpha01".into(), "帮我重构这个模块".into());
+    backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
+    backend.external_message_for("ses_alpha01", "帮我重构这个模块");
     backend.external_reply(realistic_parts());
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
@@ -546,12 +538,8 @@ async fn busy_follow_permission_approved_resumes() {
         "/work/ext",
         100,
     )]);
-    backend
-        .session_statuses
-        .insert("ses_alpha01".into(), Some(opencode::types::SessionStatus::Busy));
-    backend
-        .external_user_messages
-        .insert("ses_alpha01".into(), "帮我重构这个模块".into());
+    backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
+    backend.external_message_for("ses_alpha01", "帮我重构这个模块");
     backend.ask_permission(perm_request("per_1", "ses_alpha01", "ls -la"));
     backend.external_reply(realistic_parts());
     let backend = Arc::new(backend);
@@ -675,13 +663,9 @@ async fn busy_then_idle_race_stays_static() {
         "/work/ext",
         100,
     )]);
-    backend
-        .external_user_messages
-        .insert("ses_alpha01".into(), "帮我重构这个模块".into());
+    backend.external_message_for("ses_alpha01", "帮我重构这个模块");
     backend.ask_permission(perm_request("per_1", "ses_alpha01", "ls -la"));
-    backend
-        .status_busy_once
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+    backend.busy_then_idle_once();
     let (app, platform) = build_app(cfg, backend).await;
 
     send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
@@ -720,9 +704,7 @@ async fn busy_follow_skips_cola_authored_turn() {
         "/work/ext",
         100,
     )]);
-    backend
-        .session_statuses
-        .insert("ses_alpha01".into(), Some(opencode::types::SessionStatus::Busy));
+    backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
     // The newest user message is cola's OWN (a cola prompt mid-turn).
     backend
         .cola_user_messages
@@ -757,12 +739,8 @@ async fn busy_follow_question_block_resolves() {
         "/work/ext",
         100,
     )]);
-    backend
-        .session_statuses
-        .insert("ses_alpha01".into(), Some(opencode::types::SessionStatus::Busy));
-    backend
-        .external_user_messages
-        .insert("ses_alpha01".into(), "帮我重构这个模块".into());
+    backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
+    backend.external_message_for("ses_alpha01", "帮我重构这个模块");
     backend.ask_questions(vec![opencode::types::QuestionRequest {
         id: "q_1".into(),
         session_id: "ses_alpha01".into(),
@@ -829,12 +807,8 @@ async fn user_prompt_during_follow_takes_over() {
         "/work/ext",
         100,
     )]);
-    backend
-        .session_statuses
-        .insert("ses_alpha01".into(), Some(opencode::types::SessionStatus::Busy));
-    backend
-        .external_user_messages
-        .insert("ses_alpha01".into(), "帮我重构这个模块".into());
+    backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
+    backend.external_message_for("ses_alpha01", "帮我重构这个模块");
     let (app, platform) = build_app(cfg, backend).await;
     app.core
         .external

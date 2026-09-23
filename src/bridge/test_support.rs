@@ -991,6 +991,76 @@ impl MockBackend {
         self
     }
 
+    /// Scenario: another client posts `text` into a SPECIFIC session (takes
+    /// precedence over [`external_message`] for that session).
+    pub(crate) fn external_message_for(&mut self, session_id: &str, text: &str) -> &mut Self {
+        self.external_user_messages
+            .insert(session_id.to_string(), text.to_string());
+        self
+    }
+
+    /// Scenario: the server's live status for `session_id` (`None` = an
+    /// unrecognised status type; an absent entry means idle).
+    pub(crate) fn with_session_status(
+        &mut self,
+        session_id: &str,
+        status: Option<opencode::types::SessionStatus>,
+    ) -> &mut Self {
+        self.session_statuses.insert(session_id.to_string(), status);
+        self
+    }
+
+    /// Scenario: the server's title for `session_id` (the render poll's
+    /// subtitle source, `session_info`).
+    pub(crate) fn with_session_title(&mut self, session_id: &str, title: &str) -> &mut Self {
+        self.session_titles
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), title.to_string());
+        self
+    }
+
+    /// Scenario: the next `count` `list_permissions` calls hang forever (a
+    /// request stuck on a half-open connection); later polls serve normally.
+    pub(crate) fn hang_permission_lists(&self, count: usize) -> &Self {
+        self.hang_list_permissions
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    /// Scenario: the next `count` `list_questions` calls hang forever.
+    pub(crate) fn hang_question_lists(&self, count: usize) -> &Self {
+        self.hang_list_questions
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    /// Scenario: the next `count` `messages` calls hang forever (a wedged
+    /// per-session read).
+    pub(crate) fn hang_message_reads(&self, count: usize) -> &Self {
+        self.hang_messages
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    /// Scenario: the FIRST `session_status` read reports Busy, later reads
+    /// serve the map (the ADR-0028 busy→idle race).
+    pub(crate) fn busy_then_idle_once(&self) -> &Self {
+        self.status_busy_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    /// Scenario: `request` arrives AFTER the app was built (the snapshot was
+    /// already sent, ADR-0028).
+    pub(crate) fn ask_permission_later(&self, request: opencode::types::PermissionRequest) -> &Self {
+        self.extra_permissions
+            .try_lock()
+            .expect("ask_permission_later before the app is built")
+            .push(request);
+        self
+    }
+
     /// Scenario: the model answers the external message with `parts`. Returns
     /// the gate the test flips once the notification card has been sent.
     pub(crate) fn external_reply(&mut self, parts: serde_json::Value) -> Arc<std::sync::atomic::AtomicBool> {

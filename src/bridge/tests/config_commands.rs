@@ -614,14 +614,10 @@ async fn name_patches_cover_card_in_cover_rooted_topic() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let backend = MockBackend::new(realistic_parts());
+    let mut backend = MockBackend::new(realistic_parts());
     // The server title after the PATCH (the mock records the call but the
     // GET /session/{id} response comes from this map).
-    backend
-        .session_titles
-        .lock()
-        .unwrap()
-        .insert("ses_test".into(), "新名字".into());
+    backend.with_session_title("ses_test", "新名字");
     let (app, platform) = build_app(cfg, backend).await;
     seed_entry(
         &app,
@@ -687,12 +683,8 @@ async fn default_server_title_does_not_patch_cover_card() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let backend = MockBackend::new(realistic_parts());
-    backend
-        .session_titles
-        .lock()
-        .unwrap()
-        .insert("ses_test".into(), "New session - 2024-12-14T05:33:00.000Z".into());
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_session_title("ses_test", "New session - 2024-12-14T05:33:00.000Z");
     let (app, platform) = build_app(cfg, backend).await;
     seed_entry(
         &app,

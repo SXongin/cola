@@ -84,7 +84,7 @@ async fn scripted_app(
     let mut backend = MockBackend::new(realistic_parts());
     backend.given_timeline("ses_test", scripts);
     if let Some(status) = status {
-        backend.session_statuses.insert("ses_test".into(), Some(status));
+        backend.with_session_status("ses_test", Some(status));
     }
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
@@ -533,7 +533,7 @@ async fn a_hung_backend_read_ends_the_drain_at_the_bound() {
     app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
     // The first Backend read hangs forever (a half-open connection left by a
     // server restart); later reads serve normally.
-    backend.hang_messages.store(1, Ordering::SeqCst);
+    backend.hang_message_reads(1);
 
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(
@@ -659,7 +659,7 @@ async fn a_hung_recheck_read_does_not_extend_finalization() {
     app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
     // Both the drain's read and the re-check's read hang; the final reconcile
     // read serves normally.
-    backend.hang_messages.store(2, Ordering::SeqCst);
+    backend.hang_message_reads(2);
 
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(

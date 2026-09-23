@@ -538,11 +538,8 @@ async fn subtitle_ignores_server_default_title() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let mock = MockBackend::new(realistic_parts());
-    mock.session_titles.lock().unwrap().insert(
-        "ses_00ea4e77cffez1fo4wrNuJyHF0".into(),
-        "New session - 2026-08-28".into(),
-    );
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.with_session_title("ses_00ea4e77cffez1fo4wrNuJyHF0", "New session - 2026-08-28");
     let (app, _) = build_app(cfg, mock).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
 
@@ -580,11 +577,8 @@ async fn subtitle_prefers_server_title() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let mock = MockBackend::new(realistic_parts());
-    mock.session_titles
-        .lock()
-        .unwrap()
-        .insert("ses_test".into(), "OpenChamber 显示的标题".into());
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.with_session_title("ses_test", "OpenChamber 显示的标题");
     let (app, _) = build_app(cfg, mock).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
 

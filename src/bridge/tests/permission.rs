@@ -397,9 +397,7 @@ async fn permission_poller_recovers_when_a_list_call_hangs() {
     }]);
     // The first list call hangs forever, like a request in flight when the
     // server was SIGTERM'd; later calls serve normally.
-    backend
-        .hang_list_permissions
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    backend.hang_permission_lists(1);
     let (app, _platform) = build_app(cfg, backend).await;
 
     // Seed a session + accumulator so the poller has a reply target.
@@ -1081,7 +1079,7 @@ async fn autoaccept_on_approves_child_session_permission() {
         metadata: None,
         always: Vec::new(),
     }];
-    mock.session_parents.insert("ses_child".into(), "ses_test".into());
+    mock.with_session_parent("ses_child", "ses_test");
     let perm_calls = mock.reply_permission_calls.clone();
     let (app, _platform) = build_app(cfg, mock).await;
 

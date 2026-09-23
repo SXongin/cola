@@ -1884,12 +1884,9 @@ Index: /x/src/main.rs
         let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
-        let mock = MockBackend::new(realistic_parts());
+        let mut mock = MockBackend::new(realistic_parts());
         // The server already has a final auto-generated title.
-        mock.session_titles
-            .lock()
-            .unwrap()
-            .insert("ses_test".into(), "修复登录鉴权问题".into());
+        mock.with_session_title("ses_test", "修复登录鉴权问题");
         let backend = Arc::new(mock);
         let platform = Arc::new(RecordingPlatform::new());
         let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -1968,11 +1965,8 @@ Index: /x/src/main.rs
         let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
-        let mock = MockBackend::new(realistic_parts());
-        mock.session_titles
-            .lock()
-            .unwrap()
-            .insert("ses_test".into(), "修复登录鉴权问题".into());
+        let mut mock = MockBackend::new(realistic_parts());
+        mock.with_session_title("ses_test", "修复登录鉴权问题");
         let (app, platform) = build_app(cfg, mock).await;
         let key = crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into());
 

@@ -392,9 +392,7 @@ async fn switch_reeswitch_suppressed_when_nothing_to_report() {
 async fn switch_reeswitch_snapshots_on_external_newest_message() {
     let _wd = test_work_dir();
     let mut backend = MockBackend::new(realistic_parts());
-    backend
-        .external_user_messages
-        .insert("ses_own1".into(), "OpenChamber 里的问题".into());
+    backend.external_message_for("ses_own1", "OpenChamber 里的问题");
     let (app, platform, _dir) = build_reeswitch_app(backend).await;
 
     send_command(&app, "/switch 本项目", "msg_switch").await;
@@ -420,9 +418,7 @@ async fn switch_reeswitch_snapshots_on_external_newest_message() {
 async fn switch_reeswitch_snapshots_on_busy_status() {
     let _wd = test_work_dir();
     let mut backend = MockBackend::new(realistic_parts());
-    backend
-        .session_statuses
-        .insert("ses_own1".into(), Some(opencode::types::SessionStatus::Busy));
+    backend.with_session_status("ses_own1", Some(opencode::types::SessionStatus::Busy));
     // Cola-authored newest alone is NOT enough to suppress a busy session.
     backend
         .cola_user_messages
@@ -939,9 +935,7 @@ async fn switch_card_switch_on_mapped_session_patches_to_snapshot() {
     let mut backend = MockBackend::new(realistic_parts());
     backend.given_sessions(vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)]);
     // External newness → content to report → full snapshot, not suppressed.
-    backend
-        .external_user_messages
-        .insert("ses_own1".into(), "OpenChamber 里的问题".into());
+    backend.external_message_for("ses_own1", "OpenChamber 里的问题");
     let (app, _platform) = build_app(cfg, backend).await;
     // The session is mapped to this thread but NOT active (a stacked
     // session) — the row shows 切换.
@@ -1202,9 +1196,7 @@ async fn switch_card_readopt_keeps_per_session_overrides() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend.given_sessions(vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)]);
-    backend
-        .external_user_messages
-        .insert("ses_own1".into(), "OpenChamber 里的问题".into());
+    backend.external_message_for("ses_own1", "OpenChamber 里的问题");
     let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     // The target is mapped but NOT active (a stacked session); its cola-side
