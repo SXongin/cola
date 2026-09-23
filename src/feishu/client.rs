@@ -4,6 +4,14 @@ use serde::Deserialize;
 /// The Feishu open platform host used in production.
 const DEFAULT_BASE_URL: &str = "https://open.feishu.cn";
 
+/// The scope [`Client::set_instant_reminder`] needs. Named in the bridge's
+/// warn-once failure line so a missing grant is actionable (ADR-0048).
+pub(crate) const INSTANT_REMINDER_SCOPE: &str = "im:datasync.feed_card.time_sensitive:write";
+
+/// The scope [`Client::pin_message`] / [`Client::unpin_message`] need, named
+/// for the same reason.
+pub(crate) const MESSAGE_PIN_SCOPE: &str = "im:message.pins:write_only";
+
 /// A minimal Feishu REST client.
 pub struct Client {
     http: reqwest::Client,

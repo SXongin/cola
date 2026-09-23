@@ -97,9 +97,10 @@ pub struct RecordingPlatform {
     /// The next N `reply_card` calls fail with the same typed rejection, for
     /// the continuation-send recovery path.
     pub fail_reply_card_content_count: std::sync::atomic::AtomicUsize,
-    /// When true, `set_instant_reminder` fails after recording the attempt
+    /// When set, `set_instant_reminder` fails after recording the attempt
     /// (tests the best-effort pin path: failures log and never affect a turn).
-    pub fail_instant_reminder: bool,
+    /// Atomic so a test can flip it mid-lifecycle and watch a recovery.
+    pub fail_instant_reminder: std::sync::atomic::AtomicBool,
     /// When set, `pin_message`/`unpin_message` fail after recording the
     /// attempt (tests the best-effort waiting-card pin path: a failed pin is
     /// retried, a failed unpin stays tracked). Atomic so a test can flip it
@@ -129,7 +130,7 @@ impl RecordingPlatform {
             fail_reply_card_count: std::sync::atomic::AtomicUsize::new(0),
             fail_update_card_content_count: std::sync::atomic::AtomicUsize::new(0),
             fail_reply_card_content_count: std::sync::atomic::AtomicUsize::new(0),
-            fail_instant_reminder: false,
+            fail_instant_reminder: std::sync::atomic::AtomicBool::new(false),
             fail_pin: std::sync::atomic::AtomicBool::new(false),
             reply_in_thread_thread_id: Some("omt_created_topic".into()),
             quoted_messages: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -479,7 +480,10 @@ impl feishu::Platform for RecordingPlatform {
             user_ids: user_ids.to_vec(),
             on,
         });
-        if self.fail_instant_reminder {
+        if self
+            .fail_instant_reminder
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return Err(crate::error::BridgeError::Feishu(
                 "simulated set_instant_reminder failure".into(),
             ));
@@ -1865,6 +1869,15 @@ pub(crate) fn assert_line_level<'a>(logs: &'a str, needle: &str, level: &str) ->
         );
     }
     line
+}
+
+/// How many captured lines contain `needle` and were rendered at `level` — the
+/// count [`assert_line_level`] cannot express (a WARN-once policy is about how
+/// many lines there are, and which level each carries).
+pub(crate) fn level_count(logs: &str, needle: &str, level: &str) -> usize {
+    logs.lines()
+        .filter(|line| line_level(line) == level && line.contains(needle))
+        .count()
 }
 
 /// Run `body` under a captured subscriber and return its output plus every log

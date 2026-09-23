@@ -14,9 +14,10 @@
 //! can host both kinds, so pins are reference-counted by message: the last
 //! waiting request off a card unpins it.
 //!
-//! Pins are best-effort like the reminder: failures log and are retried while
-//! the request still waits (a failed pin) or stays tracked (a failed unpin).
-//! Cola pins each card once, on the transition from "no waiting request here"
+//! Pins are best-effort like the reminder: failures are retried while the
+//! request still waits (a failed pin) or stays tracked (a failed unpin), and
+//! warn once per message rather than on every sweep (ADR-0048; see
+//! [`FailureLatch`]). Cola pins each card once, on the transition from "no waiting request here"
 //! to "one": a user who unpins a waiting card by hand is not fought — no
 //! state change means no re-pin. State is in-memory and not reconciled at
 //! startup: a pin orphaned by a crash stays until the user removes it (its
@@ -28,8 +29,10 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+use crate::bridge::failure_latch::FailureLatch;
 use crate::bridge::snapshot_claims::ClaimKind;
 use crate::feishu::Platform;
+use crate::feishu::client::MESSAGE_PIN_SCOPE;
 
 /// One waiting request's host card, as a sweep found it: which request waits,
 /// the directory that listed it (so a failed directory's wait is never read
@@ -57,6 +60,9 @@ struct Inner {
     /// card can host a Permission and a Question at once). Absent means cola
     /// believes the message is not pinned.
     refs: HashMap<String, usize>,
+    /// The warn-once policy for this registry's best-effort calls, keyed by
+    /// message id (ADR-0048).
+    latch: FailureLatch,
 }
 
 /// The waiting-card pin registry: one pin call per (request → host card)
@@ -141,6 +147,7 @@ impl MessagePins {
             }
             match feishu.pin_message(&want.message_id).await {
                 Ok(()) => {
+                    inner.latch.succeeded(&want.message_id, "waiting card pin");
                     inner.refs.insert(want.message_id.clone(), 1);
                     inner.by_request.insert(
                         want.request_id.clone(),
@@ -156,11 +163,11 @@ impl MessagePins {
                         want.request_id
                     );
                 }
-                Err(e) => tracing::warn!(
-                    "waiting card pin {} failed (best-effort; retried while it waits): {}",
-                    want.message_id,
-                    e
-                ),
+                Err(e) => {
+                    inner
+                        .latch
+                        .failed(&want.message_id, "waiting card pin", MESSAGE_PIN_SCOPE, &e);
+                }
             }
         }
     }
@@ -193,6 +200,7 @@ impl MessagePins {
         }
         match feishu.unpin_message(message_id).await {
             Ok(()) => {
+                inner.latch.succeeded(message_id, "waiting card unpin");
                 inner.refs.remove(message_id);
                 inner.by_request.remove(request_id);
                 tracing::info!("waiting card {} unpinned (request {})", message_id, request_id);
@@ -201,11 +209,9 @@ impl MessagePins {
                 // Keep the hold (and this request) tracked: the next sweep
                 // retries the unpin.
                 *inner.refs.entry(message_id.to_string()).or_insert(0) += 1;
-                tracing::warn!(
-                    "waiting card unpin {} failed (best-effort; kept for a later sweep): {}",
-                    message_id,
-                    e
-                );
+                inner
+                    .latch
+                    .failed(message_id, "waiting card unpin", MESSAGE_PIN_SCOPE, &e);
             }
         }
     }
@@ -214,7 +220,7 @@ impl MessagePins {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::test_support::RecordingPlatform;
+    use crate::bridge::test_support::{RecordingPlatform, assert_line_level, capture_logs, level_count};
 
     fn waiting(request: &str, dir: &str, message: &str) -> WaitingCard {
         WaitingCard {
@@ -416,6 +422,111 @@ mod tests {
             6,
             "the unpin lands exactly once"
         );
+    }
+
+    /// ADR-0048's warn-once policy: a failing pin warns once per message (with
+    /// the cause and the actionable scope), the identical repeats are DEBUG,
+    /// and a pin that lands logs INFO recovery — while every sweep still
+    /// retries. The unpin path has the same shape under its own label.
+    #[tokio::test]
+    async fn a_repeated_failure_warns_once_and_recovery_logs_info() {
+        let pins = MessagePins::new(true);
+        let (platform, feishu) = test_platform();
+        let card = waiting("per_1", "/work", "msg_card");
+        platform.fail_pin.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let (_, logs) = capture_logs(async {
+            pins.sync(
+                &feishu,
+                ClaimKind::Permission,
+                std::slice::from_ref(&card),
+                &no_dirs(),
+            )
+            .await;
+            pins.sync(
+                &feishu,
+                ClaimKind::Permission,
+                std::slice::from_ref(&card),
+                &no_dirs(),
+            )
+            .await;
+        })
+        .await;
+
+        assert_eq!(
+            platform.message_pins().await.len(),
+            2,
+            "the failed pin is still retried every sweep"
+        );
+        assert_line_level(&logs, "waiting card pin msg_card failed", "WARN");
+        assert_eq!(
+            level_count(&logs, "waiting card pin msg_card", "WARN"),
+            1,
+            "one warning, not one per sweep:\n{logs}"
+        );
+        assert_eq!(
+            level_count(&logs, "waiting card pin msg_card", "DEBUG"),
+            1,
+            "the repeat is DEBUG:\n{logs}"
+        );
+        assert!(
+            logs.contains("im:message.pins:write_only"),
+            "the warning names the actionable scope:\n{logs}"
+        );
+        assert!(
+            logs.contains("simulated pin_message failure"),
+            "the warning carries the cause:\n{logs}"
+        );
+
+        // The pin lands: INFO recovery, and the retry still happened.
+        platform
+            .fail_pin
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let (_, logs) = capture_logs(async {
+            pins.sync(
+                &feishu,
+                ClaimKind::Permission,
+                std::slice::from_ref(&card),
+                &no_dirs(),
+            )
+            .await;
+        })
+        .await;
+        assert_eq!(platform.message_pins().await.len(), 3);
+        assert_line_level(&logs, "waiting card pin msg_card recovered", "INFO");
+
+        // The failed unpin has the same shape: one WARN, the repeats DEBUG.
+        platform.fail_pin.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (_, logs) = capture_logs(async {
+            pins.sync(&feishu, ClaimKind::Permission, &[], &no_dirs()).await;
+            pins.sync(&feishu, ClaimKind::Permission, &[], &no_dirs()).await;
+        })
+        .await;
+        assert_eq!(
+            platform.message_pins().await.len(),
+            5,
+            "the failed unpin is still retried every sweep"
+        );
+        assert_eq!(
+            level_count(&logs, "waiting card unpin msg_card", "WARN"),
+            1,
+            "one warning for the unpin:\n{logs}"
+        );
+        assert_eq!(
+            level_count(&logs, "waiting card unpin msg_card", "DEBUG"),
+            1,
+            "the unpin repeat is DEBUG:\n{logs}"
+        );
+
+        platform
+            .fail_pin
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let (_, logs) = capture_logs(async {
+            pins.sync(&feishu, ClaimKind::Permission, &[], &no_dirs()).await;
+        })
+        .await;
+        assert_eq!(platform.message_pins().await.len(), 6);
+        assert_line_level(&logs, "waiting card unpin msg_card recovered", "INFO");
     }
 
     /// The opt-in default: off means no pin call is ever made.

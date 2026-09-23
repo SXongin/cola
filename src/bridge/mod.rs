@@ -5,6 +5,7 @@ pub mod core;
 pub mod discovery;
 pub mod display;
 pub mod external;
+pub mod failure_latch;
 pub mod handler;
 pub mod message_pins;
 pub mod pollers;
