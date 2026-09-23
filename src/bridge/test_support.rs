@@ -1836,6 +1836,37 @@ pub(crate) fn line_level(line: &str) -> &str {
     line.split_whitespace().nth(1).unwrap_or("")
 }
 
+/// The first captured line containing `needle` — the line an assertion is
+/// about — or a panic dumping every captured line.
+pub(crate) fn line_with<'a>(logs: &'a str, needle: &str) -> &'a str {
+    logs.lines()
+        .find(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("no captured line contains {needle:?}:\n{logs}"))
+}
+
+/// Assert that the captured line containing `needle` was rendered at `level`
+/// and — unless `level` is INFO itself — that no same-`needle` line leaks at
+/// INFO: the ADR-0048 policy keeps whole payload dumps and ack timings off
+/// INFO, so a demoted line that is still emitted there is a regression. The
+/// line is returned so the caller can additionally assert on its body.
+pub(crate) fn assert_line_level<'a>(logs: &'a str, needle: &str, level: &str) -> &'a str {
+    let line = line_with(logs, needle);
+    assert_eq!(
+        line_level(line),
+        level,
+        "the {needle:?} line must be rendered at {level}: {line}"
+    );
+    if level != "INFO" {
+        assert!(
+            !logs
+                .lines()
+                .any(|other| line_level(other) == "INFO" && other.contains(needle)),
+            "the {needle:?} line must never be emitted at INFO:\n{logs}"
+        );
+    }
+    line
+}
+
 /// Run `body` under a captured subscriber and return its output plus every log
 /// line it emitted.
 ///
