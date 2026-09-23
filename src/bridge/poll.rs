@@ -36,7 +36,12 @@ use crate::bridge::failure_latch::FailureLatch;
 /// identical repeats are DEBUG, and a success after a failure logs the
 /// recovery (ADR-0048). Per-item failures inside a pass (one directory, one
 /// session) stay with the pass, which knows their finer conditions; the latch
-/// is for "this tick could not do its job".
+/// is for "this tick could not do its job". A pass whose per-item conditions
+/// are all reported inside itself — the request sweep and the external sync,
+/// each with its own finer key/scope — therefore returns `Ok(())` and leaves
+/// this latch unused; the server-reconcile loop is the one pass that consumes
+/// it today. A future pass returns `Err` only when the tick as a whole could
+/// not do its job, never to relay an item's failure.
 pub(crate) struct PollLoop<'a> {
     /// Tick cadence in milliseconds, read fresh every tick.
     cadence_ms: &'a AtomicU64,

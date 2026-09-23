@@ -58,6 +58,14 @@ impl ExternalFlow {
     /// mid-turn and cola never reads back the message's created time, the
     /// poller still recognises it as cola's own on the first poll after a heal
     /// — it can never be mistaken for an external message.
+    ///
+    /// The pass returns `Ok(())` by design (ADR-0048): a per-session failure (a
+    /// message read, a notify, a card send) is logged where it happens, under
+    /// that session's `external` span, so there is no tick-level failure for
+    /// the loop's keyless latch to name. That latch is consumed only by a pass
+    /// that fails as a whole; the server-reconcile loop is the one such pass
+    /// today. A future pass returns `Err` only when the tick itself could not
+    /// do its job, never to relay a per-item condition.
     pub(crate) async fn poll_loop(&self, handles: &FlowHandles) -> crate::error::Result<()> {
         let mut poll = crate::bridge::poll::PollLoop::new(&self.poll_interval_ms, "external message sync");
         // The seam owns the cadence ([`Self::poll_interval_ms`], injectable),
@@ -68,6 +76,8 @@ impl ExternalFlow {
             || !handles.backend.base_url().is_empty(),
             move || async move {
                 self.sync_sessions(handles).await;
+                // Per-session failures were logged inside `sync_sessions`;
+                // nothing tick-level to latch (see the doc above).
                 Ok(())
             },
         )

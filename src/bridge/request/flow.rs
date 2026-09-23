@@ -397,6 +397,15 @@ impl RequestFlow {
     /// owns the cadence ([`Self::poll_interval_ms`], injectable), the
     /// serverless guard and the failure latch; the pass is one sweep.
     ///
+    /// The pass returns `Ok(())` by design (ADR-0048): every per-item condition
+    /// of a sweep — one directory's list call, one request's surfacing, one
+    /// card repaint — is reported where it happens with its own finer
+    /// key/scope, so there is no tick-level failure for the loop's keyless
+    /// latch to name. That latch is consumed only by a pass that fails as a
+    /// whole; the server-reconcile loop is the one such pass today. A future
+    /// pass returns `Err` only when the tick itself could not do its job, never
+    /// to relay a per-item condition.
+    ///
     /// [`PollLoop`]: crate::bridge::poll::PollLoop
     pub(crate) async fn poll_loop(&self, handles: &FlowHandles) -> crate::error::Result<()> {
         // The pass returns its tick's future, so the loop's cross-tick memory
@@ -411,6 +420,8 @@ impl RequestFlow {
                 async move {
                     let mut seen = seen.lock().await;
                     self.sweep(handles, &mut seen).await;
+                    // Per-item failures were logged inside `sweep`; nothing
+                    // tick-level to latch (see the doc above).
                     Ok(())
                 }
             },
