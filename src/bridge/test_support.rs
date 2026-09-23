@@ -2134,7 +2134,7 @@ pub(crate) async fn build_reeswitch_app(
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = backend;
-    backend.session_list = vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)];
+    backend.given_sessions(vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)]);
     let (app, platform) = build_app(cfg, backend).await;
     seed_entry(
         &app,
