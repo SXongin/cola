@@ -393,29 +393,39 @@ impl RequestFlow {
     /// Independent poller: surfaces pending requests as cards (inline on a
     /// streaming card when possible, else a separate card), auto-resolves where
     /// the kind says so, and marks stale cards when another client resolves a
-    /// request. Spawned once per kind at App startup.
+    /// request. Spawned once per kind at App startup. The [`PollLoop`] seam
+    /// owns the cadence ([`Self::poll_interval_ms`], injectable), the
+    /// serverless guard and the failure latch; the pass is one sweep.
+    ///
+    /// [`PollLoop`]: crate::bridge::poll::PollLoop
     pub(crate) async fn poll_loop(&self, handles: &FlowHandles) -> crate::error::Result<()> {
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(
-                self.poll_interval_ms.load(std::sync::atomic::Ordering::Relaxed),
-            ))
-            .await;
-            self.sweep(handles, &mut seen).await;
-        }
+        // The pass returns its tick's future, so the loop's cross-tick memory
+        // (the requests it has already surfaced) travels through an Arc rather
+        // than a borrowed local; this flow is its only owner.
+        let seen = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let mut poll = crate::bridge::poll::PollLoop::new(&self.poll_interval_ms, "request poll");
+        poll.poll(
+            || !handles.backend.base_url().is_empty(),
+            move || {
+                let seen = Arc::clone(&seen);
+                async move {
+                    let mut seen = seen.lock().await;
+                    self.sweep(handles, &mut seen).await;
+                    Ok(())
+                }
+            },
+        )
+        .await
     }
 
     /// One poll iteration: list pending requests per known session directory,
     /// surface the unseen ones, then reconcile everything that left the list
     /// (stale standalone cards, inline sections, snapshot claims, and the
     /// remembered question state). Extracted from the loop so tests can drive
-    /// one deterministic sweep.
+    /// one deterministic sweep; the loop's serverless guard (Lazy Start hasn't
+    /// attached or spawned yet) lives in [`Self::poll_loop`], so a direct
+    /// caller on a serverless app must skip it itself.
     pub(crate) async fn sweep(&self, handles: &FlowHandles, seen: &mut std::collections::HashSet<String>) {
-        // Serverless (Lazy Start hasn't attached/spawned yet): there is
-        // nothing to poll — skip quietly until a server appears.
-        if handles.backend.base_url().is_empty() {
-            return;
-        }
         // Pending requests live in the server instance for the session's
         // directory; `GET /permission` / `GET /question` must be scoped with
         // `?directory=` or they only see the server cwd instance. Check every
