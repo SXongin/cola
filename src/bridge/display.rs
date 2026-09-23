@@ -3,6 +3,19 @@
 //! no platform or backend access — shared by the command dispatcher, the
 //! topic transaction and the Feishu card builders.
 
+use crate::config::ThreadKey;
+
+/// The Feishu-side label for the current conversation (ADR-0022): a topic is a
+/// 本话题, everything else is a 本聊天. Used where cola must name the Feishu
+/// side without overloading 会话 (which always means the OpenCode session).
+pub(crate) fn feishu_side_label(thread_key: &ThreadKey) -> &'static str {
+    if thread_key.thread_id.is_empty() {
+        "本聊天"
+    } else {
+        "本话题"
+    }
+}
+
 /// The first 7 characters of a session id with its `ses_` prefix stripped —
 /// the compact display hash on cards. `resolve_session` accepts this bare hash
 /// as a query, so a copy-pasted card hash resolves without the `ses_` prefix.

@@ -576,7 +576,7 @@ pub(crate) async fn handle_command(
                 .await?;
         }
         Command::DirCard => {
-            send_dir_card(handles, &thread_key, message_id).await?;
+            crate::feishu::card::command::send_dir_card(handles, &thread_key, message_id).await?;
         }
         Command::Switch(action) => {
             handle_switch_action(handles, &thread_key, action, message_id, kind).await?;
@@ -653,7 +653,14 @@ pub(crate) async fn handle_command(
             // Reuse the `/switch` session card, whose per-row button now also
             // offers "建话题接管" (ADR-0016). The card action handler creates
             // the topic via the card's own `open_message_id`.
-            send_switch_card(handles, &thread_key, "", SwitchScope::Directory, message_id).await?;
+            crate::feishu::card::command::send_switch_card(
+                handles,
+                &thread_key,
+                "",
+                crate::feishu::card::session::SwitchScope::Directory,
+                message_id,
+            )
+            .await?;
         }
         Command::Name(name) => {
             // `/name` renames the conversation's session (ADR-0007). An active
@@ -705,7 +712,7 @@ pub(crate) async fn handle_command(
                         message_id,
                         &format!(
                             "⚠️ {}还没有会话，先用 `/new` 或 `/dir` 创建。",
-                            feishu_side_label(&thread_key)
+                            crate::bridge::display::feishu_side_label(&thread_key)
                         ),
                     )
                     .await?;
@@ -720,7 +727,8 @@ pub(crate) async fn handle_command(
             // configured too, it just has no requests to approve yet.
             match action {
                 crate::bridge::command::AutoAcceptAction::Status => {
-                    send_autoaccept_card(handles, &thread_key, message_id).await?;
+                    crate::feishu::card::command::send_autoaccept_card(handles, &thread_key, message_id)
+                        .await?;
                     return Ok(());
                 }
                 crate::bridge::command::AutoAcceptAction::Set(on) => {
@@ -814,7 +822,10 @@ pub(crate) async fn handle_command(
                     .platform
                     .reply_text(
                         message_id,
-                        &format!("{}还没有会话，无需压缩。", feishu_side_label(&thread_key)),
+                        &format!(
+                            "{}还没有会话，无需压缩。",
+                            crate::bridge::display::feishu_side_label(&thread_key)
+                        ),
                     )
                     .await?;
             }
@@ -843,7 +854,7 @@ pub(crate) async fn handle_command(
             .await;
         }
         Command::AgentCard => {
-            send_agent_card(handles, &thread_key, message_id).await?;
+            crate::feishu::card::command::send_agent_card(handles, &thread_key, message_id).await?;
         }
         Command::Agent(name) => {
             // The OpenCode server has no agent-switch endpoint (the legacy
@@ -865,7 +876,7 @@ pub(crate) async fn handle_command(
                         message_id,
                         &format!(
                             "⚠️ {}还没有会话，先用 `/new` 或 `/dir` 创建。",
-                            feishu_side_label(&thread_key)
+                            crate::bridge::display::feishu_side_label(&thread_key)
                         ),
                     )
                     .await?;
@@ -886,7 +897,7 @@ pub(crate) async fn handle_command(
             handles.flow.platform.reply_text(message_id, &msg).await?;
         }
         Command::ModelCard => {
-            send_model_card(handles, &thread_key, message_id).await?;
+            crate::feishu::card::command::send_model_card(handles, &thread_key, message_id).await?;
         }
         Command::Model(name) => {
             // The OpenCode server has NO model-switch endpoint (the legacy
@@ -916,7 +927,7 @@ pub(crate) async fn handle_command(
                         message_id,
                         &format!(
                             "⚠️ {}还没有会话，先用 `/new` 或 `/dir` 创建。",
-                            feishu_side_label(&thread_key)
+                            crate::bridge::display::feishu_side_label(&thread_key)
                         ),
                     )
                     .await?;
@@ -948,7 +959,7 @@ pub(crate) async fn handle_command(
                 .await?;
         }
         Command::ThinkCard => {
-            send_think_card(handles, &thread_key, message_id).await?;
+            crate::feishu::card::command::send_think_card(handles, &thread_key, message_id).await?;
         }
         Command::Think(name) => {
             // The OpenCode server has no thinking-level endpoint either —
@@ -967,7 +978,7 @@ pub(crate) async fn handle_command(
                         message_id,
                         &format!(
                             "⚠️ {}还没有会话，先用 `/new` 或 `/dir` 创建。",
-                            feishu_side_label(&thread_key)
+                            crate::bridge::display::feishu_side_label(&thread_key)
                         ),
                     )
                     .await?;
@@ -1019,7 +1030,7 @@ pub(crate) async fn handle_command(
             match target {
                 // No target: the buttonless reference card (ADR-0012, issue 05).
                 None => {
-                    send_help_card(handles, message_id).await?;
+                    crate::feishu::card::command::send_help_card(handles, message_id).await?;
                 }
                 Some(name) => {
                     let text = match command_help(&name) {
@@ -1150,7 +1161,14 @@ async fn handle_switch_action(
 ) -> crate::error::Result<()> {
     match action {
         SwitchAction::Card => {
-            send_switch_card(handles, thread_key, "", SwitchScope::Directory, message_id).await?;
+            crate::feishu::card::command::send_switch_card(
+                handles,
+                thread_key,
+                "",
+                crate::feishu::card::session::SwitchScope::Directory,
+                message_id,
+            )
+            .await?;
             Ok(())
         }
         SwitchAction::Match(keyword) => handle_switch(handles, thread_key, &keyword, message_id, kind).await,
@@ -1173,7 +1191,7 @@ async fn handle_switch_action(
                         message_id,
                         &format!(
                             "已解除{}的映射（服务器会话仍保留，可用 `/switch list` 重新找到）。",
-                            feishu_side_label(thread_key)
+                            crate::bridge::display::feishu_side_label(thread_key)
                         ),
                     )
                     .await?;
@@ -1182,433 +1200,6 @@ async fn handle_switch_action(
         }
         SwitchAction::Attach { query, force } => {
             handle_attach(handles, thread_key, &query, force, message_id, kind).await
-        }
-    }
-}
-
-/// The `/switch` card's list scope (ADR-0022). `Directory` filters the list to
-/// the active session's directory (the card's default view); `All` shows the
-/// whole shared store. The scope round-trips through the card's button values.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SwitchScope {
-    Directory,
-    All,
-}
-
-impl SwitchScope {
-    /// The payload string (`"dir"` / `"all"`) carried on card buttons.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SwitchScope::Directory => "dir",
-            SwitchScope::All => "all",
-        }
-    }
-
-    /// Parse a payload string; anything other than `"dir"` reads as `All`.
-    pub fn parse(s: &str) -> SwitchScope {
-        if s == "dir" {
-            SwitchScope::Directory
-        } else {
-            SwitchScope::All
-        }
-    }
-}
-
-/// The Feishu-side label for the current conversation (ADR-0022): a topic is a
-/// 本话题, everything else is a 本聊天. Used where cola must name the Feishu
-/// side without overloading 会话 (which always means the OpenCode session).
-pub(crate) fn feishu_side_label(thread_key: &ThreadKey) -> &'static str {
-    if thread_key.thread_id.is_empty() {
-        "本聊天"
-    } else {
-        "本话题"
-    }
-}
-
-/// Fetch + shape the data the `/switch` card renders: the session list
-/// (children and archived excluded, filtered by `keyword`, sorted by last
-/// activity) plus the thread's active + mapped session ids. The list is scoped
-/// by `scope` (ADR-0022): `Directory` filters to the current directory (the
-/// Pending Session's when one exists, else the active session's — ADR-0041),
-/// falling back to the whole store when the thread has neither; `All` shows
-/// everything. Returns the effective scope (the fallback may downgrade
-/// `Directory` to `All`) and the current directory, so the card can render the
-/// right header and toggle. Shared by the text send path (`send_switch_card`)
-/// and the card ack refresh (`App::build_switch_card_for`) so both render from
-/// one source of truth.
-pub(crate) async fn switch_card_data(
-    handles: &CommandHandles,
-    thread_key: &ThreadKey,
-    keyword: &str,
-    scope: SwitchScope,
-) -> (
-    Vec<crate::opencode::types::SessionListInfo>,
-    Option<String>,
-    Vec<String>,
-    SwitchScope,
-    Option<String>,
-) {
-    let sessions = handles
-        .flow
-        .sessions
-        .cached_session_list(&handles.flow.backend)
-        .await
-        .unwrap_or_default();
-    // Pending-first (ADR-0041): a declared Pending Session defines the current
-    // directory even though `get_active` is `None` for the thread.
-    let current_dir = handles
-        .flow
-        .sessions
-        .store
-        .lock()
-        .await
-        .current_directory(thread_key);
-    // Directory scope only holds when there IS a current directory; a fresh
-    // conversation (no active session) falls back to the whole store.
-    let scope = if scope == SwitchScope::Directory && current_dir.is_some() {
-        SwitchScope::Directory
-    } else {
-        SwitchScope::All
-    };
-    let lower = keyword.to_lowercase();
-    let mut shown: Vec<crate::opencode::types::SessionListInfo> = sessions
-        .into_iter()
-        .filter(|s| {
-            !s.is_child()
-                && !s.time.as_ref().map(|t| t.is_archived()).unwrap_or(false)
-                && if lower.is_empty() {
-                    true
-                } else {
-                    matches_keyword(s, &lower)
-                }
-                && (scope != SwitchScope::Directory || current_dir.as_deref() == Some(s.directory.as_str()))
-        })
-        .collect();
-    shown.sort_by(|a, b| {
-        let ub = b.time.as_ref().map(|t| t.updated).unwrap_or(0);
-        let ua = a.time.as_ref().map(|t| t.updated).unwrap_or(0);
-        ub.cmp(&ua)
-    });
-    let (active_id, mapped_ids) = {
-        let store = handles.flow.sessions.store.lock().await;
-        let active = store.get_active(thread_key).map(|e| e.session_id.clone());
-        let mapped: Vec<String> = store
-            .list_thread(thread_key)
-            .into_iter()
-            .map(|e| e.session_id.clone())
-            .collect();
-        (active, mapped)
-    };
-    (shown, active_id, mapped_ids, scope, current_dir)
-}
-
-/// Build and send the interactive `/switch` session card (ADR-0012, issue 04,
-/// ADR-0022). Renders the filtered session list (via `switch_card_data`) and
-/// replies with the card.
-async fn send_switch_card(
-    handles: &CommandHandles,
-    thread_key: &ThreadKey,
-    keyword: &str,
-    scope: SwitchScope,
-    message_id: &str,
-) -> crate::error::Result<()> {
-    let (shown, active_id, mapped_ids, scope, current_dir) =
-        switch_card_data(handles, thread_key, keyword, scope).await;
-    let card = crate::feishu::card::session::build_switch_card(
-        thread_key,
-        &shown,
-        keyword,
-        scope,
-        current_dir.as_deref(),
-        active_id.as_deref(),
-        &mapped_ids,
-    );
-    handles.flow.platform.reply_card(message_id, &card).await?;
-    Ok(())
-}
-
-/// Fetch + shape the data the `/dir` Recent Directories card renders: distinct
-/// directories of recently-active sessions (children and archived excluded,
-/// deduped by directory, sorted by last activity), unioned with the
-/// directories cola has mapped, plus the thread's current directory. The
-/// session list alone loses a directory as soon as its last session is
-/// deleted or archived (OpenChamber's retention, `opencode session delete`),
-/// while the SessionStore is cola's own file and keeps its mappings. Shared by
-/// the text send path (`send_dir_card`) and the card ack refresh
-/// (`App::build_dir_card_for`) so both render from one source of truth.
-pub(crate) async fn dir_card_data(
-    handles: &CommandHandles,
-    thread_key: &ThreadKey,
-) -> (Vec<String>, Option<String>) {
-    let sessions = handles
-        .flow
-        .sessions
-        .cached_session_list(&handles.flow.backend)
-        .await
-        .unwrap_or_default();
-    // Directory -> latest activity. A directory's freshness is its most
-    // recently active session's `time.updated`.
-    let mut by_dir: Vec<(String, i64)> = Vec::new();
-    for s in sessions {
-        if s.is_child() || s.time.as_ref().map(|t| t.is_archived()).unwrap_or(false) {
-            continue;
-        }
-        let updated = s.time.as_ref().map(|t| t.updated).unwrap_or(0);
-        if let Some(entry) = by_dir.iter_mut().find(|(d, _)| *d == s.directory) {
-            entry.1 = entry.1.max(updated);
-        } else {
-            by_dir.push((s.directory, updated));
-        }
-    }
-    by_dir.sort_by_key(|(_, updated)| std::cmp::Reverse(*updated));
-    let mut dirs: Vec<String> = by_dir.into_iter().map(|(d, _)| d).collect();
-    // Pending-first (ADR-0041): `get_active` is `None` while a pending exists.
-    let (mapped_dirs, current_dir) = {
-        let store = handles.flow.sessions.store.lock().await;
-        (store.directories(), store.current_directory(thread_key))
-    };
-    // The store lists directories most recently mapped first — the sensible
-    // tail position for directories the session list no longer carries (their
-    // sessions were deleted or archived).
-    for dir in mapped_dirs {
-        if !dirs.contains(&dir) {
-            dirs.push(dir);
-        }
-    }
-    // A Pending Session's directory has no server session yet and no mapping
-    // entry (ADR-0041), so neither source above carries it; the card still has
-    // to render it as `当前` rather than fall back to the empty-state hint.
-    if let Some(current) = current_dir.as_ref()
-        && !dirs.contains(current)
-    {
-        dirs.insert(0, current.clone());
-    }
-    (dirs, current_dir)
-}
-
-/// Build and send the interactive `/dir` Recent Directories card. Renders the
-/// deduped directory list (via `dir_card_data`) and replies with the card.
-async fn send_dir_card(
-    handles: &CommandHandles,
-    thread_key: &ThreadKey,
-    message_id: &str,
-) -> crate::error::Result<()> {
-    let (dirs, current_dir) = dir_card_data(handles, thread_key).await;
-    let card = crate::feishu::card::session::build_dir_card(thread_key, &dirs, current_dir.as_deref());
-    handles.flow.platform.reply_card(message_id, &card).await?;
-    Ok(())
-}
-
-/// The first agent in `GET /agent` order that the server would actually run as
-/// its default: primary (not subagent) and visible (not hidden). Parity with
-/// opencode's `Agent.Service` `defaultInfo` fallback — `agent.list()` already
-/// sorts the configured default (or `build`) first, so the first primary
-/// visible agent in that order IS the server default; no `/config` round trip
-/// needed. Mirrors `defaultInfo`'s "first primary non-hidden agent".
-pub(crate) fn server_default_agent(agents: &[crate::opencode::types::AgentInfo]) -> Option<String> {
-    agents
-        .iter()
-        .find(|a| a.mode.as_deref() != Some("subagent") && a.hidden != Some(true))
-        .map(|a| a.name.clone())
-}
-
-/// Resolve what the `/agent` card should show for a thread's target session:
-/// the per-session override if set, else the server's default agent, plus the
-/// agent list. The target is the Pending Session when one exists, else the
-/// active SessionEntry (ADR-0041). Shared by the text send path and the
-/// card-ack refresh so both render the current agent from one source of truth.
-pub(crate) async fn agent_card(
-    handles: &CommandHandles,
-    thread_key: &ThreadKey,
-) -> (Option<serde_json::Value>, Option<String>) {
-    let Some(settings) = handles.flow.sessions.session_settings(thread_key).await else {
-        return (
-            None,
-            Some(format!(
-                "{}还没有会话，先用 `/new` 或 `/dir` 创建。",
-                feishu_side_label(thread_key)
-            )),
-        );
-    };
-    let agents = handles.flow.backend.list_agents().await;
-    let default = server_default_agent(&agents);
-    let card = crate::feishu::card::picker::build_agent_card(
-        thread_key,
-        &agents,
-        settings.agent.as_deref(),
-        default.as_deref(),
-    );
-    (Some(card), None)
-}
-
-/// Send the `/agent` picker card, or a text explanation when there is no
-/// active session.
-async fn send_agent_card(
-    handles: &CommandHandles,
-    thread_key: &ThreadKey,
-    message_id: &str,
-) -> crate::error::Result<()> {
-    let (card, error) = agent_card(handles, thread_key).await;
-    if let Some(c) = card {
-        handles.flow.platform.reply_card(message_id, &c).await?;
-    } else {
-        handles
-            .flow
-            .platform
-            .reply_text(message_id, &error.unwrap_or_default())
-            .await?;
-    }
-    Ok(())
-}
-
-/// Send the `/model` provider-picker cards (ADR-0012, issue 05): step 1 of a
-/// two-level provider → model flow, chunked so any provider count stays under
-/// Feishu's card limits. The intro carries the CURRENT model
-/// ([`current_model_label`]) so the user sees what a pick would replace.
-async fn send_model_card(
-    handles: &CommandHandles,
-    thread_key: &ThreadKey,
-    message_id: &str,
-) -> crate::error::Result<()> {
-    let current = current_model_label(handles, thread_key).await;
-    let providers = handles.flow.backend.list_models().await;
-    let cards =
-        crate::feishu::card::picker::build_model_provider_cards(thread_key, &providers, current.as_deref());
-    for card in cards {
-        handles.flow.platform.reply_card(message_id, &card).await?;
-    }
-    Ok(())
-}
-
-/// The current model label the `/model` picker renders: `provider/model` from
-/// the effective-model ladder (settings override → configured default →
-/// server-recorded), plus `@variant` when the target set a `/think` level. The
-/// target is the Pending Session when one exists, else the active SessionEntry
-/// (ADR-0041). `None` when the thread has no target or no rung resolves — the
-/// picker then omits its current-model line. Shared by the text send path and
-/// the card-ack rebuild so both show one source of truth.
-pub(crate) async fn current_model_label(handles: &CommandHandles, thread_key: &ThreadKey) -> Option<String> {
-    let settings = handles.flow.sessions.session_settings(thread_key).await?;
-    let (provider, model) = handles
-        .flow
-        .sessions
-        .effective_model(&handles.flow.backend, &settings)
-        .await?;
-    let variant = settings
-        .variant
-        .as_deref()
-        .map(|v| format!("@{v}"))
-        .unwrap_or_default();
-    Some(format!("{provider}/{model}{variant}"))
-}
-
-/// Resolve what the `/think` card should show for a thread's target session:
-/// the effective model (settings override → configured default →
-/// server-recorded) and its declared variants. The target is the Pending
-/// Session when one exists, else the active SessionEntry (ADR-0041). Returns
-/// `(card, error_text)` with exactly one set — an error text when the
-/// conversation has no target, no model can be resolved, or the model declares
-/// no variants (the caller then replies text instead of a card). Shared by the
-/// text send path and the card-ack refresh so both render the current selection
-/// from one source of truth.
-pub(crate) async fn think_card(
-    handles: &CommandHandles,
-    thread_key: &ThreadKey,
-) -> (Option<serde_json::Value>, Option<String>) {
-    let Some(settings) = handles.flow.sessions.session_settings(thread_key).await else {
-        return (
-            None,
-            Some(format!(
-                "{}还没有会话，先用 `/new` 或 `/dir` 创建。",
-                feishu_side_label(thread_key)
-            )),
-        );
-    };
-    let Some((provider, model)) = handles
-        .flow
-        .sessions
-        .effective_model(&handles.flow.backend, &settings)
-        .await
-    else {
-        return (
-            None,
-            Some("无法确定当前模型，请先用 `/model` 选择模型。".to_string()),
-        );
-    };
-    let variants = handles
-        .flow
-        .sessions
-        .model_variants(&handles.flow.backend, &provider, &model)
-        .await
-        .unwrap_or_default();
-    if variants.is_empty() {
-        return (
-            None,
-            Some(format!("当前模型 `{provider}/{model}` 没有思考等级可选。")),
-        );
-    }
-    let current = settings.variant.clone();
-    let card = crate::feishu::card::picker::build_think_card(
-        thread_key,
-        &provider,
-        &model,
-        current.as_deref(),
-        &variants,
-    );
-    (Some(card), None)
-}
-
-/// Send the `/think` variant-picker card, or a text explanation when no card
-/// applies (no session / no resolvable model / the model declares no variants).
-async fn send_think_card(
-    handles: &CommandHandles,
-    thread_key: &ThreadKey,
-    message_id: &str,
-) -> crate::error::Result<()> {
-    let (card, error) = think_card(handles, thread_key).await;
-    if let Some(c) = card {
-        handles.flow.platform.reply_card(message_id, &c).await?;
-    } else {
-        handles
-            .flow
-            .platform
-            .reply_text(message_id, &error.unwrap_or_default())
-            .await?;
-    }
-    Ok(())
-}
-
-/// Send the `/autoaccept` toggle card (ADR-0012, issue 05). The shown state is
-/// the settings target's (Pending first, else active — ADR-0041).
-async fn send_autoaccept_card(
-    handles: &CommandHandles,
-    thread_key: &ThreadKey,
-    message_id: &str,
-) -> crate::error::Result<()> {
-    let current_on = handles
-        .flow
-        .sessions
-        .session_settings(thread_key)
-        .await
-        .map(|s| s.auto_accept)
-        .unwrap_or(false);
-    let card = crate::feishu::card::picker::build_autoaccept_card(thread_key, current_on);
-    handles.flow.platform.reply_card(message_id, &card).await?;
-    Ok(())
-}
-
-/// Send the `/help` reference card (a pure command manual, no buttons; detail
-/// stays text via `/help <command>`). If the card fails to send (e.g. Feishu
-/// rejects the schema), fall back to the plain-text `help_text()` so the user
-/// always gets something instead of a silent dead `/help`.
-async fn send_help_card(handles: &CommandHandles, message_id: &str) -> crate::error::Result<()> {
-    let card = crate::feishu::card::help::build_help_card();
-    match handles.flow.platform.reply_card(message_id, &card).await {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            tracing::warn!("help card failed ({}), falling back to text", e);
-            handles.flow.platform.reply_text(message_id, &help_text()).await?;
-            Ok(())
         }
     }
 }
@@ -1707,7 +1298,7 @@ async fn handle_switch(
         let list = candidates_list(
             &format!(
                 "{}匹配到多个，请用 `/switch <完整ID>` 指定：",
-                feishu_side_label(thread_key)
+                crate::bridge::display::feishu_side_label(thread_key)
             ),
             &thread_hits,
         );
@@ -1735,7 +1326,14 @@ async fn handle_switch(
     // text `/switch <kw>` searches the whole store (ADR-0022), so the card
     // opens in the `All` scope — a directory-scoped card would hide the
     // candidates the user was just shown.
-    send_switch_card(handles, thread_key, keyword, SwitchScope::All, message_id).await?;
+    crate::feishu::card::command::send_switch_card(
+        handles,
+        thread_key,
+        keyword,
+        crate::feishu::card::session::SwitchScope::All,
+        message_id,
+    )
+    .await?;
     Ok(())
 }
 

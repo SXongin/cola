@@ -1,3 +1,4 @@
+pub(crate) mod command;
 pub(crate) mod help;
 pub(crate) mod notify;
 pub(crate) mod picker;
