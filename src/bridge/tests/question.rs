@@ -1262,9 +1262,9 @@ async fn failed_directory_list_keeps_question_surfaces() {
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_work_dir(&app).await;
 
-    let mut inline_acc = crate::bridge::streaming::StreamAccumulator::new("test");
-    inline_acc.add_interaction(crate::bridge::streaming::InteractionBlock::Question(
-        crate::bridge::streaming::PendingQuestion {
+    let mut inline_acc = crate::bridge::turn::state::StreamAccumulator::new("test");
+    inline_acc.add_interaction(crate::bridge::turn::state::InteractionBlock::Question(
+        crate::bridge::turn::state::PendingQuestion {
             request_id: "que_inline".into(),
             session_id: "ses_1".into(),
             questions: vec![],
@@ -1427,8 +1427,8 @@ async fn late_inline_click_is_cardless_and_classified() {
         let mut cards = app.cards.lock().await;
         cards.insert(
             "ses_1".into(),
-            crate::bridge::streaming::CardSession::new(
-                crate::bridge::streaming::StreamAccumulator::new("test"),
+            crate::bridge::turn::state::CardSession::new(
+                crate::bridge::turn::state::StreamAccumulator::new("test"),
                 None,
             ),
         );

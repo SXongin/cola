@@ -1,5 +1,6 @@
 mod flush;
 mod render;
+pub(crate) mod state;
 
 use std::sync::Arc;
 
@@ -8,7 +9,7 @@ use tracing::Instrument;
 use crate::bridge::handler::image_inputs;
 use crate::bridge::handles::{CardsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
-use crate::bridge::streaming::StreamAccumulator;
+use crate::bridge::turn::state::StreamAccumulator;
 use crate::config::ThreadKey;
 use crate::feishu::client::ImageAttachment;
 use crate::opencode;
@@ -257,7 +258,7 @@ impl Turn {
             let mut cards = handles.cards.cards.lock().await;
             cards.insert(
                 session_id.clone(),
-                crate::bridge::streaming::CardSession::new(acc, None),
+                crate::bridge::turn::state::CardSession::new(acc, None),
             );
         }
 
@@ -534,13 +535,17 @@ impl Turn {
         // may have created or switched branches, or committed, so re-read the
         // git state before the final flush — the footer shows where the turn
         // landed, not just where it started.
-        crate::bridge::streaming::refresh_work_context(&handles.cards, &self.session_id).await;
+        crate::bridge::turn::state::refresh_work_context(&handles.cards, &self.session_id).await;
         // Refresh the Turn Footer's context window (ADR-0044) before the final
         // flush: the render-poll refresh usually covered it, but the reconcile
         // above may have just captured a final usage the polls never saw. Runs
         // on a failed prompt too — the card already carries that usage.
-        crate::bridge::streaming::refresh_context_window(&handles.cards, &handles.backend, &self.session_id)
-            .await;
+        crate::bridge::turn::state::refresh_context_window(
+            &handles.cards,
+            &handles.backend,
+            &self.session_id,
+        )
+        .await;
         Self::flush_card(&handles.cards, &self.session_id).await;
 
         // Topic cover card (ADR-0023): once the server holds a real title for
@@ -875,7 +880,7 @@ impl Turn {
         cards: &CardsHandle,
         session_id: &str,
         reply_to: &str,
-        kind: crate::bridge::streaming::SplitKind,
+        kind: crate::bridge::turn::state::SplitKind,
     ) {
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
@@ -884,7 +889,7 @@ impl Turn {
             let Some(card) = live.get_mut(session_id) else {
                 return;
             };
-            card.pending_split.push(crate::bridge::streaming::PendingSplit {
+            card.pending_split.push(crate::bridge::turn::state::PendingSplit {
                 reply_to: reply_to.to_string(),
                 kind,
                 receipt_pushed: false,

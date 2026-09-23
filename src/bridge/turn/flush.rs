@@ -37,7 +37,7 @@ enum FallbackAdvance {
 
 /// Advance the turn's [`CardFallback`] after Feishu rejected a card it built.
 async fn advance_card_fallback(cards: &CardsHandle, session_id: &str) -> FallbackAdvance {
-    use crate::bridge::streaming::CardFallback;
+    use crate::bridge::turn::state::CardFallback;
     let mut live = cards.cards.lock().await;
     let Some(card) = live.get_mut(session_id) else {
         return FallbackAdvance::Stop;
@@ -71,7 +71,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str) {
         (
             card.pending_split.clone(),
             card.card_is_live,
-            card.acc.card_fallback == crate::bridge::streaming::CardFallback::Suspended,
+            card.acc.card_fallback == crate::bridge::turn::state::CardFallback::Suspended,
         )
     };
     if suspended {
@@ -334,8 +334,8 @@ async fn push_queued_receipts(cards: &CardsHandle, session_id: &str) {
             continue;
         }
         let receipt = match card.pending_split[i].kind {
-            crate::bridge::streaming::SplitKind::Supplement => SUPPLEMENT_RECEIPT,
-            crate::bridge::streaming::SplitKind::Pull => PULL_RECEIPT,
+            crate::bridge::turn::state::SplitKind::Supplement => SUPPLEMENT_RECEIPT,
+            crate::bridge::turn::state::SplitKind::Pull => PULL_RECEIPT,
         };
         card.acc.push_receipt(receipt);
         card.pending_split[i].receipt_pushed = true;
@@ -354,9 +354,9 @@ mod tests {
 
     use std::sync::Arc;
 
-    use crate::bridge::streaming::{CardFallback, CardSession, StreamAccumulator};
     use crate::bridge::test_support::*;
     use crate::bridge::turn::Turn;
+    use crate::bridge::turn::state::{CardFallback, CardSession, StreamAccumulator};
     use crate::feishu::card::CardState;
 
     /// The markdown content of the first body element.

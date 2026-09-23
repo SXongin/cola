@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use crate::bridge::streaming::{
+use crate::bridge::test_support::*;
+use crate::bridge::turn::state::{
     CardSession, InteractionBlock, PendingPermission, PendingQuestion, StreamAccumulator,
 };
-use crate::bridge::test_support::*;
 use crate::feishu::card::CardState;
 use crate::feishu::card::tool_render::ToolPanel;
 

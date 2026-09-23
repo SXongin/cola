@@ -13,7 +13,7 @@ use crate::bridge::question::{
     MultiOutcome, QuestionState, action_toast, qa_completion_body, question_replay_card, stale_question_card,
 };
 use crate::bridge::snapshot_claims::ClaimKind;
-use crate::bridge::streaming::{InteractionBlock, PendingPermission, PendingQuestion, StreamAccumulator};
+use crate::bridge::turn::state::{InteractionBlock, PendingPermission, PendingQuestion, StreamAccumulator};
 use crate::opencode;
 
 /// A pending request surfaced by a poll loop before it becomes a card. Carries
@@ -500,7 +500,7 @@ fn receipt_line(prefix: &str, detail: &str) -> String {
 pub(crate) fn snapshot_handled_elsewhere_receipt(req: &PendingRequest) -> String {
     let target = match req {
         PendingRequest::Permission(p) => permission_target(p),
-        PendingRequest::Question(q) => crate::bridge::streaming::question_target(&q.questions),
+        PendingRequest::Question(q) => crate::bridge::turn::state::question_target(&q.questions),
     };
     receipt_line(HANDLED_ELSEWHERE_PREFIX, &target)
 }

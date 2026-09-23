@@ -1245,9 +1245,9 @@ async fn failed_directory_list_keeps_permission_surfaces() {
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_session(&app, "ses_1", "/work").await;
 
-    let mut inline_acc = crate::bridge::streaming::StreamAccumulator::new("test");
-    inline_acc.add_interaction(crate::bridge::streaming::InteractionBlock::Permission(
-        crate::bridge::streaming::PendingPermission {
+    let mut inline_acc = crate::bridge::turn::state::StreamAccumulator::new("test");
+    inline_acc.add_interaction(crate::bridge::turn::state::InteractionBlock::Permission(
+        crate::bridge::turn::state::PendingPermission {
             session_id: "ses_1".into(),
             request_id: "per_inline".into(),
             body: "bash ls -la".into(),
@@ -1494,12 +1494,12 @@ async fn interaction_receipt_survives_later_flushes() {
     // A live card with two transcript items and an inlined permission (the
     // poll loop is what inlines in production; seeding it keeps this test
     // deterministic — no background render poll splitting underneath us).
-    let mut acc = crate::bridge::streaming::StreamAccumulator::new("test");
+    let mut acc = crate::bridge::turn::state::StreamAccumulator::new("test");
     acc.reply_to_message_id = Some("msg_1".into());
     acc.push_reasoning("用户想让我分析目录。");
     acc.push_text("当前目录有 src/ 和 Cargo.toml。");
-    acc.add_interaction(crate::bridge::streaming::InteractionBlock::Permission(
-        crate::bridge::streaming::PendingPermission {
+    acc.add_interaction(crate::bridge::turn::state::InteractionBlock::Permission(
+        crate::bridge::turn::state::PendingPermission {
             session_id: "ses_test".into(),
             request_id: "per_1".into(),
             body: "bash ls -la".into(),
@@ -1509,7 +1509,7 @@ async fn interaction_receipt_survives_later_flushes() {
     ));
     app.cards.lock().await.insert(
         "ses_test".to_string(),
-        crate::bridge::streaming::CardSession::new(acc, Some("msg_live".into())),
+        crate::bridge::turn::state::CardSession::new(acc, Some("msg_live".into())),
     );
 
     let ack = click_perm(&app, "once", "per_1", "✅ 已允许一次").await;
@@ -1653,10 +1653,10 @@ async fn inline_permission_click_after_remote_resolution_gets_receipt() {
 /// sweep by hand, so no background poll or render tick can repaint underneath
 /// them — the sweep alone must put the receipt on the card.
 async fn seed_inline_permission_card(app: &Arc<App>, session_id: &str, request_id: &str) {
-    let mut acc = crate::bridge::streaming::StreamAccumulator::new("test");
+    let mut acc = crate::bridge::turn::state::StreamAccumulator::new("test");
     acc.reply_to_message_id = Some("msg_trigger".into());
-    acc.add_interaction(crate::bridge::streaming::InteractionBlock::Permission(
-        crate::bridge::streaming::PendingPermission {
+    acc.add_interaction(crate::bridge::turn::state::InteractionBlock::Permission(
+        crate::bridge::turn::state::PendingPermission {
             session_id: session_id.into(),
             request_id: request_id.into(),
             body: "bash ls -la".into(),
@@ -1666,7 +1666,7 @@ async fn seed_inline_permission_card(app: &Arc<App>, session_id: &str, request_i
     ));
     app.cards.lock().await.insert(
         session_id.to_string(),
-        crate::bridge::streaming::CardSession::new(acc, Some("msg_live".into())),
+        crate::bridge::turn::state::CardSession::new(acc, Some("msg_live".into())),
     );
 }
 
@@ -1765,10 +1765,10 @@ async fn permission_click_at_the_split_limit_falls_back_to_the_flushed_receipt()
 
     // A live card carrying the block and a timeline already past the split
     // budget (a poll rendered parts, then the click raced the next flush).
-    let mut acc = crate::bridge::streaming::StreamAccumulator::new("test");
+    let mut acc = crate::bridge::turn::state::StreamAccumulator::new("test");
     acc.reply_to_message_id = Some("msg_1".into());
-    acc.add_interaction(crate::bridge::streaming::InteractionBlock::Permission(
-        crate::bridge::streaming::PendingPermission {
+    acc.add_interaction(crate::bridge::turn::state::InteractionBlock::Permission(
+        crate::bridge::turn::state::PendingPermission {
             session_id: "ses_1".into(),
             request_id: "per_1".into(),
             body: "bash ls -la".into(),
@@ -1781,7 +1781,7 @@ async fn permission_click_at_the_split_limit_falls_back_to_the_flushed_receipt()
         let mut cards = app.cards.lock().await;
         cards.insert(
             "ses_1".to_string(),
-            crate::bridge::streaming::CardSession::new(acc, Some("msg_live".into())),
+            crate::bridge::turn::state::CardSession::new(acc, Some("msg_live".into())),
         );
     }
 
@@ -1860,11 +1860,11 @@ async fn interaction_receipt_renders_at_the_interaction_position() {
     seed_session(&app, "ses_test", "/work").await;
 
     // 第一段 → [permission A] → a reasoning panel → [permission B]
-    let mut acc = crate::bridge::streaming::StreamAccumulator::new("test");
+    let mut acc = crate::bridge::turn::state::StreamAccumulator::new("test");
     acc.reply_to_message_id = Some("msg_1".into());
     acc.push_text("第一段。");
-    acc.add_interaction(crate::bridge::streaming::InteractionBlock::Permission(
-        crate::bridge::streaming::PendingPermission {
+    acc.add_interaction(crate::bridge::turn::state::InteractionBlock::Permission(
+        crate::bridge::turn::state::PendingPermission {
             session_id: "ses_test".into(),
             request_id: "per_1".into(),
             body: "bash ls -la".into(),
@@ -1873,8 +1873,8 @@ async fn interaction_receipt_renders_at_the_interaction_position() {
         },
     ));
     acc.push_reasoning("正在思考。");
-    acc.add_interaction(crate::bridge::streaming::InteractionBlock::Permission(
-        crate::bridge::streaming::PendingPermission {
+    acc.add_interaction(crate::bridge::turn::state::InteractionBlock::Permission(
+        crate::bridge::turn::state::PendingPermission {
             session_id: "ses_test".into(),
             request_id: "per_2".into(),
             body: "bash cargo build".into(),
@@ -1884,7 +1884,7 @@ async fn interaction_receipt_renders_at_the_interaction_position() {
     ));
     app.cards.lock().await.insert(
         "ses_test".to_string(),
-        crate::bridge::streaming::CardSession::new(acc, Some("msg_live".into())),
+        crate::bridge::turn::state::CardSession::new(acc, Some("msg_live".into())),
     );
 
     let ack = click_perm(&app, "once", "per_1", "✅ 已允许一次").await;
@@ -1950,10 +1950,10 @@ async fn late_rendered_command_lands_above_the_receipt() {
 
     // The request poll surfaces the permission before ANY of the turn's parts
     // have been rendered (the race that put receipts above their command).
-    let mut acc = crate::bridge::streaming::StreamAccumulator::new("test");
+    let mut acc = crate::bridge::turn::state::StreamAccumulator::new("test");
     acc.reply_to_message_id = Some("msg_1".into());
-    acc.add_interaction(crate::bridge::streaming::InteractionBlock::Permission(
-        crate::bridge::streaming::PendingPermission {
+    acc.add_interaction(crate::bridge::turn::state::InteractionBlock::Permission(
+        crate::bridge::turn::state::PendingPermission {
             session_id: "ses_test".into(),
             request_id: "per_1".into(),
             body: "bash ls -la".into(),
@@ -1963,7 +1963,7 @@ async fn late_rendered_command_lands_above_the_receipt() {
     ));
     app.cards.lock().await.insert(
         "ses_test".to_string(),
-        crate::bridge::streaming::CardSession::new(acc, Some("msg_live".into())),
+        crate::bridge::turn::state::CardSession::new(acc, Some("msg_live".into())),
     );
 
     // The operator clicks Allow; the receipt is keyed at this moment.

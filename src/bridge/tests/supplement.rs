@@ -8,8 +8,8 @@
 
 use std::sync::Arc;
 
-use crate::bridge::streaming::{CardSession, InteractionBlock, PendingQuestion, StreamAccumulator};
 use crate::bridge::test_support::*;
+use crate::bridge::turn::state::{CardSession, InteractionBlock, PendingQuestion, StreamAccumulator};
 use crate::feishu::card::CardState;
 
 /// One question with a single option, for the two-question fixtures below.

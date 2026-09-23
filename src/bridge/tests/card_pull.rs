@@ -8,8 +8,8 @@
 
 use std::sync::Arc;
 
-use crate::bridge::streaming::{CardSession, StreamAccumulator};
 use crate::bridge::test_support::*;
+use crate::bridge::turn::state::{CardSession, StreamAccumulator};
 use crate::feishu::card::CardState;
 
 /// A Turn that already finished leaves its card session in `cards` with a Done

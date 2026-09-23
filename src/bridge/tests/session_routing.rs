@@ -558,8 +558,8 @@ async fn message_during_inflight_goes_to_supplement_path() {
     app.inflight.lock().await.insert("ses_test".to_string());
     app.cards.lock().await.insert(
         "ses_test".into(),
-        crate::bridge::streaming::CardSession::new(
-            crate::bridge::streaming::StreamAccumulator::new("回合"),
+        crate::bridge::turn::state::CardSession::new(
+            crate::bridge::turn::state::StreamAccumulator::new("回合"),
             None,
         ),
     );

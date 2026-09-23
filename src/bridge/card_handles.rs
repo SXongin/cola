@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::bridge::snapshot_claims::ClaimKind;
-use crate::bridge::streaming::{BlockSpan, InteractionBlock};
+use crate::bridge::turn::state::{BlockSpan, InteractionBlock};
 
 /// One live interaction block as rendered onto a card: its element range plus
 /// what the registry must remember about it so it stays resolvable after the
