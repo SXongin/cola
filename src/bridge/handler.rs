@@ -283,10 +283,12 @@ impl App {
         let ws = Arc::clone(&self);
         let ws_feishu = Arc::clone(&self.feishu);
         let ws_state = Arc::new(feishu::ws::WsState::new());
-        let perm_core = Arc::clone(&self.core);
-        let question_core = Arc::clone(&self.core);
-        let external_core = Arc::clone(&self.core);
-        let reconnect_core = Arc::clone(&self.core);
+        // The poll loops each run on their own narrow bundle, built once here
+        // (the coordinator is the construction point).
+        let perm_handles = self.flow_handles();
+        let question_handles = self.flow_handles();
+        let external_handles = self.flow_handles();
+        let poll_handles = self.poll_handles();
         let perm_app = Arc::clone(&self);
         let question_app = Arc::clone(&self);
         let external_app = Arc::clone(&self);
@@ -300,7 +302,7 @@ impl App {
         // and a prompt can be blocked on an unanswered permission forever, so the
         // poller must run independently of any single prompt lifecycle.
         let perm_task = tokio::spawn(async move {
-            if let Err(e) = perm_app.permission.poll_loop(&perm_core).await {
+            if let Err(e) = perm_app.permission.poll_loop(&perm_handles).await {
                 tracing::error!("Permission poller: {}", e);
             }
         });
@@ -308,14 +310,14 @@ impl App {
         // blocks until answered, the event never reaches the global SSE, so poll
         // and surface them as Feishu cards.
         let question_task = tokio::spawn(async move {
-            if let Err(e) = question_app.question.poll_loop(&question_core).await {
+            if let Err(e) = question_app.question.poll_loop(&question_handles).await {
                 tracing::error!("Question poller: {}", e);
             }
         });
         // Notify Feishu when someone posts a message from another shared-store
         // client (e.g. OpenChamber) while cola is idle on that session.
         let external_task = tokio::spawn(async move {
-            if let Err(e) = external_app.external.poll_loop(&external_core).await {
+            if let Err(e) = external_app.external.poll_loop(&external_handles).await {
                 tracing::error!("External message poller: {}", e);
             }
         });
@@ -323,7 +325,7 @@ impl App {
         // can restart it (new pid/port/password). Re-detect a changed server so
         // cola reconnects instead of 502ing against the dead port forever.
         let reconnect_task = tokio::spawn(async move {
-            if let Err(e) = crate::bridge::pollers::reconnect_poll_loop(&reconnect_core).await {
+            if let Err(e) = crate::bridge::pollers::reconnect_poll_loop(&poll_handles).await {
                 tracing::error!("Reconnect poller: {}", e);
             }
         });
@@ -357,7 +359,8 @@ impl App {
                 }
                 return;
             }
-            if let Err(e) = command::handle_command(&self.core, cmd, thread_key, &msg.message_id, kind).await
+            if let Err(e) =
+                command::handle_command(&self.command_handles(), cmd, thread_key, &msg.message_id, kind).await
             {
                 tracing::error!("Cmd: {}", e);
             }
@@ -471,7 +474,7 @@ impl App {
         // the bot has no OpenCode to answer with — tell the user instead of
         // failing silently inside the prompt flow. Commands never trigger this
         // (so `/restart-opencode` still reports NoServer/NotOwned properly).
-        match crate::bridge::pollers::ensure_server(&self.core).await {
+        match crate::bridge::pollers::ensure_server(&self.poll_handles()).await {
             Ok(true) => {}
             Ok(false) => {
                 let _ = self
@@ -738,7 +741,7 @@ impl App {
         // 「下一条消息创建」. Move its record onto the new session and re-render
         // now — a real Session exists, so the brief (title/id) belongs on the
         // card. No-op for lobby pendings and fallback-rooted topics.
-        crate::bridge::topic::claim_pending_cover(&self.core, &thread_key, &session.id).await;
+        crate::bridge::topic::claim_pending_cover(&self.topic_handles(), &thread_key, &session.id).await;
         Ok(session.id)
     }
 
@@ -778,8 +781,16 @@ impl App {
         let action_span = span::action(session_id.as_deref(), thread_key.as_ref());
         let dispatch = async {
             match action {
-                "perm" => self.permission.handle_card_action(&self.core, &value).await,
-                "question" => self.question.handle_card_action(&self.core, &value).await,
+                "perm" => {
+                    self.permission
+                        .handle_card_action(&self.flow_handles(), &value)
+                        .await
+                }
+                "question" => {
+                    self.question
+                        .handle_card_action(&self.flow_handles(), &value)
+                        .await
+                }
                 "retry" => self.handle_retry_action(&value).await,
                 "switch" => self.handle_switch_card_action(&self.core, &value).await,
                 "dir" => self.handle_dir_card_action(&self.core, &value).await,
@@ -1045,7 +1056,8 @@ impl App {
         scope: crate::bridge::command::SwitchScope,
     ) -> serde_json::Value {
         let (shown, active_id, mapped_ids, scope, current_dir) =
-            crate::bridge::command::switch_card_data(core, thread_key, keyword, scope).await;
+            crate::bridge::command::switch_card_data(&core.command_handles(), thread_key, keyword, scope)
+                .await;
         crate::feishu::card::session::build_switch_card(
             thread_key,
             &shown,
@@ -1087,7 +1099,7 @@ impl App {
             // its snapshot runs inside the Session's `snapshot` span with the
             // thread key known here (ADR-0048).
             match crate::bridge::snapshot::re_switch_snapshot(
-                core,
+                &core.snapshot_handles(),
                 thread_key,
                 &target.id,
                 &target.directory,
@@ -1106,7 +1118,8 @@ impl App {
                 ),
             }
         } else {
-            let (card, data) = crate::bridge::snapshot::snapshot_card_for(core, "接管", target).await;
+            let (card, data) =
+                crate::bridge::snapshot::snapshot_card_for(&core.snapshot_handles(), "接管", target).await;
             (card, Some(data))
         };
         // In a topic the patched card lives INSIDE it, so persist its own
@@ -1133,10 +1146,17 @@ impl App {
         if let Err(e) = core.activate_session(entry).await {
             tracing::warn!("switch card adopt: persist failed: {}", e);
         }
-        crate::bridge::topic::claim_pending_cover(core, thread_key, &target.id).await;
+        crate::bridge::topic::claim_pending_cover(&core.topic_handles(), thread_key, &target.id).await;
         if let (Some(message_id), Some(data)) = (&open_message_id, &claim_data) {
-            crate::bridge::external::settle_snapshot_after_send(core, message_id, verb, &target.title, data)
-                .await;
+            crate::bridge::external::settle_snapshot_after_send(
+                &core.external,
+                &core.flow_handles(),
+                message_id,
+                verb,
+                &target.title,
+                data,
+            )
+            .await;
         }
         CardActionResult {
             card: Some(card),
@@ -1161,7 +1181,7 @@ impl App {
         scope: crate::bridge::command::SwitchScope,
     ) -> CardActionResult {
         let new_thread_id = match crate::bridge::topic::open_topic(
-            core,
+            &core.topic_handles(),
             &thread_key.chat_id,
             open_message_id,
             crate::bridge::topic::TopicOpening::Adopt { info: target.clone() },
@@ -1201,7 +1221,8 @@ impl App {
         core: &Arc<SharedCore>,
         thread_key: &ThreadKey,
     ) -> serde_json::Value {
-        let (dirs, current_dir) = crate::bridge::command::dir_card_data(core, thread_key).await;
+        let (dirs, current_dir) =
+            crate::bridge::command::dir_card_data(&core.command_handles(), thread_key).await;
         crate::feishu::card::session::build_dir_card(thread_key, &dirs, current_dir.as_deref())
     }
 
@@ -1279,7 +1300,7 @@ impl App {
                 // server auto-generates a title after the first exchange.
                 let display = crate::bridge::display::dir_basename(&directory);
                 match crate::bridge::topic::open_topic(
-                    core,
+                    &core.topic_handles(),
                     &thread_key.chat_id,
                     open_message_id,
                     crate::bridge::topic::TopicOpening::Fresh {
@@ -1347,7 +1368,7 @@ impl App {
         if let Err(e) = core.set_session_settings(&thread_key, settings).await {
             tracing::warn!("agent card: persist failed: {}", e);
         }
-        let (card, _error) = crate::bridge::command::agent_card(core, &thread_key).await;
+        let (card, _error) = crate::bridge::command::agent_card(&core.command_handles(), &thread_key).await;
         Some(CardActionResult {
             card,
             toast: Some(if clear {
@@ -1380,7 +1401,8 @@ impl App {
         {
             let providers = core.opencode.list_models().await;
             let cards = if picked == crate::feishu::card::picker::PICKER_BACK_TO_PROVIDERS {
-                let current = crate::bridge::command::current_model_label(core, &thread_key).await;
+                let current =
+                    crate::bridge::command::current_model_label(&core.command_handles(), &thread_key).await;
                 crate::feishu::card::picker::build_model_provider_cards(
                     &thread_key,
                     &providers,
@@ -1473,7 +1495,7 @@ impl App {
         if let Err(e) = core.set_session_settings(&thread_key, settings).await {
             tracing::warn!("think card: persist failed: {}", e);
         }
-        let (card, _error) = crate::bridge::command::think_card(core, &thread_key).await;
+        let (card, _error) = crate::bridge::command::think_card(&core.command_handles(), &thread_key).await;
         Some(CardActionResult {
             card,
             toast: Some(if clear {

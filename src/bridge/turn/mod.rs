@@ -32,7 +32,7 @@ const DRAIN_REQUEST_TIMEOUT_MS: u64 = 30_000;
 /// message even when the user was around, because the card patch itself
 /// neither pushes a notification nor bumps the conversation. Five minutes is
 /// the "long" line; it is a constant, not a config key, and tests inject a
-/// tiny value through `SharedCore::long_task_notice_ms`.
+/// tiny value through the turn config's `long_task_notice_ms` atomic.
 pub(crate) const LONG_TASK_NOTICE_MS: u64 = 300_000;
 
 /// What one drain read saw (ADR-0043).

@@ -227,7 +227,7 @@ pub(super) struct PendingSplit {
 /// One live card per session: the streaming accumulator plus the card identity
 /// chain — the current live card's message id, updated in place by
 /// `flush_card` (including continuation cards). Replaces the two per-session
-/// maps kept in lockstep; owned by [`SharedCore::cards`].
+/// maps kept in lockstep; owned by the cards handle's per-session map.
 #[derive(Clone)]
 pub struct CardSession {
     pub(super) acc: StreamAccumulator,
@@ -278,7 +278,7 @@ impl CardSession {
 
     /// True while this card belongs to a Turn that has not finished: the pull
     /// condition for `/card` (ADR-0043, 2026-09-22 amendment). A completed
-    /// (Done) or failed (Error) card session stays in `SharedCore::cards` until
+    /// (Done) or failed (Error) card session stays in the cards handle's map until
     /// the next Turn replaces it, so the map's key alone does not mean a live
     /// card.
     pub(super) fn is_running(&self) -> bool {

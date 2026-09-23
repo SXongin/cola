@@ -83,7 +83,7 @@ async fn a_pending_permission_pins_and_resolution_unpins_without_duplicates() {
     seed_turn(&app, "ses_1", false, 1).await;
 
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     assert_eq!(
         platform.reminders().await,
         vec![("chat_1".to_string(), false, vec![TEST_HOST.to_string()], true)],
@@ -91,7 +91,7 @@ async fn a_pending_permission_pins_and_resolution_unpins_without_duplicates() {
     );
 
     // Seeing the same pending request again must not re-pin it.
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     assert_eq!(
         platform.reminders().await.len(),
         1,
@@ -100,7 +100,7 @@ async fn a_pending_permission_pins_and_resolution_unpins_without_duplicates() {
 
     // Resolved elsewhere: the next complete sweep clears the pin.
     backend.permission_resolved_by_another("per_1").await;
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     let calls = platform.reminders().await;
     assert_eq!(calls.len(), 2, "one pin, one clear: {calls:?}");
     assert!(calls[0].3, "the first call pins");
@@ -112,7 +112,7 @@ async fn a_pending_permission_pins_and_resolution_unpins_without_duplicates() {
     );
 
     // Nothing tracked any more: a later sweep makes no call.
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     assert_eq!(platform.reminders().await.len(), 2);
 }
 
@@ -133,7 +133,7 @@ async fn a_pending_question_pins_and_resolution_unpins() {
     seed_turn(&app, "ses_1", false, 1).await;
 
     let mut seen = std::collections::HashSet::new();
-    app.question.sweep(&app.core, &mut seen).await;
+    app.question.sweep(&app.flow_handles(), &mut seen).await;
     assert_eq!(
         platform.reminders().await,
         vec![("chat_1".to_string(), false, vec![TEST_HOST.to_string()], true)],
@@ -141,7 +141,7 @@ async fn a_pending_question_pins_and_resolution_unpins() {
     );
 
     backend.question_resolved_by_another("que_1").await;
-    app.question.sweep(&app.core, &mut seen).await;
+    app.question.sweep(&app.flow_handles(), &mut seen).await;
     let calls = platform.reminders().await;
     assert_eq!(calls.len(), 2, "one pin, one clear: {calls:?}");
     assert!(calls[0].3 && !calls[1].3);
@@ -159,7 +159,7 @@ async fn a_group_pin_targets_its_chat() {
     seed_turn(&app, "ses_1", true, 1).await;
 
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
 
     assert_eq!(
         platform.reminders().await,
@@ -185,7 +185,7 @@ async fn pin_off_records_no_reminder_calls() {
     seed_turn(&app, "ses_1", false, 1).await;
 
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     // The request still surfaced: only the pin is off.
     assert!(
         Turn::has_interaction_in(&app.cards_handle(), "ses_1", "per_1").await,
@@ -193,7 +193,7 @@ async fn pin_off_records_no_reminder_calls() {
     );
 
     backend.permission_resolved_by_another("per_1").await;
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
 
     assert!(
         platform.reminders().await.is_empty(),
@@ -221,7 +221,7 @@ async fn a_failed_pin_never_affects_the_turn_and_does_not_clear() {
     seed_turn(&app, "ses_1", false, 1).await;
 
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
 
     // The attempt was made and failed, but the card carries the live block.
     assert_eq!(platform.reminders().await.len(), 1);
@@ -231,7 +231,7 @@ async fn a_failed_pin_never_affects_the_turn_and_does_not_clear() {
     );
 
     backend.permission_resolved_by_another("per_1").await;
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     assert_eq!(
         platform.reminders().await.len(),
         1,
@@ -257,7 +257,7 @@ async fn an_auto_accepted_permission_never_pins() {
     seed_turn(&app, "ses_1", false, 1).await;
 
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
 
     assert_eq!(
         backend.reply_permission_calls.lock().await.as_slice(),
@@ -326,7 +326,7 @@ async fn the_newest_pending_owns_the_pin_and_hands_over_on_resolution() {
     seed_turn_for(&app, "ses_ques", true, 7, "ou_ques").await;
 
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     assert_eq!(
         platform.reminders().await,
         vec![("chat_1".to_string(), true, vec!["ou_perm".to_string()], true)],
@@ -335,7 +335,7 @@ async fn the_newest_pending_owns_the_pin_and_hands_over_on_resolution() {
 
     // The newer wait (generation 7) takes the pin: release the old requester,
     // then pin the new one.
-    app.question.sweep(&app.core, &mut seen).await;
+    app.question.sweep(&app.flow_handles(), &mut seen).await;
     let calls = platform.reminders().await;
     assert_eq!(calls.len(), 3, "retarget: {calls:?}");
     assert!(!calls[1].3 && calls[1].2 == vec!["ou_perm".to_string()]);
@@ -344,7 +344,7 @@ async fn the_newest_pending_owns_the_pin_and_hands_over_on_resolution() {
     // The newer wait resolves: the older pending takes the pin back in the
     // same sweep — no pause, no gap where the chat is silently unpinned.
     backend.question_resolved_by_another("que_1").await;
-    app.question.sweep(&app.core, &mut seen).await;
+    app.question.sweep(&app.flow_handles(), &mut seen).await;
     let calls = platform.reminders().await;
     assert_eq!(calls.len(), 5, "handover: {calls:?}");
     assert!(!calls[3].3 && calls[3].2 == vec!["ou_ques".to_string()]);
@@ -352,7 +352,7 @@ async fn the_newest_pending_owns_the_pin_and_hands_over_on_resolution() {
 
     // The last wait resolves: the reminder clears.
     backend.permission_resolved_by_another("per_1").await;
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     let calls = platform.reminders().await;
     assert_eq!(calls.len(), 6, "the resolution unpins: {calls:?}");
     assert!(!calls[5].3, "the last wait's resolution unpins");
@@ -372,7 +372,7 @@ async fn the_pin_set_is_persisted_beside_the_session_file() {
     seed_turn(&app, "ses_1", false, 1).await;
 
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     let pins_file = dir.path().join("pinned_chats.json");
     let raw = std::fs::read_to_string(&pins_file).expect("the pin landed on disk");
     assert!(
@@ -382,7 +382,7 @@ async fn the_pin_set_is_persisted_beside_the_session_file() {
 
     // Resolution drops the record.
     backend.permission_resolved_by_another("per_1").await;
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     assert!(!pins_file.exists(), "the confirmed clear removes the record");
 
     // A crash left one behind: a fresh instance's startup sweep clears it.

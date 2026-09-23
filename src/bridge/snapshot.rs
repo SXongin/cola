@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tracing::Instrument;
 
-use crate::bridge::core::SharedCore;
+use crate::bridge::handles::SnapshotHandles;
 use crate::opencode;
 
 /// Read-side state for the Session Snapshot card (ADR-0028). Built purely from
@@ -189,15 +189,15 @@ pub(crate) async fn gather_snapshot(
 /// Returns the card together with the filtered data — the caller sends
 /// the card and then claims the pendings with its message id.
 pub(crate) async fn snapshot_card_for(
-    core: &Arc<SharedCore>,
+    handles: &SnapshotHandles,
     verb: &str,
     info: &crate::opencode::types::SessionListInfo,
 ) -> (serde_json::Value, SnapshotData) {
-    let thread_key = crate::bridge::span::thread_key_of(&core.sessions_handle(), &info.id).await;
+    let thread_key = crate::bridge::span::thread_key_of(&handles.sessions, &info.id).await;
     let span = crate::bridge::span::snapshot(&info.id, thread_key.as_ref());
     async move {
-        let data = gather_snapshot(&core.opencode, &info.id, &info.directory).await;
-        snapshot_card_from_data(core, verb, &info.title, data).await
+        let data = gather_snapshot(&handles.backend, &info.id, &info.directory).await;
+        snapshot_card_from_data(handles, verb, &info.title, data).await
     }
     .instrument(span)
     .await
@@ -208,12 +208,13 @@ pub(crate) async fn snapshot_card_for(
 /// [`re_switch_snapshot`], which gathers first (the suppression decision needs
 /// the raw data) and then filters, so the two surfaces cannot drift.
 pub(crate) async fn snapshot_card_from_data(
-    core: &Arc<SharedCore>,
+    handles: &SnapshotHandles,
     verb: &str,
     title: &str,
     data: SnapshotData,
 ) -> (serde_json::Value, SnapshotData) {
-    let data = crate::bridge::snapshot_claims::claimable_pendings(core, data).await;
+    let data =
+        crate::bridge::snapshot_claims::claimable_pendings(&handles.requests, &handles.cards, data).await;
     let card = crate::feishu::snapshot_card::build_snapshot_card(verb, title, &data);
     (card, data)
 }
@@ -240,7 +241,7 @@ pub(crate) enum ReSwitchSnapshot {
 /// re-activated. Shared by the text `/switch` mapped-hit path and the switch
 /// card's 切换 op so the span and the sequence cannot drift.
 pub(crate) async fn re_switch_snapshot(
-    core: &Arc<SharedCore>,
+    handles: &SnapshotHandles,
     thread_key: &crate::config::ThreadKey,
     session_id: &str,
     directory: &str,
@@ -248,10 +249,10 @@ pub(crate) async fn re_switch_snapshot(
 ) -> ReSwitchSnapshot {
     let span = crate::bridge::span::snapshot(session_id, Some(thread_key));
     async move {
-        let data = gather_snapshot(&core.opencode, session_id, directory).await;
+        let data = gather_snapshot(&handles.backend, session_id, directory).await;
         match re_switch_emit(&data) {
             SnapshotEmit::Full => {
-                let (card, data) = snapshot_card_from_data(core, "切换", title, data).await;
+                let (card, data) = snapshot_card_from_data(handles, "切换", title, data).await;
                 ReSwitchSnapshot::Full { card, data }
             }
             SnapshotEmit::Suppressed => ReSwitchSnapshot::Suppressed,

@@ -39,7 +39,7 @@ async fn external_message_from_shared_store_notifies_feishu() {
     tokio::spawn({
         let app = app.clone();
         async move {
-            let _ = app.external.poll_loop(&app.core).await;
+            let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -104,7 +104,7 @@ async fn external_poller_recovers_when_messages_hangs() {
     tokio::spawn({
         let app = app.clone();
         async move {
-            let _ = app.external.poll_loop(&app.core).await;
+            let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
 
@@ -176,7 +176,7 @@ async fn cola_own_message_after_heal_is_never_notified_external() {
     tokio::spawn({
         let app = app.clone();
         async move {
-            let _ = app.external.poll_loop(&app.core).await;
+            let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -248,7 +248,7 @@ async fn newer_external_message_after_cola_own_still_notifies() {
     tokio::spawn({
         let app = app.clone();
         async move {
-            let _ = app.external.poll_loop(&app.core).await;
+            let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -338,7 +338,7 @@ async fn external_message_to_historical_session_is_not_notified() {
     tokio::spawn({
         let app = app.clone();
         async move {
-            let _ = app.external.poll_loop(&app.core).await;
+            let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -436,7 +436,7 @@ async fn reactivated_session_resyncs_silently() {
     tokio::spawn({
         let app = app.clone();
         async move {
-            let _ = app.external.poll_loop(&app.core).await;
+            let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -509,7 +509,7 @@ async fn external_message_to_topic_session_notifies_into_thread() {
     tokio::spawn({
         let app = app.clone();
         async move {
-            let _ = app.external.poll_loop(&app.core).await;
+            let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -584,7 +584,7 @@ async fn external_message_reply_renders_into_notification_card() {
     tokio::spawn({
         let app = app.clone();
         async move {
-            let _ = app.external.poll_loop(&app.core).await;
+            let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
     // First poll tick (8s) sends the notification and arms the renderer;
@@ -673,7 +673,7 @@ async fn external_reply_render_guard_replaces_only_newer_messages() {
 
     // Arm once for the first external message.
     app.external
-        .start_reply_render(&app.core, "ses_ext", 1000, "n1", "第一条")
+        .start_reply_render(&app.flow_handles(), "ses_ext", 1000, "n1", "第一条")
         .await;
     {
         let cards = app.cards_handle();
@@ -688,7 +688,7 @@ async fn external_reply_render_guard_replaces_only_newer_messages() {
     // Re-arming for the SAME message (e.g. a duplicate poll) is a no-op:
     // the armed card id and epoch must not be clobbered.
     app.external
-        .start_reply_render(&app.core, "ses_ext", 1000, "n1b", "第一条")
+        .start_reply_render(&app.flow_handles(), "ses_ext", 1000, "n1b", "第一条")
         .await;
     {
         let cards = app.cards_handle();
@@ -703,7 +703,7 @@ async fn external_reply_render_guard_replaces_only_newer_messages() {
     // A NEWER external message replaces the armed renderer (its card id and
     // epoch move to the new notification).
     app.external
-        .start_reply_render(&app.core, "ses_ext", 2000, "n2", "第二条")
+        .start_reply_render(&app.flow_handles(), "ses_ext", 2000, "n2", "第二条")
         .await;
     {
         let cards = app.cards_handle();
@@ -777,7 +777,7 @@ async fn external_reply_render_times_out_and_finalizes_partial_content() {
     tokio::spawn({
         let app = app.clone();
         async move {
-            let _ = app.external.poll_loop(&app.core).await;
+            let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -858,7 +858,7 @@ async fn external_reply_keeps_the_user_message_above_it() {
     tokio::spawn({
         let app = app.clone();
         async move {
-            let _ = app.external.poll_loop(&app.core).await;
+            let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -945,7 +945,7 @@ async fn new_pending_stops_syncing_and_switch_back_resyncs_silently() {
     tokio::spawn({
         let app = app.clone();
         async move {
-            let _ = app.external.poll_loop(&app.core).await;
+            let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;

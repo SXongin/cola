@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::bridge::core::SharedCore;
 use crate::bridge::discovery::{self, ServerCandidate};
 use crate::bridge::handler::CardActionResult;
+use crate::bridge::handles::{CardsHandle, PollHandles, RequestsHandle, SessionsHandle, WaitsHandle};
 use crate::bridge::request::SentCard;
 use crate::bridge::turn::Turn;
 use crate::config::ServerStartPolicy;
@@ -17,8 +17,8 @@ const RECONNECT_POLL_INTERVAL_SECS: u64 = 5;
 /// Whether any session has a prompt in flight (a turn is streaming). The yield
 /// is deferred while busy so killing an Owned Server never truncates a
 /// mid-stream generation (ADR-0013).
-async fn busy(core: &SharedCore) -> bool {
-    !core.inflight.lock().await.is_empty()
+async fn busy(waits: &WaitsHandle) -> bool {
+    !waits.inflight.lock().await.is_empty()
 }
 
 /// Whether the server cola is currently attached to is its Owned Server
@@ -136,27 +136,33 @@ pub(crate) async fn wait_for_server_ready(
 /// Spawns only if `allow_spawn` OR (`heal_when_busy` and a turn is busy), and
 /// only when the policy allows it (`Never` never spawns).
 async fn reconcile(
-    core: &Arc<SharedCore>,
+    handles: &PollHandles,
     allow_spawn: bool,
     heal_when_busy: bool,
 ) -> crate::error::Result<bool> {
     let candidates = discovery::scan_processes();
     let self_pid = discovery::self_spawned_pid();
-    let Some(server) = discovery::pick_server(&candidates, core.preferred_port, self_pid) else {
+    let Some(server) = discovery::pick_server(&candidates, handles.server.preferred_port, self_pid) else {
         // No default-store server at all. Lazy Start: spawn an Owned Server on
         // demand; otherwise stay serverless (the caller replies that OpenCode
         // is unavailable).
-        let want_spawn = want_to_spawn(allow_spawn, heal_when_busy, busy(core).await);
-        if want_spawn && core.server_start.spawns_when_needed() {
-            let spawned = discovery::spawn_own_server(core.preferred_port)
+        let want_spawn = want_to_spawn(allow_spawn, heal_when_busy, busy(&handles.flow.waits).await);
+        if want_spawn && handles.server.start_policy.spawns_when_needed() {
+            let spawned = discovery::spawn_own_server(handles.server.preferred_port)
                 .await
                 .map_err(|e| crate::error::BridgeError::OpenCode(format!("lazy start failed: {e}")))?;
-            core.opencode.reconnect(&spawned.url, &spawned.password).await?;
+            handles
+                .flow
+                .backend
+                .reconnect(&spawned.url, &spawned.password)
+                .await?;
             // The spawned server only serves requests after a short startup
             // window (requests landing in it are swallowed forever). Wait until
             // it actually responds, so the message flow's first request lands
             // on a live server instead of hanging the turn silently.
-            if let Err(e) = wait_for_server_ready(&core.opencode, std::time::Duration::from_secs(20)).await {
+            if let Err(e) =
+                wait_for_server_ready(&handles.flow.backend, std::time::Duration::from_secs(20)).await
+            {
                 tracing::warn!("own OpenCode server never served a request: {}", e);
                 // Reap the wedged server and go serverless, so the NEXT message
                 // re-runs this reconcile and spawns a fresh one — leaving the
@@ -172,7 +178,7 @@ async fn reconcile(
                         }
                     }
                 }
-                let _ = core.opencode.reconnect("", "").await;
+                let _ = handles.flow.backend.reconnect("", "").await;
                 return Err(e);
             }
             if allow_spawn {
@@ -188,31 +194,31 @@ async fn reconcile(
         // The attached server, if any, is gone — go serverless so a later
         // message re-attaches or lazily spawns instead of 502ing against the
         // dead endpoint forever.
-        if !core.opencode.base_url().is_empty() {
+        if !handles.flow.backend.base_url().is_empty() {
             tracing::warn!("attached OpenCode server is gone; going serverless");
-            core.opencode.reconnect("", "").await?;
+            handles.flow.backend.reconnect("", "").await?;
         }
         return Ok(false);
     };
     let url = format!("http://localhost:{}", server.port);
-    let current = core.opencode.base_url();
+    let current = handles.flow.backend.base_url();
     let pick_is_owned = self_pid == Some(server.pid);
 
     if url != current {
         let current_is_owned = current_is_owned(&candidates, self_pid, &current);
-        if current_is_owned && !pick_is_owned && busy(core).await {
+        if current_is_owned && !pick_is_owned && busy(&handles.flow.waits).await {
             // Defer the yield: keep streaming on our Owned Server until idle,
             // so the in-flight generation isn't truncated.
             return Ok(true);
         }
         tracing::warn!("OpenCode server changed ({} -> {}); reconnecting", current, url);
-        core.opencode.reconnect(&url, &server.password).await?;
+        handles.flow.backend.reconnect(&url, &server.password).await?;
     }
 
     // Attached to the preferred server. If it's a Coexistent Server, reap a
     // leftover Owned Server (the yield) — but never while a turn is in flight.
     if !pick_is_owned {
-        if busy(core).await {
+        if busy(&handles.flow.waits).await {
             return Ok(true);
         }
         reap_owned_server(&candidates, self_pid).await;
@@ -228,11 +234,11 @@ async fn reconcile(
 /// for idle sessions — Lazy Start is the demand path — but heals a server that
 /// died while a turn was in flight (`heal_when_busy`), so a mid-stream
 /// generation's next poll finds a live server.
-pub(crate) async fn reconnect_poll_loop(core: &Arc<SharedCore>) -> crate::error::Result<()> {
+pub(crate) async fn reconnect_poll_loop(handles: &PollHandles) -> crate::error::Result<()> {
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(RECONNECT_POLL_INTERVAL_SECS)).await;
-        let _guard = core.server_lock.lock().await;
-        if let Err(e) = reconcile(core, false, true).await {
+        let _guard = handles.server.lock.lock().await;
+        if let Err(e) = reconcile(handles, false, true).await {
             tracing::warn!("server reconcile failed: {}", e);
         }
     }
@@ -243,23 +249,23 @@ pub(crate) async fn reconnect_poll_loop(core: &Arc<SharedCore>) -> crate::error:
 /// does and the policy allows (`auto`/`eager`), and reports false when
 /// attach-only (`never`) and no server exists. No-op for test mocks (they have
 /// no process to spawn). Returns whether a server is ready.
-pub(crate) async fn ensure_server(core: &Arc<SharedCore>) -> crate::error::Result<bool> {
-    if !core.opencode.can_self_start_server() {
+pub(crate) async fn ensure_server(handles: &PollHandles) -> crate::error::Result<bool> {
+    if !handles.flow.backend.can_self_start_server() {
         return Ok(true);
     }
-    if core.server_start == ServerStartPolicy::Never {
+    if handles.server.start_policy == ServerStartPolicy::Never {
         // Attach-only: a non-empty base_url means we're attached to someone
         // else's server; otherwise stay serverless.
-        return Ok(!core.opencode.base_url().is_empty());
+        return Ok(!handles.flow.backend.base_url().is_empty());
     }
     // Already attached — the reconcile loop re-points us within a few seconds
     // if that server dies or a Coexistent one appears, so don't rescan the
     // process table on every message.
-    if !core.opencode.base_url().is_empty() {
+    if !handles.flow.backend.base_url().is_empty() {
         return Ok(true);
     }
-    let _guard = core.server_lock.lock().await;
-    reconcile(core, true, true).await
+    let _guard = handles.server.lock.lock().await;
+    reconcile(handles, true, true).await
 }
 
 /// Where to deliver a permission/question card.
@@ -321,23 +327,23 @@ where
 /// Returns `None` when the session has no anchor and the thread query fails or
 /// returns nothing usable.
 pub(crate) async fn resolve_topic_anchor(
-    core: &Arc<SharedCore>,
+    sessions: &SessionsHandle,
+    platform: &Arc<dyn crate::feishu::Platform>,
     thread_key: &crate::config::ThreadKey,
 ) -> Option<String> {
     if thread_key.thread_id == thread_key.chat_id {
         return None; // not a topic
     }
     // 1. Persisted anchor.
-    let anchor = {
-        let store = core.sessions.lock().await;
-        store.get_active(thread_key).and_then(|e| e.topic_anchor.clone())
-    };
+    let anchor = sessions
+        .active_entry(thread_key)
+        .await
+        .and_then(|e| e.topic_anchor.clone());
     if let Some(a) = anchor {
         return Some(a);
     }
     // 2. Newest bot message inside the thread.
-    let msgs = core
-        .feishu
+    let msgs = platform
         .list_messages("thread", &thread_key.thread_id)
         .await
         .ok()?;
@@ -359,15 +365,18 @@ pub(crate) async fn resolve_topic_anchor(
 /// a session cola knows is found. The directory is passed through so the
 /// parent session is looked up in the same server instance.
 pub(crate) async fn resolve_card_target(
-    core: &Arc<SharedCore>,
+    sessions: &SessionsHandle,
+    cards: &CardsHandle,
+    backend: &Arc<dyn opencode::Backend>,
+    platform: &Arc<dyn crate::feishu::Platform>,
     session_id: &str,
     directory: &str,
 ) -> Option<CardTarget> {
-    walk_parent_chain(&core.opencode, session_id, Some(directory), |current| {
+    walk_parent_chain(backend, session_id, Some(directory), |current| {
         let current = current.to_string();
         async move {
             // In-flight prompt for this session → reply to its streaming card.
-            if let Some(msg_id) = Turn::reply_target(&core.cards_handle(), &current).await {
+            if let Some(msg_id) = Turn::reply_target(cards, &current).await {
                 return Some(CardTarget::ReplyTo(msg_id));
             }
             // Session mapped to a chat. A topic-backed session must be reached by
@@ -377,13 +386,10 @@ pub(crate) async fn resolve_card_target(
             // the thread (covers sessions created before the anchor existed).
             // Non-topic sessions, or topic sessions with no reachable anchor, fall
             // back to sending into the chat top level.
-            let entry = {
-                let store = core.sessions.lock().await;
-                store.entry_for_session(&current).cloned()
-            };
+            let entry = sessions.entry_for_session(&current).await;
             if let Some(entry) = entry {
                 let anchor = if entry.thread_key.thread_id != entry.thread_key.chat_id {
-                    resolve_topic_anchor(core, &entry.thread_key).await
+                    resolve_topic_anchor(sessions, platform, &entry.thread_key).await
                 } else {
                     None
                 };
@@ -405,14 +411,15 @@ pub(crate) async fn resolve_card_target(
 /// `resolve_card_target`); the host's card then carries the child's buttons,
 /// and clicking them still replies to the actual (child) session via `directory`.
 pub(crate) async fn inline_host_session(
-    core: &Arc<SharedCore>,
+    cards: &CardsHandle,
+    backend: &Arc<dyn opencode::Backend>,
     session_id: &str,
     directory: Option<&str>,
 ) -> Option<String> {
-    walk_parent_chain(&core.opencode, session_id, directory, |current| {
+    walk_parent_chain(backend, session_id, directory, |current| {
         let current = current.to_string();
         async move {
-            if Turn::has_card(&core.cards_handle(), &current).await {
+            if Turn::has_card(cards, &current).await {
                 Some(current)
             } else {
                 None
@@ -443,7 +450,8 @@ pub(crate) fn result_card(title: &str, template: &str, body: &str) -> CardAction
 /// live — that directory said nothing, so its requests may still be pending
 /// (#130, #144). Shared by the permission and question flows.
 pub(crate) async fn mark_stale_cards(
-    core: &Arc<SharedCore>,
+    requests: &RequestsHandle,
+    platform: &Arc<dyn crate::feishu::Platform>,
     pending: &std::collections::HashSet<String>,
     sent: &Arc<Mutex<HashMap<String, SentCard>>>,
     failed_dirs: &std::collections::HashSet<String>,
@@ -451,7 +459,7 @@ pub(crate) async fn mark_stale_cards(
 ) {
     let stale: Vec<(String, String, String)> = {
         let sent_map = sent.lock().await.clone();
-        let answered = core.answered_requests.lock().await;
+        let answered = requests.answered_requests.lock().await;
         sent_map
             .into_iter()
             .filter(|(rid, card)| {
@@ -463,7 +471,7 @@ pub(crate) async fn mark_stale_cards(
     for (rid, mid, desc) in stale {
         sent.lock().await.remove(&rid);
         let card = crate::feishu::card::notify::build_resolved_elsewhere_card(kind, &desc);
-        if let Err(e) = core.feishu.update_message(&mid, &card).await {
+        if let Err(e) = platform.update_message(&mid, &card).await {
             tracing::warn!("mark stale {} card {}: {}", kind, rid, e);
         } else {
             tracing::info!("Marked stale {} card {} as handled", kind, rid);
@@ -474,6 +482,7 @@ pub(crate) async fn mark_stale_cards(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::core::SharedCore;
     use crate::bridge::test_support::{MockBackend, RecordingPlatform, test_config};
     use std::sync::Arc;
 

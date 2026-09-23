@@ -70,7 +70,7 @@ async fn a_standalone_waiting_card_pins_and_resolution_unpins() {
     seed_session(&app, "ses_1", "/work").await;
 
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     assert_eq!(
         platform.message_pins().await,
         vec![("msg_sent".to_string(), true)],
@@ -79,12 +79,12 @@ async fn a_standalone_waiting_card_pins_and_resolution_unpins() {
 
     // Seeing the same pending request again must not re-pin it — a card cola
     // already pinned is never touched twice, so a manual unpin stays.
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     assert_eq!(platform.message_pins().await.len(), 1);
 
     // Resolved elsewhere: the next complete sweep unpins exactly once.
     backend.permission_resolved_by_another("per_1").await;
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     let calls = platform.message_pins().await;
     assert_eq!(
         calls,
@@ -92,7 +92,7 @@ async fn a_standalone_waiting_card_pins_and_resolution_unpins() {
         "one pin, one unpin: {calls:?}"
     );
 
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     assert_eq!(platform.message_pins().await.len(), 2, "nothing tracked any more");
 }
 
@@ -113,7 +113,7 @@ async fn an_inlined_waiting_card_pins_the_live_card() {
     seed_turn(&app, "ses_1", 1).await;
 
     let mut seen = std::collections::HashSet::new();
-    app.question.sweep(&app.core, &mut seen).await;
+    app.question.sweep(&app.flow_handles(), &mut seen).await;
     assert_eq!(
         platform.message_pins().await,
         vec![("msg_card".to_string(), true)],
@@ -121,7 +121,7 @@ async fn an_inlined_waiting_card_pins_the_live_card() {
     );
 
     backend.question_resolved_by_another("que_1").await;
-    app.question.sweep(&app.core, &mut seen).await;
+    app.question.sweep(&app.flow_handles(), &mut seen).await;
     let calls = platform.message_pins().await;
     assert_eq!(calls.len(), 2, "one pin, one unpin: {calls:?}");
     assert!(calls[0].1 && !calls[1].1);
@@ -140,7 +140,7 @@ async fn a_snapshot_claimed_wait_pins_the_snapshot_card() {
     seed_session(&app, "ses_1", "/work").await;
 
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     assert_eq!(
         platform.message_pins().await,
         vec![("msg_sent".to_string(), true)],
@@ -164,7 +164,7 @@ async fn a_snapshot_claimed_wait_pins_the_snapshot_card() {
         },
     );
 
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     let calls = platform.message_pins().await;
     assert_eq!(
         calls,
@@ -177,7 +177,7 @@ async fn a_snapshot_claimed_wait_pins_the_snapshot_card() {
     );
 
     backend.permission_resolved_by_another("per_1").await;
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     let calls = platform.message_pins().await;
     assert_eq!(
         calls.last(),
@@ -204,7 +204,7 @@ async fn an_auto_accepted_permission_never_pins() {
     seed_turn(&app, "ses_1", 1).await;
 
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
 
     assert!(
         platform.message_pins().await.is_empty(),
@@ -228,7 +228,7 @@ async fn pin_off_records_no_message_pins() {
     seed_session(&app, "ses_1", "/work").await;
 
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
 
     assert!(
         platform.message_pins().await.is_empty(),
@@ -255,7 +255,7 @@ async fn a_failed_pin_does_not_fabricate_an_unpin() {
     seed_session(&app, "ses_1", "/work").await;
 
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     assert_eq!(
         platform.message_pins().await,
         vec![("msg_sent".to_string(), true)],
@@ -263,7 +263,7 @@ async fn a_failed_pin_does_not_fabricate_an_unpin() {
     );
 
     backend.permission_resolved_by_another("per_1").await;
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     let calls = platform.message_pins().await;
     assert_eq!(
         calls.len(),

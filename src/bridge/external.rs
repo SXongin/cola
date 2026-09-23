@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
-use crate::bridge::core::SharedCore;
+use crate::bridge::handles::{CardsHandle, FlowHandles};
 use crate::bridge::turn::Turn;
 
 /// The external-message flow: watches for user messages that were NOT sent by
@@ -58,7 +58,7 @@ impl ExternalFlow {
     /// mid-turn and cola never reads back the message's created time, the
     /// poller still recognises it as cola's own on the first poll after a heal
     /// — it can never be mistaken for an external message.
-    pub(crate) async fn poll_loop(&self, core: &Arc<SharedCore>) -> crate::error::Result<()> {
+    pub(crate) async fn poll_loop(&self, handles: &FlowHandles) -> crate::error::Result<()> {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_millis(
                 self.poll_interval_ms.load(std::sync::atomic::Ordering::Relaxed),
@@ -66,7 +66,7 @@ impl ExternalFlow {
             .await;
             // Serverless (Lazy Start hasn't attached/spawned yet): nothing to
             // watch on the store — skip quietly.
-            if core.opencode.base_url().is_empty() {
+            if handles.backend.base_url().is_empty() {
                 continue;
             }
             // Only each thread's ACTIVE session is synced (ADR-0017): a lobby
@@ -83,7 +83,7 @@ impl ExternalFlow {
                 std::collections::HashSet<String>,
                 Vec<(String, crate::config::ThreadKey, String)>,
             ) = {
-                let store = core.sessions.lock().await;
+                let store = handles.sessions.store.lock().await;
                 let mut active = std::collections::HashSet::new();
                 let mut sessions = Vec::new();
                 for e in store.all_entries() {
@@ -103,7 +103,7 @@ impl ExternalFlow {
                 // the notification and the renderer it arms are all retrievable
                 // by `rg 'session=ses_x'`.
                 let span = crate::bridge::span::external(&sid, Some(&thread_key));
-                self.poll_session(core, &active, &sid, &thread_key, &directory)
+                self.poll_session(handles, &active, &sid, &thread_key, &directory)
                     .instrument(span)
                     .await;
             }
@@ -117,7 +117,7 @@ impl ExternalFlow {
     /// of [`Self::poll_loop`] so the whole pass is instrumented in one place.
     async fn poll_session(
         &self,
-        core: &Arc<SharedCore>,
+        handles: &FlowHandles,
         active: &std::collections::HashSet<String>,
         sid: &str,
         thread_key: &crate::config::ThreadKey,
@@ -131,13 +131,13 @@ impl ExternalFlow {
             return;
         }
         // While cola is answering this session, any new message is cola's own.
-        if core.inflight.lock().await.contains(sid) {
+        if handles.waits.inflight.lock().await.contains(sid) {
             return;
         }
         let Some(Ok(msgs)) = crate::bridge::bounded_call(
             "external poll messages",
             self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
-            core.opencode.messages(sid),
+            handles.backend.messages(sid),
         )
         .await
         else {
@@ -190,7 +190,7 @@ impl ExternalFlow {
             let title = crate::bridge::bounded_call(
                 "external poll session_info",
                 self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
-                core.opencode.clone().for_directory(directory).session_info(sid),
+                handles.backend.clone().for_directory(directory).session_info(sid),
             )
             .await
             .and_then(|r| r.ok())
@@ -203,17 +203,27 @@ impl ExternalFlow {
             // anchor — the persisted `/topic` confirmation card, or
             // the newest bot message in the thread. Non-topic
             // sessions fall back to the chat top level.
-            let anchor = crate::bridge::pollers::resolve_topic_anchor(core, thread_key).await;
+            let anchor = crate::bridge::pollers::resolve_topic_anchor(
+                &handles.sessions,
+                &handles.platform,
+                thread_key,
+            )
+            .await;
             let sent = match anchor {
-                Some(anchor) => core.feishu.reply_card(&anchor, &card).await,
-                None => core.feishu.send_card("chat_id", &thread_key.chat_id, &card).await,
+                Some(anchor) => handles.platform.reply_card(&anchor, &card).await,
+                None => {
+                    handles
+                        .platform
+                        .send_card("chat_id", &thread_key.chat_id, &card)
+                        .await
+                }
             };
             match sent {
                 Ok(card_id) => {
                     // Now render the model's reply INTO that card, so
                     // the Feishu side sees the answer, not just the
                     // notification.
-                    self.start_reply_render(core, sid, latest, &card_id, &preview)
+                    self.start_reply_render(handles, sid, latest, &card_id, &preview)
                         .await;
                 }
                 Err(e) => tracing::warn!("external message notify: {}", e),
@@ -228,7 +238,7 @@ impl ExternalFlow {
     /// message starts a new turn, or a hard timeout elapses.
     pub(crate) async fn start_reply_render(
         &self,
-        core: &Arc<SharedCore>,
+        handles: &FlowHandles,
         session_id: &str,
         turn_anchor_ms: i64,
         card_id: &str,
@@ -239,11 +249,11 @@ impl ExternalFlow {
         // own prompts get a fresh accumulator, so a different anchor is NOT
         // this message — a new renderer replaces the old one (whose
         // `turn_started_ms` no longer matches, so it exits).
-        if armed_turn_anchor(core, session_id).await == Some(turn_anchor_ms) {
+        if armed_turn_anchor(&handles.cards, session_id).await == Some(turn_anchor_ms) {
             return;
         }
         let (session_dir, session_thread_key) = {
-            let store = core.sessions.lock().await;
+            let store = handles.sessions.store.lock().await;
             match store.entry_for_session(session_id) {
                 Some(e) => (e.directory.clone(), Some(e.thread_key.clone())),
                 None => (String::new(), None),
@@ -253,7 +263,8 @@ impl ExternalFlow {
         let title = crate::bridge::bounded_call(
             "external render session_info",
             self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
-            core.opencode
+            handles
+                .backend
                 .clone()
                 .for_directory(session_dir.as_str())
                 .session_info(session_id),
@@ -279,8 +290,9 @@ impl ExternalFlow {
         // turn is ARMED, not when it finalizes — a `/think` issued mid-render
         // must not retro-tag this card (same rule as the work-context half,
         // ADR-0019).
-        let variant = core
+        let variant = handles
             .sessions
+            .store
             .lock()
             .await
             .entry_for_session(session_id)
@@ -291,7 +303,7 @@ impl ExternalFlow {
         // server times are at or after it — always insert BELOW the preview.
         let anchor_text = (!preview.is_empty()).then(|| format!("👤 {}", preview));
         Turn::arm_external_render(
-            &core.cards_handle(),
+            &handles.cards,
             session_id,
             card_id,
             turn_anchor_ms,
@@ -303,7 +315,7 @@ impl ExternalFlow {
         .await;
         tracing::info!("external reply render armed for session {}", session_id);
 
-        let core = Arc::clone(core);
+        let handles = handles.clone();
         let sid = session_id.to_string();
         let poll_ms = self.render_poll_ms.load(std::sync::atomic::Ordering::Relaxed);
         let timeout_ms = self.render_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
@@ -313,7 +325,7 @@ impl ExternalFlow {
         let span = crate::bridge::span::external(session_id, session_thread_key.as_ref());
         tokio::spawn(
             async move {
-                external_render_loop(&core, sid, turn_anchor_ms, poll_ms, timeout_ms).await;
+                external_render_loop(&handles, sid, turn_anchor_ms, poll_ms, timeout_ms).await;
             }
             .instrument(span),
         );
@@ -321,17 +333,17 @@ impl ExternalFlow {
 
     /// ADR-0028 busy-adopt follow: the adopted session's in-flight EXTERNAL
     /// turn streams into the snapshot card instead of freezing a static
-    /// "运行中" line. The snapshot card is the host (`CardSession` in
-    /// `core.cards`, like `start_reply_render`): its message id is the live
-    /// card, the static 已接管 prefix + tail ride as acc text (the same
-    /// representation choice as the 👤 preview), and the adopt-time pending
-    /// blocks are pre-seeded as inline sections so a permission approved from
-    /// the snapshot resumes the run inside the SAME card. The renderer exits
-    /// when a cola prompt or a newer external message replaces the accumulator
-    /// (the existing `external_render_loop` guards).
+    /// "运行中" line. The snapshot card is the host (the session's
+    /// `CardSession` accumulator, like `start_reply_render`): its message id
+    /// is the live card, the static 已接管 prefix + tail ride as acc text (the
+    /// same representation choice as the 👤 preview), and the adopt-time
+    /// pending blocks are pre-seeded as inline sections so a permission
+    /// approved from the snapshot resumes the run inside the SAME card. The
+    /// renderer exits when a cola prompt or a newer external message replaces
+    /// the accumulator (the existing `external_render_loop` guards).
     pub(crate) async fn start_snapshot_follow(
         &self,
-        core: &Arc<SharedCore>,
+        handles: &FlowHandles,
         session_id: &str,
         card_id: &str,
         verb: &str,
@@ -341,7 +353,8 @@ impl ExternalFlow {
         // Race (ADR-0028): busy at gather but idle by now → the turn already
         // finished; keep the static snapshot and never arm a renderer.
         let busy_now = matches!(
-            core.opencode
+            handles
+                .backend
                 .session_status(session_id, Some(&data.directory))
                 .await,
             Ok(Some(crate::opencode::types::SessionStatus::Busy))
@@ -376,8 +389,8 @@ impl ExternalFlow {
         // still carries its server-time anchor). Re-point it at the new card —
         // a re-adopt sent a fresh snapshot mid-turn — so one renderer keeps
         // one live card, and never double-render.
-        if armed_turn_anchor(core, session_id).await == Some(turn_anchor_ms) {
-            Turn::repoint_card(&core.cards_handle(), session_id, card_id).await;
+        if armed_turn_anchor(&handles.cards, session_id).await == Some(turn_anchor_ms) {
+            Turn::repoint_card(&handles.cards, session_id, card_id).await;
             tracing::info!(
                 "snapshot follow: re-pointing existing renderer at card {}",
                 card_id
@@ -385,14 +398,15 @@ impl ExternalFlow {
             return true;
         }
         let (session_dir, session_thread_key) = {
-            let store = core.sessions.lock().await;
+            let store = handles.sessions.store.lock().await;
             match store.entry_for_session(session_id) {
                 Some(e) => (e.directory.clone(), Some(e.thread_key.clone())),
                 None => (String::new(), None),
             }
         };
-        let variant = core
+        let variant = handles
             .sessions
+            .store
             .lock()
             .await
             .entry_for_session(session_id)
@@ -424,7 +438,7 @@ impl ExternalFlow {
             }
         }
         Turn::arm_external_render(
-            &core.cards_handle(),
+            &handles.cards,
             session_id,
             card_id,
             turn_anchor_ms,
@@ -441,11 +455,11 @@ impl ExternalFlow {
         for req in &data.pending {
             match req {
                 crate::bridge::request::PendingRequest::Permission(p) => {
-                    Turn::add_permission(&core.cards_handle(), session_id, p, &data.directory).await;
+                    Turn::add_permission(&handles.cards, session_id, p, &data.directory).await;
                 }
                 crate::bridge::request::PendingRequest::Question(q) => {
                     Turn::add_question(
-                        &core.cards_handle(),
+                        &handles.cards,
                         session_id,
                         q,
                         &data.directory,
@@ -457,13 +471,17 @@ impl ExternalFlow {
                     // claim path): the poll loop never sees follow-hosted
                     // requests, so `prepare()` never runs for them and the
                     // block's buttons would resolve to nothing.
-                    core.question.remember_question(q, &data.directory).await;
+                    handles
+                        .requests
+                        .question
+                        .remember_question(q, &data.directory)
+                        .await;
                 }
             }
         }
         tracing::info!("snapshot follow armed for session {}", session_id);
 
-        let core = Arc::clone(core);
+        let handles = handles.clone();
         let sid = session_id.to_string();
         let poll_ms = self.render_poll_ms.load(std::sync::atomic::Ordering::Relaxed);
         let timeout_ms = self.render_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
@@ -473,7 +491,7 @@ impl ExternalFlow {
         let span = crate::bridge::span::external(session_id, session_thread_key.as_ref());
         tokio::spawn(
             async move {
-                external_render_loop(&core, sid, turn_anchor_ms, poll_ms, timeout_ms).await;
+                external_render_loop(&handles, sid, turn_anchor_ms, poll_ms, timeout_ms).await;
             }
             .instrument(span),
         );
@@ -485,8 +503,8 @@ impl ExternalFlow {
 /// renderer identity both external arming paths compare their own turn's
 /// server time against, so a duplicate arm is a no-op and a different turn
 /// replaces it.
-async fn armed_turn_anchor(core: &Arc<SharedCore>, session_id: &str) -> Option<i64> {
-    Turn::armed_turn_anchor(&core.cards_handle(), session_id).await
+async fn armed_turn_anchor(cards: &CardsHandle, session_id: &str) -> Option<i64> {
+    Turn::armed_turn_anchor(cards, session_id).await
 }
 
 /// ADR-0028: settle a snapshot card right after it was sent — arm the
@@ -500,23 +518,23 @@ async fn armed_turn_anchor(core: &Arc<SharedCore>, session_id: &str) -> Option<i
 /// (ADR-0048), so its follow/claim lines are retrievable by it; the follow's
 /// own render task is instrumented at its spawn with the `external` span.
 pub(crate) async fn settle_snapshot_after_send(
-    core: &Arc<SharedCore>,
+    external: &ExternalFlow,
+    handles: &FlowHandles,
     snapshot_message_id: &str,
     verb: &str,
     title: &str,
     data: &crate::bridge::snapshot::SnapshotData,
 ) {
-    let thread_key = crate::bridge::span::thread_key_of(&core.sessions_handle(), &data.session_id).await;
+    let thread_key = crate::bridge::span::thread_key_of(&handles.sessions, &data.session_id).await;
     let span = crate::bridge::span::snapshot(&data.session_id, thread_key.as_ref());
     async {
         let followed = data.status == Some(crate::opencode::types::SessionStatus::Busy)
-            && core
-                .external
-                .start_snapshot_follow(core, &data.session_id, snapshot_message_id, verb, title, data)
+            && external
+                .start_snapshot_follow(handles, &data.session_id, snapshot_message_id, verb, title, data)
                 .await;
         if !followed {
             crate::bridge::snapshot_claims::claim_snapshot_pendings(
-                core,
+                &handles.requests,
                 snapshot_message_id,
                 verb,
                 title,
@@ -535,7 +553,7 @@ pub(crate) async fn settle_snapshot_after_send(
 /// was replaced (cola's own prompt or a newer external message), a newer user
 /// message starts a new turn, or the hard timeout elapses.
 async fn external_render_loop(
-    core: &Arc<SharedCore>,
+    handles: &FlowHandles,
     session_id: String,
     turn_anchor_ms: i64,
     poll_ms: u64,
@@ -544,7 +562,7 @@ async fn external_render_loop(
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(poll_ms)).await;
-        let msgs = match core.opencode.messages(&session_id).await {
+        let msgs = match handles.backend.messages(&session_id).await {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!("external render poll messages: {}", e);
@@ -554,16 +572,15 @@ async fn external_render_loop(
         // The accumulator was replaced (cola's own `run_prompt` inserted a fresh
         // one, or a newer external message's renderer took over): exit so this
         // turn isn't double-rendered into two cards.
-        let replaced =
-            Turn::armed_turn_anchor(&core.cards_handle(), &session_id).await != Some(turn_anchor_ms);
+        let replaced = Turn::armed_turn_anchor(&handles.cards, &session_id).await != Some(turn_anchor_ms);
         if replaced {
             break;
         }
         // Stream the reply's reasoning/tools/text into the notification card.
         let Some((new_parts, _, _)) = Turn::render_and_flush(
-            &core.cards_handle(),
-            &core.sessions_handle(),
-            &core.opencode,
+            &handles.cards,
+            &handles.sessions,
+            &handles.backend,
             &session_id,
             &msgs,
         )
@@ -576,7 +593,7 @@ async fn external_render_loop(
         }
         // The model finished answering: finalize the card, then stop.
         if external_turn_completed(&msgs, turn_anchor_ms) {
-            finalize_done(core, &session_id).await;
+            finalize_done(&handles.cards, &session_id).await;
             tracing::info!("external reply rendered: session {} done", session_id);
             break;
         }
@@ -594,9 +611,9 @@ async fn external_render_loop(
         // was rendered, finalize it so the card never sits on an eternal
         // spinner; otherwise leave the "有新消息" notification as-is.
         if tokio::time::Instant::now() >= deadline {
-            let has_content = Turn::has_rendered_content(&core.cards_handle(), &session_id).await;
+            let has_content = Turn::has_rendered_content(&handles.cards, &session_id).await;
             if has_content {
-                finalize_done(core, &session_id).await;
+                finalize_done(&handles.cards, &session_id).await;
                 tracing::info!(
                     "external reply render timed out; finalized session {}",
                     session_id
@@ -611,8 +628,8 @@ async fn external_render_loop(
 /// reply that finished (or timed out with content rendered). The work context
 /// is refreshed first (ADR-0019), so the final card shows where the turn
 /// landed (branch/dirty) rather than only where it started.
-async fn finalize_done(core: &Arc<SharedCore>, session_id: &str) {
-    Turn::finalize_done(&core.cards_handle(), session_id).await;
+async fn finalize_done(cards: &CardsHandle, session_id: &str) {
+    Turn::finalize_done(cards, session_id).await;
 }
 
 /// Whether the model has finished answering the external message: an assistant

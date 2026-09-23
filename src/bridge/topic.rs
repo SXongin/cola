@@ -14,12 +14,12 @@ use std::sync::Arc;
 
 use tracing::Instrument;
 
-use crate::bridge::core::SharedCore;
 use crate::bridge::display::{dir_basename, id_tail, model_display};
-use crate::bridge::handles::{CardsHandle, SessionsHandle};
+use crate::bridge::handles::{CardsHandle, SessionsHandle, TopicHandles};
 use crate::bridge::session::PendingEntry;
 use crate::config::{SessionEntry, ThreadKey};
 use crate::error::BridgeError;
+use crate::feishu;
 use crate::opencode;
 use crate::opencode::types::SessionListInfo;
 
@@ -78,7 +78,7 @@ pub(crate) enum OpenTopicError {
 /// the adopted Session — a fresh `/topic` has none yet — plus the Chat it is
 /// opened in (and the session's current Topic, when it already has one).
 pub(crate) async fn open_topic(
-    core: &Arc<SharedCore>,
+    handles: &TopicHandles,
     chat_id: &str,
     fallback_root: &str,
     opening: TopicOpening,
@@ -91,20 +91,20 @@ pub(crate) async fn open_topic(
     // the Chat — plus whatever Topic the adopted Session is already mapped to.
     let chat_key = ThreadKey::new(chat_id.to_string(), chat_id.to_string());
     let thread_key = match span_session {
-        Some(id) => crate::bridge::span::thread_key_of(&core.sessions_handle(), id)
+        Some(id) => crate::bridge::span::thread_key_of(&handles.flow.sessions, id)
             .await
             .unwrap_or(chat_key),
         None => chat_key,
     };
     let span = crate::bridge::span::topic(span_session, Some(&thread_key));
-    open_topic_inner(core, chat_id, fallback_root, opening)
+    open_topic_inner(handles, chat_id, fallback_root, opening)
         .instrument(span)
         .await
 }
 
 /// [`open_topic`]'s transaction body, run inside its `topic` span.
 async fn open_topic_inner(
-    core: &Arc<SharedCore>,
+    handles: &TopicHandles,
     chat_id: &str,
     fallback_root: &str,
     opening: TopicOpening,
@@ -132,7 +132,8 @@ async fn open_topic_inner(
             // best-effort, so a read failure degrades that field rather than
             // blocking the adoption. The pendings are restricted to the
             // claimable ones (the session's own, not already surfaced).
-            let (card, data) = crate::bridge::snapshot::snapshot_card_for(core, "接管", &info).await;
+            let (card, data) =
+                crate::bridge::snapshot::snapshot_card_for(&handles.snapshot_handles(), "接管", &info).await;
             OpeningParts {
                 directory: info.directory,
                 display_title: info.title.clone(),
@@ -164,8 +165,14 @@ async fn open_topic_inner(
             .await
         }
     };
-    let (anchor, thread_id, topic_root, cover_id) =
-        open_cover_topic(core, chat_id, fallback_root, &cover_text, parts.seed).await?;
+    let (anchor, thread_id, topic_root, cover_id) = open_cover_topic(
+        &handles.flow.platform,
+        chat_id,
+        fallback_root,
+        &cover_text,
+        parts.seed,
+    )
+    .await?;
     let Some(thread_id) = thread_id else {
         tracing::warn!(
             "topic: no thread_id returned in chat {}; not recording the opening",
@@ -183,12 +190,12 @@ async fn open_topic_inner(
             pending.title = title;
             pending.topic_anchor = Some(anchor.clone());
             pending.topic_root = Some(topic_root);
-            core.set_pending_session(pending).await?;
+            handles.flow.sessions.set_pending(pending).await?;
             // The cover record must survive until materialisation; keyed by the
             // pending's thread (it has no session id yet) and flagged pending so
             // the first successful sync re-renders the full brief.
             record_cover_title(
-                core,
+                &handles.flow.cards,
                 &pending_cover_key(&topic_key),
                 &parts.display_title,
                 None,
@@ -203,9 +210,9 @@ async fn open_topic_inner(
             entry.agent = parts.agent;
             entry.topic_anchor = Some(anchor.clone());
             entry.topic_root = Some(topic_root);
-            core.activate_session(entry).await?;
+            handles.flow.sessions.activate(entry).await?;
             record_cover_title(
-                core,
+                &handles.flow.cards,
                 &session_id,
                 &parts.display_title,
                 parts.model,
@@ -221,8 +228,15 @@ async fn open_topic_inner(
     // never duplicates them. Not reached when the topic could not be opened
     // (no thread_id) — the poller keeps today's standalone flow for them.
     if let Some(claim) = parts.snapshot_claim {
-        crate::bridge::external::settle_snapshot_after_send(core, &anchor, "接管", &claim.title, &claim.data)
-            .await;
+        crate::bridge::external::settle_snapshot_after_send(
+            &handles.external,
+            &handles.flow,
+            &anchor,
+            "接管",
+            &claim.title,
+            &claim.data,
+        )
+        .await;
     }
     Ok(OpenedTopic {
         session_id,
@@ -328,9 +342,9 @@ async fn topic_cover_head(title: &str, dir: &str) -> String {
 /// Send the topic cover card to the chat's top level. Returns the cover
 /// message id, or `None` when sending fails (the caller then anchors the
 /// thread on the user's command message instead).
-async fn send_topic_cover(core: &Arc<SharedCore>, chat_id: &str, text: &str) -> Option<String> {
+async fn send_topic_cover(platform: &Arc<dyn feishu::Platform>, chat_id: &str, text: &str) -> Option<String> {
     let card = crate::feishu::client::markdown_card(text);
-    match core.feishu.send_card("chat_id", chat_id, &card).await {
+    match platform.send_card("chat_id", chat_id, &card).await {
         Ok(id) => Some(id),
         Err(e) => {
             tracing::warn!("topic cover card send failed: {e}; anchoring on the command message");
@@ -348,17 +362,17 @@ async fn send_topic_cover(core: &Arc<SharedCore>, chat_id: &str, text: &str) -> 
 /// Returns the created reply's message id (the anchor), the new thread_id, the
 /// root message id (`topic_root`), and the cover id (`None` on fallback).
 async fn open_cover_topic(
-    core: &Arc<SharedCore>,
+    platform: &Arc<dyn feishu::Platform>,
     chat_id: &str,
     fallback_root: &str,
     cover_text: &str,
     seed: TopicSeed,
 ) -> crate::error::Result<(String, Option<String>, String, Option<String>)> {
-    let cover_id = send_topic_cover(core, chat_id, cover_text).await;
+    let cover_id = send_topic_cover(platform, chat_id, cover_text).await;
     let root = cover_id.clone().unwrap_or_else(|| fallback_root.to_string());
     let (anchor, thread_id) = match seed {
-        TopicSeed::ReplyHint => core.feishu.reply_in_thread(&root, TOPIC_REPLY_HINT).await?,
-        TopicSeed::Snapshot(card) => core.feishu.reply_card_in_thread(&root, &card).await?,
+        TopicSeed::ReplyHint => platform.reply_in_thread(&root, TOPIC_REPLY_HINT).await?,
+        TopicSeed::Snapshot(card) => platform.reply_card_in_thread(&root, &card).await?,
     };
     Ok((anchor, thread_id, root, cover_id))
 }
@@ -530,14 +544,14 @@ pub(crate) fn spawn_cover_title_retry_at(
 /// user message. `key` is the session id, or [`pending_cover_key`] while the
 /// topic's session is still pending (ADR-0041).
 async fn record_cover_title(
-    core: &Arc<SharedCore>,
+    cards: &CardsHandle,
     key: &str,
     title: &str,
     model: Option<String>,
     cover_sent: bool,
     pending: bool,
 ) {
-    let mut covers = core.cover_titles.lock().await;
+    let mut covers = cards.cover_titles.lock().await;
     if cover_sent {
         covers.insert(
             key.to_string(),
@@ -565,9 +579,9 @@ fn pending_cover_key(key: &ThreadKey) -> String {
 /// the full brief; when the server title is not yet available, the post-turn
 /// retry ladder finishes the job. No-op for topics without a sent cover card
 /// (fallback-rooted: nothing was recorded) and for non-topic pendings.
-pub(crate) async fn claim_pending_cover(core: &Arc<SharedCore>, key: &ThreadKey, session_id: &str) {
+pub(crate) async fn claim_pending_cover(handles: &TopicHandles, key: &ThreadKey, session_id: &str) {
     let claimed = {
-        let mut covers = core.cover_titles.lock().await;
+        let mut covers = handles.flow.cards.cover_titles.lock().await;
         if let Some(cover) = covers.remove(&pending_cover_key(key)) {
             covers.insert(session_id.to_string(), cover);
             true
@@ -577,9 +591,9 @@ pub(crate) async fn claim_pending_cover(core: &Arc<SharedCore>, key: &ThreadKey,
     };
     if claimed {
         sync_topic_cover_title(
-            &core.cards_handle(),
-            &core.sessions_handle(),
-            &core.opencode,
+            &handles.flow.cards,
+            &handles.flow.sessions,
+            &handles.flow.backend,
             session_id,
         )
         .await;
@@ -595,17 +609,17 @@ pub(crate) async fn claim_pending_cover(core: &Arc<SharedCore>, key: &ThreadKey,
 ///
 /// The retitle runs inside the pending topic's `topic` span (ADR-0048) — no
 /// Session exists yet, so the span carries the Chat/Topic alone.
-pub(crate) async fn rename_pending_cover(core: &Arc<SharedCore>, key: &ThreadKey, title: &str) {
+pub(crate) async fn rename_pending_cover(handles: &TopicHandles, key: &ThreadKey, title: &str) {
     let span = crate::bridge::span::topic(None, Some(key));
-    rename_pending_cover_inner(core, key, title)
+    rename_pending_cover_inner(handles, key, title)
         .instrument(span)
         .await
 }
 
 /// [`rename_pending_cover`]'s body, run inside the pending topic's `topic` span.
-async fn rename_pending_cover_inner(core: &Arc<SharedCore>, key: &ThreadKey, title: &str) {
+async fn rename_pending_cover_inner(handles: &TopicHandles, key: &ThreadKey, title: &str) {
     let pending_root = {
-        let store = core.sessions.lock().await;
+        let store = handles.flow.sessions.store.lock().await;
         store
             .pending_for(key)
             .map(|p| (p.topic_root.clone(), p.directory.clone()))
@@ -614,14 +628,21 @@ async fn rename_pending_cover_inner(core: &Arc<SharedCore>, key: &ThreadKey, tit
         return;
     };
     let cache_key = pending_cover_key(key);
-    if !core.cover_titles.lock().await.contains_key(&cache_key) {
+    if !handles
+        .flow
+        .cards
+        .cover_titles
+        .lock()
+        .await
+        .contains_key(&cache_key)
+    {
         return;
     }
     let text = pending_topic_cover_text(title, &directory).await;
     let card = crate::feishu::client::markdown_card(&text);
-    match core.feishu.update_message(&root_id, &card).await {
+    match handles.flow.platform.update_message(&root_id, &card).await {
         Ok(()) => {
-            if let Some(cover) = core.cover_titles.lock().await.get_mut(&cache_key) {
+            if let Some(cover) = handles.flow.cards.cover_titles.lock().await.get_mut(&cache_key) {
                 cover.title = title.to_string();
             }
             tracing::info!(

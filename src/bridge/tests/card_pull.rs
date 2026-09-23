@@ -124,7 +124,7 @@ async fn card_pull_migrates_a_pending_permission() {
     // card handle records the block before the pull.
     seed_live_card(&app, "ses_test", "回合的内容。").await;
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.core, &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     assert_eq!(
         app.card_handles.lock().await.message_of("per_live"),
         Some("om_live"),

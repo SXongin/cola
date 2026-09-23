@@ -33,7 +33,7 @@ async fn snapshot_claim_prevents_poller_duplicate() {
             app.permission
                 .poll_interval_ms
                 .store(50, std::sync::atomic::Ordering::Relaxed);
-            let _ = app.permission.poll_loop(&app.core).await;
+            let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -139,7 +139,7 @@ async fn snapshot_block_resolved_elsewhere_leaves_a_receipt() {
             app.permission
                 .poll_interval_ms
                 .store(50, std::sync::atomic::Ordering::Relaxed);
-            let _ = app.permission.poll_loop(&app.core).await;
+            let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -202,7 +202,7 @@ async fn post_adopt_requests_keep_standalone_flow() {
             app.permission
                 .poll_interval_ms
                 .store(50, std::sync::atomic::Ordering::Relaxed);
-            let _ = app.permission.poll_loop(&app.core).await;
+            let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -585,7 +585,7 @@ async fn busy_follow_permission_approved_resumes() {
     );
     assert_eq!(result.toast.as_deref(), Some("已允许本次执行"));
     assert!(
-        Turn::live_permissions(&app.core.cards_handle(), "ses_alpha01")
+        Turn::live_permissions(&app.cards_handle(), "ses_alpha01")
             .await
             .is_empty(),
         "the approved section is no longer live on the follow card"
@@ -631,7 +631,7 @@ async fn idle_adopt_does_not_arm_follow() {
     send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
 
     assert!(
-        !Turn::has_card(&app.core.cards_handle(), "ses_alpha01").await,
+        !Turn::has_card(&app.cards_handle(), "ses_alpha01").await,
         "no renderer armed for an idle session"
     );
     assert!(
@@ -663,7 +663,7 @@ async fn busy_then_idle_race_stays_static() {
     send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
 
     assert!(
-        !Turn::has_card(&app.core.cards_handle(), "ses_alpha01").await,
+        !Turn::has_card(&app.cards_handle(), "ses_alpha01").await,
         "no renderer armed for a turn that already finished"
     );
     assert!(
@@ -705,7 +705,7 @@ async fn busy_follow_skips_cola_authored_turn() {
     send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
 
     assert!(
-        !Turn::has_card(&app.core.cards_handle(), "ses_alpha01").await,
+        !Turn::has_card(&app.cards_handle(), "ses_alpha01").await,
         "cola's own turn is never followed"
     );
     assert!(
@@ -775,7 +775,7 @@ async fn busy_follow_question_block_resolves() {
         .expect("question click returns a result");
     assert_eq!(result.toast.as_deref(), Some("已回答"));
     assert!(
-        Turn::live_questions(&app.core.cards_handle(), "ses_alpha01")
+        Turn::live_questions(&app.cards_handle(), "ses_alpha01")
             .await
             .is_empty(),
         "the answered question block is stripped from the follow card"
@@ -812,7 +812,7 @@ async fn user_prompt_during_follow_takes_over() {
         .store(0, std::sync::atomic::Ordering::Relaxed);
 
     send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
-    let follow_epoch = Turn::armed_turn_anchor(&app.core.cards_handle(), "ses_alpha01").await;
+    let follow_epoch = Turn::armed_turn_anchor(&app.cards_handle(), "ses_alpha01").await;
     assert!(follow_epoch.is_some(), "follow armed");
 
     // The user prompts cola in the thread.

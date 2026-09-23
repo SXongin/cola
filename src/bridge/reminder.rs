@@ -32,7 +32,6 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::bridge::core::SharedCore;
 use crate::bridge::failure_latch::FailureLatch;
 use crate::bridge::snapshot_claims::ClaimKind;
 use crate::feishu::Platform;
@@ -528,15 +527,17 @@ impl ReminderState {
 /// pending across a restart. Without a requester there is nothing to pin, so
 /// pinning is skipped for that request (best-effort).
 pub(crate) async fn reminder_target(
-    core: &Arc<SharedCore>,
+    sessions: &crate::bridge::handles::SessionsHandle,
+    cards: &crate::bridge::handles::CardsHandle,
+    backend: &Arc<dyn crate::opencode::Backend>,
     session_id: &str,
     directory: &str,
 ) -> Option<ReminderTarget> {
     let (host, is_group, requester, generation) =
-        crate::bridge::pollers::walk_parent_chain(&core.opencode, session_id, Some(directory), |current| {
+        crate::bridge::pollers::walk_parent_chain(backend, session_id, Some(directory), |current| {
             let current = current.to_string();
             async move {
-                let source = crate::bridge::turn::Turn::pin_source(&core.cards_handle(), &current).await?;
+                let source = crate::bridge::turn::Turn::pin_source(cards, &current).await?;
                 Some((
                     current,
                     source.is_group,
@@ -546,10 +547,12 @@ pub(crate) async fn reminder_target(
             }
         })
         .await?;
-    let chat_id = {
-        let sessions = core.sessions.lock().await;
-        sessions.entry_for_session(&host)?.thread_key.chat_id.clone()
-    };
+    let chat_id = sessions
+        .entry_for_session(&host)
+        .await?
+        .thread_key
+        .chat_id
+        .clone();
     if chat_id.is_empty() {
         return None;
     }

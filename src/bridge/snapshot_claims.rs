@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
-use crate::bridge::core::SharedCore;
+use crate::bridge::handles::{CardsHandle, RequestsHandle};
 use crate::bridge::request::PendingRequest;
 use crate::bridge::snapshot::SnapshotData;
 use crate::bridge::turn::Turn;
@@ -255,10 +254,14 @@ impl SnapshotClaims {
 /// block on an EARLIER snapshot (re-switch dedupe). Such a request must NOT be
 /// embedded/claimed by a snapshot: the existing card stays authoritative
 /// (ADR-0028).
-pub(crate) async fn is_already_surfaced(core: &Arc<SharedCore>, req: &PendingRequest) -> bool {
+pub(crate) async fn is_already_surfaced(
+    requests: &RequestsHandle,
+    cards: &CardsHandle,
+    req: &PendingRequest,
+) -> bool {
     match req {
         PendingRequest::Permission(p) => {
-            if core
+            if requests
                 .permission
                 .sent_cards
                 .lock()
@@ -269,25 +272,29 @@ pub(crate) async fn is_already_surfaced(core: &Arc<SharedCore>, req: &PendingReq
             }
         }
         PendingRequest::Question(q) => {
-            if core.question.sent_cards.lock().await.contains_key(&q.id) {
+            if requests.question.sent_cards.lock().await.contains_key(&q.id) {
                 return true;
             }
         }
     }
-    if core.snapshot_claims.lock().await.contains(req.id()) {
+    if requests.snapshot_claims.lock().await.contains(req.id()) {
         return true;
     }
-    Turn::has_interaction(&core.cards_handle(), req.id()).await
+    Turn::has_interaction(cards, req.id()).await
 }
 
 /// ADR-0028: restrict the gathered adopt-time state to the pendings the
 /// snapshot may embed and claim — the adopted session's own requests minus any
 /// already surfaced elsewhere. Called BEFORE the snapshot card is built, so an
 /// already-surfaced request never shows a duplicate block on the snapshot.
-pub(crate) async fn claimable_pendings(core: &Arc<SharedCore>, mut data: SnapshotData) -> SnapshotData {
+pub(crate) async fn claimable_pendings(
+    requests: &RequestsHandle,
+    cards: &CardsHandle,
+    mut data: SnapshotData,
+) -> SnapshotData {
     let mut claimable: Vec<PendingRequest> = Vec::new();
     for req in &data.pending {
-        if is_already_surfaced(core, req).await {
+        if is_already_surfaced(requests, cards, req).await {
             tracing::info!(
                 "snapshot: {} {} already surfaced; not embedded",
                 req.id(),
@@ -307,19 +314,20 @@ pub(crate) async fn claimable_pendings(core: &Arc<SharedCore>, mut data: Snapsho
 /// `prepare()` never ran for them). Called AFTER the snapshot card is sent,
 /// with its message id.
 pub(crate) async fn claim_snapshot_pendings(
-    core: &Arc<SharedCore>,
+    requests: &RequestsHandle,
     snapshot_message_id: &str,
     verb: &str,
     title: &str,
     data: &SnapshotData,
 ) {
-    core.snapshot_claims
+    requests
+        .snapshot_claims
         .lock()
         .await
         .claim(snapshot_message_id, verb, title, data);
     for req in &data.pending {
         if let PendingRequest::Question(q) = req {
-            core.question.remember_question(q, &data.directory).await;
+            requests.question.remember_question(q, &data.directory).await;
         }
     }
 }
