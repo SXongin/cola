@@ -1845,11 +1845,24 @@ where
     F: std::future::Future<Output = T>,
 {
     let buffer = CaptureBuffer::default();
+    // A second, sink-writing dispatcher stays registered for the capture's
+    // duration. `tracing` caches a callsite's `Interest` on its FIRST hit, and
+    // with only this capture registered a callsite first hit on a thread that
+    // has no subscriber of its own — a parallel test — is cached `never` from
+    // that thread's empty default, so the capture would never see the line.
+    // Two registered dispatchers make every new callsite's interest `always`.
+    let _interest_keepalive = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::io::sink)
+            .finish(),
+    );
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
         .with_max_level(tracing::Level::TRACE)
         .with_writer(buffer.clone())
         .finish();
+
     let guard = tracing::subscriber::set_default(subscriber);
     let output = body.await;
     drop(guard);

@@ -1,6 +1,8 @@
-//! Session-scoped logs (ADR-0048): the `capture_logs` test seam and the Turn's
+//! Session-scoped logs (ADR-0048): the `capture_logs` test seam, the Turn's
 //! trace — the `turn{session=… chat=… topic=…}` span, its one INFO start
-//! anchor, and the separately-instrumented render poll.
+//! anchor, and the separately-instrumented render poll — the waiting path's
+//! `request`/`action` spans, and the background flows: the external poll and
+//! its reply-render loop.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -338,5 +340,210 @@ async fn a_permission_card_action_carries_the_session() {
     assert!(
         !reply.contains("session=per_1"),
         "the request id must not be labelled a session: {reply}"
+    );
+}
+
+/// Bounded wait for a card carrying `needle` to reach the fake Feishu, so a
+/// captured body can advance on an observed side effect instead of a sleep.
+async fn wait_for_card(platform: &Arc<RecordingPlatform>, needle: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let seen = platform.calls.lock().await.iter().any(|call| match call {
+            PlatformCall::SendCard { card, .. }
+            | PlatformCall::UpdateMessage { card, .. }
+            | PlatformCall::ReplyCard { card, .. } => card.to_string().contains(needle),
+            _ => false,
+        });
+        if seen {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no card carrying {needle:?} reached Feishu"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// The external-message poll runs inside that Session's `external` span
+/// (ADR-0048): the observation that notifies Feishu is retrievable by the
+/// Session, and by its Chat/Topic.
+#[tokio::test]
+async fn an_external_message_observation_carries_its_session_chat_and_topic() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.external_user_message = Some("OpenChamber 里发的消息".to_string());
+    let (app, _platform) = build_app(cfg, backend).await;
+    let topic = ThreadKey::new("oc_group_1".into(), "omt_topic".into());
+    seed_entry(&app, SessionEntry::new(topic, "ses_ext", "/tmp/ext")).await;
+    // Baseline: a minute ago, so the fresh user message is "new".
+    let watermark = chrono::Utc::now().timestamp_millis() - 60_000;
+    app.external
+        .last_user_msg_epoch
+        .lock()
+        .await
+        .insert("ses_ext".into(), watermark);
+    app.external.poll_interval_ms.store(20, Ordering::Relaxed);
+
+    let (_, logs) = capture_logs(async {
+        let poller = Arc::clone(&app);
+        tokio::spawn(async move {
+            let _ = poller.external.poll_loop(&poller.core).await;
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    })
+    .await;
+
+    let observed = line_with(&logs, "External message on session");
+    assert!(
+        observed.contains("session=ses_ext"),
+        "the observation carries the session: {observed}"
+    );
+    assert!(
+        observed.contains("chat=oc_group_1"),
+        "the observation carries the chat: {observed}"
+    );
+    assert!(
+        observed.contains("topic=omt_topic"),
+        "the observation carries the topic: {observed}"
+    );
+}
+
+/// The reply-render loop is its own task, so it is instrumented where it is
+/// spawned (ADR-0048): the line that finalizes the external reply carries the
+/// Session it streamed.
+#[tokio::test]
+async fn an_external_reply_render_carries_its_session() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.external_user_message = Some("OpenChamber 里发的消息".to_string());
+    // A reply that finishes in one step, so the renderer reaches Done.
+    backend.external_reply_parts = Some(json!([
+        { "type": "step-start", "snapshot": "x" },
+        { "type": "text", "text": "目录里有 src。" },
+        { "type": "step-finish", "reason": "stop" },
+    ]));
+    let reply_ready = Arc::clone(&backend.external_reply_ready);
+    let (app, platform) = build_app(cfg, backend).await;
+    let topic = ThreadKey::new("oc_group_1".into(), "omt_topic".into());
+    seed_entry(&app, SessionEntry::new(topic, "ses_ext", "/tmp/ext")).await;
+    let watermark = chrono::Utc::now().timestamp_millis() - 60_000;
+    app.external
+        .last_user_msg_epoch
+        .lock()
+        .await
+        .insert("ses_ext".into(), watermark);
+    app.external.poll_interval_ms.store(20, Ordering::Relaxed);
+    app.external.render_poll_ms.store(5, Ordering::Relaxed);
+
+    let (_, logs) = capture_logs(async {
+        let poller = Arc::clone(&app);
+        tokio::spawn(async move {
+            let _ = poller.external.poll_loop(&poller.core).await;
+        });
+        // The notification arms the renderer; only then does the reply exist.
+        wait_for_card(&platform, "有新消息").await;
+        reply_ready.store(true, Ordering::SeqCst);
+        // The Done card is flushed just before the renderer logs its exit.
+        wait_for_card(&platform, "✅").await;
+        // Let the render task finish its last line before the capture closes.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    })
+    .await;
+
+    let rendered = line_with(&logs, "external reply rendered");
+    assert!(
+        rendered.contains("session=ses_ext"),
+        "the render line carries the session: {rendered}"
+    );
+}
+
+/// A snapshot adoption's settle runs inside the adopted Session's `snapshot`
+/// span (ADR-0048): the follow decision is retrievable by the Session it
+/// looked at, even though the first adoption is not mapped to a thread yet.
+#[tokio::test]
+async fn a_snapshot_settle_carries_the_session() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    seed_session(&app, "ses_test", "/work/project").await;
+
+    // Gathered Busy, but the server reports the turn finished by arm time —
+    // the follow declines and keeps the static snapshot (ADR-0028).
+    let data = crate::bridge::snapshot::SnapshotData {
+        session_id: "ses_test".into(),
+        directory: "/work/project".into(),
+        status: Some(crate::opencode::types::SessionStatus::Busy),
+        pending: Vec::new(),
+        tail: Vec::new(),
+        newest_user_epoch: Some(1_000),
+        newest_user_is_cola_authored: false,
+    };
+    let (_, logs) = capture_logs(async {
+        crate::bridge::external::settle_snapshot_after_send(&app.core, "om_snap", "接管", "标题", &data).await
+    })
+    .await;
+
+    let declined = line_with(&logs, "snapshot follow");
+    assert!(
+        declined.contains("session=ses_test"),
+        "the follow decision carries the session: {declined}"
+    );
+}
+
+/// The topic cover sync runs inside the Session's `topic` span (ADR-0048): the
+/// line that records the retitle is retrievable by the Session whose card was
+/// updated, and by its Chat/Topic.
+#[tokio::test]
+async fn a_topic_cover_retitle_carries_the_session_chat_and_topic() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    backend
+        .session_titles
+        .lock()
+        .unwrap()
+        .insert("ses_test".into(), "新名字".into());
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_entry(
+        &app,
+        SessionEntry {
+            thread_key: ThreadKey::new("oc_chat".into(), "omt_topic".into()),
+            session_id: "ses_test".into(),
+            directory: "/work/project".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: Some("om_seed".into()),
+            topic_root: Some("om_cover".into()),
+            variant: None,
+        },
+    )
+    .await;
+    seed_cover_title(&app, "ses_test", "旧名字").await;
+
+    let (settled, logs) =
+        capture_logs(async { crate::bridge::topic::sync_topic_cover_title(&app.core, "ses_test").await })
+            .await;
+    assert!(settled, "the retitle must settle");
+
+    let retitled = line_with(&logs, "topic cover card updated");
+    assert!(
+        retitled.contains("session=ses_test"),
+        "the retitle carries the session: {retitled}"
+    );
+    assert!(
+        retitled.contains("chat=oc_chat"),
+        "the retitle carries the chat: {retitled}"
+    );
+    assert!(
+        retitled.contains("topic=omt_topic"),
+        "the retitle carries the topic: {retitled}"
     );
 }
