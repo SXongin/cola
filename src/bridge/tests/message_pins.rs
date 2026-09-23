@@ -40,13 +40,9 @@ fn question(id: &str, session_id: &str) -> opencode::types::QuestionRequest {
 /// Seed the live card a request would be inlined onto: the accumulator
 /// carries the turn's requester and generation.
 async fn seed_turn(app: &Arc<App>, session_id: &str, generation: u64) {
-    let mut acc = crate::bridge::turn::state::StreamAccumulator::new("test");
-    acc.requester_open_id = Some(TEST_HOST.into());
-    acc.turn_generation = Some(generation);
-    app.cards.lock().await.insert(
-        session_id.to_string(),
-        crate::bridge::turn::state::CardSession::new(acc, Some("msg_card".into())),
-    );
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, session_id, Some("msg_card")).await;
+    Turn::set_turn_identity(&cards, session_id, TEST_HOST, false, generation).await;
 }
 
 /// An `[bridge] instant_reminder = true` app whose MockBackend serves one

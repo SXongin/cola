@@ -696,7 +696,6 @@ async fn short_answer_stays_in_card_no_extra_message() {
 #[tokio::test]
 async fn render_poll_shows_live_context_and_memoizes_the_window() {
     use crate::bridge::turn::Turn;
-    use crate::bridge::turn::state::{CardSession, StreamAccumulator};
     use crate::opencode::types::{MessageInfo, MessageTime, MessageTokens, SessionMessage};
 
     let dir = tempfile::tempdir().unwrap();
@@ -707,13 +706,11 @@ async fn render_poll_shows_live_context_and_memoizes_the_window() {
 
     let sid = "ses_live";
     {
-        let mut cards = app.core.cards.lock().await;
-        let mut acc = StreamAccumulator::new("proj");
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_live")).await;
         // An armed anchor: every assistant message counts as this turn's.
-        acc.turn_started_ms = Some(0);
-        acc.provider_id = Some("p".into());
-        acc.model_id = Some("m".into());
-        cards.insert(sid.to_string(), CardSession::new(acc, Some("om_live".into())));
+        Turn::set_turn_anchor(&cards, sid, 0).await;
+        Turn::set_model(&cards, sid, "p", "m").await;
     }
     let tokens = |total: i64| MessageTokens {
         total,

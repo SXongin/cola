@@ -9,7 +9,6 @@
 use std::sync::Arc;
 
 use crate::bridge::test_support::*;
-use crate::bridge::turn::state::{CardSession, StreamAccumulator};
 use crate::feishu::card::CardState;
 
 /// A Turn that already finished leaves its card session in `cards` with a Done
@@ -23,10 +22,7 @@ async fn card_command_after_the_turn_finished_replies_a_notice() {
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
     seed_session(&app, "ses_test", "/work").await;
     seed_live_card(&app, "ses_test", "已完成的回合。").await;
-    {
-        let mut cards = app.cards.lock().await;
-        cards.get_mut("ses_test").unwrap().acc.card_state = CardState::Done;
-    }
+    Turn::set_card_state(&app.cards_handle(), "ses_test", CardState::Done).await;
 
     app.handle_message(incoming(
         "msg_card".into(),
@@ -178,14 +174,11 @@ async fn card_pull_migrates_a_pending_permission() {
 /// Seed the session's live card (content `text`, id `om_live`), so `/card` has
 /// something to pull down.
 async fn seed_live_card(app: &Arc<App>, session_id: &str, text: &str) {
-    let mut acc = StreamAccumulator::new("回合");
-    acc.card_state = CardState::Streaming;
-    acc.push_text(text);
-    acc.reply_to_message_id = Some("msg_1".into());
-    app.cards
-        .lock()
-        .await
-        .insert(session_id.into(), CardSession::new(acc, Some("om_live".into())));
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, session_id, Some("om_live")).await;
+    Turn::set_card_state(&cards, session_id, CardState::Streaming).await;
+    Turn::push_text(&cards, session_id, text).await;
+    Turn::set_reply_target(&cards, session_id, "msg_1").await;
 }
 
 /// The latest continuation card (`ReplyCard`) the platform recorded.
@@ -289,19 +282,27 @@ async fn card_command_splits_the_chain_and_the_continuation_takes_over() {
     // The chain is re-anchored: the continuation is the tracked live card and
     // the split is consumed.
     {
-        let cards = app.cards.lock().await;
-        let session = cards.get("ses_test").expect("card session");
-        assert_eq!(session.card_message_id.as_deref(), Some("msg_reply"));
-        assert_eq!(session.acc.reply_to_message_id.as_deref(), Some("msg_card"));
-        assert!(session.pending_split.is_empty(), "the split must be consumed");
-        assert!(session.card_is_live, "the continuation is the new live card");
+        let cards = app.cards_handle();
+        assert_eq!(
+            Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+            Some("msg_reply")
+        );
+        assert_eq!(
+            Turn::reply_target(&cards, "ses_test").await.as_deref(),
+            Some("msg_card")
+        );
+        assert!(
+            !Turn::has_pending_split(&cards, "ses_test").await,
+            "the split must be consumed"
+        );
+        assert!(
+            Turn::card_is_live(&cards, "ses_test").await,
+            "the continuation is the new live card"
+        );
     }
 
     // Later flushes target the continuation, not the finalized card.
-    {
-        let mut cards = app.cards.lock().await;
-        cards.get_mut("ses_test").unwrap().acc.push_text("后续进度。");
-    }
+    Turn::push_text(&app.cards_handle(), "ses_test", "后续进度。").await;
     crate::bridge::turn::Turn::flush_card(&app.cards_handle(), "ses_test").await;
     let calls = platform.calls.lock().await.clone();
     let last_update = calls

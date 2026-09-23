@@ -95,13 +95,7 @@ async fn question_poller_recovers_when_a_list_call_hangs() {
     // call forever and the question never surfaces.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
-        let surfaced = app
-            .cards
-            .lock()
-            .await
-            .get("ses_test")
-            .map(|c| c.acc.interaction("que_hung").is_some())
-            .unwrap_or(false);
+        let surfaced = Turn::has_interaction_in(&app.cards_handle(), "ses_test", "que_hung").await;
         if surfaced {
             break;
         }
@@ -1090,16 +1084,9 @@ async fn inline_question_answered_on_streaming_card() {
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let pending = app
-        .cards
-        .lock()
-        .await
-        .get("ses_test")
-        .unwrap()
-        .acc
-        .live_questions();
+    let pending = Turn::live_questions(&app.cards_handle(), "ses_test").await;
     assert_eq!(pending.len(), 1, "question should be inlined");
-    assert_eq!(pending[0].request_id, "que_inline");
+    assert_eq!(pending[0].0, "que_inline");
 
     // Answer the first question → toast only, no card replacement.
     let value = serde_json::json!({
@@ -1124,16 +1111,9 @@ async fn inline_question_answered_on_streaming_card() {
     assert!(!r1_text.contains("已选：main"), "q2 must stay open: {}", r1_text);
     assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
     // The accumulator's inline question reflects the partial answer.
-    let pending = app
-        .cards
-        .lock()
-        .await
-        .get("ses_test")
-        .unwrap()
-        .acc
-        .live_questions();
-    assert_eq!(pending[0].answers[0], Some(vec!["/a".to_string()]));
-    assert_eq!(pending[0].answers[1], None);
+    let pending = Turn::live_questions(&app.cards_handle(), "ses_test").await;
+    assert_eq!(pending[0].1[0], Some(vec!["/a".to_string()]));
+    assert_eq!(pending[0].1[1], None);
 
     // Answer the second → finalized, reply called, inline section removed.
     let value = serde_json::json!({
@@ -1168,13 +1148,8 @@ async fn inline_question_answered_on_streaming_card() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].1, vec![vec!["/a".to_string()], vec!["main".to_string()]]);
     assert!(
-        app.cards
-            .lock()
+        Turn::live_questions(&app.cards_handle(), "ses_test")
             .await
-            .get("ses_test")
-            .unwrap()
-            .acc
-            .live_questions()
             .is_empty()
     );
 }
@@ -1262,17 +1237,6 @@ async fn failed_directory_list_keeps_question_surfaces() {
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_work_dir(&app).await;
 
-    let mut inline_acc = crate::bridge::turn::state::StreamAccumulator::new("test");
-    inline_acc.add_interaction(crate::bridge::turn::state::InteractionBlock::Question(
-        crate::bridge::turn::state::PendingQuestion {
-            request_id: "que_inline".into(),
-            session_id: "ses_1".into(),
-            questions: vec![],
-            directory: "/work".into(),
-            answers: vec![],
-            done: vec![],
-        },
-    ));
     assert_failed_dir_keeps_surfaces(
         &app,
         &app.question,
@@ -1283,7 +1247,7 @@ async fn failed_directory_list_keeps_question_surfaces() {
             card_message_id: "om_card",
             inline_id: "que_inline",
             snapshot_message_id: "om_snapshot",
-            inline_acc,
+            inline_request: crate::bridge::request::PendingRequest::Question(question_request("que_inline")),
             claim: crate::bridge::request::PendingRequest::Question(question_request("que_claim")),
         },
     )
@@ -1423,16 +1387,7 @@ async fn late_inline_click_is_cardless_and_classified() {
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
     seed_work_dir(&app).await;
-    {
-        let mut cards = app.cards.lock().await;
-        cards.insert(
-            "ses_1".into(),
-            crate::bridge::turn::state::CardSession::new(
-                crate::bridge::turn::state::StreamAccumulator::new("test"),
-                None,
-            ),
-        );
-    }
+    Turn::seed_card(&app.cards_handle(), "ses_1", None).await;
 
     // A pruned sweep marks /work as a known directory.
     app.question
@@ -1720,14 +1675,7 @@ async fn inline_question_submit_and_reject_leave_receipts() {
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert_eq!(
-        app.cards
-            .lock()
-            .await
-            .get("ses_test")
-            .unwrap()
-            .acc
-            .live_questions()
-            .len(),
+        Turn::live_questions(&app.cards_handle(), "ses_test").await.len(),
         2,
         "both questions inlined"
     );
@@ -1808,9 +1756,9 @@ async fn inline_question_submit_and_reject_leave_receipts() {
         ack
     );
     // Both receipts are rendered from the accumulator.
-    let acc = app.cards.lock().await.get("ses_test").unwrap().acc.clone();
-    assert!(acc.live_questions().is_empty());
-    let rendered = acc.build_card().to_string();
+    let cards = app.cards_handle();
+    assert!(Turn::live_questions(&cards, "ses_test").await.is_empty());
+    let rendered = Turn::rendered_card(&cards, "ses_test").await.unwrap().to_string();
     assert!(
         rendered.contains("✅ 已回答：目录 /a、分支 （未作答）"),
         "{}",
@@ -1901,13 +1849,8 @@ async fn inline_question_click_after_remote_resolution_gets_receipt() {
         ack
     );
     assert!(
-        app.cards
-            .lock()
+        Turn::live_questions(&app.cards_handle(), "ses_test")
             .await
-            .get("ses_test")
-            .unwrap()
-            .acc
-            .live_questions()
             .is_empty()
     );
 }

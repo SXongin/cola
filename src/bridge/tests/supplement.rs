@@ -9,7 +9,6 @@
 use std::sync::Arc;
 
 use crate::bridge::test_support::*;
-use crate::bridge::turn::state::{CardSession, InteractionBlock, PendingQuestion, StreamAccumulator};
 use crate::feishu::card::CardState;
 
 /// One question with a single option, for the two-question fixtures below.
@@ -27,21 +26,6 @@ fn question_fixture(text: &str, header: &str, label: &str) -> crate::opencode::t
     }
 }
 
-/// The question block the poller would inline on the live card.
-fn question_block(request_id: &str, session_id: &str, directory: &str) -> InteractionBlock {
-    InteractionBlock::Question(PendingQuestion {
-        request_id: request_id.into(),
-        session_id: session_id.into(),
-        questions: vec![
-            question_fixture("选目录", "目录", "/a"),
-            question_fixture("选分支", "分支", "main"),
-        ],
-        directory: directory.into(),
-        answers: vec![None; 2],
-        done: vec![false; 2],
-    })
-}
-
 /// The question request the question flow replays and replies to.
 fn question_request(request_id: &str, session_id: &str) -> crate::opencode::types::QuestionRequest {
     crate::opencode::types::QuestionRequest {
@@ -57,14 +41,11 @@ fn question_request(request_id: &str, session_id: &str) -> crate::opencode::type
 /// Seed the session's live card (content `text`, id `om_live`) and the in-flight
 /// guard, so the next message takes the supplement path.
 async fn seed_live_turn(app: &Arc<App>, session_id: &str, text: &str) {
-    let mut acc = StreamAccumulator::new("回合");
-    acc.card_state = CardState::Streaming;
-    acc.push_text(text);
-    acc.reply_to_message_id = Some("msg_1".into());
-    app.cards
-        .lock()
-        .await
-        .insert(session_id.into(), CardSession::new(acc, Some("om_live".into())));
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, session_id, Some("om_live")).await;
+    Turn::set_card_state(&cards, session_id, CardState::Streaming).await;
+    Turn::push_text(&cards, session_id, text).await;
+    Turn::set_reply_target(&cards, session_id, "msg_1").await;
     app.inflight.lock().await.insert(session_id.to_string());
 }
 
@@ -198,22 +179,27 @@ async fn supplement_splits_the_chain_and_the_continuation_takes_over() {
     // The chain is re-anchored: the continuation is the tracked live card and
     // the split is consumed.
     {
-        let cards = app.cards.lock().await;
-        let session = cards.get("ses_test").expect("card session");
-        assert_eq!(session.card_message_id.as_deref(), Some("msg_reply"));
-        assert_eq!(session.acc.reply_to_message_id.as_deref(), Some("msg_sup"));
-        assert!(session.pending_split.is_empty(), "the split must be consumed");
+        let cards = app.cards_handle();
+        assert_eq!(
+            Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+            Some("msg_reply")
+        );
+        assert_eq!(
+            Turn::reply_target(&cards, "ses_test").await.as_deref(),
+            Some("msg_sup")
+        );
         assert!(
-            session.card_is_live,
+            !Turn::has_pending_split(&cards, "ses_test").await,
+            "the split must be consumed"
+        );
+        assert!(
+            Turn::card_is_live(&cards, "ses_test").await,
             "a continuation that fits is the new live card"
         );
     }
 
     // Later flushes target the continuation, not the finalized card.
-    {
-        let mut cards = app.cards.lock().await;
-        cards.get_mut("ses_test").unwrap().acc.push_text("后续进度。");
-    }
+    Turn::push_text(&app.cards_handle(), "ses_test", "后续进度。").await;
     crate::bridge::turn::Turn::flush_card(&app.cards_handle(), "ses_test").await;
     let calls = platform.calls.lock().await.clone();
     let last_update = calls
@@ -250,15 +236,12 @@ async fn a_split_continuation_takes_the_running_tool_panel_over() {
         input: Some(serde_json::json!({"command": "sleep 30"})),
         output: None,
     };
-    let mut acc = StreamAccumulator::new("回合");
-    acc.card_state = CardState::Streaming;
-    acc.push_text("开始分析。");
-    acc.push_tool("call_bash", bash("running"));
-    acc.reply_to_message_id = Some("msg_1".into());
-    app.cards
-        .lock()
-        .await
-        .insert("ses_test".into(), CardSession::new(acc, Some("om_live".into())));
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
+    Turn::set_card_state(&cards, "ses_test", CardState::Streaming).await;
+    Turn::push_text(&cards, "ses_test", "开始分析。").await;
+    Turn::push_tool(&cards, "ses_test", "call_bash", bash("running")).await;
+    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
     app.inflight.lock().await.insert("ses_test".to_string());
 
     app.handle_message(incoming(
@@ -303,10 +286,13 @@ async fn a_tool_completing_after_the_split_renders_on_the_continuation() {
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
     seed_session(&app, "ses_test", "/work").await;
 
-    let mut acc = StreamAccumulator::new("回合");
-    acc.card_state = CardState::Streaming;
-    acc.push_text("开始分析。");
-    acc.push_tool(
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
+    Turn::set_card_state(&cards, "ses_test", CardState::Streaming).await;
+    Turn::push_text(&cards, "ses_test", "开始分析。").await;
+    Turn::push_tool(
+        &cards,
+        "ses_test",
         "call_bash",
         crate::feishu::card::tool_render::ToolPanel {
             name: "bash".into(),
@@ -314,13 +300,10 @@ async fn a_tool_completing_after_the_split_renders_on_the_continuation() {
             input: Some(serde_json::json!({"command": "sleep 30"})),
             output: None,
         },
-    );
-    acc.reply_to_message_id = Some("msg_1".into());
-    acc.turn_started_ms = Some(0);
-    app.cards
-        .lock()
-        .await
-        .insert("ses_test".into(), CardSession::new(acc, Some("om_live".into())));
+    )
+    .await;
+    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
+    Turn::set_turn_anchor(&cards, "ses_test", 0).await;
     app.inflight.lock().await.insert("ses_test".to_string());
 
     app.handle_message(incoming(
@@ -386,10 +369,13 @@ async fn a_finished_tool_does_not_leak_into_the_continuation_header() {
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
     seed_session(&app, "ses_test", "/work").await;
 
-    let mut acc = StreamAccumulator::new("回合");
-    acc.card_state = CardState::Streaming;
-    acc.push_text("开始分析。");
-    acc.push_tool(
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
+    Turn::set_card_state(&cards, "ses_test", CardState::Streaming).await;
+    Turn::push_text(&cards, "ses_test", "开始分析。").await;
+    Turn::push_tool(
+        &cards,
+        "ses_test",
         "call_bash",
         crate::feishu::card::tool_render::ToolPanel {
             name: "bash".into(),
@@ -397,12 +383,9 @@ async fn a_finished_tool_does_not_leak_into_the_continuation_header() {
             input: Some(serde_json::json!({"command": "sleep 30"})),
             output: Some("done".into()),
         },
-    );
-    acc.reply_to_message_id = Some("msg_1".into());
-    app.cards
-        .lock()
-        .await
-        .insert("ses_test".into(), CardSession::new(acc, Some("om_live".into())));
+    )
+    .await;
+    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
     app.inflight.lock().await.insert("ses_test".to_string());
 
     app.handle_message(incoming(
@@ -664,11 +647,16 @@ async fn supplements_queued_in_the_startup_window_share_one_continuation() {
     assert_eq!(message_id, "msg_reply", "later updates target the continuation");
     assert!(has(&later, "📨 已收到补充"), "the receipts stay on it: {later}");
     {
-        let cards = app.cards.lock().await;
-        let session = cards.get("ses_test").expect("card session");
-        assert!(session.pending_split.is_empty(), "the batch is served");
-        assert!(session.card_is_live);
-        assert_eq!(session.acc.reply_to_message_id.as_deref(), Some("msg_sup_2"));
+        let cards = app.cards_handle();
+        assert!(
+            !Turn::has_pending_split(&cards, "ses_test").await,
+            "the batch is served"
+        );
+        assert!(Turn::card_is_live(&cards, "ses_test").await);
+        assert_eq!(
+            Turn::reply_target(&cards, "ses_test").await.as_deref(),
+            Some("msg_sup_2")
+        );
     }
 }
 
@@ -736,14 +724,13 @@ async fn every_supplement_splits_the_chain() {
             "continuation {i} must not re-render finalized content: {card}"
         );
     }
-    let cards = app.cards.lock().await;
-    let session = cards.get("ses_test").expect("card session");
+    let cards = app.cards_handle();
     assert_eq!(
-        session.acc.reply_to_message_id.as_deref(),
+        Turn::reply_target(&cards, "ses_test").await.as_deref(),
         Some("msg_sup_2"),
         "the chain re-anchors at the newest supplement"
     );
-    assert!(session.pending_split.is_empty());
+    assert!(!Turn::has_pending_split(&cards, "ses_test").await);
 }
 
 /// A failed supplement send still splits: the failure notice is sent FIRST and
@@ -886,18 +873,23 @@ async fn a_failed_continuation_send_retries_without_duplicating_receipts() {
         "it replies to the newest queued supplement: {calls:?}"
     );
     {
-        let cards = app.cards.lock().await;
-        let session = cards.get("ses_test").expect("card session");
-        assert!(session.pending_split.is_empty(), "the queue is served");
-        assert!(session.card_is_live, "the continuation is live");
-        assert_eq!(session.acc.reply_to_message_id.as_deref(), Some("msg_sup_2"));
+        let cards = app.cards_handle();
+        assert!(
+            !Turn::has_pending_split(&cards, "ses_test").await,
+            "the queue is served"
+        );
+        assert!(
+            Turn::card_is_live(&cards, "ses_test").await,
+            "the continuation is live"
+        );
+        assert_eq!(
+            Turn::reply_target(&cards, "ses_test").await.as_deref(),
+            Some("msg_sup_2")
+        );
     }
 
     // Later updates target the retried continuation.
-    {
-        let mut cards = app.cards.lock().await;
-        cards.get_mut("ses_test").unwrap().acc.push_text("后续进度。");
-    }
+    Turn::push_text(&app.cards_handle(), "ses_test", "后续进度。").await;
     crate::bridge::turn::Turn::flush_card(&app.cards_handle(), "ses_test").await;
     let calls = platform.calls.lock().await.clone();
     let (message_id, later) = calls
@@ -936,14 +928,11 @@ async fn a_failed_full_continuation_send_retries_the_same_slice() {
     // S01 as a FULL continuation (advancing `render_from` to S02) and fails
     // that send.
     let long = marked_slices(3);
-    let mut acc = StreamAccumulator::new("回合");
-    acc.card_state = CardState::Streaming;
-    acc.push_text(&long);
-    acc.reply_to_message_id = Some("msg_1".into());
-    app.cards
-        .lock()
-        .await
-        .insert("ses_test".into(), CardSession::new(acc, Some("om_live".into())));
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
+    Turn::set_card_state(&cards, "ses_test", CardState::Streaming).await;
+    Turn::push_text(&cards, "ses_test", &long).await;
+    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
     app.inflight.lock().await.insert("ses_test".to_string());
     platform
         .fail_reply_card_count
@@ -963,11 +952,14 @@ async fn a_failed_full_continuation_send_retries_the_same_slice() {
         "the first (full) continuation send failed and recorded nothing"
     );
     {
-        let cards = app.cards.lock().await;
-        let session = cards.get("ses_test").expect("card session");
-        assert!(!session.card_is_live, "the chain owes its continuation");
+        let cards = app.cards_handle();
+        assert!(
+            !Turn::card_is_live(&cards, "ses_test").await,
+            "the chain owes its continuation"
+        );
         assert_eq!(
-            session.acc.render_from, 1,
+            Turn::render_from(&cards, "ses_test").await,
+            Some(1),
             "the failed slice must stay at the boundary"
         );
     }
@@ -1071,14 +1063,11 @@ async fn supplement_split_migrates_a_pending_permission() {
 
     // The live card carries the inline permission (the poller path), so the
     // card handle records the block before the split.
-    let mut acc = StreamAccumulator::new("回合");
-    acc.card_state = CardState::Streaming;
-    acc.push_text("回合的内容。");
-    acc.reply_to_message_id = Some("msg_1".into());
-    app.cards
-        .lock()
-        .await
-        .insert("ses_test".into(), CardSession::new(acc, Some("om_live".into())));
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
+    Turn::set_card_state(&cards, "ses_test", CardState::Streaming).await;
+    Turn::push_text(&cards, "ses_test", "回合的内容。").await;
+    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
     app.inflight.lock().await.insert("ses_test".to_string());
     let mut seen = std::collections::HashSet::new();
     app.permission.sweep(&app.core, &mut seen).await;
@@ -1173,17 +1162,22 @@ async fn supplement_split_migrates_a_pending_question() {
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_session(&app, "ses_test", "/work").await;
 
-    let mut acc = StreamAccumulator::new("回合");
-    acc.card_state = CardState::Streaming;
-    acc.push_text("回合的内容。");
-    acc.reply_to_message_id = Some("msg_1".into());
-    acc.add_interaction(question_block("que_live", "ses_test", "/work"));
-    app.cards
-        .lock()
-        .await
-        .insert("ses_test".into(), CardSession::new(acc, Some("om_live".into())));
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
+    Turn::set_card_state(&cards, "ses_test", CardState::Streaming).await;
+    Turn::push_text(&cards, "ses_test", "回合的内容。").await;
+    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
+    Turn::add_question(
+        &cards,
+        "ses_test",
+        &question_request("que_live", "ses_test"),
+        "/work",
+        &[None, None],
+        &[false; 2],
+    )
+    .await;
     app.inflight.lock().await.insert("ses_test".to_string());
-    crate::bridge::turn::Turn::flush_card(&app.cards_handle(), "ses_test").await;
+    Turn::flush_card(&app.cards_handle(), "ses_test").await;
     app.question
         .remember_question(&question_request("que_live", "ses_test"), "/work")
         .await;
@@ -1260,10 +1254,13 @@ async fn size_and_supplement_split_collide_with_one_continuation() {
     // A card far over the component budget (the card_handles split fixture):
     // a plain flush would already split it, and the supplement lands at the
     // same moment.
-    let mut acc = StreamAccumulator::new("回合");
-    acc.card_state = CardState::Streaming;
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("om_filled")).await;
+    Turn::set_card_state(&cards, "ses_test", CardState::Streaming).await;
     for i in 0..50 {
-        acc.push_tool(
+        Turn::push_tool(
+            &cards,
+            "ses_test",
             &format!("call_{i}"),
             crate::feishu::card::tool_render::ToolPanel {
                 name: format!("tool{i}"),
@@ -1271,13 +1268,10 @@ async fn size_and_supplement_split_collide_with_one_continuation() {
                 input: None,
                 output: None,
             },
-        );
+        )
+        .await;
     }
-    acc.reply_to_message_id = Some("msg_1".into());
-    app.cards
-        .lock()
-        .await
-        .insert("ses_test".into(), CardSession::new(acc, Some("om_filled".into())));
+    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
     app.inflight.lock().await.insert("ses_test".to_string());
 
     app.handle_message(incoming(
@@ -1331,14 +1325,11 @@ async fn the_chain_bound_never_refuses_a_supplement_split() {
     // Ten slices of text (60000 chars, each card holds 6000): more
     // continuations than the per-flush cap of 8.
     let long = "很长的回答。".repeat(10_000);
-    let mut acc = StreamAccumulator::new("回合");
-    acc.card_state = CardState::Streaming;
-    acc.push_text(&long);
-    acc.reply_to_message_id = Some("msg_1".into());
-    app.cards
-        .lock()
-        .await
-        .insert("ses_test".into(), CardSession::new(acc, Some("om_live".into())));
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
+    Turn::set_card_state(&cards, "ses_test", CardState::Streaming).await;
+    Turn::push_text(&cards, "ses_test", &long).await;
+    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
     app.inflight.lock().await.insert("ses_test".to_string());
 
     app.handle_message(incoming(
@@ -1364,10 +1355,15 @@ async fn the_chain_bound_never_refuses_a_supplement_split() {
         platform.calls.lock().await
     );
     {
-        let cards = app.cards.lock().await;
-        let session = cards.get("ses_test").expect("card session");
-        assert_eq!(session.card_message_id.as_deref(), Some("msg_reply"));
-        assert!(session.pending_split.is_empty(), "the split is consumed");
+        let cards = app.cards_handle();
+        assert_eq!(
+            Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+            Some("msg_reply")
+        );
+        assert!(
+            !Turn::has_pending_split(&cards, "ses_test").await,
+            "the split is consumed"
+        );
     }
 
     // The remaining slice is reconciled on the next flush: the full text
@@ -1407,14 +1403,11 @@ async fn bound_exhaustion_does_not_overwrite_the_finalized_continuation() {
 
     // Ten uniquely marked slices; each fills exactly one card.
     let long = marked_slices(10);
-    let mut acc = StreamAccumulator::new("回合");
-    acc.card_state = CardState::Streaming;
-    acc.push_text(&long);
-    acc.reply_to_message_id = Some("msg_1".into());
-    app.cards
-        .lock()
-        .await
-        .insert("ses_test".into(), CardSession::new(acc, Some("om_live".into())));
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
+    Turn::set_card_state(&cards, "ses_test", CardState::Streaming).await;
+    Turn::push_text(&cards, "ses_test", &long).await;
+    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
     app.inflight.lock().await.insert("ses_test".to_string());
 
     app.handle_message(incoming(

@@ -513,16 +513,15 @@ async fn busy_adopt_streams_turn_into_snapshot() {
 
     // The follow armed: the snapshot card hosts a live accumulator for the
     // external turn (epoch = the newest user message's created time).
-    let acc = app
-        .core
-        .cards
-        .lock()
-        .await
-        .get("ses_alpha01")
-        .cloned()
-        .expect("follow armed a host accumulator");
-    assert_eq!(acc.card_message_id.as_deref(), Some("msg_reply"));
-    assert!(acc.acc.turn_started_ms.is_some(), "turn anchor set");
+    let cards = app.core.cards_handle();
+    assert_eq!(
+        Turn::card_message_id(&cards, "ses_alpha01").await.as_deref(),
+        Some("msg_reply")
+    );
+    assert!(
+        Turn::armed_turn_anchor(&cards, "ses_alpha01").await.is_some(),
+        "turn anchor set"
+    );
     assert!(
         app.core.snapshot_claims.lock().await.claim_count() == 0,
         "busy follow hosts its blocks inline, not claimed"
@@ -603,15 +602,8 @@ async fn busy_follow_permission_approved_resumes() {
 
     // The adopt-time pending block is pre-seeded as the host's inline
     // section (not claimed — the inline dedupe prevents duplicates).
-    let acc = app
-        .core
-        .cards
-        .lock()
-        .await
-        .get("ses_alpha01")
-        .cloned()
-        .expect("follow armed");
-    assert_eq!(acc.acc.live_permissions().len(), 1);
+    let cards = app.core.cards_handle();
+    assert_eq!(Turn::live_permissions(&cards, "ses_alpha01").await.len(), 1);
     assert!(app.core.snapshot_claims.lock().await.claim_count() == 0);
 
     // Approve the block from the snapshot: the normal inline path replies
@@ -647,14 +639,8 @@ async fn busy_follow_permission_approved_resumes() {
     );
     assert_eq!(result.toast.as_deref(), Some("已允许本次执行"));
     assert!(
-        app.core
-            .cards
-            .lock()
+        Turn::live_permissions(&app.core.cards_handle(), "ses_alpha01")
             .await
-            .get("ses_alpha01")
-            .unwrap()
-            .acc
-            .live_permissions()
             .is_empty(),
         "the approved section is no longer live on the follow card"
     );
@@ -848,15 +834,8 @@ async fn busy_follow_question_block_resolves() {
     .unwrap();
 
     // The follow pre-seeded the inline section AND remembered the request.
-    let acc = app
-        .core
-        .cards
-        .lock()
-        .await
-        .get("ses_alpha01")
-        .cloned()
-        .expect("follow armed");
-    assert_eq!(acc.acc.live_questions().len(), 1);
+    let cards = app.core.cards_handle();
+    assert_eq!(Turn::live_questions(&cards, "ses_alpha01").await.len(), 1);
     assert!(app.core.question.has_question("q_1").await);
 
     // Click an option: the single question is answered → the request
@@ -876,14 +855,8 @@ async fn busy_follow_question_block_resolves() {
         .expect("question click returns a result");
     assert_eq!(result.toast.as_deref(), Some("已回答"));
     assert!(
-        app.core
-            .cards
-            .lock()
+        Turn::live_questions(&app.core.cards_handle(), "ses_alpha01")
             .await
-            .get("ses_alpha01")
-            .unwrap()
-            .acc
-            .live_questions()
             .is_empty(),
         "the answered question block is stripped from the follow card"
     );
@@ -926,16 +899,8 @@ async fn user_prompt_during_follow_takes_over() {
     )
     .await
     .unwrap();
-    let follow_epoch = app
-        .core
-        .cards
-        .lock()
-        .await
-        .get("ses_alpha01")
-        .cloned()
-        .expect("follow armed")
-        .acc
-        .turn_started_ms;
+    let follow_epoch = Turn::armed_turn_anchor(&app.core.cards_handle(), "ses_alpha01").await;
+    assert!(follow_epoch.is_some(), "follow armed");
 
     // The user prompts cola in the thread.
     app.handle_message(incoming(
@@ -948,16 +913,12 @@ async fn user_prompt_during_follow_takes_over() {
     ))
     .await;
 
-    let new_epoch = app
-        .core
-        .cards
-        .lock()
-        .await
-        .get("ses_alpha01")
-        .cloned()
-        .expect("the prompt inserted its own accumulator")
-        .acc
-        .turn_started_ms;
+    let cards = app.core.cards_handle();
+    assert!(
+        Turn::has_card(&cards, "ses_alpha01").await,
+        "the prompt inserted its own accumulator"
+    );
+    let new_epoch = Turn::armed_turn_anchor(&cards, "ses_alpha01").await;
     assert_ne!(new_epoch, follow_epoch, "the follow accumulator was replaced");
     let calls = platform.calls.lock().await.clone();
     assert!(

@@ -89,13 +89,8 @@ async fn aborted_turn_rejects_its_pending_permission() {
     let mut seen = std::collections::HashSet::new();
     app.permission.sweep(&app.core, &mut seen).await;
     assert!(
-        !app.cards
-            .lock()
+        !Turn::live_permissions(&app.cards_handle(), "ses_test")
             .await
-            .get("ses_test")
-            .unwrap()
-            .acc
-            .live_permissions()
             .is_empty(),
         "the permission must be live on the card before the abort"
     );
@@ -153,13 +148,8 @@ async fn aborted_turn_rejects_its_pending_permission() {
     let mut seen = std::collections::HashSet::new();
     app.permission.sweep(&app.core, &mut seen).await;
     assert!(
-        app.cards
-            .lock()
+        Turn::live_permissions(&app.cards_handle(), "ses_test")
             .await
-            .get("ses_test")
-            .unwrap()
-            .acc
-            .live_permissions()
             .is_empty(),
         "the rejected request must not come back on the next turn"
     );
