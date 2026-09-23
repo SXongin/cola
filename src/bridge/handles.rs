@@ -402,7 +402,8 @@ impl SessionsHandle {
 ///
 /// 1. A card write takes the session's [`Self::write_lock`] FIRST and holds it
 ///    across the whole read-send-record sequence (`flush_card`,
-///    `resolve_blocks`); everything else is taken inside that sequence.
+///    `split_card_chain`, `resolve_blocks`); everything else is taken inside
+///    that sequence.
 /// 2. Inside it, `cards` and `card_handles` are each taken for one step and
 ///    released; the resolution path snapshots `sent_cards` (on the request
 ///    flow) BEFORE taking `card_handles`, and never holds the two at once.
@@ -443,8 +444,9 @@ impl CardsHandle {
 
     /// The lock serializing card writes for `session_id`. Every path that reads
     /// a session's card state, sends the result to Feishu, and then records it
-    /// must hold this across the whole sequence: `flush_card` and
-    /// `resolve_blocks` are the two.
+    /// must hold this across the whole sequence: `flush_card`, `split_card_chain`
+    /// (which enqueues its split and flushes under the same lock) and
+    /// `resolve_blocks` are the holders.
     pub(crate) async fn write_lock(&self, session_id: &str) -> Arc<Mutex<()>> {
         self.write_locks
             .lock()
@@ -509,9 +511,14 @@ impl RequestsHandle {
 /// The per-session wait state: prompt serialization, the `/stop` marker, and
 /// the reminder/pin machinery for pending requests.
 ///
-/// **Locks owned:** `inflight`, `stopped_sessions`, the reminder's own inner
-/// state, and the message-pin registry. Each is taken alone and held briefly;
-/// none is held across a platform or backend call.
+/// **Locks owned:** `inflight` and `stopped_sessions` (plain sets, taken alone
+/// and held briefly, never across an await), plus the reminder's and the
+/// message-pin registry's own inner mutexes. Those two inner mutexes ARE held
+/// across the platform's reminder/pin calls (`set_instant_reminder`,
+/// `pin_message`/`unpin_message`): the decision, the call and the state update
+/// are one transition, with the failure latch updated inside the guard, so a
+/// concurrent sweep cannot interleave a second pin or clear. No lock here is
+/// ever nested with another handle's lock.
 #[derive(Clone)]
 pub(crate) struct WaitsHandle {
     /// Session ids with a prompt currently in flight (serializes prompts per
@@ -634,8 +641,9 @@ pub(crate) struct FlowHandles {
 ///
 /// **Locks owned:** `lock`, taken for a whole reconcile pass or a demand
 /// spawn. It is the outermost lock of the bridge: it is never acquired while
-/// holding a handle's store/card/claim lock, so no ordering can invert against
-/// them. `backend.reconnect` happens under it.
+/// holding any handle lock, so no ordering can invert against them. Under it
+/// the reconcile pass reads `waits.inflight` (the only handle lock taken while
+/// it is held) and calls `backend.reconnect`.
 #[derive(Clone)]
 pub(crate) struct ServerHandle {
     /// When cola may spawn its own `opencode serve` (`auto`/`never`/`eager`).
