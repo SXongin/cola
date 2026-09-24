@@ -79,3 +79,23 @@ The snapshot never: injects a prompt or any write into the session, spends token
 ## Domain note
 
 The concept enters the glossary as **Session Snapshot (会话快照)**; the UI verbs stay 已接管/已切换. The status chip is cola's first consumer of the server's per-session status endpoint — the same one a future "is anyone running this session" feature would build on.
+
+## Update (2026-09-25)
+
+The status chip no longer derives from the embeddable (claimable) pending set
+alone. A request that `is_already_surfaced` kept off the snapshot is still
+blocking the session, and its hosting card is the live surface to answer on —
+for a live inline block, the turn card that answering resumes; that card
+carries the Message Pin where the opt-in is enabled. When the adopted session
+has pendings but none was embedded, the snapshot now shows
+`⏳ 等待你的确认（见置顶的原卡片）` instead of falling back to the server run
+state (运行中/空闲) — and the busy hint must not render in that state. The
+original rule — the chip and the blocks read the same set, so a chip never
+claims a pending that isn't shown — is refined: a pending the snapshot does not
+show must be named and pointed at, never silently dropped from the status line.
+The blocks themselves do NOT move: a live inline block stays on the turn it
+blocks, and re-hosting pendings onto the snapshot on re-activation was
+considered and rejected — it would separate the question from the turn it
+blocks, while a standalone card or an earlier snapshot's claim already has an
+authoritative, pinned surface. Where Message Pin is disabled the pointer copy
+must not promise a pin; the exact fallback wording is a spec detail.
