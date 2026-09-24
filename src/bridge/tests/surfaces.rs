@@ -368,8 +368,134 @@ async fn restart_readopts_a_pending_standalone_permission() {
         .expect("a card-action result");
     let ack = card_text(result.card.as_ref().expect("the ack carries the card"));
     assert!(ack.contains("✅ 已允许一次"), "receipt missing: {ack}");
+    assert!(
+        last_update_of(&platform, &sent.message_id).await.is_none(),
+        "the ack IS the clicked card's update; no PATCH may race behind it"
+    );
     assert_eq!(backend.reply_permission_calls.lock().await.len(), 1);
     assert_eq!(persisted(&session_file), None);
+}
+
+/// The same for a standalone question card: the re-adopted card is the live
+/// surface (nothing new posted), a partial answer rebuilds it in the ack, and
+/// the final answer resolves the request through it.
+#[tokio::test]
+async fn restart_readopts_a_pending_standalone_question() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_question(question_request("que_1", "ses_1"));
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(test_config(&session_file), backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_1", "/work").await;
+    sweep(&app.question, &app).await;
+    assert_eq!(posted_cards(&platform).await.len(), 1);
+    let sent = app
+        .question
+        .sent_cards
+        .lock()
+        .await
+        .get("que_1")
+        .cloned()
+        .expect("the standalone card is recorded");
+
+    let (app, platform, backend) = restart_app(&session_file, |b| {
+        b.ask_question(question_request("que_1", "ses_1"));
+    })
+    .await;
+    assert!(
+        app.question.sent_cards.lock().await.contains_key("que_1"),
+        "the standalone record is hydrated"
+    );
+
+    sweep(&app.question, &app).await;
+    assert!(
+        posted_cards(&platform).await.is_empty(),
+        "no second card may be posted after the restart"
+    );
+
+    // A partial answer rebuilds the standalone card in the ack (no accumulator
+    // and no block handle exist — the ack IS the card's update).
+    let r1 = app
+        .host_action(serde_json::json!({
+            "action": "question",
+            "reply": "answer",
+            "request_id": "que_1",
+            "session_id": "ses_1",
+            "directory": "/work",
+            "question_index": 0,
+            "answer": "/a",
+            "open_message_id": sent.message_id,
+        }))
+        .await
+        .expect("a card-action result");
+    let ack1 = card_text(r1.card.as_ref().expect("the ack carries the card"));
+    assert!(ack1.contains("已选：/a"), "marker missing: {ack1}");
+
+    // The final answer resolves the request through the re-adopted card.
+    let r2 = app
+        .host_action(serde_json::json!({
+            "action": "question",
+            "reply": "answer",
+            "request_id": "que_1",
+            "session_id": "ses_1",
+            "directory": "/work",
+            "question_index": 1,
+            "answer": "main",
+            "open_message_id": sent.message_id,
+        }))
+        .await
+        .expect("a card-action result");
+    let ack2 = card_text(r2.card.as_ref().expect("the ack carries the card"));
+    assert!(ack2.contains("✅ 已回答"), "completion card missing: {ack2}");
+    let replies = backend.reply_question_calls.lock().await;
+    assert_eq!(replies.len(), 1);
+    assert_eq!(
+        replies[0].1,
+        vec![vec!["/a".to_string()], vec!["main".to_string()]]
+    );
+    drop(replies);
+    assert_eq!(persisted(&session_file), None);
+}
+
+/// With no persisted state (a fresh machine, or a pruned record) the behavior
+/// is unchanged: the pending request is surfaced as a standalone card.
+#[tokio::test]
+async fn a_fresh_app_surfaces_a_pending_request_standalone() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    assert!(
+        persisted(&session_file).is_none(),
+        "precondition: no persisted state"
+    );
+
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permission(perm_request("per_1", "ses_1", "ls -la"));
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(test_config(&session_file), backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_1", "/work").await;
+
+    sweep(&app.permission, &app).await;
+
+    let posted = posted_cards(&platform).await;
+    assert_eq!(
+        posted.len(),
+        1,
+        "with no persisted state the request is surfaced as a standalone card"
+    );
+    assert!(card_text(&posted[0]).contains("🔐 权限请求"));
+    assert_eq!(
+        app.card_handles.lock().await.live_count(),
+        0,
+        "nothing was re-adopted as an inline block"
+    );
+    let raw = persisted(&session_file).expect("the standalone surface is persisted");
+    assert!(raw.contains("per_1"), "{raw}");
 }
 
 /// A request resolved while cola was down is reconciled by the first sweep —
