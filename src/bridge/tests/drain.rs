@@ -24,7 +24,10 @@ fn msg(role: &str, id: &str, created: i64, parts: serde_json::Value) -> SessionM
             id: id.into(),
             role: Some(role.into()),
             parent_id: None,
-            time: Some(MessageTime { created }),
+            time: Some(MessageTime {
+                created,
+                completed: Some(created),
+            }),
             model_id: None,
             provider_id: None,
             tokens: None,
@@ -34,7 +37,7 @@ fn msg(role: &str, id: &str, created: i64, parts: serde_json::Value) -> SessionM
 }
 
 /// A user message cola would have persisted (its `msg_cola_` id identifies it).
-fn user(id: &str, created: i64, text: &str) -> SessionMessage {
+pub(crate) fn user(id: &str, created: i64, text: &str) -> SessionMessage {
     msg("user", id, created, json!([{ "type": "text", "text": text }]))
 }
 
@@ -69,7 +72,7 @@ fn tool_assistant(created: i64, status: &str, output: &str) -> SessionMessage {
 
 /// The turn under test: the anchor id is fixed so the scripted Backend timeline can name
 /// the turn's own user message (`capture_turn_anchor` matches on it).
-fn ctx(session_id: &str, text: &str) -> PromptContext {
+pub(crate) fn ctx(session_id: &str, text: &str) -> PromptContext {
     PromptContext {
         session_id: session_id.into(),
         thread_key: ThreadKey::new("chat_1".into(), "chat_1".into()),
@@ -86,7 +89,7 @@ fn ctx(session_id: &str, text: &str) -> PromptContext {
 
 /// An app whose Backend serves the scripted message timeline for `ses_test` (one
 /// per `messages` call, the last repeating) and the given session status.
-async fn scripted_app(
+pub(crate) async fn scripted_app(
     scripts: Vec<Vec<SessionMessage>>,
     status: Option<SessionStatus>,
 ) -> (
@@ -114,7 +117,10 @@ async fn scripted_app(
 }
 
 /// Start the turn on its own task (the test drives the Backend while it drains).
-fn spawn_turn(app: &Arc<App>, context: PromptContext) -> tokio::task::JoinHandle<crate::error::Result<()>> {
+pub(crate) fn spawn_turn(
+    app: &Arc<App>,
+    context: PromptContext,
+) -> tokio::task::JoinHandle<crate::error::Result<()>> {
     let app = Arc::clone(app);
     tokio::spawn(async move { Turn::run(&app.turn_handles(), context).await })
 }
@@ -175,7 +181,7 @@ async fn settle_tool(backend: &Arc<MockBackend>, status: &str, output: &str) {
 }
 
 /// Await a card update carrying `needle`, or panic after 5 s.
-async fn wait_for_card_text(platform: &RecordingPlatform, needle: &str) {
+pub(crate) async fn wait_for_card_text(platform: &RecordingPlatform, needle: &str) {
     let wait = async {
         loop {
             let seen = platform

@@ -240,6 +240,11 @@ impl MessageTokens {
 #[derive(Debug, Clone, Deserialize)]
 pub struct MessageTime {
     pub created: i64,
+    /// Server time the message finished producing (`time.completed`). Absent
+    /// while the message is still in flight — including when a previous run's
+    /// step is still streaming as a new Turn's anchor lands (#310).
+    #[serde(default)]
+    pub completed: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

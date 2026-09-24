@@ -1453,7 +1453,10 @@ impl opencode::Backend for MockBackend {
                     id: "msg_cola_mock_user".into(),
                     role: Some("user".into()),
                     parent_id: None,
-                    time: Some(opencode::types::MessageTime { created }),
+                    time: Some(opencode::types::MessageTime {
+                        created,
+                        completed: Some(created),
+                    }),
                     model_id: None,
                     provider_id: None,
                     tokens: None,
@@ -1491,7 +1494,10 @@ impl opencode::Backend for MockBackend {
                     id: "msg_ext_user".into(),
                     role: Some("user".into()),
                     parent_id: None,
-                    time: Some(opencode::types::MessageTime { created }),
+                    time: Some(opencode::types::MessageTime {
+                        created,
+                        completed: Some(created),
+                    }),
                     model_id: None,
                     provider_id: None,
                     tokens: None,
@@ -1510,6 +1516,7 @@ impl opencode::Backend for MockBackend {
                         parent_id: Some("msg_ext_user".into()),
                         time: Some(opencode::types::MessageTime {
                             created: created + 1000,
+                            completed: Some(created + 1000),
                         }),
                         model_id: None,
                         provider_id: None,
@@ -1538,7 +1545,10 @@ impl opencode::Backend for MockBackend {
                 id: "msg_assist".into(),
                 role: Some("assistant".into()),
                 parent_id: Some("msg_user".into()),
-                time: Some(opencode::types::MessageTime { created: now + 1000 }),
+                time: Some(opencode::types::MessageTime {
+                    created: now + 1000,
+                    completed: Some(now + 1000),
+                }),
                 model_id: None,
                 provider_id: None,
                 tokens: None,
