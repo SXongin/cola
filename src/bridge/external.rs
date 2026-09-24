@@ -516,6 +516,9 @@ async fn armed_turn_anchor(cards: &CardsHandle, session_id: &str) -> Option<i64>
 /// them. The settle runs inside the adopted Session's `snapshot` span
 /// (ADR-0048), so its follow/claim lines are retrievable by it; the follow's
 /// own render task is instrumented at its spawn with the `external` span.
+/// `back` is the `/switch`-list state the card was adopted from, when it came
+/// from the list card (ADR-0052): the claim path keeps its 返回列表 button
+/// across rebuilds.
 pub(crate) async fn settle_snapshot_after_send(
     external: &ExternalFlow,
     handles: &FlowHandles,
@@ -523,6 +526,7 @@ pub(crate) async fn settle_snapshot_after_send(
     verb: &str,
     title: &str,
     data: &crate::bridge::snapshot::SnapshotData,
+    back: Option<&crate::feishu::card::session::BackToList>,
 ) {
     let thread_key = crate::bridge::span::thread_key_of(&handles.sessions, &data.session_id).await;
     let span = crate::bridge::span::snapshot(&data.session_id, thread_key.as_ref());
@@ -538,6 +542,7 @@ pub(crate) async fn settle_snapshot_after_send(
                 verb,
                 title,
                 data,
+                back,
             )
             .await;
         }

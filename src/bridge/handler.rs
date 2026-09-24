@@ -957,13 +957,20 @@ impl App {
                 }
                 // ADR-0028 one-card rule: the switch card's OWN message becomes
                 // the confirmation — the ack patches the list card in place to
-                // the snapshot.
+                // the snapshot. The list's filter rides along (ADR-0052): the
+                // snapshot's 返回列表 button rebuilds exactly this window.
                 let open_message_id = value
                     .get("open_message_id")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+                let back = crate::feishu::card::session::BackToList {
+                    thread_key: thread_key.clone(),
+                    keyword: keyword.clone(),
+                    scope,
+                    page,
+                };
                 Some(
-                    self.apply_card_adoption(core, &thread_key, &target, open_message_id)
+                    self.apply_card_adoption(core, &thread_key, &target, open_message_id, Some(&back))
                         .await,
                 )
             }
@@ -1112,7 +1119,10 @@ impl App {
     /// the Session Snapshot (or the compact suppressed-切换 state card,
     /// ADR-0028), persist the new active entry, and settle the snapshot's
     /// claimed pendings. The returned card patches the clicked card in place
-    /// (ADR-0028 one-card rule), so no second message is sent.
+    /// (ADR-0028 one-card rule), so no second message is sent. `back` is the
+    /// switch list the adoption came from (ADR-0052): both snapshot forms
+    /// carry its 返回列表 button, and the claim registry keeps it across
+    /// rebuilds.
     ///
     /// The steal is `set_active`'s: it removes any existing entry with this
     /// session id, so a `force_adopt` from another thread leaves that owner
@@ -1124,6 +1134,7 @@ impl App {
         thread_key: &ThreadKey,
         target: &crate::opencode::types::SessionListInfo,
         open_message_id: Option<String>,
+        back: Option<&crate::feishu::card::session::BackToList>,
     ) -> CardActionResult {
         let mapped_to_this_thread = {
             let store = core.sessions.lock().await;
@@ -1143,6 +1154,7 @@ impl App {
                 &target.id,
                 &target.directory,
                 &target.title,
+                back,
             )
             .await
             {
@@ -1152,13 +1164,15 @@ impl App {
                         &target.title,
                         &target.id,
                         &target.directory,
+                        back,
                     ),
                     None,
                 ),
             }
         } else {
             let (card, data) =
-                crate::bridge::snapshot::snapshot_card_for(&core.snapshot_handles(), "接管", target).await;
+                crate::bridge::snapshot::snapshot_card_for(&core.snapshot_handles(), "接管", target, back)
+                    .await;
             (card, Some(data))
         };
         // In a topic the patched card lives INSIDE it, so persist its own
@@ -1194,6 +1208,7 @@ impl App {
                 verb,
                 &target.title,
                 data,
+                back,
             )
             .await;
         }

@@ -1018,6 +1018,10 @@ async fn topic_adopt_opens_topic_around_existing_session() {
         "snapshot seed carries the adopt verb and title: {seed_card}"
     );
     assert!(
+        !seed_card.contains("返回列表"),
+        "a topic adoption has no switch list to return to: {seed_card}"
+    );
+    assert!(
         !calls
             .iter()
             .any(|c| matches!(c, PlatformCall::ReplyInThread { .. })),

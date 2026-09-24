@@ -162,6 +162,7 @@ async fn a_snapshot_claimed_wait_pins_the_snapshot_card() {
             newest_user_epoch: None,
             newest_user_is_cola_authored: false,
         },
+        None,
     );
 
     app.permission.sweep(&app.flow_handles(), &mut seen).await;

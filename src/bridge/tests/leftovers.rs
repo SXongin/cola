@@ -294,6 +294,7 @@ async fn aborted_turn_leaves_a_claimed_request() {
             newest_user_epoch: None,
             newest_user_is_cola_authored: false,
         },
+        None,
     );
 
     app.handle_message(incoming(

@@ -1780,6 +1780,240 @@ async fn switch_card_force_topic_adopt_preserves_the_filter() {
     );
 }
 
+/// ADR-0052: adopting from a filtered, paged `/switch` list patches the card
+/// to the Session Snapshot (ADR-0028), which carries a 「返回列表」 button
+/// holding that list's keyword/scope/page; clicking it rebuilds the same
+/// filtered window on the same page.
+#[tokio::test]
+async fn switch_card_adopt_round_trips_back_to_the_filtered_page() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, backend_with_sessions(8)).await;
+
+    send_command(&app, "/switch", "msg_switch").await;
+    let page1 = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .next()
+        .expect("the /switch command replies with a card");
+
+    // Type `proj` into the search box: the rebuilt card is filtered at page 1.
+    let mut search = card_buttons(&page1)
+        .into_iter()
+        .find(|b| b["value"]["op"] == "search")
+        .expect("the switch card has a search submit button")["value"]
+        .clone();
+    search["keyword"] = serde_json::json!("proj");
+    let filtered = app
+        .host_action(search)
+        .await
+        .expect("the search returns a result")
+        .card
+        .expect("the search rebuilds the card");
+
+    // Flip to page 2; ses_p1's row lives there.
+    let flip = pager_button(&filtered, "下一页")["value"].clone();
+    let page2 = app
+        .host_action(flip)
+        .await
+        .expect("the page flip returns a result")
+        .card
+        .expect("the page flip rebuilds the card");
+    assert!(
+        card_text(&page2).contains("项目1 ·"),
+        "ses_p1's row is on page 2: {}",
+        card_text(&page2)
+    );
+
+    // Click 接管 on ses_p1's row: the list card becomes the snapshot.
+    let adopt = card_buttons(&page2)
+        .into_iter()
+        .find(|b| b["value"]["op"] == "adopt" && b["value"]["session_id"] == "ses_p1")
+        .expect("page 2 lists ses_p1's adopt button")["value"]
+        .clone();
+    let snapshot = app
+        .host_action(adopt)
+        .await
+        .expect("adopt returns a result")
+        .card
+        .expect("adopt patches the card in place");
+    let text = card_text(&snapshot);
+    assert!(text.contains("已接管 项目1"), "snapshot header: {text}");
+    assert!(!text.contains("会话管理"), "the list is gone: {text}");
+
+    // The snapshot carries the list's exact return target.
+    let back = card_buttons(&snapshot)
+        .into_iter()
+        .find(|b| b["value"]["op"] == "back")
+        .expect("the list adoption carries a 返回列表 button");
+    assert_eq!(back["text"]["content"], "返回列表");
+    assert_eq!(back["value"]["keyword"], "proj");
+    assert_eq!(back["value"]["scope"], "all");
+    assert_eq!(back["value"]["page"], 2);
+
+    let list = click_button_card(&app, &snapshot, "back").await;
+    let text = card_text(&list);
+    assert!(
+        text.contains("项目2 ·") && text.contains("项目1 ·"),
+        "返回列表 rebuilds the same page two window: {text}"
+    );
+    assert!(
+        !text.contains("项目8 ·"),
+        "the return does not fall back to page 1: {text}"
+    );
+    assert_eq!(
+        switch_pager_label(&list).as_deref(),
+        Some("第 2/2 页 · 共 8 个"),
+        "the page survives the adopt round trip: {text}"
+    );
+    assert!(
+        list.to_string().contains("\"default_value\":\"proj\""),
+        "the keyword survives the adopt round trip: {list}"
+    );
+}
+
+/// ADR-0052: the suppressed compact 已切换 state card (a re-switch with
+/// nothing to report, ADR-0028) carries the same 「返回列表」 button, and it
+/// returns to the same filtered page.
+#[tokio::test]
+async fn switch_card_suppressed_round_trips_back_to_the_filtered_page() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = backend_with_sessions(8);
+    backend.cola_message("ses_p1", "上次的问题");
+    let (app, platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    // ses_p1 is mapped to this thread but NOT active: its row shows 切换, and
+    // the re-activation is eligible for suppression (idle, no pending,
+    // newest user message cola-authored).
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key.clone(), "ses_p1", "/work/proj1"),
+    )
+    .await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key, "ses_active", "/work/active"),
+    )
+    .await;
+
+    send_command(&app, "/switch", "msg_switch").await;
+    let page1 = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .next()
+        .expect("the /switch command replies with a card");
+    // The seeded active session roots the card in /work/active, where no
+    // listed session lives: widen to the whole store before searching.
+    let toggle = card_buttons(&page1)
+        .into_iter()
+        .find(|b| b["value"]["op"] == "scope" && b["value"]["scope"] == "all")
+        .expect("the directory-scoped card offers 全部")["value"]
+        .clone();
+    let widened = app
+        .host_action(toggle)
+        .await
+        .expect("the scope toggle returns a result")
+        .card
+        .expect("the scope toggle rebuilds the card");
+    let mut search = card_buttons(&widened)
+        .into_iter()
+        .find(|b| b["value"]["op"] == "search")
+        .expect("the switch card has a search submit button")["value"]
+        .clone();
+    search["keyword"] = serde_json::json!("proj");
+    let filtered = app
+        .host_action(search)
+        .await
+        .expect("the search returns a result")
+        .card
+        .expect("the search rebuilds the card");
+    let flip = pager_button(&filtered, "下一页")["value"].clone();
+    let page2 = app
+        .host_action(flip)
+        .await
+        .expect("the page flip returns a result")
+        .card
+        .expect("the page flip rebuilds the card");
+
+    let adopt = card_buttons(&page2)
+        .into_iter()
+        .find(|b| b["value"]["op"] == "adopt" && b["value"]["session_id"] == "ses_p1")
+        .expect("page 2 lists ses_p1's adopt button")["value"]
+        .clone();
+    let snapshot = app
+        .host_action(adopt)
+        .await
+        .expect("the re-switch returns a result")
+        .card
+        .expect("the re-switch patches the card in place");
+    let text = card_text(&snapshot);
+    assert!(
+        text.contains("已切换 项目1"),
+        "compact suppressed state header: {text}"
+    );
+    assert!(
+        !text.contains("最近对话"),
+        "the suppressed card carries no tail: {text}"
+    );
+
+    let back = card_buttons(&snapshot)
+        .into_iter()
+        .find(|b| b["value"]["op"] == "back")
+        .expect("the suppressed state card carries a 返回列表 button");
+    assert_eq!(back["value"]["keyword"], "proj");
+    assert_eq!(back["value"]["scope"], "all");
+    assert_eq!(back["value"]["page"], 2);
+
+    let list = click_button_card(&app, &snapshot, "back").await;
+    let text = card_text(&list);
+    assert!(
+        text.contains("项目2 ·") && text.contains("项目1 ·"),
+        "返回列表 rebuilds the same page two window: {text}"
+    );
+    assert_eq!(
+        switch_pager_label(&list).as_deref(),
+        Some("第 2/2 页 · 共 8 个"),
+        "the page survives the suppressed round trip: {text}"
+    );
+    assert!(
+        list.to_string().contains("\"default_value\":\"proj\""),
+        "the keyword survives the suppressed round trip: {list}"
+    );
+}
+
+/// ADR-0052: a snapshot from a non-list source (the text `/switch <kw>` form,
+/// the old `/attach`) carries no 「返回列表」 button — there is no filtered
+/// list to return to.
+#[tokio::test]
+async fn text_switch_snapshot_has_no_back_to_list_button() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![list_session("ses_alpha01", "重写登录", "/work/auth", 100)]);
+    let (app, platform) = build_app(cfg, backend).await;
+
+    send_command(&app, "/switch 重写登录", "msg_switch").await;
+
+    let card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .next()
+        .expect("the text /switch replies with its snapshot card");
+    let text = card_text(&card);
+    assert!(text.contains("已接管 重写登录"), "snapshot header: {text}");
+    assert!(
+        !text.contains("返回列表"),
+        "a text adoption has no list to return to: {text}"
+    );
+}
+
 /// `n` sessions 项目N rooted in `/work/projN`, most recently active last (so
 /// `switch_card_data` sorts them descending: projN first).
 fn backend_with_sessions(n: i64) -> MockBackend {

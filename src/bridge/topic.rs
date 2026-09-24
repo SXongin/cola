@@ -132,8 +132,14 @@ async fn open_topic_inner(
             // best-effort, so a read failure degrades that field rather than
             // blocking the adoption. The pendings are restricted to the
             // claimable ones (the session's own, not already surfaced).
-            let (card, data) =
-                crate::bridge::snapshot::snapshot_card_for(&handles.snapshot_handles(), "接管", &info).await;
+            let (card, data) = crate::bridge::snapshot::snapshot_card_for(
+                &handles.snapshot_handles(),
+                "接管",
+                &info,
+                // The topic form has no switch list to return to.
+                None,
+            )
+            .await;
             OpeningParts {
                 directory: info.directory,
                 display_title: info.title.clone(),
@@ -235,6 +241,7 @@ async fn open_topic_inner(
             "接管",
             &claim.title,
             &claim.data,
+            None,
         )
         .await;
     }
