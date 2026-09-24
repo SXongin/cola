@@ -15,6 +15,7 @@ use crate::bridge::handler::CardActionResult;
 use crate::bridge::handles::{CardsHandle, FlowHandles, RequestsHandle, SessionsHandle};
 use crate::bridge::pollers::{CardTarget, inline_host_session, mark_stale_cards, resolve_card_target};
 use crate::bridge::question::{QuestionState, stale_question_card};
+use crate::bridge::surfaces::{StandaloneSurface, Surfaces};
 use crate::bridge::turn::Turn;
 use crate::opencode;
 
@@ -71,18 +72,63 @@ pub struct RequestFlow {
     /// decision the backend never received. In-memory like the claim set on
     /// `handles.requests.answered_requests`, and one card per answered request.
     answered_results: Arc<Mutex<HashMap<String, CardActionResult>>>,
+    /// The persisted surface mirror (ADR-0038 restart re-adoption): every
+    /// standalone card this flow sends is written through, and its persisted
+    /// records seed [`Self::recovered`] at startup.
+    pub(crate) surfaces: Arc<Surfaces>,
+    /// request_id → owning directory of the surfaces a PREVIOUS process
+    /// persisted (ADR-0038 restart re-adoption). The first sweep that lists
+    /// such a request re-adopts its card instead of posting a second one; an
+    /// entry whose request left the pending list is reconciled away by the
+    /// stale/inline cleanups, like every other in-memory surface.
+    recovered: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl RequestFlow {
-    pub fn new(kind: Box<dyn RequestKind>) -> Self {
+    pub fn new(kind: Box<dyn RequestKind>, surfaces: Arc<Surfaces>) -> Self {
+        // Hydrate this kind's half of the persisted record: the standalone
+        // cards it sent and the requests whose surfaces the next sweep must
+        // re-adopt (both an inline block and a standalone card count).
+        let state = surfaces.snapshot();
+        let claim_kind = kind.claim_kind();
+        let sent_cards: HashMap<String, SentCard> = state
+            .standalone
+            .iter()
+            .filter(|(_, s)| s.kind == claim_kind)
+            .map(|(id, s)| {
+                (
+                    id.clone(),
+                    SentCard {
+                        message_id: s.message_id.clone(),
+                        summary: s.summary.clone(),
+                        directory: s.directory.clone(),
+                    },
+                )
+            })
+            .collect();
+        let recovered: HashMap<String, String> = state
+            .inline
+            .iter()
+            .filter(|(_, s)| s.kind == claim_kind)
+            .map(|(id, s)| (id.clone(), s.directory.clone()))
+            .chain(
+                state
+                    .standalone
+                    .iter()
+                    .filter(|(_, s)| s.kind == claim_kind)
+                    .map(|(id, s)| (id.clone(), s.directory.clone())),
+            )
+            .collect();
         Self {
             kind,
             poll_interval_ms: std::sync::atomic::AtomicU64::new(3000),
             list_timeout_ms: std::sync::atomic::AtomicU64::new(30_000),
-            sent_cards: Arc::new(Mutex::new(HashMap::new())),
+            sent_cards: Arc::new(Mutex::new(sent_cards)),
             listed_dirs: Arc::new(Mutex::new(std::collections::HashSet::new())),
             question_state: Arc::new(Mutex::new(HashMap::new())),
             answered_results: Arc::new(Mutex::new(HashMap::new())),
+            surfaces,
+            recovered: Arc::new(Mutex::new(recovered)),
         }
     }
 
@@ -549,6 +595,7 @@ impl RequestFlow {
             &handles.platform,
             &pending,
             &self.sent_cards,
+            &self.surfaces,
             &failed_dirs,
             self.kind.label(),
         )
@@ -694,6 +741,15 @@ impl RequestFlow {
             .lock()
             .await
             .retain(|id, state| pending.contains(id) || failed_dirs.contains(state.dir()));
+        // The recovered-surface memory is one-shot: an entry the sweep did not
+        // list (the request was resolved while cola was down) has no card left
+        // to re-adopt — its surfaces were reconciled by the stale/inline
+        // cleanups above. A failed directory's entries stay: it said nothing
+        // (#130).
+        self.recovered
+            .lock()
+            .await
+            .retain(|id, dir| pending.contains(id) || failed_dirs.contains(dir));
     }
 
     /// Everything one sweep does with ONE listed request, wrapped by the
@@ -734,6 +790,18 @@ impl RequestFlow {
             req.id(),
             req.session_id()
         );
+        // ADR-0038 restart re-adoption: a request whose card a PREVIOUS
+        // process persisted is already surfaced. Re-adopt that card — remember
+        // what its buttons need to resolve, repaint it — instead of posting a
+        // second one. The entry is one-shot: it exists exactly for the first
+        // sweep that meets the request after the restart. A recovered card
+        // that cannot be repainted falls through to the normal path, which
+        // surfaces the request as a standalone card.
+        if self.recovered.lock().await.remove(req.id()).is_some()
+            && self.readopt_surface(handles, req, dir).await
+        {
+            return false;
+        }
         // Kind-specific pre-card handling (auto-accept / remember). true →
         // handled, no card needed.
         if self.kind.prepare(self, handles, req, dir).await {
@@ -789,11 +857,23 @@ impl RequestFlow {
             }
         };
         if let Some(mid) = sent_id {
+            let summary = self.kind.summary(req);
             self.sent_cards.lock().await.insert(
                 req.id().to_string(),
                 SentCard {
+                    message_id: mid.clone(),
+                    summary: summary.clone(),
+                    directory: dir.to_string(),
+                },
+            );
+            // Persist the standalone surface so a restart re-adopts it instead
+            // of posting a second card (ADR-0038 restart re-adoption).
+            self.surfaces.set_standalone(
+                req.id(),
+                StandaloneSurface {
+                    kind: self.kind.claim_kind(),
                     message_id: mid,
-                    summary: self.kind.summary(req),
+                    summary,
                     directory: dir.to_string(),
                 },
             );
@@ -872,6 +952,95 @@ impl RequestFlow {
         }
     }
 
+    /// Re-adopt the card a previous process surfaced this request on (ADR-0038
+    /// restart re-adoption). The kind's in-flight state is remembered first, so
+    /// a click on the card resolves against this process; then the persisted
+    /// card is repainted — refreshed from that state for a question, whose
+    /// partial answers did not survive the restart. Returns whether the request
+    /// is settled on its recovered card; `false` means the card is gone (or its
+    /// persisted JSON unusable), so the caller must surface the request
+    /// normally.
+    async fn readopt_surface(&self, handles: &FlowHandles, req: &PendingRequest, dir: &str) -> bool {
+        let id = req.id();
+        // Remembering the kind's state is what makes the card's buttons resolve
+        // — the poller never ran `prepare` for a request it considered already
+        // surfaced.
+        self.kind.remember_surfaced(self, req, dir).await;
+        // A recovered standalone card needs no repaint: it is already the live
+        // surface and its buttons carry everything a click needs (ADR-0038,
+        // rule 6).
+        let Some(message_id) = handles
+            .cards
+            .card_handles
+            .lock()
+            .await
+            .message_of(id)
+            .map(str::to_string)
+        else {
+            return true;
+        };
+        // Inline: repaint the persisted card — refreshed from the state this
+        // process holds for a question, so partial answers that did not
+        // survive the restart are not shown as selected.
+        let repainted = match self
+            .kind
+            .refresh_cached_block(self, &handles.cards, &message_id, req, dir)
+            .await
+        {
+            Some(card) => match handles.platform.update_message(&message_id, &card).await {
+                Ok(()) => {
+                    tracing::info!(
+                        "{} {} re-adopted on card {} after restart",
+                        self.kind.label(),
+                        id,
+                        message_id
+                    );
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "{} {} re-adoption repaint failed on {}: {} — surfacing it anew",
+                        self.kind.label(),
+                        id,
+                        message_id,
+                        e
+                    );
+                    false
+                }
+            },
+            // The persisted JSON cannot render the block: the handle is dead.
+            None => false,
+        };
+        if !repainted {
+            // The card is gone (or unusable): forget the stale surface, in
+            // memory and in the record, and let the caller surface the request
+            // normally.
+            let mut handles = handles.cards.card_handles.lock().await;
+            handles.remove_on(&message_id, id);
+            handles.forget(id);
+        }
+        repainted
+    }
+
+    /// The owning directory of a request this flow knows, when a callback
+    /// carries none and the session store cannot resolve it: the question's
+    /// remembered request, the standalone card's record, or the persisted
+    /// block's handle (a re-adopted card after a restart).
+    async fn remembered_directory(&self, cards: &CardsHandle, req_id: &str) -> Option<String> {
+        if let Some(dir) = self.question_dir(req_id).await {
+            return Some(dir);
+        }
+        if let Some(card) = self.sent_cards.lock().await.get(req_id) {
+            return Some(card.directory.clone());
+        }
+        cards
+            .card_handles
+            .lock()
+            .await
+            .directory_of(req_id)
+            .map(str::to_string)
+    }
+
     /// Handle a card action on this kind's card: answer / submit / reject. The
     /// shared skeleton resolves the delivery context and the double-click guard;
     /// the kind applies its own semantics.
@@ -899,7 +1068,7 @@ impl RequestFlow {
                 if from_store.is_some() {
                     from_store
                 } else {
-                    self.question_dir(req_id).await
+                    self.remembered_directory(&handles.cards, req_id).await
                 }
             }
         };
@@ -920,7 +1089,10 @@ impl RequestFlow {
         };
         // Inline interaction: the session (or its sub-task parent chain) has a
         // live streaming card, so the result is NOT returned as a replacement
-        // card — the streaming card re-renders itself on the next poll.
+        // card — the streaming card re-renders itself on the next poll. The
+        // clicked card rendering the block through its handle counts too: a
+        // re-adopted card after a restart has no accumulator, but its cached
+        // JSON still carries the block and the ack can edit it in place.
         let host = if claimed_message.is_some() {
             None
         } else if Turn::has_card(&handles.cards, session_id).await {
@@ -928,7 +1100,16 @@ impl RequestFlow {
         } else {
             inline_host_session(&handles.cards, &handles.backend, session_id, directory).await
         };
-        let inline = host.is_some();
+        let inline = host.is_some()
+            || match clicked {
+                Some(message_id) => handles
+                    .cards
+                    .card_handles
+                    .lock()
+                    .await
+                    .renders(message_id, req_id),
+                None => false,
+            };
 
         let mut r = self
             .kind

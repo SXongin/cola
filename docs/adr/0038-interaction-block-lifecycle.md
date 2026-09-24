@@ -43,7 +43,7 @@ A pending Permission/Question is rendered inline on the card the operator is alr
 
 - New core state: the block registry and the per-message card-JSON cache, released as blocks resolve. Memory is one card JSON per card with live blocks (bounded by concurrent pendings).
 - `pending_permissions`/`pending_questions` remain the render source of truth for the tail; the registry/cache is the repaint source of truth. The two must be kept in step — a single mutation seam (add / state change / resolve / re-host) is required or they drift.
-- After a cola restart the cache is empty: pre-restart cards freeze (accepted), and a still-pending request is re-surfaced as a standalone card, interactive there.
+- The registry, the card-JSON cache and the standalone-card records are persisted beside `sessions.json` and re-adopted on startup (2026-09-24 update), so a restart no longer duplicates or freezes a pending request's surface.
 - Cross-client state is eventual within one sweep, by design (ADR-0004 keeps polling).
 
 ## Alternatives considered
@@ -59,15 +59,16 @@ A pending Permission/Question is rendered inline on the card the operator is alr
 - **Notifications when an inline block first appears**: a card PATCH does not notify, and a new-message ping was considered and deferred — not re-litigated here.
 - **SSE or any push channel for cross-client resolution**: the ≤3 s sweep latency is accepted (ADR-0004/0011 keep polling).
 - **Reworking the Session Snapshot beyond Interaction Receipts**: its claim model, gathering and busy-follow stay as ADR-0028 left them.
-- **Post-restart guarantees**: after a restart the caches are empty — pre-restart cards freeze (see Consequences) and a still-pending request is re-surfaced as a standalone card.
+- **Post-restart guarantees**: the interactive surface state is persisted and re-adopted (2026-09-24 update) — a still-pending request keeps its pre-restart card, repainted, and never gets a second one. A card deleted while cola was down, or one whose persisted JSON is unusable, falls back to the standalone path; streaming content with no live block is still not persisted (a pre-restart card that carries no block may freeze).
 
 ## Risks / open questions
 
 - The two sources of truth (accumulator sections + registry/cache) need one mutation seam; without it they will drift. This is the main implementation risk.
 - The cached card is the same JSON Feishu already accepted, so a surgical edit stays under the card size cap.
 - The Interaction Receipt line adds a line to every card that hosted an interaction; if it proves noisy it can be collapsed or shortened later — presentation-level.
-- A click on a pre-restart card (the registry is empty after a restart) is best-effort: the request is still replied to, but that card may not repaint — the re-surfaced standalone card is the live surface for it.
+- A click on a pre-restart card is a first-class surface now (the handle is re-adopted); a click on a card the registry does not know (persistence off, or the card was never recorded) stays best-effort: the request is still replied to, but that card may not repaint.
 - The re-host on a new turn is rare (the busy guard prevents a new turn while a request is pending; it happens when a request outlives a cancelled/aborted turn) and needs a regression test.
+- The persisted record is written through on every registry mutation, so a crash between a card write and its mirror leaves the record one surface stale; the sweep's reconciliation (stale marking, vanished-block receipts) heals it on the next start.
 
 ## Domain note
 
@@ -125,3 +126,48 @@ normal path, it only bounds the stalled one. The request-reply calls that gate t
 (`REPLY_TIMEOUT`, `src/opencode/client.rs`), so a stalled backend surfaces as
 the existing retryable failure card inside the budget instead of riding the ack
 deadline.
+
+## Update (2026-09-24)
+
+The restart behavior the original Consequences and Out-of-scope accepted is
+replaced: the interactive surface state is **persisted and re-adopted** (#309),
+so a still-pending request keeps exactly one live surface across a `/restart`
+or a crash. The block registry, the per-message card-JSON cache and the
+standalone-card records are mirrored to `interactive_surfaces.json` beside
+`sessions.json` (best-effort, atomic temp-file replace, an empty record
+removes the file — the reminder's `pinned_chats.json` pattern) and written
+through on every registry mutation (`Surfaces`, `src/bridge/surfaces.rs`).
+The card JSON is written only when a card's live blocks change: a live block
+freezes the turn's content, so the header timer's re-flushes carry no new
+interactive state and must not rewrite the file every second.
+
+On startup `CardHandles` hydrates from the record and each flow seeds a
+one-shot `recovered` set from its kind's entries. The first sweep that lists a
+still-pending recovered request **re-adopts** its card instead of posting a
+second one (`RequestFlow::readopt_surface`): the kind remembers what a click
+needs (a question's full request), then the persisted card is PATCHed — for a
+question, with its block re-rendered from the state this process holds, so
+partial answers that did not survive the restart are not shown as selected.
+A recovered standalone card is already the live surface and is left as it is.
+A card that cannot be repainted (message deleted, unusable cached JSON) is
+forgotten and the request is surfaced as a standalone card in the same sweep.
+The kind's `prepare` deliberately does not run on the re-adoption path: a
+request the previous process left pending was not auto-accepted then, and
+re-adopting its card keeps the decision with the Host; auto-accept still
+applies to newly-listed requests.
+
+A click on a re-adopted card resolves exactly as before the restart: the
+handle registry names the clicked card, so the resolution edits its cached
+JSON and the ack carries it (rules 2+3). The flow's `inline` ack choice now
+also counts a card handle on the clicked card, so a question's partial answer
+refreshes it in place rather than replacing it with a standalone rebuild, and
+the directory fallback resolves through the persisted handle when neither the
+callback payload nor the session store names one.
+
+The sweep's reconciliation is unchanged and now runs on hydrated state too: a
+request resolved while cola was down has its block stamped
+`⏱ 已由其他客户端处理` from the cached JSON, and a standalone card is marked
+stale; either way the persisted record is removed as its surface resolves. A
+Session Snapshot adoption no longer embeds a request whose block has a card
+handle — a re-adopted card is already surfaced (ADR-0028's
+`is_already_surfaced`).

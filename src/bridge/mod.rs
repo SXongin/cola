@@ -18,6 +18,7 @@ pub mod session;
 pub mod snapshot;
 pub mod snapshot_claims;
 pub mod span;
+pub mod surfaces;
 pub mod topic;
 pub mod turn;
 

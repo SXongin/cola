@@ -478,6 +478,7 @@ pub(crate) async fn mark_stale_cards(
     platform: &Arc<dyn crate::feishu::Platform>,
     pending: &std::collections::HashSet<String>,
     sent: &Arc<Mutex<HashMap<String, SentCard>>>,
+    surfaces: &crate::bridge::surfaces::Surfaces,
     failed_dirs: &std::collections::HashSet<String>,
     kind: &str,
 ) {
@@ -494,6 +495,7 @@ pub(crate) async fn mark_stale_cards(
     };
     for (rid, mid, desc) in stale {
         sent.lock().await.remove(&rid);
+        surfaces.remove_standalone(&rid);
         let card = crate::feishu::card::notify::build_resolved_elsewhere_card(kind, &desc);
         if let Err(e) = platform.update_message(&mid, &card).await {
             tracing::warn!("mark stale {} card {}: {}", kind, rid, e);

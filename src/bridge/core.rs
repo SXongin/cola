@@ -193,16 +193,29 @@ impl SharedCore {
         feishu: Arc<dyn feishu::Platform>,
     ) -> anyhow::Result<Self> {
         let session_store = SessionStore::new(cfg.bridge.session_file.clone())?;
+        // The interactive surfaces a previous process persisted (ADR-0038
+        // restart re-adoption), beside the session mapping like the reminder's
+        // pin file. Loaded once here; the registry and both flows hydrate from
+        // it and write their mutations back through it.
+        let surfaces = Arc::new(crate::bridge::surfaces::Surfaces::load(
+            cfg.bridge
+                .session_file
+                .with_file_name("interactive_surfaces.json"),
+        ));
         Ok(Self {
             sessions: Arc::new(Mutex::new(session_store)),
             cards: Arc::new(Mutex::new(HashMap::new())),
-            card_handles: Arc::new(Mutex::new(crate::bridge::card_handles::CardHandles::default())),
-            permission: Arc::new(crate::bridge::request::flow::RequestFlow::new(Box::new(
-                crate::bridge::request::kind::PermissionKind,
-            ))),
-            question: Arc::new(crate::bridge::request::flow::RequestFlow::new(Box::new(
-                crate::bridge::request::kind::QuestionKind,
-            ))),
+            card_handles: Arc::new(Mutex::new(
+                crate::bridge::card_handles::CardHandles::with_surfaces(Arc::clone(&surfaces)),
+            )),
+            permission: Arc::new(crate::bridge::request::flow::RequestFlow::new(
+                Box::new(crate::bridge::request::kind::PermissionKind),
+                Arc::clone(&surfaces),
+            )),
+            question: Arc::new(crate::bridge::request::flow::RequestFlow::new(
+                Box::new(crate::bridge::request::kind::QuestionKind),
+                Arc::clone(&surfaces),
+            )),
             external: Arc::new(crate::bridge::external::ExternalFlow::new()),
             snapshot_claims: Arc::new(Mutex::new(
                 crate::bridge::snapshot_claims::SnapshotClaims::default(),

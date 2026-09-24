@@ -192,9 +192,14 @@ pub(crate) async fn resolve_blocks(
     // block) keep their entry; the sweep marks the standalone copy while this
     // seam settles the inline one.
     if matches!(origin, Origin::Click { .. }) {
-        let mut sent = flow.sent_cards.lock().await;
+        {
+            let mut sent = flow.sent_cards.lock().await;
+            for id in ids {
+                sent.remove(id);
+            }
+        }
         for id in ids {
-            sent.remove(id);
+            flow.surfaces.remove_standalone(id);
         }
     }
     // 1. The accumulator that still carries a block is the render source: a

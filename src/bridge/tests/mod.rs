@@ -23,5 +23,6 @@ pub(crate) mod session_routing;
 pub(crate) mod snapshot_follow;
 pub(crate) mod subtask;
 pub(crate) mod supplement;
+pub(crate) mod surfaces;
 pub(crate) mod switch;
 pub(crate) mod topic;
