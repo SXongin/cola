@@ -763,8 +763,11 @@ pub struct MockBackend {
     /// Per-session server status served by `session_status` (session_id →
     /// status). A missing key means idle (matches the server: a finished run is
     /// removed from the status map). `Some(None)` inside simulates a session
-    /// present but with an unrecognised status type (unknown).
-    pub session_statuses: std::collections::HashMap<String, Option<opencode::types::SessionStatus>>,
+    /// present but with an unrecognised status type (unknown). Behind a lock so
+    /// a test can flip a session Busy → Idle while a loop (e.g. the #284 drain
+    /// follow) is watching it.
+    pub session_statuses:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, Option<opencode::types::SessionStatus>>>>,
     /// When set, `session_status` fails with this message (simulates a read
     /// failure — the caller must not guess a status).
     pub session_status_error: Option<String>,
@@ -846,7 +849,7 @@ impl MockBackend {
             context_window: Some(100_000),
             context_window_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_model: None,
-            session_statuses: std::collections::HashMap::new(),
+            session_statuses: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             session_status_error: None,
             status_busy_once: std::sync::atomic::AtomicBool::new(false),
             prompt_scripts: Vec::new(),
@@ -1059,8 +1062,25 @@ impl MockBackend {
         session_id: &str,
         status: Option<opencode::types::SessionStatus>,
     ) -> &mut Self {
-        self.session_statuses.insert(session_id.to_string(), status);
+        self.session_statuses
+            .try_lock()
+            .expect("with_session_status before the app is built")
+            .insert(session_id.to_string(), status);
         self
+    }
+
+    /// Scenario: update the server's live status for `session_id` AFTER the
+    /// app is built — e.g. a session that was Busy during the drain goes Idle
+    /// while the out-of-turn follow watches it (#284).
+    pub(crate) async fn set_session_status(
+        &self,
+        session_id: &str,
+        status: Option<opencode::types::SessionStatus>,
+    ) {
+        self.session_statuses
+            .lock()
+            .await
+            .insert(session_id.to_string(), status);
     }
 
     /// Scenario: the server's title for `session_id` (the render poll's
@@ -1648,7 +1668,7 @@ impl opencode::Backend for MockBackend {
         }
         // A scripted entry is served verbatim (`Some(None)` → unknown); a
         // missing key means idle (the server removes finished runs).
-        Ok(match self.session_statuses.get(session_id) {
+        Ok(match self.session_statuses.lock().await.get(session_id) {
             Some(status) => *status,
             None => Some(opencode::types::SessionStatus::Idle),
         })

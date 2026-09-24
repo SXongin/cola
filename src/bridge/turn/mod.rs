@@ -1,4 +1,5 @@
 mod flush;
+mod follow;
 mod render;
 mod state;
 
@@ -444,7 +445,10 @@ impl Turn {
     /// that missed the running run starts a new Turn on the server, and the
     /// drain keeps the render poll alive (still holding the inflight guard, so
     /// a further message is treated as a Supplement) until that Turn is
-    /// answered — then the card is marked Done and the guard released.
+    /// answered — then the card is marked Done and the guard released. A drain
+    /// that runs out its bound while the session is still running is NOT
+    /// completion (#284): the guard is released, but the card is handed to the
+    /// out-of-turn [`follow`], which finalizes it when the session goes idle.
     async fn finish(
         &mut self,
         handles: &TurnHandles,
@@ -454,12 +458,28 @@ impl Turn {
         // racing the drain's exit is drained here rather than dropped, and one
         // that lands after the release becomes a normal new Turn on the
         // handler's not-busy path.
-        self.drain_after_prompt(handles).await;
+        let drain_outcome = self.drain_after_prompt(handles).await;
 
         let prompt_err = match prompt_resp {
             Ok(r) => r.error.clone(),
             Err(e) => Some(e.to_string()),
         };
+
+        // #284: a drain bound reached while the session is still running is NOT
+        // completion. The turn ends as usual (the guard is released below, so
+        // the next message is a normal new Turn), but its card must not be
+        // marked Done from a snapshot that still shows running tools: it is
+        // handed to the out-of-turn follow, which keeps rendering the SAME
+        // accumulator and card chain until the session reports non-busy (or the
+        // follow's own ceiling ends it in Error). The anchor is the follow's
+        // identity: without one there is no card content to follow, so the
+        // turn ends the normal way.
+        let follow_anchor = if prompt_err.is_none() && drain_outcome == Some(DrainState::Running) {
+            Turn::armed_turn_anchor(&handles.cards, &self.session_id).await
+        } else {
+            None
+        };
+        let follow = follow_anchor.is_some();
 
         // #187: a turn that ended without completing (abort, interrupt, prompt
         // error) leaves every still-pending Permission/Question behind with a
@@ -479,80 +499,92 @@ impl Turn {
             .await;
         }
 
-        // Reconcile: render any parts the incremental poll missed, then mark the
-        // card Done (or Error). Fall back to the response parts if the fetch fails.
-        let final_msgs = handles.backend.messages(&self.session_id).await.ok();
-        {
-            let mut cards = handles.cards.cards.lock().await;
-            if let Some(acc) = cards.get_mut(&self.session_id).map(|c| &mut c.acc) {
-                if let Ok(resp) = prompt_resp {
-                    let mut rendered = false;
+        // The Turn Footer's variant is a fact of THIS turn (captured at send
+        // time, ADR-0019), and `self` is gone once the follow owns the card —
+        // apply it before either end. The model/token halves are captured from
+        // the messages themselves, so the follow's renders keep them current.
+        if let Some(card) = handles.cards.cards.lock().await.get_mut(&self.session_id) {
+            card.acc.variant = self.turn_variant.clone();
+        }
+
+        // A followed card is NOT finalized here: the follow owns it now. Its
+        // render ticks keep the footer's context window current, and its own
+        // finalization refreshes the work context and flushes. Everything
+        // below the guard is the normal end of a turn.
+        if !follow {
+            // Reconcile: render any parts the incremental poll missed, then mark
+            // the card Done (or Error). Fall back to the response parts if the
+            // fetch fails.
+            let final_msgs = handles.backend.messages(&self.session_id).await.ok();
+            {
+                let mut cards = handles.cards.cards.lock().await;
+                if let Some(acc) = cards.get_mut(&self.session_id).map(|c| &mut c.acc) {
+                    if let Ok(resp) = prompt_resp {
+                        let mut rendered = false;
+                        if let Some(msgs) = &final_msgs {
+                            rendered = render::render_new_turn_parts(acc, msgs);
+                        }
+                        if !rendered {
+                            render::render_parts(acc, &resp.parts);
+                        }
+                    }
+                    // Capture the answering model + token usage from the LATEST
+                    // assistant message unconditionally — the render dedup may have
+                    // captured them before the message carried its final tokens.
+                    // Usage only when nonzero: an in-flight step's message carries
+                    // zeros and must not wipe the last completed step's figure.
                     if let Some(msgs) = &final_msgs {
-                        rendered = render::render_new_turn_parts(acc, msgs);
-                    }
-                    if !rendered {
-                        render::render_parts(acc, &resp.parts);
-                    }
-                }
-                // Capture the answering model + token usage from the LATEST
-                // assistant message unconditionally — the render dedup may have
-                // captured them before the message carried its final tokens.
-                // Usage only when nonzero: an in-flight step's message carries
-                // zeros and must not wipe the last completed step's figure.
-                if let Some(msgs) = &final_msgs {
-                    let latest_assistant = msgs.iter().rfind(|m| m.info.role.as_deref() == Some("assistant"));
-                    if let Some(m) = latest_assistant {
-                        if let Some(model_id) = &m.info.model_id {
-                            acc.model_id = Some(model_id.clone());
-                        }
-                        if let Some(provider_id) = &m.info.provider_id {
-                            acc.provider_id = Some(provider_id.clone());
-                        }
-                        if let Some(tokens) = &m.info.tokens {
-                            let used = tokens.context_used();
-                            if used > 0 {
-                                acc.context_tokens = used;
+                        let latest_assistant =
+                            msgs.iter().rfind(|m| m.info.role.as_deref() == Some("assistant"));
+                        if let Some(m) = latest_assistant {
+                            if let Some(model_id) = &m.info.model_id {
+                                acc.model_id = Some(model_id.clone());
+                            }
+                            if let Some(provider_id) = &m.info.provider_id {
+                                acc.provider_id = Some(provider_id.clone());
+                            }
+                            if let Some(tokens) = &m.info.tokens {
+                                let used = tokens.context_used();
+                                if used > 0 {
+                                    acc.context_tokens = used;
+                                }
                             }
                         }
                     }
+                    if let Some(err) = &prompt_err {
+                        acc.error = Some(err.clone());
+                        acc.card_state = crate::feishu::card::CardState::Error;
+                    } else {
+                        acc.card_state = crate::feishu::card::CardState::Done;
+                    }
+                    tracing::info!(
+                        "final render: fetched_msgs={} text={} reasoning={} tools={} rendered_parts={} error={}",
+                        final_msgs.as_ref().map(|m| m.len()).unwrap_or(0),
+                        acc.text.len(),
+                        acc.reasoning.len(),
+                        acc.tools.len(),
+                        acc.rendered_parts.len(),
+                        acc.error.as_deref().unwrap_or("none"),
+                    );
                 }
-                // The footer model line shows `provider/model@variant`: the
-                // server reports the model but not the variant, so the variant
-                // comes from what cola actually sent this turn.
-                acc.variant = self.turn_variant.clone();
-                if let Some(err) = &prompt_err {
-                    acc.error = Some(err.clone());
-                    acc.card_state = crate::feishu::card::CardState::Error;
-                } else {
-                    acc.card_state = crate::feishu::card::CardState::Done;
-                }
-                tracing::info!(
-                    "final render: fetched_msgs={} text={} reasoning={} tools={} rendered_parts={} error={}",
-                    final_msgs.as_ref().map(|m| m.len()).unwrap_or(0),
-                    acc.text.len(),
-                    acc.reasoning.len(),
-                    acc.tools.len(),
-                    acc.rendered_parts.len(),
-                    acc.error.as_deref().unwrap_or("none"),
-                );
             }
+            // Refresh the Turn Footer's work context at turn end (ADR-0019): the AI
+            // may have created or switched branches, or committed, so re-read the
+            // git state before the final flush — the footer shows where the turn
+            // landed, not just where it started.
+            crate::bridge::turn::state::refresh_work_context(&handles.cards, &self.session_id).await;
+            // Refresh the Turn Footer's context window (ADR-0044) before the final
+            // flush: the render-poll refresh usually covered it, but the reconcile
+            // above may have just captured a final usage the polls never saw. Runs
+            // on a failed prompt too — the card already carries that usage.
+            crate::bridge::turn::state::refresh_context_window(
+                &handles.cards,
+                &handles.backend,
+                &self.session_id,
+            )
+            .await;
+            Self::flush_card(&handles.cards, &self.session_id).await;
         }
-        // Refresh the Turn Footer's work context at turn end (ADR-0019): the AI
-        // may have created or switched branches, or committed, so re-read the
-        // git state before the final flush — the footer shows where the turn
-        // landed, not just where it started.
-        crate::bridge::turn::state::refresh_work_context(&handles.cards, &self.session_id).await;
-        // Refresh the Turn Footer's context window (ADR-0044) before the final
-        // flush: the render-poll refresh usually covered it, but the reconcile
-        // above may have just captured a final usage the polls never saw. Runs
-        // on a failed prompt too — the card already carries that usage.
-        crate::bridge::turn::state::refresh_context_window(
-            &handles.cards,
-            &handles.backend,
-            &self.session_id,
-        )
-        .await;
-        Self::flush_card(&handles.cards, &self.session_id).await;
 
         // Topic cover card (ADR-0023): once the server holds a real title for
         // the session — auto-generated after the first exchange, or set by
@@ -588,58 +620,30 @@ impl Turn {
         // Completion notice (ADR-0043 amendment 2026-09-21): the streaming
         // card is patched in place, which pushes no notification and does not
         // bump the conversation — so reply to the requester's message to
-        // notify them. Groups notify on every turn (`[bridge]
-        // group_completion_notice`); p2p only for a long task
-        // (`[bridge] long_task_notice`, past the injected threshold), where
-        // "long" is the one event worth surfacing even though the user was
-        // presumably around.
-        if handles.config.group_completion_notice || handles.config.long_task_notice {
-            let notice = {
-                let cards = handles.cards.cards.lock().await;
-                cards.get(&self.session_id).map(|c| &c.acc).and_then(|a| {
-                    let requester = a.requester_open_id.clone()?;
-                    let reply_to = a.reply_to_message_id.clone()?;
-                    let long_task = self.started_at.elapsed()
-                        >= std::time::Duration::from_millis(handles.config.long_task_notice_ms());
-                    if !(a.is_group && handles.config.group_completion_notice
-                        || !a.is_group && handles.config.long_task_notice && long_task)
-                    {
-                        return None;
-                    }
-                    Some((
-                        reply_to,
-                        requester,
-                        a.is_group,
-                        a.card_state == crate::feishu::card::CardState::Error,
-                    ))
-                })
-            };
-            if let Some((reply_to, requester, is_group, is_error)) = notice {
-                let text = if is_error {
-                    "❌ 上一条请求处理出错了，可点击卡片上的「重试」。"
-                } else {
-                    "✅ 已完成。"
-                };
-                // Best-effort @-mention: the display name needs the contact API
-                // (permission granted). On any lookup failure cola falls back to
-                // a plain reply, which still notifies the message author. p2p
-                // needs no @ — the reply itself is the notification.
-                let name = if is_group {
-                    handles.platform.user_name(&requester).await.unwrap_or(None)
-                } else {
-                    None
-                };
-                if let Err(e) = handles
-                    .platform
-                    .reply_completion_notice(&reply_to, &requester, name.as_deref(), text)
-                    .await
-                {
-                    tracing::warn!("completion notice: {}", e);
-                }
-            }
+        // notify them. A followed turn notifies when the FOLLOW finalizes (its
+        // real end), not at the drain bound.
+        if !follow {
+            send_completion_notice(handles, &self.session_id, self.started_at).await;
         }
 
         self.release(handles).await;
+        // The guard is released before the follow arms, exactly as the old
+        // finalization released it: a message arriving now is a normal new Turn
+        // (which replaces the accumulator and ends the follow on its next tick).
+        if let Some(turn_anchor_ms) = follow_anchor {
+            tracing::info!(
+                "turn drain: bound with session {} running; handing off to the follow",
+                self.session_id
+            );
+            follow::spawn(
+                handles,
+                self.session_id.clone(),
+                self.thread_key.clone(),
+                self.directory.clone(),
+                self.started_at,
+                turn_anchor_ms,
+            );
+        }
         // Permissions are handled by the independent poller spawned in App::run,
         // so a prompt blocked on a permission still gets its card shown.
     }
@@ -664,8 +668,14 @@ impl Turn {
     /// a session that merely stays busy cannot extend finalization. A
     /// Supplement that lands after the release is seen by the handler's
     /// not-busy path and becomes a normal new Turn.
-    async fn drain_after_prompt(&mut self, handles: &TurnHandles) {
-        self.drain(handles).await;
+    ///
+    /// Returns the state the last drain observed at its bound when that was
+    /// still pending (`Some(Running)` / `Some(Supplement)`), `None` when the
+    /// drain settled or never saw anything pending. `finish` turns
+    /// bound-with-`Running` into the out-of-turn follow (#284) instead of
+    /// finalizing a card under a live session.
+    async fn drain_after_prompt(&mut self, handles: &TurnHandles) -> Option<DrainState> {
+        let last = self.drain(handles).await;
         if self
             .drain_tick(handles, drain_request_timeout(drain_deadline(handles)))
             .await
@@ -675,8 +685,9 @@ impl Turn {
                 "turn drain: supplement racing the finish on session {}; draining",
                 self.session_id
             );
-            self.drain(handles).await;
+            return self.drain(handles).await;
         }
+        last
     }
 
     /// Poll the Backend, render it into the live card, and stop when nothing
@@ -685,22 +696,26 @@ impl Turn {
     /// dropping the drain on one transient error would lose the reply this
     /// phase exists to render. Each request is bounded by the remaining drain
     /// budget, so a hung Backend cannot hold the drain past the bound.
-    async fn drain(&mut self, handles: &TurnHandles) {
+    ///
+    /// `Some(state)` means the bound was reached with `state` the last thing
+    /// observed — the caller must not read it as completion (#284); `None`
+    /// means the drain settled, stopped, or never observed anything pending.
+    async fn drain(&mut self, handles: &TurnHandles) -> Option<DrainState> {
         let poll_ms = handles.config.render_poll_ms();
         let deadline = drain_deadline(handles);
-        let mut observed_pending = false;
+        let mut last: Option<DrainState> = None;
         loop {
             // The first check runs before any sleep: a Supplement that missed
             // the run is already on the Backend when the prompt returns.
             match self.drain_tick(handles, drain_request_timeout(deadline)).await {
-                Some(DrainState::Settled) => return,
-                Some(_) => observed_pending = true,
-                None if !observed_pending => return,
+                Some(DrainState::Settled) => return None,
+                Some(state) => last = Some(state),
+                None if last.is_none() => return None,
                 None => {}
             }
             if tokio::time::Instant::now() >= deadline {
                 tracing::info!("turn drain: bound reached on session {}", self.session_id);
-                return;
+                return last;
             }
             tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
         }
@@ -1046,6 +1061,23 @@ impl Turn {
             .is_some_and(|c| !c.acc.rendered_parts.is_empty() || !c.acc.rendered_tool_states.is_empty())
     }
 
+    /// Whether the session's card still carries an unfinished Tool Panel — a
+    /// call whose status is `running` or `pending` (both render `⏳`). The
+    /// drain follow's Done decision waits for these to settle (#284): the card
+    /// must never read `✅ 完成` over a `⏳` panel.
+    pub(crate) async fn has_live_tools(cards: &CardsHandle, session_id: &str) -> bool {
+        cards.cards.lock().await.get(session_id).is_some_and(|c| {
+            c.acc
+                .tools
+                .values()
+                .any(crate::feishu::card::tool_render::ToolPanel::is_live)
+                || c.acc
+                    .todo_panel
+                    .as_ref()
+                    .is_some_and(crate::feishu::card::tool_render::ToolPanel::is_live)
+        })
+    }
+
     /// Mark the session's card Done in place (no flush).
     pub(crate) async fn mark_done(cards: &CardsHandle, session_id: &str) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
@@ -1074,6 +1106,19 @@ impl Turn {
     pub(crate) async fn finalize_done(cards: &CardsHandle, session_id: &str) {
         Self::refresh_work_context(cards, session_id).await;
         Self::mark_done(cards, session_id).await;
+        Self::flush_card(cards, session_id).await;
+    }
+
+    /// Finalize a followed card as Error: record `error`, mark it Error and
+    /// flush it. Used by the out-of-turn drain follow (#284) when its ceiling is
+    /// reached with the session still running — the card must never read Done
+    /// while a tool panel is still running.
+    pub(crate) async fn finalize_error(cards: &CardsHandle, session_id: &str, error: &str) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.error = Some(error.to_string());
+            card.acc.card_state = crate::feishu::card::CardState::Error;
+        }
+        Self::refresh_work_context(cards, session_id).await;
         Self::flush_card(cards, session_id).await;
     }
 
@@ -1354,6 +1399,67 @@ impl Turn {
 async fn release_inflight(handles: &TurnHandles, session_id: &str) {
     let mut inflight = handles.waits.inflight.lock().await;
     inflight.remove(session_id);
+}
+
+/// The completion notice (ADR-0043 amendment 2026-09-21): the streaming card is
+/// patched in place, which pushes no notification and does not bump the
+/// conversation — so reply to the requester's message to notify them. Groups
+/// notify on every turn (`[bridge] group_completion_notice`); p2p only for a
+/// long task (`[bridge] long_task_notice`, past the injected threshold), where
+/// "long" is the one event worth surfacing even though the user was presumably
+/// around.
+///
+/// A free function because both ends of a turn call it: `finish` for a turn
+/// that ended normally, and the out-of-turn drain follow (#284) when the turn
+/// it inherited actually ends — `started_at` stays the ORIGINAL turn's start,
+/// so the long-task threshold measures the whole run.
+async fn send_completion_notice(handles: &TurnHandles, session_id: &str, started_at: std::time::Instant) {
+    if !(handles.config.group_completion_notice || handles.config.long_task_notice) {
+        return;
+    }
+    let notice = {
+        let cards = handles.cards.cards.lock().await;
+        cards.get(session_id).map(|c| &c.acc).and_then(|a| {
+            let requester = a.requester_open_id.clone()?;
+            let reply_to = a.reply_to_message_id.clone()?;
+            let long_task = started_at.elapsed()
+                >= std::time::Duration::from_millis(handles.config.long_task_notice_ms());
+            if !(a.is_group && handles.config.group_completion_notice
+                || !a.is_group && handles.config.long_task_notice && long_task)
+            {
+                return None;
+            }
+            Some((
+                reply_to,
+                requester,
+                a.is_group,
+                a.card_state == crate::feishu::card::CardState::Error,
+            ))
+        })
+    };
+    if let Some((reply_to, requester, is_group, is_error)) = notice {
+        let text = if is_error {
+            "❌ 上一条请求处理出错了，可点击卡片上的「重试」。"
+        } else {
+            "✅ 已完成。"
+        };
+        // Best-effort @-mention: the display name needs the contact API
+        // (permission granted). On any lookup failure cola falls back to a
+        // plain reply, which still notifies the message author. p2p needs no
+        // @ — the reply itself is the notification.
+        let name = if is_group {
+            handles.platform.user_name(&requester).await.unwrap_or(None)
+        } else {
+            None
+        };
+        if let Err(e) = handles
+            .platform
+            .reply_completion_notice(&reply_to, &requester, name.as_deref(), text)
+            .await
+        {
+            tracing::warn!("completion notice: {}", e);
+        }
+    }
 }
 
 /// The Turn's test seam (spec #298, A3): the fixtures tests outside the Turn

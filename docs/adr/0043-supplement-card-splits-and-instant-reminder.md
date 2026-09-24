@@ -393,3 +393,47 @@ settled).
 
 Source: #244 cost/benefit evaluation with the product owner; approval of the
 minimal explicit-command form.
+
+## Amendment (2026-09-24): the drain bound hands the card to an out-of-turn follow
+
+The Decision above says the render loop stays alive while the session is still
+running, and the drain's fixed bound (10 min, `turn_drain_timeout_ms`) was read
+as completion: at the bound `finish` finalized the card Done from a snapshot
+that could still show running tools, freezing every `⏳` panel under a `✅`
+header and losing all work after the bound (#284; observed live on a Supplement
+whose `task` subagents outlived the budget by 1.6 s).
+
+- **A bound reached with the session still running is not completion.** The
+  turn ends exactly as before — the inflight guard is released, so the next
+  message is a normal new Turn — but the card is not finalized. It is handed to
+  an out-of-turn follow that keeps the SAME accumulator and Card Chain, renders
+  on the same injected poll cadence, and finalizes Done only when the session
+  reports a non-busy status.
+- **The follow is bounded by its own ceiling** (`turn_follow_timeout_ms`,
+  default 10 min, injectable). A session still running — or a Backend still
+  unreadable — at that ceiling finalizes Error: never Done under a running
+  panel, never an eternal spinner. `/stop` ends the follow promptly through the
+  same sticky stopped-session marker the drain observes, with the same final
+  reconcile before the Done card.
+- **The completion notice belongs to the follow's end** when it owns the card,
+  so 「✅ 已完成」 is only ever sent for a run that actually ended. The topic
+  cover is synced once at the hand-off (starting its title-retry window there)
+  and kept current by the follow's render ticks, which already sync it whenever
+  the server title changes. A new Turn (or an external arming) replaces the
+  accumulator and the follow exits on its next tick — the replacement guard the
+  external render loop already uses.
+- **Done waits for the panels, not just the status.** A non-busy session whose
+  accumulator still carries a `running`/`pending` panel (a crash-orphaned tool)
+  keeps the follow watching instead of stamping `✅ 完成` over a `⏳`; the
+  ceiling then ends it Error. `/stop` is the deliberate exception: it closes the
+  card promptly, after one last render of the abort's settled tool states.
+- The external-renderer arming path is NOT reused: it builds a fresh
+  accumulator, which would drop the Supplement's continuation card. The follow
+  lives in the Turn (`turn/follow.rs`) because the card, its chain and its
+  accumulator are the Turn's own state (ADR-0050).
+
+Rejected: raising the bound (moves the threshold, same failure mode one budget
+later); not releasing the guard while busy (the bound exists precisely so a
+merely-busy session cannot hold the guard).
+
+Source: #284.
