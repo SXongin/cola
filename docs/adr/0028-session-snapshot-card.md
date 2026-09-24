@@ -1,5 +1,11 @@
 # Session Snapshot: a read-only state card when a session is taken over
 
+> **Amended by ADR-0052**: a snapshot (and the suppressed 已切换 state card)
+> built from the `/switch` list carries an optional 「返回列表」 button holding
+> that list's keyword/scope/page, so an adoption can return to its filter. The
+> one-card rule and the read-only invariants are unchanged — the button is
+> navigation, not session state.
+
 Taking over a session — first `/switch` to a foreign session, `/attach`, `/topic --adopt`, or a re-`/switch` back to a mapped session — makes it the thread's Active Session but tells the operator nothing about it. The takeover target may have been driven elsewhere (OpenChamber, CLI) or long ago: its recent turns, whether the last turn finished, and any blocked Permission/Question are all unknown. The confirmation messages that exist today are bare text, so the operator starts typing blind.
 
 ## Context

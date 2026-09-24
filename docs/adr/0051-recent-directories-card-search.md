@@ -1,5 +1,11 @@
 # Recent Directories card gains a keyword search over directory paths
 
+> **Amended by ADR-0052**: both cards paginate six rows per page and every list
+> rebuild — row actions included — carries the active keyword (plus scope and
+> page on `/switch`), so a keyword DOES survive a row action; the overflow
+> hints this ADR introduced are replaced by the pager's 「第 x/y 页 · 共 N 个」.
+> The search form, its conditional visibility, and the match rules stand.
+
 The `/dir` Recent Directories picker now carries a search box — rendered only
 when the directory list outgrows the card's six-row budget, or a keyword is
 already active. The keyword filters the same union the card already renders,

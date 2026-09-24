@@ -6,6 +6,9 @@
 > searchable, and the overflow hint points at the search box. The union, its
 > order, and the current-directory insertion stand; the insertion applies to
 > the unfiltered list, and a keyword can drop the current directory's row.
+>
+> **Also amended by ADR-0052**: the card paginates six rows per page and no
+> longer prints an overflow hint — the pager's 「第 x/y 页 · 共 N 个」 carries it.
 
 The `/dir` Recent Directories picker derived its rows exclusively from the
 Shared Store's session list: a directory left the card the moment its last
