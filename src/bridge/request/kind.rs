@@ -146,6 +146,25 @@ pub trait RequestKind: Send + Sync {
     /// nothing: a kind with no in-flight state has nothing to remember.
     async fn remember_surfaced(&self, _flow: &RequestFlow, _req: &PendingRequest, _dir: &str) {}
 
+    /// The card JSON to repaint when the restart re-adoption re-hosts this
+    /// kind's block on a card whose accumulator is gone (ADR-0038 restart
+    /// re-adoption). Defaults to the cached JSON as-is: a kind whose block is
+    /// deterministic from the request (a permission) has nothing to refresh.
+    /// A kind with remembered display state (a question) overrides this to
+    /// re-render the block from that state — its partial answers did not
+    /// survive the restart, so the card must not keep showing them. `None`
+    /// when the cached JSON cannot render the block.
+    async fn refresh_cached_block(
+        &self,
+        _flow: &RequestFlow,
+        cards: &CardsHandle,
+        message_id: &str,
+        _req: &PendingRequest,
+        _dir: &str,
+    ) -> Option<serde_json::Value> {
+        cards.card_handles.lock().await.cached_card(message_id)
+    }
+
     /// Add this kind's inline block to the `host` card (the poller path and
     /// the cross-turn re-host). Permissions rebuild deterministically from the
     /// request; questions restore their remembered partial state (已选 /
@@ -821,6 +840,43 @@ impl RequestKind for QuestionKind {
         }
     }
 
+    async fn refresh_cached_block(
+        &self,
+        flow: &RequestFlow,
+        cards: &CardsHandle,
+        message_id: &str,
+        req: &PendingRequest,
+        dir: &str,
+    ) -> Option<serde_json::Value> {
+        let PendingRequest::Question(q) = req else {
+            return None;
+        };
+        // Re-render the block from the state this process holds (empty after a
+        // restart): the persisted card may show 已选 markers whose toggles did
+        // not survive, and a card that lies about a selection is worse than an
+        // un-answered one.
+        let (display, done) = flow
+            .with_question_state(&q.id, |state| {
+                let (_, display, done) = state.merge();
+                (display, done)
+            })
+            .await
+            .unwrap_or_else(|| (vec![None; q.questions.len()], vec![false; q.questions.len()]));
+        let elements = crate::feishu::card::question::question_elements(
+            &q.id,
+            &q.session_id,
+            &q.questions,
+            dir,
+            &display,
+            &done,
+        );
+        cards
+            .card_handles
+            .lock()
+            .await
+            .refresh_on(message_id, &q.id, elements)
+    }
+
     async fn add_inline(
         &self,
         flow: &RequestFlow,
@@ -1331,12 +1387,14 @@ async fn settle_question_reply(
         Ok(()) => {
             flow.remove_question(req_id).await;
             flow.sent_cards.lock().await.remove(req_id);
+            flow.surfaces.remove_standalone(req_id);
             None
         }
         Err(e) if e.is_not_found() => {
             tracing::info!("Question already resolved: {}", e);
             flow.remove_question(req_id).await;
             flow.sent_cards.lock().await.remove(req_id);
+            flow.surfaces.remove_standalone(req_id);
             // The click found the request gone: leave the neutral "handled
             // elsewhere" receipt on the clicked card, carried in the ack like
             // any other resolution (ADR-0038, rules 3+4).

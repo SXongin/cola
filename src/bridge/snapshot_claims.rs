@@ -9,7 +9,7 @@ use crate::feishu::snapshot_card::SnapshotQuestionState;
 /// Which request kind a snapshot claim hosts (ADR-0028). One registry holds
 /// both kinds' claims, and each flow's poll sweep only drops claims of its own
 /// kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ClaimKind {
     Permission,
     Question,
@@ -256,10 +256,11 @@ impl SnapshotClaims {
 }
 
 /// Whether a pending request is already surfaced elsewhere — a standalone card
-/// in a flow's `sent_cards`, an inline section on a live streaming card, or a
-/// block on an EARLIER snapshot (re-switch dedupe). Such a request must NOT be
-/// embedded/claimed by a snapshot: the existing card stays authoritative
-/// (ADR-0028).
+/// in a flow's `sent_cards`, an inline section on a live streaming card (its
+/// accumulator, or the card handle that outlives it — e.g. a re-adopted card
+/// after a restart), or a block on an EARLIER snapshot (re-switch dedupe). Such
+/// a request must NOT be embedded/claimed by a snapshot: the existing card
+/// stays authoritative (ADR-0028).
 pub(crate) async fn is_already_surfaced(
     requests: &RequestsHandle,
     cards: &CardsHandle,
@@ -275,6 +276,9 @@ pub(crate) async fn is_already_surfaced(
         return true;
     }
     if requests.snapshot_claims.lock().await.contains(req.id()) {
+        return true;
+    }
+    if cards.card_handles.lock().await.message_of(req.id()).is_some() {
         return true;
     }
     Turn::has_interaction(cards, req.id()).await

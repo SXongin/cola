@@ -1,12 +1,14 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::bridge::snapshot_claims::ClaimKind;
+use crate::bridge::surfaces::{InlineSurface, Surfaces};
 
 /// The body-element range one live interaction block occupies on a built card.
 /// Recorded at render time so the card handle can resolve or refresh the block
 /// in place on the cached JSON, long after the accumulator that rendered it is
 /// gone (ADR-0038, rule 2).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockSpan {
     pub request_id: String,
     pub start: usize,
@@ -52,13 +54,88 @@ struct CachedCard {
 /// insert path, `resolve_on`/`refresh_on`/`drop_vanished` the only edit paths,
 /// and a card's cache is released once no live block references it — so the
 /// registry cannot drift from what the cards actually render.
+///
+/// Every mutation is mirrored to the persisted [`Surfaces`] store (ADR-0038
+/// restart re-adoption), and `with_surfaces` hydrates the registry from it at
+/// startup. `surfaces: None` (the `Default`) is the in-memory registry unit
+/// tests use.
 #[derive(Default)]
 pub struct CardHandles {
     blocks: HashMap<String, BlockHandle>,
     cards: HashMap<String, CachedCard>,
+    surfaces: Option<Arc<Surfaces>>,
 }
 
 impl CardHandles {
+    /// The registry hydrated from the persisted record, with the write-through
+    /// mirror armed — the construction `SharedCore` uses at startup. The
+    /// record was parsed at load ([`Surfaces::load`]); the sweep reconciles
+    /// the rest (a request no longer pending is stamped stale, an orphan cache
+    /// is released by its next edit).
+    pub fn with_surfaces(surfaces: Arc<Surfaces>) -> Self {
+        let state = surfaces.snapshot();
+        let blocks = state
+            .inline
+            .into_iter()
+            .map(|(request_id, s)| {
+                (
+                    request_id,
+                    BlockHandle {
+                        message_id: s.message_id,
+                        kind: s.kind,
+                        session_id: s.session_id,
+                        directory: s.directory,
+                        target: s.target,
+                    },
+                )
+            })
+            .collect();
+        let cards = state
+            .cards
+            .into_iter()
+            .map(|(message_id, c)| {
+                (
+                    message_id,
+                    CachedCard {
+                        card: c.card,
+                        spans: c.spans,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            blocks,
+            cards,
+            surfaces: Some(surfaces),
+        }
+    }
+
+    /// Mirror the current registry state of `message_id` — its cached JSON,
+    /// spans and live blocks — to the persisted store. A no-op without a store.
+    fn mirror(&self, message_id: &str) {
+        let Some(surfaces) = &self.surfaces else { return };
+        let Some(card) = self.cards.get(message_id) else {
+            surfaces.remove_card(message_id);
+            return;
+        };
+        surfaces.set_card(message_id, &card.card, &card.spans);
+        for span in &card.spans {
+            let Some(handle) = self.blocks.get(&span.request_id) else {
+                continue;
+            };
+            surfaces.set_inline(
+                &span.request_id,
+                InlineSurface {
+                    message_id: message_id.to_string(),
+                    kind: handle.kind,
+                    session_id: handle.session_id.clone(),
+                    directory: handle.directory.clone(),
+                    target: handle.target.clone(),
+                },
+            );
+        }
+    }
+
     /// Record a just-sent card: cache its JSON and point every live block it
     /// renders at it. Called for every card the flush sends — the live card
     /// update and each continuation — so after a split the blocks follow the
@@ -70,6 +147,7 @@ impl CardHandles {
     pub fn record(&mut self, message_id: &str, card: &serde_json::Value, rendered: Vec<RenderedBlock>) {
         if rendered.is_empty() {
             self.cards.remove(message_id);
+            self.mirror(message_id);
             return;
         }
         let mut spans = Vec::with_capacity(rendered.len());
@@ -97,6 +175,7 @@ impl CardHandles {
                 spans,
             },
         );
+        self.mirror(message_id);
     }
 
     /// The card currently showing `request_id`'s live block.
@@ -108,6 +187,26 @@ impl CardHandles {
     /// when the accumulator no longer carries the block.
     pub fn target_of(&self, request_id: &str) -> Option<&str> {
         self.blocks.get(request_id).map(|h| h.target.as_str())
+    }
+
+    /// The owning directory recorded for `request_id`'s block — the fallback a
+    /// card callback resolves its reply target from when neither the payload
+    /// nor the session store names one (a re-adopted card after a restart).
+    pub fn directory_of(&self, request_id: &str) -> Option<&str> {
+        self.blocks.get(request_id).map(|h| h.directory.as_str())
+    }
+
+    /// Whether the cached card `message_id` renders `request_id`'s live block.
+    pub fn renders(&self, message_id: &str, request_id: &str) -> bool {
+        self.cards
+            .get(message_id)
+            .is_some_and(|card| card.spans.iter().any(|s| s.request_id == request_id))
+    }
+
+    /// The cached JSON of `message_id`, when it renders at least one live
+    /// block — the restart re-adoption's repaint source.
+    pub fn cached_card(&self, message_id: &str) -> Option<serde_json::Value> {
+        self.cards.get(message_id).map(|card| card.card.clone())
     }
 
     /// Every cached card that still renders `request_id`'s block: the
@@ -126,6 +225,9 @@ impl CardHandles {
     /// block leaves (through `record` or an edit).
     pub fn forget(&mut self, request_id: &str) {
         self.blocks.remove(request_id);
+        if let Some(surfaces) = &self.surfaces {
+            surfaces.remove_inline(request_id);
+        }
     }
 
     /// Resolve a block on the cached card `message_id`: its elements are
@@ -184,6 +286,9 @@ impl CardHandles {
         let span = card.spans.remove(idx);
         let new_end = span.start + elements.len();
         if !replace_elements(&mut card, &span, elements) {
+            // The cached JSON is not the shape the renderer wrote: drop the
+            // unusable handle, in memory and in the persisted record.
+            self.mirror(message_id);
             return None;
         }
         if keep_span {
@@ -197,6 +302,7 @@ impl CardHandles {
         if !card.spans.is_empty() {
             self.cards.insert(message_id.to_string(), card);
         }
+        self.mirror(message_id);
         Some(edited)
     }
 
@@ -239,6 +345,9 @@ impl CardHandles {
             let Some(handle) = self.blocks.remove(&id) else {
                 continue;
             };
+            if let Some(surfaces) = &self.surfaces {
+                surfaces.remove_inline(&id);
+            }
             let message_id = handle.message_id;
             tracing::info!(
                 "block {} resolved on its card handle (session {}, card {})",
