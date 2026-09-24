@@ -564,6 +564,8 @@ pub(crate) struct TurnConfig {
     pub(crate) turn_render_poll_ms: Arc<AtomicU64>,
     /// Bound on a Turn's post-prompt drain (ms); injectable for tests.
     pub(crate) turn_drain_timeout_ms: Arc<AtomicU64>,
+    /// Ceiling on the out-of-turn drain follow (ms, #284); injectable for tests.
+    pub(crate) turn_follow_timeout_ms: Arc<AtomicU64>,
     /// Default directory for new sessions (from `[bridge] work_dir`).
     work_dir: Option<String>,
 }
@@ -575,6 +577,7 @@ impl TurnConfig {
         long_task_notice_ms: Arc<AtomicU64>,
         turn_render_poll_ms: Arc<AtomicU64>,
         turn_drain_timeout_ms: Arc<AtomicU64>,
+        turn_follow_timeout_ms: Arc<AtomicU64>,
         work_dir: Option<String>,
     ) -> Self {
         Self {
@@ -583,6 +586,7 @@ impl TurnConfig {
             long_task_notice_ms,
             turn_render_poll_ms,
             turn_drain_timeout_ms,
+            turn_follow_timeout_ms,
             work_dir,
         }
     }
@@ -610,6 +614,11 @@ impl TurnConfig {
     /// The drain bound for a Turn (ms).
     pub(crate) fn drain_timeout_ms(&self) -> u64 {
         self.turn_drain_timeout_ms.load(Ordering::Relaxed)
+    }
+
+    /// The out-of-turn drain follow's ceiling (ms, #284).
+    pub(crate) fn follow_timeout_ms(&self) -> u64 {
+        self.turn_follow_timeout_ms.load(Ordering::Relaxed)
     }
 
     /// The long-task completion-notice threshold (ms).
