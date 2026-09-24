@@ -4,12 +4,14 @@ ADR-0001 already decided the global SSE is heartbeat-only (the server ends it
 every few seconds on the shared store) and that cola renders by polling
 `GET /session/{id}/message`. This ADR records the consequence: the
 `OpenCodeEvent` enum in `opencode/client.rs` and `StreamAccumulator::apply` in
-`streaming.rs` — a second, parallel "event → card state" fold built for the v1
+`streaming.rs` (the accumulator now lives in `src/bridge/turn/state.rs`) — a
+second, parallel "event → card state" fold built for the v1
 SSE events — are unreachable in production, referenced only by their own tests.
 They had already drifted (shell-start/end panels exist only there).
 
 They are to be deleted, not maintained. Any future effort to consume SSE events
-live must start from the polled-parts representation in `render.rs`, not by
+live must start from the polled-parts representation in
+`src/bridge/turn/render.rs`, not by
 reviving the dead fold. The serde fixtures that document the SSE protocol shape
 move to the OpenCode source tree as reference (see AGENTS.md) if needed.
 

@@ -80,7 +80,8 @@ Footer.
 - A window memoized for another model is never reused: after a model change the
   segment degrades to the used tokens alone until the new model's lookup lands,
   because a stale denominator paired with newer usage would silently lie.
-- The turn-end computation in `turn.rs` stays the authoritative final value;
+- The turn-end computation in `src/bridge/turn/mod.rs` stays the authoritative
+  final value;
   mid-turn refreshes share the same memoized window.
 - Tests: the assertion that the ratio must not appear mid-turn flips, and the
   footer format assertions update.
