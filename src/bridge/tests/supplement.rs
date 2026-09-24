@@ -323,7 +323,10 @@ async fn a_tool_completing_after_the_split_renders_on_the_continuation() {
             id: "a1".into(),
             role: Some("assistant".into()),
             parent_id: None,
-            time: Some(crate::opencode::types::MessageTime { created: 1 }),
+            time: Some(crate::opencode::types::MessageTime {
+                created: 1,
+                completed: Some(1),
+            }),
             model_id: None,
             provider_id: None,
             tokens: None,

@@ -22,7 +22,10 @@ fn msg(role: &str, id: &str, created: i64, parts: serde_json::Value) -> SessionM
             id: id.into(),
             role: Some(role.into()),
             parent_id: None,
-            time: Some(MessageTime { created }),
+            time: Some(MessageTime {
+                created,
+                completed: Some(created),
+            }),
             model_id: None,
             provider_id: None,
             tokens: None,

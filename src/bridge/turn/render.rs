@@ -431,6 +431,14 @@ pub(super) fn capture_turn_anchor(
 /// bled the previous turn's parts into the new card when it ran ahead. Until
 /// the anchor is observed nothing renders: with two skewed clocks there is no
 /// threshold that tells the two turns apart.
+///
+/// A message still in flight (no server completion stamp) is always rendered,
+/// whatever its created time: the previous run may still be streaming when this
+/// turn's user message lands, and that tail is live content the card must show
+/// (#310). A completed message belongs to this turn when it finished at/after
+/// the anchor — either created within the turn or still being produced as the
+/// turn began — while one that finished before the anchor stays the previous
+/// turn's and never bleeds in (#190).
 pub(super) fn render_new_turn_parts(
     acc: &mut StreamAccumulator,
     msgs: &[crate::opencode::types::SessionMessage],
@@ -442,13 +450,18 @@ pub(super) fn render_new_turn_parts(
     let mut rendered_any = false;
     for m in msgs {
         let is_assistant = m.info.role.as_deref() == Some("assistant");
-        let in_turn = m
-            .info
-            .time
-            .as_ref()
-            .map(|t| t.created >= anchor_ms)
-            .unwrap_or(false);
-        if !is_assistant || !in_turn {
+        // Whether this message's parts may render into this turn's card. A
+        // message still in flight (no server completion stamp) always may: the
+        // previous run may still be streaming when this turn's user message
+        // lands, and that tail is live content (#310). A completed message is
+        // this turn's when it was created within it, or when it was still being
+        // produced as the turn began; one that finished before the anchor is
+        // the previous turn's and never bleeds in (#190).
+        let renders_here = m.info.time.as_ref().is_some_and(|t| match t.completed {
+            None => true,
+            Some(completed) => t.created >= anchor_ms || completed >= anchor_ms,
+        });
+        if !is_assistant || !renders_here {
             continue;
         }
         // Capture the answering model + token usage for the card footer.
@@ -649,7 +662,10 @@ mod tests {
                 id: "a1".into(),
                 role: Some("assistant".into()),
                 parent_id: None,
-                time: Some(MessageTime { created: 100 }),
+                time: Some(MessageTime {
+                    created: 100,
+                    completed: Some(100),
+                }),
                 model_id: None,
                 provider_id: None,
                 tokens: None,
@@ -677,7 +693,10 @@ mod tests {
                 id: id.into(),
                 role: Some("assistant".into()),
                 parent_id: None,
-                time: Some(MessageTime { created }),
+                time: Some(MessageTime {
+                    created,
+                    completed: Some(created),
+                }),
                 model_id: Some("m".into()),
                 provider_id: Some("p".into()),
                 tokens: Some(tokens),
@@ -877,20 +896,24 @@ Index: /x/src/main.rs
     fn render_new_turn_parts_filters_turn_and_dedups() {
         use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
 
-        // The user message's server time is the turn anchor; the old assistant
-        // (created 100) sits before it, the current one (3000) after.
+        // The user message's server time is the turn anchor; the old COMPLETED
+        // assistant (created 100, finished 150) sits before it, the current one
+        // (3000) after.
         let anchor = 2000;
         let mut acc = StreamAccumulator::new("test");
         acc.turn_started_ms = Some(anchor);
 
         let msgs = vec![
-            // Old turn assistant message (before the anchor) — skipped.
+            // Old turn assistant message (completed before the anchor) — skipped.
             SessionMessage {
                 info: MessageInfo {
                     id: "old".into(),
                     role: Some("assistant".into()),
                     parent_id: None,
-                    time: Some(MessageTime { created: 100 }),
+                    time: Some(MessageTime {
+                        created: 100,
+                        completed: Some(150),
+                    }),
                     model_id: None,
                     provider_id: None,
                     tokens: None,
@@ -903,7 +926,10 @@ Index: /x/src/main.rs
                     id: "user".into(),
                     role: Some("user".into()),
                     parent_id: None,
-                    time: Some(MessageTime { created: 2000 }),
+                    time: Some(MessageTime {
+                        created: 2000,
+                        completed: Some(2000),
+                    }),
                     model_id: None,
                     provider_id: None,
                     tokens: None,
@@ -916,7 +942,10 @@ Index: /x/src/main.rs
                     id: "a1".into(),
                     role: Some("assistant".into()),
                     parent_id: None,
-                    time: Some(MessageTime { created: 3000 }),
+                    time: Some(MessageTime {
+                        created: 3000,
+                        completed: Some(3000),
+                    }),
                     model_id: None,
                     provider_id: None,
                     tokens: None,
@@ -939,6 +968,126 @@ Index: /x/src/main.rs
         assert!(!render_new_turn_parts(&mut acc, &msgs));
     }
 
+    /// #310: a still-running assistant message created BEFORE the turn anchor is
+    /// live content, not a previous turn's. The server was mid-step when this
+    /// turn's user message landed (typically a long `task` from the previous
+    /// Turn, whose guard was released while the session stayed busy — #284).
+    /// Filtering it by `created >= anchor` dropped every part it produced and
+    /// left the new card blank until finalization.
+    #[test]
+    fn an_in_flight_message_created_before_the_anchor_renders() {
+        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.cola_message_id = Some("msg_cola_1".into());
+        let msgs = vec![
+            // The new turn's own user message: the anchor.
+            SessionMessage {
+                info: MessageInfo {
+                    id: "msg_cola_1".into(),
+                    role: Some("user".into()),
+                    parent_id: None,
+                    time: Some(MessageTime {
+                        created: 2000,
+                        completed: None,
+                    }),
+                    model_id: None,
+                    provider_id: None,
+                    tokens: None,
+                },
+                parts: serde_json::json!([{ "type": "text", "text": "我的问题你回答了吗" }]),
+            },
+            // The previous run's step, still in flight (no `time.completed`),
+            // created BEFORE the anchor.
+            SessionMessage {
+                info: MessageInfo {
+                    id: "a_inflight".into(),
+                    role: Some("assistant".into()),
+                    parent_id: None,
+                    time: Some(MessageTime {
+                        created: 500,
+                        completed: None,
+                    }),
+                    model_id: None,
+                    provider_id: None,
+                    tokens: None,
+                },
+                parts: serde_json::json!([
+                    { "id": "prt_rsn", "type": "reasoning", "text": "还在研究" },
+                    { "id": "prt_tool", "type": "tool", "tool": "task", "callID": "call_task",
+                      "state": { "status": "running", "input": { "description": "research" } } },
+                ]),
+            },
+        ];
+
+        assert!(render_new_turn_parts(&mut acc, &msgs));
+        assert_eq!(acc.turn_started_ms, Some(2000));
+        assert!(
+            acc.reasoning.contains("还在研究"),
+            "the in-flight message's reasoning must render live: {:?}",
+            acc.reasoning
+        );
+        assert_eq!(
+            acc.tools["call_task"].status, "running",
+            "the running panel must render live, not only at finalization"
+        );
+
+        // Dedup still holds on the next poll.
+        assert!(!render_new_turn_parts(&mut acc, &msgs));
+    }
+
+    /// #310: once that pre-anchor message completes — the server stamps
+    /// `time.completed` at/after the anchor — it is still this turn's live
+    /// content, so its final parts (here a settled tool panel) must keep
+    /// rendering. Dropping it on completion would hide the outcome until
+    /// finalization.
+    #[test]
+    fn a_message_completed_after_the_anchor_keeps_rendering() {
+        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
+
+        let anchor = 2000;
+        let mut acc = StreamAccumulator::new("proj");
+        acc.turn_started_ms = Some(anchor);
+        let msgs = |completed: Option<i64>, status: &str, output: &str| {
+            vec![SessionMessage {
+                info: MessageInfo {
+                    id: "a_prev".into(),
+                    role: Some("assistant".into()),
+                    parent_id: None,
+                    time: Some(MessageTime {
+                        created: 500,
+                        completed,
+                    }),
+                    model_id: None,
+                    provider_id: None,
+                    tokens: None,
+                },
+                parts: serde_json::json!([{
+                    "id": "prt_tool", "type": "tool", "tool": "task", "callID": "call_task",
+                    "state": { "status": status, "input": { "description": "research" }, "output": output },
+                }]),
+            }]
+        };
+
+        // In flight when the anchor lands: rendered (no completion stamp).
+        assert!(render_new_turn_parts(&mut acc, &msgs(None, "running", "")));
+        assert_eq!(acc.tools["call_task"].status, "running");
+
+        // Completed AFTER the anchor: the settled panel still renders.
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &msgs(Some(2_500), "completed", "research done")
+        ));
+        assert_eq!(acc.tools["call_task"].status, "completed");
+        assert_eq!(acc.tools["call_task"].output.as_deref(), Some("research done"));
+
+        // Re-fetching the same settled state must not duplicate.
+        assert!(!render_new_turn_parts(
+            &mut acc,
+            &msgs(Some(2_500), "completed", "research done")
+        ));
+    }
+
     /// The header date reads the SERVER's time for the turn's user message
     /// (#183 follow-up): captured on the first poll that sees it, so cola's
     /// own clock never reaches the card. The same captured anchor is #190's
@@ -954,7 +1103,10 @@ Index: /x/src/main.rs
                 id: "msg_cola_1".into(),
                 role: Some("user".into()),
                 parent_id: None,
-                time: Some(MessageTime { created: 1234 }),
+                time: Some(MessageTime {
+                    created: 1234,
+                    completed: Some(1234),
+                }),
                 model_id: None,
                 provider_id: None,
                 tokens: None,
@@ -980,7 +1132,10 @@ Index: /x/src/main.rs
                 id: "a1".into(),
                 role: Some("assistant".into()),
                 parent_id: Some("msg_cola_1".into()),
-                time: Some(MessageTime { created: 100 }),
+                time: Some(MessageTime {
+                    created: 100,
+                    completed: Some(100),
+                }),
                 model_id: None,
                 provider_id: None,
                 tokens: None,
@@ -1013,7 +1168,10 @@ Index: /x/src/main.rs
                     id: "msg_cola_1".into(),
                     role: Some("user".into()),
                     parent_id: None,
-                    time: Some(MessageTime { created: server_user }),
+                    time: Some(MessageTime {
+                        created: server_user,
+                        completed: Some(server_user),
+                    }),
                     model_id: None,
                     provider_id: None,
                     tokens: None,
@@ -1025,7 +1183,10 @@ Index: /x/src/main.rs
                     id: "a1".into(),
                     role: Some("assistant".into()),
                     parent_id: Some("msg_cola_1".into()),
-                    time: Some(MessageTime { created: assistant }),
+                    time: Some(MessageTime {
+                        created: assistant,
+                        completed: Some(assistant),
+                    }),
                     model_id: None,
                     provider_id: None,
                     tokens: None,
@@ -1070,6 +1231,7 @@ Index: /x/src/main.rs
                     parent_id: Some("msg_cola_old".into()),
                     time: Some(MessageTime {
                         created: previous_assistant,
+                        completed: Some(previous_assistant),
                     }),
                     model_id: None,
                     provider_id: None,
@@ -1082,7 +1244,10 @@ Index: /x/src/main.rs
                     id: "msg_cola_1".into(),
                     role: Some("user".into()),
                     parent_id: None,
-                    time: Some(MessageTime { created: server_user }),
+                    time: Some(MessageTime {
+                        created: server_user,
+                        completed: Some(server_user),
+                    }),
                     model_id: None,
                     provider_id: None,
                     tokens: None,
@@ -1094,7 +1259,10 @@ Index: /x/src/main.rs
                     id: "a1".into(),
                     role: Some("assistant".into()),
                     parent_id: Some("msg_cola_1".into()),
-                    time: Some(MessageTime { created: assistant }),
+                    time: Some(MessageTime {
+                        created: assistant,
+                        completed: Some(assistant),
+                    }),
                     model_id: None,
                     provider_id: None,
                     tokens: None,
@@ -1173,7 +1341,10 @@ Index: /x/src/main.rs
                     id: "a1".into(),
                     role: Some("assistant".into()),
                     parent_id: None,
-                    time: Some(MessageTime { created: 100 }),
+                    time: Some(MessageTime {
+                        created: 100,
+                        completed: Some(100),
+                    }),
                     model_id: None,
                     provider_id: None,
                     tokens: None,
@@ -1464,7 +1635,10 @@ Index: /x/src/main.rs
                     id: "a1".into(),
                     role: Some("assistant".into()),
                     parent_id: None,
-                    time: Some(MessageTime { created: 100 }),
+                    time: Some(MessageTime {
+                        created: 100,
+                        completed: Some(100),
+                    }),
                     model_id: None,
                     provider_id: None,
                     tokens: None,
@@ -1518,7 +1692,10 @@ Index: /x/src/main.rs
                     id: "a1".into(),
                     role: Some("assistant".into()),
                     parent_id: None,
-                    time: Some(MessageTime { created: 100 }),
+                    time: Some(MessageTime {
+                        created: 100,
+                        completed: Some(100),
+                    }),
                     model_id: None,
                     provider_id: None,
                     tokens: None,
@@ -1556,7 +1733,10 @@ Index: /x/src/main.rs
                 id: "a1".into(),
                 role: Some("assistant".into()),
                 parent_id: None,
-                time: Some(MessageTime { created: 100 }),
+                time: Some(MessageTime {
+                    created: 100,
+                    completed: Some(100),
+                }),
                 model_id: None,
                 provider_id: None,
                 tokens: None,
@@ -1611,7 +1791,10 @@ Index: /x/src/main.rs
                 id: "a1".into(),
                 role: Some("assistant".into()),
                 parent_id: None,
-                time: Some(MessageTime { created: 100 }),
+                time: Some(MessageTime {
+                    created: 100,
+                    completed: Some(100),
+                }),
                 model_id: None,
                 provider_id: None,
                 tokens: None,
@@ -1656,7 +1839,10 @@ Index: /x/src/main.rs
                     id: "a1".into(),
                     role: Some("assistant".into()),
                     parent_id: None,
-                    time: Some(MessageTime { created: 100 }),
+                    time: Some(MessageTime {
+                        created: 100,
+                        completed: Some(100),
+                    }),
                     model_id: None,
                     provider_id: None,
                     tokens: None,
@@ -1704,7 +1890,10 @@ Index: /x/src/main.rs
                 id: "a1".into(),
                 role: Some("assistant".into()),
                 parent_id: None,
-                time: Some(MessageTime { created: 100 }),
+                time: Some(MessageTime {
+                    created: 100,
+                    completed: Some(100),
+                }),
                 model_id: None,
                 provider_id: None,
                 tokens: None,
@@ -1743,7 +1932,10 @@ Index: /x/src/main.rs
                 id: "a1".into(),
                 role: Some("assistant".into()),
                 parent_id: None,
-                time: Some(MessageTime { created: 100 }),
+                time: Some(MessageTime {
+                    created: 100,
+                    completed: Some(100),
+                }),
                 model_id: None,
                 provider_id: None,
                 tokens: None,
@@ -1835,7 +2027,10 @@ Index: /x/src/main.rs
                 id: "a1".into(),
                 role: Some("assistant".into()),
                 parent_id: None,
-                time: Some(MessageTime { created: 1_000 }),
+                time: Some(MessageTime {
+                    created: 1_000,
+                    completed: Some(1_000),
+                }),
                 model_id: None,
                 provider_id: None,
                 tokens: None,

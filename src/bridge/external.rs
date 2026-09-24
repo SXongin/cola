@@ -688,7 +688,10 @@ mod tests {
                 id: format!("msg_{role}_{created}"),
                 role: Some(role.into()),
                 parent_id: None,
-                time: Some(MessageTime { created }),
+                time: Some(MessageTime {
+                    created,
+                    completed: Some(created),
+                }),
                 model_id: None,
                 provider_id: None,
                 tokens: None,

@@ -713,7 +713,10 @@ async fn render_poll_shows_live_context_and_memoizes_the_window() {
             id: "a1".into(),
             role: Some("assistant".into()),
             parent_id: None,
-            time: Some(MessageTime { created: 1_000 }),
+            time: Some(MessageTime {
+                created: 1_000,
+                completed: Some(1_000),
+            }),
             model_id: Some("m".into()),
             provider_id: Some("p".into()),
             tokens: Some(tokens(total)),
@@ -766,4 +769,97 @@ async fn render_poll_shows_live_context_and_memoizes_the_window() {
         1,
         "the per-turn memo must not re-fetch the window"
     );
+}
+
+/// #310: a still-running assistant message created BEFORE the new Turn's anchor
+/// must render on the live card while the run is in flight — not leave the card
+/// blank until finalization. The previous Turn released its guard while the
+/// session stayed busy (#284), so the new message started a fresh Turn whose
+/// anchor postdates the in-flight step.
+#[tokio::test]
+async fn an_in_flight_step_before_the_anchor_renders_live() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
+
+    use super::drain::{ctx, spawn_turn, user, wait_for_card_text};
+
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    // Park the prompt: the turn is still running while the test asserts.
+    let gate = backend.hold_prompts();
+    // The step the previous run left streaming: created BEFORE the new turn's
+    // anchor, no completion stamp, a `task` still running.
+    let in_flight = |completed: Option<i64>, status: &str, output: &str| SessionMessage {
+        info: MessageInfo {
+            id: "msg_prev".into(),
+            role: Some("assistant".into()),
+            parent_id: None,
+            time: Some(MessageTime {
+                created: 500,
+                completed,
+            }),
+            model_id: None,
+            provider_id: None,
+            tokens: None,
+        },
+        parts: serde_json::json!([
+            { "id": "prt_rsn", "type": "reasoning", "text": "还在研究" },
+            { "id": "prt_tool", "type": "tool", "tool": "task", "callID": "call_task",
+              "state": { "status": status, "input": { "description": "research" }, "output": output } },
+        ]),
+    };
+    backend.given_timeline(
+        "ses_test",
+        vec![vec![
+            user("msg_cola_anchor", 1_000, "我的问题你回答了吗"),
+            in_flight(None, "running", ""),
+        ]],
+    );
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
+
+    let turn = spawn_turn(&app, ctx("ses_test", "我的问题你回答了吗"));
+
+    // The in-flight step renders on the live card while the prompt is still
+    // held — no finalization has run yet.
+    wait_for_card_text(&platform, "⏳ task").await;
+    assert!(
+        app.inflight.lock().await.contains("ses_test"),
+        "the prompt must still be in flight when the panel renders"
+    );
+
+    // The step completes (completion stamp AFTER the anchor): its settled panel
+    // lands on the live card too, still before finalization.
+    {
+        let mut scripts = backend.message_scripts.lock().await;
+        let msgs = &mut scripts.get_mut("ses_test").unwrap()[0];
+        msgs[1] = in_flight(Some(2_500), "completed", "research done");
+    }
+    wait_for_card_text(&platform, "research done").await;
+    assert!(
+        app.inflight.lock().await.contains("ses_test"),
+        "the settled panel must render before finalization"
+    );
+
+    // Release the prompt: the turn finalizes with the content still on the card.
+    gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn must finish")
+        .unwrap()
+        .unwrap();
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&final_card).contains("research done"),
+        "the final card keeps the content: {final_card}"
+    );
+    assert!(card_header(&final_card).contains("完成"), "final card Done");
 }
