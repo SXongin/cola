@@ -40,7 +40,8 @@ impl SwitchScope {
 /// current thread (`op: "adopt"`); a second "建话题接管" button
 /// (`op: "topic_adopt"`) opens a new Feishu topic around the session
 /// (ADR-0016). Each button carries the routing payload (action, op, thread_key,
-/// target session id).
+/// target session id) plus the active `keyword`/`scope` and the clamped `page`,
+/// so a row action rebuilds the same filtered window (ADR-0052).
 ///
 /// Schema 2.0 dropped the v1 `action` container (error 200861, "cards of
 /// schema V2 no longer support this capability"), so buttons never live in an
@@ -71,6 +72,8 @@ fn switch_card_row(
     thread_key: &crate::config::ThreadKey,
     session_id: &str,
     scope: SwitchScope,
+    keyword: &str,
+    page: usize,
 ) -> Vec<serde_json::Value> {
     let btn_column = |op: &str, content: &str| {
         json!({
@@ -89,6 +92,8 @@ fn switch_card_row(
                         "thread_id": thread_key.thread_id,
                         "session_id": session_id,
                         "scope": scope.as_str(),
+                        "keyword": keyword,
+                        "page": page,
                     },
                 }
             ],
@@ -181,19 +186,27 @@ fn pager_element(
 
 /// Build the interactive `/switch` session card (ADR-0012, issue 04): a
 /// search box, up to one page (`CARD_PAGE_SIZE`) of session rows (each with a
-/// switch/adopt button), and a "＋new" footer button that creates a fresh
+/// switch/adopt button), a pagination control below the rows when the filter
+/// spans more than a page, and a "＋new" footer button that creates a fresh
 /// session in the current project (equivalent to `/new`). `keyword` is the
-/// active filter (empty = all); `active_id`/`mapped_ids` drive the row
-/// labels and buttons.
+/// active filter (empty = all); `page` is 1-based and clamped into
+/// `[1, total_pages]`, so a stale page lands on the last page instead of
+/// springing back to the first (ADR-0052); `active_id`/`mapped_ids` drive the
+/// row labels and buttons.
+#[allow(clippy::too_many_arguments)] // card builder: every knob is a first-class card axis
 pub fn build_switch_card(
     thread_key: &crate::config::ThreadKey,
     sessions: &[crate::opencode::types::SessionListInfo],
     keyword: &str,
     scope: SwitchScope,
+    page: usize,
     current_dir: Option<&str>,
     active_id: Option<&str>,
     mapped_ids: &[String],
 ) -> serde_json::Value {
+    let total = sessions.len();
+    let total_pages = total.div_ceil(CARD_PAGE_SIZE).max(1);
+    let page = page.clamp(1, total_pages);
     let mut elements: Vec<serde_json::Value> = Vec::new();
 
     // Search form: an input + a submit button. The routing payload rides in the
@@ -306,7 +319,8 @@ pub fn build_switch_card(
             "tag": "markdown",
             "content": crate::feishu::card::sanitize::sanitize_markdown(&header)
         }));
-        for s in sessions.iter().take(CARD_PAGE_SIZE) {
+        let start = (page - 1) * CARD_PAGE_SIZE;
+        for s in sessions.iter().skip(start).take(CARD_PAGE_SIZE) {
             let label = crate::bridge::display::title_or_id_tail(s);
             // ADR-0022: only the active session is marked; the 本会话 ownership
             // marker on mapped-but-not-active rows is dropped.
@@ -330,11 +344,27 @@ pub fn build_switch_card(
             } else {
                 "接管"
             };
-            elements.extend(switch_card_row(&text, btn, thread_key, &s.id, scope));
+            elements.extend(switch_card_row(
+                &text, btn, thread_key, &s.id, scope, keyword, page,
+            ));
         }
     }
 
-    // Footer: "＋new" creates a fresh session in the current project.
+    // Pagination (ADR-0052) below the rows and above the ＋new footer.
+    if let Some(pager) = pager_element(
+        "switch",
+        thread_key,
+        keyword,
+        Some(scope),
+        page,
+        total_pages,
+        total,
+    ) {
+        elements.push(pager);
+    }
+
+    // Footer: "＋new" creates a fresh session in the current project. It keeps
+    // the active filter (ADR-0052), so the refreshed list stays where it was.
     elements.push(json!({
         "tag": "button",
         "text": { "tag": "plain_text", "content": "＋ 新建会话" },
@@ -344,6 +374,9 @@ pub fn build_switch_card(
             "op": "new",
             "chat_id": thread_key.chat_id,
             "thread_id": thread_key.thread_id,
+            "keyword": keyword,
+            "scope": scope.as_str(),
+            "page": page,
         },
     }));
 
@@ -356,7 +389,10 @@ pub fn build_switch_card(
 /// whose ID the card never displays. This card turns it into one more click:
 /// `force_op` re-enters the handler with the full session id and steals the
 /// mapping; `back` rebuilds the session list. `force_label` is the op-specific
-/// verb (强制接管 / 强制建话题接管).
+/// verb (强制接管 / 强制建话题接管). Both buttons carry the active
+/// `keyword`/`scope` and clamped `page` (ADR-0052), so the round trip lands
+/// back on the same filtered window.
+#[allow(clippy::too_many_arguments)] // card builder: every knob is a first-class card axis
 pub fn build_force_confirm_card(
     thread_key: &crate::config::ThreadKey,
     target: &crate::opencode::types::SessionListInfo,
@@ -364,6 +400,8 @@ pub fn build_force_confirm_card(
     force_op: &str,
     force_label: &str,
     scope: SwitchScope,
+    keyword: &str,
+    page: usize,
 ) -> serde_json::Value {
     let label = crate::bridge::display::title_or_id_tail(target);
     let back_btn = json!({
@@ -376,6 +414,8 @@ pub fn build_force_confirm_card(
             "chat_id": thread_key.chat_id,
             "thread_id": thread_key.thread_id,
             "scope": scope.as_str(),
+            "keyword": keyword,
+            "page": page,
         },
     });
     let force_btn = json!({
@@ -389,6 +429,8 @@ pub fn build_force_confirm_card(
             "thread_id": thread_key.thread_id,
             "session_id": target.id,
             "scope": scope.as_str(),
+            "keyword": keyword,
+            "page": page,
         },
     });
     card_shell(
@@ -652,6 +694,7 @@ mod tests {
             &sessions,
             "",
             SwitchScope::Directory,
+            1,
             Some("/work/auth"),
             None,
             &[],
@@ -696,6 +739,7 @@ mod tests {
             &[],
             "重写登录\n任务",
             SwitchScope::Directory,
+            1,
             Some("/work/auth"),
             None,
             &[],
@@ -721,6 +765,325 @@ mod tests {
         assert_eq!(input["input_type"], "multiline_text");
         assert_eq!(input["rows"], 1);
         assert_eq!(input["auto_resize"], true);
+    }
+
+    /// ADR-0052: the second page renders the next window of sessions, the
+    /// pager reports the position, and it sits between the row list and the
+    /// ＋新建 footer.
+    #[test]
+    fn switch_card_page_two_windows_the_rows_and_labels_the_pager() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let sessions = switch_sessions(13);
+        let card = build_switch_card(&key, &sessions, "", SwitchScope::All, 2, None, None, &[]);
+        let text = card.to_string();
+        for i in 2..=7 {
+            assert!(
+                text.contains(&format!("项目{i} ·")),
+                "page 2 shows 项目{i}: {text}"
+            );
+        }
+        assert!(
+            !text.contains("项目8 ·"),
+            "page 1's last row is off page 2: {text}"
+        );
+        assert!(!text.contains("项目1 ·"), "page 3's row is off page 2: {text}");
+        let pager = switch_pager(&card).expect("a multi-page list renders the pager");
+        assert_eq!(
+            pager["columns"][1]["elements"][0]["content"], "第 2/3 页 · 共 13 个",
+            "indicator names the position and the total: {text}"
+        );
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let pager_idx = elements
+            .iter()
+            .position(|e| e["columns"][0]["elements"][0]["value"]["op"] == "page")
+            .expect("pager is a top-level element");
+        let new_idx = elements
+            .iter()
+            .position(|e| e["tag"] == "button" && e["value"]["op"] == "new")
+            .expect("＋新建 footer is a top-level element");
+        let last_row_idx = elements
+            .iter()
+            .rposition(|e| {
+                e["tag"] == "column_set"
+                    && e["columns"]
+                        .as_array()
+                        .is_some_and(|cols| cols.iter().any(|c| c["elements"][0]["value"]["op"] == "adopt"))
+            })
+            .expect("a session row is a top-level element");
+        assert!(
+            last_row_idx < pager_idx && pager_idx < new_idx,
+            "pager sits between the rows and the footer: {text}"
+        );
+    }
+
+    /// ADR-0052: the boundary button is disabled, never hidden — 上一页 on the
+    /// first page, 下一页 on the last.
+    #[test]
+    fn switch_card_pager_disables_the_boundary_buttons() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let sessions = switch_sessions(13);
+
+        let first = switch_pager(&build_switch_card(
+            &key,
+            &sessions,
+            "",
+            SwitchScope::All,
+            1,
+            None,
+            None,
+            &[],
+        ))
+        .unwrap();
+        let columns = first["columns"].as_array().unwrap();
+        assert_eq!(columns[0]["elements"][0]["text"]["content"], "上一页");
+        assert_eq!(
+            columns[0]["elements"][0]["disabled"], true,
+            "page 1 disables 上一页"
+        );
+        assert_eq!(
+            columns[2]["elements"][0]["disabled"], false,
+            "page 1 keeps 下一页 live"
+        );
+
+        let last = switch_pager(&build_switch_card(
+            &key,
+            &sessions,
+            "",
+            SwitchScope::All,
+            3,
+            None,
+            None,
+            &[],
+        ))
+        .unwrap();
+        let columns = last["columns"].as_array().unwrap();
+        assert_eq!(
+            columns[0]["elements"][0]["disabled"], false,
+            "the last page keeps 上一页 live"
+        );
+        assert_eq!(
+            columns[2]["elements"][0]["disabled"], true,
+            "the last page disables 下一页"
+        );
+    }
+
+    /// ADR-0052: a single page (and the empty list) renders no pager at all.
+    #[test]
+    fn switch_card_single_page_renders_no_pager() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let six = switch_sessions(6);
+        assert!(
+            switch_pager(&build_switch_card(
+                &key,
+                &six,
+                "",
+                SwitchScope::All,
+                1,
+                None,
+                None,
+                &[]
+            ))
+            .is_none(),
+            "exactly one page hides the pager"
+        );
+        let seven = switch_sessions(7);
+        assert!(
+            switch_pager(&build_switch_card(
+                &key,
+                &seven,
+                "",
+                SwitchScope::All,
+                1,
+                None,
+                None,
+                &[]
+            ))
+            .is_some(),
+            "over one page the pager appears"
+        );
+        assert!(
+            switch_pager(&build_switch_card(
+                &key,
+                &[],
+                "",
+                SwitchScope::All,
+                1,
+                None,
+                None,
+                &[]
+            ))
+            .is_none(),
+            "the empty list has nothing to page through"
+        );
+    }
+
+    /// ADR-0052: a stale/out-of-range page is clamped to the last page (never
+    /// sprung back to the first); page 0 is the first page.
+    #[test]
+    fn switch_card_clamps_an_out_of_range_page_into_range() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let sessions = switch_sessions(13);
+
+        let stale = build_switch_card(&key, &sessions, "", SwitchScope::All, 99, None, None, &[]);
+        let text = stale.to_string();
+        assert!(
+            text.contains("项目1 ·") && !text.contains("项目7 ·"),
+            "clamped to the last page: {text}"
+        );
+        let pager = switch_pager(&stale).unwrap();
+        assert_eq!(
+            pager["columns"][1]["elements"][0]["content"], "第 3/3 页 · 共 13 个",
+            "the clamped page is reported: {text}"
+        );
+
+        let zero = build_switch_card(&key, &sessions, "", SwitchScope::All, 0, None, None, &[]);
+        let text = zero.to_string();
+        assert!(
+            text.contains("项目13 ·") && !text.contains("项目7 ·"),
+            "page 0 reads as page 1: {text}"
+        );
+        let pager = switch_pager(&zero).unwrap();
+        assert_eq!(
+            pager["columns"][1]["elements"][0]["content"], "第 1/3 页 · 共 13 个",
+            "page 0 reports as page 1: {text}"
+        );
+    }
+
+    /// ADR-0052: every row button carries the active keyword, scope and the
+    /// clamped page, so adopt/topic_adopt rebuild the same filtered window.
+    #[test]
+    fn switch_card_row_buttons_carry_the_filter_and_page() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let sessions = switch_sessions(13);
+        let card = build_switch_card(&key, &sessions, "proj", SwitchScope::All, 2, None, None, &[]);
+        let row = switch_row(&card, "ses_p7").expect("page 2 holds the seventh session");
+        for (i, op) in ["adopt", "topic_adopt"].iter().enumerate() {
+            let btn = &row["columns"][i]["elements"][0];
+            assert_eq!(btn["value"]["op"], *op, "left adopt / right topic_adopt: {btn}");
+            assert_eq!(btn["value"]["session_id"], "ses_p7");
+            assert_eq!(btn["value"]["keyword"], "proj");
+            assert_eq!(btn["value"]["scope"], "all");
+            assert_eq!(btn["value"]["page"], 2);
+        }
+    }
+
+    /// ADR-0052: the pager buttons carry the routing payload, the active
+    /// keyword/scope and the TARGET page (clamped).
+    #[test]
+    fn switch_card_pager_buttons_carry_the_filter_and_target_page() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let sessions = switch_sessions(13);
+        let card = build_switch_card(&key, &sessions, "proj", SwitchScope::All, 2, None, None, &[]);
+        let pager = switch_pager(&card).unwrap();
+        let columns = pager["columns"].as_array().unwrap();
+
+        let prev = &columns[0]["elements"][0];
+        assert_eq!(prev["value"]["action"], "switch");
+        assert_eq!(prev["value"]["op"], "page");
+        assert_eq!(prev["value"]["chat_id"], "chat_1");
+        assert_eq!(prev["value"]["thread_id"], "chat_1");
+        assert_eq!(prev["value"]["keyword"], "proj");
+        assert_eq!(prev["value"]["scope"], "all");
+        assert_eq!(prev["value"]["page"], 1, "上一页 targets page - 1");
+        let next = &columns[2]["elements"][0];
+        assert_eq!(next["value"]["keyword"], "proj");
+        assert_eq!(next["value"]["scope"], "all");
+        assert_eq!(next["value"]["page"], 3, "下一页 targets page + 1");
+    }
+
+    /// ADR-0052: the ＋新建 footer keeps the active keyword/scope/page, so the
+    /// refreshed list stays where it was.
+    #[test]
+    fn switch_card_new_button_carries_the_filter_and_page() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let sessions = switch_sessions(13);
+        let card = build_switch_card(&key, &sessions, "proj", SwitchScope::All, 2, None, None, &[]);
+        let new_btn = card["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["tag"] == "button" && e["value"]["op"] == "new")
+            .expect("switch card has a ＋新建 footer");
+        assert_eq!(new_btn["value"]["keyword"], "proj");
+        assert_eq!(new_btn["value"]["scope"], "all");
+        assert_eq!(new_btn["value"]["page"], 2);
+    }
+
+    /// ADR-0052: both force-confirm buttons (强制接管 / 返回列表) carry the
+    /// active keyword/scope/page so the round trip lands on the same window.
+    #[test]
+    fn force_confirm_card_buttons_carry_the_filter_and_page() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let sessions = switch_sessions(1);
+        let card = build_force_confirm_card(
+            &key,
+            &sessions[0],
+            "隔壁群",
+            "force_adopt",
+            "强制接管",
+            SwitchScope::All,
+            "proj",
+            2,
+        );
+        let columns = card["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["tag"] == "column_set")
+            .expect("force-confirm card has the button row")["columns"]
+            .as_array()
+            .unwrap();
+        for (col, op) in [(&columns[0], "force_adopt"), (&columns[1], "back")] {
+            let value = &col["elements"][0]["value"];
+            assert_eq!(value["op"], op);
+            assert_eq!(value["keyword"], "proj");
+            assert_eq!(value["scope"], "all");
+            assert_eq!(value["page"], 2);
+        }
+    }
+
+    /// `n` sessions 项目N rooted in `/work/projN`, in display order (most
+    /// recently active first) — the builder slices what its caller hands it.
+    fn switch_sessions(n: i64) -> Vec<crate::opencode::types::SessionListInfo> {
+        (1..=n)
+            .rev()
+            .map(|i| crate::opencode::types::SessionListInfo {
+                id: format!("ses_p{i}"),
+                title: format!("项目{i}"),
+                directory: format!("/work/proj{i}"),
+                parent_id: None,
+                agent: None,
+                model: None,
+                time: None,
+            })
+            .collect()
+    }
+
+    /// The `/switch` pager: the three-column `column_set` whose buttons carry
+    /// `op: "page"` (the row button rows carry adopt/topic_adopt instead).
+    fn switch_pager(card: &serde_json::Value) -> Option<serde_json::Value> {
+        card["body"]["elements"]
+            .as_array()?
+            .iter()
+            .find(|e| {
+                e["tag"] == "column_set"
+                    && e["columns"]
+                        .as_array()
+                        .is_some_and(|cols| cols.iter().any(|c| c["elements"][0]["value"]["op"] == "page"))
+            })
+            .cloned()
+    }
+
+    /// The two-column button row whose left button targets `session_id`.
+    fn switch_row(card: &serde_json::Value, session_id: &str) -> Option<serde_json::Value> {
+        card["body"]["elements"]
+            .as_array()?
+            .iter()
+            .find(|e| {
+                e["tag"] == "column_set"
+                    && e["columns"][0]["elements"][0]["value"]["session_id"] == session_id
+            })
+            .cloned()
     }
 
     /// The `/dir` Recent Directories card must be schema-V2-compatible (no v1

@@ -852,11 +852,13 @@ impl App {
     }
 
     /// Handle a `/switch` card button (ADR-0012, issue 04): adopt a session,
-    /// create a new one, or re-search. The 接管/切换 ops return the Session
-    /// Snapshot (or the compact suppressed-切换 state, ADR-0028) as the card
-    /// so the ack patches the switch card in place — one message per
-    /// activation; scope/search/new return a refreshed list card. Plus a
-    /// Toast for instant feedback.
+    /// create a new one, re-search, or flip the page. The 接管/切换 ops return
+    /// the Session Snapshot (or the compact suppressed-切换 state, ADR-0028) as
+    /// the card so the ack patches the switch card in place — one message per
+    /// activation; page/scope/search/new/topic_adopt return a refreshed list
+    /// card carrying the active keyword/scope/page (ADR-0052), except that a
+    /// search or scope toggle resets to page 1. Plus a Toast for instant
+    /// feedback.
     async fn handle_switch_card_action(
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
@@ -874,16 +876,27 @@ impl App {
         let scope = crate::feishu::card::session::SwitchScope::parse(
             value.get("scope").and_then(|v| v.as_str()).unwrap_or(""),
         );
+        // The card's stateless filter (ADR-0052): keyword, scope and page ride
+        // every button. A missing/garbage page reads as 1; the builder clamps an
+        // out-of-range page to the last page.
+        let page = value.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
 
         match op {
+            "page" => Some(CardActionResult {
+                card: Some(
+                    self.build_switch_card_for(core, &thread_key, &keyword, scope, page)
+                        .await,
+                ),
+                toast: None,
+            }),
             "scope" => {
                 // The 全部/本目录 toggle (ADR-0022): the button carries the
                 // TARGET scope ("all"/"dir"); the outer `scope` above already
-                // parsed it. Rebuild the card in that scope, keeping the
-                // keyword so a scoped search survives the toggle.
+                // parsed it. Rebuild the card in that scope at page 1, keeping
+                // the keyword so a scoped search survives the toggle (ADR-0052).
                 Some(CardActionResult {
                     card: Some(
-                        self.build_switch_card_for(core, &thread_key, &keyword, scope)
+                        self.build_switch_card_for(core, &thread_key, &keyword, scope, 1)
                             .await,
                     ),
                     toast: None,
@@ -908,7 +921,7 @@ impl App {
                 if already_active {
                     return Some(CardActionResult {
                         card: Some(
-                            self.build_switch_card_for(core, &thread_key, &keyword, scope)
+                            self.build_switch_card_for(core, &thread_key, &keyword, scope, page)
                                 .await,
                         ),
                         // The target session is already this conversation's
@@ -935,6 +948,8 @@ impl App {
                                 "force_adopt",
                                 "强制接管",
                                 scope,
+                                &keyword,
+                                page,
                             )),
                             toast: Some(format!("该会话被 {} 占用，请确认是否强制接管", owner_label)),
                         });
@@ -954,7 +969,7 @@ impl App {
             }
             "back" => Some(CardActionResult {
                 card: Some(
-                    self.build_switch_card_for(core, &thread_key, &keyword, scope)
+                    self.build_switch_card_for(core, &thread_key, &keyword, scope, page)
                         .await,
                 ),
                 toast: None,
@@ -962,21 +977,27 @@ impl App {
             "new" => {
                 // Lazy Session Creation (ADR-0041): the card form of `/new` —
                 // declare a Pending Session; the first message materialises it.
+                // The active filter survives (ADR-0052), so the refreshed list
+                // stays on the same keyword/scope/page.
                 if let Err(e) = core.declare_pending_in_current_project(&thread_key, None).await {
                     tracing::warn!("switch card new: persist failed: {}", e);
                 }
                 Some(CardActionResult {
-                    card: Some(self.build_switch_card_for(core, &thread_key, "", scope).await),
+                    card: Some(
+                        self.build_switch_card_for(core, &thread_key, &keyword, scope, page)
+                            .await,
+                    ),
                     toast: Some("下一条消息创建会话".to_string()),
                 })
             }
             "search" => {
                 // A search is an explicit refresh request: drop the session-list
                 // cache so the re-filter sees newly created/adopted sessions.
+                // It always lands on page 1; the keyword is the typed one.
                 core.invalidate_session_list_cache().await;
                 Some(CardActionResult {
                     card: Some(
-                        self.build_switch_card_for(core, &thread_key, &keyword, scope)
+                        self.build_switch_card_for(core, &thread_key, &keyword, scope, 1)
                             .await,
                     ),
                     toast: None,
@@ -1032,28 +1053,40 @@ impl App {
                                 "force_topic_adopt",
                                 "强制建话题接管",
                                 scope,
+                                &keyword,
+                                page,
                             )),
                             toast: Some(format!("会话被 {} 占用，请确认是否强制接管", owner_label)),
                         });
                     }
                 }
                 Some(
-                    self.topic_adopt_target(core, &thread_key, &target, &open_message_id, &keyword, scope)
-                        .await,
+                    self.topic_adopt_target(
+                        core,
+                        &thread_key,
+                        &target,
+                        &open_message_id,
+                        &keyword,
+                        scope,
+                        page,
+                    )
+                    .await,
                 )
             }
             _ => None,
         }
     }
 
-    /// Rebuild the `/switch` card for a thread with the given search keyword
-    /// and list scope (ADR-0022).
+    /// Rebuild the `/switch` card for a thread with the given search keyword,
+    /// list scope and 1-based page (ADR-0022, ADR-0052). The builder clamps an
+    /// out-of-range page to the last page.
     async fn build_switch_card_for(
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
         thread_key: &ThreadKey,
         keyword: &str,
         scope: crate::feishu::card::session::SwitchScope,
+        page: usize,
     ) -> serde_json::Value {
         let (shown, active_id, mapped_ids, scope, current_dir) =
             crate::feishu::card::command::switch_card_data(
@@ -1068,6 +1101,7 @@ impl App {
             &shown,
             keyword,
             scope,
+            page,
             current_dir.as_deref(),
             active_id.as_deref(),
             &mapped_ids,
@@ -1175,7 +1209,9 @@ impl App {
     /// The topic-creation tail shared by the card's 建话题接管 and
     /// 强制建话题接管 ops: open a topic anchored on the card message and map
     /// the adopted session to the new topic's `ThreadKey` (shared with the text
-    /// `/topic --adopt` form, ADR-0016), then refresh the list card in place.
+    /// `/topic --adopt` form, ADR-0016), then refresh the list card in place at
+    /// the same keyword/scope/page (ADR-0052).
+    #[allow(clippy::too_many_arguments)] // the filter triple rides the rebuild: keyword + scope + page
     async fn topic_adopt_target(
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
@@ -1184,6 +1220,7 @@ impl App {
         open_message_id: &str,
         keyword: &str,
         scope: crate::feishu::card::session::SwitchScope,
+        page: usize,
     ) -> CardActionResult {
         let new_thread_id = match crate::bridge::topic::open_topic(
             &core.topic_handles(),
@@ -1215,7 +1252,10 @@ impl App {
             thread_key.chat_id
         );
         CardActionResult {
-            card: Some(self.build_switch_card_for(core, thread_key, keyword, scope).await),
+            card: Some(
+                self.build_switch_card_for(core, thread_key, keyword, scope, page)
+                    .await,
+            ),
             toast: Some("已建话题接管".to_string()),
         }
     }
