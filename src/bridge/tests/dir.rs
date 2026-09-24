@@ -555,3 +555,96 @@ async fn dir_card_topic_rejects_after_topic_bound_via_pick() {
         Some("/work/a")
     );
 }
+
+/// ADR-0051: the `/dir` card's search op rebuilds the card narrowed to the
+/// typed keyword — the submit carries no directory — and echoes the keyword
+/// back into the search box.
+#[tokio::test]
+async fn dir_card_search_narrows_rows_and_echoes_keyword() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![
+        list_session("ses_a", "项目A", "/work/a", 100),
+        list_session("ses_b", "项目B", "/work/b", 200),
+    ]);
+    let (app, _platform) = build_app(cfg, backend).await;
+
+    let value = serde_json::json!({
+        "action": "dir",
+        "op": "search",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "keyword": "work a",
+    });
+    let result = app
+        .host_action(value)
+        .await
+        .expect("dir search should return a result");
+    let card = result.card.expect("search refreshes the card");
+    let text = card_text(&card);
+    assert!(text.contains("/work/a"), "matching row shown: {text}");
+    assert!(!text.contains("/work/b"), "non-matching row hidden: {text}");
+    assert!(
+        card.to_string().contains("\"default_value\":\"work a\""),
+        "keyword echoed into the search box: {}",
+        card
+    );
+}
+
+/// ADR-0051: a row action from a search-filtered card resets the search — the
+/// refreshed card is the full list, with the picked directory marked 当前.
+#[tokio::test]
+async fn dir_card_pick_resets_the_search_keyword() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![
+        list_session("ses_a", "项目A", "/work/a", 100),
+        list_session("ses_b", "项目B", "/work/b", 200),
+    ]);
+    let (app, _platform) = build_app(cfg, backend).await;
+
+    let search = serde_json::json!({
+        "action": "dir",
+        "op": "search",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "keyword": "b",
+    });
+    let filtered = app
+        .host_action(search)
+        .await
+        .expect("dir search should return a result")
+        .card
+        .expect("search refreshes the card");
+    assert!(
+        !card_text(&filtered).contains("/work/a"),
+        "the search filtered the list"
+    );
+
+    let pick = serde_json::json!({
+        "action": "dir",
+        "op": "pick",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "directory": "/work/b",
+    });
+    let card = app
+        .host_action(pick)
+        .await
+        .expect("dir pick should return a result")
+        .card
+        .expect("pick refreshes the card");
+    let text = card_text(&card);
+    assert!(
+        text.contains("/work/a") && text.contains("/work/b"),
+        "the refreshed card is the full list again: {text}"
+    );
+    assert!(
+        !card.to_string().contains("dir_search"),
+        "the short list drops the search form: {card}"
+    );
+}

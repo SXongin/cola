@@ -328,6 +328,15 @@ pub(crate) fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Va
                     "thread_id": parts[2],
                     "scope": parts.get(3).copied().unwrap_or(""),
                 })
+            } else if parts.len() == 3 && parts[0] == "dirsearch" {
+                // `/dir` card search form (ADR-0051): same shape as
+                // `switchsearch`, no scope segment.
+                serde_json::json!({
+                    "action": "dir",
+                    "op": "search",
+                    "chat_id": parts[1],
+                    "thread_id": parts[2],
+                })
             } else if parts[0] == "submitm" && (parts.len() == 4 || parts.len() == 5) {
                 // A multi-select custom-answer form submit: the routing payload
                 // is encoded in the name ("submitm|<req>|<ses>|<qi>[|<dir>]")
@@ -385,11 +394,11 @@ pub(crate) fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Va
                 break;
             }
         }
-        // `/switch` card search: the typed keyword from the search input.
-        if val.get("action").and_then(|v| v.as_str()) == Some("switch")
-            && val.get("op").and_then(|v| v.as_str()) == Some("search")
-            && let Some(s) = fv.get("search").and_then(|v| v.as_str())
-        {
+        // `/switch` / `/dir` card search: the typed keyword from the search
+        // input.
+        let is_search = val.get("op").and_then(|v| v.as_str()) == Some("search")
+            && matches!(val.get("action").and_then(|v| v.as_str()), Some("switch" | "dir"));
+        if is_search && let Some(s) = fv.get("search").and_then(|v| v.as_str()) {
             val["keyword"] = serde_json::Value::String(s.to_string());
         }
     }
@@ -1007,6 +1016,59 @@ mod tests {
         assert_eq!(value["answer"], "自定义答案");
         assert_eq!(value["directory"], "/tmp/proj");
         assert_eq!(value["session_id"], "ses_1");
+    }
+
+    /// The `/dir` card's search form mirrors `/switch`'s: a submit callback may
+    /// omit `action.value`, so the routing is rebuilt from the button `name`
+    /// ("dirsearch|<chat>|<thread>") and the typed keyword is attached from
+    /// `form_value.search` (ADR-0051).
+    #[test]
+    fn dir_search_form_submit_rebuilds_routing_and_keyword() {
+        let payload = r#"{
+            "schema": "2.0",
+            "event": {
+                "action": {
+                    "tag": "button",
+                    "name": "dirsearch|chat_1|chat_1",
+                    "form_value": {
+                        "search": "work a"
+                    }
+                }
+            }
+        }"#;
+        let value = extract_card_action_value(payload.as_bytes()).expect("value extracted");
+        assert_eq!(value["action"], "dir");
+        assert_eq!(value["op"], "search");
+        assert_eq!(value["chat_id"], "chat_1");
+        assert_eq!(value["thread_id"], "chat_1");
+        assert_eq!(value["keyword"], "work a");
+    }
+
+    /// The normal form-submit path (with `action.value` present) also attaches
+    /// the typed keyword to the `/dir` search payload.
+    #[test]
+    fn dir_search_form_submit_with_value_attaches_keyword() {
+        let payload = r#"{
+            "schema": "2.0",
+            "event": {
+                "action": {
+                    "tag": "button",
+                    "value": {
+                        "action": "dir",
+                        "op": "search",
+                        "chat_id": "chat_1",
+                        "thread_id": "chat_1"
+                    },
+                    "form_value": {
+                        "search": "auth"
+                    }
+                }
+            }
+        }"#;
+        let value = extract_card_action_value(payload.as_bytes()).expect("value extracted");
+        assert_eq!(value["action"], "dir");
+        assert_eq!(value["op"], "search");
+        assert_eq!(value["keyword"], "auth");
     }
 
     /// A plain button click keeps its value untouched (no option/form_value).

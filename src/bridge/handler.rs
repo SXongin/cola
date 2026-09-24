@@ -1220,15 +1220,17 @@ impl App {
         }
     }
 
-    /// Rebuild the `/dir` Recent Directories card for a thread.
+    /// Rebuild the `/dir` Recent Directories card for a thread, narrowed by
+    /// `keyword` (ADR-0051).
     async fn build_dir_card_for(
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
         thread_key: &ThreadKey,
+        keyword: &str,
     ) -> serde_json::Value {
         let (dirs, current_dir) =
-            crate::feishu::card::command::dir_card_data(&core.command_handles(), thread_key).await;
-        crate::feishu::card::session::build_dir_card(thread_key, &dirs, current_dir.as_deref())
+            crate::feishu::card::command::dir_card_data(&core.command_handles(), thread_key, keyword).await;
+        crate::feishu::card::session::build_dir_card(thread_key, &dirs, current_dir.as_deref(), keyword)
     }
 
     /// Handle a `/dir` Recent Directories card button (ADR-0025): `op:
@@ -1237,7 +1239,9 @@ impl App {
     /// first message materialises it); `op: "topic"` wraps a NEW session in a
     /// brand-new Feishu topic instead — the card equivalent of `/topic <dir>`.
     /// Clicking the current directory's `pick` is a no-op that just toasts.
-    /// Refreshes the card in place so the pending's directory shows as `当前`.
+    /// `op: "search"` rebuilds the card narrowed by the typed keyword
+    /// (ADR-0051). Refreshes the card in place so the pending's directory shows
+    /// as `当前`.
     async fn handle_dir_card_action(
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
@@ -1245,6 +1249,21 @@ impl App {
     ) -> Option<CardActionResult> {
         let op = value.get("op").and_then(|v| v.as_str()).unwrap_or("");
         let thread_key = thread_key_from_value(value);
+        // The search submit carries no directory, so it is handled before the
+        // directory guard below. A row action resets the keyword: the card
+        // returns to the full list (ADR-0051).
+        if op == "search" {
+            let keyword = value
+                .get("keyword")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            return Some(CardActionResult {
+                card: Some(self.build_dir_card_for(core, &thread_key, &keyword).await),
+                toast: None,
+            });
+        }
         let directory = value
             .get("directory")
             .and_then(|v| v.as_str())
@@ -1263,7 +1282,7 @@ impl App {
                 let current_dir = core.sessions.lock().await.current_directory(&thread_key);
                 if current_dir.as_deref() == Some(directory.as_str()) {
                     return Some(CardActionResult {
-                        card: Some(self.build_dir_card_for(core, &thread_key).await),
+                        card: Some(self.build_dir_card_for(core, &thread_key, "").await),
                         toast: Some("已在当前目录".to_string()),
                     });
                 }
@@ -1276,7 +1295,7 @@ impl App {
                     tracing::warn!("dir card pick: persist failed: {}", e);
                 }
                 Some(CardActionResult {
-                    card: Some(self.build_dir_card_for(core, &thread_key).await),
+                    card: Some(self.build_dir_card_for(core, &thread_key, "").await),
                     toast: Some(format!("下一条消息将在目录 `{directory}` 创建会话")),
                 })
             }
@@ -1316,7 +1335,7 @@ impl App {
                 .await
                 {
                     Ok(_opened) => Some(CardActionResult {
-                        card: Some(self.build_dir_card_for(core, &thread_key).await),
+                        card: Some(self.build_dir_card_for(core, &thread_key, "").await),
                         toast: Some(format!("已建话题（{display}）——下一条消息创建会话")),
                     }),
                     Err(crate::bridge::topic::OpenTopicError::NoThreadId) => Some(CardActionResult {
