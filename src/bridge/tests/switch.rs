@@ -1270,3 +1270,561 @@ async fn attach_readopt_keeps_per_session_overrides() {
         "ses_own1"
     );
 }
+
+/// ADR-0052: the text `/switch` entry opens on page 1 — the six most recent
+/// sessions — with a pager between the rows and the ＋新建 footer, 上一页
+/// disabled at the boundary, and every row button carrying keyword/scope/page.
+#[tokio::test]
+async fn switch_command_starts_on_the_first_page() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, backend_with_sessions(8)).await;
+
+    send_command(&app, "/switch", "msg_switch").await;
+
+    let card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .next()
+        .expect("the /switch command replies with a card");
+    let text = card_text(&card);
+    assert!(
+        text.contains("项目8 ·") && text.contains("项目3 ·"),
+        "page 1 holds the most recent six: {text}"
+    );
+    assert!(
+        !text.contains("项目2 ·") && !text.contains("项目1 ·"),
+        "page 2's rows are not on the first page: {text}"
+    );
+    assert_eq!(
+        switch_pager_label(&card).as_deref(),
+        Some("第 1/2 页 · 共 8 个"),
+        "text /switch reports page 1: {text}"
+    );
+    assert_eq!(
+        pager_button(&card, "上一页")["disabled"],
+        true,
+        "page 1 disables 上一页"
+    );
+    assert_eq!(
+        pager_button(&card, "下一页")["disabled"],
+        false,
+        "page 1 keeps 下一页 live"
+    );
+    // The pager renders below the rows and above the ＋新建 footer.
+    let texts = card_texts(&card);
+    let pager_pos = texts.iter().position(|t| t.contains("页 · 共")).unwrap();
+    let new_pos = texts.iter().position(|t| t == "＋ 新建会话").unwrap();
+    assert!(pager_pos < new_pos, "pager sits above the footer: {texts:?}");
+    let values = platform.button_values().await;
+    assert!(
+        values.iter().any(|v| v["op"] == "adopt"
+            && v["session_id"] == "ses_p8"
+            && v["keyword"] == ""
+            && v["scope"] == "all"
+            && v["page"] == 1),
+        "row buttons carry keyword/scope/page: {values:?}"
+    );
+}
+
+/// ADR-0052: submitting a search always rebuilds at page 1 — a stale page
+/// riding the payload is discarded — while the keyword is kept.
+#[tokio::test]
+async fn switch_card_search_resets_to_the_first_page() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, backend_with_sessions(8)).await;
+
+    let search = serde_json::json!({
+        "action": "switch",
+        "op": "search",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "keyword": "proj",
+        "scope": "all",
+        // A stale page from an older, longer result.
+        "page": 2,
+    });
+    let card = app
+        .host_action(search)
+        .await
+        .expect("switch search should return a result")
+        .card
+        .expect("search refreshes the card");
+    let text = card_text(&card);
+    assert!(
+        text.contains("项目8 ·") && text.contains("项目3 ·"),
+        "page 1 holds the most recent six: {text}"
+    );
+    assert!(
+        !text.contains("项目2 ·") && !text.contains("项目1 ·"),
+        "page 2's rows are not on the rebuilt page 1: {text}"
+    );
+    assert_eq!(
+        switch_pager_label(&card).as_deref(),
+        Some("第 1/2 页 · 共 8 个"),
+        "the search landed on page 1: {text}"
+    );
+    assert!(
+        card.to_string().contains("\"default_value\":\"proj\""),
+        "keyword echoed into the search box: {card}"
+    );
+}
+
+/// ADR-0052: the scope toggle also rebuilds at page 1, keeping the keyword.
+#[tokio::test]
+async fn switch_card_scope_toggle_resets_to_the_first_page() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, backend_with_sessions(8)).await;
+    // A current directory so the 本目录 toggle renders in the all-scope card
+    // (a directory with no listed session, so the list stays at eight rows).
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "ses_other",
+            "/work/other",
+        ),
+    )
+    .await;
+
+    let toggle = serde_json::json!({
+        "action": "switch",
+        "op": "scope",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "keyword": "proj",
+        "scope": "all",
+        "page": 2,
+    });
+    let card = app
+        .host_action(toggle)
+        .await
+        .expect("scope toggle should return a result")
+        .card
+        .expect("the toggle rebuilds the card");
+    let text = card_text(&card);
+    assert!(
+        text.contains("匹配 `proj` 的会话"),
+        "the keyword header renders: {text}"
+    );
+    assert!(text.contains("本目录"), "the directory toggle renders: {text}");
+    assert_eq!(
+        switch_pager_label(&card).as_deref(),
+        Some("第 1/2 页 · 共 8 个"),
+        "the toggle landed on page 1: {text}"
+    );
+    assert!(
+        card.to_string().contains("\"default_value\":\"proj\""),
+        "the keyword survives the toggle: {card}"
+    );
+}
+
+/// ADR-0052: 下一页 rebuilds the next window and keeps the keyword in the
+/// search box.
+#[tokio::test]
+async fn switch_card_page_flip_shows_the_next_window_and_keeps_the_keyword() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, backend_with_sessions(8)).await;
+
+    let flip = serde_json::json!({
+        "action": "switch",
+        "op": "page",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "keyword": "proj",
+        "scope": "all",
+        "page": 2,
+    });
+    let card = app
+        .host_action(flip)
+        .await
+        .expect("switch page should return a result")
+        .card
+        .expect("a page flip refreshes the card");
+    let text = card_text(&card);
+    assert!(
+        text.contains("项目2 ·") && text.contains("项目1 ·"),
+        "page 2 shows the seventh and eighth sessions: {text}"
+    );
+    assert!(
+        !text.contains("项目8 ·") && !text.contains("项目3 ·"),
+        "page 1's rows are off page 2: {text}"
+    );
+    assert_eq!(
+        switch_pager_label(&card).as_deref(),
+        Some("第 2/2 页 · 共 8 个"),
+        "the indicator reports the flipped page: {text}"
+    );
+    assert_eq!(
+        pager_button(&card, "下一页")["disabled"],
+        true,
+        "the last page disables 下一页"
+    );
+    assert_eq!(
+        pager_button(&card, "上一页")["disabled"],
+        false,
+        "the last page keeps 上一页 live"
+    );
+    assert!(
+        card.to_string().contains("\"default_value\":\"proj\""),
+        "the search box echoes the current keyword: {card}"
+    );
+}
+
+/// ADR-0052: an out-of-range page (data shrank under the user) is clamped to
+/// the LAST page, not sprung back to the first.
+#[tokio::test]
+async fn switch_card_out_of_range_page_clamps_to_the_last_page() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, backend_with_sessions(8)).await;
+
+    let flip = serde_json::json!({
+        "action": "switch",
+        "op": "page",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "keyword": "",
+        "scope": "all",
+        "page": 99,
+    });
+    let card = app
+        .host_action(flip)
+        .await
+        .expect("switch page should return a result")
+        .card
+        .expect("a page flip refreshes the card");
+    let text = card_text(&card);
+    assert!(
+        text.contains("项目2 ·") && text.contains("项目1 ·"),
+        "clamped to the last page's window: {text}"
+    );
+    assert!(!text.contains("项目8"), "not back on page 1: {text}");
+    assert_eq!(
+        switch_pager_label(&card).as_deref(),
+        Some("第 2/2 页 · 共 8 个"),
+        "the clamped page is reported: {text}"
+    );
+}
+
+/// ADR-0052: the ＋新建 footer does not reset the filter — the refreshed list
+/// stays on the same keyword/scope/page.
+#[tokio::test]
+async fn switch_card_new_preserves_the_filter() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, backend_with_sessions(8)).await;
+
+    let value = serde_json::json!({
+        "action": "switch",
+        "op": "new",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "keyword": "proj",
+        "scope": "all",
+        "page": 2,
+    });
+    let result = app
+        .host_action(value)
+        .await
+        .expect("switch new should return a result");
+    assert_eq!(
+        result.toast.as_deref(),
+        Some("下一条消息创建会话"),
+        "new still declares the pending"
+    );
+    let card = result.card.expect("new returns a refreshed card");
+    let text = card_text(&card);
+    assert!(
+        text.contains("项目2 ·") && text.contains("项目1 ·"),
+        "the same page two window is rebuilt: {text}"
+    );
+    assert!(
+        !text.contains("项目8 ·"),
+        "the refresh does not fall back to page 1: {text}"
+    );
+    assert_eq!(
+        switch_pager_label(&card).as_deref(),
+        Some("第 2/2 页 · 共 8 个"),
+        "the page is preserved: {text}"
+    );
+    assert!(
+        card.to_string().contains("\"default_value\":\"proj\""),
+        "the keyword is echoed into the search box: {card}"
+    );
+}
+
+/// ADR-0052: 返回列表 (the force-confirm card's back button) rebuilds the list
+/// at the same keyword/scope/page.
+#[tokio::test]
+async fn switch_card_back_preserves_the_filter() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, backend_with_sessions(8)).await;
+
+    let value = serde_json::json!({
+        "action": "switch",
+        "op": "back",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "keyword": "proj",
+        "scope": "all",
+        "page": 2,
+    });
+    let card = app
+        .host_action(value)
+        .await
+        .expect("back should return a result")
+        .card
+        .expect("back rebuilds the list card");
+    let text = card_text(&card);
+    assert!(
+        text.contains("项目2 ·") && text.contains("项目1 ·"),
+        "the same page two window is rebuilt: {text}"
+    );
+    assert_eq!(
+        switch_pager_label(&card).as_deref(),
+        Some("第 2/2 页 · 共 8 个"),
+        "the page is preserved: {text}"
+    );
+    assert!(
+        card.to_string().contains("\"default_value\":\"proj\""),
+        "the keyword is echoed into the search box: {card}"
+    );
+}
+
+/// ADR-0052: the force-confirm card carries the filter on both its buttons,
+/// and 返回列表 lands back on the same window.
+#[tokio::test]
+async fn switch_card_force_confirm_round_trip_preserves_the_filter() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = backend_with_sessions(8);
+    let mut platform = RecordingPlatform::new();
+    platform
+        .chat_names
+        .insert("oc_group_other".into(), "隔壁群".into());
+    let platform = Arc::new(platform);
+    let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
+    // ses_p1 sits on page 2 and is owned by another chat.
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(
+            crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into()),
+            "ses_p1",
+            "/work/proj1",
+        ),
+    )
+    .await;
+
+    let adopt = serde_json::json!({
+        "action": "switch",
+        "op": "adopt",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "session_id": "ses_p1",
+        "keyword": "proj",
+        "scope": "all",
+        "page": 2,
+        "open_message_id": "om_switch_card",
+    });
+    let confirm = app
+        .host_action(adopt)
+        .await
+        .expect("occupied adopt returns the confirm card")
+        .card
+        .expect("occupied adopt returns the confirm card");
+    assert!(
+        card_text(&confirm).contains("强制接管"),
+        "force button: {confirm}"
+    );
+    for btn in card_buttons(&confirm) {
+        assert_eq!(btn["value"]["keyword"], "proj", "button keeps the keyword: {btn}");
+        assert_eq!(btn["value"]["scope"], "all", "button keeps the scope: {btn}");
+        assert_eq!(btn["value"]["page"], 2, "button keeps the page: {btn}");
+    }
+
+    let back = click_button_card(&app, &confirm, "back").await;
+    let text = card_text(&back);
+    assert!(
+        text.contains("项目2 ·") && text.contains("项目1 ·"),
+        "返回列表 rebuilds the same page two window: {text}"
+    );
+    assert_eq!(
+        switch_pager_label(&back).as_deref(),
+        Some("第 2/2 页 · 共 8 个"),
+        "the page survives the confirm round trip: {text}"
+    );
+    assert!(
+        back.to_string().contains("\"default_value\":\"proj\""),
+        "the keyword survives the confirm round trip: {back}"
+    );
+}
+
+/// ADR-0052: 建话题接管 from a filtered, paged card rebuilds the same window
+/// and keyword (it does not reset to page 1).
+#[tokio::test]
+async fn switch_card_topic_adopt_preserves_the_filter() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, backend_with_sessions(8)).await;
+
+    let value = serde_json::json!({
+        "action": "switch",
+        "op": "topic_adopt",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "session_id": "ses_p1",
+        "keyword": "proj",
+        "scope": "all",
+        "page": 2,
+        "open_message_id": "om_switch_card",
+    });
+    let result = app
+        .host_action(value)
+        .await
+        .expect("topic_adopt should return a result");
+    assert!(
+        result.toast.clone().unwrap_or_default().contains("已建话题接管"),
+        "建话题接管 still opens the topic: {:?}",
+        result.toast
+    );
+    let card = result.card.expect("topic_adopt refreshes the card");
+    let text = card_text(&card);
+    assert!(
+        text.contains("项目2 ·") && text.contains("项目1 ·"),
+        "the same page two window is rebuilt: {text}"
+    );
+    assert!(
+        !text.contains("项目8 ·"),
+        "the refresh does not fall back to page 1: {text}"
+    );
+    assert_eq!(
+        switch_pager_label(&card).as_deref(),
+        Some("第 2/2 页 · 共 8 个"),
+        "the page is preserved: {text}"
+    );
+    assert!(
+        card.to_string().contains("\"default_value\":\"proj\""),
+        "the keyword is echoed into the search box: {card}"
+    );
+}
+
+/// ADR-0052: 强制建话题接管 (the force-confirm card's danger button) also
+/// lands back on the same filter and page.
+#[tokio::test]
+async fn switch_card_force_topic_adopt_preserves_the_filter() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = backend_with_sessions(8);
+    let mut platform = RecordingPlatform::new();
+    platform
+        .chat_names
+        .insert("oc_group_other".into(), "隔壁群".into());
+    let platform = Arc::new(platform);
+    let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(
+            crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into()),
+            "ses_p1",
+            "/work/proj1",
+        ),
+    )
+    .await;
+
+    let value = serde_json::json!({
+        "action": "switch",
+        "op": "force_topic_adopt",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "session_id": "ses_p1",
+        "keyword": "proj",
+        "scope": "all",
+        "page": 2,
+        "open_message_id": "om_switch_card",
+    });
+    let card = app
+        .host_action(value)
+        .await
+        .expect("force_topic_adopt should return a result")
+        .card
+        .expect("force_topic_adopt refreshes the card");
+    let text = card_text(&card);
+    assert!(
+        text.contains("项目2 ·") && text.contains("项目1 ·"),
+        "the same page two window is rebuilt: {text}"
+    );
+    assert_eq!(
+        switch_pager_label(&card).as_deref(),
+        Some("第 2/2 页 · 共 8 个"),
+        "the page is preserved: {text}"
+    );
+    assert!(
+        card.to_string().contains("\"default_value\":\"proj\""),
+        "the keyword is echoed into the search box: {card}"
+    );
+}
+
+/// `n` sessions 项目N rooted in `/work/projN`, most recently active last (so
+/// `switch_card_data` sorts them descending: projN first).
+fn backend_with_sessions(n: i64) -> MockBackend {
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(
+        (1..=n)
+            .map(|i| {
+                list_session(
+                    &format!("ses_p{i}"),
+                    &format!("项目{i}"),
+                    &format!("/work/proj{i}"),
+                    i * 100,
+                )
+            })
+            .collect(),
+    );
+    backend
+}
+
+/// The pager's indicator text (`第 x/y 页 · 共 N 个`) on a card.
+fn switch_pager_label(card: &serde_json::Value) -> Option<String> {
+    card_texts(card)
+        .into_iter()
+        .find(|t| t.starts_with("第 ") && t.contains(" 页 · 共 "))
+}
+
+/// The pager button labelled `label` (上一页 / 下一页).
+fn pager_button<'a>(card: &'a serde_json::Value, label: &str) -> &'a serde_json::Value {
+    card_buttons(card)
+        .into_iter()
+        .find(|b| b["value"]["op"] == "page" && b["text"]["content"] == label)
+        .unwrap_or_else(|| panic!("pager button `{label}` not found"))
+}
+
+/// Click the button whose `value.op` is `op` on `card` as the Host and return
+/// the refreshed card it produced.
+async fn click_button_card(app: &Arc<App>, card: &serde_json::Value, op: &str) -> serde_json::Value {
+    let value = card_buttons(card)
+        .into_iter()
+        .find(|b| b["value"]["op"] == op)
+        .unwrap_or_else(|| panic!("button `{op}` not found"))["value"]
+        .clone();
+    app.host_action(value)
+        .await
+        .unwrap_or_else(|| panic!("button `{op}` returned no result"))
+        .card
+        .unwrap_or_else(|| panic!("button `{op}` returned no card"))
+}

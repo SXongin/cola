@@ -109,7 +109,7 @@ pub(crate) async fn switch_card_data(
 
 /// Build and send the interactive `/switch` session card (ADR-0012, issue 04,
 /// ADR-0022). Renders the filtered session list (via `switch_card_data`) and
-/// replies with the card.
+/// replies with the card, starting on page 1 (ADR-0052).
 pub(crate) async fn send_switch_card(
     handles: &CommandHandles,
     thread_key: &ThreadKey,
@@ -124,6 +124,7 @@ pub(crate) async fn send_switch_card(
         &shown,
         keyword,
         scope,
+        1,
         current_dir.as_deref(),
         active_id.as_deref(),
         &mapped_ids,
