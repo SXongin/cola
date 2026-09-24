@@ -210,14 +210,15 @@ fn matches_directory(dir: &str, lower_keyword: &str) -> bool {
 }
 
 /// Build and send the interactive `/dir` Recent Directories card. Renders the
-/// deduped directory list (via `dir_card_data`) and replies with the card.
+/// deduped directory list (via `dir_card_data`) and replies with the card,
+/// starting on page 1 (ADR-0052).
 pub(crate) async fn send_dir_card(
     handles: &CommandHandles,
     thread_key: &ThreadKey,
     message_id: &str,
 ) -> Result<()> {
     let (dirs, current_dir) = dir_card_data(handles, thread_key, "").await;
-    let card = super::session::build_dir_card(thread_key, &dirs, current_dir.as_deref(), "");
+    let card = super::session::build_dir_card(thread_key, &dirs, current_dir.as_deref(), "", 1);
     handles.flow.platform.reply_card(message_id, &card).await?;
     Ok(())
 }

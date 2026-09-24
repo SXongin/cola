@@ -1221,16 +1221,17 @@ impl App {
     }
 
     /// Rebuild the `/dir` Recent Directories card for a thread, narrowed by
-    /// `keyword` (ADR-0051).
+    /// `keyword` and paged to `page` (ADR-0051, ADR-0052).
     async fn build_dir_card_for(
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
         thread_key: &ThreadKey,
         keyword: &str,
+        page: usize,
     ) -> serde_json::Value {
         let (dirs, current_dir) =
             crate::feishu::card::command::dir_card_data(&core.command_handles(), thread_key, keyword).await;
-        crate::feishu::card::session::build_dir_card(thread_key, &dirs, current_dir.as_deref(), keyword)
+        crate::feishu::card::session::build_dir_card(thread_key, &dirs, current_dir.as_deref(), keyword, page)
     }
 
     /// Handle a `/dir` Recent Directories card button (ADR-0025): `op:
@@ -1239,9 +1240,11 @@ impl App {
     /// first message materialises it); `op: "topic"` wraps a NEW session in a
     /// brand-new Feishu topic instead — the card equivalent of `/topic <dir>`.
     /// Clicking the current directory's `pick` is a no-op that just toasts.
-    /// `op: "search"` rebuilds the card narrowed by the typed keyword
-    /// (ADR-0051). Refreshes the card in place so the pending's directory shows
-    /// as `当前`.
+    /// `op: "search"` rebuilds the card narrowed by the typed keyword at page
+    /// 1 (ADR-0051); `op: "page"` flips to the payload's page. Every rebuild
+    /// keeps the active keyword and page (ADR-0052) — a row action no longer
+    /// resets the filter. Refreshes the card in place so the pending's
+    /// directory shows as `当前`.
     async fn handle_dir_card_action(
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
@@ -1249,18 +1252,28 @@ impl App {
     ) -> Option<CardActionResult> {
         let op = value.get("op").and_then(|v| v.as_str()).unwrap_or("");
         let thread_key = thread_key_from_value(value);
-        // The search submit carries no directory, so it is handled before the
-        // directory guard below. A row action resets the keyword: the card
-        // returns to the full list (ADR-0051).
+        // The card's stateless filter (ADR-0052): the active keyword and page
+        // ride every button. A missing/garbage page reads as 1; the builder
+        // clamps an out-of-range page to the last page.
+        let keyword = value
+            .get("keyword")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let page = value.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
+        // The search submit and a page flip carry no directory, so they are
+        // handled before the directory guard below. A search always lands on
+        // page 1; a flip rebuilds the payload's page.
         if op == "search" {
-            let keyword = value
-                .get("keyword")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
             return Some(CardActionResult {
-                card: Some(self.build_dir_card_for(core, &thread_key, &keyword).await),
+                card: Some(self.build_dir_card_for(core, &thread_key, &keyword, 1).await),
+                toast: None,
+            });
+        }
+        if op == "page" {
+            return Some(CardActionResult {
+                card: Some(self.build_dir_card_for(core, &thread_key, &keyword, page).await),
                 toast: None,
             });
         }
@@ -1282,7 +1295,7 @@ impl App {
                 let current_dir = core.sessions.lock().await.current_directory(&thread_key);
                 if current_dir.as_deref() == Some(directory.as_str()) {
                     return Some(CardActionResult {
-                        card: Some(self.build_dir_card_for(core, &thread_key, "").await),
+                        card: Some(self.build_dir_card_for(core, &thread_key, &keyword, page).await),
                         toast: Some("已在当前目录".to_string()),
                     });
                 }
@@ -1295,7 +1308,7 @@ impl App {
                     tracing::warn!("dir card pick: persist failed: {}", e);
                 }
                 Some(CardActionResult {
-                    card: Some(self.build_dir_card_for(core, &thread_key, "").await),
+                    card: Some(self.build_dir_card_for(core, &thread_key, &keyword, page).await),
                     toast: Some(format!("下一条消息将在目录 `{directory}` 创建会话")),
                 })
             }
@@ -1335,7 +1348,7 @@ impl App {
                 .await
                 {
                     Ok(_opened) => Some(CardActionResult {
-                        card: Some(self.build_dir_card_for(core, &thread_key, "").await),
+                        card: Some(self.build_dir_card_for(core, &thread_key, &keyword, page).await),
                         toast: Some(format!("已建话题（{display}）——下一条消息创建会话")),
                     }),
                     Err(crate::bridge::topic::OpenTopicError::NoThreadId) => Some(CardActionResult {

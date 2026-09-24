@@ -593,58 +593,365 @@ async fn dir_card_search_narrows_rows_and_echoes_keyword() {
     );
 }
 
-/// ADR-0051: a row action from a search-filtered card resets the search — the
-/// refreshed card is the full list, with the picked directory marked 当前.
+/// ADR-0052: submitting a search always rebuilds at page 1 — a stale page
+/// riding the payload is discarded — while the keyword is kept.
 #[tokio::test]
-async fn dir_card_pick_resets_the_search_keyword() {
+async fn dir_card_search_resets_to_the_first_page() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let mut backend = MockBackend::new(realistic_parts());
-    backend.given_sessions(vec![
-        list_session("ses_a", "项目A", "/work/a", 100),
-        list_session("ses_b", "项目B", "/work/b", 200),
-    ]);
-    let (app, _platform) = build_app(cfg, backend).await;
+    let (app, _platform) = build_app(cfg, backend_with_dirs(8)).await;
 
     let search = serde_json::json!({
         "action": "dir",
         "op": "search",
         "chat_id": "chat_1",
         "thread_id": "chat_1",
-        "keyword": "b",
+        "keyword": "proj",
+        // A stale page from an older, longer result.
+        "page": 3,
     });
-    let filtered = app
+    let card = app
         .host_action(search)
         .await
         .expect("dir search should return a result")
         .card
         .expect("search refreshes the card");
+    let text = card_text(&card);
     assert!(
-        !card_text(&filtered).contains("/work/a"),
-        "the search filtered the list"
+        text.contains("/work/proj8") && text.contains("/work/proj3"),
+        "page 1 holds the most recent six: {text}"
     );
+    assert!(
+        !text.contains("/work/proj2") && !text.contains("/work/proj1"),
+        "page 2's rows are not on the rebuilt page 1: {text}"
+    );
+    assert_eq!(
+        dir_pager_label(&card).as_deref(),
+        Some("第 1/2 页 · 共 8 个"),
+        "the search landed on page 1: {text}"
+    );
+    assert!(
+        card.to_string().contains("\"default_value\":\"proj\""),
+        "keyword echoed into the search box: {card}"
+    );
+}
+
+/// ADR-0052: 下一页 rebuilds the next window and keeps the keyword in the
+/// search box (acceptance: 第 7 条起).
+#[tokio::test]
+async fn dir_card_page_flip_shows_the_next_window_and_keeps_the_keyword() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, backend_with_dirs(8)).await;
+
+    let flip = serde_json::json!({
+        "action": "dir",
+        "op": "page",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "keyword": "proj",
+        "page": 2,
+    });
+    let card = app
+        .host_action(flip)
+        .await
+        .expect("dir page should return a result")
+        .card
+        .expect("a page flip refreshes the card");
+    let text = card_text(&card);
+    assert!(
+        text.contains("/work/proj2") && text.contains("/work/proj1"),
+        "page 2 shows the seventh and eighth directories: {text}"
+    );
+    assert!(
+        !text.contains("/work/proj8") && !text.contains("/work/proj3"),
+        "page 1's rows are off page 2: {text}"
+    );
+    assert_eq!(
+        dir_pager_label(&card).as_deref(),
+        Some("第 2/2 页 · 共 8 个"),
+        "the indicator reports the flipped page: {text}"
+    );
+    assert!(
+        card.to_string().contains("\"default_value\":\"proj\""),
+        "the search box echoes the current keyword: {card}"
+    );
+    assert_eq!(
+        pager_button(&card, "下一页")["disabled"],
+        true,
+        "the last page disables 下一页"
+    );
+    assert_eq!(
+        pager_button(&card, "上一页")["disabled"],
+        false,
+        "the last page keeps 上一页 live"
+    );
+}
+
+/// ADR-0052: an out-of-range page (data shrank under the user) is clamped to
+/// the LAST page, not sprung back to the first.
+#[tokio::test]
+async fn dir_card_out_of_range_page_clamps_to_the_last_page() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, backend_with_dirs(8)).await;
+
+    let flip = serde_json::json!({
+        "action": "dir",
+        "op": "page",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "keyword": "",
+        "page": 99,
+    });
+    let card = app
+        .host_action(flip)
+        .await
+        .expect("dir page should return a result")
+        .card
+        .expect("a page flip refreshes the card");
+    let text = card_text(&card);
+    assert!(
+        text.contains("/work/proj2") && text.contains("/work/proj1"),
+        "clamped to the last page's window: {text}"
+    );
+    assert!(!text.contains("/work/proj8"), "not back on page 1: {text}");
+    assert_eq!(
+        dir_pager_label(&card).as_deref(),
+        Some("第 2/2 页 · 共 8 个"),
+        "the clamped page is reported: {text}"
+    );
+}
+
+/// ADR-0052: `pick` from a filtered, paged card keeps the same keyword and
+/// page in the rebuilt card (reversing ADR-0051's reset).
+#[tokio::test]
+async fn dir_card_pick_preserves_the_keyword_and_page() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, backend_with_dirs(8)).await;
 
     let pick = serde_json::json!({
         "action": "dir",
         "op": "pick",
         "chat_id": "chat_1",
         "thread_id": "chat_1",
-        "directory": "/work/b",
+        "directory": "/work/proj2",
+        "keyword": "proj",
+        "page": 2,
     });
-    let card = app
+    let result = app
         .host_action(pick)
         .await
-        .expect("dir pick should return a result")
-        .card
-        .expect("pick refreshes the card");
+        .expect("dir pick should return a result");
+    assert!(result.card.is_some(), "dir pick refreshes the card");
+    let toast = result.toast.clone().unwrap_or_default();
+    assert!(
+        toast.contains("下一条消息") && toast.contains("/work/proj2"),
+        "dir pick toasts the pending timing and directory: {toast:?}"
+    );
+    let card = result.card.unwrap();
     let text = card_text(&card);
     assert!(
-        text.contains("/work/a") && text.contains("/work/b"),
-        "the refreshed card is the full list again: {text}"
+        text.contains("/work/proj1") && text.contains("/work/proj2"),
+        "the same page two window is rebuilt: {text}"
     );
     assert!(
-        !card.to_string().contains("dir_search"),
-        "the short list drops the search form: {card}"
+        !text.contains("/work/proj8"),
+        "the refresh does not fall back to page 1: {text}"
     );
+    assert_eq!(
+        dir_pager_label(&card).as_deref(),
+        Some("第 2/2 页 · 共 8 个"),
+        "the page is preserved: {text}"
+    );
+    assert!(
+        card.to_string().contains("\"default_value\":\"proj\""),
+        "the keyword is echoed into the search box: {card}"
+    );
+}
+
+/// ADR-0052: the 「已在当前目录」 no-op branch rebuilds with the same filter
+/// too — a Toast, but not a filter reset.
+#[tokio::test]
+async fn dir_card_pick_current_directory_preserves_the_filter() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, backend_with_dirs(8)).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: key,
+            session_id: "ses_p2".into(),
+            directory: "/work/proj2".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    let pick = serde_json::json!({
+        "action": "dir",
+        "op": "pick",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "directory": "/work/proj2",
+        "keyword": "proj",
+        "page": 2,
+    });
+    let result = app
+        .host_action(pick)
+        .await
+        .expect("dir pick should return a result");
+    assert_eq!(
+        result.toast.as_deref(),
+        Some("已在当前目录"),
+        "current dir pick still toasts: {:?}",
+        result.toast
+    );
+    let card = result.card.expect("the no-op branch still refreshes the card");
+    let text = card_text(&card);
+    assert!(
+        text.contains("/work/proj1") && text.contains("/work/proj2"),
+        "page 2 survives the no-op: {text}"
+    );
+    assert_eq!(
+        dir_pager_label(&card).as_deref(),
+        Some("第 2/2 页 · 共 8 个"),
+        "the page is preserved: {text}"
+    );
+    assert!(
+        card.to_string().contains("\"default_value\":\"proj\""),
+        "the keyword is echoed into the search box: {card}"
+    );
+}
+
+/// ADR-0052: 建话题 from a filtered, paged card rebuilds the same window and
+/// keyword.
+#[tokio::test]
+async fn dir_card_topic_preserves_the_keyword_and_page() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, backend_with_dirs(8)).await;
+
+    let value = serde_json::json!({
+        "action": "dir",
+        "op": "topic",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "directory": "/work/proj2",
+        "keyword": "proj",
+        "page": 2,
+        "open_message_id": "om_dir_card",
+    });
+    let result = app
+        .host_action(value)
+        .await
+        .expect("dir topic should return a result");
+    assert!(
+        result.toast.clone().unwrap_or_default().contains("已建话题"),
+        "建话题 still opens the topic: {:?}",
+        result.toast
+    );
+    let card = result.card.expect("dir topic refreshes the card");
+    let text = card_text(&card);
+    assert!(
+        text.contains("/work/proj1") && text.contains("/work/proj2"),
+        "the same page two window is rebuilt: {text}"
+    );
+    assert!(
+        !text.contains("/work/proj8"),
+        "the refresh does not fall back to page 1: {text}"
+    );
+    assert_eq!(
+        dir_pager_label(&card).as_deref(),
+        Some("第 2/2 页 · 共 8 个"),
+        "the page is preserved: {text}"
+    );
+    assert!(
+        card.to_string().contains("\"default_value\":\"proj\""),
+        "the keyword is echoed into the search box: {card}"
+    );
+}
+
+/// The text `/dir` entry opens on page 1 (ADR-0052), not on some remembered
+/// page — the cards are stateless.
+#[tokio::test]
+async fn dir_command_starts_on_the_first_page() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, backend_with_dirs(8)).await;
+
+    send_command(&app, "/dir", "msg_dir").await;
+
+    let card = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .find_map(|c| match c {
+            PlatformCall::ReplyCard { card, .. } => Some(card.clone()),
+            _ => None,
+        })
+        .expect("the /dir command replies with a card");
+    let text = card_text(&card);
+    assert!(
+        text.contains("/work/proj8") && text.contains("/work/proj3"),
+        "text /dir opens on the most recent six: {text}"
+    );
+    assert!(
+        !text.contains("/work/proj2") && !text.contains("/work/proj1"),
+        "page 2's rows are not on the first page: {text}"
+    );
+    assert_eq!(
+        dir_pager_label(&card).as_deref(),
+        Some("第 1/2 页 · 共 8 个"),
+        "text /dir reports page 1: {text}"
+    );
+}
+
+/// `n` recent sessions at `/work/proj1`…`/work/projN`, most recently active
+/// last (so `dir_card_data` sorts them descending: projN first).
+fn backend_with_dirs(n: i64) -> MockBackend {
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(
+        (1..=n)
+            .map(|i| {
+                list_session(
+                    &format!("ses_p{i}"),
+                    &format!("项目{i}"),
+                    &format!("/work/proj{i}"),
+                    i * 100,
+                )
+            })
+            .collect(),
+    );
+    backend
+}
+
+/// The pager's indicator text (`第 x/y 页 · 共 N 个`) on a card.
+fn dir_pager_label(card: &serde_json::Value) -> Option<String> {
+    card_texts(card)
+        .into_iter()
+        .find(|t| t.starts_with("第 ") && t.contains(" 页 · 共 "))
+}
+
+/// The pager button labelled `label` (上一页 / 下一页).
+fn pager_button<'a>(card: &'a serde_json::Value, label: &str) -> &'a serde_json::Value {
+    card_buttons(card)
+        .into_iter()
+        .find(|b| b["value"]["op"] == "page" && b["text"]["content"] == label)
+        .unwrap_or_else(|| panic!("pager button `{label}` not found"))
 }
