@@ -78,7 +78,7 @@ Present the dossier and stop. Do not push. Continue only on the user's explicit 
 On the user's go:
 
 - Push the branch.
-- Open exactly one PR against `main`: a Conventional Commits title derived from the spec (`CONTRIBUTING.md`, "Pull request rules"), body with what the batch delivers, the per-ticket summary, the risks, and a `Closes #a, #b, …` line listing every ticket.
+- Open exactly one PR against `main`: a Conventional Commits title derived from the spec (`CONTRIBUTING.md`, "Pull request rules"), body with what the batch delivers, the per-ticket summary, the risks, and a close line listing every ticket — one keyword per issue (`Closes #a, closes #b, …`).
 
 Done when the PR exists. Stop there — the user merges.
 
