@@ -138,12 +138,15 @@ pub(crate) async fn send_switch_card(
 /// directories cola has mapped, plus the thread's current directory. The
 /// session list alone loses a directory as soon as its last session is
 /// deleted or archived (OpenChamber's retention, `opencode session delete`),
-/// while the SessionStore is cola's own file and keeps its mappings. Shared by
-/// the text send path (`send_dir_card`) and the card ack refresh
-/// (`App::build_dir_card_for`) so both render from one source of truth.
+/// while the SessionStore is cola's own file and keeps its mappings. A
+/// non-empty `keyword` then narrows the union to paths matching it (ADR-0051),
+/// current directory included. Shared by the text send path (`send_dir_card`)
+/// and the card ack refresh (`App::build_dir_card_for`) so both render from
+/// one source of truth.
 pub(crate) async fn dir_card_data(
     handles: &CommandHandles,
     thread_key: &ThreadKey,
+    keyword: &str,
 ) -> (Vec<String>, Option<String>) {
     let sessions = handles
         .flow
@@ -188,7 +191,22 @@ pub(crate) async fn dir_card_data(
     {
         dirs.insert(0, current.clone());
     }
+    // ADR-0051: the card's keyword narrows the union — the current directory
+    // included, so a keyword that does not match it drops its row.
+    if !keyword.is_empty() {
+        let lower = keyword.to_lowercase();
+        dirs.retain(|dir| matches_directory(dir, &lower));
+    }
     (dirs, current_dir)
+}
+
+/// Case-insensitive token-AND match on a directory path (ADR-0051): the
+/// `/switch` search box's rule (`matches_keyword`) applied to the path only —
+/// `lower_keyword` is already lowercased, split on whitespace, and every token
+/// must appear as a substring.
+fn matches_directory(dir: &str, lower_keyword: &str) -> bool {
+    let dir = dir.to_lowercase();
+    lower_keyword.split_whitespace().all(|tok| dir.contains(tok))
 }
 
 /// Build and send the interactive `/dir` Recent Directories card. Renders the
@@ -198,8 +216,8 @@ pub(crate) async fn send_dir_card(
     thread_key: &ThreadKey,
     message_id: &str,
 ) -> Result<()> {
-    let (dirs, current_dir) = dir_card_data(handles, thread_key).await;
-    let card = super::session::build_dir_card(thread_key, &dirs, current_dir.as_deref());
+    let (dirs, current_dir) = dir_card_data(handles, thread_key, "").await;
+    let card = super::session::build_dir_card(thread_key, &dirs, current_dir.as_deref(), "");
     handles.flow.platform.reply_card(message_id, &card).await?;
     Ok(())
 }
@@ -443,9 +461,47 @@ mod tests {
         ]);
         let (app, _platform) = build_app(cfg, backend).await;
 
-        let (dirs, current) = dir_card_data(&app.command_handles(), &key()).await;
+        let (dirs, current) = dir_card_data(&app.command_handles(), &key(), "").await;
         assert_eq!(dirs, vec!["/work/a".to_string(), "/work/b".to_string()]);
         assert_eq!(current, None);
+    }
+
+    /// ADR-0051: a non-empty keyword narrows the union to paths — matching is
+    /// case-insensitive, whitespace-token AND, and path-only (a session title
+    /// never matches). The current directory participates: a non-matching
+    /// keyword drops its row, but it is still reported as current so a match
+    /// would be marked.
+    #[tokio::test]
+    async fn dir_card_data_filters_paths_by_token_and() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.given_sessions(vec![
+            list_session("ses_a", "项目A", "/work/a", 100),
+            list_session("ses_b", "项目B", "/work/b", 200),
+            list_session("ses_c", "登录重写", "/other/auth", 300),
+        ]);
+        let (app, _platform) = build_app(cfg, backend).await;
+
+        // Token AND: "work a" matches /work/a, not /work/b; "AUTH" matches
+        // case-insensitively; a session title is not a haystack.
+        let (dirs, _) = dir_card_data(&app.command_handles(), &key(), "work a").await;
+        assert_eq!(dirs, vec!["/work/a".to_string()]);
+        let (dirs, _) = dir_card_data(&app.command_handles(), &key(), "AUTH").await;
+        assert_eq!(dirs, vec!["/other/auth".to_string()]);
+        let (dirs, _) = dir_card_data(&app.command_handles(), &key(), "项目A").await;
+        assert!(dirs.is_empty(), "session titles are not matched: {dirs:?}");
+
+        // The current directory participates in filtering.
+        seed_session(&app, "ses_a", "/work/a").await;
+        let (dirs, current) = dir_card_data(&app.command_handles(), &key(), "b").await;
+        assert_eq!(dirs, vec!["/work/b".to_string()]);
+        assert_eq!(current.as_deref(), Some("/work/a"));
+
+        // An empty keyword keeps the whole union.
+        let (dirs, _) = dir_card_data(&app.command_handles(), &key(), "").await;
+        assert_eq!(dirs.len(), 3);
     }
 
     /// Directories cola has mapped are unioned in after the session-derived ones
@@ -473,7 +529,7 @@ mod tests {
         seed_session(&app, "ses_gone", "/work/gone").await;
         seed_session(&app, "ses_arch", "/work/arch").await;
 
-        let (dirs, current) = dir_card_data(&app.command_handles(), &key()).await;
+        let (dirs, current) = dir_card_data(&app.command_handles(), &key(), "").await;
         assert_eq!(
             dirs,
             vec![
@@ -498,7 +554,7 @@ mod tests {
 
         seed_session(&app, "ses_x", "/work/x").await;
 
-        let (dirs, current) = dir_card_data(&app.command_handles(), &key()).await;
+        let (dirs, current) = dir_card_data(&app.command_handles(), &key(), "").await;
         assert_eq!(dirs, vec!["/work/x".to_string()]);
         assert_eq!(current, Some("/work/x".to_string()));
     }
@@ -515,7 +571,7 @@ mod tests {
 
         seed_pending(&app, PendingEntry::new(key(), "/work/pending")).await;
 
-        let (dirs, current) = dir_card_data(&app.command_handles(), &key()).await;
+        let (dirs, current) = dir_card_data(&app.command_handles(), &key(), "").await;
         assert_eq!(dirs, vec!["/work/pending".to_string()]);
         assert_eq!(current, Some("/work/pending".to_string()));
     }
@@ -534,7 +590,7 @@ mod tests {
 
         seed_pending(&app, PendingEntry::new(key(), "/work/pending")).await;
 
-        let (dirs, current) = dir_card_data(&app.command_handles(), &key()).await;
+        let (dirs, current) = dir_card_data(&app.command_handles(), &key(), "").await;
         assert_eq!(
             dirs,
             vec!["/work/pending".to_string(), "/work/a".to_string()],

@@ -366,20 +366,40 @@ pub fn build_force_confirm_card(
 /// there (`op: "topic"`). Each button carries the routing payload (action,
 /// op, thread_key, directory), so the ack routes the choice back to the right
 /// thread. Schema-2.0 safe: no v1 `action` container (see `switch_card_row`).
+///
+/// ADR-0051: a search form over the paths renders when the list outgrows the
+/// row budget or `keyword` is non-empty (so a narrowed result stays
+/// refinable); the header, the empty state and the overflow hint all follow
+/// the keyword.
 pub fn build_dir_card(
     thread_key: &crate::config::ThreadKey,
     dirs: &[String],
     current_dir: Option<&str>,
+    keyword: &str,
 ) -> serde_json::Value {
     let mut elements: Vec<serde_json::Value> = Vec::new();
 
+    if dirs.len() > MAX_SWITCH_ROWS || !keyword.is_empty() {
+        elements.push(dir_search_form(thread_key, keyword));
+    }
+
     if dirs.is_empty() {
+        let hint = if keyword.is_empty() {
+            "_(还没有最近目录。用 `/dir <路径>` 或 `/new` 创建会话。)_"
+        } else {
+            "_(无匹配目录)_"
+        };
+        elements.push(json!({ "tag": "markdown", "content": hint }));
+    } else {
+        let header = if keyword.is_empty() {
+            "**最近目录**".to_string()
+        } else {
+            format!("**匹配 `{keyword}` 的目录**")
+        };
         elements.push(json!({
             "tag": "markdown",
-            "content": "_(还没有最近目录。用 `/dir <路径>` 或 `/new` 创建会话。)_"
+            "content": crate::feishu::card::sanitize::sanitize_markdown(&header)
         }));
-    } else {
-        elements.push(json!({ "tag": "markdown", "content": "**最近目录**" }));
         for dir in dirs.iter().take(MAX_SWITCH_ROWS) {
             let is_current = current_dir == Some(dir.as_str());
             let text = if is_current {
@@ -394,21 +414,65 @@ pub fn build_dir_card(
             };
             elements.extend(dir_card_row(&text, btn, thread_key, dir));
         }
-        // Truncated entries aren't lost: `/switch` adopts an EXISTING session
-        // by directory, and `/new` then opens a fresh one in that project —
-        // the two-step path to a new session in an overflow directory.
+        // Truncated entries aren't lost: the search box narrows the list
+        // (ADR-0051); under an active keyword, refining is the next step.
         if dirs.len() > MAX_SWITCH_ROWS {
-            elements.push(json!({
-                "tag": "markdown",
-                "content": format!(
-                    "_(还有 {} 个最近目录未显示。用 `/switch <路径>` 接管已有会话，再 `/new` 新建。)_",
-                    dirs.len() - MAX_SWITCH_ROWS
-                )
-            }));
+            let rest = dirs.len() - MAX_SWITCH_ROWS;
+            let hint = if keyword.is_empty() {
+                format!("_(还有 {rest} 个最近目录未显示。用上方搜索查找。)_")
+            } else {
+                format!("_(还有 {rest} 个匹配未显示。请细化关键词。)_")
+            };
+            elements.push(json!({ "tag": "markdown", "content": hint }));
         }
     }
 
     card_shell("📂 最近目录", "blue", elements)
+}
+
+/// The `/dir` card's search form (ADR-0051), mirroring the `/switch` card's:
+/// the routing payload rides in the submit button's `name` (form submits don't
+/// always deliver the button `value`), and the typed keyword arrives as
+/// `form_value.search`. `default_value` echoes the active keyword so a
+/// re-render never blanks the box.
+fn dir_search_form(thread_key: &crate::config::ThreadKey, keyword: &str) -> serde_json::Value {
+    json!({
+        "tag": "form",
+        "name": "dir_search",
+        "elements": [
+            {
+                "tag": "input",
+                "name": "search",
+                // Multiline like the switch card's search box and the question
+                // card's custom answer: one row at rest, growing with the text.
+                "input_type": "multiline_text",
+                "rows": 1,
+                "auto_resize": true,
+                "max_rows": 4,
+                "placeholder": { "tag": "plain_text", "content": "🔍 搜索目录路径" },
+                "default_value": keyword,
+                "max_length": 100,
+                "width": "fill",
+            },
+            {
+                "tag": "button",
+                "text": { "tag": "plain_text", "content": "搜索" },
+                "type": "primary",
+                "form_action_type": "submit",
+                "name": format!(
+                    "dirsearch|{}|{}",
+                    thread_key.chat_id,
+                    thread_key.thread_id
+                ),
+                "value": {
+                    "action": "dir",
+                    "op": "search",
+                    "chat_id": thread_key.chat_id,
+                    "thread_id": thread_key.thread_id,
+                },
+            },
+        ],
+    })
 }
 
 /// One `/dir` card entry: a full-width text row plus a two-button row beneath
@@ -469,7 +533,7 @@ mod tests {
     #[test]
     fn dir_card_rows_carry_pick_and_topic_buttons() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let card = build_dir_card(&key, &["/work/a".to_string()], None);
+        let card = build_dir_card(&key, &["/work/a".to_string()], None, "");
         let s = card.to_string();
         assert!(s.contains("切换到这里"), "left button re-roots: {s}");
         assert!(s.contains("建话题"), "right button opens a topic: {s}");
@@ -586,7 +650,7 @@ mod tests {
     fn dir_card_has_no_schema_v2_unsupported_action_container() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
         let dirs = vec!["/work/auth".to_string(), "/work/billing".to_string()];
-        let card = build_dir_card(&key, &dirs, Some("/work/auth"));
+        let card = build_dir_card(&key, &dirs, Some("/work/auth"), "");
         let text = card.to_string();
         assert!(
             !text.contains("\"tag\":\"action\"") && !text.contains("\"tag\": \"action\""),
@@ -627,7 +691,7 @@ mod tests {
     #[test]
     fn dir_card_empty_state_is_buttonless_hint() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let card = build_dir_card(&key, &[], None);
+        let card = build_dir_card(&key, &[], None, "");
         let text = card.to_string();
         assert!(text.contains("还没有最近目录"), "empty hint: {text}");
         assert!(
@@ -637,13 +701,13 @@ mod tests {
     }
 
     /// More than `MAX_SWITCH_ROWS` recent directories render only the most
-    /// recent six — the rest are silently dropped (same cap as the `/switch`
-    /// card).
+    /// recent six (same cap as the `/switch` card), with the search form as
+    /// the overflow path and a hint pointing at it (ADR-0051).
     #[test]
     fn dir_card_caps_rows_at_max_switch_rows() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
         let dirs: Vec<String> = (1..=9).map(|i| format!("/work/proj{i}")).collect();
-        let card = build_dir_card(&key, &dirs, None);
+        let card = build_dir_card(&key, &dirs, None, "");
         let text = card.to_string();
         let elements = card["body"]["elements"].as_array().unwrap();
         let rows: Vec<&serde_json::Value> = elements.iter().filter(|e| e["tag"] == "column_set").collect();
@@ -659,26 +723,139 @@ mod tests {
             "seventh+ directory dropped: {text}"
         );
         assert!(
-            text.contains("还有 3 个最近目录未显示"),
-            "truncated count hints at the fallback: {text}"
+            dir_search_form(&card).is_some(),
+            "overflow renders the search form: {text}"
         );
         assert!(
-            text.contains("/switch") && text.contains("接管") && text.contains("/new"),
-            "hint encodes the switch-then-new flow: {text}"
+            text.contains("还有 3 个最近目录未显示") && text.contains("用上方搜索查找"),
+            "truncated count hints at the search box: {text}"
+        );
+        assert!(
+            !text.contains("/switch"),
+            "the old switch-then-new fallback is gone: {text}"
         );
     }
 
     /// A Recent Directories card that fits under the cap shows no truncation
-    /// hint.
+    /// hint and no search form.
     #[test]
     fn dir_card_under_cap_has_no_truncation_hint() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
         let dirs = vec!["/work/auth".to_string(), "/work/billing".to_string()];
-        let card = build_dir_card(&key, &dirs, None);
+        let card = build_dir_card(&key, &dirs, None, "");
         let text = card.to_string();
         assert!(
             !text.contains("还有") && !text.contains("未显示"),
             "no truncation hint under the cap: {text}"
         );
+        assert!(
+            dir_search_form(&card).is_none(),
+            "a short list stays form-free: {text}"
+        );
+    }
+
+    /// ADR-0051: the search form appears only when the list outgrows the row
+    /// budget — or a keyword is already active, so a narrowed result stays
+    /// refinable and clearable.
+    #[test]
+    fn dir_card_search_form_appears_over_the_cap_or_with_a_keyword() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let short: Vec<String> = (1..=2).map(|i| format!("/work/p{i}")).collect();
+        let long: Vec<String> = (1..=7).map(|i| format!("/work/p{i}")).collect();
+        assert!(
+            dir_search_form(&build_dir_card(&key, &short, None, "")).is_none(),
+            "two directories do not need a search box"
+        );
+        assert!(
+            dir_search_form(&build_dir_card(&key, &long, None, "")).is_some(),
+            "over the cap the search box appears"
+        );
+        assert!(
+            dir_search_form(&build_dir_card(&key, &short, None, "p1")).is_some(),
+            "an active keyword keeps the box under the cap"
+        );
+    }
+
+    /// The dir search input echoes the keyword in `default_value` (never the
+    /// passback `value`), and the submit button's `name` encodes the routing
+    /// the WS extractor rebuilds when `value` is missing.
+    #[test]
+    fn dir_card_search_input_echoes_keyword_and_encodes_routing() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let card = build_dir_card(&key, &["/work/auth".to_string()], None, "auth\nwork");
+        let form = dir_search_form(&card).expect("keyword keeps the form");
+        assert_eq!(form["name"], "dir_search");
+        let input = form["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["tag"] == "input")
+            .expect("search form has an input");
+        assert_eq!(input["default_value"], "auth\nwork");
+        assert!(
+            input.get("value").is_none(),
+            "echo must not use the passback `value` field"
+        );
+        assert_eq!(input["input_type"], "multiline_text");
+        assert_eq!(input["rows"], 1);
+        assert_eq!(input["auto_resize"], true);
+        let submit = form["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["tag"] == "button")
+            .expect("search form has a submit button");
+        assert_eq!(submit["name"], "dirsearch|chat_1|chat_1");
+        assert_eq!(submit["value"]["action"], "dir");
+        assert_eq!(submit["value"]["op"], "search");
+        assert_eq!(submit["value"]["chat_id"], "chat_1");
+        assert_eq!(submit["value"]["thread_id"], "chat_1");
+    }
+
+    /// A keyword that matches nothing shows the no-match hint (not the
+    /// first-run hint); a matching keyword names itself in the header.
+    #[test]
+    fn dir_card_search_empty_state_and_header() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let empty = build_dir_card(&key, &[], None, "nope");
+        let text = empty.to_string();
+        assert!(text.contains("无匹配目录"), "no-match hint: {text}");
+        assert!(
+            !text.contains("还没有最近目录"),
+            "the first-run hint is not reused for a search: {text}"
+        );
+
+        let hit = build_dir_card(&key, &["/work/auth".to_string()], None, "auth");
+        let text = hit.to_string();
+        assert!(
+            text.contains("匹配 `auth` 的目录"),
+            "header names the keyword: {text}"
+        );
+        assert!(
+            !text.contains("最近目录**"),
+            "the plain header is replaced while searching: {text}"
+        );
+    }
+
+    /// An overflowing search result hints at refining the keyword instead of
+    /// the unfiltered "use the search box" copy (ADR-0051).
+    #[test]
+    fn dir_card_search_overflow_hint_points_at_refining() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let dirs: Vec<String> = (1..=8).map(|i| format!("/work/proj{i}")).collect();
+        let card = build_dir_card(&key, &dirs, None, "work");
+        let text = card.to_string();
+        assert!(
+            text.contains("还有 2 个匹配未显示") && text.contains("请细化关键词"),
+            "keyword overflow hints at refining: {text}"
+        );
+    }
+
+    fn dir_search_form(card: &serde_json::Value) -> Option<serde_json::Value> {
+        card["body"]["elements"]
+            .as_array()?
+            .iter()
+            .find(|e| e["tag"] == "form" && e["name"] == "dir_search")
+            .cloned()
     }
 }
