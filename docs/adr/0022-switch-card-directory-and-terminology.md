@@ -23,7 +23,8 @@ OpenCode session. Users reported two problems: "why are so many sessions all
   and archived excluded. There is no directory dimension: the user's "current
   directory" (the active session's `directory`, ADR-0012) plays no part.
 - cola's internal vocabulary already calls a single user→assistant exchange a
-  "turn" (ADR-0019, `streaming.rs`); the UI never labels individual turns.
+  "turn" (ADR-0019, `src/bridge/turn/state.rs`); the UI never labels individual
+  turns.
 - The Feishu side has two levels today: `ThreadKey { chat_id, thread_id }`.
   The glossary called the top-level a **Lobby** and a topic a **Thread**, but
   the user-facing copy was inconsistent — some strings said 本对话, others
