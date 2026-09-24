@@ -114,7 +114,10 @@ newly published RUSTSEC advisories surface even when nothing is pushed.
    accurate and complete).
 2. **Description** answers: what changed, why, and how it was verified.
 3. Reference the originating issue/spec when one exists (a GitHub issue
-   number; archive specs live under `.scratch/<feature>/`).
+   number; archive specs live under `.scratch/<feature>/`). To auto-close
+   issues on merge, give **every** number its own keyword — `Closes #10,
+   closes #11, closes #12`; GitHub closes only the first issue of a bare
+   comma list after a single keyword (`Closes #10, #11`).
 4. Record architectural decisions as ADRs in `docs/adr/` when the change is
    hard to reverse.
 5. Do not merge until CI (fmt, clippy, test, release build, dependency audit) is
