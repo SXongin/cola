@@ -104,14 +104,87 @@ fn switch_card_row(
     vec![text_row, btn_row]
 }
 
+/// Rows a `/switch` or `/dir` list card shows per page (ADR-0052): the old
+/// row cap becomes the page size. The builders clamp a requested page into
+/// `[1, total_pages]` and slice the full filtered list themselves.
+pub const CARD_PAGE_SIZE: usize = 6;
+
+/// The three-column pagination control both list cards share (ADR-0052): a
+/// 上一页 button, the 「第 x/y 页 · 共 N 个」 indicator, and a 下一页 button.
+/// `page` is the already-clamped current page; the boundary buttons are
+/// `disabled` (never hidden, so the layout stays stable). Every button's value
+/// carries the routing payload plus the active filter (`keyword`, and `scope`
+/// when given) and the TARGET page, so a flip rebuilds the same filtered view.
+/// `None` when there is at most one page — the caller renders nothing.
+fn pager_element(
+    action: &str,
+    thread_key: &crate::config::ThreadKey,
+    keyword: &str,
+    scope: Option<SwitchScope>,
+    page: usize,
+    total_pages: usize,
+    total_items: usize,
+) -> Option<serde_json::Value> {
+    if total_pages <= 1 {
+        return None;
+    }
+    let page_button = |content: &str, target: usize, disabled: bool| {
+        let mut value = json!({
+            "action": action,
+            "op": "page",
+            "chat_id": thread_key.chat_id,
+            "thread_id": thread_key.thread_id,
+            "keyword": keyword,
+            "page": target,
+        });
+        if let Some(scope) = scope {
+            value["scope"] = json!(scope.as_str());
+        }
+        json!({
+            "tag": "column",
+            "width": "auto",
+            "vertical_align": "center",
+            "elements": [
+                {
+                    "tag": "button",
+                    "text": { "tag": "plain_text", "content": content },
+                    "type": "default",
+                    "disabled": disabled,
+                    "value": value,
+                }
+            ],
+        })
+    };
+    let indicator = json!({
+        "tag": "column",
+        "width": "weighted",
+        "weight": 5,
+        "vertical_align": "center",
+        "elements": [
+            {
+                "tag": "markdown",
+                "content": format!("第 {page}/{total_pages} 页 · 共 {total_items} 个"),
+            }
+        ],
+    });
+    Some(json!({
+        "tag": "column_set",
+        "flex_mode": "none",
+        "horizontal_spacing": "default",
+        "columns": [
+            page_button("上一页", page - 1, page == 1),
+            indicator,
+            page_button("下一页", page + 1, page == total_pages),
+        ],
+    }))
+}
+
 /// Build the interactive `/switch` session card (ADR-0012, issue 04): a
-/// search box, up to `MAX_SWITCH_ROWS` session rows (each with a
+/// search box, up to one page (`CARD_PAGE_SIZE`) of session rows (each with a
 /// switch/adopt button), and a "＋new" footer button that creates a fresh
 /// session in the current project (equivalent to `/new`). `keyword` is the
 /// active filter (empty = all); `active_id`/`mapped_ids` drive the row
 /// labels and buttons.
-pub const MAX_SWITCH_ROWS: usize = 6;
-
 pub fn build_switch_card(
     thread_key: &crate::config::ThreadKey,
     sessions: &[crate::opencode::types::SessionListInfo],
@@ -233,7 +306,7 @@ pub fn build_switch_card(
             "tag": "markdown",
             "content": crate::feishu::card::sanitize::sanitize_markdown(&header)
         }));
-        for s in sessions.iter().take(MAX_SWITCH_ROWS) {
+        for s in sessions.iter().take(CARD_PAGE_SIZE) {
             let label = crate::bridge::display::title_or_id_tail(s);
             // ADR-0022: only the active session is marked; the 本会话 ownership
             // marker on mapped-but-not-active rows is dropped.
@@ -357,29 +430,36 @@ pub fn build_force_confirm_card(
     )
 }
 
-/// The `/dir` Recent Directories card (no-arg form): one directory per entry,
-/// capped at [`MAX_SWITCH_ROWS`]. Each entry is two rows — a full-width text
-/// row (directory path, marked `当前` when it is the thread's active session
-/// directory) and a two-button row beneath it, mirroring the `/switch` card
-/// layout (ADR-0025): 切换到这里 / ✅ 当前 re-roots the thread into that
-/// directory (`op: "pick"`), 建话题 wraps a NEW session in a fresh topic
-/// there (`op: "topic"`). Each button carries the routing payload (action,
-/// op, thread_key, directory), so the ack routes the choice back to the right
-/// thread. Schema-2.0 safe: no v1 `action` container (see `switch_card_row`).
+/// The `/dir` Recent Directories card (no-arg form): one page of directories —
+/// [`CARD_PAGE_SIZE`] entries — with a pagination control below the rows
+/// (ADR-0052). `page` is 1-based and clamped into `[1, total_pages]`, so a
+/// stale page lands on the last page instead of springing back to the first.
+/// Each entry is two rows — a full-width text row (directory path, marked
+/// `当前` when it is the thread's active session directory) and a two-button
+/// row beneath it, mirroring the `/switch` card layout (ADR-0025): 切换到这里 /
+/// ✅ 当前 re-roots the thread into that directory (`op: "pick"`), 建话题 wraps
+/// a NEW session in a fresh topic there (`op: "topic"`). Each button carries
+/// the routing payload (action, op, thread_key, directory) plus the active
+/// `keyword` and clamped `page`, so a row action rebuilds the same filtered
+/// view (ADR-0052). Schema-2.0 safe: no v1 `action` container (see
+/// `switch_card_row`).
 ///
-/// ADR-0051: a search form over the paths renders when the list outgrows the
-/// row budget or `keyword` is non-empty (so a narrowed result stays
-/// refinable); the header, the empty state and the overflow hint all follow
-/// the keyword.
+/// ADR-0051: a search form over the paths renders when the list outgrows a
+/// page or `keyword` is non-empty (so a narrowed result stays refinable); the
+/// header and the empty state follow the keyword.
 pub fn build_dir_card(
     thread_key: &crate::config::ThreadKey,
     dirs: &[String],
     current_dir: Option<&str>,
     keyword: &str,
+    page: usize,
 ) -> serde_json::Value {
+    let total = dirs.len();
+    let total_pages = total.div_ceil(CARD_PAGE_SIZE).max(1);
+    let page = page.clamp(1, total_pages);
     let mut elements: Vec<serde_json::Value> = Vec::new();
 
-    if dirs.len() > MAX_SWITCH_ROWS || !keyword.is_empty() {
+    if total > CARD_PAGE_SIZE || !keyword.is_empty() {
         elements.push(dir_search_form(thread_key, keyword));
     }
 
@@ -400,7 +480,8 @@ pub fn build_dir_card(
             "tag": "markdown",
             "content": crate::feishu::card::sanitize::sanitize_markdown(&header)
         }));
-        for dir in dirs.iter().take(MAX_SWITCH_ROWS) {
+        let start = (page - 1) * CARD_PAGE_SIZE;
+        for dir in dirs.iter().skip(start).take(CARD_PAGE_SIZE) {
             let is_current = current_dir == Some(dir.as_str());
             let text = if is_current {
                 format!("`{dir}`\n_(当前)_")
@@ -412,19 +493,13 @@ pub fn build_dir_card(
             } else {
                 "切换到这里"
             };
-            elements.extend(dir_card_row(&text, btn, thread_key, dir));
+            elements.extend(dir_card_row(&text, btn, thread_key, dir, keyword, page));
         }
-        // Truncated entries aren't lost: the search box narrows the list
-        // (ADR-0051); under an active keyword, refining is the next step.
-        if dirs.len() > MAX_SWITCH_ROWS {
-            let rest = dirs.len() - MAX_SWITCH_ROWS;
-            let hint = if keyword.is_empty() {
-                format!("_(还有 {rest} 个最近目录未显示。用上方搜索查找。)_")
-            } else {
-                format!("_(还有 {rest} 个匹配未显示。请细化关键词。)_")
-            };
-            elements.push(json!({ "tag": "markdown", "content": hint }));
-        }
+    }
+
+    // Pagination (ADR-0052) below the rows — the old overflow hints are gone.
+    if let Some(pager) = pager_element("dir", thread_key, keyword, None, page, total_pages, total) {
+        elements.push(pager);
     }
 
     card_shell("📂 最近目录", "blue", elements)
@@ -481,13 +556,16 @@ fn dir_search_form(thread_key: &crate::config::ThreadKey, keyword: &str) -> serd
 /// button wraps a NEW session in a fresh topic there (`op: "topic"` — the card
 /// equivalent of `/topic <dir>`; nested topic creation is rejected by the
 /// action handler). Each button carries the routing payload (action, op,
-/// thread_key, directory), so the ack routes back to the right thread.
-/// Schema-2.0 safe: no v1 `action` container (see `switch_card_row`).
+/// thread_key, directory) plus the active `keyword` and clamped `page`, so a
+/// row action rebuilds the same filtered view (ADR-0052). Schema-2.0 safe: no
+/// v1 `action` container (see `switch_card_row`).
 fn dir_card_row(
     text: &str,
     btn_text: &str,
     thread_key: &crate::config::ThreadKey,
     directory: &str,
+    keyword: &str,
+    page: usize,
 ) -> Vec<serde_json::Value> {
     let text_row = card_text_row(text);
     let btn_column = |op: &str, content: &str, btn_type: &str| {
@@ -506,6 +584,8 @@ fn dir_card_row(
                         "chat_id": thread_key.chat_id,
                         "thread_id": thread_key.thread_id,
                         "directory": directory,
+                        "keyword": keyword,
+                        "page": page,
                     },
                 }
             ],
@@ -533,7 +613,7 @@ mod tests {
     #[test]
     fn dir_card_rows_carry_pick_and_topic_buttons() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let card = build_dir_card(&key, &["/work/a".to_string()], None, "");
+        let card = build_dir_card(&key, &["/work/a".to_string()], None, "", 1);
         let s = card.to_string();
         assert!(s.contains("切换到这里"), "left button re-roots: {s}");
         assert!(s.contains("建话题"), "right button opens a topic: {s}");
@@ -650,7 +730,7 @@ mod tests {
     fn dir_card_has_no_schema_v2_unsupported_action_container() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
         let dirs = vec!["/work/auth".to_string(), "/work/billing".to_string()];
-        let card = build_dir_card(&key, &dirs, Some("/work/auth"), "");
+        let card = build_dir_card(&key, &dirs, Some("/work/auth"), "", 1);
         let text = card.to_string();
         assert!(
             !text.contains("\"tag\":\"action\"") && !text.contains("\"tag\": \"action\""),
@@ -691,7 +771,7 @@ mod tests {
     #[test]
     fn dir_card_empty_state_is_buttonless_hint() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let card = build_dir_card(&key, &[], None, "");
+        let card = build_dir_card(&key, &[], None, "", 1);
         let text = card.to_string();
         assert!(text.contains("还没有最近目录"), "empty hint: {text}");
         assert!(
@@ -700,39 +780,177 @@ mod tests {
         );
     }
 
-    /// More than `MAX_SWITCH_ROWS` recent directories render only the most
-    /// recent six (same cap as the `/switch` card), with the search form as
-    /// the overflow path and a hint pointing at it (ADR-0051).
+    /// ADR-0052: a second page renders the next window of directories, and the
+    /// pager reports the position (`第 x/y 页 · 共 N 个`).
     #[test]
-    fn dir_card_caps_rows_at_max_switch_rows() {
+    fn dir_card_page_two_windows_the_rows_and_labels_the_pager() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let dirs: Vec<String> = (1..=9).map(|i| format!("/work/proj{i}")).collect();
-        let card = build_dir_card(&key, &dirs, None, "");
+        let dirs: Vec<String> = (1..=13).map(|i| format!("/work/proj{i}")).collect();
+        let card = build_dir_card(&key, &dirs, None, "", 2);
         let text = card.to_string();
-        let elements = card["body"]["elements"].as_array().unwrap();
-        let rows: Vec<&serde_json::Value> = elements.iter().filter(|e| e["tag"] == "column_set").collect();
+        for i in 7..=12 {
+            assert!(
+                text.contains(&format!("/work/proj{i}")),
+                "page 2 shows proj{i}: {text}"
+            );
+        }
+        assert!(
+            !text.contains("/work/proj6"),
+            "page 1's last row is off page 2: {text}"
+        );
+        assert!(
+            !text.contains("/work/proj13"),
+            "page 3's row is off page 2: {text}"
+        );
+        let pager = dir_pager(&card).expect("a multi-page list renders the pager");
+        let columns = pager["columns"].as_array().unwrap();
         assert_eq!(
-            rows.len(),
-            MAX_SWITCH_ROWS * 2,
-            "one text row + one button row for each of the capped six: {text}"
+            columns[1]["elements"][0]["content"], "第 2/3 页 · 共 13 个",
+            "indicator names the position and the total: {text}"
         );
-        assert!(text.contains("/work/proj1"), "most recent shown: {text}");
-        assert!(text.contains("/work/proj6"), "sixth most recent shown: {text}");
+    }
+
+    /// ADR-0052: the boundary button is disabled, never hidden — 上一页 on the
+    /// first page, 下一页 on the last.
+    #[test]
+    fn dir_card_pager_disables_the_boundary_buttons() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let dirs: Vec<String> = (1..=13).map(|i| format!("/work/proj{i}")).collect();
+
+        let first = dir_pager(&build_dir_card(&key, &dirs, None, "", 1)).unwrap();
+        let columns = first["columns"].as_array().unwrap();
+        assert_eq!(columns[0]["elements"][0]["text"]["content"], "上一页");
+        assert_eq!(
+            columns[0]["elements"][0]["disabled"], true,
+            "page 1 disables 上一页"
+        );
+        assert_eq!(
+            columns[2]["elements"][0]["disabled"], false,
+            "page 1 keeps 下一页 live"
+        );
+
+        let last = dir_pager(&build_dir_card(&key, &dirs, None, "", 3)).unwrap();
+        let columns = last["columns"].as_array().unwrap();
+        assert_eq!(
+            columns[0]["elements"][0]["disabled"], false,
+            "the last page keeps 上一页 live"
+        );
+        assert_eq!(
+            columns[2]["elements"][0]["disabled"], true,
+            "the last page disables 下一页"
+        );
+    }
+
+    /// ADR-0052: a single page (and the empty list) renders no pager at all.
+    #[test]
+    fn dir_card_single_page_renders_no_pager() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let six: Vec<String> = (1..=6).map(|i| format!("/work/p{i}")).collect();
         assert!(
-            !text.contains("/work/proj7"),
-            "seventh+ directory dropped: {text}"
+            dir_pager(&build_dir_card(&key, &six, None, "", 1)).is_none(),
+            "exactly one page hides the pager"
+        );
+        let seven: Vec<String> = (1..=7).map(|i| format!("/work/p{i}")).collect();
+        assert!(
+            dir_pager(&build_dir_card(&key, &seven, None, "", 1)).is_some(),
+            "over one page the pager appears"
         );
         assert!(
-            dir_search_form(&card).is_some(),
-            "overflow renders the search form: {text}"
+            dir_pager(&build_dir_card(&key, &[], None, "", 1)).is_none(),
+            "the empty list has nothing to page through"
+        );
+    }
+
+    /// ADR-0052: a stale/out-of-range page is clamped to the last page (never
+    /// sprung back to the first); page 0 is the first page.
+    #[test]
+    fn dir_card_clamps_an_out_of_range_page_into_range() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let dirs: Vec<String> = (1..=13).map(|i| format!("/work/proj{i}")).collect();
+
+        let stale = build_dir_card(&key, &dirs, None, "", 99);
+        let text = stale.to_string();
+        assert!(
+            text.contains("/work/proj13") && !text.contains("/work/proj12"),
+            "clamped to the last page: {text}"
+        );
+        let pager = dir_pager(&stale).unwrap();
+        assert_eq!(
+            pager["columns"][1]["elements"][0]["content"], "第 3/3 页 · 共 13 个",
+            "the clamped page is reported: {text}"
+        );
+
+        let zero = build_dir_card(&key, &dirs, None, "", 0);
+        let text = zero.to_string();
+        assert!(
+            text.contains("/work/proj1") && !text.contains("/work/proj7"),
+            "page 0 reads as page 1: {text}"
+        );
+        let pager = dir_pager(&zero).unwrap();
+        assert_eq!(
+            pager["columns"][1]["elements"][0]["content"], "第 1/3 页 · 共 13 个",
+            "page 0 reports as page 1: {text}"
+        );
+    }
+
+    /// ADR-0052: every row button carries the active keyword and the clamped
+    /// page, so pick/topic rebuild the same filtered window.
+    #[test]
+    fn dir_card_row_buttons_carry_the_keyword_and_page() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let dirs: Vec<String> = (1..=7).map(|i| format!("/work/proj{i}")).collect();
+        let card = build_dir_card(&key, &dirs, None, "proj", 2);
+        let row = dir_row(&card, "/work/proj7").expect("page 2 holds the seventh directory");
+        for (i, op) in ["pick", "topic"].iter().enumerate() {
+            let btn = &row["columns"][i]["elements"][0];
+            assert_eq!(btn["value"]["op"], *op, "left pick / right topic: {btn}");
+            assert_eq!(btn["value"]["directory"], "/work/proj7");
+            assert_eq!(btn["value"]["keyword"], "proj");
+            assert_eq!(btn["value"]["page"], 2);
+        }
+    }
+
+    /// ADR-0052: the pager buttons carry the routing payload, the active
+    /// keyword and the TARGET page (clamped).
+    #[test]
+    fn dir_card_pager_buttons_carry_the_filter_and_target_page() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let dirs: Vec<String> = (1..=13).map(|i| format!("/work/proj{i}")).collect();
+        let card = build_dir_card(&key, &dirs, None, "proj", 2);
+        let pager = dir_pager(&card).unwrap();
+        let columns = pager["columns"].as_array().unwrap();
+
+        let prev = &columns[0]["elements"][0];
+        assert_eq!(prev["value"]["action"], "dir");
+        assert_eq!(prev["value"]["op"], "page");
+        assert_eq!(prev["value"]["chat_id"], "chat_1");
+        assert_eq!(prev["value"]["thread_id"], "chat_1");
+        assert_eq!(prev["value"]["keyword"], "proj");
+        assert_eq!(prev["value"]["page"], 1, "上一页 targets page - 1");
+        let next = &columns[2]["elements"][0];
+        assert_eq!(next["value"]["keyword"], "proj");
+        assert_eq!(next["value"]["page"], 3, "下一页 targets page + 1");
+    }
+
+    /// ADR-0052 replaced the old 「还有 N 个…」 overflow hints with the pager;
+    /// neither the unfiltered nor the filtered copy renders anymore.
+    #[test]
+    fn dir_card_paginates_instead_of_hinting_at_overflow() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let dirs: Vec<String> = (1..=13).map(|i| format!("/work/proj{i}")).collect();
+        let unfiltered = build_dir_card(&key, &dirs, None, "", 1).to_string();
+        assert!(
+            !unfiltered.contains("还有") && !unfiltered.contains("未显示"),
+            "the overflow hint is gone: {unfiltered}"
+        );
+        let filtered = build_dir_card(&key, &dirs, None, "work", 1).to_string();
+        assert!(
+            !filtered.contains("请细化关键词"),
+            "the refine hint is gone: {filtered}"
         );
         assert!(
-            text.contains("还有 3 个最近目录未显示") && text.contains("用上方搜索查找"),
-            "truncated count hints at the search box: {text}"
-        );
-        assert!(
-            !text.contains("/switch"),
-            "the old switch-then-new fallback is gone: {text}"
+            !unfiltered.contains("/switch") && !filtered.contains("/switch"),
+            "the old switch-then-new fallback is gone"
         );
     }
 
@@ -742,7 +960,7 @@ mod tests {
     fn dir_card_under_cap_has_no_truncation_hint() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
         let dirs = vec!["/work/auth".to_string(), "/work/billing".to_string()];
-        let card = build_dir_card(&key, &dirs, None, "");
+        let card = build_dir_card(&key, &dirs, None, "", 1);
         let text = card.to_string();
         assert!(
             !text.contains("还有") && !text.contains("未显示"),
@@ -763,15 +981,15 @@ mod tests {
         let short: Vec<String> = (1..=2).map(|i| format!("/work/p{i}")).collect();
         let long: Vec<String> = (1..=7).map(|i| format!("/work/p{i}")).collect();
         assert!(
-            dir_search_form(&build_dir_card(&key, &short, None, "")).is_none(),
+            dir_search_form(&build_dir_card(&key, &short, None, "", 1)).is_none(),
             "two directories do not need a search box"
         );
         assert!(
-            dir_search_form(&build_dir_card(&key, &long, None, "")).is_some(),
+            dir_search_form(&build_dir_card(&key, &long, None, "", 1)).is_some(),
             "over the cap the search box appears"
         );
         assert!(
-            dir_search_form(&build_dir_card(&key, &short, None, "p1")).is_some(),
+            dir_search_form(&build_dir_card(&key, &short, None, "p1", 1)).is_some(),
             "an active keyword keeps the box under the cap"
         );
     }
@@ -782,7 +1000,7 @@ mod tests {
     #[test]
     fn dir_card_search_input_echoes_keyword_and_encodes_routing() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let card = build_dir_card(&key, &["/work/auth".to_string()], None, "auth\nwork");
+        let card = build_dir_card(&key, &["/work/auth".to_string()], None, "auth\nwork", 1);
         let form = dir_search_form(&card).expect("keyword keeps the form");
         assert_eq!(form["name"], "dir_search");
         let input = form["elements"]
@@ -817,7 +1035,7 @@ mod tests {
     #[test]
     fn dir_card_search_empty_state_and_header() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let empty = build_dir_card(&key, &[], None, "nope");
+        let empty = build_dir_card(&key, &[], None, "nope", 1);
         let text = empty.to_string();
         assert!(text.contains("无匹配目录"), "no-match hint: {text}");
         assert!(
@@ -825,7 +1043,7 @@ mod tests {
             "the first-run hint is not reused for a search: {text}"
         );
 
-        let hit = build_dir_card(&key, &["/work/auth".to_string()], None, "auth");
+        let hit = build_dir_card(&key, &["/work/auth".to_string()], None, "auth", 1);
         let text = hit.to_string();
         assert!(
             text.contains("匹配 `auth` 的目录"),
@@ -837,25 +1055,35 @@ mod tests {
         );
     }
 
-    /// An overflowing search result hints at refining the keyword instead of
-    /// the unfiltered "use the search box" copy (ADR-0051).
-    #[test]
-    fn dir_card_search_overflow_hint_points_at_refining() {
-        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let dirs: Vec<String> = (1..=8).map(|i| format!("/work/proj{i}")).collect();
-        let card = build_dir_card(&key, &dirs, None, "work");
-        let text = card.to_string();
-        assert!(
-            text.contains("还有 2 个匹配未显示") && text.contains("请细化关键词"),
-            "keyword overflow hints at refining: {text}"
-        );
-    }
-
     fn dir_search_form(card: &serde_json::Value) -> Option<serde_json::Value> {
         card["body"]["elements"]
             .as_array()?
             .iter()
             .find(|e| e["tag"] == "form" && e["name"] == "dir_search")
+            .cloned()
+    }
+
+    /// The `/dir` pager: the three-column `column_set` whose buttons carry
+    /// `op: "page"` (the row button rows carry pick/topic instead).
+    fn dir_pager(card: &serde_json::Value) -> Option<serde_json::Value> {
+        card["body"]["elements"]
+            .as_array()?
+            .iter()
+            .find(|e| {
+                e["tag"] == "column_set"
+                    && e["columns"]
+                        .as_array()
+                        .is_some_and(|cols| cols.iter().any(|c| c["elements"][0]["value"]["op"] == "page"))
+            })
+            .cloned()
+    }
+
+    /// The two-column button row whose left button targets `dir`.
+    fn dir_row(card: &serde_json::Value, dir: &str) -> Option<serde_json::Value> {
+        card["body"]["elements"]
+            .as_array()?
+            .iter()
+            .find(|e| e["tag"] == "column_set" && e["columns"][0]["elements"][0]["value"]["directory"] == dir)
             .cloned()
     }
 }
