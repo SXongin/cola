@@ -122,7 +122,7 @@ A working directory on the filesystem where OpenCode operates. A property of a s
 _Avoid_: Workspace, repo
 
 **Recent Directories** (「最近目录」):
-Directories of the most recently active sessions in the Shared Store, deduplicated by directory and sorted by last activity, unioned with the directories cola has mapped (most recently mapped first) and the conversation's current directory. The union is what keeps a directory on the card after the server drops its last session — deletion or archival — and after a Pending Session declares one no server session exists for yet (ADR-0046). A bare `/dir` (no argument) presents them as a picker card whose rows offer one-tap re-rooting into the current conversation or opening a new Topic for that directory (ADR-0025).
+Directories of the most recently active sessions in the Shared Store, deduplicated by directory and sorted by last activity, unioned with the directories cola has mapped (most recently mapped first) and the conversation's current directory. The union is what keeps a directory on the card after the server drops its last session — deletion or archival — and after a Pending Session declares one no server session exists for yet (ADR-0046). A bare `/dir` (no argument) presents them as a picker card whose rows offer one-tap re-rooting into the current conversation or opening a new Topic for that directory (ADR-0025); when there are more directories than the card shows, a keyword search over the paths narrows them (ADR-0051).
 _Avoid_: Recently opened folders, folder history, recent projects
 
 **Variant**:

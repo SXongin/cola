@@ -1,5 +1,12 @@
 # Recent Directories union cola's mappings and the current directory
 
+> **Amended by ADR-0051**: the card now carries a keyword search over
+> directory paths when the list outgrows its row budget (or a keyword is
+> active). Overflow no longer degrades to `/switch <path>` + `/new` — it is
+> searchable, and the overflow hint points at the search box. The union, its
+> order, and the current-directory insertion stand; the insertion applies to
+> the unfiltered list, and a keyword can drop the current directory's row.
+
 The `/dir` Recent Directories picker derived its rows exclusively from the
 Shared Store's session list: a directory left the card the moment its last
 session was deleted or archived (OpenChamber's retention, `opencode session
