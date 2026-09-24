@@ -1271,6 +1271,8 @@ async fn handle_switch(
             &hit.id,
             &hit.directory,
             &hit.title,
+            // The text form has no switch list to return to.
+            None,
         )
         .await
         {
@@ -1285,6 +1287,7 @@ async fn handle_switch(
                     "切换",
                     &hit.title,
                     &data,
+                    None,
                 )
                 .await;
             }
@@ -1738,7 +1741,7 @@ async fn adopt_session(
     // the session's pre-adoption state; each field is best-effort, so a read
     // failure degrades that field rather than blocking the adoption.
     let (card, data) =
-        crate::bridge::snapshot::snapshot_card_for(&handles.snapshot_handles(), "接管", info).await;
+        crate::bridge::snapshot::snapshot_card_for(&handles.snapshot_handles(), "接管", info, None).await;
 
     let anchor = if kind == ConversationKind::Topic {
         // The snapshot is sent inside the topic and doubles as the fallback-card
@@ -1784,6 +1787,7 @@ async fn adopt_session(
             "接管",
             &info.title,
             &data,
+            None,
         )
         .await;
     } else if let Some(anchor) = &anchor {
@@ -1794,6 +1798,7 @@ async fn adopt_session(
             "接管",
             &info.title,
             &data,
+            None,
         )
         .await;
     }

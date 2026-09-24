@@ -1,4 +1,5 @@
 use crate::bridge::snapshot::{SnapshotData, TailEntry};
+use crate::feishu::card::session::{BackToList, back_to_list_button};
 use crate::opencode;
 use serde_json::json;
 
@@ -130,9 +131,17 @@ pub(crate) fn display_title(title: &str, session_id: &str) -> String {
 /// `title` the session's display title; the body comes entirely from the
 /// read-side [`SnapshotData`]. Sections are assembled from individually
 /// constructible builders so a later ticket can drop a resolved claim
-/// (05) or stream a busy follow (06) into the same card.
-pub fn build_snapshot_card(verb: &str, title: &str, data: &SnapshotData) -> serde_json::Value {
-    build_snapshot_card_with_state(verb, title, data, &SnapshotQuestionState::new(), &[])
+/// (05) or stream a busy follow (06) into the same card. `back` is the
+/// `/switch`-list state the adoption came from, when it came from the list
+/// card: it renders the optional 「返回列表」 button (ADR-0052); every other
+/// snapshot source passes `None`.
+pub fn build_snapshot_card(
+    verb: &str,
+    title: &str,
+    data: &SnapshotData,
+    back: Option<&BackToList>,
+) -> serde_json::Value {
+    build_snapshot_card_with_state(verb, title, data, &SnapshotQuestionState::new(), &[], back)
 }
 
 /// [`build_snapshot_card`] with live question state: after an interaction on a
@@ -147,6 +156,7 @@ pub fn build_snapshot_card_with_state(
     data: &SnapshotData,
     question_state: &SnapshotQuestionState,
     receipts: &[String],
+    back: Option<&BackToList>,
 ) -> serde_json::Value {
     let verb = verb.strip_prefix("已").unwrap_or(verb);
     let title = display_title(title, &data.session_id);
@@ -179,6 +189,12 @@ pub fn build_snapshot_card_with_state(
     }
     elements.extend(tail_panels(&data.tail));
 
+    // The `/switch`-list adoption's way back to the page it came from
+    // (ADR-0052), at the card's end where the list footer used to be.
+    if let Some(back) = back {
+        elements.push(back_to_list_button(back));
+    }
+
     crate::feishu::card::shell::card_shell(&format!("已{verb} {title}"), "blue", elements)
 }
 
@@ -187,17 +203,25 @@ pub fn build_snapshot_card_with_state(
 /// pending, newest user message cola-authored), the switch card patches to
 /// this small confirmation instead of a full snapshot — the card-form mirror
 /// of the text form's one-line ack. No status chip, no tail, no pending
-/// blocks: there is deliberately nothing to report.
-pub fn build_switched_state_card(title: &str, session_id: &str, directory: &str) -> serde_json::Value {
+/// blocks: there is deliberately nothing to report. `back` is the
+/// `/switch`-list state the adoption came from, when it came from the list
+/// card: it renders the optional 「返回列表」 button (ADR-0052) with the same
+/// behavior as the full snapshot's.
+pub fn build_switched_state_card(
+    title: &str,
+    session_id: &str,
+    directory: &str,
+    back: Option<&BackToList>,
+) -> serde_json::Value {
     let title = display_title(title, session_id);
-    crate::feishu::card::shell::card_shell(
-        &format!("已切换 {title}"),
-        "blue",
-        vec![json!({
-            "tag": "markdown",
-            "content": format!("已切换到该会话（目录 `{directory}`）。")
-        })],
-    )
+    let mut elements = vec![json!({
+        "tag": "markdown",
+        "content": format!("已切换到该会话（目录 `{directory}`）。")
+    })];
+    if let Some(back) = back {
+        elements.push(back_to_list_button(back));
+    }
+    crate::feishu::card::shell::card_shell(&format!("已切换 {title}"), "blue", elements)
 }
 
 #[cfg(test)]
@@ -272,7 +296,7 @@ mod tests {
     #[test]
     fn header_has_verb_and_title() {
         let d = data(Some(opencode::types::SessionStatus::Idle), vec![], vec![]);
-        let card = build_snapshot_card("接管", "重写登录模块", &d);
+        let card = build_snapshot_card("接管", "重写登录模块", &d, None);
         let h = card["header"]["title"]["content"].as_str().unwrap();
         assert_eq!(h, "已接管 重写登录模块", "header: {card}");
         assert_eq!(card["schema"].as_str().unwrap(), "2.0");
@@ -316,7 +340,7 @@ mod tests {
     #[test]
     fn busy_chip_carries_one_hint() {
         let d = data(Some(opencode::types::SessionStatus::Busy), vec![], vec![]);
-        let card = build_snapshot_card("接管", "t", &d);
+        let card = build_snapshot_card("接管", "t", &d, None);
         let body = elements(&card)[0]["content"].as_str().unwrap();
         assert!(body.contains(BUSY_CHIP));
         assert!(body.contains(BUSY_HINT));
@@ -325,7 +349,7 @@ mod tests {
     #[test]
     fn unknown_status_renders_no_chip_line() {
         let d = data(None, vec![], vec![]);
-        let card = build_snapshot_card("接管", "t", &d);
+        let card = build_snapshot_card("接管", "t", &d, None);
         let els = elements(&card);
         // Only the tail/none — no status markdown first.
         assert!(
@@ -347,7 +371,7 @@ mod tests {
             ))],
             vec![],
         );
-        let card = build_snapshot_card("接管", "t", &d);
+        let card = build_snapshot_card("接管", "t", &d, None);
         let els = elements(&card);
         let body: String = els
             .iter()
@@ -372,7 +396,7 @@ mod tests {
             vec![PendingRequest::Question(question("q_1", "ses_adopted"))],
             vec![],
         );
-        let card = build_snapshot_card("接管", "t", &d);
+        let card = build_snapshot_card("接管", "t", &d, None);
         let s = card.to_string();
         assert!(s.contains("确认"), "question text present: {s}");
         assert!(s.contains("继续"), "option present: {s}");
@@ -390,7 +414,7 @@ mod tests {
             ],
             vec![],
         );
-        let card = build_snapshot_card("接管", "t", &d);
+        let card = build_snapshot_card("接管", "t", &d, None);
         let s = card.to_string();
         assert!(s.contains("req_own") || s.contains("允许一次"));
         assert!(!s.contains("q_other"), "sibling question leaked: {s}");
@@ -403,7 +427,7 @@ mod tests {
     fn empty_and_full_tail() {
         // Empty tail → no 最近对话 section at all.
         let empty = data(Some(opencode::types::SessionStatus::Idle), vec![], vec![]);
-        let card = build_snapshot_card("接管", "t", &empty);
+        let card = build_snapshot_card("接管", "t", &empty, None);
         assert!(!card.to_string().contains("最近对话"));
 
         // Full tail (4) → four role-marked folded panels + the header.
@@ -417,7 +441,7 @@ mod tests {
                 tail("assistant", 4000, "回答二"),
             ],
         );
-        let card = build_snapshot_card("接管", "t", &full);
+        let card = build_snapshot_card("接管", "t", &full, None);
         let els = elements(&card);
         let panels: Vec<&serde_json::Value> =
             els.iter().filter(|e| e["tag"] == "collapsible_panel").collect();
@@ -477,7 +501,7 @@ mod tests {
             ],
             long_tail,
         );
-        let card = build_snapshot_card("接管", "重写登录模块", &d);
+        let card = build_snapshot_card("接管", "重写登录模块", &d, None);
         let s = card.to_string();
         // Chunked, not truncated: the whole long tail is present in the card.
         assert!(s.contains("超长内容。"), "full long text present: {}", s.len());
@@ -491,5 +515,62 @@ mod tests {
             "snapshot card over estimated JSON budget: {}",
             s.len()
         );
+    }
+
+    /// ADR-0052: only an adoption from the `/switch` list carries the
+    /// 「返回列表」 button on its full snapshot, and the button holds the
+    /// list's keyword/scope/page.
+    #[test]
+    fn full_snapshot_back_button_renders_only_with_the_list_state() {
+        let back = BackToList {
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            keyword: "proj".into(),
+            scope: crate::feishu::card::session::SwitchScope::All,
+            page: 2,
+        };
+        let d = data(Some(opencode::types::SessionStatus::Idle), vec![], vec![]);
+
+        let card = build_snapshot_card("接管", "t", &d, Some(&back));
+        let button = elements(&card)
+            .iter()
+            .find(|e| e["tag"] == "button" && e["text"]["content"] == "返回列表")
+            .expect("a list adoption renders the back button");
+        assert_eq!(button["value"]["action"], "switch");
+        assert_eq!(button["value"]["op"], "back");
+        assert_eq!(button["value"]["keyword"], "proj");
+        assert_eq!(button["value"]["scope"], "all");
+        assert_eq!(button["value"]["page"], 2);
+        assert_eq!(button["value"]["chat_id"], "chat_1");
+        assert_eq!(button["value"]["thread_id"], "chat_1");
+
+        // A snapshot from any other source (text /attach, /topic --adopt)
+        // passes no list state and renders no button.
+        let card = build_snapshot_card("接管", "t", &d, None);
+        assert!(!card.to_string().contains("返回列表"), "{card}");
+    }
+
+    /// ADR-0052: the suppressed compact 已切换 state card carries the same
+    /// back button when the adoption came from the list.
+    #[test]
+    fn switched_state_back_button_renders_only_with_the_list_state() {
+        let back = BackToList {
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            keyword: "proj".into(),
+            scope: crate::feishu::card::session::SwitchScope::Directory,
+            page: 3,
+        };
+
+        let card = build_switched_state_card("t", "ses_adopted", "/work/proj", Some(&back));
+        let button = elements(&card)
+            .iter()
+            .find(|e| e["tag"] == "button" && e["text"]["content"] == "返回列表")
+            .expect("the suppressed 已切换 card renders the back button");
+        assert_eq!(button["value"]["op"], "back");
+        assert_eq!(button["value"]["keyword"], "proj");
+        assert_eq!(button["value"]["scope"], "dir");
+        assert_eq!(button["value"]["page"], 3);
+
+        let card = build_switched_state_card("t", "ses_adopted", "/work/proj", None);
+        assert!(!card.to_string().contains("返回列表"), "{card}");
     }
 }

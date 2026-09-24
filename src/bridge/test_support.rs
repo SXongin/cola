@@ -2185,6 +2185,7 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
             newest_user_epoch: None,
             newest_user_is_cola_authored: false,
         },
+        None,
     );
 
     // The list call hangs: /work said nothing this sweep.

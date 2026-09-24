@@ -549,6 +549,7 @@ async fn a_snapshot_settle_carries_the_session() {
             "接管",
             "标题",
             &data,
+            None,
         )
         .await
     })

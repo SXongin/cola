@@ -37,6 +37,9 @@ struct ClaimedSnapshot {
     /// (#175): rendered under the still-live blocks, so a resolved block
     /// leaves a visible residue instead of silently vanishing.
     receipts: Vec<String>,
+    /// The `/switch`-list state the snapshot was adopted from, when it came
+    /// from the list card (ADR-0052): a rebuild keeps the 「返回列表」 button.
+    back: Option<crate::feishu::card::session::BackToList>,
 }
 
 /// The ADR-0028 claim registry: which snapshot card hosts which adopt-time
@@ -94,13 +97,22 @@ impl SnapshotClaims {
 
     /// Register a SENT snapshot card as the host of its embedded pendings: the
     /// poll loop then treats every claimed id as already surfaced. Called
-    /// after the card was sent, with its message id.
+    /// after the card was sent, with its message id. `back` is the
+    /// `/switch`-list state the card was built from, when it came from the
+    /// list card (ADR-0052), kept so a rebuild preserves its 返回列表 button.
     ///
     /// Precondition: every pending is still claimable — `claimable_pendings`
     /// filtered the ones surfaced elsewhere — so an id is never claimed twice
     /// by construction. A re-claim would overwrite the existing entry,
     /// matching the pre-C6 behaviour.
-    pub fn claim(&mut self, message_id: &str, verb: &str, title: &str, data: &SnapshotData) {
+    pub fn claim(
+        &mut self,
+        message_id: &str,
+        verb: &str,
+        title: &str,
+        data: &SnapshotData,
+        back: Option<&crate::feishu::card::session::BackToList>,
+    ) {
         self.hosts
             .entry(message_id.to_string())
             .or_insert_with(|| ClaimedSnapshot {
@@ -108,6 +120,7 @@ impl SnapshotClaims {
                 title: title.to_string(),
                 data: data.clone(),
                 receipts: Vec::new(),
+                back: back.cloned(),
             });
         for req in &data.pending {
             let kind = req.claim_kind();
@@ -141,6 +154,7 @@ impl SnapshotClaims {
             &data,
             question_state,
             &host.receipts,
+            host.back.as_ref(),
         ))
     }
 
@@ -313,19 +327,21 @@ pub(crate) async fn claimable_pendings(
 /// loop then treats them as surfaced) and remember question requests so the
 /// block buttons resolve (the poll loop never sees claimed requests, so
 /// `prepare()` never ran for them). Called AFTER the snapshot card is sent,
-/// with its message id.
+/// with its message id. `back` is the `/switch`-list state when the snapshot
+/// came from the list card (ADR-0052), preserved across claim rebuilds.
 pub(crate) async fn claim_snapshot_pendings(
     requests: &RequestsHandle,
     snapshot_message_id: &str,
     verb: &str,
     title: &str,
     data: &SnapshotData,
+    back: Option<&crate::feishu::card::session::BackToList>,
 ) {
     requests
         .snapshot_claims
         .lock()
         .await
-        .claim(snapshot_message_id, verb, title, data);
+        .claim(snapshot_message_id, verb, title, data, back);
     for req in &data.pending {
         requests
             .flow_for(req.claim_kind())
@@ -381,7 +397,7 @@ mod tests {
     #[test]
     fn claim_registers_host_and_claims() {
         let mut claims = SnapshotClaims::default();
-        claims.claim("mid_1", "接管", "title", &data_with(&["p1", "p2"]));
+        claims.claim("mid_1", "接管", "title", &data_with(&["p1", "p2"]), None);
         assert_eq!(claims.claim_count(), 2);
         assert_eq!(claims.claim_of("p1"), Some(("mid_1", ClaimKind::Permission)));
         assert!(claims.host_pending("mid_1").is_some());
@@ -391,7 +407,7 @@ mod tests {
     #[test]
     fn resolve_drops_claim_and_tombstones_but_keeps_the_host() {
         let mut claims = SnapshotClaims::default();
-        claims.claim("mid_1", "接管", "title", &data_with(&["p1", "p2"]));
+        claims.claim("mid_1", "接管", "title", &data_with(&["p1", "p2"]), None);
         let card = claims.resolve("p1", "mid_1", &empty_state());
         assert!(card.is_some(), "host card rebuilt without the block");
         assert!(!claims.contains("p1"));
@@ -404,7 +420,7 @@ mod tests {
     #[test]
     fn resolve_prunes_the_host_and_its_tombstones_on_the_last_claim() {
         let mut claims = SnapshotClaims::default();
-        claims.claim("mid_1", "接管", "title", &data_with(&["p1", "p2"]));
+        claims.claim("mid_1", "接管", "title", &data_with(&["p1", "p2"]), None);
         claims.resolve("p1", "mid_1", &empty_state());
         let card = claims.resolve("p2", "mid_1", &empty_state());
         assert!(card.is_some(), "last resolve still returns the drop card");
@@ -422,8 +438,8 @@ mod tests {
     #[test]
     fn drop_vanished_rebuilds_each_affected_host_once() {
         let mut claims = SnapshotClaims::default();
-        claims.claim("mid_1", "接管", "title", &data_with(&["p1", "p2"]));
-        claims.claim("mid_2", "接管", "title", &data_with(&["p3"]));
+        claims.claim("mid_1", "接管", "title", &data_with(&["p1", "p2"]), None);
+        claims.claim("mid_2", "接管", "title", &data_with(&["p3"]), None);
         // p1 vanished (kind permission); p2 stays pending.
         let pending: HashSet<String> = ["p2".to_string(), "p3".to_string()].into_iter().collect();
         let dropped = claims.drop_vanished(ClaimKind::Permission, &pending, &HashSet::new());
@@ -464,6 +480,7 @@ mod tests {
             "接管",
             "title",
             &data_with_patterns(&[("p1", "first"), ("p2", "second")]),
+            None,
         );
         let dropped = claims.drop_vanished(ClaimKind::Permission, &HashSet::new(), &HashSet::new());
         assert_eq!(dropped.len(), 1);
@@ -479,7 +496,7 @@ mod tests {
     #[test]
     fn drop_vanished_keeps_claims_from_a_failed_directory() {
         let mut claims = SnapshotClaims::default();
-        claims.claim("mid_1", "接管", "title", &data_with(&["p1"]));
+        claims.claim("mid_1", "接管", "title", &data_with(&["p1"]), None);
         let failed: HashSet<String> = ["/work".to_string()].into_iter().collect();
         let dropped = claims.drop_vanished(ClaimKind::Permission, &HashSet::new(), &failed);
         assert!(dropped.is_empty(), "a failed list must not drop the claim");
@@ -487,10 +504,31 @@ mod tests {
         assert!(!claims.is_tombstoned("p1"));
     }
 
+    /// ADR-0052: a claim rebuild keeps the 「返回列表」 button of a snapshot
+    /// adopted from the `/switch` list (the payload rides the host entry).
+    #[test]
+    fn rebuild_keeps_the_back_to_list_button() {
+        let back = crate::feishu::card::session::BackToList {
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            keyword: "proj".into(),
+            scope: crate::feishu::card::session::SwitchScope::All,
+            page: 2,
+        };
+        let mut claims = SnapshotClaims::default();
+        claims.claim("mid_1", "接管", "title", &data_with(&["p1", "p2"]), Some(&back));
+        let card = claims
+            .resolve("p1", "mid_1", &empty_state())
+            .expect("the host rebuilds without the resolved block");
+        assert!(
+            card.to_string().contains("返回列表"),
+            "the rebuild keeps the list button: {card}"
+        );
+    }
+
     #[test]
     fn drop_vanished_only_touches_its_own_kind() {
         let mut claims = SnapshotClaims::default();
-        claims.claim("mid_1", "接管", "title", &data_with(&["p1"]));
+        claims.claim("mid_1", "接管", "title", &data_with(&["p1"]), None);
         let pending: HashSet<String> = HashSet::new();
         let dropped = claims.drop_vanished(ClaimKind::Question, &pending, &HashSet::new());
         assert!(dropped.is_empty(), "a permission claim survives the other sweep");

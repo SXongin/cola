@@ -187,17 +187,20 @@ pub(crate) async fn gather_snapshot(
 /// them. The whole gather+build runs inside the adopted Session's `snapshot`
 /// span (ADR-0048), so its best-effort read warnings are retrievable by it.
 /// Returns the card together with the filtered data — the caller sends
-/// the card and then claims the pendings with its message id.
+/// the card and then claims the pendings with its message id. `back` is the
+/// `/switch`-list state when the adoption came from the list card (ADR-0052);
+/// every other adoption surface passes `None`.
 pub(crate) async fn snapshot_card_for(
     handles: &SnapshotHandles,
     verb: &str,
     info: &crate::opencode::types::SessionListInfo,
+    back: Option<&crate::feishu::card::session::BackToList>,
 ) -> (serde_json::Value, SnapshotData) {
     let thread_key = crate::bridge::span::thread_key_of(&handles.sessions, &info.id).await;
     let span = crate::bridge::span::snapshot(&info.id, thread_key.as_ref());
     async move {
         let data = gather_snapshot(&handles.backend, &info.id, &info.directory).await;
-        snapshot_card_from_data(handles, verb, &info.title, data).await
+        snapshot_card_from_data(handles, verb, &info.title, data, back).await
     }
     .instrument(span)
     .await
@@ -212,10 +215,11 @@ pub(crate) async fn snapshot_card_from_data(
     verb: &str,
     title: &str,
     data: SnapshotData,
+    back: Option<&crate::feishu::card::session::BackToList>,
 ) -> (serde_json::Value, SnapshotData) {
     let data =
         crate::bridge::snapshot_claims::claimable_pendings(&handles.requests, &handles.cards, data).await;
-    let card = crate::feishu::snapshot_card::build_snapshot_card(verb, title, &data);
+    let card = crate::feishu::snapshot_card::build_snapshot_card(verb, title, &data, back);
     (card, data)
 }
 
@@ -239,20 +243,23 @@ pub(crate) enum ReSwitchSnapshot {
 /// build sequence runs inside the Session's `snapshot` span (ADR-0048), so the
 /// gather's best-effort read warnings are retrievable by the Session being
 /// re-activated. Shared by the text `/switch` mapped-hit path and the switch
-/// card's 切换 op so the span and the sequence cannot drift.
+/// card's 切换 op so the span and the sequence cannot drift. `back` is the
+/// `/switch`-list state when the re-switch came from the list card
+/// (ADR-0052); the text path passes `None`.
 pub(crate) async fn re_switch_snapshot(
     handles: &SnapshotHandles,
     thread_key: &crate::config::ThreadKey,
     session_id: &str,
     directory: &str,
     title: &str,
+    back: Option<&crate::feishu::card::session::BackToList>,
 ) -> ReSwitchSnapshot {
     let span = crate::bridge::span::snapshot(session_id, Some(thread_key));
     async move {
         let data = gather_snapshot(&handles.backend, session_id, directory).await;
         match re_switch_emit(&data) {
             SnapshotEmit::Full => {
-                let (card, data) = snapshot_card_from_data(handles, "切换", title, data).await;
+                let (card, data) = snapshot_card_from_data(handles, "切换", title, data, back).await;
                 ReSwitchSnapshot::Full { card, data }
             }
             SnapshotEmit::Suppressed => ReSwitchSnapshot::Suppressed,

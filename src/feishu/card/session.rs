@@ -30,6 +30,40 @@ impl SwitchScope {
     }
 }
 
+/// The list state a `/switch`-card adoption carries onto its Session Snapshot
+/// (ADR-0052): the list's thread plus its active keyword/scope/page. The
+/// snapshot's optional 「返回列表」 button rebuilds exactly this filtered
+/// window, so an adoption that turns out wrong returns to the page it came
+/// from. Every other snapshot source has no list to return to and passes
+/// `None`.
+#[derive(Clone)]
+pub struct BackToList {
+    pub thread_key: crate::config::ThreadKey,
+    pub keyword: String,
+    pub scope: SwitchScope,
+    pub page: usize,
+}
+
+/// The 「返回列表」 button (ADR-0052) shared by the force-confirm card and the
+/// adopt snapshot: a standalone schema-2.0-safe button whose `op: "back"`
+/// rebuilds the `/switch` list with this filter and page.
+pub(crate) fn back_to_list_button(back: &BackToList) -> serde_json::Value {
+    json!({
+        "tag": "button",
+        "text": { "tag": "plain_text", "content": "返回列表" },
+        "type": "default",
+        "value": {
+            "action": "switch",
+            "op": "back",
+            "chat_id": back.thread_key.chat_id,
+            "thread_id": back.thread_key.thread_id,
+            "scope": back.scope.as_str(),
+            "keyword": back.keyword,
+            "page": back.page,
+        },
+    })
+}
+
 /// One session entry of the `/switch` card: a full-width text row followed by
 /// a button row underneath. The text row is its own `column_set` column (not a
 /// weighted column squeezed beside the buttons), so the session label and
@@ -404,19 +438,11 @@ pub fn build_force_confirm_card(
     page: usize,
 ) -> serde_json::Value {
     let label = crate::bridge::display::title_or_id_tail(target);
-    let back_btn = json!({
-        "tag": "button",
-        "text": { "tag": "plain_text", "content": "返回列表" },
-        "type": "default",
-        "value": {
-            "action": "switch",
-            "op": "back",
-            "chat_id": thread_key.chat_id,
-            "thread_id": thread_key.thread_id,
-            "scope": scope.as_str(),
-            "keyword": keyword,
-            "page": page,
-        },
+    let back_btn = back_to_list_button(&BackToList {
+        thread_key: thread_key.clone(),
+        keyword: keyword.to_string(),
+        scope,
+        page,
     });
     let force_btn = json!({
         "tag": "button",
