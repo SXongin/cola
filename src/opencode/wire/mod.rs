@@ -1,15 +1,21 @@
 //! Private protocol decoders: one per API generation (ADR-0053).
 //!
-//! Backend protocol field names live ONLY here. The adapter selects the
-//! generation; the Bridge consumes the neutral
+//! Backend protocol field names for the message/transcript read live ONLY
+//! here. The adapter selects the generation; the Bridge consumes the neutral
 //! [`SessionTranscript`](crate::backend::SessionTranscript) and never branches
 //! on a generation. This module ships both generations: [`legacy`] decodes the
 //! unprefixed V1 routes and [`v2`] the current `/api` routes.
 //!
+//! The public session/permission/provider/agent DTOs in
+//! [`crate::opencode::types`] are the known out-of-scope exception (spec
+//! #332): they still spell the list/read wire fields, and the session list's
+//! raw `model` payload is normalized where it is displayed
+//! (`crate::bridge::display::model_display`).
+//!
 //! The wire types are private to their generation's decoder: from outside the
 //! adapter only the decode functions and the generation-neutral [`Page`] are
-//! callable, so no wire shape or protocol field name can escape the seam
-//! (spec #332).
+//! callable, so no wire shape or protocol field name of the transcript read
+//! can escape the seam (spec #332).
 //!
 //! The normalizations both generations share — tool statuses, finish reasons,
 //! failure shapes, tool identity, string lists, output text and its existence,

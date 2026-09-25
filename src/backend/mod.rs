@@ -3,8 +3,12 @@
 //!
 //! The seam's read side carries a [`SessionTranscript`] — typed messages and
 //! typed parts — instead of backend wire JSON. Backend protocol field names
-//! live only in the adapter's private decoders, so a protocol change is an
-//! adapter change, not a Bridge-and-card change.
+//! for that read live only in the adapter's private decoders, so a protocol
+//! change is an adapter change, not a Bridge-and-card change. The public
+//! session/permission/provider/agent DTOs in [`crate::opencode::types`] are
+//! the known out-of-scope exception (spec #332): they still spell the
+//! list/read wire fields, and the session list's raw `model` payload is
+//! normalized where it is displayed (`bridge::display::model_display`).
 //!
 //! Every caller imports these traits from here, never from the adapter; the
 //! HTTP adapter ([`crate::opencode::client::Client`]) and the test mock
