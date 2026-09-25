@@ -181,13 +181,14 @@ fn decode_tool_output(state: Option<&Value>) -> ToolOutput {
                 }
                 text.push_str(result);
             }
-            if text.is_empty()
-                && let Some(fallback) = state.pointer("/metadata/output").and_then(Value::as_str)
-            {
-                text.push_str(fallback);
-            }
+            // `metadata.output` is the historical last resort and never
+            // overrides real text. A present string is the text even when it
+            // is empty, so an empty `metadata.output` still yields a text
+            // block (the renderer returns `Some("")` there).
             if !text.is_empty() {
                 blocks.push(ContentBlock::Text(text));
+            } else if let Some(fallback) = state.pointer("/metadata/output").and_then(Value::as_str) {
+                blocks.push(ContentBlock::Text(fallback.to_string()));
             }
             blocks.extend(raw_blocks);
         }
@@ -210,11 +211,10 @@ fn non_null(value: Option<&Value>) -> Option<&Value> {
     value.filter(|value| !value.is_null())
 }
 
-/// The text of a `content` text block, when it carries any.
+/// The text of a `content` item, when it carries any: any item with a string
+/// `text` contributes, regardless of its kind (the renderer never checks the
+/// kind either).
 fn content_text(item: &Value) -> Option<&str> {
-    if item.get("type").and_then(Value::as_str) != Some("text") {
-        return None;
-    }
     item.get("text").and_then(Value::as_str)
 }
 
@@ -364,6 +364,42 @@ mod tests {
             "metadata": {"output": "ignored"}
         }));
         assert_eq!(call.output.blocks, vec![ContentBlock::Text("real".into())]);
+    }
+
+    /// Any content item with a string `text` contributes — the kind is not
+    /// checked (the renderer reads `text` off any item); an item without one
+    /// stays raw.
+    #[test]
+    fn any_content_item_with_string_text_contributes_its_text() {
+        let call = tool(serde_json::json!({
+            "status": "completed",
+            "content": [
+                {"type": "file", "text": "file that carries text"},
+                {"type": "file", "uri": "file:///a"},
+                {"no": "type", "text": "untyped text"}
+            ]
+        }));
+
+        assert_eq!(
+            call.output.blocks,
+            vec![
+                ContentBlock::Text("file that carries textuntyped text".into()),
+                ContentBlock::Other(serde_json::json!({"type": "file", "uri": "file:///a"})),
+            ]
+        );
+    }
+
+    /// An empty-but-present `metadata.output` is still the fallback text: the
+    /// renderer returns `Some("")`, not `None`.
+    #[test]
+    fn an_empty_metadata_output_still_yields_a_text_block() {
+        let call = tool(serde_json::json!({
+            "status": "completed",
+            "metadata": {"output": ""}
+        }));
+
+        assert_eq!(call.output.blocks, vec![ContentBlock::Text(String::new())]);
+        assert_eq!(call.output.raw, Some(Value::String(String::new())));
     }
 
     /// A string output is the whole text; a `content` text block that lost its
