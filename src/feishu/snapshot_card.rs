@@ -1,4 +1,5 @@
-use crate::bridge::snapshot::{ElsewherePending, SnapshotData, TailEntry};
+use crate::backend::{MessageRole, TailEntry};
+use crate::bridge::snapshot::{ElsewherePending, SnapshotData};
 use crate::feishu::card::session::{BackToList, back_to_list_button};
 use crate::opencode;
 use serde_json::json;
@@ -126,17 +127,23 @@ fn tail_panels(tail: &[TailEntry]) -> Vec<serde_json::Value> {
     panels
 }
 
+/// The emoji marker for a tail entry's role. Shared by the static snapshot's
+/// collapsible panels and the busy-adopt follow's static text (ADR-0028), so
+/// the two presentations cannot disagree.
+pub(crate) fn role_marker(role: &MessageRole) -> &'static str {
+    match role {
+        MessageRole::User => "👤",
+        MessageRole::Assistant => "🤖",
+        _ => "💬",
+    }
+}
+
 /// One tail entry's role marker + short preview, shared by the static
 /// snapshot's collapsible panels and the busy-adopt follow's static text
 /// (ADR-0028).
 pub(crate) fn tail_preview(entry: &TailEntry) -> (&'static str, String) {
-    let role = match entry.role.as_str() {
-        "user" => "👤",
-        "assistant" => "🤖",
-        _ => "💬",
-    };
     let preview: String = entry.text.chars().take(40).collect::<String>().trim().to_string();
-    (role, preview)
+    (role_marker(&entry.role), preview)
 }
 
 /// The snapshot's display title: the cleaned session label, falling back to
@@ -308,9 +315,9 @@ mod tests {
         }
     }
 
-    fn tail(role: &str, created_ms: i64, text: &str) -> TailEntry {
+    fn tail(role: MessageRole, created_ms: i64, text: &str) -> TailEntry {
         TailEntry {
-            role: role.into(),
+            role,
             created_ms,
             text: text.into(),
         }
@@ -544,10 +551,10 @@ mod tests {
             Some(opencode::types::SessionStatus::Idle),
             vec![],
             vec![
-                tail("user", 1000, "问题一"),
-                tail("assistant", 2000, "回答一"),
-                tail("user", 3000, "问题二"),
-                tail("assistant", 4000, "回答二"),
+                tail(MessageRole::User, 1000, "问题一"),
+                tail(MessageRole::Assistant, 2000, "回答一"),
+                tail(MessageRole::User, 3000, "问题二"),
+                tail(MessageRole::Assistant, 4000, "回答二"),
             ],
         );
         let card = build_snapshot_card("接管", "t", &full, None);
@@ -577,7 +584,11 @@ mod tests {
     fn worst_case_fits_feishu_limits() {
         let mut long_tail: Vec<TailEntry> = (0..3)
             .map(|i| {
-                let role = if i % 2 == 0 { "user" } else { "assistant" };
+                let role = if i % 2 == 0 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Assistant
+                };
                 tail(
                     role,
                     i * 1000,
@@ -592,7 +603,7 @@ mod tests {
         // answer; the streaming path splits turns for that, a snapshot is
         // one-shot).
         long_tail.push(tail(
-            "assistant",
+            MessageRole::Assistant,
             9000,
             // Just over the 3000-char element budget ("超长内容。" is 5 chars),
             // so the entry splits into two chunks while the whole card still
