@@ -14,11 +14,13 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::backend::{
-    ContentBlock, FinishReason, MessageId, MessageRole, MessageTime, ModelIdentity, OtherPart, Part, Patch,
-    ReasoningPart, SessionTranscript, StepFinish, StepStart, TextPart, TokenUsage, ToolCall, ToolIdentity,
-    ToolOutput, ToolStatus, TranscriptMessage,
+    ContentBlock, MessageId, MessageRole, MessageTime, ModelIdentity, OtherPart, Part, Patch, ReasoningPart,
+    SessionTranscript, StepFinish, StepStart, TextPart, TokenUsage, ToolCall, ToolIdentity, ToolOutput,
+    TranscriptMessage,
 };
 use crate::error::Result;
+
+use super::{content_text, decode_error, decode_finish_reason, decode_tool_status, non_null, started_at};
 
 /// The legacy generation's message envelope (`{info, parts}`).
 #[derive(Debug, Clone, Deserialize)]
@@ -214,17 +216,6 @@ fn decode_tool(part: &Value) -> ToolCall {
     }
 }
 
-fn decode_tool_status(status: Option<&Value>) -> ToolStatus {
-    match status.and_then(Value::as_str) {
-        Some("pending") => ToolStatus::Pending,
-        Some("running") => ToolStatus::Running,
-        Some("completed") => ToolStatus::Completed,
-        Some("error") => ToolStatus::Error,
-        Some(other) => ToolStatus::Other(other.to_string()),
-        None => ToolStatus::Unknown,
-    }
-}
-
 /// Decode a tool state's output side. Text sources follow the precedence the
 /// presentation has always rendered: a string `output` is authoritative (the
 /// other sources are never appended to it); otherwise the `content` text runs
@@ -282,51 +273,10 @@ fn decode_tool_output(state: Option<&Value>) -> ToolOutput {
     }
 }
 
-/// A JSON field that was actually reported: absent and explicit `null` both
-/// read as "not there", so neither shadows another output source.
-fn non_null(value: Option<&Value>) -> Option<&Value> {
-    value.filter(|value| !value.is_null())
-}
-
-/// The text of a `content` item, when it carries any: any item with a string
-/// `text` contributes, regardless of its kind (the renderer never checks the
-/// kind either).
-fn content_text(item: &Value) -> Option<&str> {
-    item.get("text").and_then(Value::as_str)
-}
-
-/// Normalize a failure payload: a plain string (`"Could not find ..."`) or an
-/// object carrying `message`.
-fn decode_error(error: &Value) -> Option<String> {
-    match error {
-        Value::String(message) => Some(message.clone()),
-        Value::Object(fields) => fields.get("message").and_then(Value::as_str).map(str::to_string),
-        _ => None,
-    }
-}
-
-fn decode_finish_reason(reason: Option<&Value>) -> FinishReason {
-    match reason.and_then(Value::as_str) {
-        Some("tool-calls") => FinishReason::ToolCalls,
-        Some("stop") => FinishReason::Stop,
-        Some("length") => FinishReason::Length,
-        Some("content-filter") => FinishReason::ContentFilter,
-        Some("error") => FinishReason::Error,
-        Some(other) => FinishReason::Other(other.to_string()),
-        None => FinishReason::Unknown,
-    }
-}
-
-/// A JSON pointer to a server epoch-millis number, when the payload carries
-/// one. A float or out-of-range number is not a usable clock and reads as
-/// absent.
-fn started_at(value: &Value, pointer: &str) -> Option<i64> {
-    value.pointer(pointer).and_then(Value::as_i64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::ToolStatus;
 
     /// Decode one tool part's state into its typed call.
     fn tool(state: Value) -> ToolCall {
