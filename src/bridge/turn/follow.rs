@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use tracing::Instrument;
 
+use crate::backend::TurnAnchor;
 use crate::bridge::handles::TurnHandles;
 use crate::bridge::span;
 use crate::config::ThreadKey;
@@ -44,7 +45,7 @@ pub(super) fn spawn(
     thread_key: ThreadKey,
     directory: String,
     started_at: std::time::Instant,
-    anchor: crate::backend::TurnAnchor,
+    anchor: TurnAnchor,
 ) {
     let handles = handles.clone();
     let poll_ms = handles.config.render_poll_ms();
@@ -74,7 +75,7 @@ async fn run(
     session_id: String,
     directory: String,
     started_at: std::time::Instant,
-    anchor: crate::backend::TurnAnchor,
+    anchor: TurnAnchor,
     poll_ms: u64,
     ceiling_ms: u64,
 ) {

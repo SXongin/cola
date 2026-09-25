@@ -606,10 +606,10 @@ async fn external_render_loop(
             break;
         }
         // A NEWER user message is a turn boundary — the poller notifies and
-        // arms a fresh renderer for it. The boundary is the server TIME only
-        // (strictly greater wins): identity would misread a re-read of this
-        // turn's own message as a new turn, while a same-millisecond message
-        // cannot be ordered anyway.
+        // arms a fresh renderer for it. The boundary stays time-based (the
+        // pre-migration rule: strictly greater server time wins) because a
+        // same-millisecond message cannot be ordered by server time; the
+        // armed-renderer guards above use full-anchor identity instead.
         let newer_turn = transcript
             .newest_user()
             .and_then(|message| message.anchor())
