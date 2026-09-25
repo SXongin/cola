@@ -98,4 +98,5 @@ blocks, and re-hosting pendings onto the snapshot on re-activation was
 considered and rejected — it would separate the question from the turn it
 blocks, while a standalone card or an earlier snapshot's claim already has an
 authoritative, pinned surface. Where Message Pin is disabled the pointer copy
-must not promise a pin; the exact fallback wording is a spec detail.
+must not promise a pin: it reads `⏳ 等待你的确认（见原卡片）` instead, naming
+the hosting card without promising a pin.
