@@ -622,7 +622,7 @@ impl Client {
         &self,
         session_id: &str,
         cursor: Option<&str>,
-    ) -> crate::error::Result<Option<super::wire::v2::Page>> {
+    ) -> crate::error::Result<Option<super::wire::Page>> {
         let mut url = reqwest::Url::parse(&self.url(&format!("/api/session/{}/message", session_id)))?;
         url.query_pairs_mut()
             .append_pair("limit", &TRANSCRIPT_PAGE_SIZE.to_string());
@@ -2155,7 +2155,8 @@ mod wire_tests {
     /// The current route's pages are drained through `cursor.next` in the
     /// order served (oldest first): every message arrives once, no legacy
     /// request is made, and the free-standing cursor never combines with
-    /// `order`.
+    /// `order`. The reference server reports `next` on every NON-empty page,
+    /// so draining ends on the following empty page.
     #[tokio::test]
     async fn transcript_prefers_the_v2_route_and_drains_its_cursor() {
         let server = TestHttpServer::start().await;
@@ -2193,7 +2194,15 @@ mod wire_tests {
                              "model": {"id": "deepseek-v4-flash", "providerID": "opencode-go"},
                              "content": [{"type": "text", "id": "prt_t2", "text": "答案二"}]}
                         ],
-                        "cursor": {"previous": "p3"}
+                        "cursor": {"previous": "p3", "next": "c3"}
+                    })
+                    .to_string(),
+                ),
+                // The page after the last row is empty and reports no cursor.
+                MockResponse::json(
+                    serde_json::json!({
+                        "data": [],
+                        "cursor": {"previous": null, "next": null}
                     })
                     .to_string(),
                 ),
@@ -2219,7 +2228,7 @@ mod wire_tests {
         assert!(turn.complete, "the terminal finish completes the Turn");
 
         let requests = server.requests();
-        assert_eq!(requests.len(), 3, "one request per page");
+        assert_eq!(requests.len(), 4, "one request per page, empty page included");
         assert!(requests.iter().all(|r| r.path == "/api/session/ses_v2/message"));
         assert_eq!(requests[0].query_param("limit").as_deref(), Some("200"));
         assert_eq!(requests[0].query_param("order").as_deref(), Some("asc"));
@@ -2230,6 +2239,37 @@ mod wire_tests {
             "a cursor is never combined with order"
         );
         assert_eq!(requests[2].query_param("cursor").as_deref(), Some("c2"));
+        assert_eq!(requests[3].query_param("cursor").as_deref(), Some("c3"));
+    }
+
+    /// A non-empty page that reports no `next` ends the drain right there —
+    /// defensive coverage for a server that omits the cursor on its last page.
+    #[tokio::test]
+    async fn transcript_v2_stops_when_a_page_reports_no_next_cursor() {
+        let server = TestHttpServer::start().await;
+        server.route_sequence(
+            "GET",
+            "/api/session/ses_one_page/message",
+            vec![MockResponse::json(
+                serde_json::json!({
+                    "data": [
+                        {"type": "user", "id": "msg_u1", "time": {"created": 1000}, "text": "hi"}
+                    ],
+                    "cursor": {"previous": "p1"}
+                })
+                .to_string(),
+            )],
+        );
+        let client = wire_client(&server, None);
+
+        let transcript = client.transcript("ses_one_page").await.unwrap();
+
+        assert_eq!(transcript.messages.len(), 1);
+        assert_eq!(
+            server.request_count(),
+            1,
+            "no next cursor was reported, so there is no follow-up"
+        );
     }
 
     /// The `/api` store is fed by the V2 execution path: an empty first page
@@ -2395,5 +2435,68 @@ mod wire_tests {
         assert_eq!(legacy_ids, v2_ids);
         assert_eq!(legacy_turn.complete, v2_turn.complete);
         assert!(!legacy_turn.complete, "the fixture ends on a tool-calls pause");
+    }
+
+    /// Parity holds on the completing branch too: a legacy `step-finish`
+    /// and its `/api` counterpart `finish` decode to the same transcript and
+    /// both declare the Turn complete.
+    #[tokio::test]
+    async fn v2_and_legacy_fixtures_agree_on_a_completed_turn() {
+        let legacy_server = TestHttpServer::start().await;
+        legacy_server.route(
+            "GET",
+            "/session/ses_done_parity/message",
+            200,
+            serde_json::json!([
+                {"info": {"id": "msg_u1", "role": "user", "time": {"created": 1000}},
+                 "parts": [{"type": "text", "text": "问题"}]},
+                {"info": {"id": "msg_a1", "role": "assistant",
+                          "time": {"created": 1100, "completed": 1200},
+                          "modelID": "deepseek-v4-flash", "providerID": "opencode-go"},
+                 "parts": [{"type": "text", "text": "答案"},
+                           {"type": "step-finish", "reason": "stop"}]}
+            ])
+            .to_string(),
+        );
+
+        let v2_server = TestHttpServer::start().await;
+        v2_server.route_sequence(
+            "GET",
+            "/api/session/ses_done_parity/message",
+            vec![MockResponse::json(
+                serde_json::json!({
+                    "data": [
+                        {"type": "user", "id": "msg_u1", "time": {"created": 1000}, "text": "问题"},
+                        {"type": "assistant", "id": "msg_a1",
+                         "time": {"created": 1100, "completed": 1200},
+                         "model": {"id": "deepseek-v4-flash", "providerID": "opencode-go"},
+                         "content": [{"type": "text", "id": "prt_t", "text": "答案"}],
+                         "finish": "stop"}
+                    ],
+                    "cursor": {"previous": null, "next": null}
+                })
+                .to_string(),
+            )],
+        );
+
+        let legacy = wire_client(&legacy_server, None)
+            .transcript("ses_done_parity")
+            .await
+            .unwrap();
+        let v2 = wire_client(&v2_server, None)
+            .transcript("ses_done_parity")
+            .await
+            .unwrap();
+
+        assert_eq!(legacy.messages, v2.messages);
+        let anchor = v2.newest_user().unwrap().anchor().unwrap();
+        assert!(
+            legacy.turn_for_user(&anchor).complete,
+            "the legacy terminal finish completes the Turn"
+        );
+        assert!(
+            v2.turn_for_user(&anchor).complete,
+            "the /api finish completes it identically"
+        );
     }
 }

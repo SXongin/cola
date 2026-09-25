@@ -15,12 +15,15 @@ use serde_json::Value;
 
 use crate::backend::{
     ContentBlock, MessageId, MessageRole, MessageTime, ModelIdentity, OtherPart, Part, Patch, ReasoningPart,
-    SessionTranscript, StepFinish, StepStart, TextPart, TokenUsage, ToolCall, ToolIdentity, ToolOutput,
+    SessionTranscript, StepFinish, StepStart, TokenUsage, ToolCall, ToolIdentity, ToolOutput,
     TranscriptMessage,
 };
 use crate::error::Result;
 
-use super::{content_text, decode_error, decode_finish_reason, decode_tool_status, non_null, started_at};
+use super::{
+    content_text, decode_error, decode_finish_reason, decode_text_part, decode_tool_status, non_null,
+    started_at,
+};
 
 /// The legacy generation's message envelope (`{info, parts}`).
 #[derive(Debug, Clone, Deserialize)]
@@ -140,20 +143,11 @@ fn decode_tokens(tokens: &WireMessageTokens) -> TokenUsage {
 
 fn decode_part(part: &Value) -> Part {
     match part.get("type").and_then(Value::as_str) {
-        // A `text` part without string text is malformed: the tolerant arm
+        // A `text` part without string text is malformed: the shared arm
         // keeps it raw rather than manufacturing an empty text the old
         // extractor dropped (a valid+malformed pair must not join an extra
         // line). An explicit empty string is still a valid empty text part.
-        Some("text") => match part.get("text").and_then(Value::as_str) {
-            Some(text) => Part::Text(TextPart {
-                text: text.to_string(),
-                started_at: started_at(part, "/time/start"),
-            }),
-            None => Part::Other(OtherPart {
-                kind: "text".to_string(),
-                raw: part.clone(),
-            }),
-        },
+        Some("text") => decode_text_part(part, started_at(part, "/time/start")),
         Some("reasoning") => Part::Reasoning(ReasoningPart {
             text: part
                 .get("text")
@@ -276,7 +270,7 @@ fn decode_tool_output(state: Option<&Value>) -> ToolOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::ToolStatus;
+    use crate::backend::{TextPart, ToolStatus};
 
     /// Decode one tool part's state into its typed call.
     fn tool(state: Value) -> ToolCall {

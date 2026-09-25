@@ -13,6 +13,7 @@
 //! | body | `[{info, parts}]` | `{data: [Message], cursor: {previous?, next?}}` |
 //! | paging | none: one response carries every message | `limit` 1..=200 (server default 50), `order` asc/desc (default desc), opaque `cursor` that cannot be combined with `order`; follow `cursor.next` |
 //! | message | `info.role` user/assistant | `type` user/assistant/system/synthetic/shell/compaction/agent-switched/model-switched |
+//! | shell | none — the legacy generation has no shell message | message kind `shell` `{callID, command, output, time.{created,completed?}}`, decoded opaque (no neutral counterpart) |
 //! | time | `info.time.{created,completed?}` | `time.{created,completed?}` |
 //! | model | `info.modelID` + `info.providerID` | `model.{id,providerID,variant?}` |
 //! | tokens | `input`, `output`, `total`, `cache.{read,write}` | `input`, `output`, `reasoning`, `cache.{read,write}` — no `total` |
@@ -20,6 +21,7 @@
 //! | reasoning | `{type:"reasoning", text, time.start?}` | `content[]` `{type:"reasoning", id, text, time?}` |
 //! | tool | `{type:"tool", tool, callID, state}` | `content[]` `{type:"tool", id, name, provider?, state, time.{created,ran?,completed?}}` |
 //! | tool state | `state.{status,input,output,metadata,content,result,error,time}` | `state.status` + tagged bodies; no `output`/`metadata`, the structured result lives in `state.structured` |
+//! | tool provider | none | `provider.{executed, metadata, resultMetadata}` — only `resultMetadata` feeds the neutral `metadata` (behind the diff reassembly) |
 //! | step start | `{type:"step-start"}` | none — the assistant message is the step |
 //! | step finish | `{type:"step-finish", reason}` | assistant `finish` |
 //! | patch | `{type:"patch", hash, files}` | assistant `snapshot.{start?,end?,files?}` |
@@ -44,16 +46,19 @@ use serde_json::Value;
 
 use crate::backend::{
     ContentBlock, MessageId, MessageRole, MessageTime, ModelIdentity, OtherPart, Part, Patch, ReasoningPart,
-    StepFinish, TextPart, TokenUsage, ToolCall, ToolIdentity, ToolOutput, TranscriptMessage,
+    StepFinish, TokenUsage, ToolCall, ToolIdentity, ToolOutput, TranscriptMessage,
 };
 use crate::error::Result;
 
-use super::{content_text, decode_error, decode_finish_reason, decode_tool_status, non_null, started_at};
+use super::{
+    content_text, decode_error, decode_finish_reason, decode_text_part, decode_tool_status, non_null,
+    started_at,
+};
 
 /// One drained page of the `/api` read: its messages plus the opaque cursor
 /// for the next (newer, since pages are read oldest-first) page. The cursor is
 /// the generation's wire value; the adapter follows it without interpreting it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Page {
     pub(crate) messages: Vec<TranscriptMessage>,
     pub(crate) next: Option<String>,
@@ -109,14 +114,23 @@ fn decode_message(value: &Value) -> TranscriptMessage {
             parts: decode_assistant_parts(value),
         },
         // `system` and `synthetic` are server-authored text messages: they
-        // carry their text as a field, not as parts.
-        "system" | "synthetic" => TranscriptMessage {
+        // carry their text as a field, not as parts. Only `system` has a
+        // neutral role; a synthetic injection stays verbatim.
+        "system" => TranscriptMessage {
             id,
-            role: decode_role(kind),
+            role: MessageRole::System,
             time,
             model: None,
             tokens: None,
-            parts: decode_text_part(value),
+            parts: vec![decode_text_part(value, None)],
+        },
+        "synthetic" => TranscriptMessage {
+            id,
+            role: MessageRole::Other("synthetic".to_string()),
+            time,
+            model: None,
+            tokens: None,
+            parts: vec![decode_text_part(value, None)],
         },
         other => TranscriptMessage {
             id,
@@ -139,18 +153,6 @@ fn decode_message(value: &Value) -> TranscriptMessage {
     }
 }
 
-/// The `/api` message `type` mapped onto the neutral role. Only the two
-/// conversation roles and `system` are named; every other kind (a synthetic
-/// injection, a shell run, a switch marker) is kept verbatim.
-fn decode_role(kind: &str) -> MessageRole {
-    match kind {
-        "user" => MessageRole::User,
-        "assistant" => MessageRole::Assistant,
-        "system" => MessageRole::System,
-        other => MessageRole::Other(other.to_string()),
-    }
-}
-
 fn decode_time(time: &Value) -> Option<MessageTime> {
     Some(MessageTime {
         created: time.get("created").and_then(Value::as_i64)?,
@@ -162,7 +164,7 @@ fn decode_time(time: &Value) -> Option<MessageTime> {
 /// the generation's field, not a part, so it becomes the text part the
 /// neutral model (and the tail projection) reads.
 fn decode_user_parts(value: &Value) -> Vec<Part> {
-    let mut parts = decode_text_part(value);
+    let mut parts = vec![decode_text_part(value, None)];
     for (field, kind) in [("files", "file"), ("agents", "agent")] {
         if let Some(items) = value.get(field).and_then(Value::as_array) {
             parts.extend(items.iter().map(|item| {
@@ -174,22 +176,6 @@ fn decode_user_parts(value: &Value) -> Vec<Part> {
         }
     }
     parts
-}
-
-/// A message-level `text` field as one text part, malformed text kept raw
-/// (matching the legacy decoder's text-part arm).
-fn decode_text_part(value: &Value) -> Vec<Part> {
-    match value.get("text") {
-        Some(Value::String(text)) => vec![Part::Text(TextPart {
-            text: text.clone(),
-            started_at: None,
-        })],
-        Some(text) => vec![Part::Other(OtherPart {
-            kind: "text".to_string(),
-            raw: text.clone(),
-        })],
-        None => Vec::new(),
-    }
 }
 
 /// An assistant message's `content` items, then the message-level `snapshot`
@@ -235,19 +221,9 @@ fn decode_assistant_parts(value: &Value) -> Vec<Part> {
 
 fn decode_content(item: &Value) -> Part {
     match item.get("type").and_then(Value::as_str) {
-        // A `text` item without string text is malformed: the tolerant arm
-        // keeps it raw rather than manufacturing an empty text (the legacy
-        // decoder's rule for the equivalent part).
-        Some("text") => match item.get("text").and_then(Value::as_str) {
-            Some(text) => Part::Text(TextPart {
-                text: text.to_string(),
-                started_at: None,
-            }),
-            None => Part::Other(OtherPart {
-                kind: "text".to_string(),
-                raw: item.clone(),
-            }),
-        },
+        // The shared malformed-text rule: a `text` item without string text
+        // stays raw instead of manufacturing an empty text.
+        Some("text") => decode_text_part(item, None),
         Some("reasoning") => Part::Reasoning(ReasoningPart {
             text: item
                 .get("text")
@@ -407,7 +383,7 @@ fn decode_tokens(tokens: &Value) -> TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{FinishReason, ToolStatus};
+    use crate::backend::{FinishReason, TextPart, ToolStatus};
 
     fn page(json: Value) -> Page {
         decode_page(&json).expect("a valid page decodes")
@@ -774,7 +750,8 @@ mod tests {
                      {"type": "tool", "id": "call_1", "name": "mystery",
                       "state": {"status": "weird", "input": {"x": 1}}}
                  ],
-                 "finish": "new-reason"}
+                 "finish": "new-reason"},
+                {"type": "system", "id": "msg_s1", "time": {"created": 1300}, "text": 42}
             ]
         }));
 
@@ -814,6 +791,18 @@ mod tests {
             tool.parts[3],
             Part::StepFinish(StepFinish {
                 reason: FinishReason::Other("new-reason".into())
+            })
+        );
+
+        // A message-level text field that is not a string keeps the WHOLE
+        // message raw (the shared rule's canonical raw).
+        let system = &messages[3];
+        assert_eq!(system.role, MessageRole::System);
+        assert_eq!(
+            system.parts[0],
+            Part::Other(OtherPart {
+                kind: "text".into(),
+                raw: serde_json::json!({"type": "system", "id": "msg_s1", "time": {"created": 1300}, "text": 42})
             })
         );
     }
