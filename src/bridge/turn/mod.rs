@@ -1371,7 +1371,7 @@ impl Turn {
         cards: &CardsHandle,
         session_id: &str,
         card_id: &str,
-        anchor: &crate::backend::TurnAnchor,
+        anchor: &TurnAnchor,
         subtitle: &str,
         session_dir: &str,
         variant: Option<String>,
@@ -1520,12 +1520,9 @@ impl Turn {
         }
     }
 
-    /// Set the turn's anchor (a fixture: identity + server time, one fact).
-    pub(crate) async fn set_turn_anchor(
-        cards: &CardsHandle,
-        session_id: &str,
-        anchor: &crate::backend::TurnAnchor,
-    ) {
+    /// Set the turn's anchor — the message identity plus its server time, one
+    /// fact (the same [`TurnAnchor`] production arming stores).
+    pub(crate) async fn set_turn_anchor(cards: &CardsHandle, session_id: &str, anchor: &TurnAnchor) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
             card.acc.turn_anchor = Some(anchor.clone());
         }
