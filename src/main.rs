@@ -977,11 +977,69 @@ mod tests {
         std::fs::write(lock, child.id().to_string()).unwrap();
         // sysinfo may not have the just-spawned process in its table yet; wait
         // until the stop path can see it, like the identity settle waits above.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while running_daemon_pid_at(lock).is_none() && std::time::Instant::now() < deadline {
+        wait_until_fake_cola_visible(lock, &child);
+        child
+    }
+
+    /// Wait until the stop decision can see the just-spawned fake instance. A
+    /// targeted sysinfo refresh can transiently miss a fresh process on a
+    /// loaded runner (llvm-cov on CI), so a silent deadline expiry would
+    /// surface later as a misleading `NotRunning`; fail here instead, naming
+    /// both identity signals.
+    #[cfg(unix)]
+    fn wait_until_fake_cola_visible(lock: &std::path::Path, child: &std::process::Child) {
+        let pid = child.id() as i32;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if running_daemon_pid_at(lock).is_some() {
+                return;
+            }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        child
+        panic!(
+            "fake cola PID {pid} never became visible to sysinfo \
+             (pid_alive={}, is_cola_process={})",
+            pid_alive(pid),
+            is_cola_process(pid)
+        );
+    }
+
+    /// Run the stop decision once it can see the fake instance. The decision's
+    /// first step re-reads the same sysinfo state the visibility wait reads; a
+    /// transient miss must not be mistaken for the behavior under test
+    /// (`NotRunning`). Retry within the test's deadline — the `NotRunning`
+    /// branch has no side effects to replay.
+    #[cfg(unix)]
+    fn stop_when_visible(
+        lock: &std::path::Path,
+        confirm: Option<bool>,
+        supervisor: Option<&str>,
+    ) -> StopOutcome {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let outcome = stop_running_cola_at(lock, confirm, supervisor).expect("stop decision");
+            if outcome != StopOutcome::NotRunning || std::time::Instant::now() >= deadline {
+                return outcome;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Wait until the fake instance exits, reaping it — a deterministic
+    /// waitpid where a sysinfo liveness read could transiently miss.
+    #[cfg(unix)]
+    fn wait_for_exit(child: &mut std::process::Child, who: &str) -> std::process::ExitStatus {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                return status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{who} is still running after the deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[cfg(unix)]
@@ -993,11 +1051,11 @@ mod tests {
         let marker = home.path().join("supervisor-ran");
         let supervisor = format!("touch {}", marker.display());
         assert_eq!(
-            stop_running_cola_at(&lock, Some(false), Some(&supervisor)).unwrap(),
+            stop_when_visible(&lock, Some(false), Some(&supervisor)),
             StopOutcome::Declined
         );
         assert!(
-            pid_alive(child.id() as i32),
+            child.try_wait().unwrap().is_none(),
             "a declined stop must not kill the instance"
         );
         assert!(!marker.exists(), "a declined stop must not run the supervisor");
@@ -1014,17 +1072,14 @@ mod tests {
         let marker = home.path().join("supervisor-ran");
         let supervisor = format!("touch {}", marker.display());
         assert_eq!(
-            stop_running_cola_at(&lock, None, Some(&supervisor)).unwrap(),
+            stop_when_visible(&lock, None, Some(&supervisor)),
             StopOutcome::Stopped {
                 pid: child.id() as i32
             }
         );
         assert!(marker.exists(), "the supervisor stop command must run");
-        assert!(
-            !pid_alive(child.id() as i32),
-            "the lock holder must be terminated"
-        );
-        let _ = child.wait();
+        let status = wait_for_exit(&mut child, "the lock holder");
+        assert!(!status.success(), "the lock holder must be terminated");
     }
 
     #[cfg(unix)]
@@ -1034,16 +1089,16 @@ mod tests {
         let lock = home.path().join("cola.lock");
         let mut child = spawn_fake_cola(&lock);
         assert_eq!(
-            stop_running_cola_at(&lock, None, Some("false")).unwrap(),
+            stop_when_visible(&lock, None, Some("false")),
             StopOutcome::Stopped {
                 pid: child.id() as i32
             }
         );
+        let status = wait_for_exit(&mut child, "the lock holder");
         assert!(
-            !pid_alive(child.id() as i32),
+            !status.success(),
             "a failed supervisor command must fall back to the PID path"
         );
-        let _ = child.wait();
     }
 
     #[test]
