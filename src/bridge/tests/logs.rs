@@ -10,17 +10,10 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::backend::{
-    FinishReason, MessageRole, Part, SessionTranscript, StepFinish, StepStart, TranscriptMessage,
-};
+use crate::backend::{FinishReason, MessageRole, Part, SessionTranscript, StepFinish, StepStart};
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{PromptContext, Turn};
 use crate::config::{SessionEntry, ThreadKey};
-
-/// A typed transcript message fixture for a scripted timeline.
-fn msg(role: MessageRole, id: &str, created: i64, parts: Vec<Part>) -> TranscriptMessage {
-    typed_message(id, role, Some(created), parts)
-}
 
 /// The lobby ThreadKey: the thread id IS the chat id, i.e. not a topic.
 fn lobby() -> ThreadKey {
@@ -134,8 +127,18 @@ async fn render_poll_and_final_render_lines_carry_the_session() {
     backend.given_transcript(
         "ses_test",
         vec![SessionTranscript::new(vec![
-            msg(MessageRole::User, "msg_cola_anchor", 1_000, vec![text_part("hi")]),
-            msg(MessageRole::Assistant, "msg_assist", 2_000, realistic_parts()),
+            typed_message(
+                "msg_cola_anchor",
+                MessageRole::User,
+                Some(1_000),
+                vec![text_part("hi")],
+            ),
+            typed_message(
+                "msg_assist",
+                MessageRole::Assistant,
+                Some(2_000),
+                realistic_parts(),
+            ),
         ])],
     );
     let transcript_calls = Arc::clone(&backend.transcript_calls);
@@ -184,8 +187,18 @@ async fn the_render_poll_logs_at_info_only_on_progress() {
     backend.given_transcript(
         "ses_test",
         vec![SessionTranscript::new(vec![
-            msg(MessageRole::User, "msg_cola_anchor", 1_000, vec![text_part("hi")]),
-            msg(MessageRole::Assistant, "msg_assist", 2_000, realistic_parts()),
+            typed_message(
+                "msg_cola_anchor",
+                MessageRole::User,
+                Some(1_000),
+                vec![text_part("hi")],
+            ),
+            typed_message(
+                "msg_assist",
+                MessageRole::Assistant,
+                Some(2_000),
+                realistic_parts(),
+            ),
         ])],
     );
     let transcript_calls = Arc::clone(&backend.transcript_calls);

@@ -322,7 +322,7 @@ mod tests {
     }
 
     /// A mock whose session serves exactly this typed transcript: a scripted
-    /// transcript wins over the wire-shape fallback, so the fixture is the
+    /// transcript wins over the mock's default shape, so the fixture is the
     /// only thing the snapshot can be reading.
     fn typed_backend(messages: Vec<TranscriptMessage>) -> MockBackend {
         let mut mock = MockBackend::new(Vec::new());

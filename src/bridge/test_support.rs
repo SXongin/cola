@@ -8,8 +8,9 @@ pub(crate) use crate::feishu;
 pub(crate) use crate::opencode;
 
 use crate::backend::{
-    ContentBlock, FinishReason, MessageId, MessageRole, MessageTime, Part, ReasoningPart, StepFinish,
-    StepStart, TextPart, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, TurnAnchor,
+    ContentBlock, FinishReason, MessageId, MessageRole, MessageTime, Part, ReasoningPart, SessionTranscript,
+    StepFinish, StepStart, TextPart, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
+    TurnAnchor,
 };
 
 /// One typed transcript message for view-shaped fixtures (spec #332): identity,
@@ -41,6 +42,33 @@ pub(crate) fn text_part(text: &str) -> Part {
     Part::Text(TextPart {
         text: text.to_string(),
         started_at: None,
+    })
+}
+
+/// One typed tool part — name, correlation id, status, raw input and a single
+/// text output block: the shape most fixtures need. Fixtures that exercise
+/// metadata, richer output blocks or server times build the call directly.
+pub(crate) fn tool_part(
+    name: &str,
+    call_id: &str,
+    status: ToolStatus,
+    input: serde_json::Value,
+    output: &str,
+) -> Part {
+    Part::Tool(ToolCall {
+        identity: ToolIdentity {
+            name: name.to_string(),
+            call_id: call_id.to_string(),
+        },
+        status,
+        started_at: None,
+        input: Some(input),
+        metadata: None,
+        output: ToolOutput {
+            raw: Some(serde_json::Value::String(output.to_string())),
+            blocks: vec![ContentBlock::Text(output.to_string())],
+            error: None,
+        },
     })
 }
 
@@ -707,7 +735,7 @@ pub struct MockBackend {
     /// and mutate it mid-turn (a supplement that missed the run, then its
     /// assistant reply). Sessions absent from the map keep the default shape.
     pub transcript_scripts:
-        Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<crate::backend::SessionTranscript>>>>,
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<SessionTranscript>>>>,
     /// Records every `transcript` call's session id — the neutral read the
     /// render poll, the drain and the follow poll on.
     pub transcript_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
@@ -1002,7 +1030,7 @@ impl MockBackend {
     pub(crate) fn given_transcript(
         &mut self,
         session_id: &str,
-        snapshots: Vec<crate::backend::SessionTranscript>,
+        snapshots: Vec<SessionTranscript>,
     ) -> &mut Self {
         self.transcript_scripts
             .try_lock()
@@ -1157,7 +1185,7 @@ impl MockBackend {
 
     /// Scenario: the next `count` per-session transcript reads hang forever
     /// (a wedged per-session read).
-    pub(crate) fn hang_message_reads(&self, count: usize) -> &Self {
+    pub(crate) fn hang_transcript_reads(&self, count: usize) -> &Self {
         self.hang_transcript
             .store(count, std::sync::atomic::Ordering::SeqCst);
         self
@@ -1270,9 +1298,7 @@ impl MockBackend {
     /// The default transcript shape `transcript` serves when the test scripts
     /// no transcript for the session: cola's own or an external user message
     /// when modeled, otherwise the assistant side of cola's own turn.
-    async fn default_transcript(&self, session_id: &str) -> crate::backend::SessionTranscript {
-        use crate::backend::SessionTranscript;
-
+    fn default_transcript(&self, session_id: &str) -> SessionTranscript {
         let now = chrono::Utc::now().timestamp_millis();
         let mut messages: Vec<TranscriptMessage> = Vec::new();
         // cola's OWN user message persisting on the store (ADR-0026): id starts
@@ -1555,7 +1581,7 @@ impl crate::backend::Backend for MockBackend {
     /// Read one Session's neutral transcript (ADR-0053). A scripted transcript
     /// wins; otherwise the scenario's default typed shape is served (spec
     /// #332, #334–#339).
-    async fn transcript(&self, session_id: &str) -> crate::error::Result<crate::backend::SessionTranscript> {
+    async fn transcript(&self, session_id: &str) -> crate::error::Result<SessionTranscript> {
         hang_if_scripted(&self.hang_transcript).await;
         let scripted = {
             let mut scripts = self.transcript_scripts.lock().await;
@@ -1570,7 +1596,7 @@ impl crate::backend::Backend for MockBackend {
         };
         let transcript = match scripted {
             Some(transcript) => transcript,
-            None => self.default_transcript(session_id).await,
+            None => self.default_transcript(session_id),
         };
         self.transcript_calls.lock().await.push(session_id.to_string());
         Ok(transcript)
@@ -1770,21 +1796,13 @@ pub fn realistic_parts() -> Vec<Part> {
             text: "用户想让我分析目录。".into(),
             started_at: None,
         }),
-        Part::Tool(ToolCall {
-            identity: ToolIdentity {
-                name: "bash".into(),
-                call_id: "call_1".into(),
-            },
-            status: ToolStatus::Completed,
-            started_at: None,
-            input: Some(serde_json::json!({ "command": "ls -la" })),
-            metadata: None,
-            output: ToolOutput {
-                raw: Some(serde_json::json!("src/\nCargo.toml\n")),
-                blocks: vec![ContentBlock::Text("src/\nCargo.toml\n".into())],
-                error: None,
-            },
-        }),
+        tool_part(
+            "bash",
+            "call_1",
+            ToolStatus::Completed,
+            serde_json::json!({ "command": "ls -la" }),
+            "src/\nCargo.toml\n",
+        ),
         Part::StepFinish(StepFinish {
             reason: FinishReason::ToolCalls,
         }),
@@ -2516,7 +2534,7 @@ mod tests {
     /// A scripted transcript is served as-is, so a test can describe cola's
     /// domain instead of the backend's wire format (spec #332).
     #[tokio::test]
-    async fn mock_serves_a_scripted_transcript_without_a_wire_read() {
+    async fn mock_serves_a_scripted_transcript_as_is() {
         let mut mock = MockBackend::new(Vec::new());
         mock.given_transcript(
             "ses_x",
@@ -2542,9 +2560,9 @@ mod tests {
     }
 
     /// Without a script, the mock serves the default typed shape built from the
-    /// scenario's parts in place of the deleted wire fallback (spec #338).
+    /// scenario's parts.
     #[tokio::test]
-    async fn mock_decodes_its_wire_shape_when_no_transcript_is_scripted() {
+    async fn mock_serves_its_default_typed_shape_when_no_transcript_is_scripted() {
         let mock = MockBackend::new(realistic_parts());
         let transcript_calls = std::sync::Arc::clone(&mock.transcript_calls);
         let backend: std::sync::Arc<dyn Backend> = std::sync::Arc::new(mock);

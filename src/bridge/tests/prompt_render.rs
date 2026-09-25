@@ -786,8 +786,8 @@ async fn an_in_flight_step_before_the_anchor_renders_live() {
     use std::time::Duration;
 
     use crate::backend::{
-        ContentBlock, MessageId, MessageRole, MessageTime, Part, ReasoningPart, SessionTranscript, ToolCall,
-        ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
+        MessageId, MessageRole, MessageTime, Part, ReasoningPart, SessionTranscript, ToolStatus,
+        TranscriptMessage,
     };
 
     use super::drain::{ctx, spawn_turn, user, wait_for_card_text};
@@ -814,21 +814,13 @@ async fn an_in_flight_step_before_the_anchor_renders_live() {
                 text: "还在研究".into(),
                 started_at: None,
             }),
-            Part::Tool(ToolCall {
-                identity: ToolIdentity {
-                    name: "task".into(),
-                    call_id: "call_task".into(),
-                },
+            tool_part(
+                "task",
+                "call_task",
                 status,
-                started_at: None,
-                input: Some(serde_json::json!({ "description": "research" })),
-                metadata: None,
-                output: ToolOutput {
-                    raw: Some(serde_json::json!(output)),
-                    blocks: vec![ContentBlock::Text(output.to_string())],
-                    error: None,
-                },
-            }),
+                serde_json::json!({ "description": "research" }),
+                output,
+            ),
         ],
     };
     backend.given_transcript(
