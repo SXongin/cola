@@ -175,7 +175,6 @@ pub trait Backend: Send + Sync {
     /// Bridge consumes (ADR-0053). The wire generation is selected inside the
     /// adapter; the existing [`Backend::messages`] read stays during the
     /// migration, so both paths return the same session's data (spec #332).
-    #[allow(dead_code)] // consumers land in #334–#339 (the expand step)
     async fn transcript(&self, session_id: &str) -> Result<SessionTranscript>;
 
     /// The server's live run state for one session (`GET /session/status`).

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use tracing::Instrument;
 
+use crate::backend::{SessionTranscript, TailEntry};
 use crate::bridge::handles::SnapshotHandles;
 use crate::opencode;
 
@@ -31,11 +32,13 @@ pub struct SnapshotData {
     /// instead of falling back to the server run state; see [`ElsewherePending`].
     pub pending_elsewhere: Option<ElsewherePending>,
     /// The 最近对话 tail: the last text-bearing user/assistant messages,
-    /// newest last, verbatim `text` parts only.
+    /// newest last — the Session Transcript's shared `transcript_tail`
+    /// projection.
     pub tail: Vec<TailEntry>,
     /// The created time of the newest user message (ANY user message, text or
-    /// not — the epoch the busy-adopt follow renders from, ticket 06). `None`
-    /// when the session has no user message: nothing to follow.
+    /// not — the epoch the busy-adopt follow renders from, ticket 06) from the
+    /// Session Transcript's `newest_user` projection. `None` when the session
+    /// has no user message: nothing to follow.
     pub newest_user_epoch: Option<i64>,
     /// Whether the newest user message is a Cola-Authored Message (`msg_cola_`
     /// id, ADR-0026) — one input to the suppression predicate.
@@ -100,15 +103,6 @@ pub(crate) fn re_switch_emit(data: &SnapshotData) -> SnapshotEmit {
     }
 }
 
-/// One 最近对话 tail entry: a text-bearing user/assistant message's role, its
-/// created time (for display/ordering) and its verbatim text-part content.
-#[derive(Clone)]
-pub struct TailEntry {
-    pub role: String,
-    pub created_ms: i64,
-    pub text: String,
-}
-
 /// Whether an activation should emit a snapshot card (ADR-0028 suppression).
 ///
 /// The card is omitted only when ALL hold: the session is already mapped to
@@ -132,7 +126,8 @@ pub fn should_emit_snapshot(
 
 /// Gather everything the snapshot card needs for an adopted session
 /// `(session_id, directory)` — status, adopt-time pendings for THIS session,
-/// and the transcript tail — from server reads alone. Best-effort per source.
+/// and the Session Transcript's newest user + tail — from server reads alone.
+/// Best-effort per source.
 pub(crate) async fn gather_snapshot(
     backend: &Arc<dyn opencode::Backend>,
     session_id: &str,
@@ -175,18 +170,21 @@ pub(crate) async fn gather_snapshot(
         )
         .collect();
 
-    let messages = match backend.messages(session_id).await {
-        Ok(m) => m,
+    let transcript = match backend.transcript(session_id).await {
+        Ok(transcript) => transcript,
         Err(e) => {
-            tracing::warn!("snapshot: messages for {} failed: {}", session_id, e);
-            Vec::new()
+            tracing::warn!("snapshot: transcript for {} failed: {}", session_id, e);
+            SessionTranscript::default()
         }
     };
-    let newest_user_epoch = newest_user_message(&messages).map(|(created, _)| created);
-    let newest_user_is_cola_authored = newest_user_message(&messages)
-        .map(|(_, id)| opencode::parsing::is_cola_message_id(id))
+    // Newest user and tail come from the shared transcript projections (ADR-0053),
+    // so the snapshot cannot drift from the Turn and external-sync reads.
+    let newest_user = transcript.newest_user();
+    let newest_user_epoch = newest_user.and_then(|message| message.time.map(|time| time.created));
+    let newest_user_is_cola_authored = newest_user
+        .map(|message| opencode::parsing::is_cola_message_id(message.id.as_str()))
         .unwrap_or(false);
-    let tail = transcript_tail(&messages);
+    let tail = transcript.transcript_tail();
 
     SnapshotData {
         session_id: session_id.to_string(),
@@ -295,106 +293,73 @@ pub(crate) async fn re_switch_snapshot(
     .await
 }
 
-/// The newest user message (by created time), if any — `(created, id)`. A
-/// session with no user message has no newest; the caller decides the meaning
-/// (cola authorship for suppression, an epoch for the busy-adopt follow).
-fn newest_user_message(messages: &[opencode::types::SessionMessage]) -> Option<(i64, &str)> {
-    messages
-        .iter()
-        .filter(|m| m.info.role.as_deref() == Some("user"))
-        .filter_map(|m| m.info.time.as_ref().map(|t| (t.created, m.info.id.as_str())))
-        .max_by_key(|(created, _)| *created)
-}
-
-/// The 最近对话 tail: the last (at most `limit`) text-bearing user/assistant
-/// messages, newest last. A message is text-bearing when it carries at least
-/// one `text` part with non-empty content; reasoning/tool/step parts are inner
-/// monologue, not conversation, and are excluded. Messages without a created
-/// time cannot be ordered and are dropped.
-pub(crate) fn transcript_tail(messages: &[opencode::types::SessionMessage]) -> Vec<TailEntry> {
-    const TAIL_LIMIT: usize = 4;
-    let mut out: Vec<TailEntry> = messages
-        .iter()
-        .filter(|m| matches!(m.info.role.as_deref(), Some("user" | "assistant")))
-        .filter_map(|m| {
-            let text = text_parts_only(&m.parts);
-            if text.trim().is_empty() {
-                return None;
-            }
-            Some(TailEntry {
-                role: m.info.role.clone().unwrap_or_default(),
-                created_ms: m.info.time.as_ref()?.created,
-                text,
-            })
-        })
-        .collect();
-    // Sort oldest → newest, then keep only the newest `TAIL_LIMIT` so the tail
-    // is the last four messages, newest last.
-    out.sort_by_key(|t| t.created_ms);
-    let start = out.len().saturating_sub(TAIL_LIMIT);
-    out.drain(..start);
-    out
-}
-
-/// Verbatim concatenation of a message's `text`-type parts (newline-joined),
-/// excluding reasoning/tool/step parts. Empty when the message carries no text.
-fn text_parts_only(parts: &serde_json::Value) -> String {
-    parts
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
-                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
+    use crate::backend::{
+        FinishReason, MessageId, MessageRole, MessageTime, OtherPart, Part, ReasoningPart, StepFinish,
+        StepStart, TextPart, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
+    };
+    use crate::bridge::test_support::MockBackend;
 
-    fn msg(id: &str, role: &str, created: i64, parts: serde_json::Value) -> SessionMessage {
-        SessionMessage {
-            info: MessageInfo {
-                id: id.into(),
-                role: Some(role.into()),
-                parent_id: None,
-                time: Some(MessageTime {
-                    created,
-                    completed: Some(created),
-                }),
-                model_id: None,
-                provider_id: None,
-                tokens: None,
-            },
+    /// One typed transcript message — the snapshot grows a fixture with no
+    /// backend field name in it (spec #332).
+    fn typed_message(
+        id: &str,
+        role: MessageRole,
+        created: Option<i64>,
+        parts: Vec<Part>,
+    ) -> TranscriptMessage {
+        TranscriptMessage {
+            id: MessageId::new(id),
+            role,
+            time: created.map(|created| MessageTime {
+                created,
+                completed: Some(created),
+            }),
+            model: None,
+            tokens: None,
             parts,
         }
     }
 
-    fn text(t: &str) -> serde_json::Value {
-        serde_json::json!([{ "type": "text", "text": t }])
+    fn text(t: &str) -> Part {
+        Part::Text(TextPart {
+            text: t.to_string(),
+            started_at: None,
+        })
     }
 
-    /// A turn with reasoning + tool (no conversation text) — must NOT appear in
-    /// the tail, and an image-only user message (file parts, no text) likewise.
-    fn reasoning_only() -> serde_json::Value {
-        serde_json::json!([
-            { "type": "step-start", "snapshot": "x" },
-            { "type": "reasoning", "text": "我要先查目录。" },
-            { "type": "tool", "tool": "bash", "state": { "status": "completed", "input": { "command": "ls" } } },
-            { "type": "step-finish", "reason": "tool-calls" }
-        ])
+    fn user(id: &str, created: i64, texts: &[&str]) -> TranscriptMessage {
+        typed_message(
+            id,
+            MessageRole::User,
+            Some(created),
+            texts.iter().map(|t| text(t)).collect(),
+        )
     }
 
-    fn image_only() -> serde_json::Value {
-        serde_json::json!([{ "type": "file", "mime": "image/png", "url": "data:image/png;base64,x" }])
+    fn assistant(id: &str, created: i64, texts: &[&str]) -> TranscriptMessage {
+        typed_message(
+            id,
+            MessageRole::Assistant,
+            Some(created),
+            texts.iter().map(|t| text(t)).collect(),
+        )
     }
 
-    fn cola_user(created: i64, t: &str) -> SessionMessage {
-        msg(&format!("msg_cola_{created}"), "user", created, text(t))
+    /// A mock whose session serves exactly this typed transcript: a scripted
+    /// transcript wins over the wire-shape fallback, so the fixture is the
+    /// only thing the snapshot can be reading.
+    fn typed_backend(messages: Vec<TranscriptMessage>) -> MockBackend {
+        let mut mock = MockBackend::new(serde_json::json!([]));
+        mock.given_transcript("ses_adopted", vec![SessionTranscript::new(messages)]);
+        mock
+    }
+
+    async fn gather(mock: MockBackend) -> SnapshotData {
+        let backend: Arc<dyn opencode::Backend> = Arc::new(mock);
+        gather_snapshot(&backend, "ses_adopted", "/work/proj").await
     }
 
     #[test]
@@ -426,96 +391,146 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tail_is_newest_last_text_bearing_only() {
-        let messages = vec![
-            msg("a", "user", 1000, text("问题一")),
-            msg("b", "assistant", 2000, reasoning_only()), // reasoning/tool only: excluded
-            msg("c", "assistant", 3000, text("回答一")),
-            msg("d", "user", 4000, image_only()), // image only: excluded
-            msg("e", "user", 5000, text("问题二")),
-            msg("f", "assistant", 6000, text("回答二")),
-            msg("g", "system", 7000, text("系统提示")), // system role: excluded
-        ];
-        let tail = transcript_tail(&messages);
+    #[tokio::test]
+    async fn tail_is_newest_last_text_bearing_only() {
+        // A turn with reasoning + tool (no conversation text) — must NOT appear
+        // in the tail, and an image-only user message (file parts, no text)
+        // likewise.
+        let reasoning_only = typed_message(
+            "b",
+            MessageRole::Assistant,
+            Some(2000),
+            vec![
+                Part::StepStart(StepStart),
+                Part::Reasoning(ReasoningPart {
+                    text: "我要先查目录。".into(),
+                    started_at: None,
+                }),
+                Part::Tool(ToolCall {
+                    identity: ToolIdentity {
+                        name: "bash".into(),
+                        call_id: "call_1".into(),
+                    },
+                    status: ToolStatus::Completed,
+                    started_at: None,
+                    input: Some(serde_json::json!({ "command": "ls" })),
+                    metadata: None,
+                    output: ToolOutput::default(),
+                }),
+                Part::StepFinish(StepFinish {
+                    reason: FinishReason::ToolCalls,
+                }),
+            ],
+        );
+        let image_only = typed_message(
+            "d",
+            MessageRole::User,
+            Some(4000),
+            vec![Part::Other(OtherPart {
+                kind: "file".into(),
+                raw: serde_json::Value::Null,
+            })],
+        );
+        let snap = gather(typed_backend(vec![
+            user("a", 1000, &["问题一"]),
+            reasoning_only,
+            assistant("c", 3000, &["回答一"]),
+            image_only,
+            user("e", 5000, &["问题二"]),
+            assistant("f", 6000, &["回答二"]),
+            typed_message("g", MessageRole::System, Some(7000), vec![text("系统提示")]),
+        ]))
+        .await;
+        let tail = snap.tail;
         // Reasoning-only, image-only and system messages are dropped; the four
         // surviving text-bearing messages stay newest-last.
-        let roles: Vec<_> = tail.iter().map(|t| t.role.as_str()).collect();
-        assert_eq!(roles, vec!["user", "assistant", "user", "assistant"]);
+        let roles: Vec<_> = tail.iter().map(|t| t.role.clone()).collect();
+        assert_eq!(
+            roles,
+            vec![
+                MessageRole::User,
+                MessageRole::Assistant,
+                MessageRole::User,
+                MessageRole::Assistant
+            ]
+        );
         let texts: Vec<_> = tail.iter().map(|t| t.text.as_str()).collect();
         assert_eq!(texts, vec!["问题一", "回答一", "问题二", "回答二"]);
         assert_eq!(tail[0].created_ms, 1000);
         assert_eq!(tail[3].created_ms, 6000);
     }
 
-    #[test]
-    fn tail_caps_at_four() {
-        let mut messages = Vec::new();
-        for i in 0..10 {
-            messages.push(msg(&format!("u{i}"), "user", i * 1000, text(&format!("m{i}"))));
-        }
-        let tail = transcript_tail(&messages);
+    #[tokio::test]
+    async fn tail_caps_at_four() {
+        let messages = (0..10)
+            .map(|i| user(&format!("u{i}"), i * 1000, &[&format!("m{i}")]))
+            .collect();
+        let snap = gather(typed_backend(messages)).await;
+        let tail = snap.tail;
         assert_eq!(tail.len(), 4, "tail must cap at 4");
         assert_eq!(tail[0].text, "m6");
         assert_eq!(tail[3].text, "m9");
         assert_eq!(tail[3].created_ms, 9000);
     }
 
-    #[test]
-    fn tail_joins_multiple_text_parts_and_keeps_roles() {
-        let messages = vec![msg(
+    #[tokio::test]
+    async fn tail_joins_multiple_text_parts_and_keeps_roles() {
+        let snap = gather(typed_backend(vec![typed_message(
             "u",
-            "user",
-            1000,
-            serde_json::json!([
-                { "type": "text", "text": "第一段" },
-                { "type": "file", "mime": "image/png", "url": "data:..." },
-                { "type": "text", "text": "第二段" }
-            ]),
-        )];
-        let tail = transcript_tail(&messages);
+            MessageRole::User,
+            Some(1000),
+            vec![
+                text("第一段"),
+                Part::Other(OtherPart {
+                    kind: "file".into(),
+                    raw: serde_json::Value::Null,
+                }),
+                text("第二段"),
+            ],
+        )]))
+        .await;
+        let tail = snap.tail;
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].text, "第一段\n第二段");
-        assert_eq!(tail[0].role, "user");
+        assert_eq!(tail[0].role, MessageRole::User);
     }
 
-    #[test]
-    fn newest_user_cola_authored_detection() {
+    #[tokio::test]
+    async fn newest_user_cola_authored_detection() {
         // Cola's own prompt is the newest user message.
-        let messages = vec![
-            msg("msg_other", "user", 1000, text("外部问题")),
-            msg("msg_cola_x", "user", 2000, text("我发的")),
-            msg("assist", "assistant", 3000, text("回答")),
-        ];
-        let (created, id) = newest_user_message(&messages).unwrap();
-        assert_eq!(created, 2000);
-        assert!(opencode::parsing::is_cola_message_id(id));
+        let snap = gather(typed_backend(vec![
+            user("msg_other", 1000, &["外部问题"]),
+            user("msg_cola_x", 2000, &["我发的"]),
+            assistant("assist", 3000, &["回答"]),
+        ]))
+        .await;
+        assert_eq!(snap.newest_user_epoch, Some(2000));
+        assert!(snap.newest_user_is_cola_authored);
 
         // An external user message newer than cola's is NOT cola-authored.
-        let messages = vec![
-            msg("msg_cola_x", "user", 1000, text("我发的")),
-            msg("msg_other", "user", 2000, text("外部问题")),
-        ];
-        let (created, id) = newest_user_message(&messages).unwrap();
-        assert_eq!(created, 2000);
-        assert!(!opencode::parsing::is_cola_message_id(id));
+        let snap = gather(typed_backend(vec![
+            user("msg_cola_x", 1000, &["我发的"]),
+            user("msg_other", 2000, &["外部问题"]),
+        ]))
+        .await;
+        assert_eq!(snap.newest_user_epoch, Some(2000));
+        assert!(!snap.newest_user_is_cola_authored);
 
         // No user messages → None (no newest, no epoch).
-        let messages = vec![msg("a", "assistant", 1000, text("回答"))];
-        assert!(newest_user_message(&messages).is_none());
+        let snap = gather(typed_backend(vec![assistant("a", 1000, &["回答"])])).await;
+        assert_eq!(snap.newest_user_epoch, None);
 
         // No time on any user message → None.
-        let mut no_time = cola_user(1000, "hi");
-        no_time.info.time = None;
-        assert!(newest_user_message(&[no_time]).is_none());
+        let no_time = typed_message("msg_cola_x", MessageRole::User, None, vec![text("hi")]);
+        let snap = gather(typed_backend(vec![no_time])).await;
+        assert_eq!(snap.newest_user_epoch, None);
     }
 
     #[tokio::test]
     async fn gather_filters_pending_to_the_adopted_session_and_reads_status() {
-        use crate::bridge::test_support::MockBackend;
         use crate::opencode::types::{PermissionRequest, QuestionInfo, QuestionRequest};
 
-        let mut mock = MockBackend::new(text("你好"));
+        let mut mock = typed_backend(vec![user("msg_u1", 1000, &["你好"])]);
         mock.with_session_status("ses_adopted", Some(opencode::types::SessionStatus::Busy));
         // A permission and a question for the ADOPTED session, plus one of each
         // for a sibling session in the SAME directory — only the former belong
@@ -556,8 +571,7 @@ mod tests {
                 questions: vec![],
             },
         ]);
-        let backend: Arc<dyn opencode::Backend> = Arc::new(mock);
-        let snap = gather_snapshot(&backend, "ses_adopted", "/work/proj").await;
+        let snap = gather(mock).await;
 
         assert_eq!(snap.status, Some(opencode::types::SessionStatus::Busy));
         assert!(snap.has_pending());
@@ -567,39 +581,35 @@ mod tests {
             vec!["req_adopted", "q_adopted"],
             "sibling pendings leaked in"
         );
+        // The tail and newest user come from the scripted transcript, not the
+        // wire shape `messages` would have served.
+        assert_eq!(snap.tail.len(), 1);
+        assert_eq!(snap.tail[0].text, "你好");
+        assert_eq!(snap.newest_user_epoch, Some(1000));
     }
 
     #[tokio::test]
     async fn gather_treats_a_failed_status_read_as_unknown() {
-        use crate::bridge::test_support::MockBackend;
-
-        let mut mock = MockBackend::new(text("你好"));
+        let mut mock = typed_backend(vec![user("msg_u1", 1000, &["你好"])]);
         mock.status_read_fails("simulated failure");
-        let backend: Arc<dyn opencode::Backend> = Arc::new(mock);
-        let snap = gather_snapshot(&backend, "ses_adopted", "/work/proj").await;
+        let snap = gather(mock).await;
         assert_eq!(snap.status, None, "a failed status read must not guess a status");
     }
 
     #[tokio::test]
     async fn gather_treats_an_unrecognised_status_type_as_unknown() {
-        use crate::bridge::test_support::MockBackend;
-
         // The server reported an entry for the session whose status type cola
         // does not recognise (`Ok(None)` at the seam) — unknown, never guessed.
-        let mut mock = MockBackend::new(text("你好"));
+        let mut mock = typed_backend(vec![user("msg_u1", 1000, &["你好"])]);
         mock.with_session_status("ses_adopted", None);
-        let backend: Arc<dyn opencode::Backend> = Arc::new(mock);
-        let snap = gather_snapshot(&backend, "ses_adopted", "/work/proj").await;
+        let snap = gather(mock).await;
         assert_eq!(snap.status, None, "an unknown status type must not be guessed");
     }
 
     #[tokio::test]
     async fn gather_maps_absent_session_to_idle() {
-        use crate::bridge::test_support::MockBackend;
-
-        let mock = MockBackend::new(text("你好"));
-        let backend: Arc<dyn opencode::Backend> = Arc::new(mock);
-        let snap = gather_snapshot(&backend, "ses_adopted", "/work/proj").await;
+        let mock = typed_backend(vec![user("msg_u1", 1000, &["你好"])]);
+        let snap = gather(mock).await;
         assert_eq!(snap.status, Some(opencode::types::SessionStatus::Idle));
     }
 }

@@ -441,11 +441,7 @@ impl ExternalFlow {
         if !data.tail.is_empty() {
             static_text.push_str("\n\n**最近对话**");
             for entry in &data.tail {
-                let role = match entry.role.as_str() {
-                    "user" => "👤",
-                    "assistant" => "🤖",
-                    _ => "💬",
-                };
+                let role = crate::feishu::snapshot_card::role_marker(&entry.role);
                 let text = if entry.text.trim().is_empty() {
                     "（空消息）".to_string()
                 } else {
