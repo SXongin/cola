@@ -7,8 +7,9 @@
 //! unprefixed V1 routes and [`v2`] the current `/api` routes.
 //!
 //! The wire types are private to their generation's decoder: from outside the
-//! adapter only the decode functions are callable, so no protocol field name
-//! can escape the seam (spec #332).
+//! adapter only the decode functions and the generation-neutral [`Page`] are
+//! callable, so no wire shape or protocol field name can escape the seam
+//! (spec #332).
 //!
 //! The normalizations both generations share — tool statuses, finish reasons,
 //! failure shapes, output text, server times — live in this module so their
