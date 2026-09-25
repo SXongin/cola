@@ -105,6 +105,10 @@ _Avoid_: Current session, latest session, selected session
 Cola's record of which Sessions a Chat or Topic has activated, and which one is its Active Session. Established when a Session is opened or adopted for a conversation and remembered across restarts; distinct from the Session itself, whose identity lives on the Backend (ADR-0007), and from the server's session list, which is Backend state rather than cola's. A Pending Session is stored beside the mapping, not in it — it is not a Session.
 _Avoid_: Session list, session store, mapping table
 
+**Session Transcript**:
+The Bridge's normalized read of one Session's messages and parts: message identity, role, server time, model identity and token usage are typed, while tool payloads stay opaque content. One Transcript serves rendering, external-message sync and the Session Snapshot, and a message's identity and its server time travel together, so a Turn's anchor is one fact rather than two independently derived ones.
+_Avoid_: Message list, history, message log
+
 **Cola-Authored Message**:
 A user message cola itself submitted to the Backend on behalf of a Feishu Chat/Topic, as opposed to an External Message. Self-identifying: cola chooses the message's id (`msg_cola_…`) at send time and the Backend persists that id, so authorship survives a server crash/replacement and even a cola restart without any cola-side ledger. Recognised by the `msg_cola_` id prefix.
 _Avoid_: Outbound message, own prompt (a prompt is the send action, not the stored message)
@@ -275,6 +279,7 @@ _Avoid_: Notification, message, signal
 - A **Chat** or **Topic** has one **Session Mapping**: the set of **Session**s it has activated, with at most one of them its **Active Session**, plus at most one **Pending Session** that materialises at the conversation's first prompt
 - A **Topic** is created around its **Topic Root** and, when cola opens it, is anchored on its **Topic Anchor**; a cola-created **Topic Root** is a **Topic Cover Card**
 - A **Session** contains many **Turns** and has one **Project** and one optional **Agent**
+- A **Session** is read through one **Session Transcript**, whose projections serve rendering, external-message sync and the Session Snapshot
 - A **Turn** renders into a **Card Chain**; a pending **Permission**/**Question** rides its newest card as an **Interaction Block**, and resolving one leaves an **Interaction Receipt**
 - A **Supplement** splits its **Turn**'s **Card Chain** so the continuation card is the newest message; the render loop stays alive across a Supplement that starts a new **Turn**; a **Command** reply does not split the chain by itself — `/card` pulls the live card down on explicit request
 - An **Instant Reminder** pins the conversation while a **Permission**/**Question** is pending, and clears when the wait resolves; a **Completion Notice** announces a long p2p **Turn**'s end (a new message, not a pin)
