@@ -539,7 +539,10 @@ async fn a_snapshot_settle_carries_the_session() {
         pending: Vec::new(),
         pending_elsewhere: None,
         tail: Vec::new(),
-        newest_user_epoch: Some(1_000),
+        newest_user_anchor: Some(crate::backend::TurnAnchor {
+            message_id: crate::backend::MessageId::new("msg_user"),
+            created_ms: 1_000,
+        }),
         newest_user_is_cola_authored: false,
     };
     let (_, logs) = capture_logs(async {

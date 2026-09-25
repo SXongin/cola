@@ -1,4 +1,64 @@
+use crate::backend::{
+    FinishReason, MessageId, MessageRole, MessageTime, Part, SessionTranscript, StepFinish, TextPart,
+    TranscriptMessage, TurnAnchor,
+};
 use crate::bridge::test_support::*;
+
+/// One typed transcript message — the external fixtures describe cola's domain
+/// (the Session Transcript), not the backend's wire format (spec #332).
+fn typed_message(id: &str, role: MessageRole, created: i64, parts: Vec<Part>) -> TranscriptMessage {
+    TranscriptMessage {
+        id: MessageId::new(id),
+        role,
+        time: Some(MessageTime {
+            created,
+            completed: Some(created),
+        }),
+        model: None,
+        tokens: None,
+        parts,
+    }
+}
+
+fn text(text: &str) -> Part {
+    Part::Text(TextPart {
+        text: text.to_string(),
+        started_at: None,
+    })
+}
+
+/// A user message's typed view; the Session Transcript's newest-user projection
+/// decides the external message from it.
+fn user(id: &str, created: i64, message_text: &str) -> TranscriptMessage {
+    typed_message(id, MessageRole::User, created, vec![text(message_text)])
+}
+
+/// An assistant message whose terminal `step-finish` completes the turn.
+fn finished(id: &str, created: i64, reason: FinishReason) -> TranscriptMessage {
+    typed_message(
+        id,
+        MessageRole::Assistant,
+        created,
+        vec![Part::StepFinish(StepFinish { reason })],
+    )
+}
+
+fn transcript(messages: Vec<TranscriptMessage>) -> SessionTranscript {
+    SessionTranscript::new(messages)
+}
+
+/// The Turn anchor a typed user message would carry, for direct
+/// `start_reply_render` calls (message identity + server time, one fact).
+fn anchor(created_ms: i64) -> TurnAnchor {
+    TurnAnchor {
+        message_id: MessageId::new(format!("msg_user_{created_ms}")),
+        created_ms,
+    }
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
 
 #[tokio::test]
 async fn external_message_from_shared_store_notifies_feishu() {
@@ -6,7 +66,16 @@ async fn external_message_from_shared_store_notifies_feishu() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
-    mock.external_message("OpenChamber 里发的消息");
+    // The external message is scripted as a typed transcript: the poller's
+    // newest-user/preview read must come from its projection (spec #332).
+    mock.given_transcript(
+        "ses_ext",
+        vec![transcript(vec![user(
+            "msg_ext_user",
+            now_ms(),
+            "OpenChamber 里发的消息",
+        )])],
+    );
     let (app, platform) = build_app(cfg, mock).await;
 
     // A known session whose chat the notification goes to.
@@ -57,7 +126,7 @@ async fn external_message_from_shared_store_notifies_feishu() {
     );
 }
 
-/// A hung `messages` read (a half-open connection left by a server
+/// A hung per-session message read (a half-open connection left by a server
 /// restart) must not freeze the external poller forever: the read is
 /// bounded, so a later poll still notifies about the external message.
 #[tokio::test]
@@ -66,8 +135,15 @@ async fn external_poller_recovers_when_messages_hangs() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
-    mock.external_message("OpenChamber 里发的消息");
-    // The first `messages` call hangs forever, like a request in flight
+    mock.given_transcript(
+        "ses_ext",
+        vec![transcript(vec![user(
+            "msg_ext_user",
+            now_ms(),
+            "OpenChamber 里发的消息",
+        )])],
+    );
+    // The first per-session read hangs forever, like a request in flight
     // when the server was SIGTERM'd; later calls serve normally.
     mock.hang_message_reads(1);
     let (app, platform) = build_app(cfg, mock).await;
@@ -108,8 +184,8 @@ async fn external_poller_recovers_when_messages_hangs() {
         }
     });
 
-    // Without a bound on `messages` the poller sits on the first hung call
-    // forever and the notification never arrives.
+    // Without a bound on the per-session read the poller sits on the first
+    // hung call forever and the notification never arrives.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
         let notified = platform.calls.lock().await.iter().any(|c| {
@@ -130,6 +206,81 @@ async fn external_poller_recovers_when_messages_hangs() {
     }
 }
 
+/// Completion detection reads the Session Transcript's turn projection: the
+/// scripted transcript's assistant message finishes the turn, while the wire
+/// shape the streaming renderer still reads carries no `step-finish`. The card
+/// must still be finalized as Done, so the decision came from the transcript.
+#[tokio::test]
+async fn external_reply_completion_comes_from_the_transcript() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let now = now_ms();
+    // The typed transcript answers the external message and finishes the
+    // turn; the wire shape carries an empty assistant message with no
+    // step-finish at all.
+    let mut mock = MockBackend::new(serde_json::json!([]));
+    mock.given_transcript(
+        "ses_ext",
+        vec![transcript(vec![
+            user("msg_ext_user", now - 30_000, "OpenChamber 里发的消息"),
+            finished("msg_ext_assist", now - 29_000, FinishReason::Stop),
+        ])],
+    );
+    let (app, platform) = build_app(cfg, mock).await;
+
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
+            session_id: "ses_ext".into(),
+            directory: "/tmp/ext".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+    // The watermark sits before the external message, so it is "new".
+    app.external
+        .last_user_msg_epoch
+        .lock()
+        .await
+        .insert("ses_ext".into(), now - 60_000);
+    app.external
+        .poll_interval_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
+    app.external
+        .render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            let _ = app.external.poll_loop(&app.flow_handles()).await;
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let calls = platform.calls.lock().await.clone();
+    let updates: Vec<serde_json::Value> = calls
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::UpdateMessage { card, .. } => Some(card.clone()),
+            _ => None,
+        })
+        .collect();
+    let last = updates.last().expect("the card must be updated at least once");
+    let done_header = last["header"]["title"]["content"].as_str().unwrap_or("");
+    assert!(
+        done_header.contains("完成") || done_header.contains("✓"),
+        "the transcript's terminal finish must finalize the card as Done, header: {}",
+        done_header
+    );
+}
+
 /// ADR-0026 regression (observed 2026-09-09): when a server dies mid-turn and
 /// cola heals by starting its own server on the same store, cola's OWN
 /// persisted user message (`msg_cola_` id) surfaces as newer than the stale
@@ -143,7 +294,14 @@ async fn cola_own_message_after_heal_is_never_notified_external() {
     let mut mock = MockBackend::new(realistic_parts());
     // cola's own prompt persisted on the store before the crash (a
     // `msg_cola_` id, exactly what the real server echoes back).
-    mock.cola_message("ses_ext", "可以把我本地的 openchamber serve 杀掉吗？");
+    mock.given_transcript(
+        "ses_ext",
+        vec![transcript(vec![user(
+            "msg_cola_mock_user",
+            now_ms(),
+            "可以把我本地的 openchamber serve 杀掉吗？",
+        )])],
+    );
     let (app, platform) = build_app(cfg, mock).await;
 
     seed_entry(
@@ -216,8 +374,15 @@ async fn newer_external_message_after_cola_own_still_notifies() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
-    mock.cola_message("ses_ext", "cola 自己的一轮");
-    mock.external_message("OpenChamber 后来发的消息");
+    let now = now_ms();
+    // cola's own round, then a genuine external message after it.
+    mock.given_transcript(
+        "ses_ext",
+        vec![transcript(vec![
+            user("msg_cola_mock_user", now - 20_000, "cola 自己的一轮"),
+            user("msg_ext_user", now - 10_000, "OpenChamber 后来发的消息"),
+        ])],
+    );
     let (app, platform) = build_app(cfg, mock).await;
 
     seed_entry(
@@ -278,7 +443,14 @@ async fn external_message_to_historical_session_is_not_notified() {
     // External message ONLY on the historical session; the active session
     // has none (otherwise BOTH would get an external message and the test
     // couldn't isolate the historical one being suppressed).
-    mock.external_message_for("ses_historical", "历史会话的外部消息");
+    mock.given_transcript(
+        "ses_historical",
+        vec![transcript(vec![user(
+            "msg_ext_user",
+            now_ms(),
+            "历史会话的外部消息",
+        )])],
+    );
     let (app, platform) = build_app(cfg, mock).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
 
@@ -377,7 +549,14 @@ async fn reactivated_session_resyncs_silently() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
     // The external message is on the session that is being REACTIVATED.
-    mock.external_message_for("ses_old", "离开期间的外部消息");
+    mock.given_transcript(
+        "ses_old",
+        vec![transcript(vec![user(
+            "msg_ext_user",
+            now_ms(),
+            "离开期间的外部消息",
+        )])],
+    );
     let (app, platform) = build_app(cfg, mock).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
 
@@ -475,7 +654,14 @@ async fn external_message_to_topic_session_notifies_into_thread() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
-    mock.external_message("话题里的外部消息");
+    mock.given_transcript(
+        "ses_ext",
+        vec![transcript(vec![user(
+            "msg_ext_user",
+            now_ms(),
+            "话题里的外部消息",
+        )])],
+    );
     let (app, platform) = build_app(cfg, mock).await;
 
     // A TOPIC-backed session (thread_id != chat_id) with NO persisted
@@ -673,7 +859,7 @@ async fn external_reply_render_guard_replaces_only_newer_messages() {
 
     // Arm once for the first external message.
     app.external
-        .start_reply_render(&app.flow_handles(), "ses_ext", 1000, "n1", "第一条")
+        .start_reply_render(&app.flow_handles(), "ses_ext", &anchor(1000), "n1", "第一条")
         .await;
     {
         let cards = app.cards_handle();
@@ -688,7 +874,7 @@ async fn external_reply_render_guard_replaces_only_newer_messages() {
     // Re-arming for the SAME message (e.g. a duplicate poll) is a no-op:
     // the armed card id and epoch must not be clobbered.
     app.external
-        .start_reply_render(&app.flow_handles(), "ses_ext", 1000, "n1b", "第一条")
+        .start_reply_render(&app.flow_handles(), "ses_ext", &anchor(1000), "n1b", "第一条")
         .await;
     {
         let cards = app.cards_handle();
@@ -703,7 +889,7 @@ async fn external_reply_render_guard_replaces_only_newer_messages() {
     // A NEWER external message replaces the armed renderer (its card id and
     // epoch move to the new notification).
     app.external
-        .start_reply_render(&app.flow_handles(), "ses_ext", 2000, "n2", "第二条")
+        .start_reply_render(&app.flow_handles(), "ses_ext", &anchor(2000), "n2", "第二条")
         .await;
     {
         let cards = app.cards_handle();
@@ -908,7 +1094,14 @@ async fn new_pending_stops_syncing_and_switch_back_resyncs_silently() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
     // An external message on the superseded session, written after /new.
-    mock.external_message_for("ses_old", "离开期间的外部消息");
+    mock.given_transcript(
+        "ses_old",
+        vec![transcript(vec![user(
+            "msg_ext_user",
+            now_ms(),
+            "离开期间的外部消息",
+        )])],
+    );
     // The /switch back resolves through the shared session list.
     mock.given_sessions(vec![list_session("ses_old", "旧会话", "/work/proj", 100)]);
     let (app, platform) = build_app(cfg, mock).await;

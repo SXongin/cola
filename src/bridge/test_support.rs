@@ -1131,7 +1131,8 @@ impl MockBackend {
         self
     }
 
-    /// Scenario: the next `count` `messages` calls hang forever (a wedged
+    /// Scenario: the next `count` per-session message reads (the wire
+    /// `messages` read or the neutral `transcript` read) hang forever (a wedged
     /// per-session read).
     pub(crate) fn hang_message_reads(&self, count: usize) -> &Self {
         self.hang_messages
@@ -1594,6 +1595,7 @@ impl opencode::Backend for MockBackend {
     /// decoded through the production decoder, so existing wire-scripted
     /// scenarios keep working while fixtures migrate (spec #332, #334–#339).
     async fn transcript(&self, session_id: &str) -> crate::error::Result<crate::backend::SessionTranscript> {
+        hang_if_scripted(&self.hang_messages).await;
         {
             let mut scripts = self.transcript_scripts.lock().await;
             if let Some(script) = scripts.get_mut(session_id)
@@ -2236,7 +2238,7 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
             pending: vec![surfaces.claim],
             pending_elsewhere: None,
             tail: vec![],
-            newest_user_epoch: None,
+            newest_user_anchor: None,
             newest_user_is_cola_authored: false,
         },
         None,

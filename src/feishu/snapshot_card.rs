@@ -310,7 +310,7 @@ mod tests {
             pending,
             pending_elsewhere: None,
             tail,
-            newest_user_epoch: None,
+            newest_user_anchor: None,
             newest_user_is_cola_authored: false,
         }
     }

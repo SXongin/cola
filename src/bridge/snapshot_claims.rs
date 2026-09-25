@@ -385,7 +385,7 @@ mod tests {
             pending: ids.iter().map(|id| perm(id)).collect(),
             pending_elsewhere: None,
             tail: vec![],
-            newest_user_epoch: None,
+            newest_user_anchor: None,
             newest_user_is_cola_authored: false,
         }
     }
