@@ -1453,7 +1453,7 @@ async fn hang_if_scripted(counter: &std::sync::atomic::AtomicUsize) {
 }
 
 #[async_trait::async_trait]
-impl opencode::Backend for MockBackend {
+impl crate::backend::Backend for MockBackend {
     fn new_session_input(&self, directory: Option<&str>) -> opencode::types::CreateSessionInput {
         opencode::types::CreateSessionInput {
             id: None,
@@ -1809,8 +1809,8 @@ impl opencode::Backend for MockBackend {
         "http://mock".into()
     }
 
-    fn for_directory(self: Arc<Self>, directory: &str) -> Arc<dyn opencode::DirectoryBackend> {
-        Arc::new(opencode::BackendDirectory::new(self, directory.to_string()))
+    fn for_directory(self: Arc<Self>, directory: &str) -> Arc<dyn crate::backend::DirectoryBackend> {
+        Arc::new(crate::backend::BackendDirectory::new(self, directory.to_string()))
     }
 }
 
@@ -2573,8 +2573,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::Backend;
     use crate::backend::{MessageRole, Part, SessionTranscript};
-    use crate::opencode::Backend;
 
     /// A scripted transcript is served as-is; the wire read is never touched,
     /// so a test can describe cola's domain instead of the backend's wire

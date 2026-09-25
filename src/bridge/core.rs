@@ -164,7 +164,7 @@ pub struct SharedCore {
     /// (30 s TTL; invalidated on create/adopt/rename). Private: the core's
     /// write wrappers and `invalidate_session_list_cache` own it.
     session_list_cache: Arc<Mutex<Option<SessionListCache>>>,
-    pub opencode: Arc<dyn opencode::Backend>,
+    pub opencode: Arc<dyn crate::backend::Backend>,
     pub feishu: Arc<dyn feishu::Platform>,
     /// When cola may spawn its own `opencode serve` (`auto`/`never`/`eager`,
     /// ADR-0013). Drives the Lazy Start hook and the yield decision.
@@ -189,7 +189,7 @@ pub struct SharedCore {
 impl SharedCore {
     pub fn new(
         cfg: &crate::config::Config,
-        opencode: Arc<dyn opencode::Backend>,
+        opencode: Arc<dyn crate::backend::Backend>,
         feishu: Arc<dyn feishu::Platform>,
     ) -> anyhow::Result<Self> {
         let session_store = SessionStore::new(cfg.bridge.session_file.clone())?;

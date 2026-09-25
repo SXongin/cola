@@ -20,7 +20,6 @@ use crate::bridge::session::PendingEntry;
 use crate::config::{SessionEntry, ThreadKey};
 use crate::error::BridgeError;
 use crate::feishu;
-use crate::opencode;
 use crate::opencode::types::SessionListInfo;
 
 /// What kind of topic to open: one around a brand-new session (`/topic`, the
@@ -406,7 +405,7 @@ async fn open_cover_topic(
 pub(crate) async fn sync_topic_cover_title(
     cards: &CardsHandle,
     sessions: &SessionsHandle,
-    backend: &Arc<dyn opencode::Backend>,
+    backend: &Arc<dyn crate::backend::Backend>,
     session_id: &str,
 ) -> bool {
     let thread_key = crate::bridge::span::thread_key_of(sessions, session_id).await;
@@ -420,7 +419,7 @@ pub(crate) async fn sync_topic_cover_title(
 async fn sync_topic_cover_title_inner(
     cards: &CardsHandle,
     sessions: &SessionsHandle,
-    backend: &Arc<dyn opencode::Backend>,
+    backend: &Arc<dyn crate::backend::Backend>,
     session_id: &str,
 ) -> bool {
     let (root_id, directory, agent, recorded) = {
@@ -498,7 +497,7 @@ async fn sync_topic_cover_title_inner(
 pub(crate) fn spawn_cover_title_retry(
     cards: &CardsHandle,
     sessions: &SessionsHandle,
-    backend: &Arc<dyn opencode::Backend>,
+    backend: &Arc<dyn crate::backend::Backend>,
     session_id: &str,
 ) {
     spawn_cover_title_retry_at(
@@ -521,7 +520,7 @@ pub(crate) fn spawn_cover_title_retry(
 pub(crate) fn spawn_cover_title_retry_at(
     cards: &CardsHandle,
     sessions: &SessionsHandle,
-    backend: &Arc<dyn opencode::Backend>,
+    backend: &Arc<dyn crate::backend::Backend>,
     session_id: &str,
     delays: &[std::time::Duration],
 ) {

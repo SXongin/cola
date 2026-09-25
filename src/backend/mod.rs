@@ -1,17 +1,255 @@
-//! The backend contract: the neutral read model the Bridge consumes (ADR-0053).
+//! The backend contract: the traits the Bridge calls and the neutral read model
+//! it consumes (ADR-0010, ADR-0053).
 //!
 //! The seam's read side carries a [`SessionTranscript`] — typed messages and
 //! typed parts — instead of backend wire JSON. Backend protocol field names
 //! live only in the adapter's private decoders, so a protocol change is an
 //! adapter change, not a Bridge-and-card change.
 //!
-//! The `Backend`/`DirectoryBackend` traits themselves move here in the
-//! migration's final step (#338); this module starts as the read model so the
-//! adapter can produce it while the existing wire-typed read keeps working
-//! (spec #332, the expand step).
+//! Every caller imports these traits from here, never from the adapter; the
+//! HTTP adapter ([`crate::opencode::client::Client`]) and the test mock
+//! implement them.
 
 pub mod transcript;
 
 // The neutral views are re-exported at the contract root: consumers import
 // them from here, never from the decoder's module path.
 pub use transcript::*;
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+
+use crate::error::Result;
+use crate::opencode::types::{
+    AgentInfo, CreateSessionInput, ImageInput, ModelInfo, PermissionRequest, PromptResponse, ProviderModels,
+    QuestionRequest, Session, SessionInfo, SessionListInfo, SessionStatus,
+};
+
+/// A directory-scoped handle to the backend. Instance routing lives here: the
+/// handle carries the directory, so a caller cannot silently omit `?directory=`
+/// and scope a request to the wrong server instance (ADR-0010). Directory-scoped
+/// calls (permissions, questions, session info) take no directory argument — the
+/// handle owns it.
+#[async_trait]
+pub trait DirectoryBackend: Send + Sync {
+    async fn list_permissions(&self) -> Result<Vec<PermissionRequest>>;
+
+    async fn reply_permission(&self, request_id: &str, reply: &str) -> Result<()>;
+
+    async fn list_questions(&self) -> Result<Vec<QuestionRequest>>;
+
+    async fn reply_question(&self, request_id: &str, answers: &[Vec<String>]) -> Result<()>;
+
+    async fn reject_question(&self, request_id: &str) -> Result<()>;
+
+    async fn session_info(&self, session_id: &str) -> Result<SessionInfo>;
+
+    /// The server's live run state for one session (`GET /session/status`;
+    /// ADR-0028). A successful read always yields a status (absent = idle);
+    /// `Ok(None)` is an unrecognised status type, an error a failed read.
+    #[allow(dead_code)] // ticket 01 ships the read; 02/03 consume it
+    async fn session_status(&self, session_id: &str) -> Result<Option<SessionStatus>>;
+}
+
+/// The single concrete [`DirectoryBackend`]: wraps any [`Backend`] and forwards
+/// the carried directory into its directory-scoped methods. Both the real
+/// [`Client`](crate::opencode::client::Client) and test mocks produce this via
+/// [`Backend::for_directory`], so the directory-scoped seam is implemented once.
+pub struct BackendDirectory {
+    backend: Arc<dyn Backend>,
+    directory: String,
+}
+
+impl BackendDirectory {
+    pub(crate) fn new(backend: Arc<dyn Backend>, directory: String) -> Self {
+        Self { backend, directory }
+    }
+}
+
+#[async_trait]
+impl DirectoryBackend for BackendDirectory {
+    async fn list_permissions(&self) -> Result<Vec<PermissionRequest>> {
+        self.backend.list_permissions(Some(&self.directory)).await
+    }
+
+    async fn reply_permission(&self, request_id: &str, reply: &str) -> Result<()> {
+        self.backend
+            .reply_permission(request_id, reply, Some(&self.directory))
+            .await
+    }
+
+    async fn list_questions(&self) -> Result<Vec<QuestionRequest>> {
+        self.backend.list_questions(Some(&self.directory)).await
+    }
+
+    async fn reply_question(&self, request_id: &str, answers: &[Vec<String>]) -> Result<()> {
+        self.backend
+            .reply_question(request_id, answers, Some(&self.directory))
+            .await
+    }
+
+    async fn reject_question(&self, request_id: &str) -> Result<()> {
+        self.backend
+            .reject_question(request_id, Some(&self.directory))
+            .await
+    }
+
+    async fn session_info(&self, session_id: &str) -> Result<SessionInfo> {
+        self.backend.session_info(session_id, Some(&self.directory)).await
+    }
+
+    async fn session_status(&self, session_id: &str) -> Result<Option<SessionStatus>> {
+        self.backend
+            .session_status(session_id, Some(&self.directory))
+            .await
+    }
+}
+
+/// The backend, abstracted so tests can drive the bridge with canned responses
+/// instead of a live server. The real implementation is the adapter's
+/// [`Client`](crate::opencode::client::Client); mock implementations feed
+/// scripted transcripts/permissions and verify what cola renders from them.
+#[async_trait]
+pub trait Backend: Send + Sync {
+    fn new_session_input(&self, directory: Option<&str>) -> CreateSessionInput;
+
+    async fn create_session(&self, input: &CreateSessionInput) -> Result<Session>;
+
+    /// List every session in the shared store (canonical `GET /session`).
+    async fn list_sessions(&self) -> Result<Vec<SessionListInfo>>;
+
+    /// Rename a session server-side (`PATCH /session/{id}` with a title).
+    async fn update_session_title(&self, session_id: &str, title: &str) -> Result<()>;
+
+    /// `model` is the per-session `/model` override (parsed "provider/model");
+    /// None → the configured default applies, and if that's also unset the
+    /// server uses its own default model.
+    ///
+    /// `variant` is the per-session `/think` override; None → the server's
+    /// default variant (unset) for whatever model runs this turn.
+    ///
+    /// `agent` is the per-session `/agent` override; None → the server uses the
+    /// session's own/default agent.
+    ///
+    /// `images` are attached as data-URL `file` parts; requires a vision-capable
+    /// model (unsupported models surface an error).
+    ///
+    /// `message_id` is the id cola chose for the user message this prompt will
+    /// create (ADR-0026: `msg_cola_` self-identifies cola-authored messages;
+    /// the server persists it, and reusing it on a retry is idempotent). None
+    /// falls back to a server-generated id.
+    #[allow(clippy::too_many_arguments)] // prompt axes: session/text/images + model/variant/agent/message-id
+    async fn prompt(
+        &self,
+        session_id: &str,
+        text: &str,
+        images: &[ImageInput],
+        model: Option<&ModelInfo>,
+        variant: Option<&str>,
+        agent: Option<&str>,
+        message_id: Option<&str>,
+    ) -> Result<PromptResponse>;
+
+    /// Fire-and-forget prompt (OpenCode `prompt_async`): message persisted and
+    /// a run forked, returns immediately. Used by the supplement path so a
+    /// message sent mid-turn doesn't block. Same `images` semantics as `prompt`.
+    #[allow(clippy::too_many_arguments)] // same prompt axes as `prompt`
+    async fn prompt_async(
+        &self,
+        session_id: &str,
+        text: &str,
+        images: &[ImageInput],
+        model: Option<&ModelInfo>,
+        variant: Option<&str>,
+        agent: Option<&str>,
+        message_id: Option<&str>,
+    ) -> Result<()>;
+
+    async fn reply_permission(&self, request_id: &str, reply: &str, directory: Option<&str>) -> Result<()>;
+
+    async fn list_permissions(&self, directory: Option<&str>) -> Result<Vec<PermissionRequest>>;
+
+    async fn list_questions(&self, directory: Option<&str>) -> Result<Vec<QuestionRequest>>;
+
+    async fn reply_question(
+        &self,
+        request_id: &str,
+        answers: &[Vec<String>],
+        directory: Option<&str>,
+    ) -> Result<()>;
+
+    async fn reject_question(&self, request_id: &str, directory: Option<&str>) -> Result<()>;
+
+    /// The legacy wire read, kept while its consumers migrate (spec #332).
+    /// No production consumer remains after #336 — the Turn, external sync and
+    /// Session Snapshot all read [`Self::transcript`] — and it is deleted with
+    /// the wire types when the migration completes (#338).
+    #[allow(dead_code)]
+    async fn messages(&self, session_id: &str) -> Result<Vec<crate::opencode::types::SessionMessage>>;
+
+    /// Read one Session as a neutral [`SessionTranscript`] — the read model the
+    /// Bridge consumes (ADR-0053). The wire generation is selected inside the
+    /// adapter; the existing [`Backend::messages`] read stays during the
+    /// migration, so both paths return the same session's data (spec #332).
+    async fn transcript(&self, session_id: &str) -> Result<SessionTranscript>;
+
+    /// The server's live run state for one session (`GET /session/status`).
+    /// `directory` selects the instance (ADR-0010). A successful read always
+    /// yields a status (absent = idle); `Ok(None)` is an unrecognised status
+    /// type (never guessed), an `Err` a failed read.
+    #[allow(dead_code)] // ticket 01 ships the read; 02/03 consume it
+    async fn session_status(
+        &self,
+        session_id: &str,
+        directory: Option<&str>,
+    ) -> Result<Option<SessionStatus>>;
+
+    /// The model's context-window size (tokens), from `GET /provider`. Used to
+    /// compute the context-usage ratio for the card footer. Best-effort: None
+    /// when the provider/model can't be resolved.
+    async fn model_context_window(&self, provider: &str, model: &str) -> Result<Option<i64>>;
+
+    /// The model configured as cola's default (`[opencode] model`), if any —
+    /// the second rung of the `/think` effective-model resolution (session
+    /// override → configured default → server-recorded session model).
+    fn configured_default_model(&self) -> Option<ModelInfo>;
+
+    /// Available agents (`GET /agent`), for the `/agent` card picker. Empty on
+    /// failure (the card degrades to a text prompt).
+    async fn list_agents(&self) -> Vec<AgentInfo>;
+
+    /// Available models grouped by provider (`GET /provider`), for the `/model`
+    /// card picker. Empty on failure (the card degrades to a text prompt).
+    async fn list_models(&self) -> Vec<ProviderModels>;
+
+    /// Fetch a session's info (exposes the parent chain for sub-task sessions).
+    async fn session_info(&self, session_id: &str, directory: Option<&str>) -> Result<SessionInfo>;
+
+    async fn interrupt(&self, session_id: &str) -> Result<()>;
+
+    async fn compact(&self, session_id: &str) -> Result<()>;
+
+    /// Re-point the backend at a different OpenCode server (port/password
+    /// changed because the server was restarted/replaced at runtime). No-op for
+    /// mocks.
+    async fn reconnect(&self, url: &str, password: &str) -> Result<()>;
+
+    /// The base URL this backend currently targets (used by the reconnect loop
+    /// to detect a changed server). Empty when serverless (Lazy Start hasn't
+    /// attached or spawned yet).
+    fn base_url(&self) -> String;
+
+    /// Whether this backend can lazily start its own OpenCode server when none
+    /// is running. The real adapter can; test mocks cannot (there is no
+    /// process to spawn), so the Lazy Start hook is a no-op in tests.
+    fn can_self_start_server(&self) -> bool {
+        false
+    }
+
+    /// A directory-scoped handle for instance-routed calls (permissions,
+    /// questions, session info). The returned handle owns the directory, so no
+    /// call site can silently omit it and hit the server cwd instance
+    /// (ADR-0010).
+    fn for_directory(self: Arc<Self>, directory: &str) -> Arc<dyn DirectoryBackend>;
+}

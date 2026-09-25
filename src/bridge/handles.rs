@@ -246,7 +246,7 @@ impl SessionsHandle {
     /// reuse stays off the wire.
     pub(crate) async fn cached_session_list(
         &self,
-        backend: &Arc<dyn opencode::Backend>,
+        backend: &Arc<dyn crate::backend::Backend>,
     ) -> crate::error::Result<Vec<opencode::types::SessionListInfo>> {
         let now = std::time::Instant::now();
         {
@@ -273,7 +273,7 @@ impl SessionsHandle {
     /// rung (nothing exists on the server yet, ADR-0041).
     pub(crate) async fn effective_model(
         &self,
-        backend: &Arc<dyn opencode::Backend>,
+        backend: &Arc<dyn crate::backend::Backend>,
         settings: &SessionSettings,
     ) -> Option<(String, String)> {
         // 1. The `/model` override in the snapshot.
@@ -307,7 +307,7 @@ impl SessionsHandle {
     /// destroying it on an unknown).
     pub(crate) async fn model_variants(
         &self,
-        backend: &Arc<dyn opencode::Backend>,
+        backend: &Arc<dyn crate::backend::Backend>,
         provider: &str,
         model: &str,
     ) -> Option<Vec<String>> {
@@ -329,7 +329,7 @@ impl SessionsHandle {
     /// the advertised catalog is left alone.
     pub(crate) async fn clear_variant_for_model(
         &self,
-        backend: &Arc<dyn opencode::Backend>,
+        backend: &Arc<dyn crate::backend::Backend>,
         variant: &mut Option<String>,
         model_spec: &str,
     ) -> Option<String> {
@@ -353,7 +353,7 @@ impl SessionsHandle {
     /// working after the recreate.
     pub(crate) async fn create_fresh_session(
         &self,
-        backend: &Arc<dyn opencode::Backend>,
+        backend: &Arc<dyn crate::backend::Backend>,
         thread_key: &ThreadKey,
         directory: String,
         topic_anchor: Option<String>,
@@ -375,7 +375,7 @@ impl SessionsHandle {
     /// same way when deciding whose requests a dead turn owns.
     pub(crate) async fn descends_from(
         &self,
-        backend: &Arc<dyn opencode::Backend>,
+        backend: &Arc<dyn crate::backend::Backend>,
         candidate: &str,
         root: &str,
         directory: &str,
@@ -637,7 +637,7 @@ pub(crate) struct TurnHandles {
     pub(crate) cards: CardsHandle,
     pub(crate) requests: RequestsHandle,
     pub(crate) waits: WaitsHandle,
-    pub(crate) backend: Arc<dyn opencode::Backend>,
+    pub(crate) backend: Arc<dyn crate::backend::Backend>,
     pub(crate) platform: Arc<dyn feishu::Platform>,
     pub(crate) config: TurnConfig,
 }
@@ -654,7 +654,7 @@ pub(crate) struct FlowHandles {
     pub(crate) cards: CardsHandle,
     pub(crate) requests: RequestsHandle,
     pub(crate) waits: WaitsHandle,
-    pub(crate) backend: Arc<dyn opencode::Backend>,
+    pub(crate) backend: Arc<dyn crate::backend::Backend>,
     pub(crate) platform: Arc<dyn feishu::Platform>,
 }
 
@@ -693,7 +693,7 @@ pub(crate) struct SnapshotHandles {
     pub(crate) sessions: SessionsHandle,
     pub(crate) cards: CardsHandle,
     pub(crate) requests: RequestsHandle,
-    pub(crate) backend: Arc<dyn opencode::Backend>,
+    pub(crate) backend: Arc<dyn crate::backend::Backend>,
     /// Whether Message Pin is on (`[bridge] instant_reminder`): the snapshot's
     /// 等待你的确认 pointer may promise 置顶 only then (ADR-0028 update
     /// 2026-09-25). Config, not wait state — nothing here blocks.

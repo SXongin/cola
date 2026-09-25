@@ -369,7 +369,7 @@ impl RequestFlow {
         &self,
         requests: &RequestsHandle,
         sessions: &SessionsHandle,
-        backend: &Arc<dyn opencode::Backend>,
+        backend: &Arc<dyn crate::backend::Backend>,
         session_id: &str,
         directory: &str,
     ) -> Vec<String> {
@@ -1193,7 +1193,7 @@ impl RequestFlow {
 /// share; an empty id matches nothing.
 pub(crate) async fn session_belongs_to(
     sessions: &SessionsHandle,
-    backend: &Arc<dyn opencode::Backend>,
+    backend: &Arc<dyn crate::backend::Backend>,
     candidate: &str,
     session_id: &str,
     directory: &str,
@@ -1216,7 +1216,7 @@ pub(crate) async fn reject_leftovers_for_turn(
     requests: &RequestsHandle,
     cards: &CardsHandle,
     sessions: &SessionsHandle,
-    backend: &Arc<dyn opencode::Backend>,
+    backend: &Arc<dyn crate::backend::Backend>,
     session_id: &str,
 ) -> usize {
     let directory = sessions.directory_for_session(session_id).await;

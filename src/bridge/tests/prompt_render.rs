@@ -502,7 +502,7 @@ async fn subtitle_degrades_when_session_info_hangs() {
 async fn readiness_wait_recovers_after_wedged_attempts() {
     let mock = MockBackend::new(realistic_parts());
     mock.hang_session_lists(2);
-    let backend: Arc<dyn crate::opencode::Backend> = Arc::new(mock);
+    let backend: Arc<dyn crate::backend::Backend> = Arc::new(mock);
     let result =
         crate::bridge::pollers::wait_for_server_ready(&backend, std::time::Duration::from_secs(10)).await;
     assert!(
@@ -518,7 +518,7 @@ async fn readiness_wait_recovers_after_wedged_attempts() {
 async fn readiness_wait_fails_when_server_never_serves() {
     let mock = MockBackend::new(realistic_parts());
     mock.hang_session_lists(usize::MAX);
-    let backend: Arc<dyn crate::opencode::Backend> = Arc::new(mock);
+    let backend: Arc<dyn crate::backend::Backend> = Arc::new(mock);
     let result =
         crate::bridge::pollers::wait_for_server_ready(&backend, std::time::Duration::from_secs(2)).await;
     assert!(
