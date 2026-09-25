@@ -209,15 +209,16 @@ impl Client {
 
     /// List sessions across the shared store, most recently active first.
     ///
-    /// Uses the cross-project list `GET /experimental/session` with
-    /// `roots=true` (`Session.GlobalInfo` — camelCase: `id`, `title`,
-    /// `directory`, `parentID`, `time.created/updated`, `agent`, `model`).
-    /// The server caps a response at its page limit (default 100) and reports
-    /// the cutoff in `x-next-cursor`; the cursor is followed to the end, so
-    /// the limit can never hide older root sessions. `roots=true` makes that
-    /// limit apply to root sessions only: without it, recently updated sub-task
-    /// children fill the page and most roots disappear (issue #325). Archived
-    /// sessions are excluded server-side by default.
+    /// Uses the cross-project list `GET /experimental/session`
+    /// (`Session.GlobalInfo` — camelCase: `id`, `title`, `directory`,
+    /// `parentID`, `time.created/updated`, `agent`, `model`; archived sessions
+    /// excluded server-side by default). The server caps a response at its page
+    /// limit (default 100) and reports the cutoff in `x-next-cursor`; the
+    /// cursor is followed to the end, so the limit can never hide rows —
+    /// recently updated sub-task children used to fill the newest page and
+    /// crowd roots out of the window (issue #325). Children stay in the
+    /// returned set: `/list --all` and `/attach` resolve them, and each card
+    /// filters them per its own policy (ADR-0008).
     ///
     /// The plain `GET /session` is PROJECT-scoped: it only returns the server's
     /// *own* directory's project (the instance's cwd), so cola's sessions in
@@ -229,7 +230,6 @@ impl Client {
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_SESSION_PAGES {
             let mut url = reqwest::Url::parse(&self.url("/experimental/session"))?;
-            url.query_pairs_mut().append_pair("roots", "true");
             if let Some(cursor) = &cursor {
                 url.query_pairs_mut().append_pair("cursor", cursor);
             }
@@ -1292,17 +1292,15 @@ mod wire_tests {
         assert_eq!(request.method, "GET");
         assert_eq!(request.path, "/experimental/session");
         assert_eq!(
-            request.query_param("roots").as_deref(),
-            Some("true"),
-            "root sessions only, so the server's page limit cannot be spent on children"
+            request.query, "",
+            "no roots filter: children stay in the set for /list --all and /attach"
         );
-        assert_eq!(request.query_param("cursor"), None);
         assert_eq!(server.request_count(), 1, "one page, no cursor to follow");
     }
 
     /// Issue #325: the server applies its page limit before cola's client-side
-    /// filters, so the listing follows `x-next-cursor` to the end and always
-    /// carries `roots=true`.
+    /// child filter, so the listing follows `x-next-cursor` to the end and
+    /// merges every page.
     #[tokio::test]
     async fn list_sessions_follows_the_cursor_to_the_end() {
         let server = TestHttpServer::start().await;
@@ -1339,14 +1337,17 @@ mod wire_tests {
         assert_eq!(ids, ["ses_new", "ses_old"], "both pages merged in order");
         assert_eq!(server.request_count(), 2, "the cursor was followed once");
         let first = request_at(&server, 0);
-        assert_eq!(first.query_param("roots").as_deref(), Some("true"));
-        assert_eq!(first.query_param("cursor"), None);
+        assert_eq!(first.query, "", "the first page carries no cursor");
         let second = request_at(&server, 1);
-        assert_eq!(second.query_param("roots").as_deref(), Some("true"));
         assert_eq!(
             second.query_param("cursor").as_deref(),
             Some("1700000200000"),
             "the second page asks for rows older than the first's cutoff"
+        );
+        assert_eq!(
+            second.query_param("roots"),
+            None,
+            "no roots filter on follow-up pages either"
         );
     }
 
