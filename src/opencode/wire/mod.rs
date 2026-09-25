@@ -20,7 +20,7 @@ pub(crate) mod v2;
 
 pub(crate) use v2::Page;
 
-use crate::backend::{FinishReason, OtherPart, Part, SessionTranscript, TextPart, ToolStatus};
+use crate::backend::{ContentBlock, FinishReason, OtherPart, Part, SessionTranscript, TextPart, ToolStatus};
 use serde_json::Value;
 
 /// Decode one session's wire message read — the JSON a
@@ -119,4 +119,30 @@ fn content_text(item: &Value) -> Option<&str> {
 /// absent.
 fn started_at(value: &Value, pointer: &str) -> Option<i64> {
     value.pointer(pointer).and_then(Value::as_i64)
+}
+
+/// Assemble a tool state's shared output side from the two sources both
+/// generations carry: the `content` items and a string `result`. Text runs
+/// join verbatim; a string `result` follows on a new line; every non-text item
+/// (a text item that lost its text included) stays raw. Returns the joined
+/// text — empty when nothing contributed — and the raw blocks, so each
+/// generation layers its own precedence around the same assembly.
+fn assemble_tool_output(content: Option<&Value>, result: Option<&Value>) -> (String, Vec<ContentBlock>) {
+    let mut text = String::new();
+    let mut raw_blocks = Vec::new();
+    if let Some(items) = content.and_then(Value::as_array) {
+        for item in items {
+            match content_text(item) {
+                Some(part) => text.push_str(part),
+                None => raw_blocks.push(ContentBlock::Other(item.clone())),
+            }
+        }
+    }
+    if let Some(result) = non_null(result).and_then(Value::as_str) {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(result);
+    }
+    (text, raw_blocks)
 }

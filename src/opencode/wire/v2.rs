@@ -51,7 +51,7 @@ use crate::backend::{
 use crate::error::Result;
 
 use super::{
-    content_text, decode_error, decode_finish_reason, decode_text_part, decode_tool_status, non_null,
+    assemble_tool_output, decode_error, decode_finish_reason, decode_text_part, decode_tool_status, non_null,
     started_at,
 };
 
@@ -305,30 +305,16 @@ fn decode_tool_metadata(part: &Value, state: Option<&Value>) -> Option<Value> {
 }
 
 /// Decode a tool state's output side. The text sources follow the same
-/// precedence the legacy decoder applies to its own: the `content` text runs,
-/// then a string `result` joins it; a non-text block stays raw, and a failure
-/// keeps its reason apart as [`ToolOutput::error`].
+/// precedence the legacy decoder applies to its own: the shared
+/// [`assemble_tool_output`] joins the `content` text runs and a string
+/// `result`; a non-text block stays raw, and a failure keeps its reason apart
+/// as [`ToolOutput::error`].
 fn decode_tool_output(state: Option<&Value>) -> ToolOutput {
     let Some(state) = state else {
         return ToolOutput::default();
     };
+    let (text, raw_blocks) = assemble_tool_output(state.get("content"), state.get("result"));
     let mut blocks = Vec::new();
-    let mut text = String::new();
-    let mut raw_blocks = Vec::new();
-    if let Some(items) = state.get("content").and_then(Value::as_array) {
-        for item in items {
-            match content_text(item) {
-                Some(part) => text.push_str(part),
-                None => raw_blocks.push(ContentBlock::Other(item.clone())),
-            }
-        }
-    }
-    if let Some(result) = non_null(state.get("result")).and_then(Value::as_str) {
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(result);
-    }
     if !text.is_empty() {
         blocks.push(ContentBlock::Text(text));
     }
