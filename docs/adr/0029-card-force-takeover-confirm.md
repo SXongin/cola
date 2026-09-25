@@ -1,5 +1,11 @@
 # Force takeover from the session card
 
+> **Amended by ADR-0052**: the row buttons now carry the active `keyword` (and
+> `page`) besides `scope`, and the force-confirm card's buttons carry all three
+> — so a 返回列表 from a search-filtered list restores the keyword too, not only
+> the scope. The force-confirm flow, the full-id payload and the resolution
+> order stand.
+
 When a `/switch` card button targets a session owned by **another** chat, the
 handler refuses the steal and tells the user to type a command. That command
 required a session id the card never shows, so the escape hatch was unusable.
