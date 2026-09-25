@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
-use crate::backend::{TranscriptMessage, TurnAnchor};
+use crate::backend::{MessageRole, Part, SessionTranscript, TurnAnchor};
 use crate::bridge::handles::{CardsHandle, FlowHandles};
 use crate::bridge::turn::Turn;
 
@@ -194,7 +194,7 @@ impl ExternalFlow {
         };
         if turn_anchor.created_ms > prev {
             map.insert(sid.to_string(), turn_anchor.created_ms);
-            let preview = message_preview(newest);
+            let preview = message_preview(&transcript, &turn_anchor);
             drop(map);
             tracing::info!("External message on session {}: {}", sid, preview);
             // The card title is the server's session title (ADR-0007)
@@ -641,48 +641,84 @@ async fn finalize_done(cards: &CardsHandle, session_id: &str) {
     Turn::finalize_done(cards, session_id).await;
 }
 
-/// Preview of a user message for the external-message notification card: the
-/// message's conversational text (the Session Transcript's text projection),
-/// capped at 80 characters.
-fn message_preview(message: &TranscriptMessage) -> String {
-    message.text().chars().take(80).collect()
+/// Preview of the External Message for the notification card: every user
+/// message the backend reported at the anchor's server time (typically one),
+/// its text and reasoning parts concatenated verbatim with no separator, then
+/// capped at 80 characters. This mirrors the pre-transcript preview, which
+/// folded every `text` string of the newest-epoch user messages.
+///
+/// A part kind this build does not model ([`Part::Other`]) is not folded in:
+/// that would mean indexing raw protocol fields, which the read model exists to
+/// prevent. Such a part carrying top-level `text` does not occur in user
+/// messages in practice.
+fn message_preview(transcript: &SessionTranscript, anchor: &TurnAnchor) -> String {
+    transcript
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::User)
+        .filter(|message| message.time.is_some_and(|time| time.created == anchor.created_ms))
+        .flat_map(|message| message.parts.iter())
+        .filter_map(|part| match part {
+            Part::Text(text) => Some(text.text.as_str()),
+            Part::Reasoning(reasoning) => Some(reasoning.text.as_str()),
+            _ => None,
+        })
+        .collect::<String>()
+        .chars()
+        .take(80)
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{MessageId, MessageRole, MessageTime, Part, TextPart};
+    use crate::backend::{MessageId, MessageRole, Part, ReasoningPart, SessionTranscript, TranscriptMessage};
+    use crate::bridge::test_support::{text_part, typed_message};
 
-    fn typed_message(id: &str, created: i64, texts: &[&str]) -> TranscriptMessage {
-        TranscriptMessage {
-            id: MessageId::new(id),
-            role: MessageRole::User,
-            time: Some(MessageTime {
-                created,
-                completed: Some(created),
-            }),
-            model: None,
-            tokens: None,
-            parts: texts
-                .iter()
-                .map(|text| {
-                    Part::Text(TextPart {
-                        text: text.to_string(),
-                        started_at: None,
-                    })
-                })
-                .collect(),
+    fn user(id: &str, created: i64, parts: Vec<Part>) -> TranscriptMessage {
+        typed_message(id, MessageRole::User, Some(created), parts)
+    }
+
+    fn turn_anchor(created_ms: i64) -> TurnAnchor {
+        TurnAnchor {
+            message_id: MessageId::new(format!("msg_{created_ms}")),
+            created_ms,
         }
     }
 
     #[test]
-    fn preview_is_the_message_text_capped_at_80_chars() {
-        let message = typed_message("msg_u1", 1000, &["第一段", "第二段"]);
-        assert_eq!(message_preview(&message), "第一段\n第二段");
+    fn preview_joins_the_anchors_user_text_with_no_separator() {
+        let anchor = turn_anchor(1_000);
+        let transcript = SessionTranscript::new(vec![
+            user("msg_u1", 1_000, vec![text_part("第一段"), text_part("第二段")]),
+            // A same-epoch user message is folded in too (the old preview
+            // gathered every user message created at the newest epoch).
+            user("msg_u1b", 1_000, vec![text_part("第三段")]),
+            // A different turn's message is not part of this preview.
+            user("msg_other", 2_000, vec![text_part("别的回合")]),
+        ]);
+        assert_eq!(message_preview(&transcript, &anchor), "第一段第二段第三段");
+    }
+
+    #[test]
+    fn preview_folds_text_and_reasoning_and_caps_at_80_chars() {
+        let anchor = turn_anchor(1_000);
+        let transcript = SessionTranscript::new(vec![user(
+            "msg_u1",
+            1_000,
+            vec![
+                text_part("问题"),
+                Part::Reasoning(ReasoningPart {
+                    text: "想想".into(),
+                    started_at: None,
+                }),
+            ],
+        )]);
+        assert_eq!(message_preview(&transcript, &anchor), "问题想想");
 
         let long = "很长的内容".repeat(30);
-        let message = typed_message("msg_u2", 2000, &[&long]);
-        let preview = message_preview(&message);
+        let transcript = SessionTranscript::new(vec![user("msg_u1", 1_000, vec![text_part(&long)])]);
+        let preview = message_preview(&transcript, &anchor);
         assert_eq!(preview.chars().count(), 80, "preview must cap at 80 chars");
         assert_eq!(preview, long.chars().take(80).collect::<String>());
     }

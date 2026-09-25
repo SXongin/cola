@@ -298,45 +298,17 @@ pub(crate) async fn re_switch_snapshot(
 mod tests {
     use super::*;
     use crate::backend::{
-        FinishReason, MessageId, MessageRole, MessageTime, OtherPart, Part, ReasoningPart, StepFinish,
-        StepStart, TextPart, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
+        FinishReason, MessageRole, OtherPart, Part, ReasoningPart, StepFinish, StepStart, ToolCall,
+        ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
     };
-    use crate::bridge::test_support::MockBackend;
-
-    /// One typed transcript message — the snapshot grows a fixture with no
-    /// backend field name in it (spec #332).
-    fn typed_message(
-        id: &str,
-        role: MessageRole,
-        created: Option<i64>,
-        parts: Vec<Part>,
-    ) -> TranscriptMessage {
-        TranscriptMessage {
-            id: MessageId::new(id),
-            role,
-            time: created.map(|created| MessageTime {
-                created,
-                completed: Some(created),
-            }),
-            model: None,
-            tokens: None,
-            parts,
-        }
-    }
-
-    fn text(t: &str) -> Part {
-        Part::Text(TextPart {
-            text: t.to_string(),
-            started_at: None,
-        })
-    }
+    use crate::bridge::test_support::{MockBackend, text_part, typed_message};
 
     fn user(id: &str, created: i64, texts: &[&str]) -> TranscriptMessage {
         typed_message(
             id,
             MessageRole::User,
             Some(created),
-            texts.iter().map(|t| text(t)).collect(),
+            texts.iter().map(|t| text_part(t)).collect(),
         )
     }
 
@@ -345,7 +317,7 @@ mod tests {
             id,
             MessageRole::Assistant,
             Some(created),
-            texts.iter().map(|t| text(t)).collect(),
+            texts.iter().map(|t| text_part(t)).collect(),
         )
     }
 
@@ -439,7 +411,7 @@ mod tests {
             image_only,
             user("e", 5000, &["问题二"]),
             assistant("f", 6000, &["回答二"]),
-            typed_message("g", MessageRole::System, Some(7000), vec![text("系统提示")]),
+            typed_message("g", MessageRole::System, Some(7000), vec![text_part("系统提示")]),
         ]))
         .await;
         let tail = snap.tail;
@@ -481,12 +453,12 @@ mod tests {
             MessageRole::User,
             Some(1000),
             vec![
-                text("第一段"),
+                text_part("第一段"),
                 Part::Other(OtherPart {
                     kind: "file".into(),
                     raw: serde_json::Value::Null,
                 }),
-                text("第二段"),
+                text_part("第二段"),
             ],
         )]))
         .await;
@@ -522,7 +494,7 @@ mod tests {
         assert_eq!(snap.newest_user_anchor, None);
 
         // No time on any user message → None.
-        let no_time = typed_message("msg_cola_x", MessageRole::User, None, vec![text("hi")]);
+        let no_time = typed_message("msg_cola_x", MessageRole::User, None, vec![text_part("hi")]);
         let snap = gather_from_typed_backend(typed_backend(vec![no_time])).await;
         assert_eq!(snap.newest_user_anchor, None);
     }

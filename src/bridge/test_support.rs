@@ -7,6 +7,40 @@ pub(crate) use crate::bridge::turn::Turn;
 pub(crate) use crate::feishu;
 pub(crate) use crate::opencode;
 
+use crate::backend::{MessageId, MessageRole, MessageTime, Part, TextPart, TranscriptMessage};
+
+/// One typed transcript message for view-shaped fixtures (spec #332): identity,
+/// role, server time (completed at creation) and the given parts. `created:
+/// None` models a message the payload carried no time for. Shared by the
+/// snapshot, external and mock-backend test surfaces so their typed fixtures
+/// cannot drift.
+pub(crate) fn typed_message(
+    id: &str,
+    role: MessageRole,
+    created: Option<i64>,
+    parts: Vec<Part>,
+) -> TranscriptMessage {
+    TranscriptMessage {
+        id: MessageId::new(id),
+        role,
+        time: created.map(|created| MessageTime {
+            created,
+            completed: Some(created),
+        }),
+        model: None,
+        tokens: None,
+        parts,
+    }
+}
+
+/// One typed text part — the common content of the view-shaped fixtures.
+pub(crate) fn text_part(text: &str) -> Part {
+    Part::Text(TextPart {
+        text: text.to_string(),
+        started_at: None,
+    })
+}
+
 /// A recorded `reply_question` call: (request_id, answers).
 type QuestionReplyRecord = (String, Vec<Vec<String>>);
 
@@ -2518,27 +2552,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{
-        MessageId, MessageRole, MessageTime, Part, SessionTranscript, TextPart, TranscriptMessage,
-    };
+    use crate::backend::{MessageRole, Part, SessionTranscript};
     use crate::opencode::Backend;
-
-    fn typed_message(id: &str, role: MessageRole, created: i64, text: &str) -> TranscriptMessage {
-        TranscriptMessage {
-            id: MessageId::new(id),
-            role,
-            time: Some(MessageTime {
-                created,
-                completed: Some(created),
-            }),
-            model: None,
-            tokens: None,
-            parts: vec![Part::Text(TextPart {
-                text: text.to_string(),
-                started_at: None,
-            })],
-        }
-    }
 
     /// A scripted transcript is served as-is; the wire read is never touched,
     /// so a test can describe cola's domain instead of the backend's wire
@@ -2551,8 +2566,8 @@ mod tests {
             vec![SessionTranscript::new(vec![typed_message(
                 "msg_u1",
                 MessageRole::User,
-                1000,
-                "脚本化的问题",
+                Some(1000),
+                vec![text_part("脚本化的问题")],
             )])],
         );
         let messages_calls = std::sync::Arc::clone(&mock.messages_calls);

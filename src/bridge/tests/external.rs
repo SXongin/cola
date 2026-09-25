@@ -1,36 +1,17 @@
 use crate::backend::{
-    FinishReason, MessageId, MessageRole, MessageTime, Part, SessionTranscript, StepFinish, TextPart,
-    TranscriptMessage, TurnAnchor,
+    FinishReason, MessageId, MessageRole, Part, SessionTranscript, StepFinish, TranscriptMessage, TurnAnchor,
 };
 use crate::bridge::test_support::*;
-
-/// One typed transcript message — the external fixtures describe cola's domain
-/// (the Session Transcript), not the backend's wire format (spec #332).
-fn typed_message(id: &str, role: MessageRole, created: i64, parts: Vec<Part>) -> TranscriptMessage {
-    TranscriptMessage {
-        id: MessageId::new(id),
-        role,
-        time: Some(MessageTime {
-            created,
-            completed: Some(created),
-        }),
-        model: None,
-        tokens: None,
-        parts,
-    }
-}
-
-fn text(text: &str) -> Part {
-    Part::Text(TextPart {
-        text: text.to_string(),
-        started_at: None,
-    })
-}
 
 /// A user message's typed view; the Session Transcript's newest-user projection
 /// decides the external message from it.
 fn user(id: &str, created: i64, message_text: &str) -> TranscriptMessage {
-    typed_message(id, MessageRole::User, created, vec![text(message_text)])
+    typed_message(
+        id,
+        MessageRole::User,
+        Some(created),
+        vec![text_part(message_text)],
+    )
 }
 
 /// An assistant message whose terminal `step-finish` completes the turn.
@@ -38,13 +19,9 @@ fn finished(id: &str, created: i64, reason: FinishReason) -> TranscriptMessage {
     typed_message(
         id,
         MessageRole::Assistant,
-        created,
+        Some(created),
         vec![Part::StepFinish(StepFinish { reason })],
     )
-}
-
-fn transcript(messages: Vec<TranscriptMessage>) -> SessionTranscript {
-    SessionTranscript::new(messages)
 }
 
 /// The Turn anchor a typed user message would carry, for direct
@@ -70,7 +47,7 @@ async fn external_message_from_shared_store_notifies_feishu() {
     // newest-user/preview read must come from its projection (spec #332).
     mock.given_transcript(
         "ses_ext",
-        vec![transcript(vec![user(
+        vec![SessionTranscript::new(vec![user(
             "msg_ext_user",
             now_ms(),
             "OpenChamber 里发的消息",
@@ -137,7 +114,7 @@ async fn external_poller_recovers_when_messages_hangs() {
     let mut mock = MockBackend::new(realistic_parts());
     mock.given_transcript(
         "ses_ext",
-        vec![transcript(vec![user(
+        vec![SessionTranscript::new(vec![user(
             "msg_ext_user",
             now_ms(),
             "OpenChamber 里发的消息",
@@ -222,7 +199,7 @@ async fn external_reply_completion_comes_from_the_transcript() {
     let mut mock = MockBackend::new(serde_json::json!([]));
     mock.given_transcript(
         "ses_ext",
-        vec![transcript(vec![
+        vec![SessionTranscript::new(vec![
             user("msg_ext_user", now - 30_000, "OpenChamber 里发的消息"),
             finished("msg_ext_assist", now - 29_000, FinishReason::Stop),
         ])],
@@ -296,7 +273,7 @@ async fn cola_own_message_after_heal_is_never_notified_external() {
     // `msg_cola_` id, exactly what the real server echoes back).
     mock.given_transcript(
         "ses_ext",
-        vec![transcript(vec![user(
+        vec![SessionTranscript::new(vec![user(
             "msg_cola_mock_user",
             now_ms(),
             "可以把我本地的 openchamber serve 杀掉吗？",
@@ -378,7 +355,7 @@ async fn newer_external_message_after_cola_own_still_notifies() {
     // cola's own round, then a genuine external message after it.
     mock.given_transcript(
         "ses_ext",
-        vec![transcript(vec![
+        vec![SessionTranscript::new(vec![
             user("msg_cola_mock_user", now - 20_000, "cola 自己的一轮"),
             user("msg_ext_user", now - 10_000, "OpenChamber 后来发的消息"),
         ])],
@@ -445,7 +422,7 @@ async fn external_message_to_historical_session_is_not_notified() {
     // couldn't isolate the historical one being suppressed).
     mock.given_transcript(
         "ses_historical",
-        vec![transcript(vec![user(
+        vec![SessionTranscript::new(vec![user(
             "msg_ext_user",
             now_ms(),
             "历史会话的外部消息",
@@ -551,7 +528,7 @@ async fn reactivated_session_resyncs_silently() {
     // The external message is on the session that is being REACTIVATED.
     mock.given_transcript(
         "ses_old",
-        vec![transcript(vec![user(
+        vec![SessionTranscript::new(vec![user(
             "msg_ext_user",
             now_ms(),
             "离开期间的外部消息",
@@ -656,7 +633,7 @@ async fn external_message_to_topic_session_notifies_into_thread() {
     let mut mock = MockBackend::new(realistic_parts());
     mock.given_transcript(
         "ses_ext",
-        vec![transcript(vec![user(
+        vec![SessionTranscript::new(vec![user(
             "msg_ext_user",
             now_ms(),
             "话题里的外部消息",
@@ -1096,7 +1073,7 @@ async fn new_pending_stops_syncing_and_switch_back_resyncs_silently() {
     // An external message on the superseded session, written after /new.
     mock.given_transcript(
         "ses_old",
-        vec![transcript(vec![user(
+        vec![SessionTranscript::new(vec![user(
             "msg_ext_user",
             now_ms(),
             "离开期间的外部消息",
