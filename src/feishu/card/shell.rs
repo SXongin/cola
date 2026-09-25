@@ -241,7 +241,7 @@ impl CardBuilder {
         // Self-defending: only a LIVE panel may drive the header. A stale
         // override (finished/failed) would both lie and suppress the
         // slice-local fallback, so it is treated as absent.
-        self.header_running_tool = tool.filter(|t| t.status == "running");
+        self.header_running_tool = tool.filter(|t| t.is_running());
         self
     }
 
@@ -294,7 +294,7 @@ impl CardBuilder {
         let running = self
             .header_running_tool
             .as_ref()
-            .or_else(|| self.tools.iter().find(|t| t.status == "running"));
+            .or_else(|| self.tools.iter().find(|t| t.is_running()));
         let (header_title, template) = header_title_and_template(&self.state, running, &self.progress);
         let mut header = serde_json::json!({
             "title": { "tag": "plain_text", "content": header_title },
@@ -338,7 +338,7 @@ pub(crate) fn header_title_and_template(
                 // One icon only: `status_icon` already marks running/pending
                 // with ⏳, so an extra hardcoded 🔧 would show TWO icons
                 // (e.g. "🔧 ⏳ bench") on long-running tools.
-                (format!("{} {}", tool.status_icon(), tool.name), "orange")
+                (format!("{} {}", tool.status_icon(), tool.name()), "orange")
             } else {
                 ("✍️ 回复中".to_string(), "blue")
             }
@@ -421,6 +421,7 @@ pub(crate) fn collapsible_panel_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::ToolStatus;
     use crate::feishu::card::{
         AWAITING_BOTH_TITLE, AWAITING_PERMISSION_TITLE, AWAITING_QUESTION_TITLE, AwaitingAction,
     };
@@ -612,12 +613,12 @@ mod tests {
 
     #[test]
     fn running_tool_shows_in_header() {
-        let tool = ToolPanel {
-            name: "bash".into(),
-            status: "running".into(),
-            input: Some(json!({"command": "cargo test"})),
-            output: None,
-        };
+        let tool = ToolPanel::from_parts(
+            "bash",
+            ToolStatus::Running,
+            Some(json!({"command": "cargo test"})),
+            None,
+        );
         let card = CardBuilder::new()
             .with_state(CardState::Streaming)
             .with_tool(tool)
@@ -639,12 +640,12 @@ mod tests {
     /// falls back to today's slice-local selection when it does not.
     #[test]
     fn header_running_tool_override_wins_over_the_slice() {
-        let tool = ToolPanel {
-            name: "bash".into(),
-            status: "running".into(),
-            input: Some(json!({"command": "sleep 30"})),
-            output: None,
-        };
+        let tool = ToolPanel::from_parts(
+            "bash",
+            ToolStatus::Running,
+            Some(json!({"command": "sleep 30"})),
+            None,
+        );
         let card = CardBuilder::new()
             .with_state(CardState::Streaming)
             .with_text("补充后的内容。")
@@ -673,23 +674,18 @@ mod tests {
     /// lies in the header nor suppresses the slice-local running panel.
     #[test]
     fn a_non_running_header_tool_override_is_ignored() {
-        let finished = |name: &str| ToolPanel {
-            name: name.into(),
-            status: "completed".into(),
-            input: None,
-            output: None,
-        };
+        let finished = |name: &str| ToolPanel::from_parts(name, ToolStatus::Completed, None, None);
 
         // The slice still has a running panel: the stale override must not
         // hide it.
         let card = CardBuilder::new()
             .with_state(CardState::Streaming)
-            .with_tool(ToolPanel {
-                name: "bash".into(),
-                status: "running".into(),
-                input: Some(json!({"command": "sleep 30"})),
-                output: None,
-            })
+            .with_tool(ToolPanel::from_parts(
+                "bash",
+                ToolStatus::Running,
+                Some(json!({"command": "sleep 30"})),
+                None,
+            ))
             .with_header_running_tool(Some(finished("stale")))
             .build();
         let header = card["header"]["title"]["content"].as_str().unwrap();
@@ -943,12 +939,12 @@ mod tests {
         // A failed tool call is a normal part of an agent run — the model
         // retries or works around it. The card stays "✅ 完成"; the failure is
         // shown only on the tool's own panel (❌ + reason).
-        let tool = ToolPanel {
-            name: "edit".into(),
-            status: "error".into(),
-            input: Some(json!({"filePath": "src/main.rs"})),
-            output: Some("❌ Could not find oldString...".into()),
-        };
+        let tool = ToolPanel::from_parts(
+            "edit",
+            ToolStatus::Error,
+            Some(json!({"filePath": "src/main.rs"})),
+            Some("❌ Could not find oldString..."),
+        );
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -968,12 +964,12 @@ mod tests {
         // continuation cards when the component estimate crosses the limit.
         let mut builder = CardBuilder::new().with_state(CardState::Done);
         for i in 0..25 {
-            builder = builder.with_tool(ToolPanel {
-                name: format!("tool {}", i),
-                status: "completed".into(),
-                input: Some(json!("in")),
-                output: Some("out".into()),
-            });
+            builder = builder.with_tool(ToolPanel::from_parts(
+                &format!("tool {}", i),
+                ToolStatus::Completed,
+                Some(json!("in")),
+                Some("out"),
+            ));
         }
         let card = builder.build();
         let elements = card["body"]["elements"].as_array().unwrap();

@@ -1,3 +1,5 @@
+use crate::backend::{ContentBlock, ToolCall, ToolStatus};
+
 use super::sanitize::CardMarkdown;
 use super::shell::{collapsible_panel, panel_time_suffix};
 use super::{fenced_code, truncate_md};
@@ -7,33 +9,190 @@ use super::{fenced_code, truncate_md};
 /// command output can be meaningfully long.
 pub const TOOL_OUTPUT_MAX_CHARS: usize = 3000;
 
+/// A Tool Panel: the typed tool call as the card renders it (ADR-0053).
+///
+/// The panel owns the decoded [`ToolCall`] — identity, typed status, raw
+/// input/metadata, typed output — and derives everything presentation-side
+/// (status icon, liveness, the assembled output text) from it. Nothing is
+/// copied out into a second name/status/input/output field, so the read model
+/// stays the single description of the call. `PartialEq` is the accumulator's
+/// rendered-tool revision: an update re-renders exactly when the typed view
+/// differs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolPanel {
-    pub name: String,
-    pub status: String,
-    /// The raw structured tool input (what OpenCode recorded for the call), kept
-    /// as JSON so the panel can render it human-friendly per tool type instead
-    /// of dumping a raw JSON blob.
-    pub input: Option<serde_json::Value>,
-    pub output: Option<String>,
+    call: ToolCall,
 }
 
 impl ToolPanel {
+    pub fn new(call: ToolCall) -> Self {
+        Self { call }
+    }
+
+    /// The tool's built-in id (`bash`, `read`, …) — the rendering key
+    /// (ADR-0042).
+    pub fn name(&self) -> &str {
+        &self.call.identity.name
+    }
+
+    /// The call's typed lifecycle status.
+    pub fn status(&self) -> &ToolStatus {
+        &self.call.status
+    }
+
     pub(super) fn status_icon(&self) -> &'static str {
-        match self.status.as_str() {
-            "running" | "pending" => "⏳",
-            "completed" => "✅",
-            // OpenCode marks failed tools as status "error" (not "failed").
-            "failed" | "error" => "❌",
-            _ => "🔧",
+        match self.status() {
+            ToolStatus::Running | ToolStatus::Pending => "⏳",
+            ToolStatus::Completed => "✅",
+            // OpenCode marks failed tools as status "error" (not "failed"); a
+            // status this build does not model keeps its own name, and one
+            // named "failed"/"error" still reads as a failure.
+            ToolStatus::Error => "❌",
+            ToolStatus::Other(status) if status == "failed" || status == "error" => "❌",
+            // A missing status renders as its historical default (completed);
+            // any other unrecognized status gets the generic wrench.
+            ToolStatus::Unknown => "✅",
+            ToolStatus::Other(_) => "🔧",
         }
     }
 
     /// Whether the call is still live (`running`/`pending`): its panel is
     /// TAIL content that rides the live card, and joins the timeline only once
-    /// the tool settles (ADR-0045).
+    /// the tool settles (ADR-0045). Classification is the typed status's own,
+    /// never a string comparison.
     pub fn is_live(&self) -> bool {
-        matches!(self.status.as_str(), "running" | "pending")
+        self.status().is_live()
+    }
+
+    /// Whether the call is running right now (not merely pending): the header's
+    /// "⏳ tool" hint names the Turn's running call (ADR-0014).
+    pub fn is_running(&self) -> bool {
+        matches!(self.status(), ToolStatus::Running)
+    }
+
+    /// The raw structured tool input (what OpenCode recorded for the call), kept
+    /// as JSON so the panel can render it human-friendly per tool type instead
+    /// of dumping a raw JSON blob.
+    pub fn input(&self) -> Option<&serde_json::Value> {
+        self.call.input.as_ref()
+    }
+
+    /// The output text the panel renders: the decoder's text blocks joined (in
+    /// decoder order) with a failure's message appended on its own line, or —
+    /// for a file-editing tool — the real diff recorded in the call's raw
+    /// metadata.
+    ///
+    /// This is presentation assembly, not protocol decoding: the decoder
+    /// already applied the sources' precedence into the typed output's blocks,
+    /// so a payload carrying more than one text source can never render twice.
+    pub fn output(&self) -> Option<String> {
+        if self.call.identity.name == "edit" || self.call.identity.name == "apply_patch" {
+            edit_tool_output(&self.call)
+        } else {
+            tool_output(&self.call)
+        }
+    }
+}
+
+/// The text a tool panel renders for a call: the decoder's text blocks joined
+/// (in decoder order), with a failure's message appended on its own line. An
+/// explicit empty text block still counts as output (the historical
+/// `metadata.output: ""` rendered as an empty body, not as no output); a call
+/// with neither text nor an error has no output.
+///
+/// Non-text blocks and the raw payload stay out: the panel renders the plain
+/// string the card has always shown.
+fn tool_output(call: &ToolCall) -> Option<String> {
+    let mut out = String::new();
+    let mut has_output = false;
+    for block in &call.output.blocks {
+        if let ContentBlock::Text(text) = block {
+            has_output = true;
+            out.push_str(text);
+        }
+    }
+    if call.status == ToolStatus::Error
+        && let Some(error) = &call.output.error
+    {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("❌ {}", error));
+        has_output = true;
+    }
+    has_output.then_some(out)
+}
+
+/// For a file-editing tool (`edit`, `apply_patch`), prefer the REAL diff
+/// recorded in the call's raw metadata (`createTwoFilesPatch`) over the tool's
+/// plain text output ("Edit applied successfully." / "Success. Updated the
+/// following files: …"), which tells the reader nothing about what changed.
+/// Failures keep their extracted error text.
+fn edit_tool_output(call: &ToolCall) -> Option<String> {
+    let orig = tool_output(call);
+    if call.status == ToolStatus::Error {
+        return orig;
+    }
+    let diff = call
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("diff"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|diff| !diff.is_empty())?;
+    // The success sentence (and, for apply_patch, the A/M/D file summary after
+    // it) is noise once the diff is shown; anything beyond it (e.g. an "LSP
+    // errors detected" note) is kept as a tail after the diff.
+    let tail = orig
+        .as_deref()
+        .and_then(|output| match call.identity.name.as_str() {
+            "apply_patch" => strip_patch_summary(output),
+            _ => output.strip_prefix("Edit applied successfully."),
+        })
+        .map(|s| s.trim_start_matches('\n'))
+        .filter(|s| !s.is_empty());
+    Some(match tail {
+        Some(t) => format!("{diff}\n\n{t}"),
+        None => diff.to_string(),
+    })
+}
+
+/// Drop `apply_patch`'s success summary — `Success. Updated the following
+/// files:` plus its `A`/`M`/`D` path lines — and return what follows (the LSP
+/// note blocks, separated by a blank line), or `None` when nothing follows.
+fn strip_patch_summary(output: &str) -> Option<&str> {
+    output
+        .strip_prefix("Success. Updated the following files:")
+        .and_then(|rest| rest.split_once("\n\n").map(|(_, tail)| tail))
+}
+
+/// A Tool Panel for tests, built from the typed pieces a formatter reads: the
+/// tool name, typed status, raw input, and one text output block (the shape
+/// most fixtures need). Production code always wraps a decoded [`ToolCall`];
+/// fixtures that exercise metadata build the call directly.
+#[cfg(test)]
+impl ToolPanel {
+    pub(crate) fn from_parts(
+        name: &str,
+        status: ToolStatus,
+        input: Option<serde_json::Value>,
+        output: Option<&str>,
+    ) -> Self {
+        Self::new(ToolCall {
+            identity: crate::backend::ToolIdentity {
+                name: name.to_string(),
+                call_id: format!("call_{name}"),
+            },
+            status,
+            started_at: None,
+            input,
+            metadata: None,
+            output: crate::backend::ToolOutput {
+                raw: output.map(|text| serde_json::Value::String(text.to_string())),
+                blocks: output
+                    .map(|text| vec![ContentBlock::Text(text.to_string())])
+                    .unwrap_or_default(),
+                error: None,
+            },
+        })
     }
 }
 
@@ -65,24 +224,21 @@ pub(super) fn tool_panel_element(
     element_id: Option<&str>,
     md: &mut CardMarkdown,
 ) -> serde_json::Value {
-    let output = tool
-        .output
-        .as_ref()
-        .map(|raw| format_tool_output(&tool.name, raw));
+    let output = tool.output().map(|raw| format_tool_output(tool.name(), &raw));
     // The todo panel is a status section, not a transcript: a parsed list is
     // the panel, so the generic Input line and Output marker would only frame
     // the checklist (a still-running call has no parsed output yet — the Input
     // line `📋 共 N 项任务` is all it can show), and its prefix names the
     // section rather than the call (a finished call would sit at a permanent ✅
     // while the counts right beside it still report open items).
-    let todo_panel = tool.name == "todowrite";
+    let todo_panel = tool.name() == "todowrite";
     let todowrite_list = todo_panel
         && output
             .as_ref()
             .is_some_and(|(_, style, _)| *style == BodyStyle::Markdown);
     let mut content = String::new();
-    if !todowrite_list && let Some(i) = &tool.input {
-        let formatted = format_tool_input(&tool.name, i);
+    if !todowrite_list && let Some(i) = tool.input() {
+        let formatted = format_tool_input(tool.name(), i);
         if !formatted.is_empty() {
             // Trailing blank line so a multi-line input (edit diff, skill
             // metadata list) can't swallow the Output section as a markdown
@@ -131,7 +287,7 @@ pub(super) fn tool_panel_element(
     }
     let content = md.element(&content);
     let icon = if todo_panel { "📋" } else { tool.status_icon() };
-    let mut title = format!("{icon} {}{}", tool.name, panel_time_suffix(at_ms));
+    let mut title = format!("{icon} {}{}", tool.name(), panel_time_suffix(at_ms));
     if let Some(details) = &title_details {
         title.push_str(&format!(" · {}", details));
     }
@@ -826,18 +982,19 @@ fn first_chunk(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{ToolIdentity, ToolOutput};
     use crate::feishu::card::CardState;
     use crate::feishu::card::shell::CardBuilder;
     use serde_json::json;
 
     #[test]
     fn tool_panel_completed_is_collapsible() {
-        let tool = ToolPanel {
-            name: "read".into(),
-            status: "completed".into(),
-            input: Some(json!("src/main.rs")),
-            output: Some("fn main() {}".into()),
-        };
+        let tool = ToolPanel::from_parts(
+            "read",
+            ToolStatus::Completed,
+            Some(json!("src/main.rs")),
+            Some("fn main() {}"),
+        );
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -854,18 +1011,45 @@ mod tests {
         assert!(panel.to_string().contains("fn main() {}"));
     }
 
+    /// The panel's status presentation is the typed status, not a string: the
+    /// icon table keeps the card's historical icons (a missing status reads as
+    /// the historical completed default, "failed" still reads as a failure)
+    /// and liveness/run classification comes from [`ToolStatus`] itself.
+    #[test]
+    fn typed_status_drives_the_icon_and_liveness() {
+        let icon = |status| ToolPanel::from_parts("bash", status, None, None).status_icon();
+        assert_eq!(icon(ToolStatus::Pending), "⏳");
+        assert_eq!(icon(ToolStatus::Running), "⏳");
+        assert_eq!(icon(ToolStatus::Completed), "✅");
+        assert_eq!(icon(ToolStatus::Error), "❌");
+        assert_eq!(icon(ToolStatus::Unknown), "✅");
+        assert_eq!(icon(ToolStatus::Other("failed".into())), "❌");
+        assert_eq!(icon(ToolStatus::Other("weird".into())), "🔧");
+
+        let live = |status| ToolPanel::from_parts("bash", status, None, None).is_live();
+        assert!(live(ToolStatus::Pending) && live(ToolStatus::Running));
+        assert!(!live(ToolStatus::Completed) && !live(ToolStatus::Error));
+        assert!(!live(ToolStatus::Unknown) && !live(ToolStatus::Other("weird".into())));
+
+        // Only a RUNNING call drives the header's "⏳ tool" hint; a pending one
+        // is live tail content but not the running tool (ADR-0014/ADR-0045).
+        let running = |status| ToolPanel::from_parts("bash", status, None, None).is_running();
+        assert!(running(ToolStatus::Running));
+        assert!(!running(ToolStatus::Pending));
+    }
+
     /// #183: the tool panel's header shows the call's start time (`HH:MM`,
     /// local), visible while the panel is collapsed. A panel with no server
     /// time (a pending part, a fallback key) shows no clock.
     #[test]
     fn tool_panel_header_carries_the_start_time() {
         let at = crate::feishu::card::test_local_ms(2026, 9, 16, 14, 5);
-        let tool = ToolPanel {
-            name: "bash".into(),
-            status: "completed".into(),
-            input: Some(json!({"command": "cargo test"})),
-            output: Some("ok".into()),
-        };
+        let tool = ToolPanel::from_parts(
+            "bash",
+            ToolStatus::Completed,
+            Some(json!({"command": "cargo test"})),
+            Some("ok"),
+        );
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool_at(tool.clone(), Some(at), None)
@@ -981,12 +1165,12 @@ boom
     #[test]
     fn task_output_with_an_empty_result_still_strips_the_envelope() {
         let raw = "<task id=\"ses_1\" state=\"completed\">\n<task_result>\n</task_result>\n</task>";
-        let tool = ToolPanel {
-            name: "task".into(),
-            status: "completed".into(),
-            input: Some(json!({"description": "sub"})),
-            output: Some(raw.into()),
-        };
+        let tool = ToolPanel::from_parts(
+            "task",
+            ToolStatus::Completed,
+            Some(json!({"description": "sub"})),
+            Some(raw),
+        );
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -1052,12 +1236,12 @@ Relative paths in this skill (e.g., scripts/, reference/) are relative to this b
         assert!(body.contains("2. [Second result]("), "second result: {body}");
         assert!(!body.contains("ignored"), "excerpts dropped: {body}");
 
-        let tool = ToolPanel {
-            name: "websearch".into(),
-            status: "completed".into(),
-            input: Some(json!({"query": "x"})),
-            output: Some(raw.clone()),
-        };
+        let tool = ToolPanel::from_parts(
+            "websearch",
+            ToolStatus::Completed,
+            Some(json!({"query": "x"})),
+            Some(&raw),
+        );
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -1153,12 +1337,7 @@ Index: /x/src/main.rs
 
     #[test]
     fn edit_tool_output_renders_diff_in_panel() {
-        let tool = ToolPanel {
-            name: "edit".into(),
-            status: "completed".into(),
-            input: Some(json!({"filePath": "src/main.rs"})),
-            output: Some(
-                "\
+        let diff = "\
 Index: src/main.rs
 ===================================================================
 --- src/main.rs
@@ -1167,10 +1346,24 @@ Index: src/main.rs
  use std::fs;
 -fn main() {}
 +fn main() { println!(\"hi\"); }
-"
-                .into(),
-            ),
-        };
+";
+        let tool = ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
+                name: "edit".into(),
+                call_id: "call_edit".into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: None,
+            input: Some(json!({"filePath": "src/main.rs"})),
+            // The real diff the tool records in its metadata; the text output
+            // is only the success sentence.
+            metadata: Some(json!({ "diff": diff })),
+            output: ToolOutput {
+                raw: Some(json!("Edit applied successfully.")),
+                blocks: vec![ContentBlock::Text("Edit applied successfully.".into())],
+                error: None,
+            },
+        });
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -1194,7 +1387,8 @@ Index: src/main.rs
 
     /// #202: an `apply_patch` panel shows the same hunks as `edit`, fenced
     /// (monospace, no wrapping), with each patched file named in the body —
-    /// and the LSP note the bridge appends after the diff reaches the card.
+    /// and the tool's LSP note, which follows the success summary in the raw
+    /// output, reaches the card after the diff.
     #[test]
     fn apply_patch_output_renders_fenced_hunks_in_panel() {
         let diff = "\
@@ -1207,15 +1401,26 @@ Index: /x/one.rs
 -let b = 2;
 +let b = 3;
  let c = 4;";
-        // The bridge appends the tool's LSP note after the diff (`{diff}\n\n{tail}`);
-        // the panel must show it too.
-        let output = format!("{diff}\n\nLSP errors detected in /x/one.rs, please fix:\nunused variable `c`");
-        let tool = ToolPanel {
-            name: "apply_patch".into(),
-            status: "completed".into(),
+        // The tool's text output: the success summary, then the LSP note. The
+        // panel shows the metadata diff followed by the note; the summary is
+        // dropped as noise.
+        let text_output = "Success. Updated the following files:\nA /x/one.rs\n\n\
+                           LSP errors detected in /x/one.rs, please fix:\nunused variable `c`";
+        let tool = ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
+                name: "apply_patch".into(),
+                call_id: "call_patch".into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: None,
             input: Some(json!({"patchText": "*** Begin Patch"})),
-            output: Some(output),
-        };
+            metadata: Some(json!({ "diff": diff })),
+            output: ToolOutput {
+                raw: Some(json!(text_output)),
+                blocks: vec![ContentBlock::Text(text_output.into())],
+                error: None,
+            },
+        });
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -1363,12 +1568,12 @@ LSP errors detected in a.rs, please fix:
 <content>
 1: use std::fs;
 </content>";
-        let tool = ToolPanel {
-            name: "read".into(),
-            status: "completed".into(),
-            input: Some(json!({"filePath": "/x/y.rs"})),
-            output: Some(raw.into()),
-        };
+        let tool = ToolPanel::from_parts(
+            "read",
+            ToolStatus::Completed,
+            Some(json!({"filePath": "/x/y.rs"})),
+            Some(raw),
+        );
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -1394,13 +1599,13 @@ LSP errors detected in a.rs, please fix:
             {"content": "补测试", "status": "pending", "priority": "medium"},
             {"content": "旧方案", "status": "cancelled", "priority": "low"},
         ]);
-        let tool = ToolPanel {
-            name: "todowrite".into(),
-            status: "completed".into(),
-            input: Some(json!({ "todos": todos.clone() })),
+        let tool = ToolPanel::from_parts(
+            "todowrite",
+            ToolStatus::Completed,
+            Some(json!({ "todos": todos.clone() })),
             // Real outputs are `JSON.stringify(todos, null, 2)`.
-            output: Some(todos.to_string()),
-        };
+            Some(&todos.to_string()),
+        );
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -1437,15 +1642,15 @@ LSP errors detected in a.rs, please fix:
     /// the call can show yet (and the header carries no counts).
     #[test]
     fn running_todowrite_panel_shows_the_plan_size_in_its_body() {
-        let tool = ToolPanel {
-            name: "todowrite".into(),
-            status: "running".into(),
-            input: Some(json!({ "todos": [
+        let tool = ToolPanel::from_parts(
+            "todowrite",
+            ToolStatus::Running,
+            Some(json!({ "todos": [
                 {"content": "第一步", "status": "in_progress"},
                 {"content": "第二步", "status": "pending"},
             ] })),
-            output: None,
-        };
+            None,
+        );
         let card = CardBuilder::new()
             .with_state(CardState::Streaming)
             .with_tool(tool)
@@ -1465,12 +1670,12 @@ LSP errors detected in a.rs, please fix:
     #[test]
     fn todowrite_long_item_stays_markdown_not_fenced() {
         let content = format!("修复 {}", "很长".repeat(80));
-        let tool = ToolPanel {
-            name: "todowrite".into(),
-            status: "completed".into(),
-            input: None,
-            output: Some(json!([{"content": content, "status": "pending"}]).to_string()),
-        };
+        let tool = ToolPanel::from_parts(
+            "todowrite",
+            ToolStatus::Completed,
+            None,
+            Some(&json!([{"content": content, "status": "pending"}]).to_string()),
+        );
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -1506,12 +1711,7 @@ LSP errors detected in a.rs, please fix:
         // A non-read tool with a line long enough to wrap must become a code
         // block so Feishu doesn't fold it.
         let long = format!("cargo run {}", "a".repeat(140));
-        let tool = ToolPanel {
-            name: "bash".into(),
-            status: "completed".into(),
-            input: None,
-            output: Some(long.clone()),
-        };
+        let tool = ToolPanel::from_parts("bash", ToolStatus::Completed, None, Some(&long));
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -1530,18 +1730,53 @@ LSP errors detected in a.rs, please fix:
     #[test]
     fn tool_output_short_plain_lines_not_fenced() {
         // Short, well-formed plain output stays plain text (no fences).
-        let tool = ToolPanel {
-            name: "bash".into(),
-            status: "completed".into(),
-            input: None,
-            output: Some("all tests passed".into()),
-        };
+        let tool = ToolPanel::from_parts("bash", ToolStatus::Completed, None, Some("all tests passed"));
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
             .build();
         let text = card.to_string();
         assert!(!text.contains("```"), "short output must not be fenced: {}", text);
+    }
+
+    /// A failure's decoded message joins the output text on its OWN line: the
+    /// pieces are separate, so a missing separator runs them together. The
+    /// mutation audit found both separators surviving the suite.
+    #[test]
+    fn tool_output_joins_content_result_and_error_on_separate_lines() {
+        let completed = ToolCall {
+            identity: ToolIdentity {
+                name: "bash".into(),
+                call_id: "call_1".into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: None,
+            input: None,
+            metadata: None,
+            output: ToolOutput {
+                raw: None,
+                blocks: vec![ContentBlock::Text("first block\nsecond block".into())],
+                error: None,
+            },
+        };
+        assert_eq!(
+            ToolPanel::new(completed.clone()).output().as_deref(),
+            Some("first block\nsecond block")
+        );
+
+        let failed = ToolCall {
+            status: ToolStatus::Error,
+            output: ToolOutput {
+                raw: None,
+                blocks: vec![ContentBlock::Text("before the error".into())],
+                error: Some("boom".into()),
+            },
+            ..completed
+        };
+        assert_eq!(
+            ToolPanel::new(failed).output().as_deref(),
+            Some("before the error\n❌ boom")
+        );
     }
 
     /// Regression: a plain output containing `--` — `rg`'s group separator —
@@ -1556,12 +1791,12 @@ LSP errors detected in a.rs, please fix:
                    --\n\
                    244-        }\n\
                    245-    }";
-        let tool = ToolPanel {
-            name: "bash".into(),
-            status: "completed".into(),
-            input: Some(json!({"command": "rg -n \"x\" -B3 -A 25 src/a.rs | head -80"})),
-            output: Some(out.into()),
-        };
+        let tool = ToolPanel::from_parts(
+            "bash",
+            ToolStatus::Completed,
+            Some(json!({"command": "rg -n \"x\" -B3 -A 25 src/a.rs | head -80"})),
+            Some(out),
+        );
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -1588,12 +1823,12 @@ LSP errors detected in a.rs, please fix:
     /// which cannot interrupt a paragraph).
     #[test]
     fn output_marker_separated_from_an_indented_first_line() {
-        let tool = ToolPanel {
-            name: "bash".into(),
-            status: "completed".into(),
-            input: None,
-            output: Some("    Checking colark v0.8.4\n    Finished dev profile".into()),
-        };
+        let tool = ToolPanel::from_parts(
+            "bash",
+            ToolStatus::Completed,
+            None,
+            Some("    Checking colark v0.8.4\n    Finished dev profile"),
+        );
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -1663,12 +1898,12 @@ LSP errors detected in a.rs, please fix:
 
     #[test]
     fn tool_input_bash_shows_command_and_workdir() {
-        let tool = ToolPanel {
-            name: "bash".into(),
-            status: "completed".into(),
-            input: Some(json!({"command": "cargo test --all", "workdir": "/proj"})),
-            output: None,
-        };
+        let tool = ToolPanel::from_parts(
+            "bash",
+            ToolStatus::Completed,
+            Some(json!({"command": "cargo test --all", "workdir": "/proj"})),
+            None,
+        );
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -1686,16 +1921,16 @@ LSP errors detected in a.rs, please fix:
         // -/+) read as duplicated content and hid the real change, which now
         // comes from the tool's diff output. The input shows the target file
         // and nothing else.
-        let tool = ToolPanel {
-            name: "edit".into(),
-            status: "completed".into(),
-            input: Some(json!({
+        let tool = ToolPanel::from_parts(
+            "edit",
+            ToolStatus::Completed,
+            Some(json!({
                 "filePath": "src/main.rs",
                 "oldString": "let a = 1;",
                 "newString": "let a = 2;"
             })),
-            output: None,
-        };
+            None,
+        );
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -1719,12 +1954,12 @@ LSP errors detected in a.rs, please fix:
 
     #[test]
     fn tool_input_read_shows_path_and_limits() {
-        let tool = ToolPanel {
-            name: "read".into(),
-            status: "completed".into(),
-            input: Some(json!({"filePath": "src/foo.rs", "limit": 80})),
-            output: None,
-        };
+        let tool = ToolPanel::from_parts(
+            "read",
+            ToolStatus::Completed,
+            Some(json!({"filePath": "src/foo.rs", "limit": 80})),
+            None,
+        );
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -1739,12 +1974,12 @@ LSP errors detected in a.rs, please fix:
     fn tool_input_grep_shows_pattern_once() {
         // Regression: the pattern was rendered twice (as a bare path AND as
         // "匹配 …") for grep/glob inputs.
-        let tool = ToolPanel {
-            name: "grep".into(),
-            status: "completed".into(),
-            input: Some(json!({"pattern": "fn main", "path": "src/main.rs", "include": "*.rs"})),
-            output: None,
-        };
+        let tool = ToolPanel::from_parts(
+            "grep",
+            ToolStatus::Completed,
+            Some(json!({"pattern": "fn main", "path": "src/main.rs", "include": "*.rs"})),
+            None,
+        );
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -1765,12 +2000,12 @@ LSP errors detected in a.rs, please fix:
 
     #[test]
     fn tool_input_glob_shows_pattern_once() {
-        let tool = ToolPanel {
-            name: "glob".into(),
-            status: "completed".into(),
-            input: Some(json!({"pattern": "**/*.ts"})),
-            output: None,
-        };
+        let tool = ToolPanel::from_parts(
+            "glob",
+            ToolStatus::Completed,
+            Some(json!({"pattern": "**/*.ts"})),
+            None,
+        );
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -1787,12 +2022,12 @@ LSP errors detected in a.rs, please fix:
     /// instead of the generic `- name: …` key-value line.
     #[test]
     fn tool_input_skill_shows_its_name() {
-        let tool = ToolPanel {
-            name: "skill".into(),
-            status: "completed".into(),
-            input: Some(json!({"name": "implement"})),
-            output: None,
-        };
+        let tool = ToolPanel::from_parts(
+            "skill",
+            ToolStatus::Completed,
+            Some(json!({"name": "implement"})),
+            None,
+        );
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -1813,12 +2048,7 @@ LSP errors detected in a.rs, please fix:
                          {"label": "直接实现改进", "description": "…"}]},
             {"question": "第二个问题", "header": "其他", "options": []},
         ]});
-        let tool = ToolPanel {
-            name: "question".into(),
-            status: "running".into(),
-            input: Some(input.clone()),
-            output: None,
-        };
+        let tool = ToolPanel::from_parts("question", ToolStatus::Running, Some(input.clone()), None);
         let card = CardBuilder::new()
             .with_state(CardState::Streaming)
             .with_tool(tool)
@@ -1847,14 +2077,14 @@ LSP errors detected in a.rs, please fix:
     /// the sections keeps them on separate visual lines.
     #[test]
     fn tool_panel_input_and_output_separated_by_blank_line() {
-        let tool = ToolPanel {
-            name: "skill_apply".into(),
-            status: "completed".into(),
-            input: Some(json!({
+        let tool = ToolPanel::from_parts(
+            "skill_apply",
+            ToolStatus::Completed,
+            Some(json!({
                 "skill": "m15",
             })),
-            output: Some("applied".into()),
-        };
+            Some("applied"),
+        );
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -1880,12 +2110,7 @@ LSP errors detected in a.rs, please fix:
     #[test]
     fn tool_input_string_shows_as_is() {
         // A bare string input (non-object) renders directly.
-        let tool = ToolPanel {
-            name: "read".into(),
-            status: "completed".into(),
-            input: Some(json!("src/main.rs")),
-            output: None,
-        };
+        let tool = ToolPanel::from_parts("read", ToolStatus::Completed, Some(json!("src/main.rs")), None);
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -1895,12 +2120,12 @@ LSP errors detected in a.rs, please fix:
 
     #[test]
     fn tool_input_unknown_falls_back_to_key_value() {
-        let tool = ToolPanel {
-            name: "custom_tool".into(),
-            status: "completed".into(),
-            input: Some(json!({"a": "b", "c": 3})),
-            output: None,
-        };
+        let tool = ToolPanel::from_parts(
+            "custom_tool",
+            ToolStatus::Completed,
+            Some(json!({"a": "b", "c": 3})),
+            None,
+        );
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
