@@ -10,8 +10,9 @@ changing message, part, and tool shapes, every protocol change was a
 bridge-and-card change, and the mock adapter had grown into a second
 implementation of the wire contract.
 
-The read side of the seam is now a neutral `SessionTranscript` in
-`src/backend/`: typed envelope fields (message identity, role, server time,
+The decision is that the read side of the seam carries a neutral
+`SessionTranscript` in `src/backend/` (implemented by #333–#339): typed envelope
+fields (message identity, role, server time,
 model identity, token usage), a `Part`/`ToolCall` view whose tool payloads stay
 raw, and tolerant `Other`/`Unknown` arms. `SessionTranscript` owns the
 projections the bridge used to re-implement (`newest_user`, `turn_for_user`,
@@ -33,7 +34,8 @@ Upstream has since adopted `/api/...` as the current protocol surface
 itself now being normalized away) and kept the unprefixed routes as the V1
 compatibility layer. In this ADR and the spec, **legacy** means the unprefixed
 routes and **current** means `/api/...`; the older ADRs' "legacy `/api/*`"
-wording describes the earlier generation and is superseded on this point.
+wording describes the earlier generation — ADR-0001/0007/0026 each now carry an
+`Amended by ADR-0053` banner, and their labeling stands only as history.
 
 ## Considered Options
 

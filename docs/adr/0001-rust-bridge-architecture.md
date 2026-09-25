@@ -2,6 +2,8 @@
 
 cola is a Rust binary. Feishu + OpenCode adapters connect to a shared bridge core. Sessions map to Feishu threads via a JSON file.
 
+> **Amended by ADR-0053**: upstream redefined the route generations — the unprefixed paths are now the V1 compatibility surface and `/api/...` is the current protocol. The "legacy `/api/*`" wording below describes the earlier generation and is superseded on this point.
+
 ## Decision
 
 - **Rust**: native performance for SSE parsing + Feishu card building. Opens door to all platform API patterns.

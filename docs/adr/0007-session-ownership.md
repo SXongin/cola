@@ -8,6 +8,8 @@ How cola decides what identity a session has, and which session a thread may use
 > session still PATCHes immediately; on a Pending Session it sets the pending's
 > creation title instead (ADR-0041's command matrix).
 
+> **Amended by ADR-0053**: `/api/session` is no longer the legacy path — upstream made `/api/...` the current protocol and the unprefixed routes the V1 compatibility surface. The "legacy `/api/session`" wording below describes the earlier generation and is superseded on this point.
+
 ## Context
 
 - cola's `SessionEntry` stores a per-thread `name` that duplicates the server's

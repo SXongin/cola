@@ -13,6 +13,8 @@ after an ungraceful server death a cola write and an OpenChamber write are
 indistinguishable rows. We decided to make authorship a property of the message
 itself and give the poller sole ownership of the sync state.
 
+> **Amended by ADR-0053**: the `/api/*` generation labels below were flipped upstream — the unprefixed routes are now the V1 compatibility surface and `/api/...` is the current protocol. The "legacy `/api/...`" wording below describes the earlier generation and is superseded on this point.
+
 ## Decision
 
 1. **cola assigns every user message it submits a self-identifying id
