@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use client::Client;
 use types::{
     AgentInfo, CreateSessionInput, ImageInput, ModelInfo, PermissionRequest, PromptResponse, ProviderModels,
-    QuestionRequest, Session, SessionInfo, SessionListInfo, SessionMessage, SessionStatus,
+    QuestionRequest, Session, SessionInfo, SessionListInfo, SessionStatus,
 };
 
 #[async_trait]
@@ -89,10 +89,6 @@ impl Backend for Client {
 
     async fn reject_question(&self, request_id: &str, directory: Option<&str>) -> Result<()> {
         Client::reject_question(self, request_id, directory).await
-    }
-
-    async fn messages(&self, session_id: &str) -> Result<Vec<SessionMessage>> {
-        Client::messages(self, session_id).await
     }
 
     async fn transcript(&self, session_id: &str) -> Result<SessionTranscript> {

@@ -10,28 +10,16 @@ use std::time::Duration;
 
 use serde_json::json;
 
+use crate::backend::{
+    FinishReason, MessageRole, Part, SessionTranscript, StepFinish, StepStart, TranscriptMessage,
+};
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{PromptContext, Turn};
 use crate::config::{SessionEntry, ThreadKey};
-use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
 
-/// A Backend message fixture for a scripted timeline.
-fn msg(role: &str, id: &str, created: i64, parts: serde_json::Value) -> SessionMessage {
-    SessionMessage {
-        info: MessageInfo {
-            id: id.into(),
-            role: Some(role.into()),
-            parent_id: None,
-            time: Some(MessageTime {
-                created,
-                completed: Some(created),
-            }),
-            model_id: None,
-            provider_id: None,
-            tokens: None,
-        },
-        parts,
-    }
+/// A typed transcript message fixture for a scripted timeline.
+fn msg(role: MessageRole, id: &str, created: i64, parts: Vec<Part>) -> TranscriptMessage {
+    typed_message(id, role, Some(created), parts)
 }
 
 /// The lobby ThreadKey: the thread id IS the chat id, i.e. not a topic.
@@ -143,17 +131,12 @@ async fn render_poll_and_final_render_lines_carry_the_session() {
     let mut backend = MockBackend::new(realistic_parts());
     // Park the prompt so the render poll has to be the first renderer.
     let gate = backend.hold_prompts();
-    backend.given_timeline(
+    backend.given_transcript(
         "ses_test",
-        vec![vec![
-            msg(
-                "user",
-                "msg_cola_anchor",
-                1_000,
-                json!([{ "type": "text", "text": "hi" }]),
-            ),
-            msg("assistant", "msg_assist", 2_000, realistic_parts()),
-        ]],
+        vec![SessionTranscript::new(vec![
+            msg(MessageRole::User, "msg_cola_anchor", 1_000, vec![text_part("hi")]),
+            msg(MessageRole::Assistant, "msg_assist", 2_000, realistic_parts()),
+        ])],
     );
     let transcript_calls = Arc::clone(&backend.transcript_calls);
     let (app, _platform) = build_app(cfg, backend).await;
@@ -198,17 +181,12 @@ async fn the_render_poll_logs_at_info_only_on_progress() {
     let mut backend = MockBackend::new(realistic_parts());
     // Park the prompt so the poll ticks several times over one snapshot.
     let gate = backend.hold_prompts();
-    backend.given_timeline(
+    backend.given_transcript(
         "ses_test",
-        vec![vec![
-            msg(
-                "user",
-                "msg_cola_anchor",
-                1_000,
-                json!([{ "type": "text", "text": "hi" }]),
-            ),
-            msg("assistant", "msg_assist", 2_000, realistic_parts()),
-        ]],
+        vec![SessionTranscript::new(vec![
+            msg(MessageRole::User, "msg_cola_anchor", 1_000, vec![text_part("hi")]),
+            msg(MessageRole::Assistant, "msg_assist", 2_000, realistic_parts()),
+        ])],
     );
     let transcript_calls = Arc::clone(&backend.transcript_calls);
     let (app, _platform) = build_app(cfg, backend).await;
@@ -480,11 +458,13 @@ async fn an_external_reply_render_carries_its_session() {
     let mut backend = MockBackend::new(realistic_parts());
     backend.external_message("OpenChamber 里发的消息");
     // A reply that finishes in one step, so the renderer reaches Done.
-    let reply_ready = backend.external_reply(json!([
-        { "type": "step-start", "snapshot": "x" },
-        { "type": "text", "text": "目录里有 src。" },
-        { "type": "step-finish", "reason": "stop" },
-    ]));
+    let reply_ready = backend.external_reply(vec![
+        Part::StepStart(StepStart),
+        text_part("目录里有 src。"),
+        Part::StepFinish(StepFinish {
+            reason: FinishReason::Stop,
+        }),
+    ]);
     let (app, platform) = build_app(cfg, backend).await;
     let topic = ThreadKey::new("oc_group_1".into(), "omt_topic".into());
     seed_entry(&app, SessionEntry::new(topic, "ses_ext", "/tmp/ext")).await;

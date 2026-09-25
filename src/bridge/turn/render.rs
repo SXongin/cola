@@ -269,8 +269,8 @@ pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &Se
         // Capture the answering model + token usage for the card footer.
         if let Some(model) = &message.model {
             acc.model_id = Some(model.model_id.clone());
-            // The decoder reports an absent provider as an empty string; the
-            // old wire read left the last known provider in place.
+            // The decoder reports an absent provider as an empty string; an
+            // empty value leaves the last known provider in place.
             if !model.provider_id.is_empty() {
                 acc.provider_id = Some(model.provider_id.clone());
             }

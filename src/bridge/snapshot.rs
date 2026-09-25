@@ -325,7 +325,7 @@ mod tests {
     /// transcript wins over the wire-shape fallback, so the fixture is the
     /// only thing the snapshot can be reading.
     fn typed_backend(messages: Vec<TranscriptMessage>) -> MockBackend {
-        let mut mock = MockBackend::new(serde_json::json!([]));
+        let mut mock = MockBackend::new(Vec::new());
         mock.given_transcript("ses_adopted", vec![SessionTranscript::new(messages)]);
         mock
     }
@@ -555,7 +555,7 @@ mod tests {
             "sibling pendings leaked in"
         );
         // The tail and newest user come from the scripted transcript, not the
-        // wire shape `messages` would have served.
+        // mock's default shape.
         assert_eq!(snap.tail.len(), 1);
         assert_eq!(snap.tail[0].text, "你好");
         assert_eq!(snap.newest_user_anchor.map(|a| a.created_ms), Some(1000));

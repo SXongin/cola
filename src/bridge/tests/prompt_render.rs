@@ -785,7 +785,10 @@ async fn an_in_flight_step_before_the_anchor_renders_live() {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
-    use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
+    use crate::backend::{
+        ContentBlock, MessageId, MessageRole, MessageTime, Part, ReasoningPart, SessionTranscript, ToolCall,
+        ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
+    };
 
     use super::drain::{ctx, spawn_turn, user, wait_for_card_text};
 
@@ -797,31 +800,43 @@ async fn an_in_flight_step_before_the_anchor_renders_live() {
     let gate = backend.hold_prompts();
     // The step the previous run left streaming: created BEFORE the new turn's
     // anchor, no completion stamp, a `task` still running.
-    let in_flight = |completed: Option<i64>, status: &str, output: &str| SessionMessage {
-        info: MessageInfo {
-            id: "msg_prev".into(),
-            role: Some("assistant".into()),
-            parent_id: None,
-            time: Some(MessageTime {
-                created: 500,
-                completed,
+    let in_flight = |completed: Option<i64>, status: ToolStatus, output: &str| TranscriptMessage {
+        id: MessageId::new("msg_prev"),
+        role: MessageRole::Assistant,
+        time: Some(MessageTime {
+            created: 500,
+            completed,
+        }),
+        model: None,
+        tokens: None,
+        parts: vec![
+            Part::Reasoning(ReasoningPart {
+                text: "还在研究".into(),
+                started_at: None,
             }),
-            model_id: None,
-            provider_id: None,
-            tokens: None,
-        },
-        parts: serde_json::json!([
-            { "id": "prt_rsn", "type": "reasoning", "text": "还在研究" },
-            { "id": "prt_tool", "type": "tool", "tool": "task", "callID": "call_task",
-              "state": { "status": status, "input": { "description": "research" }, "output": output } },
-        ]),
+            Part::Tool(ToolCall {
+                identity: ToolIdentity {
+                    name: "task".into(),
+                    call_id: "call_task".into(),
+                },
+                status,
+                started_at: None,
+                input: Some(serde_json::json!({ "description": "research" })),
+                metadata: None,
+                output: ToolOutput {
+                    raw: Some(serde_json::json!(output)),
+                    blocks: vec![ContentBlock::Text(output.to_string())],
+                    error: None,
+                },
+            }),
+        ],
     };
-    backend.given_timeline(
+    backend.given_transcript(
         "ses_test",
-        vec![vec![
+        vec![SessionTranscript::new(vec![
             user("msg_cola_anchor", 1_000, "我的问题你回答了吗"),
-            in_flight(None, "running", ""),
-        ]],
+            in_flight(None, ToolStatus::Running, ""),
+        ])],
     );
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
@@ -843,9 +858,9 @@ async fn an_in_flight_step_before_the_anchor_renders_live() {
     // The step completes (completion stamp AFTER the anchor): its settled panel
     // lands on the live card too, still before finalization.
     {
-        let mut scripts = backend.message_scripts.lock().await;
-        let msgs = &mut scripts.get_mut("ses_test").unwrap()[0];
-        msgs[1] = in_flight(Some(2_500), "completed", "research done");
+        let mut scripts = backend.transcript_scripts.lock().await;
+        let transcript = &mut scripts.get_mut("ses_test").unwrap()[0];
+        transcript.messages[1] = in_flight(Some(2_500), ToolStatus::Completed, "research done");
     }
     wait_for_card_text(&platform, "research done").await;
     assert!(
