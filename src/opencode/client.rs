@@ -1748,6 +1748,14 @@ mod wire_tests {
                                "time": {"start": 1130, "end": 1140}}},
                     {"type": "tool", "tool": "mystery", "callID": "call_2",
                      "state": {"status": "weird", "input": {"x": 1}}},
+                    // A null `output` must not shadow the content/result this
+                    // state actually carries (the pre-fix regression).
+                    {"type": "tool", "tool": "read", "callID": "call_3",
+                     "state": {"status": "completed", "input": {"filePath": "a.rs"},
+                               "output": null,
+                               "content": [{"type": "text", "text": "line1"},
+                                           {"type": "text", "text": "line2"}],
+                               "result": "2 lines"}},
                     {"type": "mystery-part", "payload": 42},
                     {"type": "patch", "hash": "abc", "files": ["src/a.rs"]},
                     {"type": "step-finish", "reason": "tool-calls"}
@@ -1833,26 +1841,47 @@ mod wire_tests {
         let Part::Tool(unknown) = &assistant.parts[4] else {
             panic!("expected a tool part: {:?}", assistant.parts[4]);
         };
-        assert_eq!(unknown.status, ToolStatus::Unknown("weird".into()));
+        assert_eq!(unknown.status, ToolStatus::Other("weird".into()));
         assert!(unknown.started_at.is_none());
         assert!(unknown.output.raw.is_none());
         assert_eq!(unknown.input.as_ref().unwrap()["x"], 1);
 
+        // A null output does not shadow the content/result sources: every text
+        // block is present and the raw payload is the content the state carried.
+        let Part::Tool(null_output) = &assistant.parts[5] else {
+            panic!("expected a tool part: {:?}", assistant.parts[5]);
+        };
+        assert_eq!(
+            null_output.output.blocks,
+            vec![
+                ContentBlock::Text("line1".into()),
+                ContentBlock::Text("line2".into()),
+                ContentBlock::Text("2 lines".into()),
+            ]
+        );
+        assert_eq!(
+            null_output.output.raw.as_ref().unwrap(),
+            &serde_json::json!([
+                {"type": "text", "text": "line1"},
+                {"type": "text", "text": "line2"}
+            ])
+        );
+
         // An unrecognized part kind keeps its raw payload.
-        let Part::Other(other) = &assistant.parts[5] else {
-            panic!("expected an Other part: {:?}", assistant.parts[5]);
+        let Part::Other(other) = &assistant.parts[6] else {
+            panic!("expected an Other part: {:?}", assistant.parts[6]);
         };
         assert_eq!(other.kind, "mystery-part");
         assert_eq!(other.raw["payload"], 42);
 
-        let Part::Patch(patch) = &assistant.parts[6] else {
-            panic!("expected a patch part: {:?}", assistant.parts[6]);
+        let Part::Patch(patch) = &assistant.parts[7] else {
+            panic!("expected a patch part: {:?}", assistant.parts[7]);
         };
         assert_eq!(patch.hash.as_deref(), Some("abc"));
         assert_eq!(patch.files, vec!["src/a.rs"]);
 
-        let Part::StepFinish(finish) = &assistant.parts[7] else {
-            panic!("expected a step-finish part: {:?}", assistant.parts[7]);
+        let Part::StepFinish(finish) = &assistant.parts[8] else {
+            panic!("expected a step-finish part: {:?}", assistant.parts[8]);
         };
         assert_eq!(finish.reason, FinishReason::ToolCalls);
 

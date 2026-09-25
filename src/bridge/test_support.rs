@@ -1249,17 +1249,16 @@ impl MockBackend {
     /// cannot drift while both exist.
     async fn wire_messages(
         &self,
-        _session_id: &str,
+        session_id: &str,
     ) -> crate::error::Result<Vec<opencode::types::SessionMessage>> {
         hang_if_scripted(&self.hang_messages).await;
-        self.messages_calls.lock().await.push(_session_id.to_string());
         // A scripted Backend timeline wins over every default shape: it is
         // the test's complete message history (anchor user message, first run,
         // a supplement that missed the run, its reply), consumed one snapshot
         // per call with the last one repeating.
         {
             let mut scripts = self.message_scripts.lock().await;
-            if let Some(script) = scripts.get_mut(_session_id)
+            if let Some(script) = scripts.get_mut(session_id)
                 && !script.is_empty()
             {
                 let snapshot = if script.len() == 1 {
@@ -1276,10 +1275,10 @@ impl MockBackend {
         // with `msg_cola_`, created time stable across polls. Simulates a prompt
         // cola sent that the poller must recognise as cola-authored even when it
         // surfaces AFTER a stale watermark (server died mid-turn then healed).
-        if let Some(cola_text) = self.cola_user_messages.get(_session_id) {
+        if let Some(cola_text) = self.cola_user_messages.get(session_id) {
             let created = {
                 let mut map = self.cola_user_created.lock().unwrap();
-                *map.entry(_session_id.to_string())
+                *map.entry(session_id.to_string())
                     .or_insert_with(|| chrono::Utc::now().timestamp_millis())
             };
             msgs.push(opencode::types::SessionMessage {
@@ -1305,7 +1304,7 @@ impl MockBackend {
         // shared-store message.
         let text = self
             .external_user_messages
-            .get(_session_id)
+            .get(session_id)
             .cloned()
             .or_else(|| self.external_user_message.clone());
         if let Some(text) = text {
@@ -1319,7 +1318,7 @@ impl MockBackend {
             // is NEWEST — it was posted after cola's (the heal scenario).
             let created = {
                 let map = self.cola_user_created.lock().unwrap();
-                map.get(_session_id)
+                map.get(session_id)
                     .map(|c| created.max(c + 1000))
                     .unwrap_or(created)
             };
@@ -1584,6 +1583,9 @@ impl opencode::Backend for MockBackend {
     }
 
     async fn messages(&self, session_id: &str) -> crate::error::Result<Vec<opencode::types::SessionMessage>> {
+        // The wire read is what `messages_calls` records; `transcript` decodes
+        // the same shape without being a wire read.
+        self.messages_calls.lock().await.push(session_id.to_string());
         self.wire_messages(session_id).await
     }
 
@@ -2570,9 +2572,14 @@ mod tests {
     #[tokio::test]
     async fn mock_decodes_its_wire_shape_when_no_transcript_is_scripted() {
         let mock = MockBackend::new(realistic_parts());
+        let messages_calls = std::sync::Arc::clone(&mock.messages_calls);
         let backend: std::sync::Arc<dyn Backend> = std::sync::Arc::new(mock);
 
         let transcript = backend.transcript("ses_test").await.unwrap();
+        assert!(
+            messages_calls.lock().await.is_empty(),
+            "a transcript read must not be recorded as a wire `messages` read"
+        );
 
         assert_eq!(transcript.messages.len(), 1);
         let message = &transcript.messages[0];
