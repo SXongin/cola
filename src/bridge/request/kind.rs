@@ -114,7 +114,7 @@ pub trait RequestKind: Send + Sync {
     /// the handle, ADR-0010).
     async fn list(
         &self,
-        backend: &Arc<dyn opencode::DirectoryBackend>,
+        backend: &Arc<dyn crate::backend::DirectoryBackend>,
     ) -> crate::error::Result<Vec<PendingRequest>>;
 
     /// Reject one of this kind's pending requests on the server — the #187
@@ -124,7 +124,7 @@ pub trait RequestKind: Send + Sync {
     async fn reject(
         &self,
         flow: &RequestFlow,
-        backend: &Arc<dyn opencode::DirectoryBackend>,
+        backend: &Arc<dyn crate::backend::DirectoryBackend>,
         req: &PendingRequest,
     ) -> crate::error::Result<()>;
 
@@ -266,7 +266,7 @@ impl RequestKind for PermissionKind {
 
     async fn list(
         &self,
-        backend: &Arc<dyn opencode::DirectoryBackend>,
+        backend: &Arc<dyn crate::backend::DirectoryBackend>,
     ) -> crate::error::Result<Vec<PendingRequest>> {
         backend
             .list_permissions()
@@ -277,7 +277,7 @@ impl RequestKind for PermissionKind {
     async fn reject(
         &self,
         _flow: &RequestFlow,
-        backend: &Arc<dyn opencode::DirectoryBackend>,
+        backend: &Arc<dyn crate::backend::DirectoryBackend>,
         req: &PendingRequest,
     ) -> crate::error::Result<()> {
         let PendingRequest::Permission(p) = req else {
@@ -560,7 +560,7 @@ impl RequestKind for PermissionKind {
 /// the parent's flag, consistent with `approve_pending_for_session`.
 async fn should_auto_accept(
     sessions: &SessionsHandle,
-    backend: &Arc<dyn opencode::Backend>,
+    backend: &Arc<dyn crate::backend::Backend>,
     session_id: &str,
     directory: &str,
 ) -> bool {
@@ -588,7 +588,7 @@ async fn should_auto_accept(
 pub(crate) async fn set_auto_accept(
     sessions: &SessionsHandle,
     requests: &RequestsHandle,
-    backend: &Arc<dyn opencode::Backend>,
+    backend: &Arc<dyn crate::backend::Backend>,
     session_id: &str,
     directory: &str,
     on: bool,
@@ -623,7 +623,7 @@ pub(crate) async fn set_auto_accept(
 pub(crate) async fn approve_pending_for_session(
     sessions: &SessionsHandle,
     requests: &RequestsHandle,
-    backend: &Arc<dyn opencode::Backend>,
+    backend: &Arc<dyn crate::backend::Backend>,
     session_id: &str,
     directory: &str,
 ) -> Vec<String> {
@@ -797,7 +797,7 @@ impl RequestKind for QuestionKind {
 
     async fn list(
         &self,
-        backend: &Arc<dyn opencode::DirectoryBackend>,
+        backend: &Arc<dyn crate::backend::DirectoryBackend>,
     ) -> crate::error::Result<Vec<PendingRequest>> {
         backend
             .list_questions()
@@ -808,7 +808,7 @@ impl RequestKind for QuestionKind {
     async fn reject(
         &self,
         flow: &RequestFlow,
-        backend: &Arc<dyn opencode::DirectoryBackend>,
+        backend: &Arc<dyn crate::backend::DirectoryBackend>,
         req: &PendingRequest,
     ) -> crate::error::Result<()> {
         let PendingRequest::Question(q) = req else {
@@ -1430,7 +1430,7 @@ async fn settle_question_reply(
 /// carries the owning directory (ADR-0010); without it the reply can't be
 /// routed, so surface the failure instead of guessing at the server cwd instance.
 async fn reply_question_scoped(
-    backend: &Arc<dyn opencode::Backend>,
+    backend: &Arc<dyn crate::backend::Backend>,
     req_id: &str,
     answers: Option<&[Vec<String>]>,
     directory: Option<&str>,

@@ -160,7 +160,7 @@ async fn owner_label(core: &Arc<SharedCore>, owner_key: &ThreadKey) -> String {
 impl App {
     pub fn new(
         cfg: Config,
-        opencode: Arc<dyn opencode::Backend>,
+        opencode: Arc<dyn crate::backend::Backend>,
         feishu: Arc<dyn feishu::Platform>,
     ) -> anyhow::Result<Self> {
         let core = Arc::new(SharedCore::new(&cfg, opencode, feishu)?);

@@ -529,7 +529,7 @@ impl ReminderState {
 pub(crate) async fn reminder_target(
     sessions: &crate::bridge::handles::SessionsHandle,
     cards: &crate::bridge::handles::CardsHandle,
-    backend: &Arc<dyn crate::opencode::Backend>,
+    backend: &Arc<dyn crate::backend::Backend>,
     session_id: &str,
     directory: &str,
 ) -> Option<ReminderTarget> {

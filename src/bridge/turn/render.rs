@@ -16,7 +16,6 @@ use crate::bridge::handles::{CardsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
 use crate::bridge::turn::state::{RenderedPart, StreamAccumulator};
 use crate::config::ThreadKey;
-use crate::opencode;
 
 use super::Turn;
 
@@ -29,7 +28,7 @@ use super::Turn;
 /// echoed (the reply context already shows it).
 pub(super) async fn session_subtitle(
     sessions: &SessionsHandle,
-    backend: &Arc<dyn opencode::Backend>,
+    backend: &Arc<dyn crate::backend::Backend>,
     thread_key: &crate::config::ThreadKey,
     text: &str,
 ) -> String {
@@ -76,7 +75,7 @@ pub(super) async fn session_subtitle(
 async fn refresh_session_title(
     cards: &CardsHandle,
     sessions: &SessionsHandle,
-    backend: &Arc<dyn opencode::Backend>,
+    backend: &Arc<dyn crate::backend::Backend>,
     session_id: &str,
 ) -> bool {
     // Only meaningful while a turn is actively streaming on a live card.
@@ -305,7 +304,7 @@ pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &Se
 pub(super) async fn render_and_flush(
     cards: &CardsHandle,
     sessions: &SessionsHandle,
-    backend: &Arc<dyn opencode::Backend>,
+    backend: &Arc<dyn crate::backend::Backend>,
     session_id: &str,
     transcript: &SessionTranscript,
 ) -> Option<(usize, usize, usize)> {
@@ -368,7 +367,7 @@ pub(super) async fn render_and_flush(
 async fn render_poll_loop(
     cards: &CardsHandle,
     sessions: &SessionsHandle,
-    backend: &Arc<dyn opencode::Backend>,
+    backend: &Arc<dyn crate::backend::Backend>,
     session_id: String,
     done: std::sync::Arc<std::sync::atomic::AtomicBool>,
     poll_ms: u64,

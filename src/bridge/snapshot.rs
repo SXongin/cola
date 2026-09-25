@@ -130,7 +130,7 @@ pub fn should_emit_snapshot(
 /// and the Session Transcript's newest user + tail — from server reads alone.
 /// Best-effort per source.
 pub(crate) async fn gather_snapshot(
-    backend: &Arc<dyn opencode::Backend>,
+    backend: &Arc<dyn crate::backend::Backend>,
     session_id: &str,
     directory: &str,
 ) -> SnapshotData {
@@ -331,7 +331,7 @@ mod tests {
     }
 
     async fn gather_from_typed_backend(mock: MockBackend) -> SnapshotData {
-        let backend: Arc<dyn opencode::Backend> = Arc::new(mock);
+        let backend: Arc<dyn crate::backend::Backend> = Arc::new(mock);
         gather_snapshot(&backend, "ses_adopted", "/work/proj").await
     }
 

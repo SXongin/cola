@@ -8,7 +8,6 @@ use crate::bridge::handles::{CardsHandle, PollHandles, RequestsHandle, SessionsH
 use crate::bridge::request::flow::SentCard;
 use crate::bridge::turn::Turn;
 use crate::config::ServerStartPolicy;
-use crate::opencode;
 
 /// How often the server-reconcile loop rescans for a changed or newly-appeared
 /// server (the same cadence the old reconnect loop used).
@@ -102,7 +101,7 @@ fn want_to_spawn(allow_spawn: bool, heal_when_busy: bool, busy: bool) -> bool {
 /// swallowed request (no response at all), and a responding server is past
 /// the window even when it answers with an error.
 pub(crate) async fn wait_for_server_ready(
-    backend: &Arc<dyn opencode::Backend>,
+    backend: &Arc<dyn crate::backend::Backend>,
     timeout: std::time::Duration,
 ) -> crate::error::Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -312,7 +311,7 @@ pub enum CardTarget {
 /// every call site (card-target resolution, inline-host resolution, the
 /// auto-accept flag walk, the descendant check) shares them.
 pub(crate) async fn walk_parent_chain<F, Fut, T>(
-    backend: &Arc<dyn opencode::Backend>,
+    backend: &Arc<dyn crate::backend::Backend>,
     start: &str,
     directory: Option<&str>,
     mut predicate: F,
@@ -391,7 +390,7 @@ pub(crate) async fn resolve_topic_anchor(
 pub(crate) async fn resolve_card_target(
     sessions: &SessionsHandle,
     cards: &CardsHandle,
-    backend: &Arc<dyn opencode::Backend>,
+    backend: &Arc<dyn crate::backend::Backend>,
     platform: &Arc<dyn crate::feishu::Platform>,
     session_id: &str,
     directory: &str,
@@ -436,7 +435,7 @@ pub(crate) async fn resolve_card_target(
 /// and clicking them still replies to the actual (child) session via `directory`.
 pub(crate) async fn inline_host_session(
     cards: &CardsHandle,
-    backend: &Arc<dyn opencode::Backend>,
+    backend: &Arc<dyn crate::backend::Backend>,
     session_id: &str,
     directory: Option<&str>,
 ) -> Option<String> {

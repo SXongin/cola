@@ -1780,8 +1780,8 @@ mod wire_tests {
     /// arms) decodes, with the projections agreeing with the raw read.
     #[tokio::test]
     async fn transcript_decodes_legacy_payloads_through_the_adapter() {
+        use crate::backend::Backend;
         use crate::backend::{ContentBlock, FinishReason, MessageRole, MessageTime, Part, ToolStatus};
-        use crate::opencode::Backend;
 
         let server = TestHttpServer::start().await;
         server.route(

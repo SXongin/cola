@@ -12,7 +12,6 @@ use crate::bridge::handles::CardsHandle;
 use crate::feishu::card::shell::CardBuilder;
 use crate::feishu::card::tool_render::ToolPanel;
 use crate::feishu::card::{AwaitingAction, CardState};
-use crate::opencode;
 use indexmap::IndexMap;
 use std::sync::Arc;
 
@@ -1471,7 +1470,7 @@ pub(super) async fn refresh_work_context(cards: &CardsHandle, session_id: &str) 
 /// retries.
 pub(super) async fn refresh_context_window(
     cards: &CardsHandle,
-    backend: &Arc<dyn opencode::Backend>,
+    backend: &Arc<dyn crate::backend::Backend>,
     session_id: &str,
 ) {
     let key = {

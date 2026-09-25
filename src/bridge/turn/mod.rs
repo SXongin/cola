@@ -945,7 +945,7 @@ impl Turn {
     /// (ADR-0007), fetched on demand.
     pub(crate) async fn session_subtitle(
         sessions: &SessionsHandle,
-        backend: &Arc<dyn opencode::Backend>,
+        backend: &Arc<dyn crate::backend::Backend>,
         thread_key: &ThreadKey,
         text: &str,
     ) -> String {
@@ -958,7 +958,7 @@ impl Turn {
     pub(crate) async fn render_and_flush(
         cards: &CardsHandle,
         sessions: &SessionsHandle,
-        backend: &Arc<dyn opencode::Backend>,
+        backend: &Arc<dyn crate::backend::Backend>,
         session_id: &str,
         transcript: &SessionTranscript,
     ) -> Option<(usize, usize, usize)> {
