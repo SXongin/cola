@@ -17,7 +17,9 @@
 pub(crate) mod legacy;
 pub(crate) mod v2;
 
-use crate::backend::{FinishReason, Part, SessionTranscript, ToolStatus};
+pub(crate) use v2::Page;
+
+use crate::backend::{FinishReason, OtherPart, Part, SessionTranscript, TextPart, ToolStatus};
 use serde_json::Value;
 
 /// Decode one session's wire message read — the JSON a
@@ -37,8 +39,27 @@ pub(crate) fn decode_parts(parts: &Value) -> Vec<Part> {
 
 /// Decode one `/api` (V2) page — the `{data, cursor}` envelope a
 /// `GET /api/session/{id}/message` response carries.
-pub(crate) fn decode_page(json: &Value) -> crate::error::Result<v2::Page> {
+pub(crate) fn decode_page(json: &Value) -> crate::error::Result<Page> {
     v2::decode_page(json)
+}
+
+/// One `text` field as a text part: a string becomes [`Part::Text`]; a missing
+/// or non-string field is malformed and stays raw as the WHOLE payload, so a
+/// valid+malformed pair never joins an extra line and nothing is lost. An
+/// explicit empty string is still a valid empty text part. Both generations
+/// share this rule (a legacy part, a `/api` content item, or a `/api`
+/// message-level text field), so their tolerant arms cannot drift.
+fn decode_text_part(value: &Value, started_at: Option<i64>) -> Part {
+    match value.get("text").and_then(Value::as_str) {
+        Some(text) => Part::Text(TextPart {
+            text: text.to_string(),
+            started_at,
+        }),
+        None => Part::Other(OtherPart {
+            kind: "text".to_string(),
+            raw: value.clone(),
+        }),
+    }
 }
 
 /// A tool lifecycle status. Both generations use the same names; anything
