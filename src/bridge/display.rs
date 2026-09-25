@@ -47,6 +47,10 @@ pub(crate) fn title_or_id_tail(s: &crate::opencode::types::SessionListInfo) -> S
 /// The display identity of a session's model from the list payload
 /// (`providerID/modelID@variant`), matching how cola renders model identity
 /// elsewhere. Returns None when the payload carries no model.
+///
+/// This is the known exception to the transcript seam (spec #332): it reads
+/// the public session DTO's raw `model` payload, whose normalization was
+/// deliberately left out of scope, rather than the neutral read model.
 pub(crate) fn model_display(model: Option<&serde_json::Value>) -> Option<String> {
     let v = model?;
     let id = match v {

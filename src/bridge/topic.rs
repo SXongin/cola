@@ -143,6 +143,9 @@ async fn open_topic_inner(
                 directory: info.directory,
                 display_title: info.title.clone(),
                 agent: info.agent,
+                // The session DTO's raw `model` payload is the known exception
+                // to the transcript seam (spec #332); `model_display` reads it
+                // here rather than after a neutral normalization.
                 model: model_display(info.model.as_ref()),
                 seed: TopicSeed::Snapshot(card),
                 side: OpeningSide::Adopt { session_id: info.id },
