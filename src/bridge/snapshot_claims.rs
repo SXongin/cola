@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::bridge::handles::{CardsHandle, RequestsHandle};
 use crate::bridge::request::kind::PendingRequest;
-use crate::bridge::snapshot::SnapshotData;
+use crate::bridge::snapshot::{ElsewherePending, SnapshotData};
 use crate::bridge::turn::Turn;
 use crate::feishu::snapshot_card::SnapshotQuestionState;
 
@@ -302,12 +302,17 @@ pub(crate) async fn is_already_surfaced(
 /// snapshot may embed and claim — the adopted session's own requests minus any
 /// already surfaced elsewhere. Called BEFORE the snapshot card is built, so an
 /// already-surfaced request never shows a duplicate block on the snapshot.
+/// `pins_enabled` (Message Pin's opt-in) decides the status chip's pointer
+/// copy: with the pin on, the hosting card is pinned and the chip may say so
+/// (ADR-0028 update 2026-09-25).
 pub(crate) async fn claimable_pendings(
     requests: &RequestsHandle,
     cards: &CardsHandle,
+    pins_enabled: bool,
     mut data: SnapshotData,
 ) -> SnapshotData {
     let mut claimable: Vec<PendingRequest> = Vec::new();
+    let mut elsewhere: Option<ElsewherePending> = None;
     for req in &data.pending {
         if is_already_surfaced(requests, cards, req).await {
             tracing::info!(
@@ -315,11 +320,17 @@ pub(crate) async fn claimable_pendings(
                 req.id(),
                 req.session_id()
             );
+            elsewhere = Some(if pins_enabled {
+                ElsewherePending::Pinned
+            } else {
+                ElsewherePending::Unpinned
+            });
             continue;
         }
         claimable.push(req.clone());
     }
     data.pending = claimable;
+    data.pending_elsewhere = elsewhere;
     data
 }
 
@@ -372,6 +383,7 @@ mod tests {
             directory: "/work".into(),
             status: None,
             pending: ids.iter().map(|id| perm(id)).collect(),
+            pending_elsewhere: None,
             tail: vec![],
             newest_user_epoch: None,
             newest_user_is_cola_authored: false,

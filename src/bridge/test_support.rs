@@ -2181,6 +2181,7 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
             directory: "/work".into(),
             status: None,
             pending: vec![surfaces.claim],
+            pending_elsewhere: None,
             tail: vec![],
             newest_user_epoch: None,
             newest_user_is_cola_authored: false,

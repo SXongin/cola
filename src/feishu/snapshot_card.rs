@@ -1,4 +1,4 @@
-use crate::bridge::snapshot::{SnapshotData, TailEntry};
+use crate::bridge::snapshot::{ElsewherePending, SnapshotData, TailEntry};
 use crate::feishu::card::session::{BackToList, back_to_list_button};
 use crate::opencode;
 use serde_json::json;
@@ -22,13 +22,37 @@ pub(crate) const IDLE_CHIP: &str = "✅ 空闲";
 /// request — the operator's action beats the server's run state.
 pub(crate) const WAITING_CHIP: &str = "⏳ 等待你的确认";
 
+/// The 等待你的确认 chip when the session's pendings are NOT embedded because
+/// they are already hosted by another card, and Message Pin is on: the pointer
+/// names the card and its pin (ADR-0028 update 2026-09-25).
+pub(crate) const WAITING_ELSEWHERE_PINNED_CHIP: &str = "⏳ 等待你的确认（见置顶的原卡片）";
+
+/// The pointer chip with Message Pin off: names the original card without
+/// promising a pin, since the opt-in gates the pin itself.
+pub(crate) const WAITING_ELSEWHERE_CHIP: &str = "⏳ 等待你的确认（见原卡片）";
+
 /// The status chip content for a server run state (ADR-0028 precedence
 /// 等待你的确认 > 运行中 > 需要重试 > 空闲; a busy session carries one hint
-/// phrase). `None` when there is no status to report — the chip is omitted
-/// rather than guessed.
-fn status_chip(has_pending: bool, status: Option<opencode::types::SessionStatus>) -> Option<String> {
+/// phrase). A pending already surfaced elsewhere keeps the operator action
+/// ahead of the server state too, pointing at its hosting card instead. `None`
+/// when there is no status to report — the chip is omitted rather than
+/// guessed.
+fn status_chip(
+    has_pending: bool,
+    pending_elsewhere: Option<ElsewherePending>,
+    status: Option<opencode::types::SessionStatus>,
+) -> Option<String> {
     if has_pending {
         return Some(WAITING_CHIP.to_string());
+    }
+    if let Some(elsewhere) = pending_elsewhere {
+        return Some(
+            match elsewhere {
+                ElsewherePending::Pinned => WAITING_ELSEWHERE_PINNED_CHIP,
+                ElsewherePending::Unpinned => WAITING_ELSEWHERE_CHIP,
+            }
+            .to_string(),
+        );
     }
     match status {
         Some(opencode::types::SessionStatus::Busy) => Some(format!("{BUSY_CHIP}\n{BUSY_HINT}")),
@@ -41,9 +65,11 @@ fn status_chip(has_pending: bool, status: Option<opencode::types::SessionStatus>
 /// Build the status chip as a body element, if the precedence says one shows.
 fn status_chip_element(
     has_pending: bool,
+    pending_elsewhere: Option<ElsewherePending>,
     status: Option<opencode::types::SessionStatus>,
 ) -> Option<serde_json::Value> {
-    status_chip(has_pending, status).map(|content| json!({ "tag": "markdown", "content": content }))
+    status_chip(has_pending, pending_elsewhere, status)
+        .map(|content| json!({ "tag": "markdown", "content": content }))
 }
 /// The live answer state of one claimed question block on the snapshot
 /// (ADR-0028): request_id → state. Rebuilds after a button interaction pass
@@ -172,7 +198,7 @@ pub fn build_snapshot_card_with_state(
         .collect();
 
     let mut elements: Vec<serde_json::Value> = Vec::new();
-    if let Some(chip) = status_chip_element(!pending.is_empty(), data.status) {
+    if let Some(chip) = status_chip_element(!pending.is_empty(), data.pending_elsewhere, data.status) {
         elements.push(chip);
     }
     for (i, req) in pending.iter().enumerate() {
@@ -275,6 +301,7 @@ mod tests {
             directory: "/work/proj".into(),
             status,
             pending,
+            pending_elsewhere: None,
             tail,
             newest_user_epoch: None,
             newest_user_is_cola_authored: false,
@@ -306,35 +333,117 @@ mod tests {
     fn status_chip_precedence_matrix() {
         // Pending beats every run state.
         assert_eq!(
-            status_chip(true, Some(opencode::types::SessionStatus::Busy)).as_deref(),
+            status_chip(true, None, Some(opencode::types::SessionStatus::Busy)).as_deref(),
             Some(WAITING_CHIP)
         );
         assert_eq!(
-            status_chip(true, Some(opencode::types::SessionStatus::Retry)).as_deref(),
+            status_chip(true, None, Some(opencode::types::SessionStatus::Retry)).as_deref(),
             Some(WAITING_CHIP)
         );
         assert_eq!(
-            status_chip(true, Some(opencode::types::SessionStatus::Idle)).as_deref(),
+            status_chip(true, None, Some(opencode::types::SessionStatus::Idle)).as_deref(),
             Some(WAITING_CHIP)
         );
-        assert_eq!(status_chip(true, None).as_deref(), Some(WAITING_CHIP));
+        assert_eq!(status_chip(true, None, None).as_deref(), Some(WAITING_CHIP));
+
+        // An embedded pending beats a pending surfaced elsewhere: the pointer
+        // is only for pendings the snapshot does NOT show.
+        assert_eq!(
+            status_chip(
+                true,
+                Some(ElsewherePending::Unpinned),
+                Some(opencode::types::SessionStatus::Busy)
+            )
+            .as_deref(),
+            Some(WAITING_CHIP)
+        );
+
+        // A pending surfaced elsewhere beats every run state too (ADR-0028
+        // update 2026-09-25): the pointer copy depends on Message Pin.
+        assert_eq!(
+            status_chip(
+                false,
+                Some(ElsewherePending::Pinned),
+                Some(opencode::types::SessionStatus::Busy)
+            )
+            .as_deref(),
+            Some(WAITING_ELSEWHERE_PINNED_CHIP)
+        );
+        assert_eq!(
+            status_chip(
+                false,
+                Some(ElsewherePending::Unpinned),
+                Some(opencode::types::SessionStatus::Idle)
+            )
+            .as_deref(),
+            Some(WAITING_ELSEWHERE_CHIP)
+        );
 
         // No pending: the server state decides.
         assert!(
-            status_chip(false, Some(opencode::types::SessionStatus::Busy))
+            status_chip(false, None, Some(opencode::types::SessionStatus::Busy))
                 .unwrap()
                 .contains(BUSY_CHIP)
         );
         assert_eq!(
-            status_chip(false, Some(opencode::types::SessionStatus::Retry)).as_deref(),
+            status_chip(false, None, Some(opencode::types::SessionStatus::Retry)).as_deref(),
             Some(RETRY_CHIP)
         );
         assert_eq!(
-            status_chip(false, Some(opencode::types::SessionStatus::Idle)).as_deref(),
+            status_chip(false, None, Some(opencode::types::SessionStatus::Idle)).as_deref(),
             Some(IDLE_CHIP)
         );
         // Unknown status and nothing pending → no chip, never guessed.
-        assert_eq!(status_chip(false, None), None);
+        assert_eq!(status_chip(false, None, None), None);
+    }
+
+    /// ADR-0028 update (2026-09-25): a pending already hosted by another card
+    /// is not re-embedded, but the chip must say the session waits on the
+    /// operator — never fall back to the server run state, never carry the
+    /// busy hint.
+    #[test]
+    fn pending_elsewhere_points_at_the_host_card_without_the_busy_state() {
+        let mut d = data(Some(opencode::types::SessionStatus::Busy), vec![], vec![]);
+        d.pending_elsewhere = Some(ElsewherePending::Unpinned);
+        let card = build_snapshot_card("接管", "t", &d, None);
+        let body = elements(&card)[0]["content"].as_str().unwrap();
+        assert_eq!(body, WAITING_ELSEWHERE_CHIP);
+        let s = card.to_string();
+        assert!(!s.contains(BUSY_CHIP), "no server run state: {s}");
+        assert!(!s.contains(BUSY_HINT), "no busy hint: {s}");
+    }
+
+    /// The pointer promises 置顶 only when Message Pin is on (the same
+    /// `[bridge] instant_reminder` opt-in gates the pin itself).
+    #[test]
+    fn pending_elsewhere_promises_the_pin_only_when_message_pin_is_on() {
+        let mut d = data(None, vec![], vec![]);
+        d.pending_elsewhere = Some(ElsewherePending::Pinned);
+        let card = build_snapshot_card("接管", "t", &d, None);
+        let body = elements(&card)[0]["content"].as_str().unwrap();
+        assert_eq!(body, WAITING_ELSEWHERE_PINNED_CHIP);
+        assert!(body.contains("置顶"), "{body}");
+        assert!(!card.to_string().contains(BUSY_CHIP));
+    }
+
+    /// An embedded pending keeps the plain chip (no pointer), even when other
+    /// pendings of the same session are surfaced elsewhere.
+    #[test]
+    fn embedded_pending_keeps_the_plain_waiting_chip() {
+        let mut d = data(
+            Some(opencode::types::SessionStatus::Busy),
+            vec![PendingRequest::Permission(permission(
+                "req_1",
+                "ses_adopted",
+                "bash",
+            ))],
+            vec![],
+        );
+        d.pending_elsewhere = Some(ElsewherePending::Pinned);
+        let card = build_snapshot_card("接管", "t", &d, None);
+        let body = elements(&card)[0]["content"].as_str().unwrap();
+        assert_eq!(body, WAITING_CHIP);
+        assert!(!card.to_string().contains("原卡片"), "{card}");
     }
 
     #[test]

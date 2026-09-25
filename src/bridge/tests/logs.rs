@@ -537,6 +537,7 @@ async fn a_snapshot_settle_carries_the_session() {
         directory: "/work/project".into(),
         status: Some(crate::opencode::types::SessionStatus::Busy),
         pending: Vec::new(),
+        pending_elsewhere: None,
         tail: Vec::new(),
         newest_user_epoch: Some(1_000),
         newest_user_is_cola_authored: false,
