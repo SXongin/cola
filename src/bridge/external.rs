@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
+use crate::backend::{TranscriptMessage, TurnAnchor};
 use crate::bridge::handles::{CardsHandle, FlowHandles};
 use crate::bridge::turn::Turn;
 
@@ -151,40 +152,36 @@ impl ExternalFlow {
         if handles.waits.inflight.lock().await.contains(sid) {
             return;
         }
-        let Some(Ok(msgs)) = crate::bridge::bounded_call(
-            "external poll messages",
+        // The newest user message comes from the Session Transcript's shared
+        // `newest_user` projection, so selection and ordering live once
+        // (ADR-0053). Its author is authoritative (ADR-0026): a `msg_cola_` id
+        // means cola sent it — advance the watermark, never notify. Only a
+        // message written by another shared-store client and newer than the
+        // watermark is an External Message.
+        let Some(Ok(transcript)) = crate::bridge::bounded_call(
+            "external poll transcript",
             self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
-            handles.backend.messages(sid),
+            handles.backend.transcript(sid),
         )
         .await
         else {
             return;
         };
-        // The newest user message overall decides this poll. Its author
-        // is authoritative (ADR-0026): a `msg_cola_` id means cola sent
-        // it — advance the watermark, never notify. Only a message
-        // written by another shared-store client and newer than the
-        // watermark is an External Message.
-        let newest = msgs
-            .iter()
-            .filter(|m| m.info.role.as_deref() == Some("user"))
-            .filter_map(|m| {
-                let id = m.info.id.as_str();
-                m.info.time.as_ref().map(|t| (t.created, id))
-            })
-            .max_by_key(|(created, _)| *created);
-        let Some((latest, latest_id)) = newest else {
+        let Some(newest) = transcript.newest_user() else {
             return;
         };
-        let cola_authored = crate::opencode::parsing::is_cola_message_id(latest_id);
+        let Some(turn_anchor) = newest.anchor() else {
+            return;
+        };
+        let cola_authored = crate::opencode::parsing::is_cola_message_id(newest.id.as_str());
         let mut map = self.last_user_msg_epoch.lock().await;
         let watermark = map.get(sid).copied();
         if cola_authored {
             // cola's own message: never notify; just make sure the
             // watermark covers it so later external messages compare
             // against it.
-            if watermark.is_none_or(|w| latest > w) {
-                map.insert(sid.to_string(), latest);
+            if watermark.is_none_or(|w| turn_anchor.created_ms > w) {
+                map.insert(sid.to_string(), turn_anchor.created_ms);
             }
             return;
         }
@@ -192,12 +189,12 @@ impl ExternalFlow {
         // External messages received before cola ever polled are marked
         // read, not replayed (ADR-0017).
         let Some(prev) = watermark else {
-            map.insert(sid.to_string(), latest);
+            map.insert(sid.to_string(), turn_anchor.created_ms);
             return;
         };
-        if latest > prev {
-            map.insert(sid.to_string(), latest);
-            let preview = user_message_preview(&msgs, latest);
+        if turn_anchor.created_ms > prev {
+            map.insert(sid.to_string(), turn_anchor.created_ms);
+            let preview = message_preview(newest);
             drop(map);
             tracing::info!("External message on session {}: {}", sid, preview);
             // The card title is the server's session title (ADR-0007)
@@ -240,7 +237,7 @@ impl ExternalFlow {
                     // Now render the model's reply INTO that card, so
                     // the Feishu side sees the answer, not just the
                     // notification.
-                    self.start_reply_render(handles, sid, latest, &card_id, &preview)
+                    self.start_reply_render(handles, sid, &turn_anchor, &card_id, &preview)
                         .await;
                 }
                 Err(e) => tracing::warn!("external message notify: {}", e),
@@ -257,7 +254,7 @@ impl ExternalFlow {
         &self,
         handles: &FlowHandles,
         session_id: &str,
-        turn_anchor_ms: i64,
+        anchor: &TurnAnchor,
         card_id: &str,
         preview: &str,
     ) {
@@ -266,7 +263,7 @@ impl ExternalFlow {
         // own prompts get a fresh accumulator, so a different anchor is NOT
         // this message — a new renderer replaces the old one (whose
         // `turn_started_ms` no longer matches, so it exits).
-        if armed_turn_anchor(&handles.cards, session_id).await == Some(turn_anchor_ms) {
+        if armed_turn_anchor(&handles.cards, session_id).await == Some(anchor.created_ms) {
             return;
         }
         let (session_dir, session_thread_key) = {
@@ -323,7 +320,7 @@ impl ExternalFlow {
             &handles.cards,
             session_id,
             card_id,
-            turn_anchor_ms,
+            anchor.created_ms,
             &subtitle,
             &session_dir,
             variant,
@@ -334,6 +331,7 @@ impl ExternalFlow {
 
         let handles = handles.clone();
         let sid = session_id.to_string();
+        let anchor = anchor.clone();
         let poll_ms = self.render_poll_ms.load(std::sync::atomic::Ordering::Relaxed);
         let timeout_ms = self.render_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
         // A spawn inherits no span, so the render loop is instrumented
@@ -342,7 +340,7 @@ impl ExternalFlow {
         let span = crate::bridge::span::external(session_id, session_thread_key.as_ref());
         tokio::spawn(
             async move {
-                external_render_loop(&handles, sid, turn_anchor_ms, poll_ms, timeout_ms).await;
+                external_render_loop(&handles, sid, anchor, poll_ms, timeout_ms).await;
             }
             .instrument(span),
         );
@@ -383,13 +381,14 @@ impl ExternalFlow {
             );
             return false;
         }
-        let Some(turn_anchor_ms) = data.newest_user_epoch else {
+        let Some(anchor) = data.newest_user_anchor.clone() else {
             tracing::warn!(
                 "snapshot follow: session {} busy but has no user message to follow",
                 session_id
             );
             return false;
         };
+        let turn_anchor_ms = anchor.created_ms;
         // The follow is scoped to EXTERNAL turns (ADR-0028): the busy run
         // answers the newest user message, so a cola-authored newest means the
         // in-flight turn is cola's OWN (this thread, another thread, or a
@@ -486,7 +485,7 @@ impl ExternalFlow {
         let span = crate::bridge::span::external(session_id, session_thread_key.as_ref());
         tokio::spawn(
             async move {
-                external_render_loop(&handles, sid, turn_anchor_ms, poll_ms, timeout_ms).await;
+                external_render_loop(&handles, sid, anchor, poll_ms, timeout_ms).await;
             }
             .instrument(span),
         );
@@ -555,13 +554,23 @@ pub(crate) async fn settle_snapshot_after_send(
 async fn external_render_loop(
     handles: &FlowHandles,
     session_id: String,
-    turn_anchor_ms: i64,
+    anchor: TurnAnchor,
     poll_ms: u64,
     timeout_ms: u64,
 ) {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(poll_ms)).await;
+        // Completion and the newer-turn boundary come from the Session
+        // Transcript's shared projections (ADR-0053); the raw read still feeds
+        // the streaming renderer while the Turn module migrates (#336).
+        let transcript = match handles.backend.transcript(&session_id).await {
+            Ok(transcript) => transcript,
+            Err(e) => {
+                tracing::warn!("external render poll transcript: {}", e);
+                continue;
+            }
+        };
         let msgs = match handles.backend.messages(&session_id).await {
             Ok(m) => m,
             Err(e) => {
@@ -572,7 +581,7 @@ async fn external_render_loop(
         // The accumulator was replaced (cola's own `run_prompt` inserted a fresh
         // one, or a newer external message's renderer took over): exit so this
         // turn isn't double-rendered into two cards.
-        let replaced = Turn::armed_turn_anchor(&handles.cards, &session_id).await != Some(turn_anchor_ms);
+        let replaced = Turn::armed_turn_anchor(&handles.cards, &session_id).await != Some(anchor.created_ms);
         if replaced {
             break;
         }
@@ -591,19 +600,19 @@ async fn external_render_loop(
         if new_parts > 0 {
             tracing::info!("external render: session {} gained parts", session_id);
         }
-        // The model finished answering: finalize the card, then stop.
-        if external_turn_completed(&msgs, turn_anchor_ms) {
+        // The model finished answering this turn: the transcript's turn
+        // projection says so — finalize the card, then stop.
+        if transcript.turn_for_user(&anchor).complete {
             finalize_done(&handles.cards, &session_id).await;
             tracing::info!("external reply rendered: session {} done", session_id);
             break;
         }
         // A NEWER user message is a turn boundary — the poller notifies and arms
         // a fresh renderer for it.
-        let newer_turn = msgs
-            .iter()
-            .filter(|m| m.info.role.as_deref() == Some("user"))
-            .filter_map(|m| m.info.time.as_ref().map(|t| t.created))
-            .any(|created| created > turn_anchor_ms);
+        let newer_turn = transcript
+            .newest_user()
+            .and_then(|message| message.time.map(|time| time.created))
+            .is_some_and(|created| created > anchor.created_ms);
         if newer_turn {
             break;
         }
@@ -632,137 +641,49 @@ async fn finalize_done(cards: &CardsHandle, session_id: &str) {
     Turn::finalize_done(cards, session_id).await;
 }
 
-/// Whether the model has finished answering the external message: an assistant
-/// message in this turn carries a `step-finish` part whose reason is NOT the
-/// pause to run tools. OpenCode's terminal finish reasons are "stop", "length",
-/// "content-filter", "error" and "unknown"; "tool-calls" only means the step
-/// ended to execute tools and the model will continue.
-fn external_turn_completed(msgs: &[crate::opencode::types::SessionMessage], turn_anchor_ms: i64) -> bool {
-    msgs.iter()
-        .filter(|m| m.info.role.as_deref() == Some("assistant"))
-        .filter(|m| {
-            m.info
-                .time
-                .as_ref()
-                .map(|t| t.created >= turn_anchor_ms)
-                .unwrap_or(false)
-        })
-        .flat_map(|m| m.parts.as_array().into_iter().flatten())
-        .any(|part| {
-            part.get("type").and_then(|t| t.as_str()) == Some("step-finish")
-                && part
-                    .get("reason")
-                    .and_then(|r| r.as_str())
-                    .is_some_and(|r| r != "tool-calls")
-        })
-}
-
-/// Preview of a user message, for the external-message notification card.
-fn user_message_preview(msgs: &[crate::opencode::types::SessionMessage], created: i64) -> String {
-    let mut out = String::new();
-    for m in msgs {
-        if m.info.role.as_deref() != Some("user") {
-            continue;
-        }
-        if m.info.time.as_ref().map(|t| t.created) != Some(created) {
-            continue;
-        }
-        if let Some(parts) = m.parts.as_array() {
-            for p in parts {
-                if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
-                    out.push_str(t);
-                }
-            }
-        }
-    }
-    out.chars().take(80).collect()
+/// Preview of a user message for the external-message notification card: the
+/// message's conversational text (the Session Transcript's text projection),
+/// capped at 80 characters.
+fn message_preview(message: &TranscriptMessage) -> String {
+    message.text().chars().take(80).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
+    use crate::backend::{MessageId, MessageRole, MessageTime, Part, TextPart};
 
-    fn msg(role: &str, created: i64, parts: serde_json::Value) -> SessionMessage {
-        SessionMessage {
-            info: MessageInfo {
-                id: format!("msg_{role}_{created}"),
-                role: Some(role.into()),
-                parent_id: None,
-                time: Some(MessageTime {
-                    created,
-                    completed: Some(created),
-                }),
-                model_id: None,
-                provider_id: None,
-                tokens: None,
-            },
-            parts,
+    fn typed_message(id: &str, created: i64, texts: &[&str]) -> TranscriptMessage {
+        TranscriptMessage {
+            id: MessageId::new(id),
+            role: MessageRole::User,
+            time: Some(MessageTime {
+                created,
+                completed: Some(created),
+            }),
+            model: None,
+            tokens: None,
+            parts: texts
+                .iter()
+                .map(|text| {
+                    Part::Text(TextPart {
+                        text: text.to_string(),
+                        started_at: None,
+                    })
+                })
+                .collect(),
         }
     }
 
-    fn finish(reason: &str) -> serde_json::Value {
-        serde_json::json!([{ "type": "step-finish", "reason": reason }])
-    }
-
     #[test]
-    fn turn_completed_on_terminal_finish() {
-        // tool-calls pauses to execute tools — NOT complete.
-        let msgs = vec![
-            msg(
-                "user",
-                1000,
-                serde_json::json!([{ "type": "text", "text": "hi" }]),
-            ),
-            msg("assistant", 2000, finish("tool-calls")),
-        ];
-        assert!(!external_turn_completed(&msgs, 1000));
+    fn preview_is_the_message_text_capped_at_80_chars() {
+        let message = typed_message("msg_u1", 1000, &["第一段", "第二段"]);
+        assert_eq!(message_preview(&message), "第一段\n第二段");
 
-        // A later step finishes with "stop" — complete.
-        let msgs = vec![
-            msg(
-                "user",
-                1000,
-                serde_json::json!([{ "type": "text", "text": "hi" }]),
-            ),
-            msg("assistant", 2000, finish("tool-calls")),
-            msg("assistant", 3000, finish("stop")),
-        ];
-        assert!(external_turn_completed(&msgs, 1000));
-
-        // Other terminal reasons count too.
-        assert!(external_turn_completed(
-            &[msg("assistant", 2000, finish("length"))],
-            1000
-        ));
-        assert!(external_turn_completed(
-            &[msg("assistant", 2000, finish("error"))],
-            1000
-        ));
-    }
-
-    #[test]
-    fn turn_completion_ignores_other_turns() {
-        // A step-finish BEFORE the external epoch belongs to an earlier turn.
-        let msgs = vec![msg("assistant", 500, finish("stop"))];
-        assert!(!external_turn_completed(&msgs, 1000));
-    }
-
-    #[test]
-    fn preview_is_content_of_the_latest_user_message() {
-        let msgs = vec![
-            msg(
-                "user",
-                1000,
-                serde_json::json!([{ "type": "text", "text": "第一条" }]),
-            ),
-            msg(
-                "user",
-                2000,
-                serde_json::json!([{ "type": "text", "text": "第二条，很长很长的内容" }]),
-            ),
-        ];
-        assert_eq!(user_message_preview(&msgs, 2000), "第二条，很长很长的内容");
-        assert_eq!(user_message_preview(&msgs, 1000), "第一条");
+        let long = "很长的内容".repeat(30);
+        let message = typed_message("msg_u2", 2000, &[&long]);
+        let preview = message_preview(&message);
+        assert_eq!(preview.chars().count(), 80, "preview must cap at 80 chars");
+        assert_eq!(preview, long.chars().take(80).collect::<String>());
     }
 }

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tracing::Instrument;
 
-use crate::backend::{SessionTranscript, TailEntry};
+use crate::backend::{SessionTranscript, TailEntry, TurnAnchor};
 use crate::bridge::handles::SnapshotHandles;
 use crate::opencode;
 
@@ -35,11 +35,12 @@ pub struct SnapshotData {
     /// newest last — the Session Transcript's shared `transcript_tail`
     /// projection.
     pub tail: Vec<TailEntry>,
-    /// The created time of the newest user message (ANY user message, text or
-    /// not — the epoch the busy-adopt follow renders from, ticket 06) from the
-    /// Session Transcript's `newest_user` projection. `None` when the session
-    /// has no user message: nothing to follow.
-    pub newest_user_epoch: Option<i64>,
+    /// The newest user message's anchor — its identity together with its
+    /// server time — from the Session Transcript's `newest_user` projection.
+    /// The busy-adopt follow renders from it (ticket 06), so the message it
+    /// answers travels with the turn. `None` when the session has no user
+    /// message: nothing to follow.
+    pub newest_user_anchor: Option<TurnAnchor>,
     /// Whether the newest user message is a Cola-Authored Message (`msg_cola_`
     /// id, ADR-0026) — one input to the suppression predicate.
     pub newest_user_is_cola_authored: bool,
@@ -180,7 +181,7 @@ pub(crate) async fn gather_snapshot(
     // Newest user and tail come from the shared transcript projections (ADR-0053),
     // so the snapshot cannot drift from the Turn and external-sync reads.
     let newest_user = transcript.newest_user();
-    let newest_user_epoch = newest_user.and_then(|message| message.time.map(|time| time.created));
+    let newest_user_anchor = newest_user.and_then(|message| message.anchor());
     let newest_user_is_cola_authored = newest_user
         .map(|message| opencode::parsing::is_cola_message_id(message.id.as_str()))
         .unwrap_or(false);
@@ -193,7 +194,7 @@ pub(crate) async fn gather_snapshot(
         pending,
         pending_elsewhere: None,
         tail,
-        newest_user_epoch,
+        newest_user_anchor,
         newest_user_is_cola_authored,
     }
 }
@@ -504,7 +505,7 @@ mod tests {
             assistant("assist", 3000, &["回答"]),
         ]))
         .await;
-        assert_eq!(snap.newest_user_epoch, Some(2000));
+        assert_eq!(snap.newest_user_anchor.map(|a| a.created_ms), Some(2000));
         assert!(snap.newest_user_is_cola_authored);
 
         // An external user message newer than cola's is NOT cola-authored.
@@ -513,17 +514,17 @@ mod tests {
             user("msg_other", 2000, &["外部问题"]),
         ]))
         .await;
-        assert_eq!(snap.newest_user_epoch, Some(2000));
+        assert_eq!(snap.newest_user_anchor.map(|a| a.created_ms), Some(2000));
         assert!(!snap.newest_user_is_cola_authored);
 
         // No user messages → None (no newest, no epoch).
         let snap = gather_from_typed_backend(typed_backend(vec![assistant("a", 1000, &["回答"])])).await;
-        assert_eq!(snap.newest_user_epoch, None);
+        assert_eq!(snap.newest_user_anchor, None);
 
         // No time on any user message → None.
         let no_time = typed_message("msg_cola_x", MessageRole::User, None, vec![text("hi")]);
         let snap = gather_from_typed_backend(typed_backend(vec![no_time])).await;
-        assert_eq!(snap.newest_user_epoch, None);
+        assert_eq!(snap.newest_user_anchor, None);
     }
 
     #[tokio::test]
@@ -585,7 +586,7 @@ mod tests {
         // wire shape `messages` would have served.
         assert_eq!(snap.tail.len(), 1);
         assert_eq!(snap.tail[0].text, "你好");
-        assert_eq!(snap.newest_user_epoch, Some(1000));
+        assert_eq!(snap.newest_user_anchor.map(|a| a.created_ms), Some(1000));
     }
 
     #[tokio::test]
