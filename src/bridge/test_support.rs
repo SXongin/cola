@@ -666,11 +666,8 @@ pub struct MockBackend {
     /// consumed one snapshot per call (the last repeating). A session without
     /// a script falls back to decoding the wire shape `messages` serves, so
     /// existing scenarios keep working while fixtures migrate (spec #332).
-    pub transcript_scripts: Arc<
-        tokio::sync::Mutex<
-            std::collections::HashMap<String, Vec<crate::backend::transcript::SessionTranscript>>,
-        >,
-    >,
+    pub transcript_scripts:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<crate::backend::SessionTranscript>>>>,
     /// Records every `messages` call's session id, so tests can prove the
     /// drain stopped reading the Backend once the turn ended.
     pub messages_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
@@ -981,7 +978,7 @@ impl MockBackend {
     pub(crate) fn given_transcript(
         &mut self,
         session_id: &str,
-        snapshots: Vec<crate::backend::transcript::SessionTranscript>,
+        snapshots: Vec<crate::backend::SessionTranscript>,
     ) -> &mut Self {
         self.transcript_scripts
             .try_lock()
@@ -1594,10 +1591,7 @@ impl opencode::Backend for MockBackend {
     /// wins; otherwise the wire shape [`MockBackend::messages`] would serve is
     /// decoded through the production decoder, so existing wire-scripted
     /// scenarios keep working while fixtures migrate (spec #332, #334–#339).
-    async fn transcript(
-        &self,
-        session_id: &str,
-    ) -> crate::error::Result<crate::backend::transcript::SessionTranscript> {
+    async fn transcript(&self, session_id: &str) -> crate::error::Result<crate::backend::SessionTranscript> {
         {
             let mut scripts = self.transcript_scripts.lock().await;
             if let Some(script) = scripts.get_mut(session_id)
@@ -2520,7 +2514,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::transcript::{
+    use crate::backend::{
         MessageId, MessageRole, MessageTime, Part, SessionTranscript, TextPart, TranscriptMessage,
     };
     use crate::opencode::Backend;

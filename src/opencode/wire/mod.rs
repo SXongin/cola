@@ -2,13 +2,13 @@
 //!
 //! Backend protocol field names live ONLY here. The adapter selects the
 //! generation; the Bridge consumes the neutral
-//! [`SessionTranscript`](crate::backend::transcript::SessionTranscript) and
+//! [`SessionTranscript`](crate::backend::SessionTranscript) and
 //! never branches on a generation. This module ships the legacy (unprefixed
 //! routes) decoder; the `/api` (V2) decoder arrives in #339.
 
 pub(crate) mod legacy;
 
-use crate::backend::transcript::SessionTranscript;
+use crate::backend::SessionTranscript;
 use crate::opencode::types::SessionMessage;
 
 /// Decode one session's wire messages through the generation's decoder.
@@ -45,10 +45,7 @@ mod tests {
         );
 
         assert_eq!(transcript.messages.len(), 2);
-        assert_eq!(
-            transcript.messages[0].role,
-            crate::backend::transcript::MessageRole::User
-        );
+        assert_eq!(transcript.messages[0].role, crate::backend::MessageRole::User);
         assert_eq!(transcript.messages[0].text(), "你好");
         let newest = transcript.newest_user().expect("a user message");
         let anchor = newest.anchor().expect("a timed user message anchors");

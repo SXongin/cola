@@ -12,7 +12,6 @@
 
 pub mod transcript;
 
-// The neutral views are re-exported at the contract root for the consumers
-// that arrive in #334–#339.
-#[allow(unused_imports)]
+// The neutral views are re-exported at the contract root: consumers import
+// them from here, never from the decoder's module path.
 pub use transcript::*;
