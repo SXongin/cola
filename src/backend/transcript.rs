@@ -5,6 +5,10 @@
 //! identity and its server time travel together ([`TurnAnchor`]), so no caller
 //! reassembles an anchor from backend fields.
 //!
+//! A message carries no error field: the wire read never surfaced one, and a
+//! failed prompt's error is a prompt-response fact the adapters keep surfacing
+//! where they always have — it is not transcript content.
+//!
 //! This is the expand step: the production read path still returns wire types
 //! until the consumers migrate (#334–#339), hence the module-wide dead-code
 //! allowance.
@@ -396,14 +400,14 @@ pub enum ToolStatus {
     Running,
     Completed,
     Error,
-    /// A status this build does not know, kept verbatim; the empty string is
-    /// the missing-status case.
-    Unknown(String),
+    /// A status this build does not know, kept verbatim.
+    Other(String),
+    /// The payload reported no status at all.
+    Unknown,
 }
 
 impl ToolStatus {
-    /// Whether the call is still live (pending/running): its panel rides the
-    /// live card and joins the timeline only once the tool settles.
+    /// Whether the call is still live: pending or running, i.e. not settled.
     pub fn is_live(&self) -> bool {
         matches!(self, Self::Pending | Self::Running)
     }
@@ -415,13 +419,15 @@ impl ToolStatus {
 /// (ADR-0042).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ToolOutput {
-    /// The raw output payload, verbatim: the legacy `output` string, or the
-    /// current generation's `content`/`result`. `None` when the state carried
-    /// no output.
+    /// The tool's output payload as the server reported it, verbatim.
+    /// `None` when the state carried no output.
     pub raw: Option<Value>,
-    /// The output's content blocks, in the server's order.
+    /// The output's content blocks, in the server's order. The decoder
+    /// normalizes every text source a payload uses into [`ContentBlock`]s.
     pub blocks: Vec<ContentBlock>,
-    /// The tool's failure message, when it errored.
+    /// The failure message when the call errored. It is output-side data: the
+    /// decoder normalizes the server's error shapes, while how a failure
+    /// renders stays in the Platform.
     pub error: Option<String>,
 }
 
@@ -624,6 +630,60 @@ mod tests {
         // A finish BEFORE the anchor belongs to the previous Turn.
         let transcript = SessionTranscript::new(vec![assistant("msg_old", 500, FinishReason::Stop)]);
         assert!(!transcript.turn_for_user(&anchor).complete);
+    }
+
+    #[test]
+    fn projections_tolerate_unknown_parts_and_statuses() {
+        let (user, anchor) = anchored("msg_u1", 1_000);
+        let assistant = message(
+            "msg_a1",
+            MessageRole::Assistant,
+            Some(MessageTime {
+                created: 1_100,
+                completed: Some(1_200),
+            }),
+            vec![
+                // A part kind a newer backend invented.
+                Part::Other(OtherPart {
+                    kind: "mystery".into(),
+                    raw: serde_json::json!({"type": "mystery", "payload": 42}),
+                }),
+                // A tool whose status this build does not know.
+                Part::Tool(ToolCall {
+                    identity: ToolIdentity {
+                        name: "mystery".into(),
+                        call_id: "call_1".into(),
+                    },
+                    status: ToolStatus::Other("weird".into()),
+                    started_at: None,
+                    input: None,
+                    metadata: None,
+                    output: ToolOutput::default(),
+                }),
+                // A tool whose payload reported no status at all.
+                Part::Tool(ToolCall {
+                    identity: ToolIdentity {
+                        name: "unknown".into(),
+                        call_id: "call_2".into(),
+                    },
+                    status: ToolStatus::Unknown,
+                    started_at: None,
+                    input: None,
+                    metadata: None,
+                    output: ToolOutput::default(),
+                }),
+            ],
+        );
+        let transcript = SessionTranscript::new(vec![user, assistant]);
+
+        // Unknown arms are not completion and do not disturb the projections.
+        let turn = transcript.turn_for_user(&anchor);
+        assert_eq!(turn.messages.len(), 1);
+        assert!(!turn.complete);
+        assert_eq!(transcript.newest_user().unwrap().id.as_str(), "msg_u1");
+        let tail = transcript.transcript_tail();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].text, "问题");
     }
 
     #[test]
