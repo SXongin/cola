@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
 mod autostart;
+mod backend;
 mod bridge;
 mod config;
 mod error;
