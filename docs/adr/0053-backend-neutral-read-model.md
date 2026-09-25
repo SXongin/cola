@@ -56,3 +56,17 @@ wording describes the earlier generation — ADR-0001/0007/0026 each now carry a
   runs the production decoder, and is deleted after the fixtures migrate.
 - ADR-0010's seam stands; this decision deepens what the trait carries, not
   whether the trait exists.
+
+## Amendment (2026-09-26): the `/api` transcript decoder is removed
+
+The `/api` decoder (#339) landed with an adapter-internal selection that
+preferred `/api`, and was then deleted again. The message stores do not project
+into each other, and the other mounted client (OpenChamber) reads and writes
+the unprefixed store, so a `/api` read either split a Session's history or
+silently preferred its older slice. cola therefore stays on the unprefixed
+routes for the conversation — prompts, permissions, questions, and the
+transcript read — and switching a generation would have to be a coordinated
+migration with the other client (tracked as deferred in the cola issue
+tracker). The neutral read model and the seam stand unchanged: the adapter
+still owns the decode, and the Consequences above still hold for re-adding a
+generation.

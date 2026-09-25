@@ -174,8 +174,8 @@ pub trait Backend: Send + Sync {
     async fn reject_question(&self, request_id: &str, directory: Option<&str>) -> Result<()>;
 
     /// Read one Session as a neutral [`SessionTranscript`] — the read model the
-    /// Bridge consumes (ADR-0053). The wire generation is selected inside the
-    /// adapter, and its wire envelope never reaches the caller.
+    /// Bridge consumes (ADR-0053). The adapter's wire envelope never reaches
+    /// the caller.
     async fn transcript(&self, session_id: &str) -> Result<SessionTranscript>;
 
     /// The server's live run state for one session (`GET /session/status`).
