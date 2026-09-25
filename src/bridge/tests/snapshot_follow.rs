@@ -812,8 +812,8 @@ async fn user_prompt_during_follow_takes_over() {
         .store(0, std::sync::atomic::Ordering::Relaxed);
 
     send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
-    let follow_epoch = Turn::armed_turn_anchor(&app.cards_handle(), "ses_alpha01").await;
-    assert!(follow_epoch.is_some(), "follow armed");
+    let follow_anchor = Turn::armed_turn_anchor(&app.cards_handle(), "ses_alpha01").await;
+    assert!(follow_anchor.is_some(), "follow armed");
 
     // The user prompts cola in the thread.
     app.handle_message(incoming(
@@ -831,8 +831,8 @@ async fn user_prompt_during_follow_takes_over() {
         Turn::has_card(&cards, "ses_alpha01").await,
         "the prompt inserted its own accumulator"
     );
-    let new_epoch = Turn::armed_turn_anchor(&cards, "ses_alpha01").await;
-    assert_ne!(new_epoch, follow_epoch, "the follow accumulator was replaced");
+    let new_anchor = Turn::armed_turn_anchor(&cards, "ses_alpha01").await;
+    assert_ne!(new_anchor, follow_anchor, "the follow accumulator was replaced");
     let calls = platform.calls.lock().await.clone();
     assert!(
         calls

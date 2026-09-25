@@ -167,6 +167,10 @@ fn tool_status_label(status: &ToolStatus) -> String {
 /// explicit empty text block still counts as output (the historical
 /// `metadata.output: ""` rendered as an empty body, not as no output); a call
 /// with neither text nor an error has no output.
+///
+/// Non-text blocks and the raw payload stay out: the pre-migration renderer
+/// assembled this same plain string from the text sources only, and #337
+/// carries the full typed view (raw included) into the panel.
 fn tool_output(call: &ToolCall) -> Option<String> {
     let mut out = String::new();
     let mut has_output = false;

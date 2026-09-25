@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use tracing::Instrument;
 
-use crate::backend::{MessageRole, SessionTranscript};
+use crate::backend::{MessageRole, SessionTranscript, TurnAnchor};
 use crate::bridge::handler::image_inputs;
 use crate::bridge::handles::{CardsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
@@ -638,7 +638,7 @@ impl Turn {
         // The guard is released before the follow arms, exactly as the old
         // finalization released it: a message arriving now is a normal new Turn
         // (which replaces the accumulator and ends the follow on its next tick).
-        if let Some(turn_anchor_ms) = follow_anchor {
+        if let Some(anchor) = follow_anchor {
             tracing::info!(
                 "turn drain: bound with session {} running; handing off to the follow",
                 self.session_id
@@ -649,7 +649,7 @@ impl Turn {
                 self.thread_key.clone(),
                 self.directory.clone(),
                 self.started_at,
-                turn_anchor_ms,
+                anchor,
             );
         }
         // Permissions are handled by the independent poller spawned in App::run,
@@ -1043,14 +1043,16 @@ impl Turn {
 
     /// The turn anchor of the session's armed renderer, if one is armed: the
     /// renderer identity both external arming paths compare their own turn's
-    /// server time against.
-    pub(crate) async fn armed_turn_anchor(cards: &CardsHandle, session_id: &str) -> Option<i64> {
+    /// anchor against. The full anchor is the identity — message id together
+    /// with server time — because two user messages can share a millisecond,
+    /// so the time alone cannot tell two turns apart.
+    pub(crate) async fn armed_turn_anchor(cards: &CardsHandle, session_id: &str) -> Option<TurnAnchor> {
         cards
             .cards
             .lock()
             .await
             .get(session_id)
-            .and_then(|c| c.acc.turn_anchor.as_ref().map(|anchor| anchor.created_ms))
+            .and_then(|c| c.acc.turn_anchor.clone())
     }
 
     /// Whether the session's card has rendered any part — the external
