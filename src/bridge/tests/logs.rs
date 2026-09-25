@@ -10,10 +10,31 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::backend::{FinishReason, MessageRole, Part, SessionTranscript, StepFinish, StepStart};
+use crate::backend::{
+    FinishReason, MessageRole, Part, SessionTranscript, StepFinish, StepStart, TranscriptMessage,
+};
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{PromptContext, Turn};
 use crate::config::{SessionEntry, ThreadKey};
+
+/// The timeline both render-log tests serve: cola's anchor user message and
+/// the assistant turn that answers it.
+fn anchor_turn() -> Vec<TranscriptMessage> {
+    vec![
+        typed_message(
+            "msg_cola_anchor",
+            MessageRole::User,
+            Some(1_000),
+            vec![text_part("hi")],
+        ),
+        typed_message(
+            "msg_assist",
+            MessageRole::Assistant,
+            Some(2_000),
+            realistic_parts(),
+        ),
+    ]
+}
 
 /// The lobby ThreadKey: the thread id IS the chat id, i.e. not a topic.
 fn lobby() -> ThreadKey {
@@ -124,23 +145,7 @@ async fn render_poll_and_final_render_lines_carry_the_session() {
     let mut backend = MockBackend::new(realistic_parts());
     // Park the prompt so the render poll has to be the first renderer.
     let gate = backend.hold_prompts();
-    backend.given_transcript(
-        "ses_test",
-        vec![SessionTranscript::new(vec![
-            typed_message(
-                "msg_cola_anchor",
-                MessageRole::User,
-                Some(1_000),
-                vec![text_part("hi")],
-            ),
-            typed_message(
-                "msg_assist",
-                MessageRole::Assistant,
-                Some(2_000),
-                realistic_parts(),
-            ),
-        ])],
-    );
+    backend.given_transcript("ses_test", vec![SessionTranscript::new(anchor_turn())]);
     let transcript_calls = Arc::clone(&backend.transcript_calls);
     let (app, _platform) = build_app(cfg, backend).await;
     seed_session(&app, "ses_test", "/work").await;
@@ -184,23 +189,7 @@ async fn the_render_poll_logs_at_info_only_on_progress() {
     let mut backend = MockBackend::new(realistic_parts());
     // Park the prompt so the poll ticks several times over one snapshot.
     let gate = backend.hold_prompts();
-    backend.given_transcript(
-        "ses_test",
-        vec![SessionTranscript::new(vec![
-            typed_message(
-                "msg_cola_anchor",
-                MessageRole::User,
-                Some(1_000),
-                vec![text_part("hi")],
-            ),
-            typed_message(
-                "msg_assist",
-                MessageRole::Assistant,
-                Some(2_000),
-                realistic_parts(),
-            ),
-        ])],
-    );
+    backend.given_transcript("ses_test", vec![SessionTranscript::new(anchor_turn())]);
     let transcript_calls = Arc::clone(&backend.transcript_calls);
     let (app, _platform) = build_app(cfg, backend).await;
     seed_session(&app, "ses_test", "/work").await;
