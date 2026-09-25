@@ -718,7 +718,11 @@ async fn a_message_after_the_bound_handoff_starts_a_normal_new_turn() {
     run_to_handoff(&app, &platform).await;
 
     let followed_anchor = Turn::armed_turn_anchor(&app.cards_handle(), "ses_test").await;
-    assert_eq!(followed_anchor, Some(1_000), "the follow watches the turn anchor");
+    assert_eq!(
+        followed_anchor.as_ref().map(|anchor| anchor.created_ms),
+        Some(1_000),
+        "the follow watches the turn anchor"
+    );
 
     app.handle_message(incoming(
         "msg_next".into(),

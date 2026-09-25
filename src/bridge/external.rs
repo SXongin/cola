@@ -259,11 +259,11 @@ impl ExternalFlow {
         preview: &str,
     ) {
         // Guard: a renderer for THIS message is already armed (the accumulator
-        // still carries the message's anchor). cola's own prompts get a fresh
-        // accumulator, so a different anchor is NOT this message — a new
-        // renderer replaces the old one (whose server-time anchor no longer
-        // matches, so it exits).
-        if armed_turn_anchor(&handles.cards, session_id).await == Some(anchor.created_ms) {
+        // still carries the message's full anchor — id + server time). cola's
+        // own prompts get a fresh accumulator, so a different anchor is NOT
+        // this message — a new renderer replaces the old one (whose anchor no
+        // longer matches, so it exits).
+        if armed_turn_anchor(&handles.cards, session_id).await.as_ref() == Some(anchor) {
             return;
         }
         let (session_dir, session_thread_key) = {
@@ -388,7 +388,6 @@ impl ExternalFlow {
             );
             return false;
         };
-        let turn_anchor_ms = anchor.created_ms;
         // The follow is scoped to EXTERNAL turns (ADR-0028): the busy run
         // answers the newest user message, so a cola-authored newest means the
         // in-flight turn is cola's OWN (this thread, another thread, or a
@@ -402,10 +401,11 @@ impl ExternalFlow {
             return false;
         }
         // Guard: a renderer for THIS turn is already armed (the accumulator
-        // still carries its server-time anchor). Re-point it at the new card —
-        // a re-adopt sent a fresh snapshot mid-turn — so one renderer keeps
-        // one live card, and never double-render.
-        if armed_turn_anchor(&handles.cards, session_id).await == Some(turn_anchor_ms) {
+        // still carries its full anchor — id + server time; two messages can
+        // share a millisecond). Re-point it at the new card — a re-adopt sent
+        // a fresh snapshot mid-turn — so one renderer keeps one live card,
+        // and never double-render.
+        if armed_turn_anchor(&handles.cards, session_id).await.as_ref() == Some(&anchor) {
             Turn::repoint_card(&handles.cards, session_id, card_id).await;
             tracing::info!(
                 "snapshot follow: re-pointing existing renderer at card {}",
@@ -493,11 +493,12 @@ impl ExternalFlow {
     }
 }
 
-/// The turn anchor of the session's armed renderer, if one is armed: the
-/// renderer identity both external arming paths compare their own turn's
-/// server time against, so a duplicate arm is a no-op and a different turn
-/// replaces it.
-async fn armed_turn_anchor(cards: &CardsHandle, session_id: &str) -> Option<i64> {
+/// The full anchor of the session's armed renderer, if one is armed: the
+/// renderer identity both external arming paths compare against, so a
+/// duplicate arm is a no-op and a different turn replaces it. The identity is
+/// the message id together with its server time — a time-only comparison
+/// would confuse two messages that share a millisecond.
+async fn armed_turn_anchor(cards: &CardsHandle, session_id: &str) -> Option<TurnAnchor> {
     Turn::armed_turn_anchor(cards, session_id).await
 }
 
@@ -572,8 +573,13 @@ async fn external_render_loop(
         };
         // The accumulator was replaced (cola's own `run_prompt` inserted a fresh
         // one, or a newer external message's renderer took over): exit so this
-        // turn isn't double-rendered into two cards.
-        let replaced = Turn::armed_turn_anchor(&handles.cards, &session_id).await != Some(anchor.created_ms);
+        // turn isn't double-rendered into two cards. The full anchor is the
+        // identity — a same-millisecond message from another turn must not
+        // pass as this one.
+        let replaced = Turn::armed_turn_anchor(&handles.cards, &session_id)
+            .await
+            .as_ref()
+            != Some(&anchor);
         if replaced {
             break;
         }
@@ -599,12 +605,15 @@ async fn external_render_loop(
             tracing::info!("external reply rendered: session {} done", session_id);
             break;
         }
-        // A NEWER user message is a turn boundary — the poller notifies and arms
-        // a fresh renderer for it.
+        // A NEWER user message is a turn boundary — the poller notifies and
+        // arms a fresh renderer for it. The boundary is the server TIME only
+        // (strictly greater wins): identity would misread a re-read of this
+        // turn's own message as a new turn, while a same-millisecond message
+        // cannot be ordered anyway.
         let newer_turn = transcript
             .newest_user()
-            .and_then(|message| message.time.map(|time| time.created))
-            .is_some_and(|created| created > anchor.created_ms);
+            .and_then(|message| message.anchor())
+            .is_some_and(|newest| newest.created_ms > anchor.created_ms);
         if newer_turn {
             break;
         }

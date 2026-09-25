@@ -34,16 +34,17 @@ const CEILING_ERROR: &str = "会话超过跟进时限仍在运行，已停止更
 
 /// Spawn the out-of-turn follow for a turn whose drain bound was reached with
 /// the session still running. The caller has already released the inflight
-/// guard; `turn_anchor_ms` is the accumulator's identity (its server-time
-/// anchor) and `started_at` the original turn's start, so the follow's
-/// completion notice keeps the long-task threshold measuring the whole run.
+/// guard; `anchor` is the accumulator's identity (the message id together
+/// with its server time — one fact) and `started_at` the original turn's
+/// start, so the follow's completion notice keeps the long-task threshold
+/// measuring the whole run.
 pub(super) fn spawn(
     handles: &TurnHandles,
     session_id: String,
     thread_key: ThreadKey,
     directory: String,
     started_at: std::time::Instant,
-    turn_anchor_ms: i64,
+    anchor: crate::backend::TurnAnchor,
 ) {
     let handles = handles.clone();
     let poll_ms = handles.config.render_poll_ms();
@@ -54,13 +55,7 @@ pub(super) fn spawn(
     tokio::spawn(
         async move {
             run(
-                handles,
-                session_id,
-                directory,
-                started_at,
-                turn_anchor_ms,
-                poll_ms,
-                ceiling_ms,
+                handles, session_id, directory, started_at, anchor, poll_ms, ceiling_ms,
             )
             .await;
         }
@@ -79,7 +74,7 @@ async fn run(
     session_id: String,
     directory: String,
     started_at: std::time::Instant,
-    turn_anchor_ms: i64,
+    anchor: crate::backend::TurnAnchor,
     poll_ms: u64,
     ceiling_ms: u64,
 ) {
@@ -88,7 +83,13 @@ async fn run(
         tokio::time::sleep(Duration::from_millis(poll_ms)).await;
         // The accumulator was replaced (a new Turn, or an external arming):
         // the follow no longer owns the card. Exit without touching anything.
-        if Turn::armed_turn_anchor(&handles.cards, &session_id).await != Some(turn_anchor_ms) {
+        // The FULL anchor is the identity: another turn's message can share
+        // this one's millisecond, and mutating its card would be a hijack.
+        if Turn::armed_turn_anchor(&handles.cards, &session_id)
+            .await
+            .as_ref()
+            != Some(&anchor)
+        {
             return;
         }
         // `/stop` aborted this session's run: no answer is coming, so finalize

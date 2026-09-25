@@ -840,7 +840,10 @@ async fn external_reply_render_guard_replaces_only_newer_messages() {
         .await;
     {
         let cards = app.cards_handle();
-        assert_eq!(Turn::armed_turn_anchor(&cards, "ses_ext").await, Some(1000));
+        assert_eq!(
+            Turn::armed_turn_anchor(&cards, "ses_ext").await,
+            Some(anchor(1000))
+        );
         assert_eq!(Turn::reply_target(&cards, "ses_ext").await.as_deref(), Some("n1"));
         assert_eq!(
             Turn::card_message_id(&cards, "ses_ext").await.as_deref(),
@@ -849,13 +852,16 @@ async fn external_reply_render_guard_replaces_only_newer_messages() {
     }
 
     // Re-arming for the SAME message (e.g. a duplicate poll) is a no-op:
-    // the armed card id and epoch must not be clobbered.
+    // the armed card id and anchor must not be clobbered.
     app.external
         .start_reply_render(&app.flow_handles(), "ses_ext", &anchor(1000), "n1b", "第一条")
         .await;
     {
         let cards = app.cards_handle();
-        assert_eq!(Turn::armed_turn_anchor(&cards, "ses_ext").await, Some(1000));
+        assert_eq!(
+            Turn::armed_turn_anchor(&cards, "ses_ext").await,
+            Some(anchor(1000))
+        );
         assert_eq!(Turn::reply_target(&cards, "ses_ext").await.as_deref(), Some("n1"));
         assert_eq!(
             Turn::card_message_id(&cards, "ses_ext").await.as_deref(),
@@ -864,19 +870,69 @@ async fn external_reply_render_guard_replaces_only_newer_messages() {
     }
 
     // A NEWER external message replaces the armed renderer (its card id and
-    // epoch move to the new notification).
+    // anchor move to the new notification).
     app.external
         .start_reply_render(&app.flow_handles(), "ses_ext", &anchor(2000), "n2", "第二条")
         .await;
     {
         let cards = app.cards_handle();
-        assert_eq!(Turn::armed_turn_anchor(&cards, "ses_ext").await, Some(2000));
+        assert_eq!(
+            Turn::armed_turn_anchor(&cards, "ses_ext").await,
+            Some(anchor(2000))
+        );
         assert_eq!(Turn::reply_target(&cards, "ses_ext").await.as_deref(), Some("n2"));
         assert_eq!(
             Turn::card_message_id(&cards, "ses_ext").await.as_deref(),
             Some("n2")
         );
     }
+}
+
+/// Two user messages can share a millisecond. The armed-renderer guard compares
+/// the FULL anchor (message id + server time), so a DIFFERENT message in the
+/// same millisecond is a different turn and must replace the armed renderer —
+/// not be suppressed as a duplicate of it (the old time-only comparison did
+/// suppress it, silently dropping the new message's reply).
+#[tokio::test]
+async fn external_reply_render_guard_distinguishes_same_millisecond_messages() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    // No reply parts: the armed loops just idle/exit; we assert state only.
+    mock.external_message("外部消息");
+    let (app, _platform) = build_app(cfg, mock).await;
+
+    // Arm once for the first external message at T.
+    app.external
+        .start_reply_render(&app.flow_handles(), "ses_ext", &anchor(1000), "n1", "第一条")
+        .await;
+    let cards = app.cards_handle();
+    assert_eq!(
+        Turn::armed_turn_anchor(&cards, "ses_ext").await,
+        Some(anchor(1000))
+    );
+
+    // A DIFFERENT user message created in the same millisecond: the guard must
+    // re-arm (the identity differs), or the new message's reply renders
+    // nowhere.
+    let same_ms = TurnAnchor {
+        message_id: MessageId::new("msg_user_other"),
+        created_ms: 1000,
+    };
+    app.external
+        .start_reply_render(&app.flow_handles(), "ses_ext", &same_ms, "n2", "第二条")
+        .await;
+    assert_eq!(
+        Turn::armed_turn_anchor(&cards, "ses_ext").await,
+        Some(same_ms),
+        "a same-millisecond message with a different id must replace the armed renderer"
+    );
+    assert_eq!(Turn::reply_target(&cards, "ses_ext").await.as_deref(), Some("n2"));
+    assert_eq!(
+        Turn::card_message_id(&cards, "ses_ext").await.as_deref(),
+        Some("n2")
+    );
 }
 
 /// The external-reply renderer's hard-timeout branch: a partial reply is
