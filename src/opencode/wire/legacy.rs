@@ -148,35 +148,56 @@ fn decode_tool_status(status: Option<&Value>) -> ToolStatus {
     }
 }
 
-/// Decode a tool state's output side. The unprefixed route has served more
-/// than one tool-state shape — an `output` string, and `content` blocks plus a
-/// `result` — so every shape is normalized tolerantly: a null or absent field
-/// never shadows the others, each text source becomes a text block, and any
-/// value this build does not model stays raw rather than being dropped. The
-/// raw payload is preserved so per-tool presentation stays in the Platform
-/// (ADR-0042). A failure's reason lives apart from the output as
-/// [`ToolOutput::error`].
+/// Decode a tool state's output side. Text sources follow the precedence the
+/// presentation has always rendered: a string `output` is authoritative (the
+/// other sources are never appended to it); otherwise the `content` text runs
+/// and a string `result` are joined; otherwise `metadata.output` is the last
+/// resort. A non-string `output` — and a null or absent one — falls through to
+/// those sources. Non-text blocks (and a text block that lost its text) stay
+/// raw instead of vanishing; the raw payload is preserved so per-tool
+/// presentation stays in the Platform (ADR-0042). A failure's reason lives
+/// apart from the output as [`ToolOutput::error`].
 fn decode_tool_output(state: Option<&Value>) -> ToolOutput {
     let Some(state) = state else {
         return ToolOutput::default();
     };
     let mut blocks = Vec::new();
-    if let Some(output) = present(state.get("output")) {
-        blocks.push(content_block(output));
-    }
-    if let Some(items) = state.get("content").and_then(Value::as_array) {
-        for item in items {
-            blocks.push(content_item_block(item));
+    match non_null(state.get("output")).and_then(Value::as_str) {
+        Some(output) => blocks.push(ContentBlock::Text(output.to_string())),
+        None => {
+            let mut text = String::new();
+            let mut raw_blocks = Vec::new();
+            if let Some(items) = state.get("content").and_then(Value::as_array) {
+                for item in items {
+                    match content_text(item) {
+                        Some(part) => text.push_str(part),
+                        None => raw_blocks.push(ContentBlock::Other(item.clone())),
+                    }
+                }
+            }
+            if let Some(result) = non_null(state.get("result")).and_then(Value::as_str) {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(result);
+            }
+            if text.is_empty()
+                && let Some(fallback) = state.pointer("/metadata/output").and_then(Value::as_str)
+            {
+                text.push_str(fallback);
+            }
+            if !text.is_empty() {
+                blocks.push(ContentBlock::Text(text));
+            }
+            blocks.extend(raw_blocks);
         }
-    }
-    if let Some(result) = present(state.get("result")) {
-        blocks.push(content_block(result));
     }
     ToolOutput {
         // The first output-bearing field the payload actually carries.
-        raw: present(state.get("output"))
-            .or_else(|| present(state.get("content")))
-            .or_else(|| present(state.get("result")))
+        raw: non_null(state.get("output"))
+            .or_else(|| non_null(state.get("content")))
+            .or_else(|| non_null(state.get("result")))
+            .or_else(|| non_null(state.pointer("/metadata/output")))
             .cloned(),
         blocks,
         error: state.get("error").and_then(decode_error),
@@ -185,29 +206,16 @@ fn decode_tool_output(state: Option<&Value>) -> ToolOutput {
 
 /// A JSON field that was actually reported: absent and explicit `null` both
 /// read as "not there", so neither shadows another output source.
-fn present(value: Option<&Value>) -> Option<&Value> {
+fn non_null(value: Option<&Value>) -> Option<&Value> {
     value.filter(|value| !value.is_null())
 }
 
-/// Normalize one output value: a string is its text, anything else keeps its
-/// raw payload.
-fn content_block(value: &Value) -> ContentBlock {
-    match value.as_str() {
-        Some(text) => ContentBlock::Text(text.to_string()),
-        None => ContentBlock::Other(value.clone()),
+/// The text of a `content` text block, when it carries any.
+fn content_text(item: &Value) -> Option<&str> {
+    if item.get("type").and_then(Value::as_str) != Some("text") {
+        return None;
     }
-}
-
-/// Normalize one `content` block: a text block contributes its text; anything
-/// else — including a text block that lost its text — stays raw rather than
-/// vanishing.
-fn content_item_block(item: &Value) -> ContentBlock {
-    if item.get("type").and_then(Value::as_str) == Some("text")
-        && let Some(text) = item.get("text").and_then(Value::as_str)
-    {
-        return ContentBlock::Text(text.to_string());
-    }
-    ContentBlock::Other(item.clone())
+    item.get("text").and_then(Value::as_str)
 }
 
 /// Normalize a failure payload: a plain string (`"Could not find ..."`) or an
@@ -270,16 +278,32 @@ mod tests {
         call.clone()
     }
 
-    /// An explicit `null` output (routine on this schema) must not shadow the
-    /// `content`/`result` sources the state actually carries.
+    /// A string `output` is authoritative: the `content`/`result` sources are
+    /// never appended to it (matching the renderer's early return).
     #[test]
-    fn null_output_does_not_shadow_content_and_result() {
+    fn a_string_output_is_the_only_text_source() {
+        let call = tool(serde_json::json!({
+            "status": "completed",
+            "output": "only",
+            "content": [{"type": "text", "text": "ignored"}],
+            "result": "ignored"
+        }));
+
+        assert_eq!(call.output.blocks, vec![ContentBlock::Text("only".into())]);
+        assert_eq!(call.output.raw, Some(Value::String("only".into())));
+    }
+
+    /// An explicit `null` output must not shadow the `content`/`result` text
+    /// the state actually carries; non-text blocks stay raw.
+    #[test]
+    fn null_output_falls_through_to_content_and_result() {
         let call = tool(serde_json::json!({
             "status": "completed",
             "output": null,
             "content": [
                 {"type": "text", "text": "line1"},
-                {"type": "file", "uri": "file:///a"}
+                {"type": "file", "uri": "file:///a"},
+                {"type": "text", "text": "line2"}
             ],
             "result": "done"
         }));
@@ -287,30 +311,76 @@ mod tests {
         assert_eq!(
             call.output.blocks,
             vec![
-                ContentBlock::Text("line1".into()),
+                ContentBlock::Text("line1line2\ndone".into()),
                 ContentBlock::Other(serde_json::json!({"type": "file", "uri": "file:///a"})),
-                ContentBlock::Text("done".into()),
             ]
         );
         assert_eq!(
             call.output.raw,
             Some(serde_json::json!([
                 {"type": "text", "text": "line1"},
-                {"type": "file", "uri": "file:///a"}
+                {"type": "file", "uri": "file:///a"},
+                {"type": "text", "text": "line2"}
             ]))
         );
         assert!(call.output.error.is_none());
     }
 
-    /// A string output is the legacy body; a `content` text block that lost
-    /// its text stays raw instead of vanishing.
+    /// A non-string `output` is not text and must fall through rather than
+    /// suppressing the other sources.
     #[test]
-    fn string_output_decodes_and_content_missing_text_stays_raw() {
-        let call = tool(serde_json::json!({"status": "completed", "output": "legacy text"}));
+    fn non_string_output_falls_through_to_content_and_result() {
+        let call = tool(serde_json::json!({
+            "status": "completed",
+            "output": {"unexpected": true},
+            "content": [{"type": "text", "text": "content"}],
+            "result": "result"
+        }));
+
+        assert_eq!(
+            call.output.blocks,
+            vec![ContentBlock::Text("content\nresult".into())]
+        );
+        assert_eq!(call.output.raw, Some(serde_json::json!({"unexpected": true})));
+    }
+
+    /// `metadata.output` is the historical last resort — only when nothing
+    /// else produced text — and never overrides real text.
+    #[test]
+    fn metadata_output_is_the_last_resort_text() {
+        let call = tool(serde_json::json!({
+            "status": "completed",
+            "metadata": {"output": "from metadata"}
+        }));
+        assert_eq!(
+            call.output.blocks,
+            vec![ContentBlock::Text("from metadata".into())]
+        );
+        assert_eq!(call.output.raw, Some(Value::String("from metadata".into())));
+
+        let call = tool(serde_json::json!({
+            "status": "completed",
+            "content": [{"type": "text", "text": "real"}],
+            "metadata": {"output": "ignored"}
+        }));
+        assert_eq!(call.output.blocks, vec![ContentBlock::Text("real".into())]);
+    }
+
+    /// A string output is the whole text; a `content` text block that lost its
+    /// text stays raw instead of vanishing.
+    #[test]
+    fn a_content_text_block_that_lost_its_text_stays_raw() {
+        let call = tool(serde_json::json!({
+            "status": "completed",
+            "output": "legacy text"
+        }));
         assert_eq!(call.output.blocks, vec![ContentBlock::Text("legacy text".into())]);
         assert_eq!(call.output.raw, Some(Value::String("legacy text".into())));
 
-        let call = tool(serde_json::json!({"status": "completed", "content": [{"type": "text"}]}));
+        let call = tool(serde_json::json!({
+            "status": "completed",
+            "content": [{"type": "text"}]
+        }));
         assert_eq!(
             call.output.blocks,
             vec![ContentBlock::Other(serde_json::json!({"type": "text"}))]

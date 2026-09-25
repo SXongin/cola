@@ -52,8 +52,8 @@ impl SessionTranscript {
     /// cannot be placed and stays out.
     ///
     /// The Turn is complete when an assistant message that started within it
-    /// carries a terminal `step-finish` reason (every reason except
-    /// `tool-calls`, which only pauses to run tools).
+    /// carries a terminal step-finish reason (every reason except a pause to
+    /// run tools).
     pub fn turn_for_user(&self, anchor: &TurnAnchor) -> TurnView<'_> {
         let mut messages = Vec::new();
         let mut complete = false;
@@ -341,7 +341,7 @@ pub enum FinishReason {
     ContentFilter,
     Error,
     /// A reason this build does not know — terminal, like every reason except
-    /// `tool-calls`.
+    /// a pause to run tools.
     Other(String),
     /// No reason was reported at all: NOT terminal. Completion is only ever
     /// declared by a reason the server spelled out.
@@ -349,8 +349,8 @@ pub enum FinishReason {
 }
 
 impl FinishReason {
-    /// Whether this reason ends the Turn: every reason except `tool-calls`
-    /// (which only pauses to run tools) and a missing one.
+    /// Whether this reason ends the Turn: every reason except a pause to run
+    /// tools and a missing one.
     pub fn is_terminal(&self) -> bool {
         !matches!(self, Self::ToolCalls | Self::Unknown)
     }
@@ -422,8 +422,10 @@ pub struct ToolOutput {
     /// The tool's output payload as the server reported it, verbatim.
     /// `None` when the state carried no output.
     pub raw: Option<Value>,
-    /// The output's content blocks, in the server's order. The decoder
-    /// normalizes every text source a payload uses into [`ContentBlock`]s.
+    /// The output's content blocks: one text block with the output text the
+    /// Bridge has always rendered, followed by any non-text blocks kept raw.
+    /// The decoder owns the source precedence, so a payload that carries more
+    /// than one text source never renders twice.
     pub blocks: Vec<ContentBlock>,
     /// The failure message when the call errored. It is output-side data: the
     /// decoder normalizes the server's error shapes, while how a failure
@@ -604,7 +606,7 @@ mod tests {
             )
         };
 
-        // `tool-calls` only pauses to run tools: not complete.
+        // A pause to run tools is not completion.
         let transcript = SessionTranscript::new(vec![assistant("msg_a1", 1_100, FinishReason::ToolCalls)]);
         assert!(!transcript.turn_for_user(&anchor).complete);
 

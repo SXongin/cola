@@ -227,18 +227,16 @@ pub struct MessageTokenCache {
 }
 
 impl MessageTokens {
-    /// The context the model actually consumed. The rule lives in the read
-    /// model ([`crate::backend::TokenUsage::context_used`]) so the two copies
-    /// cannot drift; this wire copy is deleted with the wire read (#338).
+    /// The context the model actually consumed: `total` when the server reports
+    /// it, else the cached prefix + the fresh input. (`input` alone is only the
+    /// per-message delta — mostly cache reads — so it understates context a lot.)
+    ///
+    /// Mirrors the read model's `TokenUsage::context_used` (the rule's home);
+    /// this transient wire copy is deleted with the wire read (#338).
     pub fn context_used(&self) -> i64 {
-        crate::backend::TokenUsage {
-            input: self.input,
-            output: self.output,
-            total: self.total,
-            cache_read: self.cache.as_ref().map(|cache| cache.read).unwrap_or(0),
-            cache_write: self.cache.as_ref().map(|cache| cache.write).unwrap_or(0),
-        }
-        .context_used()
+        let cache_read = self.cache.as_ref().map(|c| c.read).unwrap_or(0);
+        let fallback = self.input + cache_read;
+        if self.total > 0 { self.total } else { fallback }
     }
 }
 
