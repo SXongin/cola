@@ -1,9 +1,11 @@
 pub mod client;
 pub(crate) mod parsing;
 pub mod types;
+pub(crate) mod wire;
 
 use std::sync::Arc;
 
+use crate::backend::transcript::SessionTranscript;
 use crate::error::Result;
 use async_trait::async_trait;
 use client::Client;
@@ -169,6 +171,13 @@ pub trait Backend: Send + Sync {
 
     async fn messages(&self, session_id: &str) -> Result<Vec<SessionMessage>>;
 
+    /// Read one Session as a neutral [`SessionTranscript`] — the read model the
+    /// Bridge consumes (ADR-0053). The wire generation is selected inside the
+    /// adapter; the existing [`Backend::messages`] read stays during the
+    /// migration, so both paths return the same session's data (spec #332).
+    #[allow(dead_code)] // consumers land in #334–#339 (the expand step)
+    async fn transcript(&self, session_id: &str) -> Result<SessionTranscript>;
+
     /// The server's live run state for one session (`GET /session/status`).
     /// `directory` selects the instance (ADR-0010). A successful read always
     /// yields a status (absent = idle); `Ok(None)` is an unrecognised status
@@ -300,6 +309,10 @@ impl Backend for Client {
 
     async fn messages(&self, session_id: &str) -> Result<Vec<SessionMessage>> {
         Client::messages(self, session_id).await
+    }
+
+    async fn transcript(&self, session_id: &str) -> Result<SessionTranscript> {
+        Client::transcript(self, session_id).await
     }
 
     async fn session_status(
