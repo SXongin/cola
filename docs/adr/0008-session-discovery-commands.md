@@ -108,14 +108,15 @@ How a user finds and takes over sessions that were not created in Feishu
 
 ## Update (2026-09-25)
 
-The experimental route excludes **archived** sessions by default but not
-sub-task children: children are excluded only when the request passes
-`roots=true`, and the server applies its page limit (default 100) before any
-client-side filter — so a page can be all children. It was: 463 of 809
-non-archived sessions were children, the newest 100 rows left cola only 11
-roots, and `/switch` showed 11 sessions (issue #325). `list_sessions` now sends
-`roots=true` and follows `x-next-cursor` to the end (bounded at 100 pages), so
-neither children crowding the page nor a store larger than one page can hide
-root sessions. The 30 s cache, the client-side sort and `/list`'s 15-row
-display cap are unchanged, as is the project-scoped `GET /session` fallback for
-older servers.
+The experimental route excludes **archived** sessions by default but includes
+sub-task children — children are filtered per command on the client, so
+`--all` and `/attach` still resolve them. What hid root sessions from
+`/switch` was the server's page limit (default 100) applied before that filter:
+463 of 809 non-archived sessions were children, the newest 100 rows left only
+11 roots, and the rest of the store was silently truncated (issue #325).
+`list_sessions` now follows `x-next-cursor` to the end (bounded at 100 pages)
+and merges the pages, so the page limit cannot hide rows; children stay in the
+fetched set and are filtered where they always were (the client-side `is_child`
+filter for `/switch` and `/dir`, their inclusion under `--all`). The 30 s
+cache, the client-side sort, `/list`'s 15-row display cap and the
+project-scoped `GET /session` fallback for older servers are unchanged.
