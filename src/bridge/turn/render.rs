@@ -1273,7 +1273,7 @@ Index: /x/src/main.rs
             "status": "pending",
         }])
         .to_string();
-        acc.todo_panel = Some(crate::feishu::card::tool_render::ToolPanel::from_parts(
+        acc.todo_panel = Some(crate::feishu::card::tool_render::ToolPanel::for_test(
             "todowrite",
             ToolStatus::Completed,
             None,

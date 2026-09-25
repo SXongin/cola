@@ -1836,7 +1836,7 @@ async fn late_rendered_command_lands_above_the_receipt() {
         "ses_test",
         clicked_at - 200,
         "call_1",
-        crate::feishu::card::tool_render::ToolPanel::from_parts(
+        crate::feishu::card::tool_render::ToolPanel::for_test(
             "bash",
             ToolStatus::Running,
             Some(serde_json::json!({ "command": "ls -la" })),
@@ -1861,7 +1861,7 @@ async fn late_rendered_command_lands_above_the_receipt() {
         "ses_test",
         clicked_at - 200,
         "call_1",
-        crate::feishu::card::tool_render::ToolPanel::from_parts(
+        crate::feishu::card::tool_render::ToolPanel::for_test(
             "bash",
             ToolStatus::Completed,
             Some(serde_json::json!({ "command": "ls -la" })),

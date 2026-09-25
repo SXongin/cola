@@ -613,7 +613,7 @@ mod tests {
 
     #[test]
     fn running_tool_shows_in_header() {
-        let tool = ToolPanel::from_parts(
+        let tool = ToolPanel::for_test(
             "bash",
             ToolStatus::Running,
             Some(json!({"command": "cargo test"})),
@@ -640,7 +640,7 @@ mod tests {
     /// falls back to today's slice-local selection when it does not.
     #[test]
     fn header_running_tool_override_wins_over_the_slice() {
-        let tool = ToolPanel::from_parts(
+        let tool = ToolPanel::for_test(
             "bash",
             ToolStatus::Running,
             Some(json!({"command": "sleep 30"})),
@@ -674,13 +674,13 @@ mod tests {
     /// lies in the header nor suppresses the slice-local running panel.
     #[test]
     fn a_non_running_header_tool_override_is_ignored() {
-        let finished = |name: &str| ToolPanel::from_parts(name, ToolStatus::Completed, None, None);
+        let finished = |name: &str| ToolPanel::for_test(name, ToolStatus::Completed, None, None);
 
         // The slice still has a running panel: the stale override must not
         // hide it.
         let card = CardBuilder::new()
             .with_state(CardState::Streaming)
-            .with_tool(ToolPanel::from_parts(
+            .with_tool(ToolPanel::for_test(
                 "bash",
                 ToolStatus::Running,
                 Some(json!({"command": "sleep 30"})),
@@ -939,7 +939,7 @@ mod tests {
         // A failed tool call is a normal part of an agent run — the model
         // retries or works around it. The card stays "✅ 完成"; the failure is
         // shown only on the tool's own panel (❌ + reason).
-        let tool = ToolPanel::from_parts(
+        let tool = ToolPanel::for_test(
             "edit",
             ToolStatus::Error,
             Some(json!({"filePath": "src/main.rs"})),
@@ -964,7 +964,7 @@ mod tests {
         // continuation cards when the component estimate crosses the limit.
         let mut builder = CardBuilder::new().with_state(CardState::Done);
         for i in 0..25 {
-            builder = builder.with_tool(ToolPanel::from_parts(
+            builder = builder.with_tool(ToolPanel::for_test(
                 &format!("tool {}", i),
                 ToolStatus::Completed,
                 Some(json!("in")),
