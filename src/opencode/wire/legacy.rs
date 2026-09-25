@@ -15,14 +15,14 @@ use serde_json::Value;
 
 use crate::backend::{
     ContentBlock, MessageId, MessageRole, MessageTime, ModelIdentity, OtherPart, Part, Patch, ReasoningPart,
-    SessionTranscript, StepFinish, StepStart, TokenUsage, ToolCall, ToolIdentity, ToolOutput,
+    SessionTranscript, StepFinish, StepStart, TokenUsage, ToolCall, ToolOutput, ToolStatus,
     TranscriptMessage,
 };
 use crate::error::Result;
 
 use super::{
-    assemble_tool_output, decode_error, decode_finish_reason, decode_text_part, decode_tool_status, non_null,
-    started_at,
+    assemble_tool_output, decode_error, decode_finish_reason, decode_text_part, decode_tool_identity,
+    decode_tool_status, error_suppresses_fallback, has_payload, non_null, started_at, string_list,
 };
 
 /// The legacy generation's message envelope (`{info, parts}`).
@@ -163,17 +163,7 @@ fn decode_part(part: &Value) -> Part {
         }),
         Some("patch") => Part::Patch(Patch {
             hash: part.get("hash").and_then(Value::as_str).map(str::to_string),
-            files: part
-                .get("files")
-                .and_then(Value::as_array)
-                .map(|files| {
-                    files
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            files: string_list(part.get("files")),
         }),
         Some(other) => Part::Other(OtherPart {
             kind: other.to_string(),
@@ -187,26 +177,18 @@ fn decode_part(part: &Value) -> Part {
 }
 
 fn decode_tool(part: &Value) -> ToolCall {
-    let name = part
-        .get("tool")
-        .and_then(Value::as_str)
-        .unwrap_or("tool")
-        .to_string();
     // The correlation id is the call's, never the tool's: it is what folds a
     // running call's later updates onto the same panel.
-    let call_id = part
-        .get("callID")
-        .and_then(Value::as_str)
-        .unwrap_or(name.as_str())
-        .to_string();
+    let identity = decode_tool_identity(part.get("tool"), part.get("callID"));
     let state = part.get("state");
+    let status = decode_tool_status(state.and_then(|state| state.get("status")));
     ToolCall {
-        identity: ToolIdentity { name, call_id },
-        status: decode_tool_status(state.and_then(|state| state.get("status"))),
+        identity,
+        status: status.clone(),
         started_at: state.and_then(|state| started_at(state, "/time/start")),
         input: state.and_then(|state| state.get("input")).cloned(),
         metadata: state.and_then(|state| state.get("metadata")).cloned(),
-        output: decode_tool_output(state),
+        output: decode_tool_output(state, &status),
     }
 }
 
@@ -214,17 +196,19 @@ fn decode_tool(part: &Value) -> ToolCall {
 /// presentation has always rendered: a string `output` is authoritative (the
 /// other sources are never appended to it); otherwise the shared
 /// [`assemble_tool_output`] joins the `content` text runs and a string
-/// `result`; otherwise `metadata.output` is the last resort. A non-string
-/// `output` — and a null or absent one — falls through to those sources.
-/// Non-text blocks (and a text block that lost its text) stay raw instead of
-/// vanishing; the raw payload is preserved so per-tool presentation stays in
-/// the Platform (ADR-0042). A failure's reason lives apart from the output as
-/// [`ToolOutput::error`].
-fn decode_tool_output(state: Option<&Value>) -> ToolOutput {
+/// `result`; otherwise `metadata.output` is the last resort — unless a decoded
+/// failure message suppresses it, so the panel's appended `❌ …` reproduces the
+/// historical extractor. A non-string `output` — and a null or absent one —
+/// falls through to those sources. Non-text blocks (and a text block that lost
+/// its text) stay raw instead of vanishing; the raw payload is preserved so
+/// per-tool presentation stays in the Platform (ADR-0042). A failure's reason
+/// lives apart from the output as [`ToolOutput::error`].
+fn decode_tool_output(state: Option<&Value>, status: &ToolStatus) -> ToolOutput {
     let Some(state) = state else {
         return ToolOutput::default();
     };
     let mut blocks = Vec::new();
+    let error = state.get("error").and_then(decode_error);
     match non_null(state.get("output")).and_then(Value::as_str) {
         Some(output) => blocks.push(ContentBlock::Text(output.to_string())),
         None => {
@@ -232,24 +216,30 @@ fn decode_tool_output(state: Option<&Value>) -> ToolOutput {
             // `metadata.output` is the historical last resort and never
             // overrides real text. A present string is the text even when it
             // is empty, so an empty `metadata.output` still yields a text
-            // block (the renderer returns `Some("")` there).
+            // block (the renderer returns `Some("")` there). A decoded failure
+            // message suppresses the fallback: the panel appends `❌ …`, which
+            // the historical extractor counted as output.
             if !text.is_empty() {
                 blocks.push(ContentBlock::Text(text));
-            } else if let Some(fallback) = state.pointer("/metadata/output").and_then(Value::as_str) {
+            } else if !error_suppresses_fallback(status, error.as_deref())
+                && let Some(fallback) = state.pointer("/metadata/output").and_then(Value::as_str)
+            {
                 blocks.push(ContentBlock::Text(fallback.to_string()));
             }
             blocks.extend(raw_blocks);
         }
     }
     ToolOutput {
-        // The first output-bearing field the payload actually carries.
+        // The first output-bearing field the payload actually carries; an
+        // empty container means the server carried no output.
         raw: non_null(state.get("output"))
-            .or_else(|| non_null(state.get("content")))
+            .filter(|value| has_payload(value))
+            .or_else(|| non_null(state.get("content")).filter(|value| has_payload(value)))
             .or_else(|| non_null(state.get("result")))
-            .or_else(|| non_null(state.pointer("/metadata/output")))
+            .or_else(|| non_null(state.pointer("/metadata/output")).filter(|value| has_payload(value)))
             .cloned(),
         blocks,
-        error: state.get("error").and_then(decode_error),
+        error,
     }
 }
 
@@ -369,6 +359,72 @@ mod tests {
             "metadata": {"output": "ignored"}
         }));
         assert_eq!(call.output.blocks, vec![ContentBlock::Text("real".into())]);
+    }
+
+    /// A decoded failure message suppresses the `metadata.output` last resort:
+    /// the historical extractor appended its `❌ …` line before consulting the
+    /// fallback and counted that line as output, so an errored panel renders
+    /// only the message. A failure whose payload has no decodable message
+    /// still falls back.
+    #[test]
+    fn a_decoded_error_message_suppresses_the_metadata_output_fallback() {
+        let call = tool(serde_json::json!({
+            "status": "error",
+            "error": "boom",
+            "metadata": {"output": "from metadata"}
+        }));
+        assert!(
+            call.output.blocks.is_empty(),
+            "no metadata text block may render beside the error: {:?}",
+            call.output.blocks
+        );
+        assert_eq!(call.output.error.as_deref(), Some("boom"));
+        // The raw payload still records the first output-bearing field.
+        assert_eq!(call.output.raw, Some(Value::String("from metadata".into())));
+
+        let call = tool(serde_json::json!({
+            "status": "error",
+            "error": {"type": "unknown"},
+            "metadata": {"output": "from metadata"}
+        }));
+        assert_eq!(
+            call.output.blocks,
+            vec![ContentBlock::Text("from metadata".into())]
+        );
+        assert!(call.output.error.is_none());
+    }
+
+    /// The shared payload-existence policy: an empty `content` array is the
+    /// server saying "no output", so it neither becomes the raw payload nor
+    /// masks a later source.
+    #[test]
+    fn an_empty_content_array_is_not_an_output_payload() {
+        let call = tool(serde_json::json!({
+            "status": "completed",
+            "content": [],
+            "result": "done"
+        }));
+        assert_eq!(call.output.raw, Some(Value::String("done".into())));
+        assert_eq!(call.output.blocks, vec![ContentBlock::Text("done".into())]);
+
+        let call = tool(serde_json::json!({"status": "completed", "content": []}));
+        assert!(call.output.raw.is_none());
+        assert!(call.output.blocks.is_empty());
+    }
+
+    /// A tool part that lost its name or correlation id keeps the historical
+    /// fallbacks: the name reads `"tool"` and the id falls back to it, so a
+    /// malformed call still folds onto one panel.
+    #[test]
+    fn a_tool_without_name_or_call_id_keeps_the_historical_fallbacks() {
+        let message = decoded_message(serde_json::json!([
+            {"type": "tool", "state": {"status": "completed"}}
+        ]));
+        let Part::Tool(call) = &message.parts[0] else {
+            panic!("expected a tool part: {:?}", message.parts[0]);
+        };
+        assert_eq!(call.identity.name, "tool");
+        assert_eq!(call.identity.call_id, "tool");
     }
 
     /// Any content item with a string `text` contributes — the kind is not
