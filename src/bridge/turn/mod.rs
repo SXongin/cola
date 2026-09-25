@@ -1520,8 +1520,9 @@ impl Turn {
         }
     }
 
-    /// Set the turn's anchor — the message identity plus its server time, one
-    /// fact (the same [`TurnAnchor`] production arming stores).
+    /// Set the card's Turn anchor to one the caller already holds (the test
+    /// seam); production fills it from the transcript via
+    /// `capture_turn_anchor`.
     pub(crate) async fn set_turn_anchor(cards: &CardsHandle, session_id: &str, anchor: &TurnAnchor) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
             card.acc.turn_anchor = Some(anchor.clone());
