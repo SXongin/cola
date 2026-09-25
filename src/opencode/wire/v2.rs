@@ -32,8 +32,10 @@
 //! edit-family diff is reassembled from `structured.files[].patch` so the
 //! untouched Tool Panel keeps rendering it. Message kinds with no neutral
 //! counterpart (`system`, `synthetic`, `shell`, `compaction`, switch markers)
-//! decode into tolerant roles and raw parts and never join a Turn. Every
-//! unknown kind, status or nested shape keeps its raw payload.
+//! decode into tolerant roles and raw parts and never join a Turn. Unknown
+//! kinds, statuses and nested shapes keep their raw payload; the one exception
+//! is a `reasoning` item whose `text` is missing or non-string, which decodes
+//! to an empty reasoning part (both generations' rule) instead of a raw part.
 //!
 //! The `/api` store receives rows from the V2 execution path, so a Session
 //! driven through the legacy prompt route has none here. The adapter reads an
@@ -46,13 +48,13 @@ use serde_json::Value;
 
 use crate::backend::{
     ContentBlock, MessageId, MessageRole, MessageTime, ModelIdentity, OtherPart, Part, Patch, ReasoningPart,
-    StepFinish, TokenUsage, ToolCall, ToolIdentity, ToolOutput, TranscriptMessage,
+    StepFinish, TokenUsage, ToolCall, ToolOutput, ToolStatus, TranscriptMessage,
 };
 use crate::error::Result;
 
 use super::{
-    assemble_tool_output, decode_error, decode_finish_reason, decode_text_part, decode_tool_status, non_null,
-    started_at,
+    assemble_tool_output, decode_error, decode_finish_reason, decode_text_part, decode_tool_identity,
+    decode_tool_status, error_suppresses_fallback, has_payload, non_null, started_at, string_list,
 };
 
 /// One drained page of the `/api` read: its messages plus the opaque cursor
@@ -160,11 +162,12 @@ fn decode_time(time: &Value) -> Option<MessageTime> {
     })
 }
 
-/// A message-level `text` field as parts: absent yields no part at all (a
-/// files-only `/api` user message has no text to carry), while a present but
-/// non-string value stays raw through the shared malformed-text rule.
+/// A message-level `text` field as parts: an absent or explicit null field
+/// yields no part at all (a files-only `/api` user message has no text to
+/// carry), while a present but non-string value stays raw through the shared
+/// malformed-text rule.
 fn decode_message_text(value: &Value) -> Vec<Part> {
-    if value.get("text").is_none() {
+    if non_null(value.get("text")).is_none() {
         return Vec::new();
     }
     vec![decode_text_part(value, None)]
@@ -197,17 +200,7 @@ fn decode_assistant_parts(value: &Value) -> Vec<Part> {
         .map(|items| items.iter().map(decode_content).collect())
         .unwrap_or_default();
     if let Some(snapshot) = non_null(value.get("snapshot")) {
-        let files: Vec<String> = snapshot
-            .get("files")
-            .and_then(Value::as_array)
-            .map(|files| {
-                files
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let files = string_list(snapshot.get("files"));
         // The legacy patch part appears only when files changed; the hash is
         // the tree the step left behind (`snapshot.end`).
         if !files.is_empty() {
@@ -255,22 +248,14 @@ fn decode_content(item: &Value) -> Part {
 }
 
 fn decode_tool(part: &Value) -> ToolCall {
-    let name = part
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or("tool")
-        .to_string();
     // The correlation id is the content item's own id, never the tool's name:
     // it is what folds a running call's later updates onto the same panel.
-    let call_id = part
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or(name.as_str())
-        .to_string();
+    let identity = decode_tool_identity(part.get("name"), part.get("id"));
     let state = part.get("state");
+    let status = decode_tool_status(state.and_then(|state| state.get("status")));
     ToolCall {
-        identity: ToolIdentity { name, call_id },
-        status: decode_tool_status(state.and_then(|state| state.get("status"))),
+        identity,
+        status: status.clone(),
         // `time.ran` is the `/api` counterpart of the legacy state time
         // `start`: the moment execution began, absent while the call is only
         // preparing its input.
@@ -279,7 +264,7 @@ fn decode_tool(part: &Value) -> ToolCall {
         // running and settled states carry the decoded object.
         input: state.and_then(|state| state.get("input")).cloned(),
         metadata: decode_tool_metadata(part, state),
-        output: decode_tool_output(state),
+        output: decode_tool_output(state, &status),
     }
 }
 
@@ -308,15 +293,23 @@ fn decode_tool_metadata(part: &Value, state: Option<&Value>) -> Option<Value> {
 /// precedence the legacy decoder applies to its own: the shared
 /// [`assemble_tool_output`] joins the `content` text runs and a string
 /// `result`; a non-text block stays raw, and a failure keeps its reason apart
-/// as [`ToolOutput::error`].
-fn decode_tool_output(state: Option<&Value>) -> ToolOutput {
+/// as [`ToolOutput::error`]. The `/api` state carries no `metadata` per its
+/// schema, but a payload that still carries the legacy field gets the same
+/// historical `metadata.output` last resort — under the shared suppression
+/// rule — so the two generations' fallbacks cannot drift.
+fn decode_tool_output(state: Option<&Value>, status: &ToolStatus) -> ToolOutput {
     let Some(state) = state else {
         return ToolOutput::default();
     };
     let (text, raw_blocks) = assemble_tool_output(state.get("content"), state.get("result"));
+    let error = state.get("error").and_then(decode_error);
     let mut blocks = Vec::new();
     if !text.is_empty() {
         blocks.push(ContentBlock::Text(text));
+    } else if !error_suppresses_fallback(status, error.as_deref())
+        && let Some(fallback) = state.pointer("/metadata/output").and_then(Value::as_str)
+    {
+        blocks.push(ContentBlock::Text(fallback.to_string()));
     }
     blocks.extend(raw_blocks);
     ToolOutput {
@@ -330,17 +323,7 @@ fn decode_tool_output(state: Option<&Value>) -> ToolOutput {
             .or_else(|| non_null(state.get("structured")).filter(|value| has_payload(value)))
             .cloned(),
         blocks,
-        error: state.get("error").and_then(decode_error),
-    }
-}
-
-/// Whether a payload field carries anything: an empty array or object is the
-/// server saying "no output", not an output.
-fn has_payload(value: &Value) -> bool {
-    match value {
-        Value::Array(items) => !items.is_empty(),
-        Value::Object(fields) => !fields.is_empty(),
-        _ => true,
+        error,
     }
 }
 
@@ -388,6 +371,22 @@ mod tests {
     fn only_message(json: Value) -> TranscriptMessage {
         let Page { messages, .. } = page(json);
         messages.into_iter().next().expect("one message")
+    }
+
+    /// Decode one tool content item's `state` into its typed call.
+    fn tool(state: Value) -> ToolCall {
+        let message = only_message(serde_json::json!({
+            "data": [{
+                "type": "assistant",
+                "id": "msg_a1",
+                "time": {"created": 1100},
+                "content": [{"type": "tool", "id": "call_1", "name": "bash", "state": state}]
+            }]
+        }));
+        let Part::Tool(call) = &message.parts[0] else {
+            panic!("expected a tool part: {:?}", message.parts[0]);
+        };
+        call.clone()
     }
 
     /// The envelope's `data` array decodes and `cursor.next` is the opaque
@@ -488,6 +487,37 @@ mod tests {
         assert_eq!(message.text(), "");
     }
 
+    /// An explicit `null` message-level `text` behaves like an absent one: it
+    /// gains no text part, instead of widening the whole message into a raw
+    /// `Other` part the way the shared malformed-text arm would for a present
+    /// non-string value.
+    #[test]
+    fn an_explicit_null_message_text_reads_as_absent() {
+        let message = only_message(serde_json::json!({
+            "data": [{
+                "type": "user",
+                "id": "msg_u1",
+                "time": {"created": 1000},
+                "text": null,
+                "files": [{"uri": "file:///a.png", "mime": "image/png"}]
+            }]
+        }));
+        assert_eq!(
+            message.parts,
+            vec![Part::Other(OtherPart {
+                kind: "file".into(),
+                raw: serde_json::json!({"uri": "file:///a.png", "mime": "image/png"})
+            })]
+        );
+        assert_eq!(message.text(), "");
+
+        // A `system` message behaves the same: null text means no part at all.
+        let message = only_message(serde_json::json!({
+            "data": [{"type": "system", "id": "msg_s1", "time": {"created": 1300}, "text": null}]
+        }));
+        assert!(message.parts.is_empty());
+    }
+
     /// Assistant content maps onto the typed parts: text (no time), reasoning
     /// (its created time), and a tool whose identity/status/input/start come
     /// from the content item and its state.
@@ -569,7 +599,7 @@ mod tests {
                 "id": "msg_a1",
                 "time": {"created": 1100, "completed": 1400},
                 "content": [],
-                "snapshot": {"start": "before", "end": "after", "files": ["src/a.rs", "src/b.rs"]},
+                "snapshot": {"start": "before", "end": "after", "files": ["src/a.rs", 42, "src/b.rs"]},
                 "finish": "tool-calls"
             }]
         }));
@@ -753,6 +783,67 @@ mod tests {
             call.output.raw,
             Some(serde_json::json!({"entries": [{"path": "a.rs", "type": "file"}]}))
         );
+    }
+
+    /// The shared `metadata.output` rule: a decoded failure message suppresses
+    /// the fallback (the panel appends `❌ …` itself), a failure whose payload
+    /// has no decodable message still falls back, and a non-error call falls
+    /// back as before. The `/api` state carries no `metadata` per its schema;
+    /// the decoder tolerates the legacy-shaped field so both generations agree
+    /// on the fallback's precedence.
+    #[test]
+    fn a_decoded_error_message_suppresses_the_metadata_output_fallback() {
+        let call = tool(serde_json::json!({
+            "status": "error",
+            "error": {"type": "unknown", "message": "boom"},
+            "metadata": {"output": "from metadata"}
+        }));
+        assert!(
+            call.output.blocks.is_empty(),
+            "no metadata text block may render beside the error: {:?}",
+            call.output.blocks
+        );
+        assert_eq!(call.output.error.as_deref(), Some("boom"));
+
+        let call = tool(serde_json::json!({
+            "status": "error",
+            "error": {"type": "unknown"},
+            "metadata": {"output": "from metadata"}
+        }));
+        assert_eq!(
+            call.output.blocks,
+            vec![ContentBlock::Text("from metadata".into())]
+        );
+        assert!(call.output.error.is_none());
+
+        let call = tool(serde_json::json!({
+            "status": "completed",
+            "metadata": {"output": "from metadata"}
+        }));
+        assert_eq!(
+            call.output.blocks,
+            vec![ContentBlock::Text("from metadata".into())]
+        );
+    }
+
+    /// A tool item that lost its name or correlation id keeps the historical
+    /// fallbacks: the name reads `"tool"` and the id falls back to it, so a
+    /// malformed call still folds onto one panel.
+    #[test]
+    fn a_tool_without_name_or_id_keeps_the_historical_fallbacks() {
+        let message = only_message(serde_json::json!({
+            "data": [{
+                "type": "assistant",
+                "id": "msg_a1",
+                "time": {"created": 1100},
+                "content": [{"type": "tool", "state": {"status": "completed"}}]
+            }]
+        }));
+        let Part::Tool(call) = &message.parts[0] else {
+            panic!("expected a tool part: {:?}", message.parts[0]);
+        };
+        assert_eq!(call.identity.name, "tool");
+        assert_eq!(call.identity.call_id, "tool");
     }
 
     /// Unknown message kinds, content kinds, statuses, finish reasons and
