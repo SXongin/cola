@@ -48,13 +48,13 @@ use serde_json::Value;
 
 use crate::backend::{
     ContentBlock, MessageId, MessageRole, MessageTime, ModelIdentity, OtherPart, Part, Patch, ReasoningPart,
-    StepFinish, TokenUsage, ToolCall, ToolOutput, ToolStatus, TranscriptMessage,
+    StepFinish, TokenUsage, ToolCall, ToolOutput, TranscriptMessage,
 };
 use crate::error::Result;
 
 use super::{
     assemble_tool_output, decode_error, decode_finish_reason, decode_text_part, decode_tool_identity,
-    decode_tool_status, error_suppresses_fallback, has_payload, non_null, started_at, string_list,
+    decode_tool_status, has_payload, non_null, started_at, string_list,
 };
 
 /// One drained page of the `/api` read: its messages plus the opaque cursor
@@ -252,10 +252,9 @@ fn decode_tool(part: &Value) -> ToolCall {
     // it is what folds a running call's later updates onto the same panel.
     let identity = decode_tool_identity(part.get("name"), part.get("id"));
     let state = part.get("state");
-    let status = decode_tool_status(state.and_then(|state| state.get("status")));
     ToolCall {
         identity,
-        status: status.clone(),
+        status: decode_tool_status(state.and_then(|state| state.get("status"))),
         // `time.ran` is the `/api` counterpart of the legacy state time
         // `start`: the moment execution began, absent while the call is only
         // preparing its input.
@@ -264,7 +263,7 @@ fn decode_tool(part: &Value) -> ToolCall {
         // running and settled states carry the decoded object.
         input: state.and_then(|state| state.get("input")).cloned(),
         metadata: decode_tool_metadata(part, state),
-        output: decode_tool_output(state, &status),
+        output: decode_tool_output(state),
     }
 }
 
@@ -293,23 +292,16 @@ fn decode_tool_metadata(part: &Value, state: Option<&Value>) -> Option<Value> {
 /// precedence the legacy decoder applies to its own: the shared
 /// [`assemble_tool_output`] joins the `content` text runs and a string
 /// `result`; a non-text block stays raw, and a failure keeps its reason apart
-/// as [`ToolOutput::error`]. The `/api` state carries no `metadata` per its
-/// schema, but a payload that still carries the legacy field gets the same
-/// historical `metadata.output` last resort — under the shared suppression
-/// rule — so the two generations' fallbacks cannot drift.
-fn decode_tool_output(state: Option<&Value>, status: &ToolStatus) -> ToolOutput {
+/// as [`ToolOutput::error`]. `state.metadata` is not an output source here:
+/// the `/api` schema serves no `metadata`.
+fn decode_tool_output(state: Option<&Value>) -> ToolOutput {
     let Some(state) = state else {
         return ToolOutput::default();
     };
     let (text, raw_blocks) = assemble_tool_output(state.get("content"), state.get("result"));
-    let error = state.get("error").and_then(decode_error);
     let mut blocks = Vec::new();
     if !text.is_empty() {
         blocks.push(ContentBlock::Text(text));
-    } else if !error_suppresses_fallback(status, error.as_deref())
-        && let Some(fallback) = state.pointer("/metadata/output").and_then(Value::as_str)
-    {
-        blocks.push(ContentBlock::Text(fallback.to_string()));
     }
     blocks.extend(raw_blocks);
     ToolOutput {
@@ -323,7 +315,7 @@ fn decode_tool_output(state: Option<&Value>, status: &ToolStatus) -> ToolOutput 
             .or_else(|| non_null(state.get("structured")).filter(|value| has_payload(value)))
             .cloned(),
         blocks,
-        error,
+        error: state.get("error").and_then(decode_error),
     }
 }
 
@@ -785,45 +777,27 @@ mod tests {
         );
     }
 
-    /// The shared `metadata.output` rule: a decoded failure message suppresses
-    /// the fallback (the panel appends `❌ …` itself), a failure whose payload
-    /// has no decodable message still falls back, and a non-error call falls
-    /// back as before. The `/api` state carries no `metadata` per its schema;
-    /// the decoder tolerates the legacy-shaped field so both generations agree
-    /// on the fallback's precedence.
+    /// The `/api` state schema serves no `metadata`, and the decoder does not
+    /// read one: a legacy-shaped `metadata.output` is not an output source
+    /// here (only `content`/`result`, with `structured` as the raw payload),
+    /// so a failure's `❌ …` line never renders beside a tolerated metadata
+    /// text.
     #[test]
-    fn a_decoded_error_message_suppresses_the_metadata_output_fallback() {
+    fn a_legacy_shaped_metadata_is_not_an_api_output_source() {
+        let call = tool(serde_json::json!({
+            "status": "completed",
+            "metadata": {"output": "from metadata"}
+        }));
+        assert!(call.output.blocks.is_empty());
+        assert!(call.output.raw.is_none());
+
         let call = tool(serde_json::json!({
             "status": "error",
             "error": {"type": "unknown", "message": "boom"},
             "metadata": {"output": "from metadata"}
         }));
-        assert!(
-            call.output.blocks.is_empty(),
-            "no metadata text block may render beside the error: {:?}",
-            call.output.blocks
-        );
+        assert!(call.output.blocks.is_empty());
         assert_eq!(call.output.error.as_deref(), Some("boom"));
-
-        let call = tool(serde_json::json!({
-            "status": "error",
-            "error": {"type": "unknown"},
-            "metadata": {"output": "from metadata"}
-        }));
-        assert_eq!(
-            call.output.blocks,
-            vec![ContentBlock::Text("from metadata".into())]
-        );
-        assert!(call.output.error.is_none());
-
-        let call = tool(serde_json::json!({
-            "status": "completed",
-            "metadata": {"output": "from metadata"}
-        }));
-        assert_eq!(
-            call.output.blocks,
-            vec![ContentBlock::Text("from metadata".into())]
-        );
     }
 
     /// A tool item that lost its name or correlation id keeps the historical
