@@ -8,7 +8,7 @@
 
 use serde_json::Value;
 
-use crate::backend::transcript::{
+use crate::backend::{
     ContentBlock, FinishReason, MessageId, MessageRole, MessageTime, ModelIdentity, OtherPart, Part, Patch,
     ReasoningPart, SessionTranscript, StepFinish, StepStart, TextPart, TokenUsage, ToolCall, ToolIdentity,
     ToolOutput, ToolStatus, TranscriptMessage,

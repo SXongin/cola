@@ -5,7 +5,7 @@ pub(crate) mod wire;
 
 use std::sync::Arc;
 
-use crate::backend::transcript::SessionTranscript;
+use crate::backend::SessionTranscript;
 use crate::error::Result;
 use async_trait::async_trait;
 use client::Client;
