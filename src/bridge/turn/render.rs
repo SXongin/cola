@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::Instrument;
 
-use crate::backend::{MessageRole, Part, SessionTranscript, ToolCall, ToolStatus};
+use crate::backend::{MessageRole, Part, SessionTranscript, ToolStatus};
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
 use crate::bridge::handles::{CardsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
@@ -118,13 +118,6 @@ async fn refresh_session_title(
     true
 }
 
-/// Assemble the Tool Panel a typed call renders as: the panel is a view over
-/// the call (identity, typed status, raw input/metadata, typed output), and
-/// the Platform assembles the output text and status icon from it (ADR-0042).
-fn tool_panel(call: &ToolCall) -> crate::feishu::card::tool_render::ToolPanel {
-    crate::feishu::card::tool_render::ToolPanel::new(call.clone())
-}
-
 /// Render one typed part into the accumulator, applying the dedup rules: text
 /// and reasoning are tracked by their content (OpenCode part payloads carry NO
 /// `id`, AGENTS.md #9), and a tool call re-renders exactly when its typed panel
@@ -159,21 +152,30 @@ fn render_part(acc: &mut StreamAccumulator, part: &Part) -> bool {
             acc.card_state = crate::feishu::card::CardState::Reasoning;
         }
         Part::Tool(call) => {
-            let panel = tool_panel(call);
             // The current panel IS the call's rendered revision: an update
             // (running → completed, a late output, or a todowrite list
             // rewritten with same-length items) differs from it and
             // re-renders; an unchanged poll skips. A todowrite's clock also
             // participates: each re-sent list stamps `todo_shown_at`, exactly
             // as the state-content signature used to.
+            //
+            // The comparison is against the typed call BEFORE the panel is
+            // built: an unchanged poll (the common case) must not deep-copy
+            // the call's raw payloads into a panel only to drop it.
             let already_rendered = if call.identity.name == "todowrite" {
-                acc.todo_panel.as_ref() == Some(&panel) && acc.todo_shown_at == call.started_at
+                acc.todo_panel.as_ref().is_some_and(|panel| panel.call() == call)
+                    && acc.todo_shown_at == call.started_at
             } else {
-                acc.tools.get(&call.identity.call_id) == Some(&panel)
+                acc.tools
+                    .get(&call.identity.call_id)
+                    .is_some_and(|panel| panel.call() == call)
             };
             if already_rendered {
                 return false;
             }
+            // The panel is a view over the typed call; the Platform assembles
+            // the output text and status icon from it (ADR-0042, ADR-0053).
+            let panel = crate::feishu::card::tool_render::ToolPanel::new(call.clone());
             if call.identity.name == "todowrite" {
                 // A live status section, not a transcript row: the latest call
                 // replaces the panel the card tail renders (on the live card,
@@ -442,7 +444,7 @@ impl RenderPoll {
 mod tests {
     use super::*;
     use crate::backend::{
-        MessageId, MessageTime, ReasoningPart, StepFinish, StepStart, ToolIdentity, ToolOutput,
+        MessageId, MessageTime, ReasoningPart, StepFinish, StepStart, ToolCall, ToolIdentity, ToolOutput,
         TranscriptMessage, TurnAnchor,
     };
     use crate::bridge::App;

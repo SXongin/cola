@@ -28,6 +28,14 @@ impl ToolPanel {
         Self { call }
     }
 
+    /// The typed call this panel renders. The accumulator compares it against
+    /// the polled call to decide whether the panel is still that call's
+    /// rendered revision — before building (and cloning) a panel for an
+    /// unchanged poll.
+    pub(crate) fn call(&self) -> &ToolCall {
+        &self.call
+    }
+
     /// The tool's built-in id (`bash`, `read`, …) — the rendering key
     /// (ADR-0042).
     pub fn name(&self) -> &str {
@@ -43,11 +51,11 @@ impl ToolPanel {
         match self.status() {
             ToolStatus::Running | ToolStatus::Pending => "⏳",
             ToolStatus::Completed => "✅",
-            // OpenCode marks failed tools as status "error" (not "failed"); a
-            // status this build does not model keeps its own name, and one
-            // named "failed"/"error" still reads as a failure.
+            // OpenCode marks failed tools as status "error" (the typed arm
+            // above); a status this build does not model keeps its own name,
+            // and one named "failed" still reads as a failure.
             ToolStatus::Error => "❌",
-            ToolStatus::Other(status) if status == "failed" || status == "error" => "❌",
+            ToolStatus::Other(status) if status == "failed" => "❌",
             // A missing status renders as its historical default (completed);
             // any other unrecognized status gets the generic wrench.
             ToolStatus::Unknown => "✅",
