@@ -24,6 +24,12 @@ pub struct SnapshotData {
     /// session (never another session's in the same directory, and never a
     /// sub-task child's — ADR-0028 keeps those on today's standalone flow).
     pub pending: Vec<crate::bridge::request::kind::PendingRequest>,
+    /// The session's pendings that `claimable_pendings` kept OFF this snapshot
+    /// because they are already surfaced elsewhere (a live inline block, a
+    /// standalone card, or an earlier snapshot — ADR-0028 update 2026-09-25).
+    /// `None` when there were none. The status chip points at that card
+    /// instead of falling back to the server run state; see [`ElsewherePending`].
+    pub pending_elsewhere: Option<ElsewherePending>,
     /// The 最近对话 tail: the last text-bearing user/assistant messages,
     /// newest last, verbatim `text` parts only.
     pub tail: Vec<TailEntry>,
@@ -34,6 +40,20 @@ pub struct SnapshotData {
     /// Whether the newest user message is a Cola-Authored Message (`msg_cola_`
     /// id, ADR-0026) — one input to the suppression predicate.
     pub newest_user_is_cola_authored: bool,
+}
+
+/// A pending request that is already hosted by another card, so the snapshot
+/// does not embed it (ADR-0028 update 2026-09-25). The status chip points at
+/// that card — and only promises a pin when Message Pin is on, since the pin
+/// sync is gated by the same `[bridge] instant_reminder` opt-in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ElsewherePending {
+    /// Message Pin is on: the hosting card is pinned, so the pointer may say
+    /// 置顶.
+    Pinned,
+    /// Message Pin is off: the pointer names the original card without
+    /// promising a pin.
+    Unpinned,
 }
 
 impl SnapshotData {
@@ -173,6 +193,7 @@ pub(crate) async fn gather_snapshot(
         directory: directory.to_string(),
         status,
         pending,
+        pending_elsewhere: None,
         tail,
         newest_user_epoch,
         newest_user_is_cola_authored,
@@ -217,8 +238,13 @@ pub(crate) async fn snapshot_card_from_data(
     data: SnapshotData,
     back: Option<&crate::feishu::card::session::BackToList>,
 ) -> (serde_json::Value, SnapshotData) {
-    let data =
-        crate::bridge::snapshot_claims::claimable_pendings(&handles.requests, &handles.cards, data).await;
+    let data = crate::bridge::snapshot_claims::claimable_pendings(
+        &handles.requests,
+        &handles.cards,
+        handles.pins_enabled,
+        data,
+    )
+    .await;
     let card = crate::feishu::snapshot_card::build_snapshot_card(verb, title, &data, back);
     (card, data)
 }

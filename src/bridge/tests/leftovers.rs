@@ -290,6 +290,7 @@ async fn aborted_turn_leaves_a_claimed_request() {
             pending: vec![crate::bridge::request::kind::PendingRequest::Permission(
                 perm_request("per_claimed", "ses_test", "ls -la"),
             )],
+            pending_elsewhere: None,
             tail: Vec::new(),
             newest_user_epoch: None,
             newest_user_is_cola_authored: false,

@@ -694,6 +694,10 @@ pub(crate) struct SnapshotHandles {
     pub(crate) cards: CardsHandle,
     pub(crate) requests: RequestsHandle,
     pub(crate) backend: Arc<dyn opencode::Backend>,
+    /// Whether Message Pin is on (`[bridge] instant_reminder`): the snapshot's
+    /// 等待你的确认 pointer may promise 置顶 only then (ADR-0028 update
+    /// 2026-09-25). Config, not wait state — nothing here blocks.
+    pub(crate) pins_enabled: bool,
 }
 
 impl SnapshotHandles {
@@ -704,6 +708,7 @@ impl SnapshotHandles {
             cards: flow.cards.clone(),
             requests: flow.requests.clone(),
             backend: Arc::clone(&flow.backend),
+            pins_enabled: flow.waits.message_pins.enabled(),
         }
     }
 }

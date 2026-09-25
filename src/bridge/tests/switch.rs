@@ -469,6 +469,91 @@ async fn switch_reeswitch_snapshots_on_pending_permission() {
     );
 }
 
+/// ADR-0028 update (2026-09-25): a re-switch whose pending is already hosted
+/// by a standalone card does not re-embed it. The status chip points at that
+/// card instead of falling back to 运行中 — the busy hint never renders — and
+/// the pointer promises 置顶 only when Message Pin is on.
+#[tokio::test]
+async fn switch_reeswitch_points_at_a_pending_surfaced_elsewhere() {
+    for (pins_enabled, expected_chip) in [
+        (false, crate::feishu::snapshot_card::WAITING_ELSEWHERE_CHIP),
+        (true, crate::feishu::snapshot_card::WAITING_ELSEWHERE_PINNED_CHIP),
+    ] {
+        switch_reeswitch_elsewhere_case(pins_enabled, expected_chip).await;
+    }
+}
+
+async fn switch_reeswitch_elsewhere_case(pins_enabled: bool, expected_chip: &str) {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(&dir.path().join("sessions.json"));
+    cfg.bridge.instant_reminder = pins_enabled;
+    let mut backend = MockBackend::new(realistic_parts());
+    // Busy proves the pointer outranks the server run state.
+    backend.with_session_status("ses_own1", Some(opencode::types::SessionStatus::Busy));
+    backend.cola_message("ses_own1", "上次的问题");
+    backend.ask_permissions(vec![opencode::types::PermissionRequest {
+        request_id: "req_own".into(),
+        session_id: Some("ses_own1".into()),
+        permission: Some("bash".into()),
+        patterns: vec!["ls".into()],
+        metadata: None,
+        always: vec![],
+    }]);
+    backend.given_sessions(vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)]);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            session_id: "ses_own1".into(),
+            directory: "/work/cola".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    // The request is already on its standalone card (same-directory polling)
+    // when the re-switch happens.
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    assert!(
+        app.permission.sent_cards.lock().await.contains_key("req_own"),
+        "precondition: the permission has a standalone card"
+    );
+
+    send_command(&app, "/switch 本项目", "msg_switch").await;
+
+    let card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .last()
+        .expect("the re-switch replies with its snapshot");
+    let text = card_text(&card);
+    assert!(
+        text.contains(expected_chip),
+        "pin enabled = {pins_enabled}: the chip points at the hosting card: {text}"
+    );
+    assert!(
+        !text.contains(crate::feishu::snapshot_card::BUSY_CHIP),
+        "the server run state is not shown: {text}"
+    );
+    assert!(
+        !text.contains(crate::feishu::snapshot_card::BUSY_HINT),
+        "no busy hint on a pending pointer: {text}"
+    );
+    assert!(
+        !text.contains("🔐 **权限请求**"),
+        "the already-surfaced block is not duplicated: {text}"
+    );
+}
+
 #[tokio::test]
 async fn switch_ambiguous_global_match_lists_candidates() {
     let _wd = test_work_dir();
