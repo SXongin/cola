@@ -8,6 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::backend::Part;
+
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionResponse {
     pub data: Session,
@@ -163,21 +165,19 @@ pub struct ImageInput {
     pub data_base64: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct PromptResponse {
     pub id: String,
-    #[serde(rename = "sessionID")]
     pub session_id: Option<String>,
-    #[serde(rename = "admittedSeq")]
     pub admitted_seq: Option<i64>,
     /// The user message this turn answers (from `info.parentID`).
-    #[serde(rename = "parentID")]
     pub parent_id: Option<String>,
     /// Error on the assistant message (e.g. provider 503), from `info.error`.
     pub error: Option<String>,
-    /// Parts of the assistant response (from the canonical API).
-    #[serde(default)]
-    pub parts: serde_json::Value,
+    /// Parts of the assistant response, decoded into the neutral read model by
+    /// the adapter's wire decoder — the same seam a polled message goes
+    /// through (ADR-0053).
+    pub parts: Vec<Part>,
 }
 
 /// A message returned by `GET /session/{id}/message`: `{ info, parts }`.

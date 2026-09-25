@@ -303,7 +303,7 @@ async fn a_tool_completing_after_the_split_renders_on_the_continuation() {
     )
     .await;
     Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
-    Turn::set_turn_anchor(&cards, "ses_test", 0).await;
+    Turn::set_turn_anchor(&cards, "ses_test", &turn_anchor(0)).await;
     app.inflight.lock().await.insert("ses_test".to_string());
 
     app.handle_message(incoming(
@@ -343,7 +343,7 @@ async fn a_tool_completing_after_the_split_renders_on_the_continuation() {
         &app.sessions_handle(),
         &app.opencode,
         "ses_test",
-        &msgs,
+        &crate::opencode::wire::decode(&msgs),
     )
     .await;
 

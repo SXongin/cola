@@ -7,7 +7,7 @@ use super::{fenced_code, truncate_md};
 /// command output can be meaningfully long.
 pub const TOOL_OUTPUT_MAX_CHARS: usize = 3000;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolPanel {
     pub name: String,
     pub status: String,

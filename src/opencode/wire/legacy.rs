@@ -20,6 +20,15 @@ pub(super) fn decode(messages: &[SessionMessage]) -> SessionTranscript {
     SessionTranscript::new(messages.iter().map(decode_message).collect())
 }
 
+/// Decode one raw parts array — a message's `parts` or a prompt response's —
+/// through the same per-part decoder, so both reads cannot drift.
+pub(super) fn decode_parts(parts: &Value) -> Vec<Part> {
+    parts
+        .as_array()
+        .map(|parts| parts.iter().map(decode_part).collect())
+        .unwrap_or_default()
+}
+
 fn decode_message(message: &SessionMessage) -> TranscriptMessage {
     let info = &message.info;
     TranscriptMessage {
@@ -37,11 +46,7 @@ fn decode_message(message: &SessionMessage) -> TranscriptMessage {
             variant: None,
         }),
         tokens: info.tokens.as_ref().map(decode_tokens),
-        parts: message
-            .parts
-            .as_array()
-            .map(|parts| parts.iter().map(decode_part).collect())
-            .unwrap_or_default(),
+        parts: decode_parts(&message.parts),
     }
 }
 

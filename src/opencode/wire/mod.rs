@@ -8,12 +8,19 @@
 
 pub(crate) mod legacy;
 
-use crate::backend::SessionTranscript;
+use crate::backend::{Part, SessionTranscript};
 use crate::opencode::types::SessionMessage;
 
 /// Decode one session's wire messages through the generation's decoder.
 pub(crate) fn decode(messages: &[SessionMessage]) -> SessionTranscript {
     legacy::decode(messages)
+}
+
+/// Decode one raw parts array — a prompt response's `parts` — through the same
+/// generation decoder as a polled message's, so the prompt-response fallback
+/// cannot smuggle raw protocol shapes back into the Bridge (spec #332).
+pub(crate) fn decode_parts(parts: &serde_json::Value) -> Vec<Part> {
+    legacy::decode_parts(parts)
 }
 
 /// Transitional helper (spec #332): decode a wire-shaped fixture — the JSON a

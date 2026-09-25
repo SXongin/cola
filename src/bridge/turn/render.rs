@@ -10,10 +10,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::Instrument;
 
+use crate::backend::{ContentBlock, MessageRole, Part, SessionTranscript, ToolCall, ToolStatus};
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
 use crate::bridge::handles::{CardsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
-use crate::bridge::turn::state::StreamAccumulator;
+use crate::bridge::turn::state::{RenderedPart, StreamAccumulator};
 use crate::config::ThreadKey;
 use crate::opencode;
 
@@ -117,86 +118,100 @@ async fn refresh_session_title(
     true
 }
 
-/// Extract the user-visible output of a tool part. Tries the historical
-/// `state.output` / `state.metadata.output`, then the current schema:
-/// `state.content[*].text` joined, `state.result` (string), and for an "error"
-/// status the `state.error` — which may be a string (`"Could not find ..."`) or
-/// an object (`{"message": "..."}`).
-fn extract_tool_output(part: &serde_json::Value, status: &str) -> Option<String> {
-    if let Some(o) = part
-        .get("state")
-        .and_then(|s| s.get("output"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-    {
-        return Some(o);
-    }
-    let state = part.get("state")?;
-    let mut out = String::new();
-    if let Some(arr) = state.get("content").and_then(|c| c.as_array()) {
-        for item in arr {
-            if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
-                out.push_str(t);
-            }
-        }
-    }
-    if let Some(r) = state.get("result").and_then(|v| v.as_str()) {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(r);
-    }
-    if status == "error"
-        && let Some(e) = state.get("error").and_then(|e| match e {
-            // Object form: `{"message": "..."}`.
-            serde_json::Value::Object(m) => m.get("message").and_then(|v| v.as_str()),
-            // Plain string form: `"Could not find oldString..."`.
-            serde_json::Value::String(s) => Some(s.as_str()),
-            _ => None,
-        })
-    {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(&format!("❌ {}", e));
-    }
-    if out.is_empty() {
-        // Historical fallback: `state.metadata.output`.
-        state
-            .get("metadata")
-            .and_then(|m| m.get("output"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+/// Assemble the Tool Panel a typed call renders as: its identity, the legacy
+/// status vocabulary the panel header shows, the raw input, and the output
+/// text the card has always rendered.
+///
+/// The output string is presentation assembly, not protocol decoding: the
+/// decoder already applied the sources' precedence into
+/// [`ToolOutput::blocks`], so a payload carrying more than one text source can
+/// never render twice. A failure's message is output-side data (the decoder
+/// normalized the server's error shapes into [`ToolOutput::error`]); the panel
+/// shows it as the `❌ …` line it always has. For a file-editing tool, the
+/// real diff recorded in the call's raw metadata replaces the plain success
+/// sentence ([`tool_output`] only renders blocks, which say nothing about what
+/// changed).
+fn tool_panel(call: &ToolCall) -> crate::feishu::card::tool_render::ToolPanel {
+    let name = call.identity.name.as_str();
+    let output = if name == "edit" || name == "apply_patch" {
+        edit_tool_output(call)
     } else {
-        Some(out)
+        tool_output(call)
+    };
+    crate::feishu::card::tool_render::ToolPanel {
+        name: name.to_string(),
+        status: tool_status_label(&call.status),
+        input: call.input.clone(),
+        output,
     }
 }
 
+/// The status string the panel renders, preserving the legacy vocabulary the
+/// card header/icons have always used. A missing status read as `completed`
+/// (the old default) and an unrecognized one keeps its name; live/settled
+/// classification still speaks the panel's own strings until #337 moves it
+/// onto the typed status.
+fn tool_status_label(status: &ToolStatus) -> String {
+    match status {
+        ToolStatus::Pending => "pending".into(),
+        ToolStatus::Running => "running".into(),
+        ToolStatus::Completed => "completed".into(),
+        ToolStatus::Error => "error".into(),
+        ToolStatus::Other(other) => other.clone(),
+        ToolStatus::Unknown => "completed".into(),
+    }
+}
+
+/// The text a tool panel renders for a call: the decoder's text blocks joined
+/// (in decoder order), with a failure's message appended on its own line. An
+/// explicit empty text block still counts as output (the historical
+/// `metadata.output: ""` rendered as an empty body, not as no output); a call
+/// with neither text nor an error has no output.
+fn tool_output(call: &ToolCall) -> Option<String> {
+    let mut out = String::new();
+    let mut has_output = false;
+    for block in &call.output.blocks {
+        if let ContentBlock::Text(text) = block {
+            has_output = true;
+            out.push_str(text);
+        }
+    }
+    if call.status == ToolStatus::Error
+        && let Some(error) = &call.output.error
+    {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("❌ {}", error));
+        has_output = true;
+    }
+    has_output.then_some(out)
+}
+
 /// For a file-editing tool (`edit`, `apply_patch`), prefer the REAL diff
-/// recorded in `state.metadata.diff` (OpenCode computes it with
-/// `createTwoFilesPatch`) over the tool's plain text output ("Edit applied
-/// successfully." / "Success. Updated the following files: …"), which tells
-/// the reader nothing about what changed. `extract_tool_output` only reads
-/// `state.output/content/result`, so without this the diff — the actual
-/// interesting content of every file edit — was silently dropped and the card
-/// just repeated the file name. Failures keep their extracted error text.
-fn edit_tool_output(part: &serde_json::Value, status: &str, name: &str) -> Option<String> {
-    let orig = extract_tool_output(part, status);
-    if status == "error" {
+/// recorded in the call's raw metadata (`createTwoFilesPatch`) over the tool's
+/// plain text output ("Edit applied successfully." / "Success. Updated the
+/// following files: …"), which tells the reader nothing about what changed.
+/// Failures keep their extracted error text.
+fn edit_tool_output(call: &ToolCall) -> Option<String> {
+    let orig = tool_output(call);
+    if call.status == ToolStatus::Error {
         return orig;
     }
-    let diff = part
-        .pointer("/state/metadata/diff")
-        .and_then(|v| v.as_str())
-        .filter(|d| !d.is_empty())?;
+    let diff = call
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("diff"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|diff| !diff.is_empty())?;
     // The success sentence (and, for apply_patch, the A/M/D file summary after
     // it) is noise once the diff is shown; anything beyond it (e.g. an "LSP
     // errors detected" note) is kept as a tail after the diff.
     let tail = orig
         .as_deref()
-        .and_then(|o| match name {
-            "apply_patch" => strip_patch_summary(o),
-            _ => o.strip_prefix("Edit applied successfully."),
+        .and_then(|output| match call.identity.name.as_str() {
+            "apply_patch" => strip_patch_summary(output),
+            _ => output.strip_prefix("Edit applied successfully."),
         })
         .map(|s| s.trim_start_matches('\n'))
         .filter(|s| !s.is_empty());
@@ -215,68 +230,56 @@ fn strip_patch_summary(output: &str) -> Option<&str> {
         .and_then(|rest| rest.split_once("\n\n").map(|(_, tail)| tail))
 }
 
-/// Render canonical message parts (from `POST /session/{id}/message` response)
-/// into the accumulator so the card shows the assistant's final result.
-/// The server-side start time (epoch ms) of the part — its timeline key, and
-/// the only clock the card may show. Text/reasoning carry it at
-/// `/time/start`; a tool's state carries it at `/state/time/start`.
-/// Step/patch parts have none (they render nothing), and older payloads / test
-/// fixtures may omit it: the part is then keyed by a monotonic fallback
-/// (call order) and shows no clock.
-fn part_time(part: &serde_json::Value) -> Option<i64> {
-    part.pointer("/time/start")
-        .or_else(|| part.pointer("/state/time/start"))
-        .and_then(|v| v.as_i64())
-}
-
-fn render_part(acc: &mut StreamAccumulator, part: &serde_json::Value) {
-    // The part's server start time, if the payload carries one: it both places
-    // the item on the timeline and stamps a panel header.
-    let at = part_time(part);
-    match part.get("type").and_then(|t| t.as_str()) {
-        Some("text") => {
-            if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                acc.push_text_at(at, t);
+/// Render one typed part into the accumulator, applying the dedup rules: text
+/// and reasoning are tracked by their content (OpenCode part payloads carry NO
+/// `id`, AGENTS.md #9), and a tool call re-renders exactly when its typed panel
+/// revision changed. Returns true when the part rendered (not skipped as
+/// duplicate/empty).
+fn render_part(acc: &mut StreamAccumulator, part: &Part) -> bool {
+    match part {
+        // Reasoning/text parts are written with empty text first, then updated
+        // with the full content. Only render once they have content, otherwise
+        // we'd freeze the placeholder version.
+        Part::Text(text) => {
+            if text.text.is_empty() {
+                return false;
             }
+            if !acc.rendered_parts.insert(RenderedPart::Text(text.text.clone())) {
+                return false;
+            }
+            acc.push_text_at(text.started_at, &text.text);
             acc.card_state = crate::feishu::card::CardState::Streaming;
         }
-        Some("reasoning") => {
-            if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                acc.push_reasoning_at(at, t);
+        Part::Reasoning(reasoning) => {
+            if reasoning.text.is_empty() {
+                return false;
             }
+            if !acc
+                .rendered_parts
+                .insert(RenderedPart::Reasoning(reasoning.text.clone()))
+            {
+                return false;
+            }
+            acc.push_reasoning_at(reasoning.started_at, &reasoning.text);
             acc.card_state = crate::feishu::card::CardState::Reasoning;
         }
-        Some("tool") => {
-            let name = part.get("tool").and_then(|v| v.as_str()).unwrap_or("tool");
-            let call_id = part
-                .get("callID")
-                .and_then(|v| v.as_str())
-                .unwrap_or(name)
-                .to_string();
-            let status = part
-                .get("state")
-                .and_then(|s| s.get("status"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("completed");
-            let input = part.get("state").and_then(|s| s.get("input")).cloned();
-            // OpenCode stores tool output as `state.content` (array of
-            // {type:"text",text}) plus an optional `result`, and failures put
-            // the reason in `state.error.message`. There is NO `state.output`
-            // field on tool parts — reading it silently lost every result. An
-            // `edit` call additionally records its unified diff in
-            // `state.metadata.diff`, which is what the panel should show.
-            let output = if name == "edit" || name == "apply_patch" {
-                edit_tool_output(part, status, name)
+        Part::Tool(call) => {
+            let panel = tool_panel(call);
+            // The current panel IS the call's rendered revision: an update
+            // (running → completed, a late output, or a todowrite list
+            // rewritten with same-length items) differs from it and
+            // re-renders; an unchanged poll skips. A todowrite's clock also
+            // participates: each re-sent list stamps `todo_shown_at`, exactly
+            // as the state-content signature used to.
+            let already_rendered = if call.identity.name == "todowrite" {
+                acc.todo_panel.as_ref() == Some(&panel) && acc.todo_shown_at == call.started_at
             } else {
-                extract_tool_output(part, status)
+                acc.tools.get(&call.identity.call_id) == Some(&panel)
             };
-            let panel = crate::feishu::card::tool_render::ToolPanel {
-                name: name.to_string(),
-                status: status.to_string(),
-                input,
-                output,
-            };
-            if name == "todowrite" {
+            if already_rendered {
+                return false;
+            }
+            if call.identity.name == "todowrite" {
                 // A live status section, not a transcript row: the latest call
                 // replaces the panel the card tail renders (on the live card,
                 // so a split can't strand an outdated list). The clock is
@@ -284,153 +287,74 @@ fn render_part(acc: &mut StreamAccumulator, part: &serde_json::Value) {
                 // clock rather than the previous call's, which would read as a
                 // write time this list never had.
                 acc.todo_panel = Some(panel);
-                acc.todo_shown_at = at;
+                acc.todo_shown_at = call.started_at;
             } else {
-                acc.push_tool_at(at, &call_id, panel);
+                acc.push_tool_at(call.started_at, &call.identity.call_id, panel);
             }
-            if status == "running" {
+            if call.status == ToolStatus::Running {
                 acc.card_state = crate::feishu::card::CardState::Streaming;
             }
         }
-        Some("step-start") | Some("step-finish") | Some("patch") => {
-            // No visible content for these
-        }
-        _ => {}
+        // Step boundaries, patches and part kinds this build does not model
+        // render nothing — there is no content to add or dedupe.
+        Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::Other(_) => return false,
     }
     // card_state / running-tool changes reset the header phase timer.
     acc.refresh_phase();
+    true
 }
 
-/// Render a batch of parts into the accumulator, skipping anything already
-/// rendered (same dedup as the poll loop). Returns true if anything new was
-/// rendered. Used as the final fallback when the incremental poll missed parts.
-pub(super) fn render_parts(acc: &mut StreamAccumulator, parts: &serde_json::Value) -> bool {
-    let Some(arr) = parts.as_array() else { return false };
+/// Render a batch of typed parts into the accumulator, skipping anything
+/// already rendered (same dedup as the poll loop). Returns true if anything
+/// new was rendered. Used as the final fallback when the incremental poll
+/// missed parts.
+pub(super) fn render_parts(acc: &mut StreamAccumulator, parts: &[Part]) -> bool {
     let mut rendered_any = false;
-    for part in arr {
-        if render_part_once(acc, part) {
+    for part in parts {
+        if render_part(acc, part) {
             rendered_any = true;
         }
     }
     rendered_any
 }
 
-/// Render a single part into the accumulator, applying the same dedup rules as
-/// the poll loop: reasoning/text are tracked by `{type}:{content}` (OpenCode
-/// part payloads carry NO `id`), tool parts by a state signature so they can
-/// re-render on running → completed, everything else by part `id`. Returns true
-/// if the part was rendered (not skipped as duplicate/empty).
-fn render_part_once(acc: &mut StreamAccumulator, part: &serde_json::Value) -> bool {
-    let ptype = part
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("?")
-        .to_string();
-    // Reasoning/text parts are written with empty text first, then updated with
-    // the full content. Only render once they have content, otherwise we'd
-    // freeze the placeholder version.
-    if ptype == "reasoning" || ptype == "text" {
-        let Some(t) = part.get("text").and_then(|v| v.as_str()) else {
-            return false;
-        };
-        if t.is_empty() {
-            return false;
-        }
-        let dedup_key = format!("{}:{}", ptype, t);
-        if acc.rendered_parts.contains(&dedup_key) {
-            return false;
-        }
-        acc.rendered_parts.insert(dedup_key);
-        render_part(acc, part);
-        return true;
-    }
-    // Tool parts get updated in place (running → completed); re-render whenever
-    // the state signature changes so panels don't stay stuck on "running".
-    if ptype == "tool" {
-        let call_id = part.get("callID").and_then(|v| v.as_str()).unwrap_or_default();
-        let status = part
-            .pointer("/state/status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let output_len = part
-            .pointer("/state/output")
-            .and_then(|v| v.as_str())
-            .map(|s| s.len())
-            .unwrap_or(0);
-        // An edit's meaningful content is its unified diff (`metadata.diff`),
-        // not `state.output` ("Edit applied successfully.") — fold its length
-        // into the signature so a diff appearing under a stable status still
-        // triggers a re-render.
-        let diff_len = part
-            .pointer("/state/metadata/diff")
-            .and_then(|v| v.as_str())
-            .map(|s| s.len())
-            .unwrap_or(0);
-        // A todowrite's panel is replaced on every call, so its signature must
-        // fold in the state CONTENT: a list whose items changed without
-        // changing any length (任务 A → 任务 B) must still refresh the panel.
-        let sig = if part.get("tool").and_then(|v| v.as_str()) == Some("todowrite") {
-            part.get("state").map(|s| s.to_string()).unwrap_or_default()
-        } else {
-            format!("{status}|{output_len}|{diff_len}")
-        };
-        if acc.rendered_tool_states.get(call_id) == Some(&sig) {
-            return false;
-        }
-        acc.rendered_tool_states.insert(call_id.to_string(), sig);
-        render_part(acc, part);
-        return true;
-    }
-    // Everything else (step-start/step-finish/patch): render once.
-    let part_id = part.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
-    if let Some(id) = &part_id {
-        if acc.rendered_parts.contains(id) {
-            return false;
-        }
-        acc.rendered_parts.insert(id.clone());
-    }
-    render_part(acc, part);
-    true
-}
-
-/// Capture the turn's SERVER-clock anchor (`turn_started_ms`) from the user
-/// message the server stored, matched by the `msg_cola_` id cola chose
-/// (ADR-0026). External renders arm with the anchor directly; this fills it in
-/// for cola's own turns on the first poll that sees the message. It must run
-/// before any filtering: the anchor alone decides which messages are this
-/// turn's, and cola's clock cannot. Shared with the post-prompt drain
-/// (ADR-0043), whose Backend snapshot must capture the anchor before it can
-/// judge an unanswered supplement.
-pub(super) fn capture_turn_anchor(
-    acc: &mut StreamAccumulator,
-    msgs: &[crate::opencode::types::SessionMessage],
-) {
-    if acc.turn_started_ms.is_some() {
+/// Capture the Turn's anchor — the identity of the user message the server
+/// stored together with its server time, one fact — matched by the `msg_cola_`
+/// id cola chose (ADR-0026). External renders arm with the anchor directly;
+/// this fills it in for cola's own turns on the first poll that sees the
+/// message. It must run before any filtering: the anchor alone decides which
+/// messages are this turn's, and cola's clock cannot. Shared with the
+/// post-prompt drain (ADR-0043), whose Backend snapshot must capture the
+/// anchor before it can judge an unanswered supplement.
+pub(super) fn capture_turn_anchor(acc: &mut StreamAccumulator, transcript: &SessionTranscript) {
+    if acc.turn_anchor.is_some() {
         return;
     }
     let Some(cola_message_id) = acc.cola_message_id.as_deref() else {
         return;
     };
-    for m in msgs {
-        if m.info.role.as_deref() == Some("user")
-            && m.info.id == cola_message_id
-            && let Some(t) = m.info.time.as_ref()
-        {
-            acc.turn_started_ms = Some(t.created);
-            return;
-        }
-    }
+    let Some(message) = transcript
+        .messages
+        .iter()
+        .find(|message| message.role == MessageRole::User && message.id.as_str() == cola_message_id)
+    else {
+        return;
+    };
+    // `anchor()` keeps identity and server time together; a message with no
+    // server time cannot anchor (and is retried on the next poll).
+    acc.turn_anchor = message.anchor();
 }
 
 /// Render the parts of this turn's assistant messages that haven't been
 /// rendered yet. Returns true if anything new was rendered.
 ///
-/// The turn filter is anchored on `acc.turn_started_ms`, the SERVER's own time
-/// for this turn's user message (#190). Filtering against cola's submit clock
-/// instead dropped the new turn's parts when the server ran behind cola, and
-/// bled the previous turn's parts into the new card when it ran ahead. Until
-/// the anchor is observed nothing renders: with two skewed clocks there is no
-/// threshold that tells the two turns apart.
+/// Turn membership is the Session Transcript's shared `turn_for_user`
+/// projection, anchored on the Turn's own anchor — the SERVER's message
+/// identity and time for this turn (#190). Filtering against cola's submit
+/// clock instead dropped the new turn's parts when the server ran behind cola,
+/// and bled the previous turn's parts into the new card when it ran ahead.
+/// Until the anchor is observed nothing renders: with two skewed clocks there
+/// is no threshold that tells the two turns apart.
 ///
 /// A message still in flight (no server completion stamp) is always rendered,
 /// whatever its created time: the previous run may still be streaming when this
@@ -439,50 +363,33 @@ pub(super) fn capture_turn_anchor(
 /// the anchor — either created within the turn or still being produced as the
 /// turn began — while one that finished before the anchor stays the previous
 /// turn's and never bleeds in (#190).
-pub(super) fn render_new_turn_parts(
-    acc: &mut StreamAccumulator,
-    msgs: &[crate::opencode::types::SessionMessage],
-) -> bool {
-    capture_turn_anchor(acc, msgs);
-    let Some(anchor_ms) = acc.turn_started_ms else {
+pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
+    capture_turn_anchor(acc, transcript);
+    let Some(anchor) = acc.turn_anchor.clone() else {
         return false;
     };
     let mut rendered_any = false;
-    for m in msgs {
-        let is_assistant = m.info.role.as_deref() == Some("assistant");
-        // Whether this message's parts may render into this turn's card. A
-        // message still in flight (no server completion stamp) always may: the
-        // previous run may still be streaming when this turn's user message
-        // lands, and that tail is live content (#310). A completed message is
-        // this turn's when it was created within it, or when it was still being
-        // produced as the turn began; one that finished before the anchor is
-        // the previous turn's and never bleeds in (#190).
-        let renders_here = m.info.time.as_ref().is_some_and(|t| match t.completed {
-            None => true,
-            Some(completed) => t.created >= anchor_ms || completed >= anchor_ms,
-        });
-        if !is_assistant || !renders_here {
-            continue;
-        }
+    for message in transcript.turn_for_user(&anchor).messages {
         // Capture the answering model + token usage for the card footer.
-        if let Some(model_id) = &m.info.model_id {
-            acc.model_id = Some(model_id.clone());
-        }
-        if let Some(provider_id) = &m.info.provider_id {
-            acc.provider_id = Some(provider_id.clone());
+        if let Some(model) = &message.model {
+            acc.model_id = Some(model.model_id.clone());
+            // The decoder reports an absent provider as an empty string; the
+            // old wire read left the last known provider in place.
+            if !model.provider_id.is_empty() {
+                acc.provider_id = Some(model.provider_id.clone());
+            }
         }
         // An in-flight step is its own assistant message and carries all-zero
         // usage until it finishes. Capturing that zero would wipe the last
         // completed step's figure and hide the footer's 📊 segment mid-turn.
-        if let Some(tokens) = &m.info.tokens {
+        if let Some(tokens) = &message.tokens {
             let used = tokens.context_used();
             if used > 0 {
                 acc.context_tokens = used;
             }
         }
-        let Some(parts) = m.parts.as_array() else { continue };
-        for part in parts {
-            if render_part_once(acc, part) {
+        for part in &message.parts {
+            if render_part(acc, part) {
                 rendered_any = true;
             }
         }
@@ -490,10 +397,10 @@ pub(super) fn render_new_turn_parts(
     rendered_any
 }
 
-/// Poll the session's messages and render any new parts into the streaming
-/// card, flushing when something changed. The shared heart of both render
-/// loops — `render_poll_loop` (cola's own prompts) and the external-message
-/// renderer (`bridge::external`) — so the two never drift apart.
+/// Render the session's transcript into the streaming card and flush it when
+/// something changed. The shared heart of both render loops — `render_poll_loop`
+/// (cola's own prompts) and the external-message renderer
+/// (`bridge::external`) — so the two never drift apart.
 ///
 /// Returns `Some((new_parts, text_len, reasoning_len))` when the accumulator is
 /// still present (the statistics are for logging); `None` when it vanished (the
@@ -503,7 +410,7 @@ pub(super) async fn render_and_flush(
     sessions: &SessionsHandle,
     backend: &Arc<dyn opencode::Backend>,
     session_id: &str,
-    msgs: &[crate::opencode::types::SessionMessage],
+    transcript: &SessionTranscript,
 ) -> Option<(usize, usize, usize)> {
     // OpenCode auto-renames sessions after a turn; follow the server's live
     // title so the card subtitle doesn't stay on the "new session" default.
@@ -512,7 +419,7 @@ pub(super) async fn render_and_flush(
         let mut live = cards.cards.lock().await;
         let card = live.get_mut(session_id)?;
         let before = card.acc.rendered_parts.len();
-        let changed = render_new_turn_parts(&mut card.acc, msgs);
+        let changed = render_new_turn_parts(&mut card.acc, transcript);
         // Re-flush when the header changed even without new content: the
         // progress timer keeps ticking, so an idle turn still proves it is
         // alive (ADR-0014). Whole-second timestamps bound this to at most one
@@ -557,7 +464,7 @@ pub(super) async fn render_and_flush(
 }
 
 /// Incremental renderer: while the synchronous prompt is in flight, poll the
-/// session's messages and flush the card as parts complete (reasoning, tools,
+/// session's transcript and flush the card as parts complete (reasoning, tools,
 /// text). `done` stops the loop once the prompt returns. `poll_ms` is the
 /// injected cadence (`TurnConfig::turn_render_poll_ms`), so tests never wait
 /// on the production 1.5 s.
@@ -575,14 +482,14 @@ async fn render_poll_loop(
         if done.load(Ordering::SeqCst) {
             return;
         }
-        let msgs = match backend.messages(&session_id).await {
-            Ok(m) => m,
+        let transcript = match backend.transcript(&session_id).await {
+            Ok(transcript) => transcript,
             Err(e) => {
-                tracing::warn!("render poll messages: {}", e);
+                tracing::warn!("render poll transcript: {}", e);
                 continue;
             }
         };
-        match render_and_flush(cards, sessions, backend, &session_id, &msgs).await {
+        match render_and_flush(cards, sessions, backend, &session_id, &transcript).await {
             // Accumulator gone (turn completed and was cleaned up); keep polling
             // until the prompt returns so late parts are still caught.
             None => continue,
@@ -639,44 +546,138 @@ impl RenderPoll {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{
+        MessageId, MessageTime, ReasoningPart, StepFinish, StepStart, ToolIdentity, ToolOutput,
+        TranscriptMessage, TurnAnchor,
+    };
     use crate::bridge::App;
     use crate::bridge::test_support::{
         MockBackend, PlatformCall, RecordingPlatform, build_app, realistic_parts, seed_cover_title,
-        seed_entry, test_config, test_work_dir,
+        seed_entry, test_config, test_work_dir, text_part, turn_anchor, typed_message,
     };
     use crate::bridge::turn::state::StreamAccumulator;
     use crate::feishu::card::CardState;
 
+    /// A typed assistant message: identity, role, server time and parts, with
+    /// no backend field name in the fixture (spec #332).
+    fn message(id: &str, created: i64, parts: Vec<Part>) -> TranscriptMessage {
+        typed_message(id, MessageRole::Assistant, Some(created), parts)
+    }
+
+    /// A typed assistant message with an explicit completion stamp (`None`
+    /// models a message still in flight).
+    fn message_in_flight(
+        id: &str,
+        created: i64,
+        completed: Option<i64>,
+        parts: Vec<Part>,
+    ) -> TranscriptMessage {
+        TranscriptMessage {
+            id: MessageId::new(id),
+            role: MessageRole::Assistant,
+            time: Some(MessageTime { created, completed }),
+            model: None,
+            tokens: None,
+            parts,
+        }
+    }
+
+    fn reasoning_part(text: &str) -> Part {
+        Part::Reasoning(ReasoningPart {
+            text: text.to_string(),
+            started_at: None,
+        })
+    }
+
+    fn reasoning_at(text: &str, started_at: i64) -> Part {
+        Part::Reasoning(ReasoningPart {
+            text: text.to_string(),
+            started_at: Some(started_at),
+        })
+    }
+
+    /// A typed tool call with the given typed output blocks.
+    fn tool_call(
+        name: &str,
+        call_id: &str,
+        status: ToolStatus,
+        started_at: Option<i64>,
+        input: Option<serde_json::Value>,
+        output: Vec<crate::backend::ContentBlock>,
+    ) -> ToolCall {
+        ToolCall {
+            identity: ToolIdentity {
+                name: name.to_string(),
+                call_id: call_id.to_string(),
+            },
+            status,
+            started_at,
+            input,
+            metadata: None,
+            output: ToolOutput {
+                raw: None,
+                blocks: output,
+                error: None,
+            },
+        }
+    }
+
+    /// A tool call whose decoded output is one text block.
+    fn tool(
+        name: &str,
+        call_id: &str,
+        status: ToolStatus,
+        started_at: Option<i64>,
+        input: Option<serde_json::Value>,
+        output: Option<&str>,
+    ) -> Part {
+        Part::Tool(tool_call(
+            name,
+            call_id,
+            status,
+            started_at,
+            input,
+            output
+                .map(|text| vec![crate::backend::ContentBlock::Text(text.to_string())])
+                .unwrap_or_default(),
+        ))
+    }
+
+    /// A typed `todowrite` call: the list as input, JSON-encoded as the text
+    /// output, exactly the shapes the model re-sends whole on every update.
+    fn todowrite(call_id: &str, at_ms: i64, todos: serde_json::Value) -> Part {
+        Part::Tool(ToolCall {
+            identity: ToolIdentity {
+                name: "todowrite".into(),
+                call_id: call_id.into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: Some(at_ms),
+            input: Some(serde_json::json!({ "todos": todos.clone() })),
+            metadata: None,
+            output: ToolOutput {
+                raw: None,
+                blocks: vec![crate::backend::ContentBlock::Text(todos.to_string())],
+                error: None,
+            },
+        })
+    }
+
     #[test]
     fn render_part_marks_content_and_tracks_header_phase() {
         use crate::bridge::turn::state::HeaderPhase;
-        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
 
-        let epoch = 0;
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_started_ms = Some(epoch);
+        acc.turn_anchor = Some(turn_anchor(0));
         assert_eq!(acc.current_phase, Some(HeaderPhase::Loading));
 
-        let msgs = vec![SessionMessage {
-            info: MessageInfo {
-                id: "a1".into(),
-                role: Some("assistant".into()),
-                parent_id: None,
-                time: Some(MessageTime {
-                    created: 100,
-                    completed: Some(100),
-                }),
-                model_id: None,
-                provider_id: None,
-                tokens: None,
-            },
-            parts: serde_json::json!([
-                { "type": "reasoning", "text": "Let me think" },
-                { "type": "text", "text": "Answer" },
-            ]),
-        }];
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            100,
+            vec![reasoning_part("Let me think"), text_part("Answer")],
+        )]);
 
-        assert!(render_new_turn_parts(&mut acc, &msgs));
+        assert!(render_new_turn_parts(&mut acc, &transcript));
         assert_eq!(acc.current_phase, Some(HeaderPhase::Streaming));
     }
 
@@ -686,72 +687,81 @@ mod tests {
     /// whole streaming phase and showed it only at turn end (reported bug).
     #[test]
     fn inflight_zero_usage_keeps_the_last_completed_steps_figure() {
-        use crate::opencode::types::{MessageInfo, MessageTime, MessageTokens, SessionMessage};
+        use crate::backend::{ModelIdentity, TokenUsage};
 
-        let message = |id: &str, created: i64, tokens: MessageTokens| SessionMessage {
-            info: MessageInfo {
-                id: id.into(),
-                role: Some("assistant".into()),
-                parent_id: None,
-                time: Some(MessageTime {
-                    created,
-                    completed: Some(created),
-                }),
-                model_id: Some("m".into()),
-                provider_id: Some("p".into()),
-                tokens: Some(tokens),
-            },
-            parts: serde_json::json!([]),
+        let message = |id: &str, created: i64, tokens: TokenUsage| TranscriptMessage {
+            id: MessageId::new(id),
+            role: MessageRole::Assistant,
+            time: Some(MessageTime {
+                created,
+                completed: Some(created),
+            }),
+            model: Some(ModelIdentity {
+                provider_id: "p".into(),
+                model_id: "m".into(),
+                variant: None,
+            }),
+            tokens: Some(tokens),
+            parts: Vec::new(),
         };
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_started_ms = Some(0);
+        acc.turn_anchor = Some(turn_anchor(0));
 
-        let msgs = vec![
+        let transcript = SessionTranscript::new(vec![
             message(
                 "a1",
                 100,
-                MessageTokens {
+                TokenUsage {
                     total: 210_239,
                     ..Default::default()
                 },
             ),
             // The step now streaming: its message exists, usage still zeros.
-            message("a2", 200, MessageTokens::default()),
-        ];
-        render_new_turn_parts(&mut acc, &msgs);
+            message("a2", 200, TokenUsage::default()),
+        ]);
+        render_new_turn_parts(&mut acc, &transcript);
         assert_eq!(acc.context_tokens, 210_239);
 
         // The next completed step updates the figure as usual.
-        let msgs = vec![
-            message("a2", 200, MessageTokens::default()),
+        let transcript = SessionTranscript::new(vec![
+            message("a2", 200, TokenUsage::default()),
             message(
                 "a3",
                 300,
-                MessageTokens {
+                TokenUsage {
                     total: 216_860,
                     ..Default::default()
                 },
             ),
-        ];
-        render_new_turn_parts(&mut acc, &msgs);
+        ]);
+        render_new_turn_parts(&mut acc, &transcript);
         assert_eq!(acc.context_tokens, 216_860);
     }
 
     #[test]
     fn render_parts_shows_reasoning_and_tool_output() {
-        // Shapes copied from a real turn in the message store: reasoning parts
-        // carry "text", tool parts carry "state.output" (NOT state.metadata.output).
-        let parts = serde_json::json!([
-            {"type": "step-start", "snapshot": "abc"},
-            {"type": "reasoning", "text": "The user is asking in Chinese."},
-            {"type": "tool", "tool": "bash", "callID": "call_1",
-             "state": {"status": "completed", "input": {"command": "pwd && ls -la"},
-                       "output": "/root/workspace/dev/cola\n..."}},
-            {"type": "step-finish", "reason": "tool-calls"},
-            {"type": "step-start", "snapshot": "abc"},
-            {"type": "text", "text": "我是 opencode。"},
-            {"type": "step-finish", "reason": "stop"},
-        ]);
+        // A real turn's typed parts: reasoning text, a settled bash call with
+        // its output block, and the final answer text.
+        let parts = vec![
+            Part::StepStart(StepStart),
+            reasoning_part("The user is asking in Chinese."),
+            tool(
+                "bash",
+                "call_1",
+                ToolStatus::Completed,
+                None,
+                Some(serde_json::json!({"command": "pwd && ls -la"})),
+                Some("/root/workspace/dev/cola\n..."),
+            ),
+            Part::StepFinish(StepFinish {
+                reason: crate::backend::FinishReason::ToolCalls,
+            }),
+            Part::StepStart(StepStart),
+            text_part("我是 opencode。"),
+            Part::StepFinish(StepFinish {
+                reason: crate::backend::FinishReason::Stop,
+            }),
+        ];
 
         let mut acc = StreamAccumulator::new("test");
         render_parts(&mut acc, &parts);
@@ -783,43 +793,51 @@ mod tests {
 
     #[test]
     fn render_parts_falls_back_to_metadata_output() {
-        let parts = serde_json::json!([
-            {"type": "tool", "tool": "read", "callID": "call_2",
-             "state": {"status": "completed", "input": {"path": "src/main.rs"},
-                       "metadata": {"output": "fn main() {}"}}},
-        ]);
+        // The decoder's text block already carries the `metadata.output`
+        // fallback; the renderer just shows it.
+        let parts = vec![tool(
+            "read",
+            "call_2",
+            ToolStatus::Completed,
+            None,
+            Some(serde_json::json!({"path": "src/main.rs"})),
+            Some("fn main() {}"),
+        )];
         let mut acc = StreamAccumulator::new("test");
         render_parts(&mut acc, &parts);
         assert_eq!(acc.tools["call_2"].output.as_deref(), Some("fn main() {}"));
     }
 
-    /// The extracted output joins `state.content` with `state.result` (and an
-    /// error message after it) on its OWN line: the pieces are separate blocks,
-    /// so a missing separator runs them together. The mutation audit
-    /// (render.rs:144/158) found both separators surviving the suite.
+    /// A failure's decoded message joins the output text on its OWN line: the
+    /// pieces are separate, so a missing separator runs them together. The
+    /// mutation audit (render.rs:144/158) found both separators surviving the
+    /// suite.
     #[test]
     fn tool_output_joins_content_result_and_error_on_separate_lines() {
-        let completed = serde_json::json!({
-            "type": "tool", "tool": "bash", "callID": "call_1",
-            "state": { "status": "completed",
-                       "content": [{ "type": "text", "text": "first block" }],
-                       "result": "second block" }
-        });
+        let completed = tool_call(
+            "bash",
+            "call_1",
+            ToolStatus::Completed,
+            None,
+            None,
+            vec![crate::backend::ContentBlock::Text(
+                "first block\nsecond block".into(),
+            )],
+        );
         assert_eq!(
-            extract_tool_output(&completed, "completed").as_deref(),
+            tool_output(&completed).as_deref(),
             Some("first block\nsecond block")
         );
 
-        let failed = serde_json::json!({
-            "type": "tool", "tool": "bash", "callID": "call_2",
-            "state": { "status": "error",
-                       "content": [{ "type": "text", "text": "before the error" }],
-                       "error": { "message": "boom" } }
-        });
-        assert_eq!(
-            extract_tool_output(&failed, "error").as_deref(),
-            Some("before the error\n❌ boom")
-        );
+        let failed = ToolCall {
+            output: ToolOutput {
+                raw: None,
+                blocks: vec![crate::backend::ContentBlock::Text("before the error".into())],
+                error: Some("boom".into()),
+            },
+            ..tool_call("bash", "call_2", ToolStatus::Error, None, None, Vec::new())
+        };
+        assert_eq!(tool_output(&failed).as_deref(), Some("before the error\n❌ boom"));
     }
 
     /// A tool part's `running` status marks the card Streaming; a completed one
@@ -827,10 +845,14 @@ mod tests {
     /// status comparison surviving the suite.
     #[test]
     fn a_running_tool_marks_the_card_streaming() {
-        let running = serde_json::json!([
-            {"type": "tool", "tool": "bash", "callID": "call_running",
-             "state": {"status": "running", "input": {"command": "sleep 1"}}},
-        ]);
+        let running = vec![tool(
+            "bash",
+            "call_running",
+            ToolStatus::Running,
+            None,
+            Some(serde_json::json!({"command": "sleep 1"})),
+            None,
+        )];
         let mut acc = StreamAccumulator::new("test");
         acc.card_state = CardState::Done;
         render_parts(&mut acc, &running);
@@ -840,10 +862,14 @@ mod tests {
             "a running tool must keep the card Streaming"
         );
 
-        let completed = serde_json::json!([
-            {"type": "tool", "tool": "bash", "callID": "call_done",
-             "state": {"status": "completed", "output": "ok"}},
-        ]);
+        let completed = vec![tool(
+            "bash",
+            "call_done",
+            ToolStatus::Completed,
+            None,
+            None,
+            Some("ok"),
+        )];
         let mut acc = StreamAccumulator::new("test");
         acc.card_state = CardState::Done;
         render_parts(&mut acc, &completed);
@@ -854,8 +880,8 @@ mod tests {
         );
     }
 
-    /// #202: an `apply_patch` records its real change in `metadata.diff` (like
-    /// `edit`), while `state.output` is only the success summary. The panel
+    /// #202: an `apply_patch` records its real change in its raw metadata (like
+    /// `edit`), while the text output is only the success summary. The panel
     /// must show the diff, keep an LSP note as its tail, and drop the summary.
     #[test]
     fn apply_patch_uses_metadata_diff_and_keeps_the_lsp_tail() {
@@ -871,13 +897,16 @@ Index: /x/src/main.rs
  let c = 4;";
         let output = "Success. Updated the following files:\nM src/main.rs\n\n\
                       LSP errors detected in src/main.rs, please fix:\nboom";
-        let parts = serde_json::json!([
-            {"type": "tool", "tool": "apply_patch", "callID": "call_patch",
-             "state": {"status": "completed",
-                       "input": {"patchText": "*** Begin Patch"},
-                       "output": output,
-                       "metadata": {"diff": diff}}},
-        ]);
+        let mut call = tool_call(
+            "apply_patch",
+            "call_patch",
+            ToolStatus::Completed,
+            None,
+            Some(serde_json::json!({"patchText": "*** Begin Patch"})),
+            vec![crate::backend::ContentBlock::Text(output.to_string())],
+        );
+        call.metadata = Some(serde_json::json!({"diff": diff}));
+        let parts = vec![Part::Tool(call)];
         let mut acc = StreamAccumulator::new("test");
         render_parts(&mut acc, &parts);
         let out = acc.tools["call_patch"].output.as_deref().unwrap();
@@ -894,78 +923,44 @@ Index: /x/src/main.rs
 
     #[test]
     fn render_new_turn_parts_filters_turn_and_dedups() {
-        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
-
         // The user message's server time is the turn anchor; the old COMPLETED
         // assistant (created 100, finished 150) sits before it, the current one
         // (3000) after.
         let anchor = 2000;
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_started_ms = Some(anchor);
+        acc.turn_anchor = Some(turn_anchor(anchor));
 
-        let msgs = vec![
+        let transcript = SessionTranscript::new(vec![
             // Old turn assistant message (completed before the anchor) — skipped.
-            SessionMessage {
-                info: MessageInfo {
-                    id: "old".into(),
-                    role: Some("assistant".into()),
-                    parent_id: None,
-                    time: Some(MessageTime {
-                        created: 100,
-                        completed: Some(150),
-                    }),
-                    model_id: None,
-                    provider_id: None,
-                    tokens: None,
-                },
-                parts: serde_json::json!([{ "id": "prt_old", "type": "reasoning", "text": "old reasoning" }]),
-            },
+            message_in_flight("old", 100, Some(150), vec![reasoning_part("old reasoning")]),
             // User message — skipped (not assistant).
-            SessionMessage {
-                info: MessageInfo {
-                    id: "user".into(),
-                    role: Some("user".into()),
-                    parent_id: None,
-                    time: Some(MessageTime {
-                        created: 2000,
-                        completed: Some(2000),
-                    }),
-                    model_id: None,
-                    provider_id: None,
-                    tokens: None,
-                },
-                parts: serde_json::json!([{ "id": "prt_user", "type": "text", "text": "question" }]),
-            },
+            typed_message("user", MessageRole::User, Some(2000), vec![text_part("question")]),
             // Current turn assistant message.
-            SessionMessage {
-                info: MessageInfo {
-                    id: "a1".into(),
-                    role: Some("assistant".into()),
-                    parent_id: None,
-                    time: Some(MessageTime {
-                        created: 3000,
-                        completed: Some(3000),
-                    }),
-                    model_id: None,
-                    provider_id: None,
-                    tokens: None,
-                },
-                parts: serde_json::json!([
-                    { "id": "prt_rsn", "type": "reasoning", "text": "Let me think" },
-                    { "id": "prt_tool", "type": "tool", "tool": "bash", "callID": "call_1", "state": { "status": "completed", "input": { "command": "ls" }, "output": "src" } },
-                ]),
-            },
-        ];
+            message(
+                "a1",
+                3000,
+                vec![
+                    reasoning_part("Let me think"),
+                    tool(
+                        "bash",
+                        "call_1",
+                        ToolStatus::Completed,
+                        None,
+                        Some(serde_json::json!({"command": "ls"})),
+                        Some("src"),
+                    ),
+                ],
+            ),
+        ]);
 
-        assert!(render_new_turn_parts(&mut acc, &msgs));
+        assert!(render_new_turn_parts(&mut acc, &transcript));
         assert!(acc.reasoning.contains("Let me think"));
         assert_eq!(acc.tools.len(), 1);
         assert_eq!(acc.rendered_parts.len(), 1);
-        assert_eq!(acc.rendered_tool_states.len(), 1);
         assert!(!acc.text.contains("question"));
         assert!(!acc.reasoning.contains("old reasoning"));
 
-        assert!(!render_new_turn_parts(&mut acc, &msgs));
+        assert!(!render_new_turn_parts(&mut acc, &transcript));
     }
 
     /// #310: a still-running assistant message created BEFORE the turn anchor is
@@ -976,52 +971,50 @@ Index: /x/src/main.rs
     /// left the new card blank until finalization.
     #[test]
     fn an_in_flight_message_created_before_the_anchor_renders() {
-        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
-
         let mut acc = StreamAccumulator::new("proj");
         acc.cola_message_id = Some("msg_cola_1".into());
-        let msgs = vec![
+        let transcript = SessionTranscript::new(vec![
             // The new turn's own user message: the anchor.
-            SessionMessage {
-                info: MessageInfo {
-                    id: "msg_cola_1".into(),
-                    role: Some("user".into()),
-                    parent_id: None,
-                    time: Some(MessageTime {
-                        created: 2000,
-                        completed: None,
-                    }),
-                    model_id: None,
-                    provider_id: None,
-                    tokens: None,
-                },
-                parts: serde_json::json!([{ "type": "text", "text": "我的问题你回答了吗" }]),
+            TranscriptMessage {
+                id: MessageId::new("msg_cola_1"),
+                role: MessageRole::User,
+                time: Some(MessageTime {
+                    created: 2000,
+                    completed: None,
+                }),
+                model: None,
+                tokens: None,
+                parts: vec![text_part("我的问题你回答了吗")],
             },
-            // The previous run's step, still in flight (no `time.completed`),
+            // The previous run's step, still in flight (no completion stamp),
             // created BEFORE the anchor.
-            SessionMessage {
-                info: MessageInfo {
-                    id: "a_inflight".into(),
-                    role: Some("assistant".into()),
-                    parent_id: None,
-                    time: Some(MessageTime {
-                        created: 500,
-                        completed: None,
-                    }),
-                    model_id: None,
-                    provider_id: None,
-                    tokens: None,
-                },
-                parts: serde_json::json!([
-                    { "id": "prt_rsn", "type": "reasoning", "text": "还在研究" },
-                    { "id": "prt_tool", "type": "tool", "tool": "task", "callID": "call_task",
-                      "state": { "status": "running", "input": { "description": "research" } } },
-                ]),
-            },
-        ];
+            message_in_flight(
+                "a_inflight",
+                500,
+                None,
+                vec![
+                    reasoning_part("还在研究"),
+                    tool(
+                        "task",
+                        "call_task",
+                        ToolStatus::Running,
+                        None,
+                        Some(serde_json::json!({"description": "research"})),
+                        None,
+                    ),
+                ],
+            ),
+        ]);
 
-        assert!(render_new_turn_parts(&mut acc, &msgs));
-        assert_eq!(acc.turn_started_ms, Some(2000));
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+        assert_eq!(
+            acc.turn_anchor,
+            Some(TurnAnchor {
+                message_id: MessageId::new("msg_cola_1"),
+                created_ms: 2000,
+            }),
+            "the anchor is the message's identity together with its server time"
+        );
         assert!(
             acc.reasoning.contains("还在研究"),
             "the in-flight message's reasoning must render live: {:?}",
@@ -1033,7 +1026,7 @@ Index: /x/src/main.rs
         );
 
         // Dedup still holds on the next poll.
-        assert!(!render_new_turn_parts(&mut acc, &msgs));
+        assert!(!render_new_turn_parts(&mut acc, &transcript));
     }
 
     /// #310: once that pre-anchor message completes — the server stamps
@@ -1043,40 +1036,36 @@ Index: /x/src/main.rs
     /// finalization.
     #[test]
     fn a_message_completed_after_the_anchor_keeps_rendering() {
-        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
-
         let anchor = 2000;
         let mut acc = StreamAccumulator::new("proj");
-        acc.turn_started_ms = Some(anchor);
-        let msgs = |completed: Option<i64>, status: &str, output: &str| {
-            vec![SessionMessage {
-                info: MessageInfo {
-                    id: "a_prev".into(),
-                    role: Some("assistant".into()),
-                    parent_id: None,
-                    time: Some(MessageTime {
-                        created: 500,
-                        completed,
-                    }),
-                    model_id: None,
-                    provider_id: None,
-                    tokens: None,
-                },
-                parts: serde_json::json!([{
-                    "id": "prt_tool", "type": "tool", "tool": "task", "callID": "call_task",
-                    "state": { "status": status, "input": { "description": "research" }, "output": output },
-                }]),
-            }]
+        acc.turn_anchor = Some(turn_anchor(anchor));
+        let transcript = |completed: Option<i64>, status: ToolStatus, output: &str| {
+            SessionTranscript::new(vec![message_in_flight(
+                "a_prev",
+                500,
+                completed,
+                vec![tool(
+                    "task",
+                    "call_task",
+                    status,
+                    None,
+                    Some(serde_json::json!({"description": "research"})),
+                    Some(output),
+                )],
+            )])
         };
 
         // In flight when the anchor lands: rendered (no completion stamp).
-        assert!(render_new_turn_parts(&mut acc, &msgs(None, "running", "")));
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &transcript(None, ToolStatus::Running, "")
+        ));
         assert_eq!(acc.tools["call_task"].status, "running");
 
         // Completed AFTER the anchor: the settled panel still renders.
         assert!(render_new_turn_parts(
             &mut acc,
-            &msgs(Some(2_500), "completed", "research done")
+            &transcript(Some(2_500), ToolStatus::Completed, "research done")
         ));
         assert_eq!(acc.tools["call_task"].status, "completed");
         assert_eq!(acc.tools["call_task"].output.as_deref(), Some("research done"));
@@ -1084,7 +1073,7 @@ Index: /x/src/main.rs
         // Re-fetching the same settled state must not duplicate.
         assert!(!render_new_turn_parts(
             &mut acc,
-            &msgs(Some(2_500), "completed", "research done")
+            &transcript(Some(2_500), ToolStatus::Completed, "research done")
         ));
     }
 
@@ -1093,29 +1082,24 @@ Index: /x/src/main.rs
     /// own clock never reaches the card. The same captured anchor is #190's
     /// turn filter, so this test also pins the capture source.
     #[test]
-    fn turn_started_ms_captures_the_user_message_server_time() {
-        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
-
+    fn turn_anchor_captures_the_user_message_identity_and_server_time() {
         let mut acc = StreamAccumulator::new("proj");
         acc.cola_message_id = Some("msg_cola_1".into());
-        let msgs = vec![SessionMessage {
-            info: MessageInfo {
-                id: "msg_cola_1".into(),
-                role: Some("user".into()),
-                parent_id: None,
-                time: Some(MessageTime {
-                    created: 1234,
-                    completed: Some(1234),
-                }),
-                model_id: None,
-                provider_id: None,
-                tokens: None,
-            },
-            parts: serde_json::json!([{ "type": "text", "text": "你好" }]),
-        }];
+        let transcript = SessionTranscript::new(vec![typed_message(
+            "msg_cola_1",
+            MessageRole::User,
+            Some(1234),
+            vec![text_part("你好")],
+        )]);
 
-        assert!(!render_new_turn_parts(&mut acc, &msgs));
-        assert_eq!(acc.turn_started_ms, Some(1234));
+        assert!(!render_new_turn_parts(&mut acc, &transcript));
+        assert_eq!(
+            acc.turn_anchor,
+            Some(TurnAnchor {
+                message_id: MessageId::new("msg_cola_1"),
+                created_ms: 1234,
+            })
+        );
     }
 
     /// Until the server's own user message is observed there is no anchor, and
@@ -1123,28 +1107,12 @@ Index: /x/src/main.rs
     /// threshold it provides either drops the new turn or admits the old one.
     #[test]
     fn nothing_renders_before_the_server_anchor_is_observed() {
-        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
-
         let mut acc = StreamAccumulator::new("proj");
         acc.cola_message_id = Some("msg_cola_1".into());
-        let msgs = vec![SessionMessage {
-            info: MessageInfo {
-                id: "a1".into(),
-                role: Some("assistant".into()),
-                parent_id: Some("msg_cola_1".into()),
-                time: Some(MessageTime {
-                    created: 100,
-                    completed: Some(100),
-                }),
-                model_id: None,
-                provider_id: None,
-                tokens: None,
-            },
-            parts: serde_json::json!([{ "type": "text", "text": "回答" }]),
-        }];
+        let transcript = SessionTranscript::new(vec![message("a1", 100, vec![text_part("回答")])]);
 
-        assert!(!render_new_turn_parts(&mut acc, &msgs));
-        assert_eq!(acc.turn_started_ms, None);
+        assert!(!render_new_turn_parts(&mut acc, &transcript));
+        assert_eq!(acc.turn_anchor, None);
         assert!(acc.text.is_empty());
     }
 
@@ -1154,53 +1122,34 @@ Index: /x/src/main.rs
     /// server's own user-message time instead.
     #[test]
     fn a_server_clock_behind_cola_does_not_drop_the_turns_parts() {
-        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
-
         let cola_now = chrono::Utc::now().timestamp_millis();
         let server_user = cola_now - 3_600_000; // the server is an hour behind
         let assistant = server_user + 250;
 
         let mut acc = StreamAccumulator::new("proj");
         acc.cola_message_id = Some("msg_cola_1".into());
-        let msgs = vec![
-            SessionMessage {
-                info: MessageInfo {
-                    id: "msg_cola_1".into(),
-                    role: Some("user".into()),
-                    parent_id: None,
-                    time: Some(MessageTime {
-                        created: server_user,
-                        completed: Some(server_user),
-                    }),
-                    model_id: None,
-                    provider_id: None,
-                    tokens: None,
-                },
-                parts: serde_json::json!([{ "type": "text", "text": "你好" }]),
-            },
-            SessionMessage {
-                info: MessageInfo {
-                    id: "a1".into(),
-                    role: Some("assistant".into()),
-                    parent_id: Some("msg_cola_1".into()),
-                    time: Some(MessageTime {
-                        created: assistant,
-                        completed: Some(assistant),
-                    }),
-                    model_id: None,
-                    provider_id: None,
-                    tokens: None,
-                },
-                parts: serde_json::json!([{ "type": "text", "text": "回答" }]),
-            },
-        ];
+        let transcript = SessionTranscript::new(vec![
+            typed_message(
+                "msg_cola_1",
+                MessageRole::User,
+                Some(server_user),
+                vec![text_part("你好")],
+            ),
+            message("a1", assistant, vec![text_part("回答")]),
+        ]);
         assert!(
             assistant < cola_now,
             "fixture: the whole turn predates cola's clock"
         );
 
-        assert!(render_new_turn_parts(&mut acc, &msgs));
-        assert_eq!(acc.turn_started_ms, Some(server_user));
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+        assert_eq!(
+            acc.turn_anchor,
+            Some(TurnAnchor {
+                message_id: MessageId::new("msg_cola_1"),
+                created_ms: server_user,
+            })
+        );
         assert!(
             acc.text.contains("回答"),
             "the turn's parts must render: {:?}",
@@ -1214,8 +1163,6 @@ Index: /x/src/main.rs
     /// anchor separates the two turns.
     #[test]
     fn a_server_clock_ahead_of_cola_does_not_bleed_the_previous_turn() {
-        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
-
         let cola_now = chrono::Utc::now().timestamp_millis();
         let previous_assistant = cola_now + 30_000; // still future to cola
         let server_user = cola_now + 60_000; // this turn's user message
@@ -1223,60 +1170,29 @@ Index: /x/src/main.rs
 
         let mut acc = StreamAccumulator::new("proj");
         acc.cola_message_id = Some("msg_cola_1".into());
-        let msgs = vec![
-            SessionMessage {
-                info: MessageInfo {
-                    id: "a_old".into(),
-                    role: Some("assistant".into()),
-                    parent_id: Some("msg_cola_old".into()),
-                    time: Some(MessageTime {
-                        created: previous_assistant,
-                        completed: Some(previous_assistant),
-                    }),
-                    model_id: None,
-                    provider_id: None,
-                    tokens: None,
-                },
-                parts: serde_json::json!([{ "type": "text", "text": "旧回答" }]),
-            },
-            SessionMessage {
-                info: MessageInfo {
-                    id: "msg_cola_1".into(),
-                    role: Some("user".into()),
-                    parent_id: None,
-                    time: Some(MessageTime {
-                        created: server_user,
-                        completed: Some(server_user),
-                    }),
-                    model_id: None,
-                    provider_id: None,
-                    tokens: None,
-                },
-                parts: serde_json::json!([{ "type": "text", "text": "你好" }]),
-            },
-            SessionMessage {
-                info: MessageInfo {
-                    id: "a1".into(),
-                    role: Some("assistant".into()),
-                    parent_id: Some("msg_cola_1".into()),
-                    time: Some(MessageTime {
-                        created: assistant,
-                        completed: Some(assistant),
-                    }),
-                    model_id: None,
-                    provider_id: None,
-                    tokens: None,
-                },
-                parts: serde_json::json!([{ "type": "text", "text": "新回答" }]),
-            },
-        ];
+        let transcript = SessionTranscript::new(vec![
+            message("a_old", previous_assistant, vec![text_part("旧回答")]),
+            typed_message(
+                "msg_cola_1",
+                MessageRole::User,
+                Some(server_user),
+                vec![text_part("你好")],
+            ),
+            message("a1", assistant, vec![text_part("新回答")]),
+        ]);
         assert!(
             previous_assistant > cola_now,
             "fixture: the previous turn is still ahead of cola's clock"
         );
 
-        assert!(render_new_turn_parts(&mut acc, &msgs));
-        assert_eq!(acc.turn_started_ms, Some(server_user));
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+        assert_eq!(
+            acc.turn_anchor,
+            Some(TurnAnchor {
+                message_id: MessageId::new("msg_cola_1"),
+                created_ms: server_user,
+            })
+        );
         assert!(
             acc.text.contains("新回答"),
             "the turn must render: {:?}",
@@ -1300,11 +1216,10 @@ Index: /x/src/main.rs
         let mut acc = StreamAccumulator::new("proj");
         render_parts(
             &mut acc,
-            &serde_json::json!([
-                { "type": "reasoning", "text": "thinking", "time": { "start": at } },
-                { "type": "tool", "tool": "bash", "callID": "call_1",
-                  "state": { "status": "pending" } },
-            ]),
+            &[
+                reasoning_at("thinking", at),
+                tool("bash", "call_1", ToolStatus::Pending, None, None, None),
+            ],
         );
         let card = acc.build_card().to_string();
         assert!(card.contains("💭 推理过程 · 00:05"), "{card}");
@@ -1317,11 +1232,14 @@ Index: /x/src/main.rs
         // shows the start time from now on.
         render_parts(
             &mut acc,
-            &serde_json::json!([
-                { "type": "tool", "tool": "bash", "callID": "call_1",
-                  "state": { "status": "running", "input": { "command": "sleep 2" },
-                             "time": { "start": at } } },
-            ]),
+            &[tool(
+                "bash",
+                "call_1",
+                ToolStatus::Running,
+                Some(at),
+                Some(serde_json::json!({"command": "sleep 2"})),
+                None,
+            )],
         );
         let card = acc.build_card().to_string();
         assert!(card.contains("⏳ bash · 00:05"), "{card}");
@@ -1329,50 +1247,48 @@ Index: /x/src/main.rs
 
     #[test]
     fn tool_part_update_re_renders_panel() {
-        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
-
-        let epoch = 0;
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_started_ms = Some(epoch);
+        acc.turn_anchor = Some(turn_anchor(0));
 
-        let msgs = |status: &str, output: &str| {
-            vec![SessionMessage {
-                info: MessageInfo {
-                    id: "a1".into(),
-                    role: Some("assistant".into()),
-                    parent_id: None,
-                    time: Some(MessageTime {
-                        created: 100,
-                        completed: Some(100),
-                    }),
-                    model_id: None,
-                    provider_id: None,
-                    tokens: None,
-                },
-                parts: serde_json::json!([{
-                    "id": "prt_tool",
-                    "type": "tool",
-                    "tool": "bash",
-                    "callID": "call_1",
-                    "state": { "status": status, "input": { "command": "ls" }, "output": output },
-                }]),
-            }]
+        let transcript = |status: ToolStatus, output: &str| {
+            SessionTranscript::new(vec![message(
+                "a1",
+                100,
+                vec![tool(
+                    "bash",
+                    "call_1",
+                    status,
+                    None,
+                    Some(serde_json::json!({"command": "ls"})),
+                    Some(output),
+                )],
+            )])
         };
 
         // First render: tool running.
-        assert!(render_new_turn_parts(&mut acc, &msgs("running", "")));
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &transcript(ToolStatus::Running, "")
+        ));
         assert_eq!(acc.tools["call_1"].status, "running");
 
-        // Same part id, updated to completed — must re-render (upsert).
-        assert!(render_new_turn_parts(&mut acc, &msgs("completed", "src\n")));
+        // Same call, updated to completed — must re-render (upsert).
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &transcript(ToolStatus::Completed, "src\n")
+        ));
         assert_eq!(acc.tools["call_1"].status, "completed");
 
         // No change → nothing new.
-        assert!(!render_new_turn_parts(&mut acc, &msgs("completed", "src\n")));
+        assert!(!render_new_turn_parts(
+            &mut acc,
+            &transcript(ToolStatus::Completed, "src\n")
+        ));
     }
 
     /// The model re-sends the whole todo list on every update, each as a NEW
-    /// `todowrite` call (new callID). The panel is a card-TAIL status section:
+    /// `todowrite` call (a new correlation id). The panel is a card-TAIL status
+    /// section:
     /// no timeline row, the latest call replaces it in place, and its header
     /// carries the latest list's counts (visible while folded) and clock.
     #[test]
@@ -1382,17 +1298,23 @@ Index: /x/src/main.rs
         let mut acc = StreamAccumulator::new("test");
         render_parts(
             &mut acc,
-            &serde_json::json!([
-                { "type": "tool", "tool": "todowrite", "callID": "call_a",
-                  "state": { "status": "completed", "time": { "start": at_a },
-                             "input": { "todos": [ { "content": "第一步", "status": "in_progress", "priority": "high" } ] },
-                             "output": "[{\"content\":\"第一步\",\"status\":\"in_progress\",\"priority\":\"high\"}]" } },
-                { "type": "tool", "tool": "todowrite", "callID": "call_b",
-                  "state": { "status": "completed", "time": { "start": at_b },
-                             "input": { "todos": [ { "content": "第一步", "status": "completed", "priority": "high" },
-                                                    { "content": "第二步", "status": "pending", "priority": "medium" } ] },
-                             "output": "[{\"content\":\"第一步\",\"status\":\"completed\",\"priority\":\"high\"},{\"content\":\"第二步\",\"status\":\"pending\",\"priority\":\"medium\"}]" } },
-            ]),
+            &[
+                todowrite(
+                    "call_a",
+                    at_a,
+                    serde_json::json!([
+                        { "content": "第一步", "status": "in_progress", "priority": "high" }
+                    ]),
+                ),
+                todowrite(
+                    "call_b",
+                    at_b,
+                    serde_json::json!([
+                        { "content": "第一步", "status": "completed", "priority": "high" },
+                        { "content": "第二步", "status": "pending", "priority": "medium" }
+                    ]),
+                ),
+            ],
         );
 
         assert!(
@@ -1430,12 +1352,13 @@ Index: /x/src/main.rs
         let mut acc = StreamAccumulator::new("test");
         render_parts(
             &mut acc,
-            &serde_json::json!([
-                { "type": "tool", "tool": "todowrite", "callID": "call_a",
-                  "state": { "status": "completed",
-                             "input": { "todos": [ { "content": "第一步", "status": "in_progress" } ] },
-                             "output": "[{\"content\":\"第一步\",\"status\":\"in_progress\"}]" } },
-            ]),
+            &[todowrite(
+                "call_a",
+                0,
+                serde_json::json!([
+                    { "content": "第一步", "status": "in_progress" }
+                ]),
+            )],
         );
         // Enough text to push the timeline past one card's budget.
         acc.push_text(&"很长的回答。".repeat(2000));
@@ -1452,13 +1375,14 @@ Index: /x/src/main.rs
         // later list update is visible there.
         render_parts(
             &mut acc,
-            &serde_json::json!([
-                { "type": "tool", "tool": "todowrite", "callID": "call_b",
-                  "state": { "status": "completed",
-                             "input": { "todos": [ { "content": "第一步", "status": "completed" },
-                                                    { "content": "第二步", "status": "pending" } ] },
-                             "output": "[{\"content\":\"第一步\",\"status\":\"completed\"},{\"content\":\"第二步\",\"status\":\"pending\"}]" } },
-            ]),
+            &[todowrite(
+                "call_b",
+                0,
+                serde_json::json!([
+                    { "content": "第一步", "status": "completed" },
+                    { "content": "第二步", "status": "pending" }
+                ]),
+            )],
         );
         let (rest, full2) = acc.build_card_with_split();
         assert!(!full2, "the tail should fit on the continuation");
@@ -1520,25 +1444,31 @@ Index: /x/src/main.rs
         );
     }
 
-    /// A todowrite update whose state has the same byte length as the previous
-    /// one (任务 A → 任务 B) must still refresh the panel: length alone is not a
-    /// change signal for a re-written list. The same-callID case is the
+    /// A todowrite update whose content has the same byte length as the
+    /// previous one (任务 A → 任务 B) must still refresh the panel: length alone
+    /// is not a change signal for a re-written list. The same-call case is the
     /// in-place update the accumulator must never skip — the mutation audit
-    /// (render.rs:372) found the todowrite branch surviving a different-callID
+    /// (render.rs:372) found the todowrite branch surviving a different-call
     /// test alone.
     #[test]
     fn todowrite_same_length_update_still_refreshes() {
         let mut acc = StreamAccumulator::new("test");
-        let part = |call_id: &str, task: &str| {
-            serde_json::json!([
-                { "type": "tool", "tool": "todowrite", "callID": call_id,
-                  "state": { "status": "completed",
-                             "input": { "todos": [ { "content": task, "status": "pending" } ] },
-                             "output": format!("[{{\"content\":\"{task}\",\"status\":\"pending\"}}]") } }
-            ])
-        };
-        render_parts(&mut acc, &part("call_a", "任务 A"));
-        render_parts(&mut acc, &part("call_b", "任务 B"));
+        render_parts(
+            &mut acc,
+            &[todowrite(
+                "call_a",
+                0,
+                serde_json::json!([{ "content": "任务 A", "status": "pending" }]),
+            )],
+        );
+        render_parts(
+            &mut acc,
+            &[todowrite(
+                "call_b",
+                0,
+                serde_json::json!([{ "content": "任务 B", "status": "pending" }]),
+            )],
+        );
 
         let card = acc.build_card().to_string();
         assert!(card.contains("任务 B"), "latest content must render: {card}");
@@ -1549,10 +1479,24 @@ Index: /x/src/main.rs
         assert!(acc.todo_panel.is_some(), "the tail holds the panel");
 
         // The SAME call re-streams with new, equal-length content: the panel
-        // must follow it, not dedupe on the length-only signature.
+        // must follow it, not dedupe on a length-only signature.
         let mut acc = StreamAccumulator::new("test");
-        render_parts(&mut acc, &part("call_same", "任务 C"));
-        render_parts(&mut acc, &part("call_same", "任务 D"));
+        render_parts(
+            &mut acc,
+            &[todowrite(
+                "call_same",
+                0,
+                serde_json::json!([{ "content": "任务 C", "status": "pending" }]),
+            )],
+        );
+        render_parts(
+            &mut acc,
+            &[todowrite(
+                "call_same",
+                0,
+                serde_json::json!([{ "content": "任务 D", "status": "pending" }]),
+            )],
+        );
         let card = acc.build_card().to_string();
         assert!(
             card.contains("任务 D"),
@@ -1590,15 +1534,15 @@ Index: /x/src/main.rs
         let mut acc = StreamAccumulator::new("test");
         render_parts(
             &mut acc,
-            &serde_json::json!([
-                { "type": "reasoning", "text": "想一想" },
-                { "type": "tool", "tool": "bash", "callID": "call_1",
-                  "state": { "status": "completed", "output": "ok" } },
-                { "type": "tool", "tool": "todowrite", "callID": "call_todo",
-                  "state": { "status": "completed",
-                             "input": { "todos": [ { "content": "第一步", "status": "pending" } ] },
-                             "output": "[{\"content\":\"第一步\",\"status\":\"pending\"}]" } },
-            ]),
+            &[
+                reasoning_part("想一想"),
+                tool("bash", "call_1", ToolStatus::Completed, None, None, Some("ok")),
+                todowrite(
+                    "call_todo",
+                    0,
+                    serde_json::json!([{ "content": "第一步", "status": "pending" }]),
+                ),
+            ],
         );
         let before = panel_ids(&acc.build_card());
         assert_eq!(before.len(), 3, "reasoning, tool, todo: {before:?}");
@@ -1623,43 +1567,27 @@ Index: /x/src/main.rs
 
     #[test]
     fn empty_then_updated_part_renders_once_with_content() {
-        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
-
-        let epoch = 0;
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_started_ms = Some(epoch);
+        acc.turn_anchor = Some(turn_anchor(0));
 
-        let msgs = |reasoning: &str, text: &str| {
-            vec![SessionMessage {
-                info: MessageInfo {
-                    id: "a1".into(),
-                    role: Some("assistant".into()),
-                    parent_id: None,
-                    time: Some(MessageTime {
-                        created: 100,
-                        completed: Some(100),
-                    }),
-                    model_id: None,
-                    provider_id: None,
-                    tokens: None,
-                },
-                parts: serde_json::json!([
-                    { "id": "prt_rsn", "type": "reasoning", "text": reasoning },
-                    { "id": "prt_txt", "type": "text", "text": text },
-                ]),
-            }]
+        let transcript = |reasoning: &str, text: &str| {
+            SessionTranscript::new(vec![message(
+                "a1",
+                100,
+                vec![reasoning_part(reasoning), text_part(text)],
+            )])
         };
 
         // Parts are written empty first, then updated with content. The empty
         // version must NOT be rendered (it would freeze the placeholder).
-        assert!(!render_new_turn_parts(&mut acc, &msgs("", "")));
+        assert!(!render_new_turn_parts(&mut acc, &transcript("", "")));
         assert_eq!(acc.reasoning, "");
         assert_eq!(acc.text, "");
 
-        // Once content lands (same part ids), render it once.
+        // Once content lands (same message/parts), render it once.
         assert!(render_new_turn_parts(
             &mut acc,
-            &msgs("Let me think", "Answer here")
+            &transcript("Let me think", "Answer here")
         ));
         assert!(acc.reasoning.contains("Let me think"));
         assert!(acc.text.contains("Answer here"));
@@ -1667,7 +1595,7 @@ Index: /x/src/main.rs
         // Re-fetching the same content must not duplicate.
         assert!(!render_new_turn_parts(
             &mut acc,
-            &msgs("Let me think", "Answer here")
+            &transcript("Let me think", "Answer here")
         ));
         assert_eq!(acc.reasoning, "Let me think");
         assert_eq!(acc.text, "Answer here");
@@ -1679,81 +1607,48 @@ Index: /x/src/main.rs
     /// (observed: card text 81 → 162 chars).
     #[test]
     fn text_without_id_is_not_rendered_twice() {
-        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
-
-        let epoch = 0;
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_started_ms = Some(epoch);
+        acc.turn_anchor = Some(turn_anchor(0));
 
-        // Realistic: no "id" on the text part.
-        let msgs = || {
-            vec![SessionMessage {
-                info: MessageInfo {
-                    id: "a1".into(),
-                    role: Some("assistant".into()),
-                    parent_id: None,
-                    time: Some(MessageTime {
-                        created: 100,
-                        completed: Some(100),
-                    }),
-                    model_id: None,
-                    provider_id: None,
-                    tokens: None,
-                },
-                parts: serde_json::json!([
-                    { "type": "text", "text": "你好！很高兴认识你。" },
-                    { "type": "reasoning", "text": "thinking" },
-                ]),
-            }]
+        // Realistic: no part id, just typed text and reasoning.
+        let transcript = || {
+            SessionTranscript::new(vec![message(
+                "a1",
+                100,
+                vec![text_part("你好！很高兴认识你。"), reasoning_part("thinking")],
+            )])
         };
 
         // Poll loop renders the parts.
-        assert!(render_new_turn_parts(&mut acc, &msgs()));
+        assert!(render_new_turn_parts(&mut acc, &transcript()));
         assert_eq!(acc.text, "你好！很高兴认识你。");
 
         // Final render re-fetches the same messages — must NOT append again.
-        assert!(!render_new_turn_parts(&mut acc, &msgs()));
+        assert!(!render_new_turn_parts(&mut acc, &transcript()));
         assert_eq!(acc.text, "你好！很高兴认识你。");
         assert_eq!(acc.reasoning, "thinking");
     }
 
-    /// Real OpenCode failed-tool parts use `state.status: "error"` with the
-    /// reason in `state.error.message` and NO `state.output` field — the panel
-    /// must show the error and mark the card failed, not stay stuck "running".
+    /// Real OpenCode failed-tool calls use status `error` with the reason in
+    /// the output's error side and no output text — the panel must show the
+    /// error and mark the card failed, not stay stuck "running".
     #[test]
     fn failed_tool_error_part_renders_output_and_error_state() {
-        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
-
-        let epoch = 0;
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_started_ms = Some(epoch);
+        acc.turn_anchor = Some(turn_anchor(0));
 
-        let msgs = vec![SessionMessage {
-            info: MessageInfo {
-                id: "a1".into(),
-                role: Some("assistant".into()),
-                parent_id: None,
-                time: Some(MessageTime {
-                    created: 100,
-                    completed: Some(100),
-                }),
-                model_id: None,
-                provider_id: None,
-                tokens: None,
-            },
-            parts: serde_json::json!([
-                { "type": "tool", "tool": "edit", "callID": "call_edit",
-                  "state": {
-                    "status": "error",
-                    "input": { "filePath": "src/main.rs", "oldString": "a", "newString": "b" },
-                    "content": [ { "type": "text", "text": "something went wrong" } ],
-                    "error": { "type": "unknown", "message": "no such file" },
-                    "result": null
-                  } }
-            ]),
-        }];
+        let mut call = tool_call(
+            "edit",
+            "call_edit",
+            ToolStatus::Error,
+            None,
+            Some(serde_json::json!({"filePath": "src/main.rs", "oldString": "a", "newString": "b"})),
+            vec![crate::backend::ContentBlock::Text("something went wrong".into())],
+        );
+        call.output.error = Some("no such file".into());
+        let transcript = SessionTranscript::new(vec![message("a1", 100, vec![Part::Tool(call)])]);
 
-        assert!(render_new_turn_parts(&mut acc, &msgs));
+        assert!(render_new_turn_parts(&mut acc, &transcript));
         let tool = acc.tools.get("call_edit").expect("tool rendered");
         assert_eq!(tool.status, "error");
         let out = tool.output.clone().unwrap_or_default();
@@ -1776,40 +1671,25 @@ Index: /x/src/main.rs
     }
 
     /// Some tools (e.g. `edit` with a stale `oldString`) put the reason in a
-    /// PLAIN STRING (`state.error: "Could not find oldString..."`), not an
-    /// object — it must still show up on the panel, not vanish.
+    /// PLAIN STRING error (the decoder normalizes it to the output's error
+    /// side) — it must still show up on the panel, not vanish.
     #[test]
     fn failed_tool_string_error_renders_on_panel() {
-        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
-
-        let epoch = 0;
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_started_ms = Some(epoch);
+        acc.turn_anchor = Some(turn_anchor(0));
 
-        let msgs = vec![SessionMessage {
-            info: MessageInfo {
-                id: "a1".into(),
-                role: Some("assistant".into()),
-                parent_id: None,
-                time: Some(MessageTime {
-                    created: 100,
-                    completed: Some(100),
-                }),
-                model_id: None,
-                provider_id: None,
-                tokens: None,
-            },
-            parts: serde_json::json!([
-                { "type": "tool", "tool": "edit", "callID": "call_edit",
-                  "state": {
-                    "status": "error",
-                    "input": { "filePath": "src/main.rs", "oldString": "a", "newString": "b" },
-                    "error": "Could not find oldString in the file. It must match exactly."
-                  } }
-            ]),
-        }];
+        let mut call = tool_call(
+            "edit",
+            "call_edit",
+            ToolStatus::Error,
+            None,
+            Some(serde_json::json!({"filePath": "src/main.rs", "oldString": "a", "newString": "b"})),
+            Vec::new(),
+        );
+        call.output.error = Some("Could not find oldString in the file. It must match exactly.".into());
+        let transcript = SessionTranscript::new(vec![message("a1", 100, vec![Part::Tool(call)])]);
 
-        assert!(render_new_turn_parts(&mut acc, &msgs));
+        assert!(render_new_turn_parts(&mut acc, &transcript));
         let tool = acc.tools.get("call_edit").expect("tool rendered");
         assert_eq!(tool.status, "error");
         let out = tool.output.clone().unwrap_or_default();
@@ -1820,53 +1700,49 @@ Index: /x/src/main.rs
         );
         assert!(!out.is_empty(), "output must not be empty for a string error");
     }
-    /// A completed `edit` records its real unified diff in
-    /// `state.metadata.diff` (not in `state.output`, which only says "Edit
-    /// applied successfully."). The panel output must carry the diff so the card
-    /// shows what actually changed instead of the file name + the tool's
-    /// success sentence. Failures keep their extracted error text.
+    /// A completed `edit` records its real unified diff in its raw metadata
+    /// (the text output only says "Edit applied successfully."). The panel
+    /// output must carry the diff so the card shows what actually changed
+    /// instead of the file name + the tool's success sentence. Failures keep
+    /// their extracted error text.
     #[test]
     fn edit_part_uses_metadata_diff_as_output() {
-        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
-
-        let epoch = 0;
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_started_ms = Some(epoch);
+        acc.turn_anchor = Some(turn_anchor(0));
 
-        let msgs = |status: &str, output: &str| {
-            vec![SessionMessage {
-                info: MessageInfo {
-                    id: "a1".into(),
-                    role: Some("assistant".into()),
-                    parent_id: None,
-                    time: Some(MessageTime {
-                        created: 100,
-                        completed: Some(100),
-                    }),
-                    model_id: None,
-                    provider_id: None,
-                    tokens: None,
-                },
-                parts: serde_json::json!([{
-                    "type": "tool", "tool": "edit", "callID": "call_edit",
-                    "state": {
-                        "status": status,
-                        "input": { "filePath": "src/main.rs", "oldString": "a", "newString": "b" },
-                        "output": output,
-                        "metadata": {
-                            "diagnostics": {},
-                            "diff": "Index: src/main.rs\n======\n--- src/main.rs\n+++ src/main.rs\n@@ -1 +1 @@\n-a\n+b\n",
-                            "filediff": { "file": "src/main.rs", "additions": 1, "deletions": 1 }
-                        }
-                    }
-                }]),
-            }]
+        let diff = "Index: src/main.rs\n======\n--- src/main.rs\n+++ src/main.rs\n@@ -1 +1 @@\n-a\n+b\n";
+        let edit = |status: ToolStatus, output: Option<&str>, with_diff: bool, error: Option<&str>| {
+            let mut call = tool_call(
+                "edit",
+                "call_edit",
+                status,
+                None,
+                Some(serde_json::json!({"filePath": "src/main.rs", "oldString": "a", "newString": "b"})),
+                output
+                    .map(|text| vec![crate::backend::ContentBlock::Text(text.to_string())])
+                    .unwrap_or_default(),
+            );
+            call.output.error = error.map(str::to_string);
+            if with_diff {
+                call.metadata = Some(serde_json::json!({
+                    "diagnostics": {},
+                    "diff": diff,
+                    "filediff": { "file": "src/main.rs", "additions": 1, "deletions": 1 }
+                }));
+            }
+            Part::Tool(call)
         };
+        let transcript = |part: Part| SessionTranscript::new(vec![message("a1", 100, vec![part])]);
 
         // Completed: the diff replaces the generic success sentence.
         assert!(render_new_turn_parts(
             &mut acc,
-            &msgs("completed", "Edit applied successfully.")
+            &transcript(edit(
+                ToolStatus::Completed,
+                Some("Edit applied successfully."),
+                true,
+                None
+            ))
         ));
         let out = acc.tools["call_edit"].output.clone().unwrap_or_default();
         assert!(out.contains("@@ -1 +1 @@"), "diff must be shown: {}", out);
@@ -1879,36 +1755,21 @@ Index: /x/src/main.rs
         // Re-rendering the same completed part is deduped (output unchanged).
         assert!(!render_new_turn_parts(
             &mut acc,
-            &msgs("completed", "Edit applied successfully.")
+            &transcript(edit(
+                ToolStatus::Completed,
+                Some("Edit applied successfully."),
+                true,
+                None
+            ))
         ));
 
         // A failure keeps its error text, not a diff.
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_started_ms = Some(epoch);
-        let err_msgs = vec![SessionMessage {
-            info: MessageInfo {
-                id: "a1".into(),
-                role: Some("assistant".into()),
-                parent_id: None,
-                time: Some(MessageTime {
-                    created: 100,
-                    completed: Some(100),
-                }),
-                model_id: None,
-                provider_id: None,
-                tokens: None,
-            },
-            parts: serde_json::json!([{
-                "type": "tool", "tool": "edit", "callID": "call_edit",
-                "state": {
-                    "status": "error",
-                    "input": { "filePath": "src/main.rs", "oldString": "a", "newString": "b" },
-                    "error": { "type": "unknown", "message": "no such file" },
-                    "metadata": { "diff": "Index: src/main.rs\n@@ -1 +1 @@\n-a\n+b\n" }
-                }
-            }]),
-        }];
-        assert!(render_new_turn_parts(&mut acc, &err_msgs));
+        acc.turn_anchor = Some(turn_anchor(0));
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &transcript(edit(ToolStatus::Error, None, true, Some("no such file")))
+        ));
         let out = acc.tools["call_edit"].output.clone().unwrap_or_default();
         assert!(out.contains("no such file"), "error text must be shown: {}", out);
         assert!(!out.contains("@@"), "no diff on a failed edit: {}", out);
@@ -1921,45 +1782,29 @@ Index: /x/src/main.rs
     /// "streaming", then the final card repeats it).
     #[test]
     fn render_parts_fallback_does_not_double_already_rendered_text() {
-        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
-
-        let epoch = 0;
         let mut acc = StreamAccumulator::new("test");
-        acc.turn_started_ms = Some(epoch);
+        acc.turn_anchor = Some(turn_anchor(0));
 
-        let msgs = vec![SessionMessage {
-            info: MessageInfo {
-                id: "a1".into(),
-                role: Some("assistant".into()),
-                parent_id: None,
-                time: Some(MessageTime {
-                    created: 100,
-                    completed: Some(100),
-                }),
-                model_id: None,
-                provider_id: None,
-                tokens: None,
-            },
-            parts: serde_json::json!([
-                { "type": "reasoning", "text": "Let me check" },
-                { "type": "text", "text": "The answer." },
-                { "type": "tool", "tool": "bash", "callID": "call_1",
-                  "state": { "status": "completed", "input": { "command": "ls" }, "output": "src" } },
-            ]),
-        }];
+        let parts = vec![
+            reasoning_part("Let me check"),
+            text_part("The answer."),
+            tool(
+                "bash",
+                "call_1",
+                ToolStatus::Completed,
+                None,
+                Some(serde_json::json!({"command": "ls"})),
+                Some("src"),
+            ),
+        ];
+        let transcript = SessionTranscript::new(vec![message("a1", 100, parts.clone())]);
 
         // Long turn: the poll loop already rendered the parts.
-        assert!(render_new_turn_parts(&mut acc, &msgs));
+        assert!(render_new_turn_parts(&mut acc, &transcript));
 
-        // Final reconcile: nothing new from messages → falls back to the
+        // Final reconcile: nothing new from the transcript → falls back to the
         // response parts (identical content). Must NOT append again.
-        let resp_parts = serde_json::json!([
-            { "type": "reasoning", "text": "Let me check" },
-            { "type": "text", "text": "The answer." },
-            { "type": "tool", "tool": "bash", "callID": "call_1",
-              "state": { "status": "completed", "input": { "command": "ls" }, "output": "src" } },
-        ]);
-        assert!(!render_parts(&mut acc, &resp_parts));
+        assert!(!render_parts(&mut acc, &parts));
         assert_eq!(acc.text, "The answer.");
         assert_eq!(acc.reasoning, "Let me check");
         assert_eq!(acc.tools["call_1"].output.as_deref(), Some("src"));
@@ -1978,11 +1823,11 @@ Index: /x/src/main.rs
         let sid = "ses_header";
         let cards = app.core.cards_handle();
         Turn::seed_card(&cards, sid, Some("om_header")).await;
-        Turn::set_turn_anchor(&cards, sid, 0).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
 
         // No parts at all: only the header signature can trigger a flush.
-        let msgs: Vec<crate::opencode::types::SessionMessage> = Vec::new();
-        let _ = render_and_flush(&cards, &app.sessions_handle(), &app.opencode, sid, &msgs).await;
+        let transcript = SessionTranscript::default();
+        let _ = render_and_flush(&cards, &app.sessions_handle(), &app.opencode, sid, &transcript).await;
         assert_eq!(
             platform.updated_cards().await.len(),
             1,
@@ -1991,7 +1836,7 @@ Index: /x/src/main.rs
 
         // The header signature moves (the state label flips) with no new parts.
         Turn::set_card_state(&cards, sid, CardState::Reasoning).await;
-        let _ = render_and_flush(&cards, &app.sessions_handle(), &app.opencode, sid, &msgs).await;
+        let _ = render_and_flush(&cards, &app.sessions_handle(), &app.opencode, sid, &transcript).await;
         let updates = platform.updated_cards().await;
         assert_eq!(
             updates.len(),
@@ -2011,8 +1856,6 @@ Index: /x/src/main.rs
     /// header signature.
     #[tokio::test]
     async fn render_and_flush_flushes_on_new_parts_without_a_header_tick() {
-        use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage};
-
         let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
@@ -2020,30 +1863,17 @@ Index: /x/src/main.rs
         let sid = "ses_content";
         let cards = app.core.cards_handle();
         Turn::seed_card(&cards, sid, Some("om_content")).await;
-        Turn::set_turn_anchor(&cards, sid, 0).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
 
-        let message = |text: &str| SessionMessage {
-            info: MessageInfo {
-                id: "a1".into(),
-                role: Some("assistant".into()),
-                parent_id: None,
-                time: Some(MessageTime {
-                    created: 1_000,
-                    completed: Some(1_000),
-                }),
-                model_id: None,
-                provider_id: None,
-                tokens: None,
-            },
-            parts: serde_json::json!([{ "type": "text", "text": text }]),
-        };
+        let transcript =
+            |text: &str| SessionTranscript::new(vec![message("a1", 1_000, vec![text_part(text)])]);
 
         let _ = render_and_flush(
             &cards,
             &app.sessions_handle(),
             &app.opencode,
             sid,
-            &[message("第一段")],
+            &transcript("第一段"),
         )
         .await;
         assert_eq!(platform.updated_cards().await.len(), 1);
@@ -2054,7 +1884,7 @@ Index: /x/src/main.rs
             &app.sessions_handle(),
             &app.opencode,
             sid,
-            &[message("第二段")],
+            &transcript("第二段"),
         )
         .await;
         let updates = platform.updated_cards().await;
@@ -2238,7 +2068,7 @@ Index: /x/src/main.rs
     /// are constructed from local wall times, so the expected strings hold in any
     /// test-machine timezone — and the turn crossing midnight proves the header
     /// date is the turn's, not the render moment's. The header date reads the
-    /// SERVER anchor (`turn_started_ms`), the accumulator's only clock (#190).
+    /// SERVER anchor (the Turn anchor's time), the accumulator's only clock (#190).
     #[test]
     fn panel_times_and_header_date_come_from_part_epochs() {
         use crate::bridge::turn::state::StreamAccumulator;
@@ -2246,21 +2076,24 @@ Index: /x/src/main.rs
         use crate::feishu::card::test_local_ms;
 
         let turn_started = test_local_ms(2026, 9, 16, 23, 58);
-        let reasoning_at = test_local_ms(2026, 9, 17, 0, 3);
+        let reasoning_start = test_local_ms(2026, 9, 17, 0, 3);
         let tool_start = test_local_ms(2026, 9, 17, 0, 5);
-        let tool_end = test_local_ms(2026, 9, 17, 0, 7);
 
         let mut acc = StreamAccumulator::new("proj");
-        acc.turn_started_ms = Some(turn_started);
+        acc.turn_anchor = Some(turn_anchor(turn_started));
         render_parts(
             &mut acc,
-            &serde_json::json!([
-                { "type": "reasoning", "text": "thinking",
-                  "time": { "start": reasoning_at, "end": reasoning_at + 1_000 } },
-                { "type": "tool", "tool": "bash", "callID": "call_1",
-                  "state": { "status": "running", "input": { "command": "sleep 2" },
-                             "time": { "start": tool_start } } },
-            ]),
+            &[
+                reasoning_at("thinking", reasoning_start),
+                tool(
+                    "bash",
+                    "call_1",
+                    ToolStatus::Running,
+                    Some(tool_start),
+                    Some(serde_json::json!({"command": "sleep 2"})),
+                    None,
+                ),
+            ],
         );
         let running = acc.build_card().to_string();
         assert!(
@@ -2276,12 +2109,14 @@ Index: /x/src/main.rs
         // stay, not slide to the completion moment.
         render_parts(
             &mut acc,
-            &serde_json::json!([
-                { "type": "tool", "tool": "bash", "callID": "call_1",
-                  "state": { "status": "completed", "input": { "command": "sleep 2" },
-                             "output": "done",
-                             "time": { "start": tool_start, "end": tool_end } } },
-            ]),
+            &[tool(
+                "bash",
+                "call_1",
+                ToolStatus::Completed,
+                Some(tool_start),
+                Some(serde_json::json!({"command": "sleep 2"})),
+                Some("done"),
+            )],
         );
         acc.card_state = CardState::Done;
         let done = acc.build_card();

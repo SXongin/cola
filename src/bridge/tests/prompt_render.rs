@@ -687,8 +687,10 @@ async fn short_answer_stays_in_card_no_extra_message() {
 /// (provider, model) for the turn, so later polls cost no extra request.
 #[tokio::test]
 async fn render_poll_shows_live_context_and_memoizes_the_window() {
+    use crate::backend::{
+        MessageId, MessageRole, MessageTime, ModelIdentity, SessionTranscript, TokenUsage, TranscriptMessage,
+    };
     use crate::bridge::turn::Turn;
-    use crate::opencode::types::{MessageInfo, MessageTime, MessageTokens, SessionMessage};
 
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -701,27 +703,29 @@ async fn render_poll_shows_live_context_and_memoizes_the_window() {
         let cards = app.core.cards_handle();
         Turn::seed_card(&cards, sid, Some("om_live")).await;
         // An armed anchor: every assistant message counts as this turn's.
-        Turn::set_turn_anchor(&cards, sid, 0).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
         Turn::set_model(&cards, sid, "p", "m").await;
     }
-    let tokens = |total: i64| MessageTokens {
-        total,
-        ..Default::default()
-    };
-    let message = |total: i64, text: &str| SessionMessage {
-        info: MessageInfo {
-            id: "a1".into(),
-            role: Some("assistant".into()),
-            parent_id: None,
+    // A typed assistant step: the answering model and its usage, plus text.
+    let transcript = |total: i64| {
+        SessionTranscript::new(vec![TranscriptMessage {
+            id: MessageId::new("a1"),
+            role: MessageRole::Assistant,
             time: Some(MessageTime {
                 created: 1_000,
                 completed: Some(1_000),
             }),
-            model_id: Some("m".into()),
-            provider_id: Some("p".into()),
-            tokens: Some(tokens(total)),
-        },
-        parts: serde_json::json!([{ "type": "text", "text": text }]),
+            model: Some(ModelIdentity {
+                provider_id: "p".into(),
+                model_id: "m".into(),
+                variant: None,
+            }),
+            tokens: Some(TokenUsage {
+                total,
+                ..Default::default()
+            }),
+            parts: vec![text_part("回答")],
+        }])
     };
 
     let _ = Turn::render_and_flush(
@@ -729,7 +733,7 @@ async fn render_poll_shows_live_context_and_memoizes_the_window() {
         &app.sessions_handle(),
         &app.opencode,
         sid,
-        &[message(42_000, "回答")],
+        &transcript(42_000),
     )
     .await;
     let updates = platform.updated_cards().await;
@@ -752,7 +756,7 @@ async fn render_poll_shows_live_context_and_memoizes_the_window() {
         &app.sessions_handle(),
         &app.opencode,
         sid,
-        &[message(55_000, "回答")],
+        &transcript(55_000),
     )
     .await;
     let updates = platform.updated_cards().await;

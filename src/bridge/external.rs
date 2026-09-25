@@ -259,10 +259,10 @@ impl ExternalFlow {
         preview: &str,
     ) {
         // Guard: a renderer for THIS message is already armed (the accumulator
-        // still carries the message's server time as its turn anchor). cola's
-        // own prompts get a fresh accumulator, so a different anchor is NOT
-        // this message — a new renderer replaces the old one (whose
-        // `turn_started_ms` no longer matches, so it exits).
+        // still carries the message's anchor). cola's own prompts get a fresh
+        // accumulator, so a different anchor is NOT this message — a new
+        // renderer replaces the old one (whose server-time anchor no longer
+        // matches, so it exits).
         if armed_turn_anchor(&handles.cards, session_id).await == Some(anchor.created_ms) {
             return;
         }
@@ -320,7 +320,7 @@ impl ExternalFlow {
             &handles.cards,
             session_id,
             card_id,
-            anchor.created_ms,
+            anchor,
             &subtitle,
             &session_dir,
             variant,
@@ -453,7 +453,7 @@ impl ExternalFlow {
             &handles.cards,
             session_id,
             card_id,
-            turn_anchor_ms,
+            &anchor,
             "",
             &session_dir,
             variant,
@@ -561,20 +561,12 @@ async fn external_render_loop(
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(poll_ms)).await;
-        // Completion and the newer-turn boundary come from the Session
-        // Transcript's shared projections (ADR-0053); the raw read still feeds
-        // the streaming renderer while the Turn module migrates (#336).
+        // Completion, the newer-turn boundary and the streaming render all
+        // come from the one Session Transcript read (ADR-0053).
         let transcript = match handles.backend.transcript(&session_id).await {
             Ok(transcript) => transcript,
             Err(e) => {
                 tracing::warn!("external render poll transcript: {}", e);
-                continue;
-            }
-        };
-        let msgs = match handles.backend.messages(&session_id).await {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("external render poll messages: {}", e);
                 continue;
             }
         };
@@ -591,7 +583,7 @@ async fn external_render_loop(
             &handles.sessions,
             &handles.backend,
             &session_id,
-            &msgs,
+            &transcript,
         )
         .await
         else {

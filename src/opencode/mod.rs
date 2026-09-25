@@ -169,6 +169,11 @@ pub trait Backend: Send + Sync {
 
     async fn reject_question(&self, request_id: &str, directory: Option<&str>) -> Result<()>;
 
+    /// The legacy wire read, kept while its consumers migrate (spec #332).
+    /// No production consumer remains after #336 — the Turn, external sync and
+    /// Session Snapshot all read [`Self::transcript`] — and it is deleted with
+    /// the wire types when the migration completes (#338).
+    #[allow(dead_code)]
     async fn messages(&self, session_id: &str) -> Result<Vec<SessionMessage>>;
 
     /// Read one Session as a neutral [`SessionTranscript`] — the read model the
