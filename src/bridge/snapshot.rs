@@ -357,7 +357,7 @@ mod tests {
         mock
     }
 
-    async fn gather(mock: MockBackend) -> SnapshotData {
+    async fn gather_from_typed_backend(mock: MockBackend) -> SnapshotData {
         let backend: Arc<dyn opencode::Backend> = Arc::new(mock);
         gather_snapshot(&backend, "ses_adopted", "/work/proj").await
     }
@@ -431,7 +431,7 @@ mod tests {
                 raw: serde_json::Value::Null,
             })],
         );
-        let snap = gather(typed_backend(vec![
+        let snap = gather_from_typed_backend(typed_backend(vec![
             user("a", 1000, &["问题一"]),
             reasoning_only,
             assistant("c", 3000, &["回答一"]),
@@ -465,7 +465,7 @@ mod tests {
         let messages = (0..10)
             .map(|i| user(&format!("u{i}"), i * 1000, &[&format!("m{i}")]))
             .collect();
-        let snap = gather(typed_backend(messages)).await;
+        let snap = gather_from_typed_backend(typed_backend(messages)).await;
         let tail = snap.tail;
         assert_eq!(tail.len(), 4, "tail must cap at 4");
         assert_eq!(tail[0].text, "m6");
@@ -475,7 +475,7 @@ mod tests {
 
     #[tokio::test]
     async fn tail_joins_multiple_text_parts_and_keeps_roles() {
-        let snap = gather(typed_backend(vec![typed_message(
+        let snap = gather_from_typed_backend(typed_backend(vec![typed_message(
             "u",
             MessageRole::User,
             Some(1000),
@@ -498,7 +498,7 @@ mod tests {
     #[tokio::test]
     async fn newest_user_cola_authored_detection() {
         // Cola's own prompt is the newest user message.
-        let snap = gather(typed_backend(vec![
+        let snap = gather_from_typed_backend(typed_backend(vec![
             user("msg_other", 1000, &["外部问题"]),
             user("msg_cola_x", 2000, &["我发的"]),
             assistant("assist", 3000, &["回答"]),
@@ -508,7 +508,7 @@ mod tests {
         assert!(snap.newest_user_is_cola_authored);
 
         // An external user message newer than cola's is NOT cola-authored.
-        let snap = gather(typed_backend(vec![
+        let snap = gather_from_typed_backend(typed_backend(vec![
             user("msg_cola_x", 1000, &["我发的"]),
             user("msg_other", 2000, &["外部问题"]),
         ]))
@@ -517,12 +517,12 @@ mod tests {
         assert!(!snap.newest_user_is_cola_authored);
 
         // No user messages → None (no newest, no epoch).
-        let snap = gather(typed_backend(vec![assistant("a", 1000, &["回答"])])).await;
+        let snap = gather_from_typed_backend(typed_backend(vec![assistant("a", 1000, &["回答"])])).await;
         assert_eq!(snap.newest_user_epoch, None);
 
         // No time on any user message → None.
         let no_time = typed_message("msg_cola_x", MessageRole::User, None, vec![text("hi")]);
-        let snap = gather(typed_backend(vec![no_time])).await;
+        let snap = gather_from_typed_backend(typed_backend(vec![no_time])).await;
         assert_eq!(snap.newest_user_epoch, None);
     }
 
@@ -571,7 +571,7 @@ mod tests {
                 questions: vec![],
             },
         ]);
-        let snap = gather(mock).await;
+        let snap = gather_from_typed_backend(mock).await;
 
         assert_eq!(snap.status, Some(opencode::types::SessionStatus::Busy));
         assert!(snap.has_pending());
@@ -592,7 +592,7 @@ mod tests {
     async fn gather_treats_a_failed_status_read_as_unknown() {
         let mut mock = typed_backend(vec![user("msg_u1", 1000, &["你好"])]);
         mock.status_read_fails("simulated failure");
-        let snap = gather(mock).await;
+        let snap = gather_from_typed_backend(mock).await;
         assert_eq!(snap.status, None, "a failed status read must not guess a status");
     }
 
@@ -602,14 +602,14 @@ mod tests {
         // does not recognise (`Ok(None)` at the seam) — unknown, never guessed.
         let mut mock = typed_backend(vec![user("msg_u1", 1000, &["你好"])]);
         mock.with_session_status("ses_adopted", None);
-        let snap = gather(mock).await;
+        let snap = gather_from_typed_backend(mock).await;
         assert_eq!(snap.status, None, "an unknown status type must not be guessed");
     }
 
     #[tokio::test]
     async fn gather_maps_absent_session_to_idle() {
         let mock = typed_backend(vec![user("msg_u1", 1000, &["你好"])]);
-        let snap = gather(mock).await;
+        let snap = gather_from_typed_backend(mock).await;
         assert_eq!(snap.status, Some(opencode::types::SessionStatus::Idle));
     }
 }

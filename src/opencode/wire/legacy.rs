@@ -67,14 +67,20 @@ fn decode_tokens(tokens: &MessageTokens) -> TokenUsage {
 
 fn decode_part(part: &Value) -> Part {
     match part.get("type").and_then(Value::as_str) {
-        Some("text") => Part::Text(TextPart {
-            text: part
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            started_at: started_at(part, "/time/start"),
-        }),
+        // A `text` part without string text is malformed: the tolerant arm
+        // keeps it raw rather than manufacturing an empty text the old
+        // extractor dropped (a valid+malformed pair must not join an extra
+        // line). An explicit empty string is still a valid empty text part.
+        Some("text") => match part.get("text").and_then(Value::as_str) {
+            Some(text) => Part::Text(TextPart {
+                text: text.to_string(),
+                started_at: started_at(part, "/time/start"),
+            }),
+            None => Part::Other(OtherPart {
+                kind: "text".to_string(),
+                raw: part.clone(),
+            }),
+        },
         Some("reasoning") => Part::Reasoning(ReasoningPart {
             text: part
                 .get("text")
@@ -421,6 +427,77 @@ mod tests {
             call.output.blocks,
             vec![ContentBlock::Other(serde_json::json!({"type": "text"}))]
         );
+    }
+
+    /// Decode one message's parts into its transcript message.
+    fn decoded_message(parts: Value) -> TranscriptMessage {
+        let transcript = decode(&[SessionMessage {
+            info: MessageInfo {
+                id: "msg_a1".into(),
+                role: Some("assistant".into()),
+                parent_id: None,
+                time: Some(MessageTime {
+                    created: 1_000,
+                    completed: Some(1_000),
+                }),
+                model_id: None,
+                provider_id: None,
+                tokens: None,
+            },
+            parts,
+        }]);
+        transcript.messages.into_iter().next().expect("one message")
+    }
+
+    /// A `text` part whose `text` field is not a string is malformed: it stays
+    /// raw instead of becoming an empty text part, so the message text joins
+    /// only the real text (the old snapshot extractor dropped the malformed
+    /// part too — a valid+malformed pair must not grow a phantom newline).
+    #[test]
+    fn a_text_part_without_string_text_stays_raw() {
+        let message = decoded_message(serde_json::json!([
+            {"type": "text", "text": "a"},
+            {"type": "text", "text": null},
+            {"type": "text"}
+        ]));
+
+        assert_eq!(
+            message.parts[0],
+            Part::Text(TextPart {
+                text: "a".into(),
+                started_at: None
+            })
+        );
+        assert_eq!(
+            message.parts[1],
+            Part::Other(OtherPart {
+                kind: "text".into(),
+                raw: serde_json::json!({"type": "text", "text": null})
+            })
+        );
+        assert_eq!(
+            message.parts[2],
+            Part::Other(OtherPart {
+                kind: "text".into(),
+                raw: serde_json::json!({"type": "text"})
+            })
+        );
+        assert_eq!(message.text(), "a", "only the real text part joins");
+
+        // An explicit empty string is still a valid empty text part: the old
+        // extractor kept it, so joining behaves exactly as before.
+        let message = decoded_message(serde_json::json!([
+            {"type": "text", "text": "a"},
+            {"type": "text", "text": ""}
+        ]));
+        assert_eq!(
+            message.parts[1],
+            Part::Text(TextPart {
+                text: String::new(),
+                started_at: None
+            })
+        );
+        assert_eq!(message.text(), "a\n");
     }
 
     /// The two failure shapes the server has used normalize to the message.
