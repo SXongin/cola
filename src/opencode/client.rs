@@ -1846,18 +1846,15 @@ mod wire_tests {
         assert!(unknown.output.raw.is_none());
         assert_eq!(unknown.input.as_ref().unwrap()["x"], 1);
 
-        // A null output does not shadow the content/result sources: every text
-        // block is present and the raw payload is the content the state carried.
+        // A null output does not shadow the content/result sources: the text
+        // runs and the result join into one block and the raw payload is the
+        // content the state carried.
         let Part::Tool(null_output) = &assistant.parts[5] else {
             panic!("expected a tool part: {:?}", assistant.parts[5]);
         };
         assert_eq!(
             null_output.output.blocks,
-            vec![
-                ContentBlock::Text("line1".into()),
-                ContentBlock::Text("line2".into()),
-                ContentBlock::Text("2 lines".into()),
-            ]
+            vec![ContentBlock::Text("line1line2\n2 lines".into())]
         );
         assert_eq!(
             null_output.output.raw.as_ref().unwrap(),
