@@ -2489,14 +2489,25 @@ mod wire_tests {
             .unwrap();
 
         assert_eq!(legacy.messages, v2.messages);
+
+        // Projections and the Turn outcome agree, exactly as on the paused
+        // branch: newest user, recent tail, turn membership and completion.
+        assert_eq!(
+            legacy.newest_user().map(|m| m.id.as_str()),
+            v2.newest_user().map(|m| m.id.as_str())
+        );
+        assert_eq!(legacy.transcript_tail(), v2.transcript_tail());
         let anchor = v2.newest_user().unwrap().anchor().unwrap();
+        let legacy_turn = legacy.turn_for_user(&anchor);
+        let v2_turn = v2.turn_for_user(&anchor);
+        let legacy_ids: Vec<_> = legacy_turn.messages.iter().map(|m| m.id.as_str()).collect();
+        let v2_ids: Vec<_> = v2_turn.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(legacy_ids, v2_ids);
+        assert_eq!(legacy_turn.complete, v2_turn.complete);
         assert!(
-            legacy.turn_for_user(&anchor).complete,
+            legacy_turn.complete,
             "the legacy terminal finish completes the Turn"
         );
-        assert!(
-            v2.turn_for_user(&anchor).complete,
-            "the /api finish completes it identically"
-        );
+        assert!(v2_turn.complete, "the /api finish completes it identically");
     }
 }

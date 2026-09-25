@@ -122,7 +122,7 @@ fn decode_message(value: &Value) -> TranscriptMessage {
             time,
             model: None,
             tokens: None,
-            parts: vec![decode_text_part(value, None)],
+            parts: decode_message_text(value),
         },
         "synthetic" => TranscriptMessage {
             id,
@@ -130,7 +130,7 @@ fn decode_message(value: &Value) -> TranscriptMessage {
             time,
             model: None,
             tokens: None,
-            parts: vec![decode_text_part(value, None)],
+            parts: decode_message_text(value),
         },
         other => TranscriptMessage {
             id,
@@ -160,11 +160,21 @@ fn decode_time(time: &Value) -> Option<MessageTime> {
     })
 }
 
+/// A message-level `text` field as parts: absent yields no part at all (a
+/// files-only `/api` user message has no text to carry), while a present but
+/// non-string value stays raw through the shared malformed-text rule.
+fn decode_message_text(value: &Value) -> Vec<Part> {
+    if value.get("text").is_none() {
+        return Vec::new();
+    }
+    vec![decode_text_part(value, None)]
+}
+
 /// A user message's text field plus its file/agent attachments. The text is
 /// the generation's field, not a part, so it becomes the text part the
 /// neutral model (and the tail projection) reads.
 fn decode_user_parts(value: &Value) -> Vec<Part> {
-    let mut parts = vec![decode_text_part(value, None)];
+    let mut parts = decode_message_text(value);
     for (field, kind) in [("files", "file"), ("agents", "agent")] {
         if let Some(items) = value.get(field).and_then(Value::as_array) {
             parts.extend(items.iter().map(|item| {
@@ -465,6 +475,31 @@ mod tests {
             })
         );
         assert_eq!(message.text(), "看这个");
+    }
+
+    /// A user message with no `text` field gains NO text part — a files-only
+    /// message must not widen into a whole-message raw part — while a
+    /// present but non-string text still stays raw (the malformed-value rule,
+    /// pinned for a message-level field in the tolerance test below).
+    #[test]
+    fn a_files_only_user_message_gains_no_text_part() {
+        let message = only_message(serde_json::json!({
+            "data": [{
+                "type": "user",
+                "id": "msg_u1",
+                "time": {"created": 1000},
+                "files": [{"uri": "file:///a.png", "mime": "image/png"}]
+            }]
+        }));
+        assert_eq!(message.role, MessageRole::User);
+        assert_eq!(
+            message.parts,
+            vec![Part::Other(OtherPart {
+                kind: "file".into(),
+                raw: serde_json::json!({"uri": "file:///a.png", "mime": "image/png"})
+            })]
+        );
+        assert_eq!(message.text(), "");
     }
 
     /// Assistant content maps onto the typed parts: text (no time), reasoning
