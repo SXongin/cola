@@ -662,6 +662,15 @@ pub struct MockBackend {
     /// default shape.
     pub message_scripts:
         Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<Vec<opencode::types::SessionMessage>>>>>,
+    /// Session id → scripted Session Transcripts served by `transcript`,
+    /// consumed one snapshot per call (the last repeating). A session without
+    /// a script falls back to decoding the wire shape `messages` serves, so
+    /// existing scenarios keep working while fixtures migrate (spec #332).
+    pub transcript_scripts: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, Vec<crate::backend::transcript::SessionTranscript>>,
+        >,
+    >,
     /// Records every `messages` call's session id, so tests can prove the
     /// drain stopped reading the Backend once the turn ended.
     pub messages_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
@@ -813,6 +822,7 @@ impl MockBackend {
             extra_permissions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             session_titles: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             message_scripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            transcript_scripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             messages_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             questions: Vec::new(),
             reply_question_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -960,6 +970,22 @@ impl MockBackend {
         self.message_scripts
             .try_lock()
             .expect("given_timeline before the app is built")
+            .insert(session_id.to_string(), snapshots);
+        self
+    }
+
+    /// Scenario: `transcript` serves `snapshots` for `session_id`, one per
+    /// call (the last repeating) — the neutral view of that session's history.
+    /// Sessions without a script fall back to decoding the wire shape
+    /// `messages` serves.
+    pub(crate) fn given_transcript(
+        &mut self,
+        session_id: &str,
+        snapshots: Vec<crate::backend::transcript::SessionTranscript>,
+    ) -> &mut Self {
+        self.transcript_scripts
+            .try_lock()
+            .expect("given_transcript before the app is built")
             .insert(session_id.to_string(), snapshots);
         self
     }
@@ -1220,6 +1246,153 @@ impl MockBackend {
         self.replied_questions.lock().await.insert(request_id.to_string());
         Ok(())
     }
+    /// The legacy wire shape `messages` serves: a scripted Backend timeline
+    /// wins over every default shape, otherwise the scenario's message is
+    /// modeled. `transcript` decodes exactly this shape, so the two reads
+    /// cannot drift while both exist.
+    async fn wire_messages(
+        &self,
+        _session_id: &str,
+    ) -> crate::error::Result<Vec<opencode::types::SessionMessage>> {
+        hang_if_scripted(&self.hang_messages).await;
+        self.messages_calls.lock().await.push(_session_id.to_string());
+        // A scripted Backend timeline wins over every default shape: it is
+        // the test's complete message history (anchor user message, first run,
+        // a supplement that missed the run, its reply), consumed one snapshot
+        // per call with the last one repeating.
+        {
+            let mut scripts = self.message_scripts.lock().await;
+            if let Some(script) = scripts.get_mut(_session_id)
+                && !script.is_empty()
+            {
+                let snapshot = if script.len() == 1 {
+                    script[0].clone()
+                } else {
+                    script.remove(0)
+                };
+                return Ok(snapshot);
+            }
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut msgs: Vec<opencode::types::SessionMessage> = Vec::new();
+        // cola's OWN user message persisting on the store (ADR-0026): id starts
+        // with `msg_cola_`, created time stable across polls. Simulates a prompt
+        // cola sent that the poller must recognise as cola-authored even when it
+        // surfaces AFTER a stale watermark (server died mid-turn then healed).
+        if let Some(cola_text) = self.cola_user_messages.get(_session_id) {
+            let created = {
+                let mut map = self.cola_user_created.lock().unwrap();
+                *map.entry(_session_id.to_string())
+                    .or_insert_with(|| chrono::Utc::now().timestamp_millis())
+            };
+            msgs.push(opencode::types::SessionMessage {
+                info: opencode::types::MessageInfo {
+                    id: "msg_cola_mock_user".into(),
+                    role: Some("user".into()),
+                    parent_id: None,
+                    time: Some(opencode::types::MessageTime {
+                        created,
+                        completed: Some(created),
+                    }),
+                    model_id: None,
+                    provider_id: None,
+                    tokens: None,
+                },
+                parts: serde_json::json!([{ "type": "text", "text": cola_text }]),
+            });
+        }
+        // When set, simulate a user message posted by ANOTHER client (e.g.
+        // OpenChamber), for the external-message poller tests. If an AI
+        // reply is also set (and `external_reply_ready` has flipped), return
+        // it as the assistant turn — simulates OpenCode answering the
+        // shared-store message.
+        let text = self
+            .external_user_messages
+            .get(_session_id)
+            .cloned()
+            .or_else(|| self.external_user_message.clone());
+        if let Some(text) = text {
+            // Stable created time: captured once, so the same message is not
+            // seen as "new" on every poll.
+            let created = {
+                let mut slot = self.external_user_created.lock().unwrap();
+                *slot.get_or_insert_with(|| chrono::Utc::now().timestamp_millis())
+            };
+            // If cola's own message is also present, guarantee the external one
+            // is NEWEST — it was posted after cola's (the heal scenario).
+            let created = {
+                let map = self.cola_user_created.lock().unwrap();
+                map.get(_session_id)
+                    .map(|c| created.max(c + 1000))
+                    .unwrap_or(created)
+            };
+            msgs.push(opencode::types::SessionMessage {
+                info: opencode::types::MessageInfo {
+                    id: "msg_ext_user".into(),
+                    role: Some("user".into()),
+                    parent_id: None,
+                    time: Some(opencode::types::MessageTime {
+                        created,
+                        completed: Some(created),
+                    }),
+                    model_id: None,
+                    provider_id: None,
+                    tokens: None,
+                },
+                parts: serde_json::json!([{ "type": "text", "text": text }]),
+            });
+            if self
+                .external_reply_ready
+                .load(std::sync::atomic::Ordering::SeqCst)
+                && let Some(parts) = &self.external_reply_parts
+            {
+                msgs.push(opencode::types::SessionMessage {
+                    info: opencode::types::MessageInfo {
+                        id: "msg_ext_assist".into(),
+                        role: Some("assistant".into()),
+                        parent_id: Some("msg_ext_user".into()),
+                        time: Some(opencode::types::MessageTime {
+                            created: created + 1000,
+                            completed: Some(created + 1000),
+                        }),
+                        model_id: None,
+                        provider_id: None,
+                        tokens: None,
+                    },
+                    parts: parts.clone(),
+                });
+            }
+            return Ok(msgs);
+        }
+        // No cola-authored or external user message modeled: return only the
+        // assistant side of cola's own turn (the default rendering path).
+        if !msgs.is_empty() {
+            return Ok(msgs);
+        }
+        // A matched prompt script's parts win over the construction-time
+        // `parts`: the render poll must see the same turn the prompt streamed.
+        let parts = self
+            .last_prompt_parts
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| self.parts.clone());
+        Ok(vec![opencode::types::SessionMessage {
+            info: opencode::types::MessageInfo {
+                id: "msg_assist".into(),
+                role: Some("assistant".into()),
+                parent_id: Some("msg_user".into()),
+                time: Some(opencode::types::MessageTime {
+                    created: now + 1000,
+                    completed: Some(now + 1000),
+                }),
+                model_id: None,
+                provider_id: None,
+                tokens: None,
+            },
+            parts,
+        }])
+    }
 }
 
 /// Test scaffolding: while `counter` is positive, hang this call forever.
@@ -1413,148 +1586,32 @@ impl opencode::Backend for MockBackend {
         Ok(())
     }
 
-    async fn messages(
+    async fn messages(&self, session_id: &str) -> crate::error::Result<Vec<opencode::types::SessionMessage>> {
+        self.wire_messages(session_id).await
+    }
+
+    /// Read one Session's neutral transcript (ADR-0053). A scripted transcript
+    /// wins; otherwise the wire shape [`MockBackend::messages`] would serve is
+    /// decoded through the production decoder, so existing wire-scripted
+    /// scenarios keep working while fixtures migrate (spec #332, #334–#339).
+    async fn transcript(
         &self,
-        _session_id: &str,
-    ) -> crate::error::Result<Vec<opencode::types::SessionMessage>> {
-        hang_if_scripted(&self.hang_messages).await;
-        self.messages_calls.lock().await.push(_session_id.to_string());
-        // A scripted Backend timeline wins over every default shape: it is
-        // the test's complete message history (anchor user message, first run,
-        // a supplement that missed the run, its reply), consumed one snapshot
-        // per call with the last one repeating.
+        session_id: &str,
+    ) -> crate::error::Result<crate::backend::transcript::SessionTranscript> {
         {
-            let mut scripts = self.message_scripts.lock().await;
-            if let Some(script) = scripts.get_mut(_session_id)
+            let mut scripts = self.transcript_scripts.lock().await;
+            if let Some(script) = scripts.get_mut(session_id)
                 && !script.is_empty()
             {
-                let snapshot = if script.len() == 1 {
+                return Ok(if script.len() == 1 {
                     script[0].clone()
                 } else {
                     script.remove(0)
-                };
-                return Ok(snapshot);
-            }
-        }
-        let now = chrono::Utc::now().timestamp_millis();
-        let mut msgs: Vec<opencode::types::SessionMessage> = Vec::new();
-        // cola's OWN user message persisting on the store (ADR-0026): id starts
-        // with `msg_cola_`, created time stable across polls. Simulates a prompt
-        // cola sent that the poller must recognise as cola-authored even when it
-        // surfaces AFTER a stale watermark (server died mid-turn then healed).
-        if let Some(cola_text) = self.cola_user_messages.get(_session_id) {
-            let created = {
-                let mut map = self.cola_user_created.lock().unwrap();
-                *map.entry(_session_id.to_string())
-                    .or_insert_with(|| chrono::Utc::now().timestamp_millis())
-            };
-            msgs.push(opencode::types::SessionMessage {
-                info: opencode::types::MessageInfo {
-                    id: "msg_cola_mock_user".into(),
-                    role: Some("user".into()),
-                    parent_id: None,
-                    time: Some(opencode::types::MessageTime {
-                        created,
-                        completed: Some(created),
-                    }),
-                    model_id: None,
-                    provider_id: None,
-                    tokens: None,
-                },
-                parts: serde_json::json!([{ "type": "text", "text": cola_text }]),
-            });
-        }
-        // When set, simulate a user message posted by ANOTHER client (e.g.
-        // OpenChamber), for the external-message poller tests. If an AI
-        // reply is also set (and `external_reply_ready` has flipped), return
-        // it as the assistant turn — simulates OpenCode answering the
-        // shared-store message.
-        let text = self
-            .external_user_messages
-            .get(_session_id)
-            .cloned()
-            .or_else(|| self.external_user_message.clone());
-        if let Some(text) = text {
-            // Stable created time: captured once, so the same message is not
-            // seen as "new" on every poll.
-            let created = {
-                let mut slot = self.external_user_created.lock().unwrap();
-                *slot.get_or_insert_with(|| chrono::Utc::now().timestamp_millis())
-            };
-            // If cola's own message is also present, guarantee the external one
-            // is NEWEST — it was posted after cola's (the heal scenario).
-            let created = {
-                let map = self.cola_user_created.lock().unwrap();
-                map.get(_session_id)
-                    .map(|c| created.max(c + 1000))
-                    .unwrap_or(created)
-            };
-            msgs.push(opencode::types::SessionMessage {
-                info: opencode::types::MessageInfo {
-                    id: "msg_ext_user".into(),
-                    role: Some("user".into()),
-                    parent_id: None,
-                    time: Some(opencode::types::MessageTime {
-                        created,
-                        completed: Some(created),
-                    }),
-                    model_id: None,
-                    provider_id: None,
-                    tokens: None,
-                },
-                parts: serde_json::json!([{ "type": "text", "text": text }]),
-            });
-            if self
-                .external_reply_ready
-                .load(std::sync::atomic::Ordering::SeqCst)
-                && let Some(parts) = &self.external_reply_parts
-            {
-                msgs.push(opencode::types::SessionMessage {
-                    info: opencode::types::MessageInfo {
-                        id: "msg_ext_assist".into(),
-                        role: Some("assistant".into()),
-                        parent_id: Some("msg_ext_user".into()),
-                        time: Some(opencode::types::MessageTime {
-                            created: created + 1000,
-                            completed: Some(created + 1000),
-                        }),
-                        model_id: None,
-                        provider_id: None,
-                        tokens: None,
-                    },
-                    parts: parts.clone(),
                 });
             }
-            return Ok(msgs);
         }
-        // No cola-authored or external user message modeled: return only the
-        // assistant side of cola's own turn (the default rendering path).
-        if !msgs.is_empty() {
-            return Ok(msgs);
-        }
-        // A matched prompt script's parts win over the construction-time
-        // `parts`: the render poll must see the same turn the prompt streamed.
-        let parts = self
-            .last_prompt_parts
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or_else(|| self.parts.clone());
-        Ok(vec![opencode::types::SessionMessage {
-            info: opencode::types::MessageInfo {
-                id: "msg_assist".into(),
-                role: Some("assistant".into()),
-                parent_id: Some("msg_user".into()),
-                time: Some(opencode::types::MessageTime {
-                    created: now + 1000,
-                    completed: Some(now + 1000),
-                }),
-                model_id: None,
-                provider_id: None,
-                tokens: None,
-            },
-            parts,
-        }])
+        let messages = self.wire_messages(session_id).await?;
+        Ok(crate::opencode::wire::decode(&messages))
     }
 
     async fn list_permissions(
@@ -2458,4 +2515,82 @@ where
     drop(guard);
     let text = String::from_utf8(buffer.0.lock().unwrap().clone()).expect("the fmt layer writes valid UTF-8");
     (output, text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::transcript::{
+        MessageId, MessageRole, MessageTime, Part, SessionTranscript, TextPart, TranscriptMessage,
+    };
+    use crate::opencode::Backend;
+
+    fn typed_message(id: &str, role: MessageRole, created: i64, text: &str) -> TranscriptMessage {
+        TranscriptMessage {
+            id: MessageId::new(id),
+            role,
+            time: Some(MessageTime {
+                created,
+                completed: Some(created),
+            }),
+            model: None,
+            tokens: None,
+            parts: vec![Part::Text(TextPart {
+                text: text.to_string(),
+                started_at: None,
+            })],
+        }
+    }
+
+    /// A scripted transcript is served as-is; the wire read is never touched,
+    /// so a test can describe cola's domain instead of the backend's wire
+    /// format (spec #332).
+    #[tokio::test]
+    async fn mock_serves_a_scripted_transcript_without_a_wire_read() {
+        let mut mock = MockBackend::new(serde_json::json!([]));
+        mock.given_transcript(
+            "ses_x",
+            vec![SessionTranscript::new(vec![typed_message(
+                "msg_u1",
+                MessageRole::User,
+                1000,
+                "脚本化的问题",
+            )])],
+        );
+        let messages_calls = std::sync::Arc::clone(&mock.messages_calls);
+        let backend: std::sync::Arc<dyn Backend> = std::sync::Arc::new(mock);
+
+        let transcript = backend.transcript("ses_x").await.unwrap();
+
+        assert_eq!(transcript.messages.len(), 1);
+        assert_eq!(transcript.messages[0].text(), "脚本化的问题");
+        assert!(
+            messages_calls.lock().await.is_empty(),
+            "a scripted transcript must not read the wire shape"
+        );
+    }
+
+    /// Without a script, the mock decodes the wire shape its `messages` read
+    /// serves, so existing wire-scripted scenarios keep working while fixtures
+    /// migrate.
+    #[tokio::test]
+    async fn mock_decodes_its_wire_shape_when_no_transcript_is_scripted() {
+        let mock = MockBackend::new(realistic_parts());
+        let backend: std::sync::Arc<dyn Backend> = std::sync::Arc::new(mock);
+
+        let transcript = backend.transcript("ses_test").await.unwrap();
+
+        assert_eq!(transcript.messages.len(), 1);
+        let message = &transcript.messages[0];
+        assert_eq!(message.role, MessageRole::Assistant);
+        assert_eq!(message.text(), "当前目录有 src/ 和 Cargo.toml。");
+        assert!(
+            message
+                .parts
+                .iter()
+                .any(|part| matches!(part, Part::Tool(tool) if tool.identity.name == "bash")),
+            "the wire tool part must decode: {:?}",
+            message.parts
+        );
+    }
 }

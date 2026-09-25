@@ -1,6 +1,8 @@
 use base64::Engine;
 use std::sync::Arc;
 
+use crate::backend::transcript::SessionTranscript;
+
 use super::parsing::{
     build_parts, inject_agent, inject_message_id, inject_model, parse_model, parse_provider_models,
     parse_session_status_entry,
@@ -541,6 +543,15 @@ impl Client {
             .await?
             .error_for_status()?;
         Ok(resp.json().await?)
+    }
+
+    /// Fetch one session's Session Transcript: the same
+    /// `GET /session/{id}/message` read, decoded through the wire decoder into
+    /// the neutral read model (ADR-0053). The existing [`Client::messages`]
+    /// read is untouched while its consumers migrate (spec #332).
+    pub async fn transcript(&self, session_id: &str) -> crate::error::Result<SessionTranscript> {
+        let messages = self.messages(session_id).await?;
+        Ok(super::wire::decode(&messages))
     }
 
     /// The server's per-session run state for ONE session (canonical:
@@ -1706,5 +1717,199 @@ mod wire_tests {
 
         let message = not_found_error(client.reject_question("q_gone", None).await.unwrap_err());
         assert!(message.contains("question q_gone"), "unexpected: {message}");
+    }
+
+    /// The legacy payload shapes a session read serves: a user message, an
+    /// assistant turn with reasoning/text/tool(/unknown)/patch/step-finish
+    /// parts, and an in-flight assistant message with no completion stamp.
+    fn transcript_fixture() -> serde_json::Value {
+        serde_json::json!([
+            {
+                "info": {"id": "msg_u1", "role": "user", "time": {"created": 1000}},
+                "parts": [{"type": "text", "text": "第一个问题"}]
+            },
+            {
+                "info": {
+                    "id": "msg_a1",
+                    "role": "assistant",
+                    "time": {"created": 1100, "completed": 1400},
+                    "modelID": "deepseek-v4-flash",
+                    "providerID": "opencode-go",
+                    "tokens": {"total": 162034, "input": 220, "output": 129,
+                               "cache": {"write": 0, "read": 161664}}
+                },
+                "parts": [
+                    {"type": "step-start", "snapshot": "abc"},
+                    {"type": "reasoning", "text": "想一下", "time": {"start": 1110, "end": 1120}},
+                    {"type": "text", "text": "答案一", "time": {"start": 1120, "end": 1130}},
+                    {"type": "tool", "tool": "bash", "callID": "call_1",
+                     "state": {"status": "completed", "input": {"command": "ls"},
+                               "output": "src", "metadata": {"output": ""},
+                               "time": {"start": 1130, "end": 1140}}},
+                    {"type": "tool", "tool": "mystery", "callID": "call_2",
+                     "state": {"status": "weird", "input": {"x": 1}}},
+                    {"type": "mystery-part", "payload": 42},
+                    {"type": "patch", "hash": "abc", "files": ["src/a.rs"]},
+                    {"type": "step-finish", "reason": "tool-calls"}
+                ]
+            },
+            {
+                "info": {"id": "msg_a2", "role": "assistant", "time": {"created": 2000}},
+                "parts": [{"type": "text", "text": "答案二", "time": {"start": 2010}}]
+            }
+        ])
+    }
+
+    /// The adapter produces the neutral Session Transcript from the legacy
+    /// wire payloads: the request goes to the canonical message route and
+    /// every typed view (message envelope, part kinds, tool payloads, tolerant
+    /// arms) decodes, with the projections agreeing with the raw read.
+    #[tokio::test]
+    async fn transcript_decodes_legacy_payloads_through_the_adapter() {
+        use crate::backend::transcript::{
+            ContentBlock, FinishReason, MessageRole, MessageTime, Part, ToolStatus,
+        };
+        use crate::opencode::Backend;
+
+        let server = TestHttpServer::start().await;
+        server.route(
+            "GET",
+            "/session/ses_1/message",
+            200,
+            transcript_fixture().to_string(),
+        );
+        let backend: std::sync::Arc<dyn Backend> = std::sync::Arc::new(wire_client(&server, None));
+
+        let transcript = backend.transcript("ses_1").await.unwrap();
+
+        let request = last_request(&server);
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/session/ses_1/message");
+        assert_eq!(transcript.messages.len(), 3);
+
+        let user = &transcript.messages[0];
+        assert_eq!(user.id.as_str(), "msg_u1");
+        assert_eq!(user.role, MessageRole::User);
+        assert_eq!(
+            user.time,
+            Some(MessageTime {
+                created: 1000,
+                completed: None
+            })
+        );
+        assert_eq!(user.text(), "第一个问题");
+
+        let assistant = &transcript.messages[1];
+        assert_eq!(assistant.role, MessageRole::Assistant);
+        let model = assistant.model.as_ref().expect("the message names its model");
+        assert_eq!(model.provider_id, "opencode-go");
+        assert_eq!(model.model_id, "deepseek-v4-flash");
+        assert!(model.variant.is_none());
+        assert_eq!(assistant.tokens.as_ref().unwrap().context_used(), 162034);
+
+        let Part::Reasoning(reasoning) = &assistant.parts[1] else {
+            panic!("expected a reasoning part: {:?}", assistant.parts[1]);
+        };
+        assert_eq!(reasoning.text, "想一下");
+        assert_eq!(reasoning.started_at, Some(1110));
+        let Part::Text(text) = &assistant.parts[2] else {
+            panic!("expected a text part: {:?}", assistant.parts[2]);
+        };
+        assert_eq!(text.text, "答案一");
+        assert_eq!(text.started_at, Some(1120));
+
+        let Part::Tool(call) = &assistant.parts[3] else {
+            panic!("expected a tool part: {:?}", assistant.parts[3]);
+        };
+        assert_eq!(call.identity.name, "bash");
+        assert_eq!(call.identity.call_id, "call_1");
+        assert_eq!(call.status, ToolStatus::Completed);
+        assert_eq!(call.started_at, Some(1130));
+        assert_eq!(call.input.as_ref().unwrap()["command"].as_str(), Some("ls"));
+        assert_eq!(call.metadata.as_ref().unwrap()["output"].as_str(), Some(""));
+        assert_eq!(call.output.raw.as_ref().unwrap().as_str(), Some("src"));
+        assert_eq!(call.output.blocks, vec![ContentBlock::Text("src".into())]);
+        assert!(call.output.error.is_none());
+
+        // An unrecognized tool status decodes tolerantly, payloads intact.
+        let Part::Tool(unknown) = &assistant.parts[4] else {
+            panic!("expected a tool part: {:?}", assistant.parts[4]);
+        };
+        assert_eq!(unknown.status, ToolStatus::Unknown("weird".into()));
+        assert!(unknown.started_at.is_none());
+        assert!(unknown.output.raw.is_none());
+        assert_eq!(unknown.input.as_ref().unwrap()["x"], 1);
+
+        // An unrecognized part kind keeps its raw payload.
+        let Part::Other(other) = &assistant.parts[5] else {
+            panic!("expected an Other part: {:?}", assistant.parts[5]);
+        };
+        assert_eq!(other.kind, "mystery-part");
+        assert_eq!(other.raw["payload"], 42);
+
+        let Part::Patch(patch) = &assistant.parts[6] else {
+            panic!("expected a patch part: {:?}", assistant.parts[6]);
+        };
+        assert_eq!(patch.hash.as_deref(), Some("abc"));
+        assert_eq!(patch.files, vec!["src/a.rs"]);
+
+        let Part::StepFinish(finish) = &assistant.parts[7] else {
+            panic!("expected a step-finish part: {:?}", assistant.parts[7]);
+        };
+        assert_eq!(finish.reason, FinishReason::ToolCalls);
+
+        // Projections read the decoded transcript: the anchor is the user
+        // message's identity + server time, and the in-flight assistant
+        // message belongs to the turn, which is not complete on `tool-calls`.
+        let newest = transcript.newest_user().expect("a user message exists");
+        let anchor = newest.anchor().expect("the user message has a server time");
+        assert_eq!(anchor.message_id.as_str(), "msg_u1");
+        assert_eq!(anchor.created_ms, 1000);
+        let turn = transcript.turn_for_user(&anchor);
+        let ids: Vec<_> = turn.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["msg_a1", "msg_a2"], "the in-flight message must belong");
+        assert!(!turn.complete, "tool-calls is not a terminal finish");
+    }
+
+    /// A terminal `step-finish` in the decoded turn reports completion, and a
+    /// pre-anchor message stays the previous turn's.
+    #[tokio::test]
+    async fn transcript_turn_completes_on_a_terminal_finish() {
+        let server = TestHttpServer::start().await;
+        server.route(
+            "GET",
+            "/session/ses_done/message",
+            200,
+            serde_json::json!([
+                {"info": {"id": "msg_u1", "role": "user", "time": {"created": 1000}},
+                 "parts": [{"type": "text", "text": "hi"}]},
+                // The previous turn: finished before the anchor.
+                {"info": {"id": "msg_old", "role": "assistant", "time": {"created": 500, "completed": 600}},
+                 "parts": [{"type": "step-finish", "reason": "stop"}]},
+                {"info": {"id": "msg_a1", "role": "assistant", "time": {"created": 1100, "completed": 1200}},
+                 "parts": [{"type": "step-finish", "reason": "stop"}]}
+            ])
+            .to_string(),
+        );
+        let client = wire_client(&server, None);
+
+        let transcript = client.transcript("ses_done").await.unwrap();
+        let anchor = transcript.newest_user().unwrap().anchor().unwrap();
+        let turn = transcript.turn_for_user(&anchor);
+
+        let ids: Vec<_> = turn.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["msg_a1"], "a pre-anchor message is the previous turn's");
+        assert!(turn.complete);
+    }
+
+    /// A failed message read surfaces as an error; the transcript read adds no
+    /// silent fallback.
+    #[tokio::test]
+    async fn transcript_surfaces_a_failed_message_read() {
+        let server = TestHttpServer::start().await;
+        server.route("GET", "/session/ses_gone/message", 500, r#"{"error":"boom"}"#);
+        let client = wire_client(&server, None);
+
+        assert!(client.transcript("ses_gone").await.is_err());
     }
 }
