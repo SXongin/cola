@@ -232,7 +232,7 @@ async fn a_split_continuation_takes_the_running_tool_panel_over() {
     seed_session(&app, "ses_test", "/work").await;
 
     let bash = |status: ToolStatus| {
-        crate::feishu::card::tool_render::ToolPanel::from_parts(
+        crate::feishu::card::tool_render::ToolPanel::for_test(
             "bash",
             status,
             Some(serde_json::json!({"command": "sleep 30"})),
@@ -297,7 +297,7 @@ async fn a_tool_completing_after_the_split_renders_on_the_continuation() {
         &cards,
         "ses_test",
         "call_bash",
-        crate::feishu::card::tool_render::ToolPanel::from_parts(
+        crate::feishu::card::tool_render::ToolPanel::for_test(
             "bash",
             ToolStatus::Running,
             Some(serde_json::json!({"command": "sleep 30"})),
@@ -375,7 +375,7 @@ async fn a_finished_tool_does_not_leak_into_the_continuation_header() {
         &cards,
         "ses_test",
         "call_bash",
-        crate::feishu::card::tool_render::ToolPanel::from_parts(
+        crate::feishu::card::tool_render::ToolPanel::for_test(
             "bash",
             ToolStatus::Completed,
             Some(serde_json::json!({"command": "sleep 30"})),
@@ -1261,7 +1261,7 @@ async fn size_and_supplement_split_collide_with_one_continuation() {
             &cards,
             "ses_test",
             &format!("call_{i}"),
-            crate::feishu::card::tool_render::ToolPanel::from_parts(
+            crate::feishu::card::tool_render::ToolPanel::for_test(
                 &format!("tool{i}"),
                 ToolStatus::Completed,
                 None,

@@ -1775,7 +1775,7 @@ mod tests {
         // More content arrives on the next poll.
         acc.push_tool(
             "call_1",
-            ToolPanel::from_parts(
+            ToolPanel::for_test(
                 "bash",
                 ToolStatus::Completed,
                 Some(serde_json::json!("ls")),
@@ -1805,7 +1805,7 @@ mod tests {
         for i in 0..50 {
             acc.push_tool(
                 &format!("call_{}", i),
-                ToolPanel::from_parts(&format!("tool{}", i), ToolStatus::Completed, None, None),
+                ToolPanel::for_test(&format!("tool{}", i), ToolStatus::Completed, None, None),
             );
         }
         acc.push_text("最后的结论。");
@@ -1844,7 +1844,7 @@ mod tests {
         for i in 0..12 {
             acc.push_tool(
                 &format!("call_{}", i),
-                ToolPanel::from_parts(
+                ToolPanel::for_test(
                     &format!("tool{}", i),
                     ToolStatus::Completed,
                     Some(serde_json::json!("in")),
@@ -1895,7 +1895,7 @@ mod tests {
         for i in 0..7 {
             acc.push_tool(
                 &format!("call_{}", i),
-                ToolPanel::from_parts(
+                ToolPanel::for_test(
                     &format!("tool{}", i),
                     ToolStatus::Completed,
                     Some(serde_json::json!("入参")),
@@ -2010,7 +2010,7 @@ mod tests {
         acc.push_text("先看一下目录。");
         acc.push_tool(
             "call_1",
-            ToolPanel::from_parts(
+            ToolPanel::for_test(
                 "bash",
                 ToolStatus::Completed,
                 Some(serde_json::json!("ls")),
@@ -2020,7 +2020,7 @@ mod tests {
         acc.push_text("再看一下配置。");
         acc.push_tool(
             "call_2",
-            ToolPanel::from_parts(
+            ToolPanel::for_test(
                 "read",
                 ToolStatus::Completed,
                 Some(serde_json::json!("cola.toml")),
@@ -2080,7 +2080,7 @@ mod tests {
         acc.push_text(&text);
         acc.push_tool(
             "call_web",
-            ToolPanel::from_parts(
+            ToolPanel::for_test(
                 "websearch",
                 ToolStatus::Completed,
                 None,
@@ -2107,11 +2107,11 @@ mod tests {
         let mut acc = StreamAccumulator::new("test");
         acc.push_tool(
             "call_1",
-            ToolPanel::from_parts("bash", ToolStatus::Running, Some(serde_json::json!("ls")), None),
+            ToolPanel::for_test("bash", ToolStatus::Running, Some(serde_json::json!("ls")), None),
         );
         acc.push_tool(
             "call_1",
-            ToolPanel::from_parts(
+            ToolPanel::for_test(
                 "bash",
                 ToolStatus::Completed,
                 Some(serde_json::json!("ls")),
@@ -2128,7 +2128,7 @@ mod tests {
     #[test]
     fn a_running_tool_panel_rides_the_live_continuation() {
         let bash = |status: ToolStatus, output: Option<&str>| {
-            ToolPanel::from_parts(
+            ToolPanel::for_test(
                 "bash",
                 status,
                 Some(serde_json::json!({ "command": "sleep 30" })),
@@ -2164,7 +2164,7 @@ mod tests {
     #[test]
     fn a_late_server_start_time_orders_the_settled_panel() {
         let bash = |status: ToolStatus, output: Option<&str>| {
-            ToolPanel::from_parts(
+            ToolPanel::for_test(
                 "bash",
                 status,
                 Some(serde_json::json!({ "command": "sleep 30" })),
@@ -2214,7 +2214,7 @@ mod tests {
                 .collect()
         };
         let bash = |status: ToolStatus, output: Option<&str>| {
-            ToolPanel::from_parts(
+            ToolPanel::for_test(
                 "bash",
                 status,
                 Some(serde_json::json!({ "command": "sleep 30" })),
@@ -2259,7 +2259,7 @@ mod tests {
         // A running tool is its own phase.
         acc.push_tool(
             "call_1",
-            ToolPanel::from_parts(
+            ToolPanel::for_test(
                 "bash",
                 ToolStatus::Running,
                 Some(serde_json::json!("cargo test")),
@@ -2270,7 +2270,7 @@ mod tests {
         // Tool completes → back to plain streaming (timer resets).
         acc.push_tool(
             "call_1",
-            ToolPanel::from_parts(
+            ToolPanel::for_test(
                 "bash",
                 ToolStatus::Completed,
                 Some(serde_json::json!("cargo test")),
@@ -2282,14 +2282,9 @@ mod tests {
         // still a running tool: it gets the Tool phase too, and a completed one
         // drops back. (Mutation audit, state.rs:548 — the todo_panel status
         // comparison survived the tools-only coverage.)
-        acc.todo_panel = Some(ToolPanel::from_parts(
-            "todowrite",
-            ToolStatus::Running,
-            None,
-            None,
-        ));
+        acc.todo_panel = Some(ToolPanel::for_test("todowrite", ToolStatus::Running, None, None));
         assert_eq!(acc.active_phase(), Some(HeaderPhase::Tool));
-        acc.todo_panel = Some(ToolPanel::from_parts(
+        acc.todo_panel = Some(ToolPanel::for_test(
             "todowrite",
             ToolStatus::Completed,
             None,

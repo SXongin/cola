@@ -47,7 +47,7 @@ impl ToolPanel {
         &self.call.status
     }
 
-    pub(super) fn status_icon(&self) -> &'static str {
+    pub fn status_icon(&self) -> &'static str {
         match self.status() {
             ToolStatus::Running | ToolStatus::Pending => "⏳",
             ToolStatus::Completed => "✅",
@@ -178,7 +178,7 @@ fn strip_patch_summary(output: &str) -> Option<&str> {
 /// fixtures that exercise metadata build the call directly.
 #[cfg(test)]
 impl ToolPanel {
-    pub(crate) fn from_parts(
+    pub(crate) fn for_test(
         name: &str,
         status: ToolStatus,
         input: Option<serde_json::Value>,
@@ -232,21 +232,25 @@ pub(super) fn tool_panel_element(
     element_id: Option<&str>,
     md: &mut CardMarkdown,
 ) -> serde_json::Value {
-    let output = tool.output().map(|raw| format_tool_output(tool.name(), &raw));
+    // One name read for the panel's name-keyed decisions: the output
+    // formatter's dispatch, the todo section's detection, and the input
+    // formatter's dispatch.
+    let name = tool.name();
+    let output = tool.output().map(|raw| format_tool_output(name, &raw));
     // The todo panel is a status section, not a transcript: a parsed list is
     // the panel, so the generic Input line and Output marker would only frame
     // the checklist (a still-running call has no parsed output yet — the Input
     // line `📋 共 N 项任务` is all it can show), and its prefix names the
     // section rather than the call (a finished call would sit at a permanent ✅
     // while the counts right beside it still report open items).
-    let todo_panel = tool.name() == "todowrite";
+    let todo_panel = name == "todowrite";
     let todowrite_list = todo_panel
         && output
             .as_ref()
             .is_some_and(|(_, style, _)| *style == BodyStyle::Markdown);
     let mut content = String::new();
     if !todowrite_list && let Some(i) = tool.input() {
-        let formatted = format_tool_input(tool.name(), i);
+        let formatted = format_tool_input(name, i);
         if !formatted.is_empty() {
             // Trailing blank line so a multi-line input (edit diff, skill
             // metadata list) can't swallow the Output section as a markdown
@@ -295,7 +299,7 @@ pub(super) fn tool_panel_element(
     }
     let content = md.element(&content);
     let icon = if todo_panel { "📋" } else { tool.status_icon() };
-    let mut title = format!("{icon} {}{}", tool.name(), panel_time_suffix(at_ms));
+    let mut title = format!("{icon} {}{}", name, panel_time_suffix(at_ms));
     if let Some(details) = &title_details {
         title.push_str(&format!(" · {}", details));
     }
@@ -997,7 +1001,7 @@ mod tests {
 
     #[test]
     fn tool_panel_completed_is_collapsible() {
-        let tool = ToolPanel::from_parts(
+        let tool = ToolPanel::for_test(
             "read",
             ToolStatus::Completed,
             Some(json!("src/main.rs")),
@@ -1025,7 +1029,7 @@ mod tests {
     /// and liveness/run classification comes from [`ToolStatus`] itself.
     #[test]
     fn typed_status_drives_the_icon_and_liveness() {
-        let icon = |status| ToolPanel::from_parts("bash", status, None, None).status_icon();
+        let icon = |status| ToolPanel::for_test("bash", status, None, None).status_icon();
         assert_eq!(icon(ToolStatus::Pending), "⏳");
         assert_eq!(icon(ToolStatus::Running), "⏳");
         assert_eq!(icon(ToolStatus::Completed), "✅");
@@ -1034,14 +1038,14 @@ mod tests {
         assert_eq!(icon(ToolStatus::Other("failed".into())), "❌");
         assert_eq!(icon(ToolStatus::Other("weird".into())), "🔧");
 
-        let live = |status| ToolPanel::from_parts("bash", status, None, None).is_live();
+        let live = |status| ToolPanel::for_test("bash", status, None, None).is_live();
         assert!(live(ToolStatus::Pending) && live(ToolStatus::Running));
         assert!(!live(ToolStatus::Completed) && !live(ToolStatus::Error));
         assert!(!live(ToolStatus::Unknown) && !live(ToolStatus::Other("weird".into())));
 
         // Only a RUNNING call drives the header's "⏳ tool" hint; a pending one
         // is live tail content but not the running tool (ADR-0014/ADR-0045).
-        let running = |status| ToolPanel::from_parts("bash", status, None, None).is_running();
+        let running = |status| ToolPanel::for_test("bash", status, None, None).is_running();
         assert!(running(ToolStatus::Running));
         assert!(!running(ToolStatus::Pending));
     }
@@ -1052,7 +1056,7 @@ mod tests {
     #[test]
     fn tool_panel_header_carries_the_start_time() {
         let at = crate::feishu::card::test_local_ms(2026, 9, 16, 14, 5);
-        let tool = ToolPanel::from_parts(
+        let tool = ToolPanel::for_test(
             "bash",
             ToolStatus::Completed,
             Some(json!({"command": "cargo test"})),
@@ -1173,7 +1177,7 @@ boom
     #[test]
     fn task_output_with_an_empty_result_still_strips_the_envelope() {
         let raw = "<task id=\"ses_1\" state=\"completed\">\n<task_result>\n</task_result>\n</task>";
-        let tool = ToolPanel::from_parts(
+        let tool = ToolPanel::for_test(
             "task",
             ToolStatus::Completed,
             Some(json!({"description": "sub"})),
@@ -1244,7 +1248,7 @@ Relative paths in this skill (e.g., scripts/, reference/) are relative to this b
         assert!(body.contains("2. [Second result]("), "second result: {body}");
         assert!(!body.contains("ignored"), "excerpts dropped: {body}");
 
-        let tool = ToolPanel::from_parts(
+        let tool = ToolPanel::for_test(
             "websearch",
             ToolStatus::Completed,
             Some(json!({"query": "x"})),
@@ -1576,7 +1580,7 @@ LSP errors detected in a.rs, please fix:
 <content>
 1: use std::fs;
 </content>";
-        let tool = ToolPanel::from_parts(
+        let tool = ToolPanel::for_test(
             "read",
             ToolStatus::Completed,
             Some(json!({"filePath": "/x/y.rs"})),
@@ -1607,7 +1611,7 @@ LSP errors detected in a.rs, please fix:
             {"content": "补测试", "status": "pending", "priority": "medium"},
             {"content": "旧方案", "status": "cancelled", "priority": "low"},
         ]);
-        let tool = ToolPanel::from_parts(
+        let tool = ToolPanel::for_test(
             "todowrite",
             ToolStatus::Completed,
             Some(json!({ "todos": todos.clone() })),
@@ -1650,7 +1654,7 @@ LSP errors detected in a.rs, please fix:
     /// the call can show yet (and the header carries no counts).
     #[test]
     fn running_todowrite_panel_shows_the_plan_size_in_its_body() {
-        let tool = ToolPanel::from_parts(
+        let tool = ToolPanel::for_test(
             "todowrite",
             ToolStatus::Running,
             Some(json!({ "todos": [
@@ -1678,7 +1682,7 @@ LSP errors detected in a.rs, please fix:
     #[test]
     fn todowrite_long_item_stays_markdown_not_fenced() {
         let content = format!("修复 {}", "很长".repeat(80));
-        let tool = ToolPanel::from_parts(
+        let tool = ToolPanel::for_test(
             "todowrite",
             ToolStatus::Completed,
             None,
@@ -1719,7 +1723,7 @@ LSP errors detected in a.rs, please fix:
         // A non-read tool with a line long enough to wrap must become a code
         // block so Feishu doesn't fold it.
         let long = format!("cargo run {}", "a".repeat(140));
-        let tool = ToolPanel::from_parts("bash", ToolStatus::Completed, None, Some(&long));
+        let tool = ToolPanel::for_test("bash", ToolStatus::Completed, None, Some(&long));
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -1738,7 +1742,7 @@ LSP errors detected in a.rs, please fix:
     #[test]
     fn tool_output_short_plain_lines_not_fenced() {
         // Short, well-formed plain output stays plain text (no fences).
-        let tool = ToolPanel::from_parts("bash", ToolStatus::Completed, None, Some("all tests passed"));
+        let tool = ToolPanel::for_test("bash", ToolStatus::Completed, None, Some("all tests passed"));
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -1799,7 +1803,7 @@ LSP errors detected in a.rs, please fix:
                    --\n\
                    244-        }\n\
                    245-    }";
-        let tool = ToolPanel::from_parts(
+        let tool = ToolPanel::for_test(
             "bash",
             ToolStatus::Completed,
             Some(json!({"command": "rg -n \"x\" -B3 -A 25 src/a.rs | head -80"})),
@@ -1831,7 +1835,7 @@ LSP errors detected in a.rs, please fix:
     /// which cannot interrupt a paragraph).
     #[test]
     fn output_marker_separated_from_an_indented_first_line() {
-        let tool = ToolPanel::from_parts(
+        let tool = ToolPanel::for_test(
             "bash",
             ToolStatus::Completed,
             None,
@@ -1906,7 +1910,7 @@ LSP errors detected in a.rs, please fix:
 
     #[test]
     fn tool_input_bash_shows_command_and_workdir() {
-        let tool = ToolPanel::from_parts(
+        let tool = ToolPanel::for_test(
             "bash",
             ToolStatus::Completed,
             Some(json!({"command": "cargo test --all", "workdir": "/proj"})),
@@ -1929,7 +1933,7 @@ LSP errors detected in a.rs, please fix:
         // -/+) read as duplicated content and hid the real change, which now
         // comes from the tool's diff output. The input shows the target file
         // and nothing else.
-        let tool = ToolPanel::from_parts(
+        let tool = ToolPanel::for_test(
             "edit",
             ToolStatus::Completed,
             Some(json!({
@@ -1962,7 +1966,7 @@ LSP errors detected in a.rs, please fix:
 
     #[test]
     fn tool_input_read_shows_path_and_limits() {
-        let tool = ToolPanel::from_parts(
+        let tool = ToolPanel::for_test(
             "read",
             ToolStatus::Completed,
             Some(json!({"filePath": "src/foo.rs", "limit": 80})),
@@ -1982,7 +1986,7 @@ LSP errors detected in a.rs, please fix:
     fn tool_input_grep_shows_pattern_once() {
         // Regression: the pattern was rendered twice (as a bare path AND as
         // "匹配 …") for grep/glob inputs.
-        let tool = ToolPanel::from_parts(
+        let tool = ToolPanel::for_test(
             "grep",
             ToolStatus::Completed,
             Some(json!({"pattern": "fn main", "path": "src/main.rs", "include": "*.rs"})),
@@ -2008,7 +2012,7 @@ LSP errors detected in a.rs, please fix:
 
     #[test]
     fn tool_input_glob_shows_pattern_once() {
-        let tool = ToolPanel::from_parts(
+        let tool = ToolPanel::for_test(
             "glob",
             ToolStatus::Completed,
             Some(json!({"pattern": "**/*.ts"})),
@@ -2030,7 +2034,7 @@ LSP errors detected in a.rs, please fix:
     /// instead of the generic `- name: …` key-value line.
     #[test]
     fn tool_input_skill_shows_its_name() {
-        let tool = ToolPanel::from_parts(
+        let tool = ToolPanel::for_test(
             "skill",
             ToolStatus::Completed,
             Some(json!({"name": "implement"})),
@@ -2056,7 +2060,7 @@ LSP errors detected in a.rs, please fix:
                          {"label": "直接实现改进", "description": "…"}]},
             {"question": "第二个问题", "header": "其他", "options": []},
         ]});
-        let tool = ToolPanel::from_parts("question", ToolStatus::Running, Some(input.clone()), None);
+        let tool = ToolPanel::for_test("question", ToolStatus::Running, Some(input.clone()), None);
         let card = CardBuilder::new()
             .with_state(CardState::Streaming)
             .with_tool(tool)
@@ -2085,7 +2089,7 @@ LSP errors detected in a.rs, please fix:
     /// the sections keeps them on separate visual lines.
     #[test]
     fn tool_panel_input_and_output_separated_by_blank_line() {
-        let tool = ToolPanel::from_parts(
+        let tool = ToolPanel::for_test(
             "skill_apply",
             ToolStatus::Completed,
             Some(json!({
@@ -2118,7 +2122,7 @@ LSP errors detected in a.rs, please fix:
     #[test]
     fn tool_input_string_shows_as_is() {
         // A bare string input (non-object) renders directly.
-        let tool = ToolPanel::from_parts("read", ToolStatus::Completed, Some(json!("src/main.rs")), None);
+        let tool = ToolPanel::for_test("read", ToolStatus::Completed, Some(json!("src/main.rs")), None);
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -2128,7 +2132,7 @@ LSP errors detected in a.rs, please fix:
 
     #[test]
     fn tool_input_unknown_falls_back_to_key_value() {
-        let tool = ToolPanel::from_parts(
+        let tool = ToolPanel::for_test(
             "custom_tool",
             ToolStatus::Completed,
             Some(json!({"a": "b", "c": 3})),

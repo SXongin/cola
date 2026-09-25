@@ -337,7 +337,7 @@ async fn a_split_registers_the_continuation_card() {
             &cards,
             "ses_split",
             &format!("call_{i}"),
-            ToolPanel::from_parts(&format!("tool{i}"), ToolStatus::Completed, None, None),
+            ToolPanel::for_test(&format!("tool{i}"), ToolStatus::Completed, None, None),
         )
         .await;
     }
@@ -701,7 +701,7 @@ async fn a_concurrent_flush_leaves_the_tail_on_one_card() {
             &cards,
             "ses_split",
             &format!("call_{i}"),
-            ToolPanel::from_parts(&format!("tool{i}"), ToolStatus::Completed, None, None),
+            ToolPanel::for_test(&format!("tool{i}"), ToolStatus::Completed, None, None),
         )
         .await;
     }
