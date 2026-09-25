@@ -673,18 +673,11 @@ fn message_preview(transcript: &SessionTranscript, anchor: &TurnAnchor) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{MessageId, MessageRole, Part, ReasoningPart, SessionTranscript, TranscriptMessage};
-    use crate::bridge::test_support::{text_part, typed_message};
+    use crate::backend::{MessageRole, Part, ReasoningPart, SessionTranscript, TranscriptMessage};
+    use crate::bridge::test_support::{text_part, turn_anchor, typed_message};
 
     fn user(id: &str, created: i64, parts: Vec<Part>) -> TranscriptMessage {
         typed_message(id, MessageRole::User, Some(created), parts)
-    }
-
-    fn turn_anchor(created_ms: i64) -> TurnAnchor {
-        TurnAnchor {
-            message_id: MessageId::new(format!("msg_{created_ms}")),
-            created_ms,
-        }
     }
 
     #[test]
