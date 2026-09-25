@@ -1,3 +1,4 @@
+use crate::backend::ToolStatus;
 use crate::bridge::test_support::*;
 
 #[tokio::test]
@@ -1835,12 +1836,12 @@ async fn late_rendered_command_lands_above_the_receipt() {
         "ses_test",
         clicked_at - 200,
         "call_1",
-        crate::feishu::card::tool_render::ToolPanel {
-            name: "bash".into(),
-            status: "running".into(),
-            input: Some(serde_json::json!({ "command": "ls -la" })),
-            output: None,
-        },
+        crate::feishu::card::tool_render::ToolPanel::from_parts(
+            "bash",
+            ToolStatus::Running,
+            Some(serde_json::json!({ "command": "ls -la" })),
+            None,
+        ),
     )
     .await;
     crate::bridge::turn::Turn::flush_card(&app.cards_handle(), "ses_test").await;
@@ -1860,12 +1861,12 @@ async fn late_rendered_command_lands_above_the_receipt() {
         "ses_test",
         clicked_at - 200,
         "call_1",
-        crate::feishu::card::tool_render::ToolPanel {
-            name: "bash".into(),
-            status: "completed".into(),
-            input: Some(serde_json::json!({ "command": "ls -la" })),
-            output: Some("src".into()),
-        },
+        crate::feishu::card::tool_render::ToolPanel::from_parts(
+            "bash",
+            ToolStatus::Completed,
+            Some(serde_json::json!({ "command": "ls -la" })),
+            Some("src"),
+        ),
     )
     .await;
     crate::bridge::turn::Turn::flush_card(&app.cards_handle(), "ses_test").await;

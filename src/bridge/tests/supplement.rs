@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use crate::backend::ToolStatus;
 use crate::bridge::test_support::*;
 use crate::feishu::card::CardState;
 
@@ -230,17 +231,19 @@ async fn a_split_continuation_takes_the_running_tool_panel_over() {
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
     seed_session(&app, "ses_test", "/work").await;
 
-    let bash = |status: &str| crate::feishu::card::tool_render::ToolPanel {
-        name: "bash".into(),
-        status: status.into(),
-        input: Some(serde_json::json!({"command": "sleep 30"})),
-        output: None,
+    let bash = |status: ToolStatus| {
+        crate::feishu::card::tool_render::ToolPanel::from_parts(
+            "bash",
+            status,
+            Some(serde_json::json!({"command": "sleep 30"})),
+            None,
+        )
     };
     let cards = app.cards_handle();
     Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
     Turn::set_card_state(&cards, "ses_test", CardState::Streaming).await;
     Turn::push_text(&cards, "ses_test", "开始分析。").await;
-    Turn::push_tool(&cards, "ses_test", "call_bash", bash("running")).await;
+    Turn::push_tool(&cards, "ses_test", "call_bash", bash(ToolStatus::Running)).await;
     Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
     app.inflight.lock().await.insert("ses_test".to_string());
 
@@ -294,12 +297,12 @@ async fn a_tool_completing_after_the_split_renders_on_the_continuation() {
         &cards,
         "ses_test",
         "call_bash",
-        crate::feishu::card::tool_render::ToolPanel {
-            name: "bash".into(),
-            status: "running".into(),
-            input: Some(serde_json::json!({"command": "sleep 30"})),
-            output: None,
-        },
+        crate::feishu::card::tool_render::ToolPanel::from_parts(
+            "bash",
+            ToolStatus::Running,
+            Some(serde_json::json!({"command": "sleep 30"})),
+            None,
+        ),
     )
     .await;
     Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
@@ -380,12 +383,12 @@ async fn a_finished_tool_does_not_leak_into_the_continuation_header() {
         &cards,
         "ses_test",
         "call_bash",
-        crate::feishu::card::tool_render::ToolPanel {
-            name: "bash".into(),
-            status: "completed".into(),
-            input: Some(serde_json::json!({"command": "sleep 30"})),
-            output: Some("done".into()),
-        },
+        crate::feishu::card::tool_render::ToolPanel::from_parts(
+            "bash",
+            ToolStatus::Completed,
+            Some(serde_json::json!({"command": "sleep 30"})),
+            Some("done"),
+        ),
     )
     .await;
     Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
@@ -1266,12 +1269,12 @@ async fn size_and_supplement_split_collide_with_one_continuation() {
             &cards,
             "ses_test",
             &format!("call_{i}"),
-            crate::feishu::card::tool_render::ToolPanel {
-                name: format!("tool{i}"),
-                status: "completed".into(),
-                input: None,
-                output: None,
-            },
+            crate::feishu::card::tool_render::ToolPanel::from_parts(
+                &format!("tool{i}"),
+                ToolStatus::Completed,
+                None,
+                None,
+            ),
         )
         .await;
     }

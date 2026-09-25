@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::Instrument;
 
-use crate::backend::{ContentBlock, MessageRole, Part, SessionTranscript, ToolCall, ToolStatus};
+use crate::backend::{MessageRole, Part, SessionTranscript, ToolCall, ToolStatus};
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
 use crate::bridge::handles::{CardsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
@@ -118,120 +118,11 @@ async fn refresh_session_title(
     true
 }
 
-/// Assemble the Tool Panel a typed call renders as: its identity, the legacy
-/// status vocabulary the panel header shows, the raw input, and the output
-/// text the card has always rendered.
-///
-/// The output string is presentation assembly, not protocol decoding: the
-/// decoder already applied the sources' precedence into
-/// [`ToolOutput::blocks`], so a payload carrying more than one text source can
-/// never render twice. A failure's message is output-side data (the decoder
-/// normalized the server's error shapes into [`ToolOutput::error`]); the panel
-/// shows it as the `❌ …` line it always has. For a file-editing tool, the
-/// real diff recorded in the call's raw metadata replaces the plain success
-/// sentence ([`tool_output`] only renders blocks, which say nothing about what
-/// changed).
+/// Assemble the Tool Panel a typed call renders as: the panel is a view over
+/// the call (identity, typed status, raw input/metadata, typed output), and
+/// the Platform assembles the output text and status icon from it (ADR-0042).
 fn tool_panel(call: &ToolCall) -> crate::feishu::card::tool_render::ToolPanel {
-    let name = call.identity.name.as_str();
-    let output = if name == "edit" || name == "apply_patch" {
-        edit_tool_output(call)
-    } else {
-        tool_output(call)
-    };
-    crate::feishu::card::tool_render::ToolPanel {
-        name: name.to_string(),
-        status: tool_status_label(&call.status),
-        input: call.input.clone(),
-        output,
-    }
-}
-
-/// The status string the panel renders, preserving the legacy vocabulary the
-/// card header/icons have always used. A missing status read as `completed`
-/// (the old default) and an unrecognized one keeps its name; live/settled
-/// classification still speaks the panel's own strings until #337 moves it
-/// onto the typed status.
-fn tool_status_label(status: &ToolStatus) -> String {
-    match status {
-        ToolStatus::Pending => "pending".into(),
-        ToolStatus::Running => "running".into(),
-        ToolStatus::Completed => "completed".into(),
-        ToolStatus::Error => "error".into(),
-        ToolStatus::Other(other) => other.clone(),
-        ToolStatus::Unknown => "completed".into(),
-    }
-}
-
-/// The text a tool panel renders for a call: the decoder's text blocks joined
-/// (in decoder order), with a failure's message appended on its own line. An
-/// explicit empty text block still counts as output (the historical
-/// `metadata.output: ""` rendered as an empty body, not as no output); a call
-/// with neither text nor an error has no output.
-///
-/// Non-text blocks and the raw payload stay out: the pre-migration renderer
-/// assembled this same plain string from the text sources only, and #337
-/// carries the full typed view (raw included) into the panel.
-fn tool_output(call: &ToolCall) -> Option<String> {
-    let mut out = String::new();
-    let mut has_output = false;
-    for block in &call.output.blocks {
-        if let ContentBlock::Text(text) = block {
-            has_output = true;
-            out.push_str(text);
-        }
-    }
-    if call.status == ToolStatus::Error
-        && let Some(error) = &call.output.error
-    {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(&format!("❌ {}", error));
-        has_output = true;
-    }
-    has_output.then_some(out)
-}
-
-/// For a file-editing tool (`edit`, `apply_patch`), prefer the REAL diff
-/// recorded in the call's raw metadata (`createTwoFilesPatch`) over the tool's
-/// plain text output ("Edit applied successfully." / "Success. Updated the
-/// following files: …"), which tells the reader nothing about what changed.
-/// Failures keep their extracted error text.
-fn edit_tool_output(call: &ToolCall) -> Option<String> {
-    let orig = tool_output(call);
-    if call.status == ToolStatus::Error {
-        return orig;
-    }
-    let diff = call
-        .metadata
-        .as_ref()
-        .and_then(|metadata| metadata.get("diff"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|diff| !diff.is_empty())?;
-    // The success sentence (and, for apply_patch, the A/M/D file summary after
-    // it) is noise once the diff is shown; anything beyond it (e.g. an "LSP
-    // errors detected" note) is kept as a tail after the diff.
-    let tail = orig
-        .as_deref()
-        .and_then(|output| match call.identity.name.as_str() {
-            "apply_patch" => strip_patch_summary(output),
-            _ => output.strip_prefix("Edit applied successfully."),
-        })
-        .map(|s| s.trim_start_matches('\n'))
-        .filter(|s| !s.is_empty());
-    Some(match tail {
-        Some(t) => format!("{diff}\n\n{t}"),
-        None => diff.to_string(),
-    })
-}
-
-/// Drop `apply_patch`'s success summary — `Success. Updated the following
-/// files:` plus its `A`/`M`/`D` path lines — and return what follows (the LSP
-/// note blocks, separated by a blank line), or `None` when nothing follows.
-fn strip_patch_summary(output: &str) -> Option<&str> {
-    output
-        .strip_prefix("Success. Updated the following files:")
-        .and_then(|rest| rest.split_once("\n\n").map(|(_, tail)| tail))
+    crate::feishu::card::tool_render::ToolPanel::new(call.clone())
 }
 
 /// Render one typed part into the accumulator, applying the dedup rules: text
@@ -774,17 +665,16 @@ mod tests {
         assert!(acc.reasoning.contains("The user is asking in Chinese."));
         assert_eq!(acc.tools.len(), 1);
         let tool = &acc.tools["call_1"];
-        assert_eq!(tool.name, "bash");
-        assert_eq!(tool.status, "completed");
+        assert_eq!(tool.name(), "bash");
+        assert_eq!(tool.status(), &ToolStatus::Completed);
         assert!(
-            tool.output
+            tool.output()
                 .as_deref()
                 .unwrap()
                 .contains("/root/workspace/dev/cola")
         );
         assert!(
-            tool.input
-                .as_ref()
+            tool.input()
                 .map(|i| i.to_string())
                 .unwrap_or_default()
                 .contains("pwd")
@@ -809,39 +699,7 @@ mod tests {
         )];
         let mut acc = StreamAccumulator::new("test");
         render_parts(&mut acc, &parts);
-        assert_eq!(acc.tools["call_2"].output.as_deref(), Some("fn main() {}"));
-    }
-
-    /// A failure's decoded message joins the output text on its OWN line: the
-    /// pieces are separate, so a missing separator runs them together. The
-    /// mutation audit (render.rs:144/158) found both separators surviving the
-    /// suite.
-    #[test]
-    fn tool_output_joins_content_result_and_error_on_separate_lines() {
-        let completed = tool_call(
-            "bash",
-            "call_1",
-            ToolStatus::Completed,
-            None,
-            None,
-            vec![crate::backend::ContentBlock::Text(
-                "first block\nsecond block".into(),
-            )],
-        );
-        assert_eq!(
-            tool_output(&completed).as_deref(),
-            Some("first block\nsecond block")
-        );
-
-        let failed = ToolCall {
-            output: ToolOutput {
-                raw: None,
-                blocks: vec![crate::backend::ContentBlock::Text("before the error".into())],
-                error: Some("boom".into()),
-            },
-            ..tool_call("bash", "call_2", ToolStatus::Error, None, None, Vec::new())
-        };
-        assert_eq!(tool_output(&failed).as_deref(), Some("before the error\n❌ boom"));
+        assert_eq!(acc.tools["call_2"].output().as_deref(), Some("fn main() {}"));
     }
 
     /// A tool part's `running` status marks the card Streaming; a completed one
@@ -913,7 +771,7 @@ Index: /x/src/main.rs
         let parts = vec![Part::Tool(call)];
         let mut acc = StreamAccumulator::new("test");
         render_parts(&mut acc, &parts);
-        let out = acc.tools["call_patch"].output.as_deref().unwrap();
+        let out = acc.tools["call_patch"].output().unwrap();
         assert!(out.contains("+let b = 3;"), "hunk shown: {out}");
         assert!(
             out.contains("LSP errors detected in src/main.rs"),
@@ -1025,7 +883,8 @@ Index: /x/src/main.rs
             acc.reasoning
         );
         assert_eq!(
-            acc.tools["call_task"].status, "running",
+            acc.tools["call_task"].status(),
+            &ToolStatus::Running,
             "the running panel must render live, not only at finalization"
         );
 
@@ -1064,15 +923,15 @@ Index: /x/src/main.rs
             &mut acc,
             &transcript(None, ToolStatus::Running, "")
         ));
-        assert_eq!(acc.tools["call_task"].status, "running");
+        assert_eq!(acc.tools["call_task"].status(), &ToolStatus::Running);
 
         // Completed AFTER the anchor: the settled panel still renders.
         assert!(render_new_turn_parts(
             &mut acc,
             &transcript(Some(2_500), ToolStatus::Completed, "research done")
         ));
-        assert_eq!(acc.tools["call_task"].status, "completed");
-        assert_eq!(acc.tools["call_task"].output.as_deref(), Some("research done"));
+        assert_eq!(acc.tools["call_task"].status(), &ToolStatus::Completed);
+        assert_eq!(acc.tools["call_task"].output().as_deref(), Some("research done"));
 
         // Re-fetching the same settled state must not duplicate.
         assert!(!render_new_turn_parts(
@@ -1274,14 +1133,14 @@ Index: /x/src/main.rs
             &mut acc,
             &transcript(ToolStatus::Running, "")
         ));
-        assert_eq!(acc.tools["call_1"].status, "running");
+        assert_eq!(acc.tools["call_1"].status(), &ToolStatus::Running);
 
         // Same call, updated to completed — must re-render (upsert).
         assert!(render_new_turn_parts(
             &mut acc,
             &transcript(ToolStatus::Completed, "src\n")
         ));
-        assert_eq!(acc.tools["call_1"].status, "completed");
+        assert_eq!(acc.tools["call_1"].status(), &ToolStatus::Completed);
 
         // No change → nothing new.
         assert!(!render_new_turn_parts(
@@ -1413,12 +1272,12 @@ Index: /x/src/main.rs
             "status": "pending",
         }])
         .to_string();
-        acc.todo_panel = Some(crate::feishu::card::tool_render::ToolPanel {
-            name: "todowrite".into(),
-            status: "completed".into(),
-            input: None,
-            output: Some(output),
-        });
+        acc.todo_panel = Some(crate::feishu::card::tool_render::ToolPanel::from_parts(
+            "todowrite",
+            ToolStatus::Completed,
+            None,
+            Some(&output),
+        ));
         // Two max-size CJK text chunks (~18KB each): the first alone plus the
         // reserve is over the budget, so only the progress guarantee keeps the
         // chain moving.
@@ -1654,8 +1513,8 @@ Index: /x/src/main.rs
 
         assert!(render_new_turn_parts(&mut acc, &transcript));
         let tool = acc.tools.get("call_edit").expect("tool rendered");
-        assert_eq!(tool.status, "error");
-        let out = tool.output.clone().unwrap_or_default();
+        assert_eq!(tool.status(), &ToolStatus::Error);
+        let out = tool.output().unwrap_or_default();
         assert!(
             out.contains("no such file"),
             "error message must be shown: {}",
@@ -1695,8 +1554,8 @@ Index: /x/src/main.rs
 
         assert!(render_new_turn_parts(&mut acc, &transcript));
         let tool = acc.tools.get("call_edit").expect("tool rendered");
-        assert_eq!(tool.status, "error");
-        let out = tool.output.clone().unwrap_or_default();
+        assert_eq!(tool.status(), &ToolStatus::Error);
+        let out = tool.output().unwrap_or_default();
         assert!(
             out.contains("Could not find oldString"),
             "string error message must be shown: {:?}",
@@ -1748,7 +1607,7 @@ Index: /x/src/main.rs
                 None
             ))
         ));
-        let out = acc.tools["call_edit"].output.clone().unwrap_or_default();
+        let out = acc.tools["call_edit"].output().unwrap_or_default();
         assert!(out.contains("@@ -1 +1 @@"), "diff must be shown: {}", out);
         assert!(
             !out.contains("Edit applied successfully."),
@@ -1774,7 +1633,7 @@ Index: /x/src/main.rs
             &mut acc,
             &transcript(edit(ToolStatus::Error, None, true, Some("no such file")))
         ));
-        let out = acc.tools["call_edit"].output.clone().unwrap_or_default();
+        let out = acc.tools["call_edit"].output().unwrap_or_default();
         assert!(out.contains("no such file"), "error text must be shown: {}", out);
         assert!(!out.contains("@@"), "no diff on a failed edit: {}", out);
     }
@@ -1811,7 +1670,7 @@ Index: /x/src/main.rs
         assert!(!render_parts(&mut acc, &parts));
         assert_eq!(acc.text, "The answer.");
         assert_eq!(acc.reasoning, "Let me check");
-        assert_eq!(acc.tools["call_1"].output.as_deref(), Some("src"));
+        assert_eq!(acc.tools["call_1"].output().as_deref(), Some("src"));
     }
 
     /// A header change alone must re-flush the card: the progress timer keeps

@@ -86,15 +86,13 @@ pub(super) struct BuiltCard {
 fn panel_estimate(p: &ToolPanel) -> usize {
     let first_n_bytes = |s: &str, n: usize| s.chars().take(n).map(|c| c.len_utf8()).sum::<usize>();
     let input = p
-        .input
-        .as_ref()
+        .input()
         .map(|x| x.to_string())
         .map(|s| first_n_bytes(&s, 400))
         .unwrap_or(0);
     let output = p
-        .output
-        .as_deref()
-        .map(|s| first_n_bytes(s, crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS))
+        .output()
+        .map(|s| first_n_bytes(&s, crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS))
         .unwrap_or(0);
     400 + input + output
 }
@@ -553,8 +551,8 @@ impl StreamAccumulator {
                 // A running todowrite is a tail panel, not a timeline tool, but
                 // it is still a running tool: ADR-0014 gives it the Tool phase
                 // (and the timer reset that comes with it), like any other.
-                let running = self.tools.values().any(|t| t.status == "running")
-                    || self.todo_panel.as_ref().is_some_and(|t| t.status == "running");
+                let running = self.tools.values().any(|t| t.is_running())
+                    || self.todo_panel.as_ref().is_some_and(|t| t.is_running());
                 if running {
                     Some(HeaderPhase::Tool)
                 } else {
@@ -768,8 +766,8 @@ impl StreamAccumulator {
     fn running_tool(&self) -> Option<&ToolPanel> {
         self.tools
             .values()
-            .find(|t| t.status == "running")
-            .or_else(|| self.todo_panel.as_ref().filter(|t| t.status == "running"))
+            .find(|t| t.is_running())
+            .or_else(|| self.todo_panel.as_ref().filter(|t| t.is_running()))
     }
 
     /// The header (title, template) this accumulator's card should show: the
@@ -1514,6 +1512,7 @@ pub(super) async fn refresh_context_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::ToolStatus;
     use crate::feishu::card::MAX_CARD_TEXT_CHARS;
 
     #[test]
@@ -1777,12 +1776,12 @@ mod tests {
         // More content arrives on the next poll.
         acc.push_tool(
             "call_1",
-            ToolPanel {
-                name: "bash".into(),
-                status: "completed".into(),
-                input: Some(serde_json::json!("ls")),
-                output: Some("src".into()),
-            },
+            ToolPanel::from_parts(
+                "bash",
+                ToolStatus::Completed,
+                Some(serde_json::json!("ls")),
+                Some("src"),
+            ),
         );
         acc.push_text("第二条文本。");
         let (card2, full2) = acc.build_card_with_split();
@@ -1807,12 +1806,7 @@ mod tests {
         for i in 0..50 {
             acc.push_tool(
                 &format!("call_{}", i),
-                ToolPanel {
-                    name: format!("tool{}", i),
-                    status: "completed".into(),
-                    input: None,
-                    output: None,
-                },
+                ToolPanel::from_parts(&format!("tool{}", i), ToolStatus::Completed, None, None),
             );
         }
         acc.push_text("最后的结论。");
@@ -1851,12 +1845,12 @@ mod tests {
         for i in 0..12 {
             acc.push_tool(
                 &format!("call_{}", i),
-                ToolPanel {
-                    name: format!("tool{}", i),
-                    status: "completed".into(),
-                    input: Some(serde_json::json!("in")),
-                    output: Some(big_output.clone()),
-                },
+                ToolPanel::from_parts(
+                    &format!("tool{}", i),
+                    ToolStatus::Completed,
+                    Some(serde_json::json!("in")),
+                    Some(&big_output),
+                ),
             );
         }
         acc.push_text("最后的结论。");
@@ -1902,12 +1896,12 @@ mod tests {
         for i in 0..7 {
             acc.push_tool(
                 &format!("call_{}", i),
-                ToolPanel {
-                    name: format!("tool{}", i),
-                    status: "completed".into(),
-                    input: Some(serde_json::json!("入参")),
-                    output: Some(cjk_output.clone()),
-                },
+                ToolPanel::from_parts(
+                    &format!("tool{}", i),
+                    ToolStatus::Completed,
+                    Some(serde_json::json!("入参")),
+                    Some(&cjk_output),
+                ),
             );
         }
         acc.push_text("最后的结论。");
@@ -2017,22 +2011,22 @@ mod tests {
         acc.push_text("先看一下目录。");
         acc.push_tool(
             "call_1",
-            ToolPanel {
-                name: "bash".into(),
-                status: "completed".into(),
-                input: Some(serde_json::json!("ls")),
-                output: Some("src".into()),
-            },
+            ToolPanel::from_parts(
+                "bash",
+                ToolStatus::Completed,
+                Some(serde_json::json!("ls")),
+                Some("src"),
+            ),
         );
         acc.push_text("再看一下配置。");
         acc.push_tool(
             "call_2",
-            ToolPanel {
-                name: "read".into(),
-                status: "completed".into(),
-                input: Some(serde_json::json!("cola.toml")),
-                output: Some("[bridge]".into()),
-            },
+            ToolPanel::from_parts(
+                "read",
+                ToolStatus::Completed,
+                Some(serde_json::json!("cola.toml")),
+                Some("[bridge]"),
+            ),
         );
         acc.push_text("结论是...");
 
@@ -2087,12 +2081,12 @@ mod tests {
         acc.push_text(&text);
         acc.push_tool(
             "call_web",
-            ToolPanel {
-                name: "websearch".into(),
-                status: "completed".into(),
-                input: None,
-                output: Some("see <number_tag> and\n\n| p | q |\n|---|---|\n| 1 | 2 |".into()),
-            },
+            ToolPanel::from_parts(
+                "websearch",
+                ToolStatus::Completed,
+                None,
+                Some("see <number_tag> and\n\n| p | q |\n|---|---|\n| 1 | 2 |"),
+            ),
         );
 
         let card = acc.build_card();
@@ -2114,21 +2108,16 @@ mod tests {
         let mut acc = StreamAccumulator::new("test");
         acc.push_tool(
             "call_1",
-            ToolPanel {
-                name: "bash".into(),
-                status: "running".into(),
-                input: Some(serde_json::json!("ls")),
-                output: None,
-            },
+            ToolPanel::from_parts("bash", ToolStatus::Running, Some(serde_json::json!("ls")), None),
         );
         acc.push_tool(
             "call_1",
-            ToolPanel {
-                name: "bash".into(),
-                status: "completed".into(),
-                input: Some(serde_json::json!("ls")),
-                output: Some("src".into()),
-            },
+            ToolPanel::from_parts(
+                "bash",
+                ToolStatus::Completed,
+                Some(serde_json::json!("ls")),
+                Some("src"),
+            ),
         );
         assert_eq!(acc.tools.len(), 1);
         assert_eq!(acc.timeline.len(), 1, "one tool marker, no duplicates");
@@ -2139,14 +2128,16 @@ mod tests {
     /// card — carries it, so the completion can never strand on a closed card.
     #[test]
     fn a_running_tool_panel_rides_the_live_continuation() {
-        let bash = |status: &str, output: Option<&str>| ToolPanel {
-            name: "bash".into(),
-            status: status.into(),
-            input: Some(serde_json::json!({ "command": "sleep 30" })),
-            output: output.map(|o| o.to_string()),
+        let bash = |status: ToolStatus, output: Option<&str>| {
+            ToolPanel::from_parts(
+                "bash",
+                status,
+                Some(serde_json::json!({ "command": "sleep 30" })),
+                output,
+            )
         };
         let mut acc = StreamAccumulator::new("test");
-        acc.push_tool("call_bash", bash("running", None));
+        acc.push_tool("call_bash", bash(ToolStatus::Running, None));
         // Enough text to push the timeline past one card's budget.
         acc.push_text(&"很长的回答。".repeat(2000));
 
@@ -2173,20 +2164,22 @@ mod tests {
     /// content it actually preceded.
     #[test]
     fn a_late_server_start_time_orders_the_settled_panel() {
-        let bash = |status: &str, output: Option<&str>| ToolPanel {
-            name: "bash".into(),
-            status: status.into(),
-            input: Some(serde_json::json!({ "command": "sleep 30" })),
-            output: output.map(|o| o.to_string()),
+        let bash = |status: ToolStatus, output: Option<&str>| {
+            ToolPanel::from_parts(
+                "bash",
+                status,
+                Some(serde_json::json!({ "command": "sleep 30" })),
+                output,
+            )
         };
         let mut acc = StreamAccumulator::new("test");
-        acc.push_tool_at(None, "call_bash", bash("pending", None));
+        acc.push_tool_at(None, "call_bash", bash(ToolStatus::Pending, None));
         // Content that really started before and after the tool (server keys
         // 0 and 1000); the tool's own start time lands later.
         acc.push_text_at(Some(0), "第一段");
         acc.push_text_at(Some(1_000), "第二段");
-        acc.push_tool_at(Some(500), "call_bash", bash("running", None));
-        acc.push_tool_at(Some(500), "call_bash", bash("completed", Some("done")));
+        acc.push_tool_at(Some(500), "call_bash", bash(ToolStatus::Running, None));
+        acc.push_tool_at(Some(500), "call_bash", bash(ToolStatus::Completed, Some("done")));
 
         let card = acc.build_card();
         let elements = card["body"]["elements"].as_array().unwrap();
@@ -2221,21 +2214,23 @@ mod tests {
                 .map(|e| e["element_id"].as_str().unwrap().to_string())
                 .collect()
         };
-        let bash = |status: &str, output: Option<&str>| ToolPanel {
-            name: "bash".into(),
-            status: status.into(),
-            input: Some(serde_json::json!({ "command": "sleep 30" })),
-            output: output.map(|o| o.to_string()),
+        let bash = |status: ToolStatus, output: Option<&str>| {
+            ToolPanel::from_parts(
+                "bash",
+                status,
+                Some(serde_json::json!({ "command": "sleep 30" })),
+                output,
+            )
         };
         let mut acc = StreamAccumulator::new("test");
-        acc.push_tool("call_bash", bash("running", None));
+        acc.push_tool("call_bash", bash(ToolStatus::Running, None));
         // While the tool runs the panel is live: it renders on the card, but
         // has not joined the timeline.
         assert!(acc.timeline.is_empty(), "a running panel is not history yet");
         let running_card = acc.build_card();
         assert_eq!(panel_ids(&running_card).len(), 1, "{running_card}");
 
-        acc.push_tool("call_bash", bash("completed", Some("done")));
+        acc.push_tool("call_bash", bash(ToolStatus::Completed, Some("done")));
         assert_eq!(acc.timeline.len(), 1, "the settled panel joins the timeline");
         let done_card = acc.build_card();
         assert!(
@@ -2265,42 +2260,42 @@ mod tests {
         // A running tool is its own phase.
         acc.push_tool(
             "call_1",
-            ToolPanel {
-                name: "bash".into(),
-                status: "running".into(),
-                input: Some(serde_json::json!("cargo test")),
-                output: None,
-            },
+            ToolPanel::from_parts(
+                "bash",
+                ToolStatus::Running,
+                Some(serde_json::json!("cargo test")),
+                None,
+            ),
         );
         assert_eq!(acc.active_phase(), Some(HeaderPhase::Tool));
         // Tool completes → back to plain streaming (timer resets).
         acc.push_tool(
             "call_1",
-            ToolPanel {
-                name: "bash".into(),
-                status: "completed".into(),
-                input: Some(serde_json::json!("cargo test")),
-                output: Some("ok".into()),
-            },
+            ToolPanel::from_parts(
+                "bash",
+                ToolStatus::Completed,
+                Some(serde_json::json!("cargo test")),
+                Some("ok"),
+            ),
         );
         assert_eq!(acc.active_phase(), Some(HeaderPhase::Streaming));
         // A running todowrite is a tail panel, not a timeline tool, but it is
         // still a running tool: it gets the Tool phase too, and a completed one
         // drops back. (Mutation audit, state.rs:548 — the todo_panel status
         // comparison survived the tools-only coverage.)
-        acc.todo_panel = Some(ToolPanel {
-            name: "todowrite".into(),
-            status: "running".into(),
-            input: None,
-            output: None,
-        });
+        acc.todo_panel = Some(ToolPanel::from_parts(
+            "todowrite",
+            ToolStatus::Running,
+            None,
+            None,
+        ));
         assert_eq!(acc.active_phase(), Some(HeaderPhase::Tool));
-        acc.todo_panel = Some(ToolPanel {
-            name: "todowrite".into(),
-            status: "completed".into(),
-            input: None,
-            output: None,
-        });
+        acc.todo_panel = Some(ToolPanel::from_parts(
+            "todowrite",
+            ToolStatus::Completed,
+            None,
+            None,
+        ));
         assert_eq!(acc.active_phase(), Some(HeaderPhase::Streaming));
         // Finished turns show no timer phase.
         acc.card_state = CardState::Done;
