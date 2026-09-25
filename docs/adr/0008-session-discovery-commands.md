@@ -105,3 +105,17 @@ How a user finds and takes over sessions that were not created in Feishu
 - `/list --all` shows sub-task children by id-tail/directory only (their titles
   are `Child session - ...`); adoption of a child is possible and deliberately
   left out of `/switch` auto-adoption.
+
+## Update (2026-09-25)
+
+The experimental route excludes **archived** sessions by default but not
+sub-task children: children are excluded only when the request passes
+`roots=true`, and the server applies its page limit (default 100) before any
+client-side filter — so a page can be all children. It was: 463 of 809
+non-archived sessions were children, the newest 100 rows left cola only 11
+roots, and `/switch` showed 11 sessions (issue #325). `list_sessions` now sends
+`roots=true` and follows `x-next-cursor` to the end (bounded at 100 pages), so
+neither children crowding the page nor a store larger than one page can hide
+root sessions. The 30 s cache, the client-side sort and `/list`'s 15-row
+display cap are unchanged, as is the project-scoped `GET /session` fallback for
+older servers.

@@ -6,10 +6,14 @@
 //! the socket — no mock of the HTTP library — so the bytes under test are the
 //! production ones (ADR-0031). Compiled only for tests.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+/// One response inside a [`Route::script`]: extra headers and a JSON body.
+type ScriptedResponse = (Vec<(String, String)>, Vec<u8>);
 
 /// A scripted response for requests whose method and path prefix match.
 struct Route {
@@ -18,8 +22,39 @@ struct Route {
     status: u16,
     content_type: String,
     body: Vec<u8>,
+    /// Extra response headers, written after content-type.
+    headers: Vec<(String, String)>,
     /// Held before the response is written — for exercising client timeouts.
     delay: Duration,
+    /// When non-empty, matched requests consume these in order (the last
+    /// repeats) instead of the fields above — for cursor/pagination flows
+    /// where the second request must see a different response.
+    script: Vec<ScriptedResponse>,
+    /// How many requests have been served from `script`.
+    served: AtomicUsize,
+}
+
+/// One scripted response for [`TestHttpServer::route_sequence`]: extra
+/// response headers and the JSON body.
+pub struct MockResponse {
+    headers: Vec<(String, String)>,
+    body: String,
+}
+
+impl MockResponse {
+    /// A `200 OK` response with no extra headers.
+    pub fn json(body: impl Into<String>) -> Self {
+        Self {
+            headers: Vec::new(),
+            body: body.into(),
+        }
+    }
+
+    /// Add a response header.
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
 }
 
 /// One request received by the server, recorded for assertions.
@@ -115,7 +150,34 @@ impl TestHttpServer {
             status,
             content_type: content_type.to_string(),
             body: body.into(),
+            headers: Vec::new(),
             delay: Duration::ZERO,
+            script: Vec::new(),
+            served: AtomicUsize::new(0),
+        });
+    }
+
+    /// Answer matching requests from a script: one response per request, in
+    /// order, the last repeating. For protocols where the client is expected
+    /// to come back with a cursor (`list_sessions` follows `x-next-cursor`).
+    pub fn route_sequence(&self, method: &str, path_prefix: &str, responses: Vec<MockResponse>) {
+        assert!(
+            !responses.is_empty(),
+            "a route sequence needs at least one response"
+        );
+        self.state.routes.lock().unwrap().push(Route {
+            method: method.to_ascii_uppercase(),
+            path_prefix: path_prefix.to_string(),
+            status: 200,
+            content_type: "application/json".to_string(),
+            body: Vec::new(),
+            headers: Vec::new(),
+            delay: Duration::ZERO,
+            script: responses
+                .into_iter()
+                .map(|r| (r.headers, r.body.into_bytes()))
+                .collect(),
+            served: AtomicUsize::new(0),
         });
     }
 
@@ -135,7 +197,10 @@ impl TestHttpServer {
             status,
             content_type: "application/json".to_string(),
             body: body.into().into_bytes(),
+            headers: Vec::new(),
             delay,
+            script: Vec::new(),
+            served: AtomicUsize::new(0),
         });
     }
 
@@ -174,12 +239,12 @@ async fn handle_connection(stream: tokio::net::TcpStream, state: Arc<ServerState
         return;
     };
     state.requests.lock().unwrap().push(request.clone());
-    let (status, content_type, body, delay) = response_for(&state, &request);
+    let (status, content_type, headers, body, delay) = response_for(&state, &request);
     if !delay.is_zero() {
         tokio::time::sleep(delay).await;
     }
     let mut stream = reader.into_inner();
-    write_response(&mut stream, status, &content_type, &body).await;
+    write_response(&mut stream, status, &content_type, &headers, &body).await;
 }
 
 async fn read_request(reader: &mut tokio::io::BufReader<tokio::net::TcpStream>) -> Option<RecordedRequest> {
@@ -225,22 +290,41 @@ async fn read_request(reader: &mut tokio::io::BufReader<tokio::net::TcpStream>) 
     })
 }
 
-fn response_for(state: &ServerState, request: &RecordedRequest) -> (u16, String, Vec<u8>, Duration) {
+fn response_for(
+    state: &ServerState,
+    request: &RecordedRequest,
+) -> (u16, String, Vec<(String, String)>, Vec<u8>, Duration) {
     let routes = state.routes.lock().unwrap();
     let matched = routes
         .iter()
         .filter(|route| route.method == request.method && request.path.starts_with(&route.path_prefix))
         .max_by_key(|route| route.path_prefix.len());
     match matched {
+        Some(route) if !route.script.is_empty() => {
+            let index = route
+                .served
+                .fetch_add(1, Ordering::Relaxed)
+                .min(route.script.len() - 1);
+            let (headers, body) = &route.script[index];
+            (
+                200,
+                "application/json".to_string(),
+                headers.clone(),
+                body.clone(),
+                Duration::ZERO,
+            )
+        }
         Some(route) => (
             route.status,
             route.content_type.clone(),
+            route.headers.clone(),
             route.body.clone(),
             route.delay,
         ),
         None => (
             404,
             "application/json".to_string(),
+            Vec::new(),
             serde_json::json!({
                 "code": -1,
                 "msg": format!("no route for {} {}", request.method, request.path),
@@ -252,12 +336,22 @@ fn response_for(state: &ServerState, request: &RecordedRequest) -> (u16, String,
     }
 }
 
-async fn write_response(stream: &mut tokio::net::TcpStream, status: u16, content_type: &str, body: &[u8]) {
-    let head = format!(
-        "HTTP/1.1 {status} {}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+async fn write_response(
+    stream: &mut tokio::net::TcpStream,
+    status: u16,
+    content_type: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) {
+    let mut head = format!(
+        "HTTP/1.1 {status} {}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\n",
         reason_phrase(status),
         body.len(),
     );
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("connection: close\r\n\r\n");
     let _ = stream.write_all(head.as_bytes()).await;
     let _ = stream.write_all(body).await;
     let _ = stream.flush().await;
