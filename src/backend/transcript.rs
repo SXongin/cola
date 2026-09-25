@@ -121,9 +121,8 @@ fn belongs_to_turn(time: &MessageTime, anchor_ms: i64) -> bool {
 pub struct TranscriptMessage {
     pub id: MessageId,
     pub role: MessageRole,
-    /// Server time the message was created (`time.created`) and, for an
-    /// assistant message, finished producing (`time.completed`). `None` when
-    /// the payload carried no time at all.
+    /// Server time the message was created and, for an assistant message,
+    /// finished producing. `None` when the payload carried no time at all.
     pub time: Option<MessageTime>,
     /// The model that produced an assistant message, when the payload names
     /// one.
@@ -290,8 +289,8 @@ pub enum Part {
 
 impl Part {
     /// The server start time (epoch ms) the part carries, when it has one:
-    /// a text/reasoning part's `time.start`, a tool's `state.time.start`.
-    /// Parts that never render a clock report `None`.
+    /// when a text/reasoning part or a tool call began. Parts that never
+    /// render a clock report `None`.
     pub fn started_at(&self) -> Option<i64> {
         match self {
             Part::Text(part) => part.started_at,
@@ -363,7 +362,7 @@ pub struct Patch {
 /// A part kind this build does not model, kept raw.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OtherPart {
-    /// The wire kind, empty when the payload named none.
+    /// The backend's kind name, empty when the payload named none.
     pub kind: String,
     pub raw: Value,
 }
@@ -373,7 +372,7 @@ pub struct OtherPart {
 pub struct ToolCall {
     pub identity: ToolIdentity,
     pub status: ToolStatus,
-    /// Server time the call started (`state.time.start`), when reported.
+    /// Server time the call started, when reported.
     pub started_at: Option<i64>,
     /// The raw structured input, verbatim.
     pub input: Option<Value>,
