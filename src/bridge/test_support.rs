@@ -7,7 +7,10 @@ pub(crate) use crate::bridge::turn::Turn;
 pub(crate) use crate::feishu;
 pub(crate) use crate::opencode;
 
-use crate::backend::{MessageId, MessageRole, MessageTime, Part, TextPart, TranscriptMessage, TurnAnchor};
+use crate::backend::{
+    ContentBlock, FinishReason, MessageId, MessageRole, MessageTime, Part, ReasoningPart, StepFinish,
+    StepStart, TextPart, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, TurnAnchor,
+};
 
 /// One typed transcript message for view-shaped fixtures (spec #332): identity,
 /// role, server time (completed at creation) and the given parts. `created:
@@ -620,7 +623,8 @@ impl feishu::Platform for RecordingPlatform {
 
 /// Serves scripted parts/permissions instead of a live OpenCode server.
 pub struct MockBackend {
-    pub parts: serde_json::Value,
+    /// The parts the default assistant turn carries: reasoning → tool → text.
+    pub parts: Vec<Part>,
     pub permissions: Vec<opencode::types::PermissionRequest>,
     /// Number of initial `list_permissions` calls to hang forever — simulates
     /// an in-flight request stuck on a half-open connection while the server
@@ -629,9 +633,9 @@ pub struct MockBackend {
     pub hang_list_permissions: Arc<std::sync::atomic::AtomicUsize>,
     /// Same as `hang_list_permissions`, for `list_questions`.
     pub hang_list_questions: Arc<std::sync::atomic::AtomicUsize>,
-    /// Same as `hang_list_permissions`, for `messages` (the external poller's
-    /// per-session read).
-    pub hang_messages: Arc<std::sync::atomic::AtomicUsize>,
+    /// Same as `hang_list_permissions`, for `transcript` (the external
+    /// poller's per-session read).
+    pub hang_transcript: Arc<std::sync::atomic::AtomicUsize>,
     /// Same as `hang_list_permissions`, for `session_info` (the session
     /// subtitle fetch — a wedged first request on a freshly spawned server).
     pub hang_session_info: Arc<std::sync::atomic::AtomicUsize>,
@@ -655,11 +659,11 @@ pub struct MockBackend {
     /// Created time of each cola-authored message, captured on first read so it
     /// stays stable across polls.
     pub cola_user_created: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
-    /// When set, `messages` returns this as the assistant reply to the
+    /// When set, `transcript` returns this as the assistant reply to the
     /// external user message (simulates OpenCode answering it), replacing the
     /// default assistant turn. Returned only once `external_reply_ready`
     /// flips, so tests can script the reply arriving on a LATER poll.
-    pub external_reply_parts: Option<serde_json::Value>,
+    pub external_reply_parts: Option<Vec<Part>>,
     /// Gates whether the `external_reply_parts` assistant turn is returned.
     /// The test holds a clone of this `Arc` and flips it after the
     /// notification card is sent, to simulate the model answering later.
@@ -696,29 +700,17 @@ pub struct MockBackend {
     /// `std::sync::Mutex` for interior mutability: `update_session_title`
     /// writes it through `&self` (the trait requires `&self`).
     pub session_titles: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
-    /// Session id → scripted Backend message timelines served by `messages`,
-    /// consumed one snapshot per call (the last snapshot repeats). Lets a test
-    /// script the Backend's history call by call — e.g. the post-prompt
-    /// drain's exit check seeing no supplement and the racing finish re-check
-    /// seeing one — and mutate it mid-turn (a supplement that missed the run,
-    /// then its assistant reply). Sessions absent from the map keep the
-    /// default shape.
-    pub message_scripts:
-        Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<Vec<opencode::types::SessionMessage>>>>>,
     /// Session id → scripted Session Transcripts served by `transcript`,
-    /// consumed one snapshot per call (the last repeating). A session without
-    /// a script falls back to decoding the wire shape `messages` serves, so
-    /// existing scenarios keep working while fixtures migrate (spec #332).
+    /// consumed one snapshot per call (the last repeating). Lets a test script
+    /// the Backend's history call by call — e.g. the post-prompt drain's exit
+    /// check seeing no supplement and the racing finish re-check seeing one —
+    /// and mutate it mid-turn (a supplement that missed the run, then its
+    /// assistant reply). Sessions absent from the map keep the default shape.
     pub transcript_scripts:
         Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<crate::backend::SessionTranscript>>>>,
     /// Records every `transcript` call's session id — the neutral read the
-    /// render poll, the drain and the follow poll on. A wire `messages` call
-    /// is recorded separately in `messages_calls`.
+    /// render poll, the drain and the follow poll on.
     pub transcript_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
-    /// Records every `messages` call's session id — the legacy wire read.
-    /// Rendering tests wait on `transcript_calls` instead: the poll, the drain
-    /// and the follow render from the neutral read (spec #332).
-    pub messages_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// Pending questions served by `list_questions`.
     pub questions: Vec<opencode::types::QuestionRequest>,
     /// Records `reply_question` calls: (request_id, answers).
@@ -830,24 +822,24 @@ pub struct MockBackend {
     pub status_busy_once: std::sync::atomic::AtomicBool,
     /// Scenario state for [`MockBackend::given_prompt`]: `(needle, parts)`
     /// pairs matched against the prompt text, first match wins.
-    prompt_scripts: Vec<(String, serde_json::Value)>,
-    /// The parts the last matched prompt script streamed. `messages` serves
+    prompt_scripts: Vec<(String, Vec<Part>)>,
+    /// The parts the last matched prompt script streamed. `transcript` serves
     /// them instead of `parts` once set, so the scripted prompt's own turn
     /// renders consistently through both read paths.
-    last_prompt_parts: std::sync::Mutex<Option<serde_json::Value>>,
+    last_prompt_parts: std::sync::Mutex<Option<Vec<Part>>>,
     /// The message counted `prompt` failures report (see
     /// [`MockBackend::fail_prompts`]); `None` keeps the generic one.
     fail_prompt_message: Option<String>,
 }
 
 impl MockBackend {
-    pub fn new(parts: serde_json::Value) -> Self {
+    pub fn new(parts: Vec<Part>) -> Self {
         Self {
             parts,
             permissions: Vec::new(),
             hang_list_permissions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             hang_list_questions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            hang_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hang_transcript: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             hang_session_info: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             hang_list_sessions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             external_user_message: None,
@@ -866,9 +858,7 @@ impl MockBackend {
             reply_question_not_found: false,
             extra_permissions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             session_titles: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            message_scripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             transcript_scripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-            messages_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             transcript_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             questions: Vec::new(),
             reply_question_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -971,7 +961,7 @@ impl MockBackend {
 
     /// Scenario: `prompt` streams `parts` when the prompt text contains
     /// `needle` (first match wins; `""` matches any prompt).
-    pub(crate) fn given_prompt(&mut self, needle: &str, parts: serde_json::Value) -> &mut Self {
+    pub(crate) fn given_prompt(&mut self, needle: &str, parts: Vec<Part>) -> &mut Self {
         self.prompt_scripts.push((needle.to_string(), parts));
         self
     }
@@ -1006,24 +996,9 @@ impl MockBackend {
         self
     }
 
-    /// Scenario: `messages` serves `snapshots` for `session_id`, one per call
-    /// (the last repeating) — the test's complete message history.
-    pub(crate) fn given_timeline(
-        &mut self,
-        session_id: &str,
-        snapshots: Vec<Vec<opencode::types::SessionMessage>>,
-    ) -> &mut Self {
-        self.message_scripts
-            .try_lock()
-            .expect("given_timeline before the app is built")
-            .insert(session_id.to_string(), snapshots);
-        self
-    }
-
     /// Scenario: `transcript` serves `snapshots` for `session_id`, one per
     /// call (the last repeating) — the neutral view of that session's history.
-    /// Sessions without a script fall back to decoding the wire shape
-    /// `messages` serves.
+    /// Sessions without a script keep the default shape.
     pub(crate) fn given_transcript(
         &mut self,
         session_id: &str,
@@ -1180,11 +1155,10 @@ impl MockBackend {
         self
     }
 
-    /// Scenario: the next `count` per-session message reads (the wire
-    /// `messages` read or the neutral `transcript` read) hang forever (a wedged
-    /// per-session read).
+    /// Scenario: the next `count` per-session transcript reads hang forever
+    /// (a wedged per-session read).
     pub(crate) fn hang_message_reads(&self, count: usize) -> &Self {
-        self.hang_messages
+        self.hang_transcript
             .store(count, std::sync::atomic::Ordering::SeqCst);
         self
     }
@@ -1225,7 +1199,7 @@ impl MockBackend {
 
     /// Scenario: the model answers the external message with `parts`. Returns
     /// the gate the test flips once the notification card has been sent.
-    pub(crate) fn external_reply(&mut self, parts: serde_json::Value) -> Arc<std::sync::atomic::AtomicBool> {
+    pub(crate) fn external_reply(&mut self, parts: Vec<Part>) -> Arc<std::sync::atomic::AtomicBool> {
         self.external_reply_parts = Some(parts);
         Arc::clone(&self.external_reply_ready)
     }
@@ -1293,34 +1267,14 @@ impl MockBackend {
         self.replied_questions.lock().await.insert(request_id.to_string());
         Ok(())
     }
-    /// The legacy wire shape `messages` serves: a scripted Backend timeline
-    /// wins over every default shape, otherwise the scenario's message is
-    /// modeled. `transcript` decodes exactly this shape, so the two reads
-    /// cannot drift while both exist.
-    async fn wire_messages(
-        &self,
-        session_id: &str,
-    ) -> crate::error::Result<Vec<opencode::types::SessionMessage>> {
-        hang_if_scripted(&self.hang_messages).await;
-        // A scripted Backend timeline wins over every default shape: it is
-        // the test's complete message history (anchor user message, first run,
-        // a supplement that missed the run, its reply), consumed one snapshot
-        // per call with the last one repeating.
-        {
-            let mut scripts = self.message_scripts.lock().await;
-            if let Some(script) = scripts.get_mut(session_id)
-                && !script.is_empty()
-            {
-                let snapshot = if script.len() == 1 {
-                    script[0].clone()
-                } else {
-                    script.remove(0)
-                };
-                return Ok(snapshot);
-            }
-        }
+    /// The default transcript shape `transcript` serves when the test scripts
+    /// no transcript for the session: cola's own or an external user message
+    /// when modeled, otherwise the assistant side of cola's own turn.
+    async fn default_transcript(&self, session_id: &str) -> crate::backend::SessionTranscript {
+        use crate::backend::SessionTranscript;
+
         let now = chrono::Utc::now().timestamp_millis();
-        let mut msgs: Vec<opencode::types::SessionMessage> = Vec::new();
+        let mut messages: Vec<TranscriptMessage> = Vec::new();
         // cola's OWN user message persisting on the store (ADR-0026): id starts
         // with `msg_cola_`, created time stable across polls. Simulates a prompt
         // cola sent that the poller must recognise as cola-authored even when it
@@ -1331,21 +1285,12 @@ impl MockBackend {
                 *map.entry(session_id.to_string())
                     .or_insert_with(|| chrono::Utc::now().timestamp_millis())
             };
-            msgs.push(opencode::types::SessionMessage {
-                info: opencode::types::MessageInfo {
-                    id: "msg_cola_mock_user".into(),
-                    role: Some("user".into()),
-                    parent_id: None,
-                    time: Some(opencode::types::MessageTime {
-                        created,
-                        completed: Some(created),
-                    }),
-                    model_id: None,
-                    provider_id: None,
-                    tokens: None,
-                },
-                parts: serde_json::json!([{ "type": "text", "text": cola_text }]),
-            });
+            messages.push(typed_message(
+                "msg_cola_mock_user",
+                MessageRole::User,
+                Some(created),
+                vec![text_part(cola_text)],
+            ));
         }
         // When set, simulate a user message posted by ANOTHER client (e.g.
         // OpenChamber), for the external-message poller tests. If an AI
@@ -1372,48 +1317,30 @@ impl MockBackend {
                     .map(|c| created.max(c + 1000))
                     .unwrap_or(created)
             };
-            msgs.push(opencode::types::SessionMessage {
-                info: opencode::types::MessageInfo {
-                    id: "msg_ext_user".into(),
-                    role: Some("user".into()),
-                    parent_id: None,
-                    time: Some(opencode::types::MessageTime {
-                        created,
-                        completed: Some(created),
-                    }),
-                    model_id: None,
-                    provider_id: None,
-                    tokens: None,
-                },
-                parts: serde_json::json!([{ "type": "text", "text": text }]),
-            });
+            messages.push(typed_message(
+                "msg_ext_user",
+                MessageRole::User,
+                Some(created),
+                vec![text_part(&text)],
+            ));
             if self
                 .external_reply_ready
                 .load(std::sync::atomic::Ordering::SeqCst)
                 && let Some(parts) = &self.external_reply_parts
             {
-                msgs.push(opencode::types::SessionMessage {
-                    info: opencode::types::MessageInfo {
-                        id: "msg_ext_assist".into(),
-                        role: Some("assistant".into()),
-                        parent_id: Some("msg_ext_user".into()),
-                        time: Some(opencode::types::MessageTime {
-                            created: created + 1000,
-                            completed: Some(created + 1000),
-                        }),
-                        model_id: None,
-                        provider_id: None,
-                        tokens: None,
-                    },
-                    parts: parts.clone(),
-                });
+                messages.push(typed_message(
+                    "msg_ext_assist",
+                    MessageRole::Assistant,
+                    Some(created + 1000),
+                    parts.clone(),
+                ));
             }
-            return Ok(msgs);
+            return SessionTranscript::new(messages);
         }
         // No cola-authored or external user message modeled: return only the
         // assistant side of cola's own turn (the default rendering path).
-        if !msgs.is_empty() {
-            return Ok(msgs);
+        if !messages.is_empty() {
+            return SessionTranscript::new(messages);
         }
         // A matched prompt script's parts win over the construction-time
         // `parts`: the render poll must see the same turn the prompt streamed.
@@ -1423,21 +1350,12 @@ impl MockBackend {
             .unwrap()
             .clone()
             .unwrap_or_else(|| self.parts.clone());
-        Ok(vec![opencode::types::SessionMessage {
-            info: opencode::types::MessageInfo {
-                id: "msg_assist".into(),
-                role: Some("assistant".into()),
-                parent_id: Some("msg_user".into()),
-                time: Some(opencode::types::MessageTime {
-                    created: now + 1000,
-                    completed: Some(now + 1000),
-                }),
-                model_id: None,
-                provider_id: None,
-                tokens: None,
-            },
+        SessionTranscript::new(vec![typed_message(
+            "msg_assist",
+            MessageRole::Assistant,
+            Some(now + 1000),
             parts,
-        }])
+        )])
     }
 }
 
@@ -1573,7 +1491,7 @@ impl crate::backend::Backend for MockBackend {
             hook();
         }
         // A prompt script wins over the construction-time `parts`: the prompt
-        // that matches streams its own parts, and `messages` serves them too.
+        // that matches streams its own parts, and `transcript` serves them too.
         let parts = match self
             .prompt_scripts
             .iter()
@@ -1591,10 +1509,9 @@ impl crate::backend::Backend for MockBackend {
             admitted_seq: None,
             parent_id: Some("msg_user".into()),
             error: None,
-            // The mock's scripted parts are wire-shaped; decode them through
-            // the production seam so the prompt-response path carries the same
-            // typed views the polled read does (spec #332).
-            parts: crate::opencode::wire::decode_parts(&parts),
+            // The mock scripts typed parts: the prompt-response path carries
+            // the same neutral views the polled read does (spec #332).
+            parts,
         })
     }
 
@@ -1635,19 +1552,11 @@ impl crate::backend::Backend for MockBackend {
         Ok(())
     }
 
-    async fn messages(&self, session_id: &str) -> crate::error::Result<Vec<opencode::types::SessionMessage>> {
-        // The wire read is what `messages_calls` records; `transcript` decodes
-        // the same shape without being a wire read.
-        self.messages_calls.lock().await.push(session_id.to_string());
-        self.wire_messages(session_id).await
-    }
-
     /// Read one Session's neutral transcript (ADR-0053). A scripted transcript
-    /// wins; otherwise the wire shape [`MockBackend::messages`] would serve is
-    /// decoded through the production decoder, so existing wire-scripted
-    /// scenarios keep working while fixtures migrate (spec #332, #334–#339).
+    /// wins; otherwise the scenario's default typed shape is served (spec
+    /// #332, #334–#339).
     async fn transcript(&self, session_id: &str) -> crate::error::Result<crate::backend::SessionTranscript> {
-        hang_if_scripted(&self.hang_messages).await;
+        hang_if_scripted(&self.hang_transcript).await;
         let scripted = {
             let mut scripts = self.transcript_scripts.lock().await;
             match scripts.get_mut(session_id) {
@@ -1661,7 +1570,7 @@ impl crate::backend::Backend for MockBackend {
         };
         let transcript = match scripted {
             Some(transcript) => transcript,
-            None => crate::opencode::wire::decode(&self.wire_messages(session_id).await?),
+            None => self.default_transcript(session_id).await,
         };
         self.transcript_calls.lock().await.push(session_id.to_string());
         Ok(transcript)
@@ -1854,29 +1763,57 @@ pub fn test_config_unclaimed(session_file: &std::path::Path) -> crate::config::C
 }
 
 /// The parts a real assistant turn produces: reasoning → tool → text.
-pub fn realistic_parts() -> serde_json::Value {
-    serde_json::json!([
-        { "id": "prt_s1", "type": "step-start", "snapshot": "x" },
-        { "id": "prt_r1", "type": "reasoning", "text": "用户想让我分析目录。" },
-        { "id": "prt_t1", "type": "tool", "tool": "bash", "callID": "call_1",
-          "state": { "status": "completed", "input": { "command": "ls -la" }, "output": "src/\nCargo.toml\n" } },
-        { "id": "prt_f1", "type": "step-finish", "reason": "tool-calls" },
-        { "id": "prt_s2", "type": "step-start", "snapshot": "x" },
-        { "id": "prt_txt", "type": "text", "text": "当前目录有 src/ 和 Cargo.toml。" },
-        { "id": "prt_f2", "type": "step-finish", "reason": "stop" },
-    ])
+pub fn realistic_parts() -> Vec<Part> {
+    vec![
+        Part::StepStart(StepStart),
+        Part::Reasoning(ReasoningPart {
+            text: "用户想让我分析目录。".into(),
+            started_at: None,
+        }),
+        Part::Tool(ToolCall {
+            identity: ToolIdentity {
+                name: "bash".into(),
+                call_id: "call_1".into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: None,
+            input: Some(serde_json::json!({ "command": "ls -la" })),
+            metadata: None,
+            output: ToolOutput {
+                raw: Some(serde_json::json!("src/\nCargo.toml\n")),
+                blocks: vec![ContentBlock::Text("src/\nCargo.toml\n".into())],
+                error: None,
+            },
+        }),
+        Part::StepFinish(StepFinish {
+            reason: FinishReason::ToolCalls,
+        }),
+        Part::StepStart(StepStart),
+        Part::Text(TextPart {
+            text: "当前目录有 src/ 和 Cargo.toml。".into(),
+            started_at: None,
+        }),
+        Part::StepFinish(StepFinish {
+            reason: FinishReason::Stop,
+        }),
+    ]
 }
 
 /// A prompt whose answer is far longer than one card's text budget, so it
 /// must flow across continuation cards (no plain-text fallback anymore).
-pub fn long_answer_parts() -> serde_json::Value {
+pub fn long_answer_parts() -> Vec<Part> {
     // 1200 × 6 chars = 7200 chars, above MAX_CARD_TEXT_CHARS (6000).
     let long_text = "很长的回答。".repeat(1200);
-    serde_json::json!([
-        { "id": "prt_s1", "type": "step-start", "snapshot": "x" },
-        { "id": "prt_txt", "type": "text", "text": long_text },
-        { "id": "prt_f1", "type": "step-finish", "reason": "stop" },
-    ])
+    vec![
+        Part::StepStart(StepStart),
+        Part::Text(TextPart {
+            text: long_text,
+            started_at: None,
+        }),
+        Part::StepFinish(StepFinish {
+            reason: FinishReason::Stop,
+        }),
+    ]
 }
 
 /// Build a `ModelOption` with the given id and declared variants.
@@ -2576,12 +2513,11 @@ mod tests {
     use crate::backend::Backend;
     use crate::backend::{MessageRole, Part, SessionTranscript};
 
-    /// A scripted transcript is served as-is; the wire read is never touched,
-    /// so a test can describe cola's domain instead of the backend's wire
-    /// format (spec #332).
+    /// A scripted transcript is served as-is, so a test can describe cola's
+    /// domain instead of the backend's wire format (spec #332).
     #[tokio::test]
     async fn mock_serves_a_scripted_transcript_without_a_wire_read() {
-        let mut mock = MockBackend::new(serde_json::json!([]));
+        let mut mock = MockBackend::new(Vec::new());
         mock.given_transcript(
             "ses_x",
             vec![SessionTranscript::new(vec![typed_message(
@@ -2591,7 +2527,6 @@ mod tests {
                 vec![text_part("脚本化的问题")],
             )])],
         );
-        let messages_calls = std::sync::Arc::clone(&mock.messages_calls);
         let transcript_calls = std::sync::Arc::clone(&mock.transcript_calls);
         let backend: std::sync::Arc<dyn Backend> = std::sync::Arc::new(mock);
 
@@ -2599,10 +2534,6 @@ mod tests {
 
         assert_eq!(transcript.messages.len(), 1);
         assert_eq!(transcript.messages[0].text(), "脚本化的问题");
-        assert!(
-            messages_calls.lock().await.is_empty(),
-            "a scripted transcript must not read the wire shape"
-        );
         assert_eq!(
             transcript_calls.lock().await.as_slice(),
             &["ses_x".to_string()],
@@ -2610,21 +2541,15 @@ mod tests {
         );
     }
 
-    /// Without a script, the mock decodes the wire shape its `messages` read
-    /// serves, so existing wire-scripted scenarios keep working while fixtures
-    /// migrate.
+    /// Without a script, the mock serves the default typed shape built from the
+    /// scenario's parts in place of the deleted wire fallback (spec #338).
     #[tokio::test]
     async fn mock_decodes_its_wire_shape_when_no_transcript_is_scripted() {
         let mock = MockBackend::new(realistic_parts());
-        let messages_calls = std::sync::Arc::clone(&mock.messages_calls);
         let transcript_calls = std::sync::Arc::clone(&mock.transcript_calls);
         let backend: std::sync::Arc<dyn Backend> = std::sync::Arc::new(mock);
 
         let transcript = backend.transcript("ses_test").await.unwrap();
-        assert!(
-            messages_calls.lock().await.is_empty(),
-            "a transcript read must not be recorded as a wire `messages` read"
-        );
         assert_eq!(transcript_calls.lock().await.len(), 1, "the read is recorded");
 
         assert_eq!(transcript.messages.len(), 1);
@@ -2636,7 +2561,7 @@ mod tests {
                 .parts
                 .iter()
                 .any(|part| matches!(part, Part::Tool(tool) if tool.identity.name == "bash")),
-            "the wire tool part must decode: {:?}",
+            "the typed tool part must round-trip: {:?}",
             message.parts
         );
     }

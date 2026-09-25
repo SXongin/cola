@@ -10,63 +10,72 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use crate::backend::{
+    ContentBlock, FinishReason, MessageRole, Part, SessionTranscript, StepFinish, TextPart, ToolCall,
+    ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
+};
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{PromptContext, Turn};
 use crate::config::ThreadKey;
 use crate::feishu::card::CardState;
-use crate::opencode::types::{MessageInfo, MessageTime, SessionMessage, SessionStatus};
-use serde_json::json;
+use crate::opencode::types::SessionStatus;
 
-/// A Backend message fixture with the given role/id/server time.
-fn msg(role: &str, id: &str, created: i64, parts: serde_json::Value) -> SessionMessage {
-    SessionMessage {
-        info: MessageInfo {
-            id: id.into(),
-            role: Some(role.into()),
-            parent_id: None,
-            time: Some(MessageTime {
-                created,
-                completed: Some(created),
-            }),
-            model_id: None,
-            provider_id: None,
-            tokens: None,
-        },
-        parts,
-    }
+/// A typed transcript message with the given role/id/server time.
+fn msg(role: MessageRole, id: &str, created: i64, parts: Vec<Part>) -> TranscriptMessage {
+    typed_message(id, role, Some(created), parts)
 }
 
 /// A user message cola would have persisted (its `msg_cola_` id identifies it).
-pub(crate) fn user(id: &str, created: i64, text: &str) -> SessionMessage {
-    msg("user", id, created, json!([{ "type": "text", "text": text }]))
+pub(crate) fn user(id: &str, created: i64, text: &str) -> TranscriptMessage {
+    msg(MessageRole::User, id, created, vec![text_part(text)])
 }
 
 /// A finished assistant turn whose only visible content is `text`.
-fn assistant(created: i64, text: &str) -> SessionMessage {
+fn assistant(created: i64, text: &str) -> TranscriptMessage {
     msg(
-        "assistant",
+        MessageRole::Assistant,
         &format!("msg_a_{created}"),
         created,
-        json!([
-            { "type": "text", "text": text },
-            { "type": "step-finish", "reason": "stop" },
-        ]),
+        vec![
+            Part::Text(TextPart {
+                text: text.to_string(),
+                started_at: None,
+            }),
+            Part::StepFinish(StepFinish {
+                reason: FinishReason::Stop,
+            }),
+        ],
     )
 }
 
 /// An assistant message whose only content is one `bash` tool call in the
 /// given state — the #284 fixture: a panel still `running` when the drain
 /// bound lands, whose later `completed` update must still reach the card.
-fn tool_assistant(created: i64, status: &str, output: &str) -> SessionMessage {
+fn tool_assistant(created: i64, status: ToolStatus, output: &str) -> TranscriptMessage {
     msg(
-        "assistant",
+        MessageRole::Assistant,
         &format!("msg_tool_{created}"),
         created,
-        json!([
-            { "type": "tool", "tool": "bash", "callID": "call_1",
-              "state": { "status": status, "input": { "command": "sleep 600" }, "output": output } },
-            { "type": "step-finish", "reason": "tool-calls" },
-        ]),
+        vec![
+            Part::Tool(ToolCall {
+                identity: ToolIdentity {
+                    name: "bash".into(),
+                    call_id: "call_1".into(),
+                },
+                status,
+                started_at: None,
+                input: Some(serde_json::json!({ "command": "sleep 600" })),
+                metadata: None,
+                output: ToolOutput {
+                    raw: Some(serde_json::json!(output)),
+                    blocks: vec![ContentBlock::Text(output.to_string())],
+                    error: None,
+                },
+            }),
+            Part::StepFinish(StepFinish {
+                reason: FinishReason::ToolCalls,
+            }),
+        ],
     )
 }
 
@@ -87,10 +96,10 @@ pub(crate) fn ctx(session_id: &str, text: &str) -> PromptContext {
     }
 }
 
-/// An app whose Backend serves the scripted message timeline for `ses_test` (one
-/// per `messages` call, the last repeating) and the given session status.
+/// An app whose Backend serves the scripted transcripts for `ses_test` (one
+/// per `transcript` call, the last repeating) and the given session status.
 pub(crate) async fn scripted_app(
-    scripts: Vec<Vec<SessionMessage>>,
+    scripts: Vec<SessionTranscript>,
     status: Option<SessionStatus>,
 ) -> (
     tempfile::TempDir,
@@ -101,7 +110,7 @@ pub(crate) async fn scripted_app(
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.given_timeline("ses_test", scripts);
+    backend.given_transcript("ses_test", scripts);
     if let Some(status) = status {
         backend.with_session_status("ses_test", Some(status));
     }
@@ -140,9 +149,10 @@ async fn busy_supplement_app(
         user("msg_cola_anchor", 1_000, "第一条消息"),
         assistant(2_000, "第一轮回答。"),
         user("msg_cola_supp", 3_000, "补充一下"),
-        tool_assistant(4_000, "running", ""),
+        tool_assistant(4_000, ToolStatus::Running, ""),
     ];
-    let (dir, app, backend, platform) = scripted_app(vec![timeline], Some(SessionStatus::Busy)).await;
+    let (dir, app, backend, platform) =
+        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
     app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
     app.turn_follow_timeout_ms
         .store(follow_timeout_ms, Ordering::Relaxed);
@@ -166,16 +176,20 @@ async fn run_to_handoff(app: &Arc<App>, platform: &RecordingPlatform) {
     );
 }
 
-/// Settle the scenario's `bash` panel in the scripted timeline the follow
+/// Settle the scenario's `bash` panel in the scripted transcript the follow
 /// reads (`status`/`output` — the server's own part update).
-async fn settle_tool(backend: &Arc<MockBackend>, status: &str, output: &str) {
-    let mut scripts = backend.message_scripts.lock().await;
-    let msgs = &mut scripts.get_mut("ses_test").unwrap()[0];
-    let parts = msgs.last_mut().unwrap().parts.as_array_mut().unwrap();
-    for part in parts.iter_mut() {
-        if part.get("type").and_then(|t| t.as_str()) == Some("tool") {
-            part["state"]["status"] = json!(status);
-            part["state"]["output"] = json!(output);
+async fn settle_tool(backend: &Arc<MockBackend>, status: ToolStatus, output: &str) {
+    let mut scripts = backend.transcript_scripts.lock().await;
+    let transcript = &mut scripts.get_mut("ses_test").unwrap()[0];
+    let message = transcript.messages.last_mut().unwrap();
+    for part in message.parts.iter_mut() {
+        if let Part::Tool(call) = part {
+            call.status = status.clone();
+            call.output = ToolOutput {
+                raw: Some(serde_json::json!(output)),
+                blocks: vec![ContentBlock::Text(output.to_string())],
+                error: None,
+            };
         }
     }
 }
@@ -251,7 +265,8 @@ async fn drain_renders_the_new_turns_reply_on_the_live_card() {
         assistant(2_000, "第一轮回答。"),
         user("msg_cola_supp", 3_000, "补充一下"),
     ];
-    let (_dir, app, backend, platform) = scripted_app(vec![timeline], Some(SessionStatus::Idle)).await;
+    let (_dir, app, backend, platform) =
+        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Idle)).await;
 
     let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
 
@@ -269,7 +284,13 @@ async fn drain_renders_the_new_turns_reply_on_the_live_card() {
     );
 
     // The supplement's new Turn answers: an assistant message after it.
-    backend.message_scripts.lock().await.get_mut("ses_test").unwrap()[0]
+    backend
+        .transcript_scripts
+        .lock()
+        .await
+        .get_mut("ses_test")
+        .unwrap()[0]
+        .messages
         .push(assistant(4_000, "补充后的回答。"));
 
     let result = tokio::time::timeout(Duration::from_secs(5), turn)
@@ -313,7 +334,11 @@ async fn finish_rechecks_for_a_supplement_racing_the_drain_exit() {
     ];
     // Snapshot 1 (the drain's exit check): nothing pending. Snapshot 2 (the
     // finish re-check): the supplement landed, still unanswered.
-    let (_dir, app, backend, platform) = scripted_app(vec![quiet, raced], Some(SessionStatus::Idle)).await;
+    let (_dir, app, backend, platform) = scripted_app(
+        vec![SessionTranscript::new(quiet), SessionTranscript::new(raced)],
+        Some(SessionStatus::Idle),
+    )
+    .await;
 
     let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
 
@@ -338,7 +363,13 @@ async fn finish_rechecks_for_a_supplement_racing_the_drain_exit() {
     );
 
     // The new Turn answers; the drain picks it up and the turn finishes.
-    backend.message_scripts.lock().await.get_mut("ses_test").unwrap()[0]
+    backend
+        .transcript_scripts
+        .lock()
+        .await
+        .get_mut("ses_test")
+        .unwrap()[0]
+        .messages
         .push(assistant(4_000, "补充后的回答。"));
     let result = tokio::time::timeout(Duration::from_secs(5), turn)
         .await
@@ -362,7 +393,8 @@ async fn a_message_during_the_drain_is_handled_as_a_supplement() {
         assistant(2_000, "第一轮回答。"),
         user("msg_cola_supp", 3_000, "补充一下"),
     ];
-    let (_dir, app, backend, platform) = scripted_app(vec![timeline], Some(SessionStatus::Idle)).await;
+    let (_dir, app, backend, platform) =
+        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Idle)).await;
 
     let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
     wait_for_card_text(&platform, "第一轮回答。").await;
@@ -412,7 +444,13 @@ async fn a_message_during_the_drain_is_handled_as_a_supplement() {
     );
 
     // Answer the second supplement and let the turn finish.
-    backend.message_scripts.lock().await.get_mut("ses_test").unwrap()[0]
+    backend
+        .transcript_scripts
+        .lock()
+        .await
+        .get_mut("ses_test")
+        .unwrap()[0]
+        .messages
         .push(assistant(4_000, "补充二的回答。"));
     let result = tokio::time::timeout(Duration::from_secs(5), turn)
         .await
@@ -439,7 +477,8 @@ async fn stop_ends_the_drain_promptly() {
         assistant(2_000, "第一轮回答。"),
         user("msg_cola_supp", 3_000, "补充一下"),
     ];
-    let (_dir, app, backend, platform) = scripted_app(vec![timeline], Some(SessionStatus::Idle)).await;
+    let (_dir, app, backend, platform) =
+        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Idle)).await;
 
     let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
     wait_for_card_text(&platform, "第一轮回答。").await;
@@ -491,7 +530,8 @@ async fn a_stopped_turn_logs_finalizing_once_per_turn() {
         assistant(2_000, "第一轮回答。"),
         user("msg_cola_supp", 3_000, "补充一下"),
     ];
-    let (_dir, app, _backend, platform) = scripted_app(vec![timeline], Some(SessionStatus::Idle)).await;
+    let (_dir, app, _backend, platform) =
+        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Idle)).await;
 
     let (_, logs) = capture_logs(async {
         let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
@@ -536,7 +576,8 @@ async fn the_drain_bound_exits_cleanly_and_finishes_the_turn() {
         user("msg_cola_anchor", 1_000, "第一条消息"),
         assistant(2_000, "第一轮回答。"),
     ];
-    let (_dir, app, backend, platform) = scripted_app(vec![timeline], Some(SessionStatus::Busy)).await;
+    let (_dir, app, backend, platform) =
+        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
     // Tiny bounds so the long-poll branch and the follow's ceiling run in
     // milliseconds.
     app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
@@ -619,7 +660,7 @@ async fn a_running_supplement_panel_rides_past_the_drain_bound_until_idle() {
     );
 
     // The tool settles; the next tick renders it and finalizes Done.
-    settle_tool(&backend, "completed", "done").await;
+    settle_tool(&backend, ToolStatus::Completed, "done").await;
     wait_for_card_header(&platform, "完成").await;
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
@@ -651,7 +692,7 @@ async fn stop_during_the_follow_finalizes_promptly() {
 
     // The interrupt settles the running tool server-side (OpenCode writes it
     // as `error`): mirror that, so the final render shows the aborted panel.
-    settle_tool(&backend, "error", "Tool execution aborted").await;
+    settle_tool(&backend, ToolStatus::Error, "Tool execution aborted").await;
 
     let started = std::time::Instant::now();
     app.handle_message(incoming(
@@ -766,7 +807,8 @@ async fn a_message_after_the_release_becomes_a_normal_new_turn() {
         user("msg_cola_anchor", 1_000, "第一条消息"),
         assistant(2_000, "第一轮回答。"),
     ];
-    let (_dir, app, backend, platform) = scripted_app(vec![timeline], Some(SessionStatus::Idle)).await;
+    let (_dir, app, backend, platform) =
+        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Idle)).await;
 
     Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
         .await
@@ -814,7 +856,8 @@ async fn a_hung_backend_read_ends_the_drain_at_the_bound() {
         user("msg_cola_anchor", 1_000, "第一条消息"),
         assistant(2_000, "第一轮回答。"),
     ];
-    let (_dir, app, backend, platform) = scripted_app(vec![timeline], Some(SessionStatus::Busy)).await;
+    let (_dir, app, backend, platform) =
+        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
     app.turn_render_poll_ms.store(20, Ordering::Relaxed);
     app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
     // The first Backend read hangs forever (a half-open connection left by a
@@ -892,13 +935,13 @@ async fn a_handler_started_turn_drains_the_new_turns_reply() {
     .expect("the handler's prompt must record its cola id");
 
     // The first run ended; a cola-authored supplement missed it.
-    backend.message_scripts.lock().await.insert(
+    backend.transcript_scripts.lock().await.insert(
         "ses_test".into(),
-        vec![vec![
+        vec![SessionTranscript::new(vec![
             user(&anchor_id, 1_000, "第一条消息"),
             assistant(2_000, "第一轮回答。"),
             user("msg_cola_supp", 3_000, "补充一下"),
-        ]],
+        ])],
     );
     gate.add_permits(1);
 
@@ -911,7 +954,13 @@ async fn a_handler_started_turn_drains_the_new_turns_reply() {
     );
 
     // The new Turn answers; the drain picks it up and the turn finishes.
-    backend.message_scripts.lock().await.get_mut("ses_test").unwrap()[0]
+    backend
+        .transcript_scripts
+        .lock()
+        .await
+        .get_mut("ses_test")
+        .unwrap()[0]
+        .messages
         .push(assistant(4_000, "补充后的回答。"));
 
     tokio::time::timeout(Duration::from_secs(5), turn)
@@ -940,7 +989,8 @@ async fn a_hung_recheck_read_does_not_extend_finalization() {
         user("msg_cola_anchor", 1_000, "第一条消息"),
         assistant(2_000, "第一轮回答。"),
     ];
-    let (_dir, app, backend, platform) = scripted_app(vec![timeline], Some(SessionStatus::Busy)).await;
+    let (_dir, app, backend, platform) =
+        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
     app.turn_render_poll_ms.store(50, Ordering::Relaxed);
     app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
     // Both the drain's read and the re-check's read hang; the final reconcile
@@ -988,7 +1038,11 @@ async fn a_supplement_landing_after_the_drain_exit_is_still_drained() {
         assistant(2_000, "第一轮回答。"),
         user("msg_cola_supp", 3_000, "补充一下"),
     ];
-    let (_dir, app, backend, platform) = scripted_app(vec![settled, raced], Some(SessionStatus::Idle)).await;
+    let (_dir, app, backend, platform) = scripted_app(
+        vec![SessionTranscript::new(settled), SessionTranscript::new(raced)],
+        Some(SessionStatus::Idle),
+    )
+    .await;
     app.turn_render_poll_ms.store(20, Ordering::Relaxed);
     app.turn_drain_timeout_ms.store(200, Ordering::Relaxed);
 
@@ -1014,7 +1068,13 @@ async fn a_supplement_landing_after_the_drain_exit_is_still_drained() {
     );
 
     // The new Turn answers while the re-check's drain is still polling.
-    backend.message_scripts.lock().await.get_mut("ses_test").unwrap()[0]
+    backend
+        .transcript_scripts
+        .lock()
+        .await
+        .get_mut("ses_test")
+        .unwrap()[0]
+        .messages
         .push(assistant(4_000, "补充后的回答。"));
 
     let result = tokio::time::timeout(Duration::from_secs(5), turn)
@@ -1042,7 +1102,8 @@ async fn an_idle_session_exits_the_drain_without_waiting() {
         user("msg_cola_anchor", 1_000, "第一条消息"),
         assistant(2_000, "第一轮回答。"),
     ];
-    let (_dir, app, _backend, platform) = scripted_app(vec![timeline], Some(SessionStatus::Idle)).await;
+    let (_dir, app, _backend, platform) =
+        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Idle)).await;
 
     let started = std::time::Instant::now();
     Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))

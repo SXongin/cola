@@ -5,7 +5,12 @@
 //! `state.output`, `metadata.diff`, ...) live in this module alone. Every
 //! shape the server has ever served is decoded tolerantly: unknown parts and
 //! statuses keep their raw payload, and a missing field never fails the read.
+//!
+//! The wire envelope types are private to this decoder: outside the adapter a
+//! caller reaches a transcript only through [`decode_response`], so no protocol
+//! field name can leak (ADR-0053).
 
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::backend::{
@@ -13,10 +18,71 @@ use crate::backend::{
     ReasoningPart, SessionTranscript, StepFinish, StepStart, TextPart, TokenUsage, ToolCall, ToolIdentity,
     ToolOutput, ToolStatus, TranscriptMessage,
 };
-use crate::opencode::types::{MessageTokens, SessionMessage};
+use crate::error::Result;
+
+/// The legacy generation's message envelope (`{info, parts}`).
+#[derive(Debug, Clone, Deserialize)]
+struct WireSessionMessage {
+    info: WireMessageInfo,
+    #[serde(default)]
+    parts: Value,
+}
+
+/// The legacy generation's message `info`.
+#[derive(Debug, Clone, Deserialize)]
+struct WireMessageInfo {
+    id: String,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    time: Option<WireMessageTime>,
+    #[serde(rename = "modelID", default)]
+    model_id: Option<String>,
+    #[serde(rename = "providerID", default)]
+    provider_id: Option<String>,
+    #[serde(default)]
+    tokens: Option<WireMessageTokens>,
+}
+
+/// Token usage carried on an assistant message's `info.tokens`.
+#[derive(Debug, Default, Clone, Deserialize)]
+struct WireMessageTokens {
+    #[serde(default)]
+    input: i64,
+    #[serde(default)]
+    output: i64,
+    #[serde(default)]
+    total: i64,
+    #[serde(default)]
+    cache: Option<WireMessageTokenCache>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+struct WireMessageTokenCache {
+    #[serde(default)]
+    read: i64,
+    #[serde(default)]
+    write: i64,
+}
+
+/// A message's server time (epoch ms) on the wire. `completed` is absent while
+/// the message is still in flight.
+#[derive(Debug, Clone, Deserialize)]
+struct WireMessageTime {
+    created: i64,
+    #[serde(default)]
+    completed: Option<i64>,
+}
+
+/// Decode one session's message read — the JSON array a
+/// `GET /session/{id}/message` response carries.
+pub(super) fn decode_response(json: &Value) -> Result<SessionTranscript> {
+    let messages = Vec::<WireSessionMessage>::deserialize(json)?;
+    Ok(decode(&messages))
+}
 
 /// Decode every message of one session, preserving the server's order.
-pub(super) fn decode(messages: &[SessionMessage]) -> SessionTranscript {
+fn decode(messages: &[WireSessionMessage]) -> SessionTranscript {
     SessionTranscript::new(messages.iter().map(decode_message).collect())
 }
 
@@ -29,7 +95,7 @@ pub(super) fn decode_parts(parts: &Value) -> Vec<Part> {
         .unwrap_or_default()
 }
 
-fn decode_message(message: &SessionMessage) -> TranscriptMessage {
+fn decode_message(message: &WireSessionMessage) -> TranscriptMessage {
     let info = &message.info;
     TranscriptMessage {
         id: MessageId::new(info.id.clone()),
@@ -60,7 +126,7 @@ fn decode_role(role: Option<&str>) -> MessageRole {
     }
 }
 
-fn decode_tokens(tokens: &MessageTokens) -> TokenUsage {
+fn decode_tokens(tokens: &WireMessageTokens) -> TokenUsage {
     TokenUsage {
         input: tokens.input,
         output: tokens.output,
@@ -261,16 +327,14 @@ fn started_at(value: &Value, pointer: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::opencode::types::{MessageInfo, MessageTime};
 
     /// Decode one tool part's state into its typed call.
     fn tool(state: Value) -> ToolCall {
-        let message = SessionMessage {
-            info: MessageInfo {
+        let message = WireSessionMessage {
+            info: WireMessageInfo {
                 id: "msg_a1".into(),
                 role: Some("assistant".into()),
-                parent_id: None,
-                time: Some(MessageTime {
+                time: Some(WireMessageTime {
                     created: 1_000,
                     completed: Some(1_000),
                 }),
@@ -436,12 +500,11 @@ mod tests {
 
     /// Decode one message's parts into its transcript message.
     fn decoded_message(parts: Value) -> TranscriptMessage {
-        let transcript = decode(&[SessionMessage {
-            info: MessageInfo {
+        let transcript = decode(&[WireSessionMessage {
+            info: WireMessageInfo {
                 id: "msg_a1".into(),
                 role: Some("assistant".into()),
-                parent_id: None,
-                time: Some(MessageTime {
+                time: Some(WireMessageTime {
                     created: 1_000,
                     completed: Some(1_000),
                 }),
@@ -522,6 +585,24 @@ mod tests {
         assert_eq!(
             tool(serde_json::json!({"status": "weird"})).status,
             ToolStatus::Other("weird".into())
+        );
+    }
+
+    /// The adapter-facing entry point parses the raw response array; malformed
+    /// input is a decode error, not a silent empty transcript.
+    #[test]
+    fn decode_response_parses_the_raw_array_and_rejects_garbage() {
+        let transcript = decode_response(&serde_json::json!([
+            {"info": {"id": "msg_u1", "role": "user", "time": {"created": 1000}},
+             "parts": [{"type": "text", "text": "你好"}]}
+        ]))
+        .expect("a valid payload decodes");
+        assert_eq!(transcript.messages.len(), 1);
+        assert_eq!(transcript.messages[0].text(), "你好");
+
+        assert!(
+            decode_response(&serde_json::json!({"not": "an array"})).is_err(),
+            "malformed payloads must surface as errors"
         );
     }
 }

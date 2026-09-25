@@ -1,5 +1,6 @@
 use crate::backend::{
-    FinishReason, MessageId, MessageRole, Part, SessionTranscript, StepFinish, TranscriptMessage, TurnAnchor,
+    ContentBlock, FinishReason, MessageId, MessageRole, Part, ReasoningPart, SessionTranscript, StepFinish,
+    StepStart, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, TurnAnchor,
 };
 use crate::bridge::test_support::*;
 
@@ -184,19 +185,16 @@ async fn external_poller_recovers_when_messages_hangs() {
 }
 
 /// Completion detection reads the Session Transcript's turn projection: the
-/// scripted transcript's assistant message finishes the turn, while the wire
-/// shape the streaming renderer still reads carries no `step-finish`. The card
-/// must still be finalized as Done, so the decision came from the transcript.
+/// scripted transcript's assistant message finishes the turn, so the card must
+/// be finalized as Done.
 #[tokio::test]
 async fn external_reply_completion_comes_from_the_transcript() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let now = now_ms();
-    // The typed transcript answers the external message and finishes the
-    // turn; the wire shape carries an empty assistant message with no
-    // step-finish at all.
-    let mut mock = MockBackend::new(serde_json::json!([]));
+    // The typed transcript answers the external message and finishes the turn.
+    let mut mock = MockBackend::new(Vec::new());
     mock.given_transcript(
         "ses_ext",
         vec![SessionTranscript::new(vec![
@@ -708,14 +706,32 @@ async fn external_message_reply_renders_into_notification_card() {
     let mut mock = MockBackend::new(realistic_parts());
     mock.external_message("OpenChamber 里发的消息");
     // OpenCode's reply to that message: reasoning → tool → text → stop.
-    let reply_ready = mock.external_reply(serde_json::json!([
-        { "type": "step-start", "snapshot": "x" },
-        { "type": "reasoning", "text": "我来看看目录。" },
-        { "type": "tool", "tool": "bash", "callID": "call_1",
-          "state": { "status": "completed", "input": { "command": "ls" }, "output": "src" } },
-        { "type": "text", "text": "目录里有 src。" },
-        { "type": "step-finish", "reason": "stop" },
-    ]));
+    let reply_ready = mock.external_reply(vec![
+        Part::StepStart(StepStart),
+        Part::Reasoning(ReasoningPart {
+            text: "我来看看目录。".into(),
+            started_at: None,
+        }),
+        Part::Tool(ToolCall {
+            identity: ToolIdentity {
+                name: "bash".into(),
+                call_id: "call_1".into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: None,
+            input: Some(serde_json::json!({ "command": "ls" })),
+            metadata: None,
+            output: ToolOutput {
+                raw: Some(serde_json::json!("src")),
+                blocks: vec![ContentBlock::Text("src".into())],
+                error: None,
+            },
+        }),
+        text_part("目录里有 src。"),
+        Part::StepFinish(StepFinish {
+            reason: FinishReason::Stop,
+        }),
+    ]);
     let (app, platform) = build_app(cfg, mock).await;
 
     // A known session whose chat the notification goes to.
@@ -949,11 +965,14 @@ async fn external_reply_render_times_out_and_finalizes_partial_content() {
     mock.external_message("OpenChamber 里发的消息");
     // A partial reply: reasoning + text, but NO step-finish — the turn never
     // completes, so the loop must be stopped by the timeout.
-    mock.external_reply(serde_json::json!([
-        { "type": "step-start", "snapshot": "x" },
-        { "type": "reasoning", "text": "我在想。" },
-        { "type": "text", "text": "部分回答。" },
-    ]))
+    mock.external_reply(vec![
+        Part::StepStart(StepStart),
+        Part::Reasoning(ReasoningPart {
+            text: "我在想。".into(),
+            started_at: None,
+        }),
+        text_part("部分回答。"),
+    ])
     .store(true, std::sync::atomic::Ordering::SeqCst);
     let (app, platform) = build_app(cfg, mock).await;
 
@@ -1041,14 +1060,20 @@ async fn external_reply_keeps_the_user_message_above_it() {
     // The external message was posted half a minute ago; the reply's parts
     // carry real server times after it but well before cola renders them.
     mock.external_message_created_at(now - 30_000);
-    let reply_ready = mock.external_reply(serde_json::json!([
-        { "type": "step-start", "snapshot": "x" },
-        { "type": "reasoning", "text": "我来看看目录。",
-          "time": { "start": now - 20_000, "end": now - 19_000 } },
-        { "type": "text", "text": "目录里有 src。",
-          "time": { "start": now - 18_000, "end": now - 17_000 } },
-        { "type": "step-finish", "reason": "stop" },
-    ]));
+    let reply_ready = mock.external_reply(vec![
+        Part::StepStart(StepStart),
+        Part::Reasoning(ReasoningPart {
+            text: "我来看看目录。".into(),
+            started_at: Some(now - 20_000),
+        }),
+        Part::Text(crate::backend::TextPart {
+            text: "目录里有 src。".into(),
+            started_at: Some(now - 18_000),
+        }),
+        Part::StepFinish(StepFinish {
+            reason: FinishReason::Stop,
+        }),
+    ]);
     let (app, platform) = build_app(cfg, mock).await;
     seed_entry(
         &app,

@@ -588,7 +588,7 @@ mod tests {
     /// A shared core whose `session_info` serves the given parent map, so the
     /// walker hops over scripted parent chains.
     async fn core_with_parents(parents: Vec<(String, String)>) -> Arc<SharedCore> {
-        let mut backend = MockBackend::new(serde_json::json!([]));
+        let mut backend = MockBackend::new(Vec::new());
         for (child, parent) in parents {
             backend.with_session_parent(&child, &parent);
         }

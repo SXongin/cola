@@ -8,12 +8,6 @@
 //! A message carries no error field: the wire read never surfaced one, and a
 //! failed prompt's error is a prompt-response fact the adapters keep surfacing
 //! where they always have — it is not transcript content.
-//!
-//! This is the expand step: the production read path still returns wire types
-//! until the consumers migrate (#334–#339), hence the module-wide dead-code
-//! allowance.
-
-#![allow(dead_code)] // read model — consumers land in #334–#339 (spec #332)
 
 use serde_json::Value;
 
@@ -263,6 +257,9 @@ pub struct TurnAnchor {
 /// that belong to it (in-flight ones included), and whether it has finished.
 #[derive(Debug)]
 pub struct TurnView<'a> {
+    /// The anchor the view was read for, echoed so the view is self-describing;
+    /// production callers already hold it.
+    #[allow(dead_code)] // exercised by the projection tests only
     pub anchor: TurnAnchor,
     pub messages: Vec<&'a TranscriptMessage>,
     pub complete: bool,
@@ -289,20 +286,6 @@ pub enum Part {
     Patch(Patch),
     /// A part kind this build does not model, kept raw.
     Other(OtherPart),
-}
-
-impl Part {
-    /// The server start time (epoch ms) the part carries, when it has one:
-    /// when a text/reasoning part or a tool call began. Parts that never
-    /// render a clock report `None`.
-    pub fn started_at(&self) -> Option<i64> {
-        match self {
-            Part::Text(part) => part.started_at,
-            Part::Reasoning(part) => part.started_at,
-            Part::Tool(call) => call.started_at,
-            _ => None,
-        }
-    }
 }
 
 /// An assistant's (or user's) text part.
@@ -838,5 +821,31 @@ mod tests {
             "Edit applied successfully."
         );
         assert_eq!(call.metadata.as_ref().unwrap()["diff"], "@@ -1 +1 @@");
+    }
+
+    #[test]
+    fn context_used_prefers_total_over_input_delta() {
+        // Real shape: `input` is only the per-message delta; the cached prefix
+        // is the bulk of the context. Using `input` alone understates usage.
+        let tokens = TokenUsage {
+            input: 263,
+            output: 308,
+            total: 612_920,
+            cache_read: 612_096,
+            cache_write: 0,
+        };
+        assert_eq!(tokens.context_used(), 612_920);
+
+        // No `total` (older server): input + cache.read.
+        let tokens = TokenUsage {
+            input: 263,
+            total: 0,
+            cache_read: 612_096,
+            ..Default::default()
+        };
+        assert_eq!(tokens.context_used(), 612_359);
+
+        // Degenerate: neither present.
+        assert_eq!(TokenUsage::default().context_used(), 0);
     }
 }

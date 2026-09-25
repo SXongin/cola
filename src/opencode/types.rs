@@ -180,76 +180,6 @@ pub struct PromptResponse {
     pub parts: Vec<Part>,
 }
 
-/// A message returned by `GET /session/{id}/message`: `{ info, parts }`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct SessionMessage {
-    pub info: MessageInfo,
-    #[serde(default)]
-    pub parts: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct MessageInfo {
-    pub id: String,
-    #[serde(default)]
-    pub role: Option<String>,
-    #[serde(rename = "parentID")]
-    pub parent_id: Option<String>,
-    #[serde(default)]
-    pub time: Option<MessageTime>,
-    #[serde(rename = "modelID", default)]
-    pub model_id: Option<String>,
-    #[serde(rename = "providerID", default)]
-    pub provider_id: Option<String>,
-    #[serde(default)]
-    pub tokens: Option<MessageTokens>,
-}
-
-/// Token usage carried on an assistant message's `info.tokens`.
-#[derive(Debug, Default, Clone, Deserialize)]
-pub struct MessageTokens {
-    #[serde(default)]
-    pub input: i64,
-    #[serde(default)]
-    pub output: i64,
-    #[serde(default)]
-    pub total: i64,
-    #[serde(default)]
-    pub cache: Option<MessageTokenCache>,
-}
-
-#[derive(Debug, Default, Clone, Deserialize)]
-pub struct MessageTokenCache {
-    #[serde(default)]
-    pub read: i64,
-    #[serde(default)]
-    pub write: i64,
-}
-
-impl MessageTokens {
-    /// The context the model actually consumed: `total` when the server reports
-    /// it, else the cached prefix + the fresh input. (`input` alone is only the
-    /// per-message delta — mostly cache reads — so it understates context a lot.)
-    ///
-    /// Mirrors the read model's `TokenUsage::context_used` (the rule's home);
-    /// this transient wire copy is deleted with the wire read (#338).
-    pub fn context_used(&self) -> i64 {
-        let cache_read = self.cache.as_ref().map(|c| c.read).unwrap_or(0);
-        let fallback = self.input + cache_read;
-        if self.total > 0 { self.total } else { fallback }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct MessageTime {
-    pub created: i64,
-    /// Server time the message finished producing (`time.completed`). Absent
-    /// while the message is still in flight — including when a previous run's
-    /// step is still streaming as a new Turn's anchor lands (#310).
-    #[serde(default)]
-    pub completed: Option<i64>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct QuestionInfo {
     pub question: String,
@@ -356,25 +286,5 @@ mod tests {
         )
         .unwrap();
         assert!(info.time.as_ref().unwrap().is_archived());
-    }
-
-    #[test]
-    fn context_used_prefers_total_over_input_delta() {
-        // Real shape: `input` is only the per-message delta; the cached prefix
-        // is the bulk of the context. Using `input` alone understates usage.
-        let tokens: MessageTokens = serde_json::from_str(
-            r#"{"total":612920,"input":263,"output":308,"reasoning":253,
-                "cache":{"write":0,"read":612096}}"#,
-        )
-        .unwrap();
-        assert_eq!(tokens.context_used(), 612920);
-
-        // No `total` (older server): input + cache.read.
-        let tokens: MessageTokens = serde_json::from_str(r#"{"input":263,"cache":{"read":612096}}"#).unwrap();
-        assert_eq!(tokens.context_used(), 612359);
-
-        // Degenerate: neither present.
-        let tokens: MessageTokens = serde_json::from_str(r#"{}"#).unwrap();
-        assert_eq!(tokens.context_used(), 0);
     }
 }

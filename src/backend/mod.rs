@@ -181,17 +181,9 @@ pub trait Backend: Send + Sync {
 
     async fn reject_question(&self, request_id: &str, directory: Option<&str>) -> Result<()>;
 
-    /// The legacy wire read, kept while its consumers migrate (spec #332).
-    /// No production consumer remains after #336 — the Turn, external sync and
-    /// Session Snapshot all read [`Self::transcript`] — and it is deleted with
-    /// the wire types when the migration completes (#338).
-    #[allow(dead_code)]
-    async fn messages(&self, session_id: &str) -> Result<Vec<crate::opencode::types::SessionMessage>>;
-
     /// Read one Session as a neutral [`SessionTranscript`] — the read model the
     /// Bridge consumes (ADR-0053). The wire generation is selected inside the
-    /// adapter; the existing [`Backend::messages`] read stays during the
-    /// migration, so both paths return the same session's data (spec #332).
+    /// adapter, and its wire envelope never reaches the caller.
     async fn transcript(&self, session_id: &str) -> Result<SessionTranscript>;
 
     /// The server's live run state for one session (`GET /session/status`).

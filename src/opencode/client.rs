@@ -9,8 +9,7 @@ use super::parsing::{
 };
 use super::types::{
     AgentInfo, CreateSessionInput, CreateSessionResponse, ImageInput, Location, ModelInfo, PermissionRequest,
-    PromptResponse, ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionMessage,
-    SessionStatus,
+    PromptResponse, ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionStatus,
 };
 
 /// Lightweight HTTP client for the OpenCode Server REST API.
@@ -537,24 +536,19 @@ impl Client {
         Ok(resp.json().await?)
     }
 
-    /// Fetch all messages (with parts) for a session (canonical: `GET /session/{id}/message`).
-    pub async fn messages(&self, session_id: &str) -> crate::error::Result<Vec<SessionMessage>> {
+    /// Fetch one session's Session Transcript: the canonical
+    /// `GET /session/{id}/message` read, decoded through the generation's wire
+    /// decoder into the neutral read model (ADR-0053). The wire envelope never
+    /// leaves the adapter.
+    pub async fn transcript(&self, session_id: &str) -> crate::error::Result<SessionTranscript> {
         let resp = self
             .http()
             .get(self.url(&format!("/session/{}/message", session_id)))
             .send()
             .await?
             .error_for_status()?;
-        Ok(resp.json().await?)
-    }
-
-    /// Fetch one session's Session Transcript: the same
-    /// `GET /session/{id}/message` read, decoded through the wire decoder into
-    /// the neutral read model (ADR-0053). The existing [`Client::messages`]
-    /// read is untouched while its consumers migrate (spec #332).
-    pub async fn transcript(&self, session_id: &str) -> crate::error::Result<SessionTranscript> {
-        let messages = self.messages(session_id).await?;
-        Ok(super::wire::decode(&messages))
+        let body: serde_json::Value = resp.json().await?;
+        super::wire::decode_response(&body)
     }
 
     /// The server's per-session run state for ONE session (canonical:
