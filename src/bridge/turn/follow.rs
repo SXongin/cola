@@ -96,10 +96,10 @@ async fn run(
         // rule). One last render reconciles the abort's tool states before the
         // card goes Done, exactly as `finish` does on its stop path.
         if handles.waits.stopped_sessions.lock().await.contains(&session_id) {
-            if let Some(Ok(msgs)) = crate::bridge::bounded_call(
-                "drain follow messages",
+            if let Some(Ok(transcript)) = crate::bridge::bounded_call(
+                "drain follow transcript",
                 super::drain_request_timeout(deadline),
-                handles.backend.messages(&session_id),
+                handles.backend.transcript(&session_id),
             )
             .await
             {
@@ -108,7 +108,7 @@ async fn run(
                     &handles.sessions,
                     &handles.backend,
                     &session_id,
-                    &msgs,
+                    &transcript,
                 )
                 .await;
             }
@@ -118,13 +118,13 @@ async fn run(
             return;
         }
         match crate::bridge::bounded_call(
-            "drain follow messages",
+            "drain follow transcript",
             super::drain_request_timeout(deadline),
-            handles.backend.messages(&session_id),
+            handles.backend.transcript(&session_id),
         )
         .await
         {
-            Some(Ok(msgs)) => {
+            Some(Ok(transcript)) => {
                 // Stream the parts into the SAME card (the accumulator this
                 // turn has been rendering into all along); `None` means it is
                 // gone.
@@ -133,7 +133,7 @@ async fn run(
                     &handles.sessions,
                     &handles.backend,
                     &session_id,
-                    &msgs,
+                    &transcript,
                 )
                 .await
                 .is_none()
@@ -170,7 +170,7 @@ async fn run(
                     None => {}
                 }
             }
-            Some(Err(e)) => tracing::warn!("drain follow messages: {}", e),
+            Some(Err(e)) => tracing::warn!("drain follow transcript: {}", e),
             None => {}
         }
         if tokio::time::Instant::now() >= deadline {

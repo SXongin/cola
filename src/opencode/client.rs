@@ -384,10 +384,13 @@ impl Client {
                 admitted_seq: None,
                 parent_id,
                 error,
-                parts: parsed
-                    .get("parts")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Array(vec![])),
+                // The response's parts decode through the same wire seam as a
+                // polled message, so no raw protocol shape reaches the Bridge.
+                parts: super::wire::decode_parts(
+                    parsed
+                        .get("parts")
+                        .unwrap_or(&serde_json::Value::Array(Vec::new())),
+                ),
             });
         }
 
@@ -965,7 +968,10 @@ mod wire_tests {
         assert_eq!(response.parent_id.as_deref(), Some("msg_u1"));
         assert_eq!(
             response.parts,
-            serde_json::json!([{"type": "text", "text": "reply"}])
+            vec![crate::backend::Part::Text(crate::backend::TextPart {
+                text: "reply".into(),
+                started_at: None,
+            })]
         );
         assert!(response.error.is_none());
 

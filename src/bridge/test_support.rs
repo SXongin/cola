@@ -7,7 +7,7 @@ pub(crate) use crate::bridge::turn::Turn;
 pub(crate) use crate::feishu;
 pub(crate) use crate::opencode;
 
-use crate::backend::{MessageId, MessageRole, MessageTime, Part, TextPart, TranscriptMessage};
+use crate::backend::{MessageId, MessageRole, MessageTime, Part, TextPart, TranscriptMessage, TurnAnchor};
 
 /// One typed transcript message for view-shaped fixtures (spec #332): identity,
 /// role, server time (completed at creation) and the given parts. `created:
@@ -39,6 +39,15 @@ pub(crate) fn text_part(text: &str) -> Part {
         text: text.to_string(),
         started_at: None,
     })
+}
+
+/// A fixture Turn anchor: a message identity together with its server time,
+/// one fact (spec #332).
+pub(crate) fn turn_anchor(created_ms: i64) -> TurnAnchor {
+    TurnAnchor {
+        message_id: MessageId::new(format!("msg_anchor_{created_ms}")),
+        created_ms,
+    }
 }
 
 /// A recorded `reply_question` call: (request_id, answers).
@@ -702,8 +711,13 @@ pub struct MockBackend {
     /// existing scenarios keep working while fixtures migrate (spec #332).
     pub transcript_scripts:
         Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<crate::backend::SessionTranscript>>>>,
-    /// Records every `messages` call's session id, so tests can prove the
-    /// drain stopped reading the Backend once the turn ended.
+    /// Records every `transcript` call's session id — the neutral read the
+    /// render poll, the drain and the follow poll on. A wire `messages` call
+    /// is recorded separately in `messages_calls`.
+    pub transcript_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// Records every `messages` call's session id — the legacy wire read.
+    /// Rendering tests wait on `transcript_calls` instead: the poll, the drain
+    /// and the follow render from the neutral read (spec #332).
     pub messages_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// Pending questions served by `list_questions`.
     pub questions: Vec<opencode::types::QuestionRequest>,
@@ -855,6 +869,7 @@ impl MockBackend {
             message_scripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             transcript_scripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             messages_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            transcript_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             questions: Vec::new(),
             reply_question_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             replied_questions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
@@ -1576,7 +1591,10 @@ impl opencode::Backend for MockBackend {
             admitted_seq: None,
             parent_id: Some("msg_user".into()),
             error: None,
-            parts,
+            // The mock's scripted parts are wire-shaped; decode them through
+            // the production seam so the prompt-response path carries the same
+            // typed views the polled read does (spec #332).
+            parts: crate::opencode::wire::decode_parts(&parts),
         })
     }
 
@@ -1630,20 +1648,23 @@ impl opencode::Backend for MockBackend {
     /// scenarios keep working while fixtures migrate (spec #332, #334–#339).
     async fn transcript(&self, session_id: &str) -> crate::error::Result<crate::backend::SessionTranscript> {
         hang_if_scripted(&self.hang_messages).await;
-        {
+        let scripted = {
             let mut scripts = self.transcript_scripts.lock().await;
-            if let Some(script) = scripts.get_mut(session_id)
-                && !script.is_empty()
-            {
-                return Ok(if script.len() == 1 {
+            match scripts.get_mut(session_id) {
+                Some(script) if !script.is_empty() => Some(if script.len() == 1 {
                     script[0].clone()
                 } else {
                     script.remove(0)
-                });
+                }),
+                _ => None,
             }
-        }
-        let messages = self.wire_messages(session_id).await?;
-        Ok(crate::opencode::wire::decode(&messages))
+        };
+        let transcript = match scripted {
+            Some(transcript) => transcript,
+            None => crate::opencode::wire::decode(&self.wire_messages(session_id).await?),
+        };
+        self.transcript_calls.lock().await.push(session_id.to_string());
+        Ok(transcript)
     }
 
     async fn list_permissions(
@@ -2571,6 +2592,7 @@ mod tests {
             )])],
         );
         let messages_calls = std::sync::Arc::clone(&mock.messages_calls);
+        let transcript_calls = std::sync::Arc::clone(&mock.transcript_calls);
         let backend: std::sync::Arc<dyn Backend> = std::sync::Arc::new(mock);
 
         let transcript = backend.transcript("ses_x").await.unwrap();
@@ -2581,6 +2603,11 @@ mod tests {
             messages_calls.lock().await.is_empty(),
             "a scripted transcript must not read the wire shape"
         );
+        assert_eq!(
+            transcript_calls.lock().await.as_slice(),
+            &["ses_x".to_string()],
+            "the transcript read must be recorded for polls that wait on it"
+        );
     }
 
     /// Without a script, the mock decodes the wire shape its `messages` read
@@ -2590,6 +2617,7 @@ mod tests {
     async fn mock_decodes_its_wire_shape_when_no_transcript_is_scripted() {
         let mock = MockBackend::new(realistic_parts());
         let messages_calls = std::sync::Arc::clone(&mock.messages_calls);
+        let transcript_calls = std::sync::Arc::clone(&mock.transcript_calls);
         let backend: std::sync::Arc<dyn Backend> = std::sync::Arc::new(mock);
 
         let transcript = backend.transcript("ses_test").await.unwrap();
@@ -2597,6 +2625,7 @@ mod tests {
             messages_calls.lock().await.is_empty(),
             "a transcript read must not be recorded as a wire `messages` read"
         );
+        assert_eq!(transcript_calls.lock().await.len(), 1, "the read is recorded");
 
         assert_eq!(transcript.messages.len(), 1);
         let message = &transcript.messages[0];

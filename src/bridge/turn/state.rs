@@ -7,6 +7,7 @@
 //! Turn module, and every read or write goes through a `Turn::` method. The
 //! accumulator's own tests are the module's internal seam.
 
+use crate::backend::TurnAnchor;
 use crate::bridge::handles::CardsHandle;
 use crate::feishu::card::shell::CardBuilder;
 use crate::feishu::card::tool_render::ToolPanel;
@@ -14,6 +15,16 @@ use crate::feishu::card::{AwaitingAction, CardState};
 use crate::opencode;
 use indexmap::IndexMap;
 use std::sync::Arc;
+
+/// One part already rendered into this card, addressed by content: a part
+/// payload carries no stable id (AGENTS.md #9), so text and reasoning dedupe
+/// on the content itself — equal content never renders twice, whatever message
+/// carried it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) enum RenderedPart {
+    Text(String),
+    Reasoning(String),
+}
 
 /// One entry on a turn's chronological timeline: a rendered item plus the
 /// server-side start time (epoch ms) of the part it came from — its **key**.
@@ -440,24 +451,23 @@ pub(super) struct StreamAccumulator {
     /// Reminder pin lifecycle reads it so every pin carries the turn it
     /// belongs to and a stale clear cannot unpin a newer turn's pin.
     pub(super) turn_generation: Option<u64>,
-    /// Part ids already rendered into this card — dedupes incremental polling.
-    /// Reasoning/text parts are written empty first and updated with full text,
-    /// so they are only tracked once they have content. Tool parts are tracked
-    /// separately in `rendered_tool_states` because they get re-rendered on
-    /// status changes (running → completed).
-    pub(super) rendered_parts: std::collections::HashSet<String>,
-    /// callID → state signature for tool panels (status + output length; a
-    /// todowrite's whole state, since its list can change without changing any
-    /// length); a tool is re-rendered when its signature changes.
-    pub(super) rendered_tool_states: std::collections::HashMap<String, String>,
-    /// The turn's start on the SERVER's clock: the created time of the user
-    /// message this turn answers. External renders arm with it directly; a
+    /// Text/reasoning parts already rendered into this card, keyed by their
+    /// typed content — dedupes incremental polling. Reasoning/text parts are
+    /// written empty first and updated with full text, so they are only tracked
+    /// once they have content. Tool panels are deduped separately: the current
+    /// panel in `tools` / `todo_panel` IS the tool's rendered revision, so a
+    /// re-render happens exactly when the typed call's visible content changed
+    /// (including a `todowrite` list rewritten with same-length items).
+    pub(super) rendered_parts: std::collections::HashSet<RenderedPart>,
+    /// The Turn's anchor, captured as one fact: the identity of the user
+    /// message this turn answers together with that message's server time. An
+    /// external render arms with the external message's anchor directly; a
     /// cola-sent turn captures it from the stored user message on the first
     /// poll it appears in (matched by `cola_message_id`, ADR-0026). It is the
-    /// turn's single anchor: the header date, the turn filter
-    /// (`created >= it`) and the renderer replacement guard all read it, so
-    /// cola's own clock is never compared against the server's (#183, #190).
-    pub(super) turn_started_ms: Option<i64>,
+    /// turn's single anchor: the header date, the turn filter and the renderer
+    /// replacement guard all read it, so cola's own clock is never compared
+    /// against the server's (#183, #190).
+    pub(super) turn_anchor: Option<TurnAnchor>,
     /// ADR-0014: progress/liveness signals for the header.
     /// The active header phase; None when the turn is not actively working
     /// (Done/Error/Continued show no timer).
@@ -477,7 +487,6 @@ impl StreamAccumulator {
             requester_open_id: None,
             is_group: false,
             rendered_parts: std::collections::HashSet::new(),
-            rendered_tool_states: std::collections::HashMap::new(),
             // The card starts loading the moment it is created; the header
             // timer counts from here (ADR-0014).
             current_phase: Some(HeaderPhase::Loading),
@@ -976,12 +985,13 @@ impl StreamAccumulator {
         self.push_tool_at(None, call_id, panel);
     }
 
-    /// [`Self::push_tool`] for a tool part that started at `at_ms` (the
-    /// server's `state.time.start`). A tool first seen before the server
-    /// stamped it (a pending part, no time) gains its start time on the later
-    /// update: a live panel adopts it as its timeline key — nothing is placed
-    /// yet — while a panel already in the timeline keeps its key and only
-    /// gains the clock. A part with no server time keeps showing no clock.
+    /// [`Self::push_tool`] for a tool call that started at `at_ms` (the typed
+    /// [`ToolCall::started_at`](crate::backend::ToolCall)). A tool first seen
+    /// before the server stamped it (a pending call, no time) gains its start
+    /// time on the later update: a live panel adopts it as its timeline key —
+    /// nothing is placed yet — while a panel already in the timeline keeps its
+    /// key and only gains the clock. A call with no server time keeps showing
+    /// no clock.
     pub(super) fn push_tool_at(&mut self, at_ms: Option<i64>, call_id: &str, panel: ToolPanel) {
         let live = panel.is_live();
         let is_new = !self.tools.contains_key(call_id);
@@ -1006,7 +1016,7 @@ impl StreamAccumulator {
             }
         } else if self.live_tools.contains_key(call_id) {
             // A later sighting may carry the server start time the first one
-            // lacked (a pending part with no `state.time`). The panel is not on
+            // lacked (a pending call with no time). The panel is not on
             // the timeline yet, so the real start time REPLACES the synthetic
             // fallback key — the settle move must land where the call started.
             if let Some(at) = at_ms {
@@ -1221,7 +1231,11 @@ impl StreamAccumulator {
         // anchor is the turn's SERVER time (#183 follow-up) — never cola's —
         // so it can't disagree with the panels and stays stable across flushes.
         builder = builder.with_subtitle(&self.title);
-        if let Some(date) = self.turn_started_ms.and_then(crate::feishu::card::fmt_local_date) {
+        if let Some(date) = self
+            .turn_anchor
+            .as_ref()
+            .and_then(|anchor| crate::feishu::card::fmt_local_date(anchor.created_ms))
+        {
             builder = builder.with_date(&date);
         }
 

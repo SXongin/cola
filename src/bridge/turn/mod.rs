@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use tracing::Instrument;
 
+use crate::backend::{MessageRole, SessionTranscript};
 use crate::bridge::handler::image_inputs;
 use crate::bridge::handles::{CardsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
@@ -20,7 +21,7 @@ use crate::bridge::turn::state::StreamAccumulator;
 use crate::config::ThreadKey;
 use crate::feishu::client::ImageAttachment;
 use crate::opencode;
-use crate::opencode::types::{SessionMessage, SessionStatus};
+use crate::opencode::types::SessionStatus;
 
 /// How long one Backend read in the post-prompt drain may take before it is
 /// abandoned. The drain's own bound caps this further per call: a hung
@@ -502,7 +503,8 @@ impl Turn {
         // The Turn Footer's variant is a fact of THIS turn (captured at send
         // time, ADR-0019), and `self` is gone once the follow owns the card —
         // apply it before either end. The model/token halves are captured from
-        // the messages themselves, so the follow's renders keep them current.
+        // the transcript's messages themselves, so the follow's renders keep
+        // them current.
         if let Some(card) = handles.cards.cards.lock().await.get_mut(&self.session_id) {
             card.acc.variant = self.turn_variant.clone();
         }
@@ -513,16 +515,17 @@ impl Turn {
         // below the guard is the normal end of a turn.
         if !follow {
             // Reconcile: render any parts the incremental poll missed, then mark
-            // the card Done (or Error). Fall back to the response parts if the
-            // fetch fails.
-            let final_msgs = handles.backend.messages(&self.session_id).await.ok();
+            // the card Done (or Error). Fall back to the prompt response's parts
+            // (already decoded through the same wire seam) if the fetch fails or
+            // shows nothing new.
+            let final_transcript = handles.backend.transcript(&self.session_id).await.ok();
             {
                 let mut cards = handles.cards.cards.lock().await;
                 if let Some(acc) = cards.get_mut(&self.session_id).map(|c| &mut c.acc) {
                     if let Ok(resp) = prompt_resp {
                         let mut rendered = false;
-                        if let Some(msgs) = &final_msgs {
-                            rendered = render::render_new_turn_parts(acc, msgs);
+                        if let Some(transcript) = &final_transcript {
+                            rendered = render::render_new_turn_parts(acc, transcript);
                         }
                         if !rendered {
                             render::render_parts(acc, &resp.parts);
@@ -533,17 +536,19 @@ impl Turn {
                     // captured them before the message carried its final tokens.
                     // Usage only when nonzero: an in-flight step's message carries
                     // zeros and must not wipe the last completed step's figure.
-                    if let Some(msgs) = &final_msgs {
-                        let latest_assistant =
-                            msgs.iter().rfind(|m| m.info.role.as_deref() == Some("assistant"));
-                        if let Some(m) = latest_assistant {
-                            if let Some(model_id) = &m.info.model_id {
-                                acc.model_id = Some(model_id.clone());
+                    if let Some(transcript) = &final_transcript {
+                        let latest_assistant = transcript
+                            .messages
+                            .iter()
+                            .rfind(|message| message.role == MessageRole::Assistant);
+                        if let Some(message) = latest_assistant {
+                            if let Some(model) = &message.model {
+                                acc.model_id = Some(model.model_id.clone());
+                                if !model.provider_id.is_empty() {
+                                    acc.provider_id = Some(model.provider_id.clone());
+                                }
                             }
-                            if let Some(provider_id) = &m.info.provider_id {
-                                acc.provider_id = Some(provider_id.clone());
-                            }
-                            if let Some(tokens) = &m.info.tokens {
+                            if let Some(tokens) = &message.tokens {
                                 let used = tokens.context_used();
                                 if used > 0 {
                                     acc.context_tokens = used;
@@ -558,8 +563,11 @@ impl Turn {
                         acc.card_state = crate::feishu::card::CardState::Done;
                     }
                     tracing::info!(
-                        "final render: fetched_msgs={} text={} reasoning={} tools={} rendered_parts={} error={}",
-                        final_msgs.as_ref().map(|m| m.len()).unwrap_or(0),
+                        "final render: fetched_messages={} text={} reasoning={} tools={} rendered_parts={} error={}",
+                        final_transcript
+                            .as_ref()
+                            .map(|transcript| transcript.messages.len())
+                            .unwrap_or(0),
                         acc.text.len(),
                         acc.reasoning.len(),
                         acc.tools.len(),
@@ -726,8 +734,8 @@ impl Turn {
     /// from, so the live card follows the new Turn. `None` means the Backend
     /// read failed (unknown state).
     async fn drain_tick(&mut self, handles: &TurnHandles, timeout_ms: u64) -> Option<DrainState> {
-        let msgs = self.drain_messages(handles, timeout_ms).await?;
-        match self.drain_state(handles, &msgs, timeout_ms).await {
+        let transcript = self.drain_transcript(handles, timeout_ms).await?;
+        match self.drain_state(handles, &transcript, timeout_ms).await {
             DrainState::Settled => Some(DrainState::Settled),
             pending => {
                 render::render_and_flush(
@@ -735,7 +743,7 @@ impl Turn {
                     &handles.sessions,
                     &handles.backend,
                     &self.session_id,
-                    &msgs,
+                    &transcript,
                 )
                 .await;
                 Some(pending)
@@ -746,13 +754,13 @@ impl Turn {
     /// What the drain must do next (ADR-0043): keep going while the session's
     /// run is still alive, or while the Backend's newest user message is a
     /// cola-authored Supplement newer than this turn's anchor with no
-    /// assistant reply after it. `msgs` is the snapshot the caller just read.
-    /// The Supplement is classified before the run state so the re-check can
-    /// tell the racing Supplement apart from a session that is merely busy.
+    /// assistant reply after it. `transcript` is the snapshot the caller just
+    /// read. The Supplement is classified before the run state so the re-check
+    /// can tell the racing Supplement apart from a session that is merely busy.
     async fn drain_state(
         &mut self,
         handles: &TurnHandles,
-        msgs: &[SessionMessage],
+        transcript: &SessionTranscript,
         timeout_ms: u64,
     ) -> DrainState {
         // `/stop` interrupted this session's run: no answer is coming, so the
@@ -774,16 +782,16 @@ impl Turn {
             }
             return DrainState::Settled;
         }
-        // Capture the turn's server-time anchor from this snapshot if the
-        // incremental poll never saw it — the supplement comparison is
-        // meaningless without it, and a short turn's first poll only ever
-        // runs here.
-        let anchor_ms = {
+        // Capture the turn's anchor from this snapshot if the incremental poll
+        // never saw it — the supplement comparison is meaningless without it,
+        // and a short turn's first poll only ever runs here. The anchor is one
+        // fact: the message's identity together with its server time.
+        let anchor = {
             let mut cards = handles.cards.cards.lock().await;
             match cards.get_mut(&self.session_id) {
                 Some(card) => {
-                    render::capture_turn_anchor(&mut card.acc, msgs);
-                    card.acc.turn_started_ms
+                    render::capture_turn_anchor(&mut card.acc, transcript);
+                    card.acc.turn_anchor.clone()
                 }
                 None => None,
             }
@@ -791,31 +799,26 @@ impl Turn {
         // A Supplement the Backend has not answered yet. Its `msg_cola_` id is
         // authoritative (ADR-0026); the anchor is the server's own time for
         // this turn's user message (#190). Cola's clock never enters here.
-        if let Some(anchor_ms) = anchor_ms {
-            let newest_user = msgs
-                .iter()
-                .filter(|m| m.info.role.as_deref() == Some("user"))
-                .filter_map(|m| m.info.time.as_ref().map(|t| (t.created, m.info.id.as_str())))
-                .max_by_key(|(created, _)| *created);
-            if let Some((created, id)) = newest_user
-                && crate::opencode::parsing::is_cola_message_id(id)
-                && created > anchor_ms
-            {
-                // No assistant message after it: either its new Turn has not
-                // started yet or it is being answered — keep rendering either
-                // way. (`/stop` was handled above; an aborted run leaves
-                // nothing for this check to wait for.)
-                let answered = msgs.iter().any(|m| {
-                    m.info.role.as_deref() == Some("assistant")
-                        && m.info
-                            .time
-                            .as_ref()
-                            .map(|t| t.created >= created)
-                            .unwrap_or(false)
-                });
-                if !answered {
-                    return DrainState::Supplement;
-                }
+        if let Some(anchor) = anchor
+            && let Some(newest_user) = transcript.newest_user()
+            && let Some(created) = newest_user.time.map(|time| time.created)
+            && crate::opencode::parsing::is_cola_message_id(newest_user.id.as_str())
+            && created > anchor.created_ms
+        {
+            // No assistant message after it: either its new Turn has not
+            // started yet or it is being answered — keep rendering either
+            // way. (`/stop` was handled above; an aborted run leaves nothing
+            // for this check to wait for.)
+            let answered = transcript.messages.iter().any(|message| {
+                message.role == MessageRole::Assistant
+                    && message
+                        .time
+                        .as_ref()
+                        .map(|time| time.created >= created)
+                        .unwrap_or(false)
+            });
+            if !answered {
+                return DrainState::Supplement;
             }
         }
         // The run is still alive: parts keep coming.
@@ -840,17 +843,17 @@ impl Turn {
     /// The drain's Backend read, bounded by the caller's per-call timeout so a
     /// hung Backend cannot hold the card (and the inflight guard) past the
     /// drain bound.
-    async fn drain_messages(&self, handles: &TurnHandles, timeout_ms: u64) -> Option<Vec<SessionMessage>> {
+    async fn drain_transcript(&self, handles: &TurnHandles, timeout_ms: u64) -> Option<SessionTranscript> {
         match crate::bridge::bounded_call(
-            "turn drain messages",
+            "turn drain transcript",
             timeout_ms,
-            handles.backend.messages(&self.session_id),
+            handles.backend.transcript(&self.session_id),
         )
         .await
         {
-            Some(Ok(msgs)) => Some(msgs),
+            Some(Ok(transcript)) => Some(transcript),
             Some(Err(e)) => {
-                tracing::warn!("turn drain messages: {}", e);
+                tracing::warn!("turn drain transcript: {}", e);
                 None
             }
             None => None,
@@ -949,17 +952,17 @@ impl Turn {
         render::session_subtitle(sessions, backend, thread_key, text).await
     }
 
-    /// Render a polled message snapshot into `session_id`'s live card, flushing
-    /// when the content, header or context footer changed. Returns `None` when
-    /// the session's accumulator vanished (the caller should stop).
+    /// Render a polled Session Transcript into `session_id`'s live card,
+    /// flushing when the content, header or context footer changed. Returns
+    /// `None` when the session's accumulator vanished (the caller should stop).
     pub(crate) async fn render_and_flush(
         cards: &CardsHandle,
         sessions: &SessionsHandle,
         backend: &Arc<dyn opencode::Backend>,
         session_id: &str,
-        msgs: &[SessionMessage],
+        transcript: &SessionTranscript,
     ) -> Option<(usize, usize, usize)> {
-        render::render_and_flush(cards, sessions, backend, session_id, msgs).await
+        render::render_and_flush(cards, sessions, backend, session_id, transcript).await
     }
 }
 
@@ -1047,18 +1050,15 @@ impl Turn {
             .lock()
             .await
             .get(session_id)
-            .and_then(|c| c.acc.turn_started_ms)
+            .and_then(|c| c.acc.turn_anchor.as_ref().map(|anchor| anchor.created_ms))
     }
 
     /// Whether the session's card has rendered any part — the external
     /// renderer's "partial reply" probe before it finalizes on timeout.
     pub(crate) async fn has_rendered_content(cards: &CardsHandle, session_id: &str) -> bool {
-        cards
-            .cards
-            .lock()
-            .await
-            .get(session_id)
-            .is_some_and(|c| !c.acc.rendered_parts.is_empty() || !c.acc.rendered_tool_states.is_empty())
+        cards.cards.lock().await.get(session_id).is_some_and(|c| {
+            !c.acc.rendered_parts.is_empty() || !c.acc.tools.is_empty() || c.acc.todo_panel.is_some()
+        })
     }
 
     /// Whether the session's card still carries an unfinished Tool Panel — a
@@ -1361,31 +1361,32 @@ impl Turn {
     /// the work context, push the anchor text (the message preview / snapshot
     /// identity) just before the turn's server-time anchor so the reply's parts
     /// always insert below it, and insert the card session the render loop
-    /// streams into. `variant` is the session's `/think` override captured at
-    /// ARM time (ADR-0019).
+    /// streams into. `anchor` is the external message's identity together with
+    /// its server time, one fact; `variant` is the session's `/think` override
+    /// captured at ARM time (ADR-0019).
     #[allow(clippy::too_many_arguments)] // the card's whole arming fixture
     pub(crate) async fn arm_external_render(
         cards: &CardsHandle,
         session_id: &str,
         card_id: &str,
-        turn_anchor_ms: i64,
+        anchor: &crate::backend::TurnAnchor,
         subtitle: &str,
         session_dir: &str,
         variant: Option<String>,
         anchor_text: Option<&str>,
     ) {
         let mut acc = state::StreamAccumulator::new(subtitle);
-        // The external message's server time is the turn's anchor: header date,
-        // turn filter and renderer replacement guard all read it — one
-        // server-clock value, and cola's clock is never part of the card
+        // The external message's anchor — identity plus server time — is the
+        // turn's anchor: header date, turn filter and renderer replacement
+        // guard all read it, and cola's clock is never part of the card
         // (#183, #190).
-        acc.turn_started_ms = Some(turn_anchor_ms);
+        acc.turn_anchor = Some(anchor.clone());
         acc.session_id = Some(session_id.to_string());
         acc.reply_to_message_id = Some(card_id.to_string());
         acc.attach_work_context(session_dir).await;
         acc.variant = variant;
         if let Some(text) = anchor_text.filter(|text| !text.is_empty()) {
-            acc.push_text_at(Some(turn_anchor_ms - 1), text);
+            acc.push_text_at(Some(anchor.created_ms - 1), text);
         }
         cards.cards.lock().await.insert(
             session_id.to_string(),
@@ -1517,10 +1518,14 @@ impl Turn {
         }
     }
 
-    /// Set the turn's server-time anchor.
-    pub(crate) async fn set_turn_anchor(cards: &CardsHandle, session_id: &str, anchor_ms: i64) {
+    /// Set the turn's anchor (a fixture: identity + server time, one fact).
+    pub(crate) async fn set_turn_anchor(
+        cards: &CardsHandle,
+        session_id: &str,
+        anchor: &crate::backend::TurnAnchor,
+    ) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.acc.turn_started_ms = Some(anchor_ms);
+            card.acc.turn_anchor = Some(anchor.clone());
         }
     }
 

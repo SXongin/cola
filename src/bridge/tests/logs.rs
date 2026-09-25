@@ -155,7 +155,7 @@ async fn render_poll_and_final_render_lines_carry_the_session() {
             msg("assistant", "msg_assist", 2_000, realistic_parts()),
         ]],
     );
-    let messages_calls = Arc::clone(&backend.messages_calls);
+    let transcript_calls = Arc::clone(&backend.transcript_calls);
     let (app, _platform) = build_app(cfg, backend).await;
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
@@ -164,7 +164,7 @@ async fn render_poll_and_final_render_lines_carry_the_session() {
     // that read is the tick that renders and logs, and `RenderPoll::stop`
     // always awaits that tick, so the line cannot be lost to a race.
     let releaser = tokio::spawn(async move {
-        while messages_calls.lock().await.is_empty() {
+        while transcript_calls.lock().await.is_empty() {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         gate.add_permits(1);
@@ -210,7 +210,7 @@ async fn the_render_poll_logs_at_info_only_on_progress() {
             msg("assistant", "msg_assist", 2_000, realistic_parts()),
         ]],
     );
-    let messages_calls = Arc::clone(&backend.messages_calls);
+    let transcript_calls = Arc::clone(&backend.transcript_calls);
     let (app, _platform) = build_app(cfg, backend).await;
     seed_session(&app, "ses_test", "/work").await;
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
@@ -218,7 +218,7 @@ async fn the_render_poll_logs_at_info_only_on_progress() {
     // Release the prompt only after several poll ticks have read the same
     // snapshot: the first renders (and logs), the rest dedupe to nothing.
     let releaser = tokio::spawn(async move {
-        while messages_calls.lock().await.len() < 4 {
+        while transcript_calls.lock().await.len() < 4 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         gate.add_permits(1);

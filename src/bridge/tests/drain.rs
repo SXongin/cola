@@ -222,13 +222,13 @@ async fn wait_for_card_header(platform: &RecordingPlatform, needle: &str) {
 }
 
 /// The drain must stop touching the Backend and the card when the turn ends:
-/// no further message reads and no further card PATCHes.
+/// no further transcript reads and no further card PATCHes.
 async fn assert_no_further_rendering(backend: &Arc<MockBackend>, platform: &RecordingPlatform) {
-    let reads = backend.messages_calls.lock().await.len();
+    let reads = backend.transcript_calls.lock().await.len();
     let patches = platform.updated_cards().await.len();
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert_eq!(
-        backend.messages_calls.lock().await.len(),
+        backend.transcript_calls.lock().await.len(),
         reads,
         "rendering must stop with the turn"
     );
@@ -555,7 +555,7 @@ async fn the_drain_bound_exits_cleanly_and_finishes_the_turn() {
         "the guard must be released at the bound"
     );
     assert!(
-        backend.messages_calls.lock().await.len() > 1,
+        backend.transcript_calls.lock().await.len() > 1,
         "the drain must keep polling while the session is busy"
     );
 
