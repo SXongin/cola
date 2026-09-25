@@ -22,6 +22,19 @@ generation, selected inside the adapter and invisible to the Bridge — and
 through the same seam. Once no caller remains, the wire modules are sealed
 `pub(crate)`.
 
+## Naming across generations
+
+Route labels flipped upstream since ADR-0001/0007/0026 were written. Those ADRs
+call `/api/*` legacy because it then hosted an older generation whose prompt
+appended a fresh user message and emitted only `v2` events (ADR-0001; ADR-0026
+verified the behaviour live), while the unprefixed routes were canonical.
+Upstream has since adopted `/api/...` as the current protocol surface
+(`@opencode-ai/protocol` and `sdk-next`, announced as V2 with the V2 label
+itself now being normalized away) and kept the unprefixed routes as the V1
+compatibility layer. In this ADR and the spec, **legacy** means the unprefixed
+routes and **current** means `/api/...`; the older ADRs' "legacy `/api/*`"
+wording describes the earlier generation and is superseded on this point.
+
 ## Considered Options
 
 - **Keep wire DTOs on the trait; normalize in each consumer.** Rejected: that is
