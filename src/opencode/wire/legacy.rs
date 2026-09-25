@@ -21,7 +21,7 @@ use crate::backend::{
 use crate::error::Result;
 
 use super::{
-    content_text, decode_error, decode_finish_reason, decode_text_part, decode_tool_status, non_null,
+    assemble_tool_output, decode_error, decode_finish_reason, decode_text_part, decode_tool_status, non_null,
     started_at,
 };
 
@@ -212,13 +212,14 @@ fn decode_tool(part: &Value) -> ToolCall {
 
 /// Decode a tool state's output side. Text sources follow the precedence the
 /// presentation has always rendered: a string `output` is authoritative (the
-/// other sources are never appended to it); otherwise the `content` text runs
-/// and a string `result` are joined; otherwise `metadata.output` is the last
-/// resort. A non-string `output` — and a null or absent one — falls through to
-/// those sources. Non-text blocks (and a text block that lost its text) stay
-/// raw instead of vanishing; the raw payload is preserved so per-tool
-/// presentation stays in the Platform (ADR-0042). A failure's reason lives
-/// apart from the output as [`ToolOutput::error`].
+/// other sources are never appended to it); otherwise the shared
+/// [`assemble_tool_output`] joins the `content` text runs and a string
+/// `result`; otherwise `metadata.output` is the last resort. A non-string
+/// `output` — and a null or absent one — falls through to those sources.
+/// Non-text blocks (and a text block that lost its text) stay raw instead of
+/// vanishing; the raw payload is preserved so per-tool presentation stays in
+/// the Platform (ADR-0042). A failure's reason lives apart from the output as
+/// [`ToolOutput::error`].
 fn decode_tool_output(state: Option<&Value>) -> ToolOutput {
     let Some(state) = state else {
         return ToolOutput::default();
@@ -227,22 +228,7 @@ fn decode_tool_output(state: Option<&Value>) -> ToolOutput {
     match non_null(state.get("output")).and_then(Value::as_str) {
         Some(output) => blocks.push(ContentBlock::Text(output.to_string())),
         None => {
-            let mut text = String::new();
-            let mut raw_blocks = Vec::new();
-            if let Some(items) = state.get("content").and_then(Value::as_array) {
-                for item in items {
-                    match content_text(item) {
-                        Some(part) => text.push_str(part),
-                        None => raw_blocks.push(ContentBlock::Other(item.clone())),
-                    }
-                }
-            }
-            if let Some(result) = non_null(state.get("result")).and_then(Value::as_str) {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(result);
-            }
+            let (text, raw_blocks) = assemble_tool_output(state.get("content"), state.get("result"));
             // `metadata.output` is the historical last resort and never
             // overrides real text. A present string is the text even when it
             // is empty, so an empty `metadata.output` still yields a text
