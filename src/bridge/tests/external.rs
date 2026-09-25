@@ -1,6 +1,6 @@
 use crate::backend::{
-    ContentBlock, FinishReason, MessageId, MessageRole, Part, ReasoningPart, SessionTranscript, StepFinish,
-    StepStart, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, TurnAnchor,
+    FinishReason, MessageId, MessageRole, Part, ReasoningPart, SessionTranscript, StepFinish, StepStart,
+    ToolStatus, TranscriptMessage, TurnAnchor,
 };
 use crate::bridge::test_support::*;
 
@@ -123,7 +123,7 @@ async fn external_poller_recovers_when_messages_hangs() {
     );
     // The first per-session read hangs forever, like a request in flight
     // when the server was SIGTERM'd; later calls serve normally.
-    mock.hang_message_reads(1);
+    mock.hang_transcript_reads(1);
     let (app, platform) = build_app(cfg, mock).await;
 
     seed_entry(
@@ -712,21 +712,13 @@ async fn external_message_reply_renders_into_notification_card() {
             text: "我来看看目录。".into(),
             started_at: None,
         }),
-        Part::Tool(ToolCall {
-            identity: ToolIdentity {
-                name: "bash".into(),
-                call_id: "call_1".into(),
-            },
-            status: ToolStatus::Completed,
-            started_at: None,
-            input: Some(serde_json::json!({ "command": "ls" })),
-            metadata: None,
-            output: ToolOutput {
-                raw: Some(serde_json::json!("src")),
-                blocks: vec![ContentBlock::Text("src".into())],
-                error: None,
-            },
-        }),
+        tool_part(
+            "bash",
+            "call_1",
+            ToolStatus::Completed,
+            serde_json::json!({ "command": "ls" }),
+            "src",
+        ),
         text_part("目录里有 src。"),
         Part::StepFinish(StepFinish {
             reason: FinishReason::Stop,

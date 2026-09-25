@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use crate::backend::ToolStatus;
+use crate::backend::{MessageRole, SessionTranscript, ToolStatus};
 use crate::bridge::test_support::*;
 use crate::feishu::card::CardState;
 
@@ -321,25 +321,17 @@ async fn a_tool_completing_after_the_split_renders_on_the_continuation() {
 
     // The tool settles through the render path the poll uses: `sleep 30`
     // completes and its output lands.
-    let transcript = crate::backend::SessionTranscript::new(vec![typed_message(
+    let transcript = SessionTranscript::new(vec![typed_message(
         "a1",
-        crate::backend::MessageRole::Assistant,
+        MessageRole::Assistant,
         Some(1),
-        vec![crate::backend::Part::Tool(crate::backend::ToolCall {
-            identity: crate::backend::ToolIdentity {
-                name: "bash".into(),
-                call_id: "call_bash".into(),
-            },
-            status: ToolStatus::Completed,
-            started_at: None,
-            input: Some(serde_json::json!({ "command": "sleep 30" })),
-            metadata: None,
-            output: crate::backend::ToolOutput {
-                raw: Some(serde_json::json!("done")),
-                blocks: vec![crate::backend::ContentBlock::Text("done".into())],
-                error: None,
-            },
-        })],
+        vec![tool_part(
+            "bash",
+            "call_bash",
+            ToolStatus::Completed,
+            serde_json::json!({ "command": "sleep 30" }),
+            "done",
+        )],
     )]);
     crate::bridge::turn::Turn::render_and_flush(
         &app.cards_handle(),

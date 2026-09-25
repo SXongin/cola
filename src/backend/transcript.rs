@@ -64,11 +64,7 @@ impl SessionTranscript {
             }
             messages.push(message);
         }
-        TurnView {
-            anchor: anchor.clone(),
-            messages,
-            complete,
-        }
+        TurnView { messages, complete }
     }
 
     /// The recent-conversation tail: the last (at most four) text-bearing
@@ -253,14 +249,10 @@ pub struct TurnAnchor {
     pub created_ms: i64,
 }
 
-/// One Turn as read from a transcript: its anchor, the assistant messages
-/// that belong to it (in-flight ones included), and whether it has finished.
+/// One Turn as read from a transcript: the assistant messages that belong to
+/// it (in-flight ones included), and whether it has finished.
 #[derive(Debug)]
 pub struct TurnView<'a> {
-    /// The anchor the view was read for, echoed so the view is self-describing;
-    /// production callers already hold it.
-    #[allow(dead_code)] // exercised by the projection tests only
-    pub anchor: TurnAnchor,
     pub messages: Vec<&'a TranscriptMessage>,
     pub complete: bool,
 }
@@ -567,8 +559,6 @@ mod tests {
         ]);
 
         let turn = transcript.turn_for_user(&anchor);
-        assert_eq!(turn.anchor.message_id.as_str(), "msg_u1");
-        assert_eq!(turn.anchor.created_ms, 1_000);
         let ids: Vec<_> = turn.messages.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["msg_straddle", "msg_inflight", "msg_new"]);
         assert!(!turn.complete, "an in-flight tail is not a completed Turn");

@@ -11,8 +11,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::backend::{
-    ContentBlock, FinishReason, MessageRole, Part, SessionTranscript, StepFinish, TextPart, ToolCall,
-    ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
+    ContentBlock, FinishReason, MessageRole, Part, SessionTranscript, StepFinish, TextPart, ToolOutput,
+    ToolStatus, TranscriptMessage,
 };
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{PromptContext, Turn};
@@ -20,22 +20,17 @@ use crate::config::ThreadKey;
 use crate::feishu::card::CardState;
 use crate::opencode::types::SessionStatus;
 
-/// A typed transcript message with the given role/id/server time.
-fn msg(role: MessageRole, id: &str, created: i64, parts: Vec<Part>) -> TranscriptMessage {
-    typed_message(id, role, Some(created), parts)
-}
-
 /// A user message cola would have persisted (its `msg_cola_` id identifies it).
 pub(crate) fn user(id: &str, created: i64, text: &str) -> TranscriptMessage {
-    msg(MessageRole::User, id, created, vec![text_part(text)])
+    typed_message(id, MessageRole::User, Some(created), vec![text_part(text)])
 }
 
 /// A finished assistant turn whose only visible content is `text`.
 fn assistant(created: i64, text: &str) -> TranscriptMessage {
-    msg(
-        MessageRole::Assistant,
+    typed_message(
         &format!("msg_a_{created}"),
-        created,
+        MessageRole::Assistant,
+        Some(created),
         vec![
             Part::Text(TextPart {
                 text: text.to_string(),
@@ -52,26 +47,18 @@ fn assistant(created: i64, text: &str) -> TranscriptMessage {
 /// given state — the #284 fixture: a panel still `running` when the drain
 /// bound lands, whose later `completed` update must still reach the card.
 fn tool_assistant(created: i64, status: ToolStatus, output: &str) -> TranscriptMessage {
-    msg(
-        MessageRole::Assistant,
+    typed_message(
         &format!("msg_tool_{created}"),
-        created,
+        MessageRole::Assistant,
+        Some(created),
         vec![
-            Part::Tool(ToolCall {
-                identity: ToolIdentity {
-                    name: "bash".into(),
-                    call_id: "call_1".into(),
-                },
+            tool_part(
+                "bash",
+                "call_1",
                 status,
-                started_at: None,
-                input: Some(serde_json::json!({ "command": "sleep 600" })),
-                metadata: None,
-                output: ToolOutput {
-                    raw: Some(serde_json::json!(output)),
-                    blocks: vec![ContentBlock::Text(output.to_string())],
-                    error: None,
-                },
-            }),
+                serde_json::json!({ "command": "sleep 600" }),
+                output,
+            ),
             Part::StepFinish(StepFinish {
                 reason: FinishReason::ToolCalls,
             }),
@@ -733,7 +720,7 @@ async fn a_hung_backend_ends_the_follow_in_error() {
 
     // Every read the follow makes now hangs (a wedged per-session read); the
     // bounded call must expire at the ceiling and finalize Error.
-    backend.hang_message_reads(100);
+    backend.hang_transcript_reads(100);
 
     let started = std::time::Instant::now();
     wait_for_card_header(&platform, "出错").await;
@@ -862,7 +849,7 @@ async fn a_hung_backend_read_ends_the_drain_at_the_bound() {
     app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
     // The first Backend read hangs forever (a half-open connection left by a
     // server restart); later reads serve normally.
-    backend.hang_message_reads(1);
+    backend.hang_transcript_reads(1);
 
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(
@@ -995,7 +982,7 @@ async fn a_hung_recheck_read_does_not_extend_finalization() {
     app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
     // Both the drain's read and the re-check's read hang; the final reconcile
     // read serves normally.
-    backend.hang_message_reads(2);
+    backend.hang_transcript_reads(2);
 
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(

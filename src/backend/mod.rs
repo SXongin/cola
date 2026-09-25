@@ -44,12 +44,6 @@ pub trait DirectoryBackend: Send + Sync {
     async fn reject_question(&self, request_id: &str) -> Result<()>;
 
     async fn session_info(&self, session_id: &str) -> Result<SessionInfo>;
-
-    /// The server's live run state for one session (`GET /session/status`;
-    /// ADR-0028). A successful read always yields a status (absent = idle);
-    /// `Ok(None)` is an unrecognised status type, an error a failed read.
-    #[allow(dead_code)] // ticket 01 ships the read; 02/03 consume it
-    async fn session_status(&self, session_id: &str) -> Result<Option<SessionStatus>>;
 }
 
 /// The single concrete [`DirectoryBackend`]: wraps any [`Backend`] and forwards
@@ -97,12 +91,6 @@ impl DirectoryBackend for BackendDirectory {
 
     async fn session_info(&self, session_id: &str) -> Result<SessionInfo> {
         self.backend.session_info(session_id, Some(&self.directory)).await
-    }
-
-    async fn session_status(&self, session_id: &str) -> Result<Option<SessionStatus>> {
-        self.backend
-            .session_status(session_id, Some(&self.directory))
-            .await
     }
 }
 
@@ -190,7 +178,6 @@ pub trait Backend: Send + Sync {
     /// `directory` selects the instance (ADR-0010). A successful read always
     /// yields a status (absent = idle); `Ok(None)` is an unrecognised status
     /// type (never guessed), an `Err` a failed read.
-    #[allow(dead_code)] // ticket 01 ships the read; 02/03 consume it
     async fn session_status(
         &self,
         session_id: &str,
