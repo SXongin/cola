@@ -81,6 +81,11 @@ fn build_http_client_with(
 /// policy: real turns run for minutes.
 const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// Hard stop for the `x-next-cursor` follow in [`Client::list_sessions`]: a
+/// misbehaving server must not spin the client forever. 100 pages of the
+/// server's 100-row default is 10k sessions, far past any real store.
+const MAX_SESSION_PAGES: usize = 100;
+
 /// Apply the shared policy for a request-reply endpoint's response: a 404
 /// means the request was already resolved elsewhere — benign and expected (a
 /// double-click, another client, or a click replayed after a cola restart) —
@@ -204,30 +209,63 @@ impl Client {
 
     /// List sessions across the shared store, most recently active first.
     ///
-    /// Uses the cross-project list `GET /experimental/session`
-    /// (`Session.GlobalInfo` — camelCase: `id`, `title`, `directory`,
-    /// `parentID`, `time.created/updated`, `agent`, `model`; sub-task children
-    /// and archived sessions excluded by default). The plain `GET /session` is
-    /// PROJECT-scoped: it only returns the server's *own* directory's project
-    /// (the instance's cwd), so cola's sessions in another project never
-    /// appear — the "recent" list instead shows stale sessions from the server's
-    /// project. We fall back to it only for servers too old to expose the
-    /// experimental route.
+    /// Uses the cross-project list `GET /experimental/session` with
+    /// `roots=true` (`Session.GlobalInfo` — camelCase: `id`, `title`,
+    /// `directory`, `parentID`, `time.created/updated`, `agent`, `model`).
+    /// The server caps a response at its page limit (default 100) and reports
+    /// the cutoff in `x-next-cursor`; the cursor is followed to the end, so
+    /// the limit can never hide older root sessions. `roots=true` makes that
+    /// limit apply to root sessions only: without it, recently updated sub-task
+    /// children fill the page and most roots disappear (issue #325). Archived
+    /// sessions are excluded server-side by default.
+    ///
+    /// The plain `GET /session` is PROJECT-scoped: it only returns the server's
+    /// *own* directory's project (the instance's cwd), so cola's sessions in
+    /// another project never appear — the "recent" list instead shows stale
+    /// sessions from the server's project. We fall back to it only for servers
+    /// too old to expose the experimental route.
     pub async fn list_sessions(&self) -> crate::error::Result<Vec<SessionListInfo>> {
-        let resp = self.http().get(self.url("/experimental/session")).send().await?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            tracing::warn!(
-                "server lacks GET /experimental/session; falling back to project-scoped GET /session"
-            );
-            let resp = self
-                .http()
-                .get(self.url("/session"))
-                .send()
-                .await?
-                .error_for_status()?;
-            return Ok(resp.json().await?);
+        let mut sessions = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_SESSION_PAGES {
+            let mut url = reqwest::Url::parse(&self.url("/experimental/session"))?;
+            url.query_pairs_mut().append_pair("roots", "true");
+            if let Some(cursor) = &cursor {
+                url.query_pairs_mut().append_pair("cursor", cursor);
+            }
+            let resp = self.http().get(url).send().await?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND && cursor.is_none() {
+                tracing::warn!(
+                    "server lacks GET /experimental/session; falling back to project-scoped GET /session"
+                );
+                let resp = self
+                    .http()
+                    .get(self.url("/session"))
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                return Ok(resp.json().await?);
+            }
+            let next = resp
+                .headers()
+                .get("x-next-cursor")
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let page: Vec<SessionListInfo> = resp.error_for_status()?.json().await?;
+            let empty = page.is_empty();
+            sessions.extend(page);
+            match next {
+                Some(next) if !empty => cursor = Some(next),
+                _ => return Ok(sessions),
+            }
         }
-        Ok(resp.error_for_status()?.json().await?)
+        tracing::warn!(
+            "session list: x-next-cursor still present after {MAX_SESSION_PAGES} pages; \
+             returning the {} sessions fetched so far",
+            sessions.len()
+        );
+        Ok(sessions)
     }
 
     /// Rename a session server-side (canonical: `PATCH /session/{id}` with
@@ -721,7 +759,7 @@ impl Client {
 mod wire_tests {
     use super::*;
     use crate::error::BridgeError;
-    use crate::test_http::{RecordedRequest, TestHttpServer};
+    use crate::test_http::{MockResponse, RecordedRequest, TestHttpServer};
 
     /// A client pointed at the fake server with both Basic-auth parts set —
     /// what discovery hands production. The transport is swapped for a
@@ -1253,7 +1291,63 @@ mod wire_tests {
         let request = last_request(&server);
         assert_eq!(request.method, "GET");
         assert_eq!(request.path, "/experimental/session");
-        assert_eq!(request.query, "");
+        assert_eq!(
+            request.query_param("roots").as_deref(),
+            Some("true"),
+            "root sessions only, so the server's page limit cannot be spent on children"
+        );
+        assert_eq!(request.query_param("cursor"), None);
+        assert_eq!(server.request_count(), 1, "one page, no cursor to follow");
+    }
+
+    /// Issue #325: the server applies its page limit before cola's client-side
+    /// filters, so the listing follows `x-next-cursor` to the end and always
+    /// carries `roots=true`.
+    #[tokio::test]
+    async fn list_sessions_follows_the_cursor_to_the_end() {
+        let server = TestHttpServer::start().await;
+        server.route_sequence(
+            "GET",
+            "/experimental/session",
+            vec![
+                MockResponse::json(
+                    serde_json::json!([{
+                        "id": "ses_new",
+                        "title": "新",
+                        "directory": "/work/cola",
+                        "time": {"created": 1700000000000i64, "updated": 1700000200000i64},
+                    }])
+                    .to_string(),
+                )
+                .header("x-next-cursor", "1700000200000"),
+                MockResponse::json(
+                    serde_json::json!([{
+                        "id": "ses_old",
+                        "title": "旧",
+                        "directory": "/work/other",
+                        "time": {"created": 1700000000000i64, "updated": 1700000100000i64},
+                    }])
+                    .to_string(),
+                ),
+            ],
+        );
+        let client = wire_client(&server, None);
+
+        let sessions = client.list_sessions().await.unwrap();
+
+        let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["ses_new", "ses_old"], "both pages merged in order");
+        assert_eq!(server.request_count(), 2, "the cursor was followed once");
+        let first = request_at(&server, 0);
+        assert_eq!(first.query_param("roots").as_deref(), Some("true"));
+        assert_eq!(first.query_param("cursor"), None);
+        let second = request_at(&server, 1);
+        assert_eq!(second.query_param("roots").as_deref(), Some("true"));
+        assert_eq!(
+            second.query_param("cursor").as_deref(),
+            Some("1700000200000"),
+            "the second page asks for rows older than the first's cutoff"
+        );
     }
 
     #[tokio::test]
