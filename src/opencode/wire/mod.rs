@@ -12,15 +12,18 @@
 //! (spec #332).
 //!
 //! The normalizations both generations share — tool statuses, finish reasons,
-//! failure shapes, output text, server times — live in this module so their
-//! tolerant arms cannot drift apart.
+//! failure shapes, tool identity, string lists, output text and its existence,
+//! server times — live in this module so their tolerant arms cannot drift
+//! apart.
 
 pub(crate) mod legacy;
 pub(crate) mod v2;
 
 pub(crate) use v2::Page;
 
-use crate::backend::{ContentBlock, FinishReason, OtherPart, Part, SessionTranscript, TextPart, ToolStatus};
+use crate::backend::{
+    ContentBlock, FinishReason, OtherPart, Part, SessionTranscript, TextPart, ToolIdentity, ToolStatus,
+};
 use serde_json::Value;
 
 /// Decode one session's wire message read — the JSON a
@@ -119,6 +122,55 @@ fn content_text(item: &Value) -> Option<&str> {
 /// absent.
 fn started_at(value: &Value, pointer: &str) -> Option<i64> {
     value.pointer(pointer).and_then(Value::as_i64)
+}
+
+/// A tool's identity: its built-in name — the historical `"tool"` when the
+/// payload lost it — and the call's opaque correlation id, falling back to the
+/// name so a call without one still folds onto a single panel. Both
+/// generations carry the pair under different field names but with the same
+/// fallback order, so sharing it keeps the arms from drifting apart.
+fn decode_tool_identity(name: Option<&Value>, call_id: Option<&Value>) -> ToolIdentity {
+    let name = name.and_then(Value::as_str).unwrap_or("tool").to_string();
+    let call_id = call_id
+        .and_then(Value::as_str)
+        .unwrap_or(name.as_str())
+        .to_string();
+    ToolIdentity { name, call_id }
+}
+
+/// The strings of an array field (a patch's `files`, a snapshot's `files`):
+/// non-string items are skipped and a missing or non-array field yields none.
+fn string_list(field: Option<&Value>) -> Vec<String> {
+    field
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a payload field carries anything: an empty array or object is the
+/// server saying "no output", not an output. Both decoders apply this when
+/// they pick the raw payload, so an empty container neither masks a later
+/// source nor counts as output on its own.
+fn has_payload(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(fields) => !fields.is_empty(),
+        _ => true,
+    }
+}
+
+/// Whether a decoded failure message suppresses the `metadata.output` last
+/// resort: the panel appends `❌ …` after the output text, and the historical
+/// extractor counted that line as output — so the fallback never rendered
+/// beside it. An error status without a decoded message still falls back.
+fn error_suppresses_fallback(status: &ToolStatus, error: Option<&str>) -> bool {
+    *status == ToolStatus::Error && error.is_some()
 }
 
 /// Assemble a tool state's shared output side from the two sources both
