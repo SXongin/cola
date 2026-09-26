@@ -20,9 +20,9 @@ use super::types::{
     PromptResponse, ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionStatus,
 };
 
-/// Session creation and compaction, on the `/api` surface both generations
-/// serve. These are current-generation calls, not V1 coupling, so they live on
-/// the generation-blind adapter rather than in a strategy.
+/// Session creation, on the `/api` surface both generations serve. It is a
+/// current-generation call, not V1 coupling, so it lives on the
+/// generation-blind adapter rather than in a strategy.
 const API_SESSION: &str = "/api/session";
 
 /// One OpenCode server attachment, generation-blind.
@@ -389,16 +389,11 @@ impl OpenCodeBackend {
         self.strategy().interrupt(&self.transport, session_id).await
     }
 
-    /// Compact a session's context, on the current-generation `/api/session`
-    /// route (shared by both generations).
+    /// Compact a session's context. The `/api/session/{id}/compact` path is
+    /// shared, but the bodies around it are not (V1 sends none and answers 204;
+    /// V2 sends `{}` and answers `{data}`), so the strategy owns the call.
     pub async fn compact(&self, session_id: &str) -> crate::error::Result<()> {
-        self.transport
-            .client()
-            .post(self.transport.url(&format!("{API_SESSION}/{session_id}/compact")))
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(())
+        self.strategy().compact(&self.transport, session_id).await
     }
 
     /// Test-only: point the live transport at a no-proxy HTTP client so the

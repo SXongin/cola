@@ -1,7 +1,8 @@
-//! Adapter-level wire tests: the `OpenCodeBackend` calls that are not owned by
-//! a generation strategy — session creation and compaction, on the `/api`
-//! surface both generations serve. They drive the real backend against a local
-//! fake server and assert both sides of the exchange (ADR-0031).
+//! Adapter-level wire tests: session creation, the one call that lives on the
+//! generation-blind `OpenCodeBackend` itself (`/api/session`, served by both
+//! generations), plus V1's strategy-owned compaction shape driven through the
+//! adapter. They drive the real backend against a local fake server and assert
+//! both sides of the exchange (ADR-0031).
 
 use super::client::OpenCodeBackend;
 use super::parsing::parse_model;
@@ -116,8 +117,11 @@ async fn create_session_posts_the_input_and_parses_the_data_envelope() {
     assert_eq!(body["location"]["directory"], "/work/cola");
 }
 
+/// V1's compaction shape, driven through the generation-blind adapter: the
+/// shared `/api/session/{id}/compact` route with no request body (V2's
+/// strategy sends its own empty payload).
 #[tokio::test]
-async fn compact_posts_the_current_generation_route() {
+async fn v1_compact_posts_the_shared_route_without_a_body() {
     let server = TestHttpServer::start().await;
     server.route("POST", "/api/session/ses_1/compact", 200, r#"{"data":{}}"#);
     let backend = wire_backend(&server);

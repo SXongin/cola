@@ -6,7 +6,7 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::opencode::conformance::{SessionReadCase, SessionReadFixture, TranscriptFixture};
+use crate::opencode::conformance::{PromptFixture, SessionReadCase, SessionReadFixture, TranscriptFixture};
 use crate::opencode::strategy::Generation;
 use crate::test_http::{MockResponse, TestHttpServer};
 
@@ -19,6 +19,7 @@ pub(crate) fn session_read_case() -> SessionReadCase {
         mount,
         mount_transcript,
         mount_recorded_transcript,
+        mount_prompt,
     }
 }
 
@@ -169,4 +170,31 @@ fn mount_transcript(server: &TestHttpServer, fixture: &TranscriptFixture) {
 /// Serve a recorded V1 transcript response body (a bare array) verbatim.
 fn mount_recorded_transcript(server: &TestHttpServer, session_id: &str, body: &str) {
     server.route("GET", &format!("/session/{session_id}/message"), 200, body);
+}
+
+/// Mount the V1 blocking prompt: `POST /session/{id}/message` answers the
+/// assistant message inline (`{info, parts}`), exactly as the live server does
+/// when the turn finishes. The answer's `parts` carry the same neutral values
+/// the shared [`PromptFixture`] names.
+fn mount_prompt(server: &TestHttpServer, fixture: &PromptFixture) {
+    server.route(
+        "POST",
+        &format!("/session/{}/message", fixture.session),
+        200,
+        json!({
+            "info": {
+                "id": fixture.answer_id,
+                "parentID": fixture.message_id,
+                "role": "assistant",
+                "time": {"created": 1010, "completed": 1100},
+                "providerID": "opencode-go",
+                "modelID": "deepseek-v4-flash",
+            },
+            "parts": [
+                {"type": "text", "text": fixture.answer_text},
+                {"type": "step-finish", "reason": "stop"},
+            ],
+        })
+        .to_string(),
+    );
 }

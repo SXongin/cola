@@ -9,15 +9,18 @@
 //! (`v1::conformance` / `v2::conformance`), so a V1 route literal never leaves
 //! the V1 strategy (the coupling guard, spec #364 §1) and V1 retirement deletes
 //! its case with the rest of the strategy. The payload *values* are shared via
-//! [`SessionReadFixture`] and [`TranscriptFixture`], so the two generations'
-//! fixtures cannot drift — only the wire spellings around them differ.
+//! [`SessionReadFixture`], [`TranscriptFixture`] and [`PromptFixture`], so the
+//! two generations' fixtures cannot drift — only the wire spellings around them
+//! differ.
 
 use crate::opencode::client::OpenCodeBackend;
 use crate::opencode::strategy::Generation;
 use crate::test_http::TestHttpServer;
 
-/// One generation's read-surface conformance case: which strategy to speak,
-/// and how to mount that generation's fake routes.
+/// One generation's conformance case: which strategy to speak, and how to
+/// mount that generation's fake routes. The suite grows a scenario per neutral
+/// capability (reads today, writes as they land); each mount translates the
+/// shared fixture values into the generation's own wire shapes.
 pub(crate) struct SessionReadCase {
     pub(crate) generation: Generation,
     /// Mount the generation's fake session-read routes (a two-page list, one
@@ -32,6 +35,12 @@ pub(crate) struct SessionReadCase {
     /// follow-up cursor page with the empty end-of-list page, so a recorded
     /// body's real `cursor.next` is exercised rather than stripped out.
     pub(crate) mount_recorded_transcript: fn(&TestHttpServer, &str, &str),
+    /// Mount the generation's prompt dispatch with one scripted assistant
+    /// answer, publishing the shared [`PromptFixture`] values in that
+    /// generation's wire shape. V1 answers the blocking request inline; V2's
+    /// mount includes its wait endpoint and the follow-up transcript read the
+    /// synchronous polyfill performs.
+    pub(crate) mount_prompt: fn(&TestHttpServer, &PromptFixture),
 }
 
 /// The neutral values both generations' session-read payloads publish. One
@@ -170,6 +179,31 @@ impl SessionReadCase {
         );
         backend.disable_env_proxy(Some("opencode"), Some("secret"));
         backend
+    }
+}
+
+/// The neutral values both generations' prompt mounts publish. The prompt
+/// dispatch differs structurally — V1 answers the blocking request with the
+/// assistant message inline, V2 admits, waits and reads the transcript — but
+/// the neutral reply the Bridge consumes is the same.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PromptFixture {
+    pub(crate) session: &'static str,
+    pub(crate) message_id: &'static str,
+    pub(crate) text: &'static str,
+    pub(crate) answer_id: &'static str,
+    pub(crate) answer_text: &'static str,
+}
+
+impl Default for PromptFixture {
+    fn default() -> Self {
+        Self {
+            session: "ses_prompt",
+            message_id: "msg_cola_prompt",
+            text: "开始干活",
+            answer_id: "msg_prompt_answer",
+            answer_text: "干完了",
+        }
     }
 }
 
@@ -520,5 +554,61 @@ async fn transcript_reads_the_same_neutral_view_on_every_generation() {
         );
         assert_eq!(tail[2].role, MessageRole::Assistant);
         assert_eq!(tail[2].created_ms, fixture.assistant_created_ms);
+    }
+}
+
+/// The prompt dispatch has the same neutral outcome on both generations: the
+/// blocking call returns the answer the turn produced, answers the admitted
+/// user message, and surfaces no error. How the block is achieved (V1's native
+/// blocking prompt vs V2's admit + wait + transcript read) stays in the mounts.
+#[tokio::test]
+async fn prompt_returns_the_turn_reply_on_every_generation() {
+    use crate::backend::Part;
+
+    for case in cases() {
+        let generation = case.generation.as_str();
+        let fixture = PromptFixture::default();
+        let server = TestHttpServer::start().await;
+        (case.mount_prompt)(&server, &fixture);
+        let backend = case.backend(&server);
+
+        let response = backend
+            .prompt(
+                fixture.session,
+                fixture.text,
+                &[],
+                None,
+                None,
+                None,
+                Some(fixture.message_id),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{generation}: prompt failed: {e}"));
+
+        assert_eq!(response.id, fixture.answer_id, "{generation}: answer id");
+        assert_eq!(
+            response.session_id.as_deref(),
+            Some(fixture.session),
+            "{generation}: session"
+        );
+        assert_eq!(
+            response.parent_id.as_deref(),
+            Some(fixture.message_id),
+            "{generation}: the reply answers the admitted user message"
+        );
+        assert!(
+            response.error.is_none(),
+            "{generation}: a clean turn reports no error: {:?}",
+            response.error
+        );
+        let texts: Vec<&str> = response
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                Part::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, [fixture.answer_text], "{generation}: reply text");
     }
 }

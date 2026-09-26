@@ -6,11 +6,12 @@
 //! 204 mutations, and the run-state derivation.
 
 use super::V2Strategy;
+use crate::backend::{FinishReason, Part, StepFinish, TextPart};
 use crate::error::BridgeError;
 use crate::opencode::client::OpenCodeBackend;
 use crate::opencode::strategy::{Generation, GenerationStrategy};
 use crate::opencode::transport::Transport;
-use crate::opencode::types::SessionStatus;
+use crate::opencode::types::{ImageInput, SessionStatus};
 use crate::test_http::{MockResponse, RecordedRequest, TestHttpServer};
 
 /// A client pointed at the fake server with both Basic-auth parts set, speaking
@@ -546,22 +547,434 @@ async fn session_status_surfaces_failures() {
     );
 }
 
+/// The admitted-prompt response body (`{data: SessionInbox.User}`); the write
+/// path reads only `data.id`.
+fn admitted_body(id: &str) -> String {
+    serde_json::json!({
+        "data": {
+            "id": id,
+            "sessionID": "ses_1",
+            "type": "user",
+            "delivery": "steer",
+            "time": {"created": 1},
+            "payload": {"text": "hi"},
+        },
+    })
+    .to_string()
+}
+
+/// A projected transcript around one admitted user message and its answer.
+/// The optional `error` rides the assistant message, as a settled model
+/// failure does.
+fn prompt_transcript(user_id: &str, error: Option<&str>) -> String {
+    let mut answer = serde_json::json!({
+        "id": "msg_a1",
+        "type": "assistant",
+        "time": {"created": 1010, "completed": 1100},
+        "model": {"id": "deepseek-v4-flash", "providerID": "opencode-go"},
+        "content": [{"type": "text", "text": "答案"}],
+        "finish": "stop",
+    });
+    if let Some(message) = error {
+        answer["error"] = serde_json::json!({"type": "ProviderError", "message": message});
+        answer["finish"] = serde_json::Value::Null;
+    }
+    serde_json::json!({
+        "data": [
+            {"id": user_id, "type": "user", "time": {"created": 1000}, "text": "hi"},
+            answer,
+        ],
+        "cursor": {},
+    })
+    .to_string()
+}
+
+/// The blocking prompt: admit with the cola-chosen id and the text/files
+/// payload, wait through the experimental endpoint, then decode the turn's
+/// assistant content into the neutral response. The per-prompt
+/// model/variant/agent axes are V1 concepts — V2 must not put them on the wire.
+#[tokio::test]
+async fn prompt_admits_the_text_files_and_id_then_waits_and_decodes_the_reply() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "POST",
+        "/api/session/ses_1/prompt",
+        200,
+        admitted_body("msg_cola_1"),
+    );
+    server.route("POST", "/api/experimental/session/ses_1/wait", 204, "");
+    server.route(
+        "GET",
+        "/api/session/ses_1/message",
+        200,
+        prompt_transcript("msg_cola_1", None),
+    );
+    let client = v2_wire_client(&server);
+
+    let response = client
+        .prompt(
+            "ses_1",
+            "hi",
+            &[ImageInput {
+                mime: "image/png".into(),
+                data_base64: "AAAA".into(),
+            }],
+            None,
+            None,
+            None,
+            Some("msg_cola_1"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.id, "msg_a1", "the answer's id");
+    assert_eq!(response.session_id.as_deref(), Some("ses_1"));
+    assert_eq!(
+        response.parent_id.as_deref(),
+        Some("msg_cola_1"),
+        "the response answers the admitted user message"
+    );
+    assert!(response.error.is_none());
+    assert_eq!(
+        response.parts,
+        vec![
+            Part::Text(TextPart {
+                text: "答案".into(),
+                started_at: None
+            }),
+            Part::StepFinish(StepFinish {
+                reason: FinishReason::Stop
+            }),
+        ]
+    );
+
+    let prompt = request_at(&server, 0);
+    assert_eq!(prompt.method, "POST");
+    assert_eq!(prompt.path, "/api/session/ses_1/prompt");
+    assert_eq!(
+        body_json(&prompt),
+        serde_json::json!({
+            "id": "msg_cola_1",
+            "text": "hi",
+            "files": [{"uri": "data:image/png;base64,AAAA"}],
+        }),
+        "V2's prompt payload: text + files + the durable id; no model/agent axes"
+    );
+    let wait = request_at(&server, 1);
+    assert_eq!(wait.method, "POST");
+    assert_eq!(wait.path, "/api/experimental/session/ses_1/wait");
+    assert_eq!(wait.body, "", "the wait endpoint takes no payload");
+    let read = request_at(&server, 2);
+    assert_eq!(read.path, "/api/session/ses_1/message");
+    assert_eq!(read.query_param("order").as_deref(), Some("asc"));
+    assert_eq!(server.request_count(), 3);
+}
+
+/// A prompt without images carries no `files` key at all (never an empty
+/// array), and a prompt without a cola id omits `id` so the server mints one.
+#[tokio::test]
+async fn prompt_omits_empty_files_and_an_absent_message_id() {
+    let server = TestHttpServer::start().await;
+    server.route("POST", "/api/session/ses_1/prompt", 200, admitted_body("msg_srv"));
+    server.route("POST", "/api/experimental/session/ses_1/wait", 204, "");
+    server.route(
+        "GET",
+        "/api/session/ses_1/message",
+        200,
+        prompt_transcript("msg_srv", None),
+    );
+    let client = v2_wire_client(&server);
+
+    client
+        .prompt("ses_1", "hi", &[], None, None, None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        body_json(&request_at(&server, 0)),
+        serde_json::json!({"text": "hi"}),
+        "no files, no id, no delivery on the main dispatch"
+    );
+}
+
+/// When the experimental wait route is absent (or failing), the blocking
+/// prompt falls back to polling `session.active` until the session is absent —
+/// the same transition wait resolves on. Paused time keeps the poll cadence
+/// free.
+#[tokio::test(start_paused = true)]
+async fn prompt_falls_back_to_active_map_polling_when_wait_is_unavailable() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "POST",
+        "/api/session/ses_1/prompt",
+        200,
+        admitted_body("msg_cola_1"),
+    );
+    server.route(
+        "POST",
+        "/api/experimental/session/ses_1/wait",
+        404,
+        r#"{"message":"no such route"}"#,
+    );
+    server.route_sequence(
+        "GET",
+        "/api/session/active",
+        vec![
+            MockResponse::json(serde_json::json!({"data": {"ses_1": {"type": "running"}}}).to_string()),
+            MockResponse::json(serde_json::json!({"data": {}}).to_string()),
+        ],
+    );
+    server.route(
+        "GET",
+        "/api/session/ses_1/message",
+        200,
+        prompt_transcript("msg_cola_1", None),
+    );
+    let client = v2_wire_client(&server);
+
+    let response = client
+        .prompt("ses_1", "hi", &[], None, None, None, Some("msg_cola_1"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.id, "msg_a1");
+    assert_eq!(
+        server.request_count(),
+        5,
+        "admit + wait + two active polls + transcript"
+    );
+    assert_eq!(request_at(&server, 2).path, "/api/session/active");
+    assert_eq!(request_at(&server, 3).path, "/api/session/active");
+    assert_eq!(request_at(&server, 4).path, "/api/session/ses_1/message");
+}
+
+/// The settled turn's failure is surfaced: the assistant message's `error`
+/// rides the prompt response as V1's `info.error` does.
+#[tokio::test]
+async fn prompt_surfaces_the_turns_model_error() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "POST",
+        "/api/session/ses_1/prompt",
+        200,
+        admitted_body("msg_cola_1"),
+    );
+    server.route("POST", "/api/experimental/session/ses_1/wait", 204, "");
+    server.route(
+        "GET",
+        "/api/session/ses_1/message",
+        200,
+        prompt_transcript("msg_cola_1", Some("provider 503")),
+    );
+    let client = v2_wire_client(&server);
+
+    let response = client
+        .prompt("ses_1", "hi", &[], None, None, None, Some("msg_cola_1"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.error.as_deref(), Some("provider 503"));
+}
+
+/// A 404 is the bridge's recreate-the-mapping signal only when its `_tag` says
+/// the session is missing: an untagged proxy 404 stays a plain failure, and a
+/// tagged 404 while waiting surfaces the same SessionNotFound.
+#[tokio::test]
+async fn prompt_maps_only_a_tagged_session_not_found() {
+    let tagged = TestHttpServer::start().await;
+    tagged.route(
+        "POST",
+        "/api/session/ses_gone/prompt",
+        404,
+        r#"{"_tag":"SessionNotFoundError","message":"gone"}"#,
+    );
+    let client = v2_wire_client(&tagged);
+    let error = client
+        .prompt("ses_gone", "hi", &[], None, None, None, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, BridgeError::SessionNotFound(_)),
+        "a tagged 404 is SessionNotFound: {error:?}"
+    );
+
+    let untagged = TestHttpServer::start().await;
+    untagged.route(
+        "POST",
+        "/api/session/ses_1/prompt",
+        404,
+        r#"{"message":"no route"}"#,
+    );
+    let client = v2_wire_client(&untagged);
+    let error = client
+        .prompt("ses_1", "hi", &[], None, None, None, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, BridgeError::OpenCode(_)),
+        "an untagged 404 must not trigger the recreate heal: {error:?}"
+    );
+
+    // The wait's tagged 404 (the session vanished mid-turn) surfaces too.
+    let wait_gone = TestHttpServer::start().await;
+    wait_gone.route(
+        "POST",
+        "/api/session/ses_1/prompt",
+        200,
+        admitted_body("msg_cola_1"),
+    );
+    wait_gone.route(
+        "POST",
+        "/api/experimental/session/ses_1/wait",
+        404,
+        r#"{"_tag":"SessionNotFoundError","message":"gone"}"#,
+    );
+    let client = v2_wire_client(&wait_gone);
+    let error = client
+        .prompt("ses_1", "hi", &[], None, None, None, Some("msg_cola_1"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, BridgeError::SessionNotFound(_)), "{error:?}");
+}
+
+/// A transcript read that fails after a successful wait is a downgrade, never a
+/// failed turn: the response is Ok with the admitted id and no parts, so the
+/// Bridge's own final read decides the render.
+#[tokio::test]
+async fn prompt_degrades_when_the_reply_read_fails() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "POST",
+        "/api/session/ses_1/prompt",
+        200,
+        admitted_body("msg_cola_1"),
+    );
+    server.route("POST", "/api/experimental/session/ses_1/wait", 204, "");
+    server.route("GET", "/api/session/ses_1/message", 500, r#"{"message":"boom"}"#);
+    let client = v2_wire_client(&server);
+
+    let response = client
+        .prompt("ses_1", "hi", &[], None, None, None, Some("msg_cola_1"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.id, "msg_cola_1");
+    assert_eq!(response.parent_id.as_deref(), Some("msg_cola_1"));
+    assert!(response.error.is_none());
+    assert!(response.parts.is_empty());
+}
+
+/// The supplement path: `prompt_async` admits with `delivery: "steer"` so the
+/// item merges into the running turn, and returns without waiting (no wait, no
+/// transcript read — the bridge keeps its card live through the render poll).
+#[tokio::test]
+async fn prompt_async_admits_with_steer_delivery_and_does_not_wait() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "POST",
+        "/api/session/ses_1/prompt",
+        200,
+        admitted_body("msg_cola_2"),
+    );
+    let client = v2_wire_client(&server);
+
+    client
+        .prompt_async("ses_1", "更多", &[], None, None, None, Some("msg_cola_2"))
+        .await
+        .unwrap();
+
+    assert_eq!(server.request_count(), 1, "no wait and no transcript read");
+    assert_eq!(
+        body_json(&last_request(&server)),
+        serde_json::json!({"id": "msg_cola_2", "text": "更多", "delivery": "steer"})
+    );
+}
+
+/// Interrupt (`{interrupted:bool}`, false = idle no-op = success) and compact
+/// (V2 declares an all-optional payload, so `{}` is sent; the `{data}` body is
+/// ignored).
+#[tokio::test]
+async fn interrupt_accepts_the_idle_no_op_and_compact_sends_an_empty_payload() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "POST",
+        "/api/session/ses_1/interrupt",
+        200,
+        r#"{"interrupted":false}"#,
+    );
+    server.route(
+        "POST",
+        "/api/session/ses_1/compact",
+        200,
+        r#"{"data":{"id":"msg_c","type":"compaction","delivery":"steer"}}"#,
+    );
+    server.route(
+        "POST",
+        "/api/session/ses_gone/interrupt",
+        404,
+        r#"{"_tag":"SessionNotFoundError","message":"gone"}"#,
+    );
+    let client = v2_wire_client(&server);
+
+    client.interrupt("ses_1").await.unwrap();
+    let interrupt = request_at(&server, 0);
+    assert_eq!(interrupt.method, "POST");
+    assert_eq!(interrupt.path, "/api/session/ses_1/interrupt");
+    assert_eq!(interrupt.body, "", "interrupt carries no body");
+
+    client.compact("ses_1").await.unwrap();
+    let compact = request_at(&server, 1);
+    assert_eq!(compact.method, "POST");
+    assert_eq!(compact.path, "/api/session/ses_1/compact");
+    assert_eq!(
+        body_json(&compact),
+        serde_json::json!({}),
+        "V2's all-optional compact payload still needs a JSON body"
+    );
+
+    let error = client.interrupt("ses_gone").await.unwrap_err();
+    assert!(matches!(error, BridgeError::SessionNotFound(_)), "{error:?}");
+}
+
 /// Attaching to V2 must never pretend a missing capability worked: a caller
 /// gets an error naming the method and the generation (spec #364, S3). S4a
-/// landed the session reads and S4b the transcript, so this pins capabilities
-/// still waiting for their slices (writes are S5, permissions/forms S6).
+/// landed the session reads, S4b the transcript, S5 the writes, so this pins
+/// the capabilities still waiting for their slices: permissions/forms (S6) and
+/// the session-scoped model/agent catalogs (S7).
 #[tokio::test]
 async fn remaining_capabilities_fail_loudly_until_their_slice_lands() {
     let strategy = V2Strategy;
     let http = Transport::new(Some("opencode"), Some("pw"), "http://127.0.0.1:1");
-    let error = strategy
-        .prompt(&http, "ses_1", "hi", &[], None, None, None, None)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("V2 strategy"), "unexpected: {error}");
-    assert!(error.contains("prompt"), "unexpected: {error}");
-    assert!(error.contains("not implemented"), "unexpected: {error}");
+    for (method, error) in [
+        (
+            "reply_permission",
+            strategy
+                .reply_permission(&http, "p1", "once", None)
+                .await
+                .unwrap_err(),
+        ),
+        (
+            "list_permissions",
+            strategy.list_permissions(&http, None).await.unwrap_err(),
+        ),
+        (
+            "list_questions",
+            strategy.list_questions(&http, None).await.unwrap_err(),
+        ),
+        (
+            "reply_question",
+            strategy.reply_question(&http, "q1", &[], None).await.unwrap_err(),
+        ),
+        (
+            "model_context_window",
+            strategy.model_context_window(&http, "p", "m").await.unwrap_err(),
+        ),
+    ] {
+        let error = error.to_string();
+        assert!(error.contains("V2 strategy"), "{method}: unexpected: {error}");
+        assert!(error.contains(method), "{method}: unexpected: {error}");
+        assert!(error.contains("not implemented"), "{method}: unexpected: {error}");
+    }
     // The two catalog reads degrade to empty with a warning instead of an
     // error (their card surfaces tolerate emptiness).
     assert!(strategy.list_agents(&http).await.is_empty());
