@@ -37,12 +37,35 @@ pub(crate) fn body_preview(body: &str) -> &str {
 /// operation and the status with a bounded body preview, and the
 /// [`crate::error::BridgeError::OpenCode`] the caller returns. Both
 /// generations' list/status reads share it, so their diagnostics cannot drift
-/// (and none of them silently writes to stderr).
+/// (and none of them silently writes to stderr). The returned error names the
+/// operation and the status only — its callers log it and surface a fixed card
+/// — so use [`read_failure_detailed`] when the error text itself is the
+/// diagnostic.
 pub(crate) async fn read_failure(response: reqwest::Response, what: &str) -> crate::error::BridgeError {
+    let (status, _) = consume_failure(response, what).await;
+    crate::error::BridgeError::OpenCode(format!("{what} failed: {status}"))
+}
+
+/// [`read_failure`] with the bounded body preview in the RETURNED error too,
+/// for a read whose failure is surfaced rather than merely logged — the prompt
+/// polyfill's status poll, whose error propagates out of `prompt` and is the
+/// only diagnostic the caller gets. Same WARN either way.
+pub(crate) async fn read_failure_detailed(
+    response: reqwest::Response,
+    what: &str,
+) -> crate::error::BridgeError {
+    let (status, body) = consume_failure(response, what).await;
+    crate::error::BridgeError::OpenCode(format!("{what} failed: {status} — body: {}", body_preview(&body)))
+}
+
+/// The shared failure consumption: read the status and body once, WARN with the
+/// bounded preview, and hand both back so the two wrappers above cannot log
+/// differently.
+async fn consume_failure(response: reqwest::Response, what: &str) -> (reqwest::StatusCode, String) {
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     tracing::warn!("{what} failed: {status} — body: {}", body_preview(&body));
-    crate::error::BridgeError::OpenCode(format!("{what} failed: {status}"))
+    (status, body)
 }
 
 /// The live endpoint: the reqwest client (with its baked-in auth headers) and

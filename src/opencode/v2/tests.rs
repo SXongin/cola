@@ -894,6 +894,29 @@ async fn poll_fallback_timeout_warning_reports_an_unconfirmed_absence() {
     );
 }
 
+/// A failed status read inside the poll fallback is surfaced WITH its body:
+/// the error leaves `prompt` and is the caller's only diagnostic, so a bare
+/// status code is not enough. The shared `read_failure` (error without body)
+/// serves the list reads whose callers only log it; this one site uses the
+/// detailed variant.
+#[tokio::test]
+async fn poll_fallback_status_failure_surfaces_the_body() {
+    let server = TestHttpServer::start().await;
+    server.route("GET", "/api/session/active", 500, r#"{"message":"boom"}"#);
+    let http = Transport::new(Some("opencode"), Some("secret"), server.base_url());
+    http.disable_env_proxy(Some("opencode"), Some("secret"));
+
+    let error = V2Strategy
+        .poll_until_idle(&http, "ses_1", std::time::Duration::from_millis(300))
+        .await
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("session status failed") && message.contains("500") && message.contains("boom"),
+        "the poll fallback's status failure must keep its body preview: {message}"
+    );
+}
+
 /// The settled turn's failure is surfaced: the assistant message's `error`
 /// rides the prompt response as V1's `info.error` does.
 #[tokio::test]
