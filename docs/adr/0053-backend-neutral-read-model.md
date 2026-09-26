@@ -70,3 +70,8 @@ migration with the other client (tracked as deferred in the cola issue
 tracker). The neutral read model and the seam stand unchanged: the adapter
 still owns the decode, and the Consequences above still hold for re-adding a
 generation.
+
+That coordinated migration is now under way — OpenChamber v2 migrates the
+shared store — and cola re-adds the generation as a strategy behind the
+unchanged seam, decided in **ADR-0055** and specified in **#364** (OpenCode V2
+dual-generation support).
