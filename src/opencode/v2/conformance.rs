@@ -7,7 +7,7 @@
 
 use serde_json::{Map, json};
 
-use crate::opencode::conformance::{SessionReadCase, SessionReadFixture};
+use crate::opencode::conformance::{SessionReadCase, SessionReadFixture, TranscriptFixture};
 use crate::opencode::strategy::Generation;
 use crate::test_http::{MockResponse, TestHttpServer};
 
@@ -17,6 +17,8 @@ pub(crate) fn session_read_case() -> SessionReadCase {
     SessionReadCase {
         generation: Generation::V2,
         mount,
+        mount_transcript,
+        mount_recorded_transcript,
     }
 }
 
@@ -111,5 +113,93 @@ fn mount(server: &TestHttpServer, fixture: &SessionReadFixture) {
             "cursor": {},
         })
         .to_string(),
+    );
+}
+
+/// Mount the V2 transcript read: the `{data, cursor}` envelope whose items are
+/// a tagged union. The shared [`TranscriptFixture`] publishes the same neutral
+/// facts as V1's mount through V2's spellings: `type`/`time`, `content[]` with
+/// `text`/`reasoning`/`tool`, the tool's own `id`, and the `finish` field whose
+/// reason declares completion. The body ends before any cursor (`cursor: {}`),
+/// so the neutral scenario does not depend on pagination; the V2 wire suite
+/// and the recorded corpus pin the cursor follow.
+fn mount_transcript(server: &TestHttpServer, fixture: &TranscriptFixture) {
+    server.route(
+        "GET",
+        &format!("/api/session/{}/message", fixture.session),
+        200,
+        json!({
+            "data": [
+                {
+                    "id": fixture.previous_id,
+                    "type": "assistant",
+                    "time": {"created": fixture.previous_created_ms, "completed": fixture.previous_completed_ms},
+                    "model": {"id": fixture.model, "providerID": fixture.provider},
+                    "content": [{"type": "text", "text": fixture.previous_text}],
+                    "finish": "stop",
+                },
+                {
+                    "id": fixture.inflight_id,
+                    "type": "assistant",
+                    "time": {"created": fixture.inflight_created_ms},
+                    "model": {"id": fixture.model, "providerID": fixture.provider},
+                    "content": [
+                        {"type": "reasoning", "text": fixture.inflight_reasoning,
+                         "time": {"created": fixture.inflight_created_ms}},
+                        {"type": "tool", "id": fixture.inflight_call_id, "name": "shell",
+                         "state": {"status": "running", "input": {"command": "sleep 10"}, "metadata": {}},
+                         "time": {"created": fixture.inflight_created_ms}},
+                    ],
+                },
+                {
+                    "id": fixture.user_id,
+                    "type": "user",
+                    "time": {"created": fixture.user_created_ms},
+                    "text": fixture.user_text,
+                },
+                {
+                    "id": fixture.assistant_id,
+                    "type": "assistant",
+                    "time": {"created": fixture.assistant_created_ms, "completed": fixture.assistant_completed_ms},
+                    "model": {"id": fixture.model, "providerID": fixture.provider},
+                    "tokens": {
+                        "input": fixture.input_tokens,
+                        "output": fixture.output_tokens,
+                        "reasoning": fixture.reasoning_tokens,
+                        "cache": {"read": fixture.cache_read_tokens, "write": fixture.cache_write_tokens},
+                    },
+                    "content": [
+                        {"type": "reasoning", "text": fixture.assistant_reasoning,
+                         "time": {"created": fixture.assistant_created_ms + 10}},
+                        {"type": "tool", "id": fixture.tool_call_id, "name": "shell",
+                         "state": {"status": "completed",
+                                   "input": {"command": fixture.tool_command},
+                                   "content": [{"type": "text", "text": fixture.tool_output}],
+                                   "metadata": {"exit": 0}},
+                         "time": {"created": fixture.assistant_created_ms + 20,
+                                  "completed": fixture.assistant_completed_ms}},
+                        {"type": "text", "text": fixture.assistant_text},
+                    ],
+                    "finish": "stop",
+                },
+            ],
+            "cursor": {},
+        })
+        .to_string(),
+    );
+}
+
+/// Serve a recorded V2 transcript response body verbatim, then the terminating
+/// empty page: a real recording carries `cursor.next` even on its last data
+/// page (the server mints one for every non-empty page), so the follow must see
+/// an end-of-list page rather than loop on the recording.
+fn mount_recorded_transcript(server: &TestHttpServer, session_id: &str, body: &str) {
+    server.route_sequence(
+        "GET",
+        &format!("/api/session/{session_id}/message"),
+        vec![
+            MockResponse::json(body),
+            MockResponse::json(json!({"data": [], "cursor": {}}).to_string()),
+        ],
     );
 }

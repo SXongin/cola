@@ -28,6 +28,8 @@ pub(crate) mod transport;
 pub mod types;
 pub(crate) mod v1;
 pub(crate) mod v2;
+#[cfg(test)]
+mod wire;
 
 use std::sync::Arc;
 

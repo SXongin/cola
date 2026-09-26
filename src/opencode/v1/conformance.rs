@@ -6,7 +6,7 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::opencode::conformance::{SessionReadCase, SessionReadFixture};
+use crate::opencode::conformance::{SessionReadCase, SessionReadFixture, TranscriptFixture};
 use crate::opencode::strategy::Generation;
 use crate::test_http::{MockResponse, TestHttpServer};
 
@@ -17,6 +17,8 @@ pub(crate) fn session_read_case() -> SessionReadCase {
     SessionReadCase {
         generation: Generation::V1,
         mount,
+        mount_transcript,
+        mount_recorded_transcript,
     }
 }
 
@@ -81,4 +83,90 @@ fn mount(server: &TestHttpServer, fixture: &SessionReadFixture) {
         json!({"type": "retry", "attempt": 1, "message": "boom", "next": 5000}),
     );
     server.route("GET", "/session/status", 200, Value::Object(statuses).to_string());
+}
+
+/// Mount the V1 transcript read: a bare `[{info, parts}]` array, in server
+/// order. The shared [`TranscriptFixture`] publishes the same neutral facts as
+/// V2's mount through V1's spellings: `info.role`/`info.time`, `parts` with
+/// `text`/`reasoning`/`tool`, `callID`/`state`, and the `step-finish` part
+/// whose reason declares completion.
+fn mount_transcript(server: &TestHttpServer, fixture: &TranscriptFixture) {
+    server.route(
+        "GET",
+        &format!("/session/{}/message", fixture.session),
+        200,
+        json!([
+            {
+                "info": {
+                    "id": fixture.previous_id,
+                    "role": "assistant",
+                    "time": {"created": fixture.previous_created_ms, "completed": fixture.previous_completed_ms},
+                    "providerID": fixture.provider,
+                    "modelID": fixture.model,
+                },
+                "parts": [
+                    {"type": "text", "text": fixture.previous_text},
+                    {"type": "step-finish", "reason": "stop"},
+                ],
+            },
+            {
+                "info": {
+                    "id": fixture.inflight_id,
+                    "role": "assistant",
+                    "time": {"created": fixture.inflight_created_ms},
+                    "providerID": fixture.provider,
+                    "modelID": fixture.model,
+                },
+                "parts": [
+                    {"type": "reasoning", "text": fixture.inflight_reasoning,
+                     "time": {"start": fixture.inflight_created_ms}},
+                    {"type": "tool", "tool": "bash", "callID": fixture.inflight_call_id,
+                     "state": {"status": "running", "input": {"command": "sleep 10"},
+                               "time": {"start": fixture.inflight_created_ms}}},
+                ],
+            },
+            {
+                "info": {
+                    "id": fixture.user_id,
+                    "role": "user",
+                    "time": {"created": fixture.user_created_ms},
+                },
+                "parts": [{"type": "text", "text": fixture.user_text}],
+            },
+            {
+                "info": {
+                    "id": fixture.assistant_id,
+                    "role": "assistant",
+                    "time": {"created": fixture.assistant_created_ms, "completed": fixture.assistant_completed_ms},
+                    "providerID": fixture.provider,
+                    "modelID": fixture.model,
+                    "tokens": {
+                        "input": fixture.input_tokens,
+                        "output": fixture.output_tokens,
+                        "total": fixture.total_tokens,
+                        "cache": {"read": fixture.cache_read_tokens, "write": fixture.cache_write_tokens},
+                    },
+                },
+                "parts": [
+                    {"type": "step-start"},
+                    {"type": "reasoning", "text": fixture.assistant_reasoning,
+                     "time": {"start": fixture.assistant_created_ms + 10}},
+                    {"type": "tool", "tool": "bash", "callID": fixture.tool_call_id,
+                     "state": {"status": "completed",
+                               "input": {"command": fixture.tool_command},
+                               "output": fixture.tool_output,
+                               "time": {"start": fixture.assistant_created_ms + 20,
+                                        "end": fixture.assistant_completed_ms}}},
+                    {"type": "text", "text": fixture.assistant_text},
+                    {"type": "step-finish", "reason": "stop"},
+                ],
+            },
+        ])
+        .to_string(),
+    );
+}
+
+/// Serve a recorded V1 transcript response body (a bare array) verbatim.
+fn mount_recorded_transcript(server: &TestHttpServer, session_id: &str, body: &str) {
+    server.route("GET", &format!("/session/{session_id}/message"), 200, body);
 }

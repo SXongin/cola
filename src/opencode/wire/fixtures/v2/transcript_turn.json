@@ -1,0 +1,133 @@
+{
+  "capture": {
+    "captured_at": "2026-09-26",
+    "command": "COLA_LIVE_OPENCODE_V2_BIN=<v2-binary> COLA_LIVE_CAPTURE_DIR=<dir> cargo test --locked -- --ignored live_v2_scripted_transcript_read",
+    "generation": "v2",
+    "source": "opencode v2.0.18"
+  },
+  "response": {
+    "cursor": {
+      "next": "cursor_next_fixture",
+      "previous": "cursor_previous_fixture"
+    },
+    "data": [
+      {
+        "id": "msg_cola_live_fixture",
+        "text": "run the live harness command",
+        "time": {
+          "created": 1700000000000
+        },
+        "type": "user"
+      },
+      {
+        "agent": "build",
+        "content": [
+          {
+            "state": {
+              "reasoningField": "reasoning_content"
+            },
+            "text": "live-harness-reasoning",
+            "time": {
+              "completed": 1700000000083,
+              "created": 1700000000071
+            },
+            "type": "reasoning"
+          },
+          {
+            "executed": false,
+            "id": "call_live_harness_1",
+            "name": "shell",
+            "state": {
+              "content": [
+                {
+                  "text": "live-harness-tool\n",
+                  "type": "text"
+                }
+              ],
+              "input": {
+                "command": "sleep 2; echo live-harness-tool"
+              },
+              "metadata": {
+                "exit": 0,
+                "status": "completed",
+                "truncated": false
+              },
+              "status": "completed"
+            },
+            "time": {
+              "completed": 1700000002170,
+              "created": 1700000000077,
+              "ran": 1700000000089
+            },
+            "type": "tool"
+          }
+        ],
+        "cost": 0,
+        "finish": "tool-calls",
+        "id": "msg_live_step",
+        "model": {
+          "id": "scripted-model",
+          "providerID": "scripted",
+          "variant": "default"
+        },
+        "rawFinish": "tool_calls",
+        "time": {
+          "completed": 1700000002174,
+          "created": 1700000000039,
+          "streamed": 1700000000093
+        },
+        "tokens": {
+          "cache": {
+            "read": 0,
+            "write": 0
+          },
+          "input": 11,
+          "output": 7,
+          "reasoning": 0
+        },
+        "type": "assistant"
+      },
+      {
+        "agent": "build",
+        "content": [
+          {
+            "text": "live-harness-final-text",
+            "type": "text"
+          }
+        ],
+        "cost": 0,
+        "finish": "stop",
+        "id": "msg_live_answer",
+        "model": {
+          "id": "scripted-model",
+          "providerID": "scripted",
+          "variant": "default"
+        },
+        "rawFinish": "stop",
+        "time": {
+          "completed": 1700000002232,
+          "created": 1700000002210,
+          "streamed": 1700000002229
+        },
+        "tokens": {
+          "cache": {
+            "read": 0,
+            "write": 0
+          },
+          "input": 11,
+          "output": 7,
+          "reasoning": 0
+        },
+        "type": "assistant"
+      },
+      {
+        "id": "msg_live_idle",
+        "outcome": "succeeded",
+        "time": {
+          "created": 1700000002236
+        },
+        "type": "idle"
+      }
+    ]
+  }
+}
