@@ -70,8 +70,11 @@ Standard local verification loop before pushing (CI's Format job is `cargo fmt -
 
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
+    cargo xtask check-generation
     cargo test --workspace --locked
     cargo build --release --locked
+
+`cargo xtask check-generation` is the V1 coupling guard (spec #364): it rejects V1 route literals and wire field names outside `src/opencode/v1/` (plus the tool-render allow-list), so V1 retirement stays a deletion.
 
 ## Contribution guidelines
 

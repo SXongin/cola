@@ -1,11 +1,12 @@
 use std::process::{Command, exit};
 
+mod generation_guard;
 mod release;
 
 fn main() {
     let task = std::env::args().nth(1).unwrap_or_else(|| {
         eprintln!("Usage: cargo xtask <task>");
-        eprintln!("Tasks: check, test, clippy, fmt, audit, check-commit-msg, release");
+        eprintln!("Tasks: check, test, clippy, fmt, audit, check-commit-msg, check-generation, release");
         exit(1);
     });
 
@@ -16,10 +17,12 @@ fn main() {
         "fmt" => run_fmt(),
         "audit" => run_audit(),
         "check-commit-msg" => run_check_commit_msg(),
+        "check-generation" => generation_guard::run(),
         "release" => release::cli(),
         other => {
             eprintln!(
-                "Unknown task: {other}. Available: check, test, clippy, fmt, audit, check-commit-msg, release"
+                "Unknown task: {other}. Available: check, test, clippy, fmt, audit, check-commit-msg, \
+                 check-generation, release"
             );
             exit(1);
         }
