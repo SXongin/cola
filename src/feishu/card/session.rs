@@ -534,7 +534,7 @@ pub fn build_child_card(
         "sub",
         thread_key,
         None,
-        "🔍 搜索标题 / ID",
+        "🔍 搜索标题 / 目录 / ID",
         keyword,
     ));
 
@@ -1430,6 +1430,9 @@ mod tests {
             .find(|e| e["tag"] == "input")
             .expect("search form has an input");
         assert_eq!(input["default_value"], "子会话1");
+        // The filter is `matches_keyword` (title + directory + id), so the
+        // placeholder carries the same copy as the `/switch` card's.
+        assert_eq!(input["placeholder"]["content"], "🔍 搜索标题 / 目录 / ID");
         let submit = form["elements"]
             .as_array()
             .unwrap()
