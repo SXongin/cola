@@ -504,6 +504,24 @@ impl RequestsHandle {
         }
     }
 
+    /// The wait blocking `session_id`, if any (ADR-0054): the two kinds'
+    /// pending records combine into the card's wait vocabulary.
+    pub(crate) async fn wait_for(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::feishu::card::tool_render::WaitState> {
+        use crate::feishu::card::tool_render::WaitState;
+        match (
+            self.permission.is_pending_for(session_id).await,
+            self.question.is_pending_for(session_id).await,
+        ) {
+            (true, true) => Some(WaitState::Both),
+            (true, false) => Some(WaitState::Permission),
+            (false, true) => Some(WaitState::Question),
+            (false, false) => None,
+        }
+    }
+
     /// The requests cola itself is answering or has answered — `answered_requests`
     /// plus the live `settling_requests` claims. The sweep's vanished passes
     /// take one snapshot of this per pass: a request that disappeared from the

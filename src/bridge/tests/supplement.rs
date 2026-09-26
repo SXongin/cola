@@ -337,6 +337,7 @@ async fn a_tool_completing_after_the_split_renders_on_the_continuation() {
         &app.cards_handle(),
         &app.sessions_handle(),
         &app.opencode,
+        &app.requests_handle(),
         "ses_test",
         &transcript,
     )

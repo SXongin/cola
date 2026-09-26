@@ -15,7 +15,7 @@ use tracing::Instrument;
 
 use crate::backend::{MessageRole, SessionTranscript, TurnAnchor};
 use crate::bridge::handler::image_inputs;
-use crate::bridge::handles::{CardsHandle, SessionsHandle, TurnHandles};
+use crate::bridge::handles::{CardsHandle, RequestsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
 use crate::bridge::turn::state::StreamAccumulator;
 use crate::config::ThreadKey;
@@ -742,6 +742,7 @@ impl Turn {
                     &handles.cards,
                     &handles.sessions,
                     &handles.backend,
+                    &handles.requests,
                     &self.session_id,
                     &transcript,
                 )
@@ -959,10 +960,11 @@ impl Turn {
         cards: &CardsHandle,
         sessions: &SessionsHandle,
         backend: &Arc<dyn crate::backend::Backend>,
+        requests: &RequestsHandle,
         session_id: &str,
         transcript: &SessionTranscript,
     ) -> Option<(usize, usize, usize)> {
-        render::render_and_flush(cards, sessions, backend, session_id, transcript).await
+        render::render_and_flush(cards, sessions, backend, requests, session_id, transcript).await
     }
 }
 

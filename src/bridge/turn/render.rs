@@ -12,10 +12,11 @@ use tracing::Instrument;
 
 use crate::backend::{MessageRole, Part, SessionTranscript, ToolStatus};
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
-use crate::bridge::handles::{CardsHandle, SessionsHandle, TurnHandles};
+use crate::bridge::handles::{CardsHandle, RequestsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
 use crate::bridge::turn::state::{RenderedPart, StreamAccumulator};
 use crate::config::ThreadKey;
+use crate::feishu::card::tool_render::TaskLiveness;
 
 use super::Turn;
 
@@ -305,6 +306,7 @@ pub(super) async fn render_and_flush(
     cards: &CardsHandle,
     sessions: &SessionsHandle,
     backend: &Arc<dyn crate::backend::Backend>,
+    requests: &RequestsHandle,
     session_id: &str,
     transcript: &SessionTranscript,
 ) -> Option<(usize, usize, usize)> {
@@ -353,10 +355,115 @@ pub(super) async fn render_and_flush(
             None => false,
         }
     };
-    if changed || header_changed || context_changed {
+    // ADR-0054: refresh every live task panel's child-session liveness. A
+    // change must flush even when no part, header second or context figure
+    // moved — the line is the only thing that changed.
+    let liveness_changed = refresh_task_liveness(cards, requests, backend, session_id, now_ms()).await;
+    if changed || header_changed || context_changed || liveness_changed {
         Turn::flush_card(cards, session_id).await;
     }
     Some((new_parts, text_len, reasoning_len))
+}
+
+/// Wall-clock now in epoch ms, the reference the child-liveness ages are
+/// measured against (server times are epoch ms too).
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// A child session's liveness as its transcript reports it (ADR-0054): the age
+/// of its newest activity and its newest still-running tool. `None` when the
+/// transcript carries no timestamp at all (a child that just started, or a
+/// payload without times) — no line is better than a made-up age.
+fn child_liveness(transcript: &SessionTranscript, now_ms: i64) -> Option<(u64, Option<String>)> {
+    let mut newest_ms: Option<i64> = None;
+    let mut current_tool: Option<String> = None;
+    let mut observe = |at: Option<i64>| {
+        if let Some(at) = at {
+            newest_ms = Some(newest_ms.map_or(at, |current: i64| current.max(at)));
+        }
+    };
+    for message in &transcript.messages {
+        if let Some(time) = &message.time {
+            observe(Some(time.completed.unwrap_or(time.created)));
+        }
+        for part in &message.parts {
+            match part {
+                Part::Tool(call) => {
+                    observe(call.started_at);
+                    if matches!(call.status, ToolStatus::Running | ToolStatus::Pending) {
+                        current_tool = Some(call.identity.name.clone());
+                    }
+                }
+                Part::Text(text) => observe(text.started_at),
+                Part::Reasoning(reasoning) => observe(reasoning.started_at),
+                Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::Other(_) => {}
+            }
+        }
+    }
+    let newest_ms = newest_ms?;
+    Some((((now_ms - newest_ms).max(0) / 1000) as u64, current_tool))
+}
+
+/// Read and attach the child-session liveness of every live `task` panel on
+/// `session_id`'s card (ADR-0054): one transcript read per distinct child, the
+/// wait from the request flows' pending record. Returns true when a panel
+/// changed. Every read is best-effort: a failure leaves the previous line in
+/// place rather than clearing it.
+async fn refresh_task_liveness(
+    cards: &CardsHandle,
+    requests: &RequestsHandle,
+    backend: &Arc<dyn crate::backend::Backend>,
+    session_id: &str,
+    now_ms: i64,
+) -> bool {
+    let tasks: Vec<(String, String)> = {
+        let live = cards.cards.lock().await;
+        match live.get(session_id) {
+            Some(card) => card.acc.live_task_children(),
+            None => return false,
+        }
+    };
+    if tasks.is_empty() {
+        return false;
+    }
+    let mut gathered: std::collections::HashMap<String, TaskLiveness> = std::collections::HashMap::new();
+    let mut failed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (_, child) in &tasks {
+        if gathered.contains_key(child) || failed.contains(child) {
+            continue;
+        }
+        let Ok(transcript) = backend.transcript(child).await else {
+            failed.insert(child.clone());
+            continue;
+        };
+        let Some((last_activity_ago_secs, current_tool)) = child_liveness(&transcript, now_ms) else {
+            failed.insert(child.clone());
+            continue;
+        };
+        gathered.insert(
+            child.clone(),
+            TaskLiveness {
+                last_activity_ago_secs,
+                current_tool,
+                wait: requests.wait_for(child).await,
+            },
+        );
+    }
+    let mut live = cards.cards.lock().await;
+    let Some(card) = live.get_mut(session_id) else {
+        return false;
+    };
+    let mut changed = false;
+    for (call_id, child) in tasks {
+        if let Some(liveness) = gathered.get(&child).cloned() {
+            changed |= card.acc.set_tool_liveness(&call_id, Some(liveness));
+        }
+    }
+    changed
 }
 
 /// Incremental renderer: while the synchronous prompt is in flight, poll the
@@ -368,6 +475,7 @@ async fn render_poll_loop(
     cards: &CardsHandle,
     sessions: &SessionsHandle,
     backend: &Arc<dyn crate::backend::Backend>,
+    requests: &RequestsHandle,
     session_id: String,
     done: std::sync::Arc<std::sync::atomic::AtomicBool>,
     poll_ms: u64,
@@ -385,7 +493,7 @@ async fn render_poll_loop(
                 continue;
             }
         };
-        match render_and_flush(cards, sessions, backend, &session_id, &transcript).await {
+        match render_and_flush(cards, sessions, backend, requests, &session_id, &transcript).await {
             // Accumulator gone (turn completed and was cleaned up); keep polling
             // until the prompt returns so late parts are still caught.
             None => continue,
@@ -416,6 +524,7 @@ impl RenderPoll {
         let cards = handles.cards.clone();
         let sessions = handles.sessions.clone();
         let backend = Arc::clone(&handles.backend);
+        let requests = handles.requests.clone();
         let sid = session_id.to_string();
         let flag = Arc::clone(&done);
         let poll_ms = handles.config.render_poll_ms();
@@ -426,7 +535,7 @@ impl RenderPoll {
         let span = span::turn(session_id, thread_key, None);
         let handle = tokio::spawn(
             async move {
-                render_poll_loop(&cards, &sessions, &backend, sid, flag, poll_ms).await;
+                render_poll_loop(&cards, &sessions, &backend, &requests, sid, flag, poll_ms).await;
             }
             .instrument(span),
         );
@@ -1691,7 +1800,15 @@ Index: /x/src/main.rs
 
         // No parts at all: only the header signature can trigger a flush.
         let transcript = SessionTranscript::default();
-        let _ = render_and_flush(&cards, &app.sessions_handle(), &app.opencode, sid, &transcript).await;
+        let _ = render_and_flush(
+            &cards,
+            &app.sessions_handle(),
+            &app.opencode,
+            &app.requests_handle(),
+            sid,
+            &transcript,
+        )
+        .await;
         assert_eq!(
             platform.updated_cards().await.len(),
             1,
@@ -1700,7 +1817,15 @@ Index: /x/src/main.rs
 
         // The header signature moves (the state label flips) with no new parts.
         Turn::set_card_state(&cards, sid, CardState::Reasoning).await;
-        let _ = render_and_flush(&cards, &app.sessions_handle(), &app.opencode, sid, &transcript).await;
+        let _ = render_and_flush(
+            &cards,
+            &app.sessions_handle(),
+            &app.opencode,
+            &app.requests_handle(),
+            sid,
+            &transcript,
+        )
+        .await;
         let updates = platform.updated_cards().await;
         assert_eq!(
             updates.len(),
@@ -1736,6 +1861,7 @@ Index: /x/src/main.rs
             &cards,
             &app.sessions_handle(),
             &app.opencode,
+            &app.requests_handle(),
             sid,
             &transcript("第一段"),
         )
@@ -1747,6 +1873,7 @@ Index: /x/src/main.rs
             &cards,
             &app.sessions_handle(),
             &app.opencode,
+            &app.requests_handle(),
             sid,
             &transcript("第二段"),
         )
@@ -1761,6 +1888,137 @@ Index: /x/src/main.rs
             updates.last().unwrap().to_string().contains("第二段"),
             "the flushed card carries the new text: {}",
             updates.last().unwrap()
+        );
+    }
+
+    /// ADR-0054: the child session's liveness is the age of its newest activity
+    /// (message completion or part start) and its newest still-running tool.
+    #[test]
+    fn child_liveness_reads_age_and_current_tool() {
+        let transcript = SessionTranscript::new(vec![
+            typed_message("u", MessageRole::User, Some(1_000), vec![]),
+            message(
+                "a1",
+                5_000,
+                vec![
+                    reasoning_at("thinking", 4_000),
+                    tool("read", "c1", ToolStatus::Completed, Some(6_000), None, None),
+                    tool("bash", "c2", ToolStatus::Running, Some(9_000), None, None),
+                ],
+            ),
+        ]);
+        assert_eq!(
+            child_liveness(&transcript, 21_000),
+            Some((12, Some("bash".into())))
+        );
+    }
+
+    /// A child with no timestamp at all renders no line — a made-up age would
+    /// be a lie, and an empty transcript is normal for a just-started child.
+    #[test]
+    fn child_liveness_without_any_timestamp_is_none() {
+        let transcript = SessionTranscript::new(vec![typed_message("u", MessageRole::User, None, vec![])]);
+        assert_eq!(child_liveness(&transcript, 21_000), None);
+    }
+
+    /// While the child thinks (no live tool), only the age is shown.
+    #[test]
+    fn child_liveness_reports_no_tool_while_thinking() {
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            5_000,
+            vec![
+                tool("bash", "c1", ToolStatus::Completed, Some(6_000), None, None),
+                reasoning_at("thinking", 8_000),
+            ],
+        )]);
+        assert_eq!(child_liveness(&transcript, 10_000), Some((2, None)));
+    }
+
+    /// A typed `task` call: running, with the child session id in its metadata
+    /// as the event contract records it (`state.metadata.sessionId`).
+    fn task_part(call_id: &str, started_at: i64, child: &str) -> Part {
+        Part::Tool(ToolCall {
+            identity: ToolIdentity {
+                name: "task".into(),
+                call_id: call_id.into(),
+            },
+            status: ToolStatus::Running,
+            started_at: Some(started_at),
+            input: Some(serde_json::json!({"description": "review"})),
+            metadata: Some(serde_json::json!({"sessionId": child, "parentSessionId": "ses_parent"})),
+            output: ToolOutput::default(),
+        })
+    }
+
+    /// ADR-0054: a live task panel's title carries the child's liveness, and a
+    /// later poll refreshes it from the child's new state.
+    #[tokio::test]
+    async fn live_task_panel_shows_the_childs_liveness() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let now = now_ms();
+        let mut backend = MockBackend::new(realistic_parts());
+        let child = |started: i64, name: &str| {
+            SessionTranscript::new(vec![message(
+                "a_child",
+                started,
+                vec![tool(
+                    name,
+                    "call_child",
+                    ToolStatus::Running,
+                    Some(started),
+                    Some(serde_json::json!({"command": "sleep 60"})),
+                    None,
+                )],
+            )])
+        };
+        backend.given_transcript(
+            "ses_child",
+            vec![child(now - 5_000, "bash"), child(now - 1_000, "read")],
+        );
+        let parent = SessionTranscript::new(vec![message(
+            "a1",
+            now - 19_000,
+            vec![task_part("call_task", now - 19_000, "ses_child")],
+        )]);
+        let (app, platform) = build_app(cfg, backend).await;
+        let cards = app.cards_handle();
+        let sid = "ses_parent";
+        Turn::seed_card(&cards, sid, Some("om_parent")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(now - 20_000)).await;
+
+        let _ = render_and_flush(
+            &cards,
+            &app.sessions_handle(),
+            &app.opencode,
+            &app.requests_handle(),
+            sid,
+            &parent,
+        )
+        .await;
+        let updates = platform.updated_cards().await;
+        let first = updates.last().expect("a live flush").to_string();
+        assert!(
+            first.contains("前 · bash"),
+            "the first poll shows the child's running tool: {first}"
+        );
+
+        let _ = render_and_flush(
+            &cards,
+            &app.sessions_handle(),
+            &app.opencode,
+            &app.requests_handle(),
+            sid,
+            &parent,
+        )
+        .await;
+        let updates = platform.updated_cards().await;
+        let second = updates.last().expect("a refresh flush").to_string();
+        assert!(
+            second.contains("前 · read"),
+            "the next poll refreshes the child's liveness: {second}"
         );
     }
 

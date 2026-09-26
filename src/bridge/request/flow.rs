@@ -72,6 +72,12 @@ pub struct RequestFlow {
     /// decision the backend never received. In-memory like the claim set on
     /// `handles.requests.answered_requests`, and one card per answered request.
     answered_results: Arc<Mutex<HashMap<String, CardActionResult>>>,
+    /// Session ids with at least one pending request of this kind, as of the
+    /// last COMPLETE sweep. The task liveness line (ADR-0054) reads it to show
+    /// a child session's wait without listing pending requests per render poll.
+    /// Replaced wholesale, and only when no directory failed — unknown is never
+    /// read as resolved (#130), exactly like the reminder's own rule.
+    pending_sessions: Arc<Mutex<std::collections::HashSet<String>>>,
     /// The persisted surface mirror (ADR-0038 restart re-adoption): every
     /// standalone card this flow sends is written through, and its persisted
     /// records seed [`Self::recovered`] at startup.
@@ -127,6 +133,7 @@ impl RequestFlow {
             listed_dirs: Arc::new(Mutex::new(std::collections::HashSet::new())),
             question_state: Arc::new(Mutex::new(HashMap::new())),
             answered_results: Arc::new(Mutex::new(HashMap::new())),
+            pending_sessions: Arc::new(Mutex::new(std::collections::HashSet::new())),
             surfaces,
             recovered: Arc::new(Mutex::new(recovered)),
         }
@@ -147,6 +154,13 @@ impl RequestFlow {
     /// could.
     pub(crate) async fn try_mark_answered(&self, requests: &RequestsHandle, req_id: &str) -> bool {
         requests.answered_requests.lock().await.insert(req_id.to_string())
+    }
+
+    /// Whether `session_id` has a pending request of this kind, per the last
+    /// complete sweep (ADR-0054). A session never read as pending, or one whose
+    /// sweep failed, reads as false.
+    pub(crate) async fn is_pending_for(&self, session_id: &str) -> bool {
+        self.pending_sessions.lock().await.contains(session_id)
     }
 
     /// Roll back a claim made by [`Self::try_mark_answered`] after a GENUINE
@@ -489,6 +503,9 @@ impl RequestFlow {
         // known session directory.
         let directories = { handles.sessions.store.lock().await.directories() };
         let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // (request id, session id) pairs for the liveness record (ADR-0054);
+        // auto-resolved requests are filtered out when the record is written.
+        let mut wait_candidates: Vec<(String, String)> = Vec::new();
         // Feishu's Instant Reminder (ADR-0043): this kind's pin candidates,
         // collected here and resolved after the sweep. Collected (not resolved
         // inline) so a request auto-resolved in the same sweep (e.g.
@@ -526,6 +543,7 @@ impl RequestFlow {
                     listed_now.insert(dir.clone());
                     for req in &requests {
                         pending.insert(req.id().to_string());
+                        wait_candidates.push((req.id().to_string(), req.session_id().to_string()));
                         // Both pin surfaces need the listed candidates: the
                         // reminder's chat-level target and the waiting-card
                         // registry's host message.
@@ -554,6 +572,19 @@ impl RequestFlow {
                     failed_dirs.insert(dir.clone());
                 }
             }
+        }
+        // ADR-0054: record which sessions wait on this kind, so the task
+        // liveness line reads it without listing pending requests per render
+        // poll. Only a complete sweep may replace the record — a failed
+        // directory said nothing, and unknown is never read as resolved (#130),
+        // the reminder's own rule below.
+        if failed_dirs.is_empty() {
+            let waiting: std::collections::HashSet<String> = wait_candidates
+                .iter()
+                .filter(|(id, _)| !auto_resolved.contains(id))
+                .map(|(_, session)| session.clone())
+                .collect();
+            *self.pending_sessions.lock().await = waiting;
         }
         // Instant Reminder (ADR-0043): reconcile this kind's pending requests
         // with the pin state. A sweep where any directory failed must not

@@ -10,7 +10,7 @@
 use crate::backend::TurnAnchor;
 use crate::bridge::handles::CardsHandle;
 use crate::feishu::card::shell::CardBuilder;
-use crate::feishu::card::tool_render::ToolPanel;
+use crate::feishu::card::tool_render::{TaskLiveness, ToolPanel};
 use crate::feishu::card::{AwaitingAction, CardState};
 use indexmap::IndexMap;
 use std::sync::Arc;
@@ -1045,6 +1045,34 @@ impl StreamAccumulator {
         // A running-tool phase starts/exits here (running → completed), so the
         // header timer must follow even though card_state stays Streaming.
         self.refresh_phase();
+    }
+
+    /// The live `task` panels' (call id, child Session id) pairs (ADR-0054):
+    /// the render path reads each child's liveness for them. A task call with
+    /// no recorded child id contributes nothing.
+    pub(super) fn live_task_children(&self) -> Vec<(String, String)> {
+        self.tools
+            .iter()
+            .filter(|(_, panel)| panel.is_live() && panel.name() == "task")
+            .filter_map(|(call_id, panel)| {
+                panel
+                    .child_session_id()
+                    .map(|child| (call_id.clone(), child.to_string()))
+            })
+            .collect()
+    }
+
+    /// Attach or clear one panel's gathered child liveness (ADR-0054). Returns
+    /// true when the panel changed, so the caller can flush.
+    pub(super) fn set_tool_liveness(&mut self, call_id: &str, liveness: Option<TaskLiveness>) -> bool {
+        let Some(panel) = self.tools.get_mut(call_id) else {
+            return false;
+        };
+        if panel.liveness() == liveness.as_ref() {
+            return false;
+        }
+        panel.set_liveness(liveness);
+        true
     }
 
     /// Build the whole card (tests + simple callers). Assembles the full

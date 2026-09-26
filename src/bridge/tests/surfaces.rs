@@ -586,3 +586,65 @@ async fn restart_marks_a_standalone_card_stale_when_resolved_while_down() {
     );
     assert_eq!(persisted(&session_file), None);
 }
+
+/// ADR-0054: each sweep records which sessions hold a pending request of its
+/// kind, so the task liveness line reads a child's wait without listing pending
+/// requests per render poll. A failed list is unknown, never resolved.
+#[tokio::test]
+async fn sweep_records_pending_sessions_for_liveness() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permission(perm_request("per_1", "ses_child", "ls -la"));
+    backend.ask_question(question_request("q_1", "ses_child"));
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(test_config(&session_file), backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_1", "/work").await;
+
+    assert!(
+        app.requests_handle().wait_for("ses_child").await.is_none(),
+        "nothing is pending before the first sweep"
+    );
+    sweep(&app.permission, &app).await;
+    assert!(
+        app.permission.is_pending_for("ses_child").await,
+        "the sweep records the waiting child session"
+    );
+    sweep(&app.question, &app).await;
+    assert_eq!(
+        app.requests_handle().wait_for("ses_child").await,
+        Some(crate::feishu::card::tool_render::WaitState::Both),
+        "both kinds pending combine into the card's wait vocabulary"
+    );
+
+    // A failed list says nothing: the record must survive it (#130).
+    app.permission
+        .list_timeout_ms
+        .store(10, std::sync::atomic::Ordering::SeqCst);
+    backend
+        .hang_list_permissions
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    sweep(&app.permission, &app).await;
+    assert!(
+        app.permission.is_pending_for("ses_child").await,
+        "a failed sweep leaves the record alone"
+    );
+
+    // Resolved elsewhere: the next complete sweep drops the kind's record.
+    backend.permission_resolved_by_another("per_1").await;
+    sweep(&app.permission, &app).await;
+    assert_eq!(
+        app.requests_handle().wait_for("ses_child").await,
+        Some(crate::feishu::card::tool_render::WaitState::Question),
+        "the resolved permission leaves only the question"
+    );
+    backend.question_resolved_by_another("q_1").await;
+    sweep(&app.question, &app).await;
+    assert!(
+        app.requests_handle().wait_for("ses_child").await.is_none(),
+        "a complete sweep with no pending request clears the record"
+    );
+}
