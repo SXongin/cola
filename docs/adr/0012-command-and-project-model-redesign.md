@@ -22,6 +22,13 @@ backend).
 > activating a session at command time; the session file's structure changed
 > to `{"entries":[…],"pending":[…]}` (legacy bare arrays still load).
 
+> **Amended by ADR-0022's 2026-09-26 update**: the `/list` text form that
+> `/switch` absorbed is deleted outright (no tombstone, no `--all`); the switch
+> card's 全部 scope + keyword search is the lossless find-anything path, and
+> child sessions gained their own scoped `/sub` family (`/sub list` read-only,
+> `/sub attach` explicit takeover) while session management stays root-only.
+> The "12 commands" count in the text above is a historical snapshot.
+
 Consequences: config simplifies (`url` optional, `username`/`password` deleted,
 `work_dir` = default project), the log rotates daily (`cola-YYYY-MM-DD.log`,
 keep N days) with cross-day sessions queried by `grep session_id=... cola-*.log`,

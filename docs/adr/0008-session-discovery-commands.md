@@ -26,7 +26,8 @@ How a user finds and takes over sessions that were not created in Feishu
 
 ## Decision
 
-- **`/list [keyword] [--all]`**
+- **`/list [keyword] [--all]`** *(absorbed by `/switch` in ADR-0012; the text
+  list form — `--all` included — is deleted in the 2026-09-26 update below)*
   - Pulls the cross-store session list (`GET /experimental/session`, falling
     back to project-scoped `GET /session` on servers without it) into an
     in-memory cache with a 30 s TTL, invalidated immediately when cola
@@ -34,7 +35,8 @@ How a user finds and takes over sessions that were not created in Feishu
   - Sorts client-side by `time.updated`; shows at most 15 entries.
   - Keyword: case-insensitive substring match on `title` / `directory` / id.
   - Children (`parentID` set) and archived sessions hidden by default; `--all`
-    includes children. Archived stays hidden unless listed explicitly.
+    included children (that flag no longer exists — see the 2026-09-26 update).
+    Archived stays hidden unless listed explicitly.
   - Marks the current thread's active session and its other mapped sessions.
   - Rejected inside a topic that already has a session (ADR-0007); in a
     never-had-a-session topic it is allowed (the outcome is that topic's single
@@ -102,21 +104,54 @@ How a user finds and takes over sessions that were not created in Feishu
   assistant-message updates into Feishu is a separate feature, out of scope here.
 - `/list` caching can serve up to 30 s-stale data after external renames or
   activity; acceptable for a listing command.
-- `/list --all` shows sub-task children by id-tail/directory only (their titles
-  are `Child session - ...`); adoption of a child is possible and deliberately
-  left out of `/switch` auto-adoption.
+- Sub-task children show by id-tail/directory only (their titles are
+  `Child session - ...`); child takeover is the explicit `/sub attach`, never a
+  `/switch` result or auto-adoption, and a `/switch --force` adoption attempt on
+  a child is refused with a pointer to it. See the 2026-09-26 update.
 
 ## Update (2026-09-25)
 
 The experimental route excludes **archived** sessions by default but includes
 sub-task children — children are filtered per command on the client, so
-`--all` and `/attach` still resolve them. What hid root sessions from
-`/switch` was the server's page limit (default 100) applied before that filter:
+`--all` (deleted 2026-09-26, see below) and `/attach` still resolve them. What
+hid root sessions from `/switch` was the server's page limit (default 100)
+applied before that filter:
 463 of 809 non-archived sessions were children, the newest 100 rows left only
 11 roots, and the rest of the store was silently truncated (issue #325).
 `list_sessions` now follows `x-next-cursor` to the end (bounded at 100 pages)
 and merges the pages, so the page limit cannot hide rows; children stay in the
 fetched set and are filtered where they always were (the client-side `is_child`
-filter for `/switch` and `/dir`, their inclusion under `--all`). The 30 s
+filter for `/switch` and `/dir`, their inclusion under the then-existing
+`--all`). The 30 s
 cache, the client-side sort, `/list`'s 15-row display cap and the
 project-scoped `GET /session` fallback for older servers are unchanged.
+
+## Update (2026-09-26)
+
+Child takeover became explicit and advertised, and the vault-wide text list was
+deleted outright rather than retired (spec #344). The `--all` flag in the
+updates above is gone with it.
+
+- **`/switch` never adopts a child.** The card and `/switch <keyword>` stay
+  roots-only, and the `--force` attach path — the text form and the card's
+  接管/强制接管 buttons — refuses a child this chat has not already mapped,
+  naming `/sub attach`; `--force` does not open that door. A child this chat
+  adopted behaves like any mapped session: `/switch` re-activates it and a
+  `--force` re-adoption works.
+- **Children have their own scoped surface: the `/sub` family.** `/sub` /
+  `/sub list [keyword]` open a read-only card of the Active Session's **direct**
+  children (title, id tail, agent, last activity, 运行中/空闲), and `/sub attach
+  <id|id-prefix|title> [--force]` takes one over through the ordinary adoption
+  path (mapping, Session Snapshot receipt, owner check, `--force` steal). The
+  parent stays mapped.
+- **The text list is deleted, not retired.** `/switch list` (with or without
+  `--all`) parses as an ordinary `/switch list` keyword query: no tombstone
+  reply, no flag, and nothing forwarded to the model. The switch card's 全部
+  scope + keyword search is the lossless find-anything path (ADR-0022's
+  2026-09-26 update).
+- **The Risk bullet above is replaced**: hidden became rejected — "adoption of
+  a child is possible and deliberately left out of `/switch` auto-adoption" no
+  longer describes the behaviour.
+- **ADR-0016's `/topic --adopt` child rejection stands**: a child is never a
+  topic's own session; the takeover above adopts a child into the current Chat,
+  not into a new Topic.

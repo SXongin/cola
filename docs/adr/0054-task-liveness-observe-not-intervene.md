@@ -1,4 +1,4 @@
-# Task liveness is observed on the running panel; child sessions are never messaged
+# Task liveness is observed on the running panel; child sessions get no second write path
 
 A `task` tool call runs a **child session** — a real session parented to the
 calling one, whose id sits in the call's metadata (`state.metadata.sessionId`).
@@ -7,8 +7,9 @@ subagent_type, `⏳`); everything inside — tools, waits, progress — has no F
 surface, so a long task and a hung one look identical. #284 showed what the
 misjudgment costs: the card was finalized while both review task calls still
 ran, and their work never rendered. This ADR decides the minimum answer: one
-liveness line on the running panel, read-only. The operator never writes into a
-child session.
+liveness line on the running panel, read-only. cola never injects a message into
+a child session — the explicit takeover (`/sub attach`) is a thread-level
+adoption, not a message injection.
 
 ## Context
 
@@ -28,11 +29,15 @@ child session.
 
 ## Decision
 
-- **Observation only.** cola never sends a message into a child session. The
-  parent Session stays the only prompt seam; continuing a child is the parent
-  agent's `task` call with the prior `task_id`. No free-text injection, and no
-  per-child abort/continue control (a `/stop` on the parent already aborts its
-  task call with well-defined semantics).
+- **Observation only; no second write path.** cola never sends a message into a
+  child session on its own initiative. The parent Session stays the prompt seam;
+  continuing a child is the parent agent's `task` call with the prior `task_id`.
+  No free-text injection, and no per-child abort/continue control (a `/stop` on
+  the parent already aborts its task call with well-defined semantics). The one
+  explicit takeover is `/sub attach` (spec #344): a thread-level adoption that
+  maps the child to the Chat through the ordinary adoption path and makes it an
+  ordinary mapped Session — it injects no message itself, and the parent stays
+  mapped alongside it.
 - **One liveness line on the running panel.** While a task Tool Panel is live
   it carries what the child is doing and for how long, in the header's own
   shape: its newest running tool and that call's elapsed time (`bash 28s`), or
@@ -57,7 +62,10 @@ child session.
   limits) to answer a question the liveness line already answers.
 - **A command or standalone card for on-demand inspection.** Rejected: the
   question is asked while looking at the running panel, so the answer belongs
-  there, with no second entry point to learn.
+  there, with no second entry point to learn. **Partly superseded (2026-09-26
+  amendment)**: `/sub list` now provides a command-side, read-only view of a
+  session's direct children for *discovery*; the on-demand inspection of a
+  running child's insides stays rejected, and observation stays read-only.
 - **A new glossary term for the child session.** Rejected: `task` keeps meaning
   the tool call/panel; the **Session** entry records the child relationship and
   the N:1 resume shape (see Domain note).
@@ -77,13 +85,15 @@ child session.
   legitimately slow, and a pending wait names itself.
 - A resumed task shows the same child's state on whichever panel is running;
   the operator reads it as the session continuing, not as a new sub-task.
-- If direct child messaging is ever wanted, it needs its own decision: the
-  rejected alternative and its rationale are recorded here.
+- If out-of-band child messaging is ever wanted (writing into a child without
+  taking it over), it needs its own decision: the rejected alternatives and
+  their rationale are recorded here; the explicit takeover is `/sub attach`.
 
 ## Domain note
 
-The **Session** glossary entry records the child session (parented; never
-mapped to a Chat/Topic; its Permissions/Questions re-home to the parent's card)
-and that the `task` call is a Tool Panel — one child session can be driven by
-several calls. The **Tool Panel** entry records the live task panel's liveness
-line. No new canonical term.
+The **Session** glossary entry records the child session (parented; absent from
+the Session Mapping until an explicit `/sub attach` takeover maps it like any
+other Session; its Permissions/Questions re-home to the parent's card) and that
+the `task` call is a Tool Panel — one child session can be driven by several
+calls. The **Tool Panel** entry records the live task panel's liveness line. No
+new canonical term.

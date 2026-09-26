@@ -66,7 +66,7 @@ Every session-selection command today creates a real backend Session immediately
 - Every consumer of "the current session" must read through the pending-aware accessors (message path, `current_project_directory`, switch/dir card current, external sync's active computation, `/name` target, `/autoaccept` status). A missed consumer is a bug where the pending is invisible to that path.
 - The cover card's 「下一条消息创建」 state is a visible, if brief, degradation: the session id appears only after the first prompt.
 - `/new` followed by the first prompt still issues create-then-prompt; the total work is unchanged from today's first message, but both calls now land at prompt time — with Lazy Start, that prompt may also wait for the server spawn (see #99).
-- Whether `/switch list` should show the pending as a row is a presentation question, not required for correctness.
+- Whether the switch card should show the pending as a row is a presentation question, not required for correctness.
 
 ## Compatibility
 
