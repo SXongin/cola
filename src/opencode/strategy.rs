@@ -40,6 +40,14 @@ pub(crate) trait GenerationStrategy: Send + Sync {
 
     async fn update_session_title(&self, http: &Transport, session_id: &str, title: &str) -> Result<()>;
 
+    /// Delete a session server-side. V2 cascades to the session's child
+    /// sessions and answers 204; V1 deletes the one session and answers a
+    /// boolean body. Un-mapping a chat is a separate, local act. No Bridge
+    /// command calls it yet; the generation wire tests pin the route and the
+    /// 204 handling (spec #364, S4a).
+    #[allow(dead_code)] // no bridge caller yet; the generation wire tests drive it
+    async fn delete_session(&self, http: &Transport, session_id: &str) -> Result<()>;
+
     /// A synchronous prompt: the call returns only when the turn is done, with
     /// the assistant response inline. `model` is already the effective model
     /// (the adapter resolved the configured default before dispatch).

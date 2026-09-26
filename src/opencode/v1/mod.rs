@@ -14,6 +14,8 @@
 mod wire;
 
 #[cfg(test)]
+pub(crate) mod conformance;
+#[cfg(test)]
 mod tests;
 
 use async_trait::async_trait;
@@ -125,6 +127,18 @@ impl GenerationStrategy for V1Strategy {
         http.client()
             .patch(http.url(&format!("{SESSION}/{session_id}")))
             .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Delete a session server-side (canonical: `DELETE /session/{id}`, which
+    /// answers a boolean body on this generation). V1 deletes only the one
+    /// session; children keep their `parentID` and are not cascaded.
+    async fn delete_session(&self, http: &Transport, session_id: &str) -> Result<()> {
+        http.client()
+            .delete(http.url(&format!("{SESSION}/{session_id}")))
             .send()
             .await?
             .error_for_status()?;

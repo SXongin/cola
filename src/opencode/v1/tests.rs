@@ -749,6 +749,23 @@ async fn update_session_title_patches_the_canonical_session_route() {
     assert_eq!(body_json(&request), serde_json::json!({"title": "新标题"}));
 }
 
+/// The V1 delete is the canonical unprefixed route, whose boolean success body
+/// is deliberately not parsed (V2 answers 204 on the same operation).
+#[tokio::test]
+async fn delete_session_deletes_the_canonical_session_route() {
+    let server = TestHttpServer::start().await;
+    server.route("DELETE", "/session/ses_1", 200, "true");
+    let client = v1_wire_client(&server, None);
+
+    client.delete_session("ses_1").await.unwrap();
+
+    let request = last_request(&server);
+    assert_eq!(request.method, "DELETE");
+    assert_eq!(request.path, "/session/ses_1");
+    assert_eq!(request.query, "");
+    assert_eq!(request.body, "", "delete carries no body");
+}
+
 #[tokio::test]
 async fn session_info_sends_the_directory_scope_and_parses_the_parent_chain() {
     let server = TestHttpServer::start().await;

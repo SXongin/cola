@@ -15,6 +15,8 @@
 //! [`crate::backend`], never from here.
 
 pub mod client;
+#[cfg(test)]
+mod conformance;
 pub(crate) mod generation;
 #[cfg(test)]
 mod live;
@@ -54,6 +56,10 @@ impl Backend for OpenCodeBackend {
 
     async fn update_session_title(&self, session_id: &str, title: &str) -> Result<()> {
         OpenCodeBackend::update_session_title(self, session_id, title).await
+    }
+
+    async fn delete_session(&self, session_id: &str) -> Result<()> {
+        OpenCodeBackend::delete_session(self, session_id).await
     }
 
     async fn prompt(
