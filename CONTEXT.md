@@ -16,6 +16,22 @@ _Avoid_: Client, frontend, channel
 An AI code agent provider (e.g. OpenCode). Handles session management, prompt execution, and event streaming.
 _Avoid_: Engine, model, provider
 
+**Generation**:
+An OpenCode protocol era cola can speak: **V1** is the 1.18.x unprefixed compatibility surface; **V2** is the 2.0.x `/api`-only surface. The numbers name OpenCode releases, not protocol versions (ADR-0055).
+_Avoid_: version, API version, protocol v1/v2 (the numbers are OpenCode releases, not protocol versions)
+
+**Attached Generation**:
+The **Generation** of the OpenCode server cola is currently attached to. A property of the attachment, not of a **Session**: switching generations is a reattach (which server is up), never a per-session route (ADR-0055).
+_Avoid_: server version, active generation
+
+**Generation Strategy**:
+The adapter-internal module behind the one `OpenCodeBackend` adapter that owns one **Generation**'s paths, payloads, decoders and semantics; deleting it is the retirement act (ADR-0055).
+_Avoid_: adapter (the adapter is the one `OpenCodeBackend` around it), driver
+
+**Generation Override**:
+The `[opencode] generation` setting forcing the **Attached Generation** when the probe is absent or contradicted; a contradicting probe still logs its evidence (ADR-0055).
+_Avoid_: force mode, protocol pin
+
 **Host** (机主):
 The person who runs cola on their own machine and owns what it operates on — the OpenCode server, the Shared Store, and the filesystem. In the personal-machine model the Host is the single admitted Principal and the only one permitted to act at all.
 _Avoid_: Operator (ambiguous — code and docs use it for whoever drives a session), owner (in code that word means the Chat/Topic a Session is mapped to, ADR-0007)
@@ -267,12 +283,13 @@ A read-only **Card** whose only job is to present information: no buttons, no st
 _Avoid_: Manual card, static card
 
 **Event**:
-A typed protocol message from the Backend via SSE. Drives Card state transitions.
+A typed protocol message on the Backend's server-sent event stream. Not a domain input: cola subscribes to no stream and renders **Cards** by polling the **Session Transcript** instead (ADR-0011).
 _Avoid_: Notification, message, signal
 
 ## Relationships
 
 - A **Bot** contains one **Platform** and one or more **Backend** adapters
+- A **Backend** attachment speaks exactly one **Generation**; its **Generation Strategy** is the adapter-internal module that owns it, and the **Attached Generation** is a property of the attachment, never of a **Session** (ADR-0055)
 - Every inbound message or card action carries exactly one **Principal** (its sender or clicking user), authorized against the **Access List** before cola acts
 - The first successful **Claim** writes the **Host** into the **Access List**; every other Principal is refused
 - A **Chat** contains many **Topics**; a **Chat** may hold several **Sessions** directly (lobby), while a **Topic** holds exactly one **Session** (or one **Pending Session** until its first prompt)
@@ -286,7 +303,7 @@ _Avoid_: Notification, message, signal
 - A **Turn** renders one **Tool Panel** per tool call; an unfinished panel rides the newest card of its **Card Chain** as a tail section and joins the card timeline when the tool settles; only **Built-in Tool**s (and tools cola itself injects) may get tailored rendering — every other tool's payload stays opaque
 - A **Session** receives many **Permissions** and **Questions**
 - A **Session Snapshot** reports the state of one **Session** (its last **Turn**'s completion, pending **Permissions**/**Questions**, recent messages) to the **Chat**/**Topic** that activated it
-- The **Bridge** receives **Events** from a **Backend** and renders them as **Card** updates on the **Platform**
+- The **Bridge** reads the **Session Transcript** from a **Backend** and renders **Card** updates on the **Platform**
 - A prompt's **Quoted Context** and **Image Attachment**s enrich the **Session** the reply belongs to
 - A **Command** is parsed by the **Bridge** from message text before routing to the **Backend**
 - Every **Cola-Authored Message** carries a `msg_cola_` id chosen by the **Bridge**; external-message sync treats only user messages newer than the **Sync Watermark** that are NOT **Cola-Authored Message**s as **External Message**s
