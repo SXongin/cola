@@ -41,6 +41,10 @@ pub(crate) struct SessionCase {
     /// mount includes its wait endpoint and the follow-up transcript read the
     /// synchronous polyfill performs.
     pub(crate) mount_prompt: fn(&TestHttpServer, &PromptFixture),
+    /// Mount the generation's permission/question-form routes for one pending
+    /// request each, publishing the shared [`RequestFixture`] values in that
+    /// generation's shape (V1's positional questions, V2's typed forms).
+    pub(crate) mount_requests: fn(&TestHttpServer, &RequestFixture),
 }
 
 /// The neutral values both generations' session-read payloads publish. One
@@ -203,6 +207,45 @@ impl Default for PromptFixture {
             text: "开始干活",
             answer_id: "msg_prompt_answer",
             answer_text: "干完了",
+        }
+    }
+}
+
+/// The neutral values both generations' permission/form payloads publish. The
+/// permission request renames (`action`/`resources`/`save`) and the form model
+/// (typed fields, keyed answers) differ per generation; the neutral outcome the
+/// Bridge consumes is the same.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RequestFixture {
+    pub(crate) session: &'static str,
+    pub(crate) directory: &'static str,
+    pub(crate) permission_id: &'static str,
+    pub(crate) action: &'static str,
+    pub(crate) resource: &'static str,
+    pub(crate) form_id: &'static str,
+    pub(crate) form_title: &'static str,
+    pub(crate) field_key: &'static str,
+    pub(crate) field_title: &'static str,
+    pub(crate) field_question: &'static str,
+    pub(crate) option_value: &'static str,
+    pub(crate) option_label: &'static str,
+}
+
+impl Default for RequestFixture {
+    fn default() -> Self {
+        Self {
+            session: "ses_requests",
+            directory: "/work/cola",
+            permission_id: "per_req",
+            action: "shell",
+            resource: "rm -rf *",
+            form_id: "frm_req",
+            form_title: "Questions",
+            field_key: "q0",
+            field_title: "目录",
+            field_question: "选哪个目录？",
+            option_value: "/a",
+            option_label: "目录 A",
         }
     }
 }
@@ -610,5 +653,128 @@ async fn prompt_returns_the_turn_reply_on_every_generation() {
             })
             .collect();
         assert_eq!(texts, [fixture.answer_text], "{generation}: reply text");
+    }
+}
+
+/// The pending-permission read and reply have the same neutral outcome on both
+/// generations: the request id, the owning session, the action name and its
+/// resources reach the Bridge identically, and a decision round-trips.
+#[tokio::test]
+async fn permission_list_and_reply_round_trip_on_every_generation() {
+    for case in cases() {
+        let generation = case.generation.as_str();
+        let fixture = RequestFixture::default();
+        let server = TestHttpServer::start().await;
+        (case.mount_requests)(&server, &fixture);
+        let backend = case.backend(&server);
+
+        let permissions = backend
+            .list_permissions(Some(fixture.directory))
+            .await
+            .unwrap_or_else(|e| panic!("{generation}: list_permissions failed: {e}"));
+        assert_eq!(permissions.len(), 1, "{generation}: one pending permission");
+        assert_eq!(
+            permissions[0].request_id, fixture.permission_id,
+            "{generation}: id"
+        );
+        assert_eq!(
+            permissions[0].session_id.as_deref(),
+            Some(fixture.session),
+            "{generation}: owning session"
+        );
+        assert_eq!(
+            permissions[0].permission.as_deref(),
+            Some(fixture.action),
+            "{generation}: action"
+        );
+        assert_eq!(
+            permissions[0].patterns,
+            vec![fixture.resource],
+            "{generation}: resources"
+        );
+
+        backend
+            .reply_permission(
+                fixture.session,
+                fixture.permission_id,
+                "once",
+                Some(fixture.directory),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{generation}: reply_permission failed: {e}"));
+    }
+}
+
+/// The pending form/question read and its keyed reply have the same neutral
+/// outcome on both generations: a field with an answer key, a typed kind and an
+/// option whose submitted value is what a click sends back.
+#[tokio::test]
+async fn form_list_and_keyed_reply_round_trip_on_every_generation() {
+    use crate::opencode::types::{FormAnswer, FormFieldKind, FormValue};
+
+    for case in cases() {
+        let generation = case.generation.as_str();
+        let fixture = RequestFixture::default();
+        let server = TestHttpServer::start().await;
+        (case.mount_requests)(&server, &fixture);
+        let backend = case.backend(&server);
+
+        let forms = backend
+            .list_questions(Some(fixture.directory))
+            .await
+            .unwrap_or_else(|e| panic!("{generation}: list_questions failed: {e}"));
+        assert_eq!(forms.len(), 1, "{generation}: one pending form");
+        let form = &forms[0];
+        assert_eq!(form.id, fixture.form_id, "{generation}: form id");
+        assert_eq!(form.session_id, fixture.session, "{generation}: owning session");
+        assert_eq!(form.questions.len(), 1, "{generation}: one field");
+        let field = &form.questions[0];
+        assert_eq!(field.key, fixture.field_key, "{generation}: answer key");
+        assert_eq!(
+            field.kind,
+            FormFieldKind::String,
+            "{generation}: a question/string field"
+        );
+        assert!(
+            !field.options[0].label.is_empty(),
+            "{generation}: the option carries a display label"
+        );
+        assert_eq!(
+            field.options[0].answer_value(),
+            fixture.option_value,
+            "{generation}: the option's submitted value"
+        );
+
+        let answers = vec![FormAnswer {
+            key: fixture.field_key.to_string(),
+            value: Some(FormValue::Text(fixture.option_value.to_string())),
+        }];
+        backend
+            .reply_question(
+                fixture.session,
+                fixture.form_id,
+                &answers,
+                Some(fixture.directory),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{generation}: reply_question failed: {e}"));
+    }
+}
+
+/// Cancelling a pending question/form round-trips on both generations: V1
+/// rejects, V2 deletes — the neutral caller sees one outcome.
+#[tokio::test]
+async fn form_cancel_round_trips_on_every_generation() {
+    for case in cases() {
+        let generation = case.generation.as_str();
+        let fixture = RequestFixture::default();
+        let server = TestHttpServer::start().await;
+        (case.mount_requests)(&server, &fixture);
+        let backend = case.backend(&server);
+
+        backend
+            .reject_question(fixture.session, fixture.form_id, Some(fixture.directory))
+            .await
+            .unwrap_or_else(|e| panic!("{generation}: reject_question failed: {e}"));
     }
 }

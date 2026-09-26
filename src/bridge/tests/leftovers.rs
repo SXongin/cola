@@ -23,10 +23,13 @@ fn question_request(id: &str, session_id: &str) -> opencode::types::QuestionRequ
             options: vec![opencode::types::QuestionOption {
                 label: "/a".into(),
                 description: String::new(),
+                ..Default::default()
             }],
-            multiple: None,
+            kind: crate::opencode::types::FormFieldKind::String,
             custom: None,
+            ..Default::default()
         }],
+        ..Default::default()
     }
 }
 

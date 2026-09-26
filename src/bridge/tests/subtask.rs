@@ -20,6 +20,7 @@ async fn subtask_permission_routes_to_mapped_parent_and_reply_carries_directory(
         always: Vec::new(),
     }]);
     let parent_id = backend.session_id.clone();
+    let reply_sessions = backend.reply_permission_sessions.clone();
     let (app, _platform) = build_app(cfg, backend).await;
 
     // Seed the parent session so it maps child → parent → chat.
@@ -107,6 +108,13 @@ async fn subtask_permission_routes_to_mapped_parent_and_reply_carries_directory(
             .await
             .is_empty(),
         "inline permission section is resolved after answering"
+    );
+    // V2's reply is session-scoped: the click must route via the CHILD session
+    // id the request belongs to, not the parent card's session.
+    assert_eq!(
+        reply_sessions.lock().await.as_slice(),
+        &[child.to_string()],
+        "the permission reply must be routed via the child session id"
     );
 }
 

@@ -350,14 +350,17 @@ async fn snapshot_question_block_answers_and_patches() {
                     opencode::types::QuestionOption {
                         label: "rust".into(),
                         description: String::new(),
+                        ..Default::default()
                     },
                     opencode::types::QuestionOption {
                         label: "go".into(),
                         description: String::new(),
+                        ..Default::default()
                     },
                 ],
-                multiple: Some(false),
+                kind: crate::opencode::types::FormFieldKind::String,
                 custom: Some(false),
+                ..Default::default()
             },
             opencode::types::QuestionInfo {
                 question: "选择框架".into(),
@@ -365,11 +368,14 @@ async fn snapshot_question_block_answers_and_patches() {
                 options: vec![opencode::types::QuestionOption {
                     label: "axum".into(),
                     description: String::new(),
+                    ..Default::default()
                 }],
-                multiple: Some(false),
+                kind: crate::opencode::types::FormFieldKind::String,
                 custom: Some(false),
+                ..Default::default()
             },
         ],
+        ..Default::default()
     }]);
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
@@ -740,10 +746,13 @@ async fn busy_follow_question_block_resolves() {
             options: vec![opencode::types::QuestionOption {
                 label: "rust".into(),
                 description: String::new(),
+                ..Default::default()
             }],
-            multiple: Some(false),
+            kind: crate::opencode::types::FormFieldKind::String,
             custom: Some(false),
+            ..Default::default()
         }],
+        ..Default::default()
     }]);
     let (app, _platform) = build_app(cfg, backend).await;
     app.core

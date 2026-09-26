@@ -33,7 +33,10 @@ use crate::backend::{
     ReasoningPart, SessionTranscript, StepFinish, TextPart, TokenUsage, ToolCall, ToolIdentity, ToolOutput,
     ToolStatus, TranscriptMessage,
 };
-use crate::opencode::types::{SessionInfo, SessionListInfo, SessionModel, SessionTime};
+use crate::opencode::types::{
+    FormFieldKind, PermissionRequest, QuestionInfo, QuestionOption, QuestionRequest, SessionInfo,
+    SessionListInfo, SessionModel, SessionTime,
+};
 
 /// `{data: T}` — the envelope most V2 reads share (R2's "unwrap per route —
 /// there is no single rule").
@@ -141,6 +144,263 @@ impl ActiveSessions {
         self.data
             .get(session_id)
             .map(|entry| entry.get("type").and_then(Value::as_str) == Some("running"))
+    }
+}
+
+/// `GET /api/permission/request` — `{location, data: Permission.Request[]}`.
+/// The request field names are V2's own: `action`/`resources`/`save` where V1
+/// spells `permission`/`patterns`/`always`.
+#[derive(Debug, Deserialize)]
+pub(super) struct RawPermission {
+    pub(super) id: String,
+    #[serde(rename = "sessionID")]
+    pub(super) session_id: String,
+    pub(super) action: String,
+    #[serde(default)]
+    pub(super) resources: Vec<String>,
+    #[serde(default)]
+    pub(super) save: Vec<String>,
+    #[serde(default)]
+    pub(super) metadata: Option<Value>,
+}
+
+impl RawPermission {
+    pub(super) fn into_neutral(self) -> PermissionRequest {
+        PermissionRequest {
+            request_id: self.id,
+            session_id: Some(self.session_id),
+            permission: Some(self.action),
+            patterns: self.resources,
+            metadata: self.metadata,
+            always: self.save,
+        }
+    }
+}
+
+/// `GET /api/form` — `{location, data: Form.Info[]}`.
+#[derive(Debug, Deserialize)]
+pub(super) struct RawForm {
+    pub(super) id: String,
+    #[serde(rename = "sessionID")]
+    pub(super) session_id: String,
+    #[serde(default)]
+    pub(super) title: String,
+    #[serde(default)]
+    pub(super) fields: Vec<RawFormField>,
+}
+
+impl RawForm {
+    /// The neutral form: the title is the card header, each field keeps its
+    /// answer key and typed kind. The `when` visibility conditions are
+    /// deliberately not carried — cola renders every field (spec #364, out of
+    /// scope: V2-only form behaviour beyond parity).
+    pub(super) fn into_neutral(self) -> QuestionRequest {
+        QuestionRequest {
+            id: self.id,
+            session_id: self.session_id,
+            title: self.title,
+            questions: self.fields.into_iter().map(RawFormField::into_neutral).collect(),
+        }
+    }
+}
+
+/// One `Form.Field` — V2's tagged union keyed by `type`. Only the fields cola
+/// renders are decoded; unknown extra fields (formats, bounds, `when`) are
+/// ignored, so a form with a shape this build does not know still lists.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub(super) enum RawFormField {
+    String {
+        key: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        required: bool,
+        #[serde(default)]
+        custom: Option<bool>,
+        #[serde(default)]
+        options: Vec<RawFormOption>,
+    },
+    Number {
+        key: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        required: bool,
+    },
+    Integer {
+        key: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        required: bool,
+    },
+    Boolean {
+        key: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        required: bool,
+    },
+    Multiselect {
+        key: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        required: bool,
+        #[serde(default)]
+        custom: Option<bool>,
+        #[serde(default)]
+        options: Vec<RawFormOption>,
+    },
+    External {
+        key: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        url: String,
+    },
+}
+
+impl RawFormField {
+    pub(super) fn into_neutral(self) -> QuestionInfo {
+        let field = |key: String,
+                     title: Option<String>,
+                     description: Option<String>,
+                     kind: FormFieldKind,
+                     options: Vec<RawFormOption>,
+                     custom: Option<bool>,
+                     required: bool| QuestionInfo {
+            key,
+            header: title.unwrap_or_default(),
+            question: description.unwrap_or_default(),
+            kind,
+            options: options.into_iter().map(RawFormOption::into_neutral).collect(),
+            custom,
+            required,
+            url: None,
+        };
+        match self {
+            RawFormField::String {
+                key,
+                title,
+                description,
+                required,
+                custom,
+                options,
+            } => field(
+                key,
+                title,
+                description,
+                FormFieldKind::String,
+                options,
+                custom,
+                required,
+            ),
+            RawFormField::Number {
+                key,
+                title,
+                description,
+                required,
+            } => field(
+                key,
+                title,
+                description,
+                FormFieldKind::Number,
+                Vec::new(),
+                None,
+                required,
+            ),
+            RawFormField::Integer {
+                key,
+                title,
+                description,
+                required,
+            } => field(
+                key,
+                title,
+                description,
+                FormFieldKind::Integer,
+                Vec::new(),
+                None,
+                required,
+            ),
+            RawFormField::Boolean {
+                key,
+                title,
+                description,
+                required,
+            } => field(
+                key,
+                title,
+                description,
+                FormFieldKind::Boolean,
+                Vec::new(),
+                None,
+                required,
+            ),
+            RawFormField::Multiselect {
+                key,
+                title,
+                description,
+                required,
+                custom,
+                options,
+            } => field(
+                key,
+                title,
+                description,
+                FormFieldKind::Multiselect,
+                options,
+                custom,
+                required,
+            ),
+            RawFormField::External {
+                key,
+                title,
+                description,
+                url,
+            } => QuestionInfo {
+                key,
+                header: title.unwrap_or_default(),
+                question: description.unwrap_or_default(),
+                kind: FormFieldKind::External,
+                options: Vec::new(),
+                custom: None,
+                required: false,
+                url: Some(url),
+            },
+        }
+    }
+}
+
+/// One `Form.Option`: the submitted `value` and the display `label` differ.
+#[derive(Debug, Deserialize)]
+pub(super) struct RawFormOption {
+    pub(super) value: String,
+    pub(super) label: String,
+    #[serde(default)]
+    pub(super) description: Option<String>,
+}
+
+impl RawFormOption {
+    pub(super) fn into_neutral(self) -> QuestionOption {
+        QuestionOption {
+            value: self.value,
+            label: self.label,
+            description: self.description.unwrap_or_default(),
+        }
     }
 }
 

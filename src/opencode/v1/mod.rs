@@ -27,8 +27,9 @@ use crate::error::Result;
 use super::strategy::GenerationStrategy;
 use super::transport::{REPLY_TIMEOUT, Transport};
 use super::types::{
-    AgentInfo, ImageInput, ModelInfo, ModelOption, PermissionRequest, PromptResponse, ProviderModels,
-    QuestionRequest, SessionInfo, SessionListInfo, SessionStatus,
+    AgentInfo, FormAnswer, FormFieldKind, ImageInput, ModelInfo, ModelOption, PermissionRequest,
+    PromptResponse, ProviderModels, QuestionInfo, QuestionOption, QuestionRequest, SessionInfo,
+    SessionListInfo, SessionStatus,
 };
 
 /// Hard stop for the `x-next-cursor` follow in [`V1Strategy::list_sessions`]: a
@@ -341,9 +342,12 @@ impl GenerationStrategy for V1Strategy {
     /// Reply to a permission request (canonical: `POST /permission/{id}/reply`).
     /// `directory` routes the request to the instance that owns the permission —
     /// without it the server checks the cwd instance and returns 404/400.
+    /// `session_id` is V2's routing key; V1 resolves the instance from
+    /// `directory` alone and ignores it.
     async fn reply_permission(
         &self,
         http: &Transport,
+        _session_id: &str,
         request_id: &str,
         reply: &str,
         directory: Option<&str>,
@@ -391,7 +395,8 @@ impl GenerationStrategy for V1Strategy {
                 status
             )));
         }
-        Ok(resp.json().await?)
+        let wire: Vec<WirePermission> = resp.json().await?;
+        Ok(wire.into_iter().map(WirePermission::into_neutral).collect())
     }
 
     /// Fetch one session's Session Transcript through the unprefixed
@@ -486,7 +491,8 @@ impl GenerationStrategy for V1Strategy {
                 status
             )));
         }
-        Ok(resp.json().await?)
+        let wire: Vec<WireQuestion> = resp.json().await?;
+        Ok(wire.into_iter().map(WireQuestion::into_neutral).collect())
     }
 
     /// The model's context-window size (tokens), from `GET /provider`. Best
@@ -527,14 +533,27 @@ impl GenerationStrategy for V1Strategy {
     }
 
     /// Answer a question request (canonical: `POST /question/{id}/reply`).
+    /// V1 answers are positional string arrays, one per question; the keyed
+    /// neutral answers are flattened in field order. `session_id` is V2's
+    /// routing key and is ignored here.
     async fn reply_question(
         &self,
         http: &Transport,
+        _session_id: &str,
         request_id: &str,
-        answers: &[Vec<String>],
+        answers: &[FormAnswer],
         directory: Option<&str>,
     ) -> Result<()> {
-        let body = serde_json::json!({ "answers": answers });
+        let positional: Vec<Vec<String>> = answers
+            .iter()
+            .map(|answer| {
+                answer
+                    .value
+                    .as_ref()
+                    .map_or_else(Vec::new, super::types::FormValue::to_strings)
+            })
+            .collect();
+        let body = serde_json::json!({ "answers": positional });
         let mut url = reqwest::Url::parse(&http.url(&format!("{QUESTION}/{request_id}/reply")))?;
         if let Some(d) = directory {
             url.query_pairs_mut().append_pair("directory", d);
@@ -587,9 +606,11 @@ impl GenerationStrategy for V1Strategy {
     }
 
     /// Reject a question request (canonical: `POST /question/{id}/reject`).
+    /// `session_id` is V2's routing key and is ignored here.
     async fn reject_question(
         &self,
         http: &Transport,
+        _session_id: &str,
         request_id: &str,
         directory: Option<&str>,
     ) -> Result<()> {
@@ -629,6 +650,106 @@ impl GenerationStrategy for V1Strategy {
             .await?
             .error_for_status()?;
         Ok(())
+    }
+}
+
+/// One pending permission request (`PermissionV1.Request`) — the V1 spellings
+/// of the neutral [`PermissionRequest`]. The V2 generation renames these fields
+/// (`action`/`resources`/`save`), so its decode lives with its own strategy.
+#[derive(Debug, serde::Deserialize)]
+struct WirePermission {
+    id: String,
+    #[serde(rename = "sessionID", default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    permission: Option<String>,
+    #[serde(default)]
+    patterns: Vec<String>,
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
+    #[serde(default)]
+    always: Vec<String>,
+}
+
+impl WirePermission {
+    fn into_neutral(self) -> PermissionRequest {
+        PermissionRequest {
+            request_id: self.id,
+            session_id: self.session_id,
+            permission: self.permission,
+            patterns: self.patterns,
+            metadata: self.metadata,
+            always: self.always,
+        }
+    }
+}
+
+/// One pending question request (`Question.Request`) — V1's positional shape.
+#[derive(Debug, serde::Deserialize)]
+struct WireQuestion {
+    id: String,
+    #[serde(rename = "sessionID")]
+    session_id: String,
+    questions: Vec<WireQuestionInfo>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct WireQuestionInfo {
+    question: String,
+    #[serde(default)]
+    header: String,
+    #[serde(default)]
+    options: Vec<WireQuestionOption>,
+    #[serde(default)]
+    multiple: Option<bool>,
+    #[serde(default)]
+    custom: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct WireQuestionOption {
+    label: String,
+    #[serde(default)]
+    description: String,
+}
+
+impl WireQuestion {
+    /// V1 has no field keys or types: each question becomes a `String` (or
+    /// `Multiselect`) field keyed positionally, and the label is both the
+    /// option's value and its display label.
+    fn into_neutral(self) -> QuestionRequest {
+        QuestionRequest {
+            id: self.id,
+            session_id: self.session_id,
+            title: String::new(),
+            questions: self
+                .questions
+                .into_iter()
+                .enumerate()
+                .map(|(index, question)| QuestionInfo {
+                    key: format!("q{index}"),
+                    question: question.question,
+                    header: question.header,
+                    kind: if question.multiple == Some(true) {
+                        FormFieldKind::Multiselect
+                    } else {
+                        FormFieldKind::String
+                    },
+                    options: question
+                        .options
+                        .into_iter()
+                        .map(|option| QuestionOption {
+                            value: option.label.clone(),
+                            label: option.label,
+                            description: option.description,
+                        })
+                        .collect(),
+                    custom: question.custom,
+                    required: false,
+                    url: None,
+                })
+                .collect(),
+        }
     }
 }
 

@@ -928,7 +928,7 @@ async fn reply_permission_posts_the_reply_with_the_directory_scope() {
     let client = v1_wire_client(&server, None);
 
     client
-        .reply_permission("per_1", "always", Some("/work/cola"))
+        .reply_permission("ses_1", "per_1", "always", Some("/work/cola"))
         .await
         .unwrap();
 
@@ -942,7 +942,7 @@ async fn reply_permission_posts_the_reply_with_the_directory_scope() {
     // NotFound variant, not a transport failure.
     let message = not_found_error(
         client
-            .reply_permission("per_gone", "once", None)
+            .reply_permission("ses_1", "per_gone", "once", None)
             .await
             .unwrap_err(),
     );
@@ -981,7 +981,14 @@ async fn list_questions_sends_the_directory_scope_and_parses_questions() {
     assert_eq!(questions[0].session_id, "ses_1");
     assert_eq!(questions[0].questions[0].question, "选哪个？");
     assert_eq!(questions[0].questions[0].options[0].label, "A");
-    assert_eq!(questions[0].questions[0].multiple, Some(true));
+    // V1 has no typed fields: a `multiple: true` question becomes a
+    // Multiselect field, keyed positionally, with the label as its value.
+    assert_eq!(
+        questions[0].questions[0].kind,
+        crate::opencode::types::FormFieldKind::Multiselect
+    );
+    assert_eq!(questions[0].questions[0].key, "q0");
+    assert_eq!(questions[0].questions[0].options[1].answer_value(), "B");
 
     let request = last_request(&server);
     assert_eq!(request.method, "GET");
@@ -998,8 +1005,21 @@ async fn reply_question_posts_answers_with_the_directory_scope() {
 
     client
         .reply_question(
+            "ses_1",
             "q_1",
-            &[vec!["A".to_string()], vec!["B".to_string(), "C".to_string()]],
+            &[
+                crate::opencode::types::FormAnswer {
+                    key: "q0".into(),
+                    value: Some(crate::opencode::types::FormValue::Text("A".into())),
+                },
+                crate::opencode::types::FormAnswer {
+                    key: "q1".into(),
+                    value: Some(crate::opencode::types::FormValue::List(vec![
+                        "B".into(),
+                        "C".into(),
+                    ])),
+                },
+            ],
             Some("/work/cola"),
         )
         .await
@@ -1014,7 +1034,12 @@ async fn reply_question_posts_answers_with_the_directory_scope() {
         serde_json::json!({"answers": [["A"], ["B", "C"]]})
     );
 
-    let message = not_found_error(client.reply_question("q_gone", &[], None).await.unwrap_err());
+    let message = not_found_error(
+        client
+            .reply_question("ses_1", "q_gone", &[], None)
+            .await
+            .unwrap_err(),
+    );
     assert!(message.contains("question q_gone"), "unexpected: {message}");
 }
 
@@ -1034,12 +1059,21 @@ async fn reply_endpoints_give_up_on_a_hung_server() {
     for (label, err) in [
         (
             "reply",
-            client.reply_question("q_1", &[], None).await.unwrap_err(),
+            client
+                .reply_question("ses_1", "q_1", &[], None)
+                .await
+                .unwrap_err(),
         ),
-        ("reject", client.reject_question("q_1", None).await.unwrap_err()),
+        (
+            "reject",
+            client.reject_question("ses_1", "q_1", None).await.unwrap_err(),
+        ),
         (
             "permission",
-            client.reply_permission("p_1", "once", None).await.unwrap_err(),
+            client
+                .reply_permission("ses_1", "p_1", "once", None)
+                .await
+                .unwrap_err(),
         ),
     ] {
         assert!(
@@ -1056,7 +1090,10 @@ async fn reject_question_posts_with_the_directory_scope() {
     server.route("POST", "/question/q_gone/reject", 404, r#"{"error":"not found"}"#);
     let client = v1_wire_client(&server, None);
 
-    client.reject_question("q_1", Some("/work/cola")).await.unwrap();
+    client
+        .reject_question("ses_1", "q_1", Some("/work/cola"))
+        .await
+        .unwrap();
 
     let request = last_request(&server);
     assert_eq!(request.method, "POST");
@@ -1064,7 +1101,7 @@ async fn reject_question_posts_with_the_directory_scope() {
     assert_eq!(request.query_param("directory").as_deref(), Some("/work/cola"));
     assert_eq!(request.body, "", "reject carries no body");
 
-    let message = not_found_error(client.reject_question("q_gone", None).await.unwrap_err());
+    let message = not_found_error(client.reject_question("ses_1", "q_gone", None).await.unwrap_err());
     assert!(message.contains("question q_gone"), "unexpected: {message}");
 }
 

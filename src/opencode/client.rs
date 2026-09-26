@@ -16,8 +16,9 @@ use super::parsing::parse_model;
 use super::strategy::{Generation, GenerationStrategy};
 use super::transport::Transport;
 use super::types::{
-    AgentInfo, CreateSessionInput, CreateSessionResponse, ImageInput, Location, ModelInfo, PermissionRequest,
-    PromptResponse, ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionStatus,
+    AgentInfo, CreateSessionInput, CreateSessionResponse, FormAnswer, ImageInput, Location, ModelInfo,
+    PermissionRequest, PromptResponse, ProviderModels, QuestionRequest, Session, SessionInfo,
+    SessionListInfo, SessionStatus,
 };
 
 /// Session creation, on the `/api` surface both generations serve. It is a
@@ -299,12 +300,13 @@ impl OpenCodeBackend {
 
     pub async fn reply_permission(
         &self,
+        session_id: &str,
         request_id: &str,
         reply: &str,
         directory: Option<&str>,
     ) -> crate::error::Result<()> {
         self.strategy()
-            .reply_permission(&self.transport, request_id, reply, directory)
+            .reply_permission(&self.transport, session_id, request_id, reply, directory)
             .await
     }
 
@@ -324,22 +326,24 @@ impl OpenCodeBackend {
 
     pub async fn reply_question(
         &self,
+        session_id: &str,
         request_id: &str,
-        answers: &[Vec<String>],
+        answers: &[FormAnswer],
         directory: Option<&str>,
     ) -> crate::error::Result<()> {
         self.strategy()
-            .reply_question(&self.transport, request_id, answers, directory)
+            .reply_question(&self.transport, session_id, request_id, answers, directory)
             .await
     }
 
     pub async fn reject_question(
         &self,
+        session_id: &str,
         request_id: &str,
         directory: Option<&str>,
     ) -> crate::error::Result<()> {
         self.strategy()
-            .reject_question(&self.transport, request_id, directory)
+            .reject_question(&self.transport, session_id, request_id, directory)
             .await
     }
 

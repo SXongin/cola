@@ -7,7 +7,9 @@
 
 use serde_json::{Map, json};
 
-use crate::opencode::conformance::{PromptFixture, SessionCase, SessionReadFixture, TranscriptFixture};
+use crate::opencode::conformance::{
+    PromptFixture, RequestFixture, SessionCase, SessionReadFixture, TranscriptFixture,
+};
 use crate::opencode::strategy::Generation;
 use crate::test_http::{MockResponse, TestHttpServer};
 
@@ -21,6 +23,7 @@ pub(crate) fn case() -> SessionCase {
         mount_transcript,
         mount_recorded_transcript,
         mount_prompt,
+        mount_requests,
     }
 }
 
@@ -257,5 +260,76 @@ fn mount_prompt(server: &TestHttpServer, fixture: &PromptFixture) {
             "cursor": {},
         })
         .to_string(),
+    );
+}
+
+/// Mount V2's location-scoped permission/form routes: the `{location, data}`
+/// envelopes, the session-scoped reply/cancel paths, and the renamed
+/// permission fields / typed form fields. The option's submitted `value` and
+/// its display `label` are deliberately different — the neutral view must
+/// carry both.
+fn mount_requests(server: &TestHttpServer, fixture: &RequestFixture) {
+    server.route(
+        "GET",
+        "/api/permission/request",
+        200,
+        json!({
+            "location": {"directory": fixture.directory},
+            "data": [{
+                "id": fixture.permission_id,
+                "sessionID": fixture.session,
+                "action": fixture.action,
+                "resources": [fixture.resource],
+                "save": [],
+                "metadata": {},
+            }],
+        })
+        .to_string(),
+    );
+    server.route(
+        "POST",
+        &format!(
+            "/api/session/{}/permission/{}/reply",
+            fixture.session, fixture.permission_id
+        ),
+        204,
+        "",
+    );
+    server.route(
+        "GET",
+        "/api/form",
+        200,
+        json!({
+            "location": {"directory": fixture.directory},
+            "data": [{
+                "id": fixture.form_id,
+                "sessionID": fixture.session,
+                "title": fixture.form_title,
+                "fields": [{
+                    "key": fixture.field_key,
+                    "title": fixture.field_title,
+                    "description": fixture.field_question,
+                    "type": "string",
+                    "options": [{
+                        "value": fixture.option_value,
+                        "label": fixture.option_label,
+                    }],
+                    "custom": false,
+                }],
+            }],
+        })
+        .to_string(),
+    );
+    server.route(
+        "POST",
+        &format!("/api/session/{}/form/{}/reply", fixture.session, fixture.form_id),
+        204,
+        "",
+    );
+    server.route(
+        "DELETE",
+        &format!("/api/session/{}/form/{}", fixture.session, fixture.form_id),
+        204,
+        "",
     );
 }

@@ -67,10 +67,7 @@ impl QuestionState {
     }
 
     pub(crate) fn is_multi(&self, index: usize) -> bool {
-        self.request
-            .questions
-            .get(index)
-            .is_some_and(|q| q.multiple == Some(true))
+        self.request.questions.get(index).is_some_and(|q| q.is_multi())
     }
 
     /// Record a single-select answer (replaces any previous one).
@@ -218,18 +215,18 @@ pub(crate) fn stale_question_card(inline: bool) -> CardActionResult {
 /// question with the answer(s) the user gave, so the finished card keeps the
 /// full Q&A instead of echoing only the last clicked answer (which used to be
 /// mislabeled "AI 的问题是：<answer>"). Empty answer slots (skipped via
-/// submit/skip) render as 未作答.
+/// submit/skip) render as 未作答; option values render as their display labels.
 pub(crate) fn qa_completion_body(
     questions: &[crate::opencode::types::QuestionInfo],
-    answers: &[Vec<String>],
+    answers: &[Option<Vec<String>>],
 ) -> String {
     let mut lines: Vec<String> = Vec::new();
-    for (i, (q, a)) in questions.iter().zip(answers).enumerate() {
-        lines.push(format!("**{}. {}**", i + 1, q.question));
-        lines.push(if a.is_empty() {
-            "（未作答）".to_string()
-        } else {
-            format!("👉 {}", a.join("、"))
+    for (i, q) in questions.iter().enumerate() {
+        let answer = answers.get(i).and_then(|slot| slot.as_ref());
+        lines.push(format!("**{}. {}**", i + 1, q.title()));
+        lines.push(match answer.filter(|a| !a.is_empty()) {
+            Some(values) => format!("👉 {}", q.display_values(values).join("、")),
+            None => "（未作答）".to_string(),
         });
     }
     if lines.is_empty() {
@@ -253,8 +250,13 @@ mod tests {
                 question: format!("q{i}"),
                 header: String::new(),
                 options: vec![],
-                multiple: Some(*m),
+                kind: if *m {
+                    crate::opencode::types::FormFieldKind::Multiselect
+                } else {
+                    crate::opencode::types::FormFieldKind::String
+                },
                 custom: None,
+                ..Default::default()
             })
             .collect();
         QuestionState::new(
@@ -262,6 +264,7 @@ mod tests {
                 id: "q1".into(),
                 session_id: "ses_1".into(),
                 questions,
+                ..Default::default()
             },
             "/work".into(),
         )

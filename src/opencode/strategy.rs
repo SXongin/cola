@@ -23,8 +23,8 @@ use crate::error::Result;
 
 use super::transport::Transport;
 use super::types::{
-    AgentInfo, ImageInput, ModelInfo, PermissionRequest, PromptResponse, ProviderModels, QuestionRequest,
-    SessionInfo, SessionListInfo, SessionStatus,
+    AgentInfo, FormAnswer, ImageInput, ModelInfo, PermissionRequest, PromptResponse, ProviderModels,
+    QuestionRequest, SessionInfo, SessionListInfo, SessionStatus,
 };
 
 /// One protocol generation's wire contract.
@@ -82,9 +82,14 @@ pub(crate) trait GenerationStrategy: Send + Sync {
         message_id: Option<&str>,
     ) -> Result<()>;
 
+    /// Reply to a pending permission request with a decision (`once` /
+    /// `always` / `reject`). V1 answers the global request id under the owning
+    /// directory's instance; V2's reply is session-scoped, so its strategy
+    /// needs the session id as well.
     async fn reply_permission(
         &self,
         http: &Transport,
+        session_id: &str,
         request_id: &str,
         reply: &str,
         directory: Option<&str>,
@@ -99,17 +104,23 @@ pub(crate) trait GenerationStrategy: Send + Sync {
     async fn list_questions(&self, http: &Transport, directory: Option<&str>)
     -> Result<Vec<QuestionRequest>>;
 
+    /// Answer a pending form (V2) / question (V1). V1 takes positional string
+    /// arrays; V2 takes a keyed answer object assembled from the same neutral
+    /// [`FormAnswer`] list, so the strategy owns the generation's body shape.
     async fn reply_question(
         &self,
         http: &Transport,
+        session_id: &str,
         request_id: &str,
-        answers: &[Vec<String>],
+        answers: &[FormAnswer],
         directory: Option<&str>,
     ) -> Result<()>;
 
+    /// Cancel a pending form (V2) / reject a question (V1) by request id.
     async fn reject_question(
         &self,
         http: &Transport,
+        session_id: &str,
         request_id: &str,
         directory: Option<&str>,
     ) -> Result<()>;
