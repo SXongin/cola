@@ -136,7 +136,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: ./.github/actions/install-opencode-v1
       - name: Live V1 suite
-        run: cargo test --locked -- --ignored live
+        run: cargo test --locked -- --ignored live_v1
 
   test:
     # Compile + test only on the other platforms: catches platform quirks

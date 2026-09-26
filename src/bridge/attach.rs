@@ -285,8 +285,8 @@ mod tests {
     /// forced to `v1`, attach as V1 with a contradicting-probe WARN.
     ///
     /// Ignored because it needs machine-local servers; it skips cleanly when
-    /// none is running. Deliberately not named `live*` — the hermetic CI live
-    /// filter (`cargo test -- --ignored live`) must never pick it up.
+    /// none is running. Deliberately not named `live*` — the CI live filters
+    /// (`cargo test -- --ignored live_v1` / `live_v2`) must never pick it up.
     #[tokio::test]
     #[ignore = "needs local OpenCode servers (opencode serve / opencode-v2 service start)"]
     async fn detects_the_running_servers_generations() {

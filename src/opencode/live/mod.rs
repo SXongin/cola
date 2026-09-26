@@ -1,25 +1,42 @@
-//! The live contract suite (ADR-0057): the real pinned OpenCode **V1** binary
-//! runs its actual agent loop against an in-process, scripted OpenAI-compatible
+//! The live contract suite (ADR-0057): the real pinned OpenCode binary runs
+//! its actual agent loop against an in-process, scripted OpenAI-compatible
 //! provider, in an isolated store.
 //!
+//! Two generations share the harness: the **V1** capability chain
+//! (`live_v1_scripted_capability_chain`: prompt → streamed reasoning → tool
+//! call → permission round-trip → final text) and the **V2** read chain
+//! (`live_v2_scripted_transcript_read`: admit one scripted turn, then assert
+//! the decoded transcript and its projections). Each test spawns the binary of
+//! its own generation into its own temp store, so neither can touch the
+//! machine's default store, credentials or config; each refuses a binary of
+//! the other generation.
+//!
 //! These tests are `#[ignore]`-gated, so `cargo test --workspace --locked`
-//! stays hermetic and credential-free. Run the live suite with the pinned V1
-//! binary — the fingerprint `.github/actions/install-opencode-v1` installs for
-//! the `Live V1` CI job — via:
+//! stays hermetic and credential-free. Run one generation with the pinned
+//! binary:
 //!
 //! ```text
-//! COLA_LIVE_OPENCODE_BIN=/path/to/opencode cargo test --locked -- --ignored live
+//! COLA_LIVE_OPENCODE_BIN=/path/to/opencode cargo test --locked -- --ignored live_v1
+//! COLA_LIVE_OPENCODE_V2_BIN=/path/to/opencode cargo test --locked -- --ignored live_v2
 //! ```
 //!
-//! When the env var is unset, `opencode` on `PATH` is used. The harness
-//! refuses a V2 binary and never touches the machine's default store: the
-//! child server gets its own XDG trees under a temp dir and its config points
-//! the only provider at the in-process script. No credentials or external
-//! services are involved.
+//! When an env var is unset, `opencode` (`opencode2` for V2) on `PATH` is used.
+//! The V2 binary is the 2.x CLI; the runbook drives it through the
+//! `opencode-v2` wrapper for a service, but a plain isolated `serve` is what
+//! the harness needs (and is what keeps the default store untouched).
 //!
-//! The assertion is the capability chain, structurally: prompt → streamed
-//! reasoning → tool call → permission round-trip → final text. Ids and
-//! timestamps vary run to run; membership, order and content are asserted.
+//! The assertion is structural: ids and timestamps vary run to run; membership,
+//! order and content are asserted. The V2 turn's admit is raw protocol
+//! scaffolding (slice S5 owns production prompt dispatch); the read path under
+//! test is the production adapter's.
+//!
+//! ## Re-recording the fixture corpus
+//!
+//! With `COLA_LIVE_CAPTURE_DIR` set, the tests write the raw transcript read
+//! they performed — stamped with the server version and the reproducing
+//! command — under `<dir>/<name>.json`. Sanitize ids/times/cursors and commit
+//! the result under `src/opencode/wire/fixtures/` (spec #364, "Testing
+//! Decisions"); no cassette or replay engine is involved.
 
 mod provider;
 mod server;
@@ -29,8 +46,9 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tokio::time::sleep;
 
-use crate::backend::{ContentBlock, MessageRole, Part, ToolStatus};
+use crate::backend::{ContentBlock, MessageRole, Part, SessionTranscript, ToolStatus};
 use crate::opencode::client::OpenCodeBackend;
+use crate::opencode::strategy::Generation;
 use crate::opencode::types::SessionStatus;
 
 use server::LiveServer;
@@ -45,9 +63,16 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The gap between polls of a live read.
 const POLL_INTERVAL: Duration = Duration::from_millis(150);
 
-/// The binary under test: the pinned V1 path when set, else `opencode` on PATH.
-fn live_binary() -> String {
+/// The V1 binary under test: the pinned path when set, else `opencode` on PATH.
+fn live_v1_binary() -> String {
     std::env::var("COLA_LIVE_OPENCODE_BIN").unwrap_or_else(|_| "opencode".to_string())
+}
+
+/// The V2 binary under test: the env override, else `opencode2` — the bin name
+/// the official `@opencode/cli` 2.x package installs (the wrapper's direct
+/// binary is the usual local override).
+fn live_v2_binary() -> String {
+    std::env::var("COLA_LIVE_OPENCODE_V2_BIN").unwrap_or_else(|_| "opencode2".to_string())
 }
 
 /// The whole chain against the pinned V1 server: create a session, prompt
@@ -56,7 +81,7 @@ fn live_binary() -> String {
 #[tokio::test]
 #[ignore = "live: needs the pinned V1 binary (see the module docs)"]
 async fn live_v1_scripted_capability_chain() {
-    let binary = live_binary();
+    let binary = live_v1_binary();
     let version = server::ensure_v1_binary(&binary).await;
     eprintln!("live V1 binary: {binary} ({version})");
 
@@ -108,15 +133,271 @@ async fn live_v1_scripted_capability_chain() {
         .unwrap_or_else(|error| panic!("transcript read failed: {error}\n{}", server.stderr()));
 
     assert_user_anchor(&transcript, &message_id);
-    assert_tool_call(&transcript);
+    assert_tool_call(&transcript, provider::Tool::Bash, provider::ToolCommand::Fast);
     assert_streamed_reasoning(&transcript);
     assert_final_text(&transcript);
     assert_turn_complete(&transcript, &message_id);
+
+    capture_fixture(
+        "v1/transcript_turn",
+        "v1",
+        &version,
+        &capture_command(
+            "COLA_LIVE_OPENCODE_BIN",
+            &binary,
+            "live_v1_scripted_capability_chain",
+        ),
+        &format!("{}/session/{}/message", server.base_url(), session.id),
+    )
+    .await;
 
     // The finished turn reads idle once the run state clears.
     wait_for_idle(&backend, &session.id, &work_dir, &server).await;
 
     assert_provider_requests(&provider.requests());
+}
+
+/// The V2 read chain against the pinned V2 server: create a session through
+/// the generation-blind adapter, admit one scripted turn, watch the transcript
+/// mid-turn and at rest, and assert the neutral projections the Session
+/// Snapshot tail, the external-message sync and the follow renderers consume —
+/// no duplicated text, correct turn anchoring.
+///
+/// The prompt itself is admitted raw: V2's production dispatch (the strategy's
+/// `prompt` plus its synchronous polyfill) is slice S5's work, and this read
+/// slice must run against a real server turn rather than a fixture. Slice S5
+/// replaces [`admit_v2_prompt`] with the adapter call.
+#[tokio::test]
+#[ignore = "live: needs a V2 binary (see the module docs)"]
+async fn live_v2_scripted_transcript_read() {
+    let binary = live_v2_binary();
+    let version = server::ensure_v2_binary(&binary).await;
+    eprintln!("live V2 binary: {binary} ({version})");
+
+    let provider = provider::start_with(provider::Tool::Shell, provider::ToolCommand::Slow).await;
+    let server = LiveServer::start_v2(&binary, &provider.base_url()).await;
+
+    // The real adapter, pointed at the live child — its transport's env-proxy
+    // workaround keeps the loopback traffic off a developer shell's proxy.
+    let backend = OpenCodeBackend::with_generation(
+        Some(provider::MODEL_REF),
+        server.base_url(),
+        Some("opencode"),
+        Some(server::PASSWORD),
+        Generation::V2,
+        None,
+    );
+    backend.disable_env_proxy(Some("opencode"), Some(server::PASSWORD));
+
+    wait_for_ready(&backend, &server).await;
+
+    let work_dir = server.work_dir();
+    let session = backend
+        .create_session(&backend.new_session_input(Some(&work_dir)))
+        .await
+        .unwrap_or_else(|error| panic!("create session failed: {error}\n{}", server.stderr()));
+
+    let message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
+    admit_v2_prompt(server.base_url(), &session.id, PROMPT_TEXT, &message_id).await;
+
+    // Mid-turn: the projected assistant message is one row that carries its
+    // content while it streams, so the first read that sees a live tool captures
+    // V2's in-flight shape (no completion stamp, a running tool) for real.
+    let url = format!(
+        "{}/api/session/{}/message?order=asc&limit=200",
+        server.base_url(),
+        session.id
+    );
+    let inflight = poll_until(
+        "the live V2 turn's in-flight transcript",
+        POLL_TIMEOUT,
+        || async {
+            let transcript = backend.transcript(&session.id).await?;
+            Ok(has_live_tool(&transcript).then_some(transcript))
+        },
+        || server.stderr(),
+    )
+    .await;
+    assert_user_anchor(&inflight, &message_id);
+    let anchor = inflight
+        .newest_user()
+        .unwrap()
+        .anchor()
+        .expect("the user message anchors");
+    assert!(
+        !inflight.turn_for_user(&anchor).complete,
+        "a turn with only a live tool is not complete: {inflight:#?}"
+    );
+    capture_fixture(
+        "v2/transcript_inflight",
+        "v2",
+        &version,
+        &capture_command(
+            "COLA_LIVE_OPENCODE_V2_BIN",
+            &binary,
+            "live_v2_scripted_transcript_read",
+        ),
+        &url,
+    )
+    .await;
+
+    // At rest: the terminal finish ends the turn and every marker is present
+    // exactly once.
+    let transcript = poll_until(
+        "the live V2 turn to complete",
+        POLL_TIMEOUT,
+        || async {
+            let transcript = backend.transcript(&session.id).await?;
+            let Some(anchor) = transcript.newest_user().and_then(|message| message.anchor()) else {
+                return Ok(None);
+            };
+            let complete = transcript.turn_for_user(&anchor).complete;
+            Ok(complete.then_some(transcript))
+        },
+        || server.stderr(),
+    )
+    .await;
+
+    assert_user_anchor(&transcript, &message_id);
+    assert_tool_call(&transcript, provider::Tool::Shell, provider::ToolCommand::Slow);
+    assert_streamed_reasoning(&transcript);
+    assert_final_text(&transcript);
+    assert_turn_complete(&transcript, &message_id);
+    // Authorship survives V2's tighter message-id rule: the external-message
+    // sync's `msg_cola_` check still recognises cola's own turn.
+    let user = transcript
+        .messages
+        .iter()
+        .find(|message| message.id.as_str() == message_id)
+        .expect("the admitted user message is in the transcript");
+    assert!(
+        crate::opencode::parsing::is_cola_message_id(user.id.as_str()),
+        "V2 must persist the cola-chosen message id: {user:#?}"
+    );
+    // The Session Snapshot tail: the newest text-bearing conversation, with the
+    // tool/reasoning-only steps excluded and nothing duplicated.
+    let tail = transcript.transcript_tail();
+    assert_eq!(
+        tail.last().map(|entry| entry.text.as_str()),
+        Some(provider::FINAL_TEXT),
+        "the tail ends on the final answer: {tail:#?}"
+    );
+    assert_eq!(
+        tail.iter()
+            .filter(|entry| entry.text == provider::FINAL_TEXT)
+            .count(),
+        1,
+        "the final text renders once in the tail: {tail:#?}"
+    );
+
+    capture_fixture(
+        "v2/transcript_turn",
+        "v2",
+        &version,
+        &capture_command(
+            "COLA_LIVE_OPENCODE_V2_BIN",
+            &binary,
+            "live_v2_scripted_transcript_read",
+        ),
+        &url,
+    )
+    .await;
+
+    // The finished turn reads idle once the run state clears (S4a's read).
+    wait_for_idle(&backend, &session.id, &work_dir, &server).await;
+
+    // The scripted provider saw the shell tool offered and its result returned.
+    let calls: Vec<Value> = provider
+        .requests()
+        .iter()
+        .filter(|request| request.path == "/v1/chat/completions")
+        .map(|request| serde_json::from_str(&request.body).expect("a provider request body must be JSON"))
+        .collect();
+    assert!(
+        calls
+            .iter()
+            .any(|call| provider::offers_tools(call) && call.to_string().contains("\"shell\"")),
+        "the shell tool schema must be offered: {calls:#?}"
+    );
+    assert!(
+        calls.iter().any(provider::has_tool_result),
+        "the executed tool result must come back: {calls:#?}"
+    );
+}
+
+/// Admit one V2 turn over the protocol's own prompt route. Slice S5 replaces
+/// this with the adapter's `prompt` (plus its synchronous polyfill); until
+/// then the read slice seeds a real server turn, never a fake one.
+async fn admit_v2_prompt(base_url: &str, session_id: &str, text: &str, message_id: &str) {
+    let response = crate::test_http::no_proxy_transport()
+        .post(format!("{base_url}/api/session/{session_id}/prompt"))
+        .basic_auth("opencode", Some(server::PASSWORD))
+        .json(&serde_json::json!({ "id": message_id, "text": text }))
+        .send()
+        .await
+        .expect("admit the V2 prompt");
+    let status = response.status();
+    assert!(
+        status.is_success(),
+        "the V2 prompt admit must succeed: {status} — {}",
+        response.text().await.unwrap_or_default()
+    );
+}
+
+/// Whether any decoded part of the transcript is a still-live tool call.
+fn has_live_tool(transcript: &SessionTranscript) -> bool {
+    transcript
+        .messages
+        .iter()
+        .flat_map(|message| message.parts.iter())
+        .any(|part| matches!(part, Part::Tool(call) if call.status.is_live()))
+}
+
+/// The reproducing command stamped into a captured fixture.
+fn capture_command(binary_env: &str, binary: &str, test: &str) -> String {
+    format!("{binary_env}={binary} COLA_LIVE_CAPTURE_DIR=<dir> cargo test --locked -- --ignored {test}")
+}
+
+/// Re-record one transcript fixture (see the module docs): with
+/// `COLA_LIVE_CAPTURE_DIR` set, write the raw read `url` returns, stamped with
+/// the generation, the server version that produced it and the reproducing
+/// command. The committed corpus is sanitized by hand afterwards — this helper
+/// records reality, it does not sanitize it.
+async fn capture_fixture(name: &str, generation: &str, version: &str, command: &str, url: &str) {
+    let Ok(dir) = std::env::var("COLA_LIVE_CAPTURE_DIR") else {
+        return;
+    };
+    let response = crate::test_http::no_proxy_transport()
+        .get(url)
+        .basic_auth("opencode", Some(server::PASSWORD))
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("capture {name}: request failed: {error}"));
+    let status = response.status();
+    let body: Value = response
+        .json()
+        .await
+        .unwrap_or_else(|error| panic!("capture {name}: the response body is not JSON: {error}"));
+    assert!(status.is_success(), "capture {name}: HTTP {status}");
+    let recorded = serde_json::json!({
+        "capture": {
+            "generation": generation,
+            "source": format!("opencode {}", version.trim_start_matches("opencode ")),
+            "command": command,
+            "captured_at": chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        },
+        "response": body,
+    });
+    let path = std::path::Path::new(&dir).join(format!("{name}.json"));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create the capture directory");
+    }
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&recorded).expect("serialize the recorded fixture") + "\n",
+    )
+    .expect("write the recorded fixture");
+    eprintln!("captured fixture: {}", path.display());
 }
 
 /// Poll `read` until it yields a value, failing the test at `timeout`.
@@ -225,17 +506,27 @@ fn assert_user_anchor(transcript: &crate::backend::SessionTranscript, message_id
     assert!(user.anchor().is_some(), "a live message carries a server time");
 }
 
-/// The `bash` tool call ran to completion with the scripted command's output.
-fn assert_tool_call(transcript: &crate::backend::SessionTranscript) {
+/// The generation's shell tool call ran to completion with the scripted
+/// command's output.
+fn assert_tool_call(
+    transcript: &crate::backend::SessionTranscript,
+    shell: provider::Tool,
+    command: provider::ToolCommand,
+) {
     let tool = transcript
         .messages
         .iter()
         .flat_map(|message| message.parts.iter())
         .find_map(|part| match part {
-            Part::Tool(tool) if tool.identity.name == "bash" => Some(tool),
+            Part::Tool(tool) if tool.identity.name == shell.name() => Some(tool),
             _ => None,
         })
-        .unwrap_or_else(|| panic!("the bash tool call must be in the transcript: {transcript:#?}"));
+        .unwrap_or_else(|| {
+            panic!(
+                "the {} tool call must be in the transcript: {transcript:#?}",
+                shell.name()
+            )
+        });
     assert_eq!(
         tool.status,
         ToolStatus::Completed,
@@ -246,7 +537,7 @@ fn assert_tool_call(transcript: &crate::backend::SessionTranscript) {
             .as_ref()
             .and_then(|input| input.get("command"))
             .and_then(Value::as_str),
-        Some(provider::TOOL_COMMAND),
+        Some(command.text()),
         "the split argument deltas must reassemble into the scripted command: {tool:#?}"
     );
     assert!(

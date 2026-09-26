@@ -76,9 +76,12 @@ Standard local verification loop before pushing (CI's Format job is `cargo fmt -
 
 `cargo xtask check-generation` is the V1 coupling guard (spec #364): it rejects V1 route literals and wire field names outside `src/opencode/v1/` (plus the tool-render allow-list), so V1 retirement stays a deletion.
 
-The live V1 contract suite (ADR-0057) is opt-in: it is `#[ignore]`-gated and needs the pinned OpenCode **1.18.31** binary (the one `.github/actions/install-opencode-v1` installs — never V2, never the default store). CI installs it on `PATH`; locally point `COLA_LIVE_OPENCODE_BIN` at it, then run the same command:
+The live contract suite (ADR-0057) is opt-in: every test is `#[ignore]`-gated and runs one generation per test, always in a fresh isolated XDG tree (never the default store). The V1 chain (`live_v1_scripted_capability_chain`) needs the pinned OpenCode **1.18.31** binary (the one `.github/actions/install-opencode-v1` installs — never V2); CI installs it on `PATH` and runs `cargo test --locked -- --ignored live_v1`. The V2 read chain (`live_v2_scripted_transcript_read`) needs a 2.x binary and spawns it directly with relocated XDG trees; point `COLA_LIVE_OPENCODE_V2_BIN` at one (`opencode2` on `PATH` is the fallback):
 
-    COLA_LIVE_OPENCODE_BIN=/path/to/opencode cargo test --locked -- --ignored live
+    COLA_LIVE_OPENCODE_BIN=/path/to/opencode cargo test --locked -- --ignored live_v1
+    COLA_LIVE_OPENCODE_V2_BIN=/path/to/opencode2 cargo test --locked -- --ignored live_v2
+
+Set `COLA_LIVE_CAPTURE_DIR=<dir>` on either run to re-record the raw transcript responses into the fixture format; sanitize them by hand before committing under `src/opencode/wire/fixtures/`.
 
 ## Contribution guidelines
 

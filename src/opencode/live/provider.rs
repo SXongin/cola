@@ -7,25 +7,71 @@
 //!
 //! - **title** — the session-title call carries no tools: answer plain text;
 //! - **tool call** — a real turn's first model call: stream reasoning, then a
-//!   `bash` tool call the server must gate behind a permission ask;
+//!   shell tool call the server must gate behind a permission ask;
 //! - **final text** — any call whose conversation already carries a tool
 //!   result: stream the closing text.
+//!
+//! The tool the script calls is the generation's own ([`Tool::Bash`] on V1,
+//! [`Tool::Shell`] on V2 — the V1→V2 rename); everything else about the script
+//! is shared.
 //!
 //! Every script streams its content as **multiple SSE deltas** (text,
 //! reasoning and tool-call arguments alike), so the suite exercises the
 //! incremental path — a server that ignored SSE framing and answered in one
 //! shot would not produce the assembled parts. The unit tests below pin that
-//! the deltas concatenate to the full scripted values; the live test pins that
+//! the deltas concatenate to the full scripted values; the live tests pin that
 //! the transcript the adapter decoded carries exactly those values.
 //!
 //! Everything the server sent is recorded by the hosting [`TestHttpServer`],
-//! so the test asserts both the request side (the tool schema was offered, the
+//! so the tests assert both the request side (the tool schema was offered, the
 //! tool result came back) and the response side (the transcript the adapter
 //! decoded).
 
 use serde_json::{Value, json};
 
 use crate::test_http::{DynamicResponse, TestHttpServer};
+
+/// The shell tool the scripted turn calls, per generation: V1 still calls it
+/// `bash`, V2 renamed it `shell` (the permission action follows the rename).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tool {
+    /// V1's `bash` tool.
+    Bash,
+    /// V2's `shell` tool.
+    Shell,
+}
+
+impl Tool {
+    /// The tool name on the model wire and in the transcript.
+    pub fn name(self) -> &'static str {
+        match self {
+            Tool::Bash => "bash",
+            Tool::Shell => "shell",
+        }
+    }
+}
+
+/// The command the scripted tool call asks to run. The fast one is enough for
+/// the V1 capability chain; the slow one keeps the tool in its running state
+/// long enough for a live read to observe (and record) it, so the V2 read test
+/// is deterministic rather than racing the echo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCommand {
+    /// `echo live-harness-tool` — settles immediately.
+    Fast,
+    /// `sleep 2; echo live-harness-tool` — still running for ~2 s.
+    Slow,
+}
+
+impl ToolCommand {
+    /// The command text the transcript must carry back.
+    pub fn text(self) -> &'static str {
+        match self {
+            ToolCommand::Fast => "echo live-harness-tool",
+            ToolCommand::Slow => "sleep 2; echo live-harness-tool",
+        }
+    }
+}
 
 /// The provider id the isolated server config declares.
 pub const PROVIDER: &str = "scripted";
@@ -40,11 +86,8 @@ const REASONING_DELTAS: &[&str] = &["live-harness-", "reasoning"];
 /// The assembled reasoning the transcript must carry.
 pub const REASONING_TEXT: &str = "live-harness-reasoning";
 
-/// The `bash` command the scripted tool call asks to run.
+/// The `echo` command the scripted tool call asks to run by default.
 pub const TOOL_COMMAND: &str = "echo live-harness-tool";
-/// The tool-call argument fragments, streamed in order. Assembled they must be
-/// `{"command": TOOL_COMMAND}` (pinned by a unit test below).
-const TOOL_ARGUMENT_DELTAS: &[&str] = &[r#"{"command":"echo live-"#, r#"harness-tool"}"#];
 /// The correlation id the streamed tool call declares once, on its first delta.
 const TOOL_CALL_ID: &str = "call_live_harness_1";
 
@@ -58,11 +101,23 @@ pub const FINAL_TEXT: &str = "live-harness-final-text";
 const TITLE_DELTAS: &[&str] = &["live harness ", "title"];
 const TITLE_TEXT: &str = "live harness title";
 
-/// Start a provider that answers `POST /v1/chat/completions` from the scripts.
+/// Start a provider whose scripted turn calls V1's `bash` tool with the fast
+/// command.
 pub async fn start() -> TestHttpServer {
+    start_with(Tool::Bash, ToolCommand::Fast).await
+}
+
+/// Start a provider whose scripted turn calls `tool` (the generation's shell
+/// name) with `command`, answering `POST /v1/chat/completions` from the
+/// scripts.
+pub async fn start_with(tool: Tool, command: ToolCommand) -> TestHttpServer {
     let server = TestHttpServer::start().await;
-    server.route_dynamic("POST", "/v1/chat/completions", |request| {
-        DynamicResponse::new(200, "text/event-stream", completion_body(&request.body))
+    server.route_dynamic("POST", "/v1/chat/completions", move |request| {
+        DynamicResponse::new(
+            200,
+            "text/event-stream",
+            completion_body(&request.body, tool, command),
+        )
     });
     server
 }
@@ -79,12 +134,18 @@ enum Script {
 }
 
 /// The full SSE body for one model call, selected from the request body.
-fn completion_body(body: &str) -> String {
+fn completion_body(body: &str, tool: Tool, command: ToolCommand) -> String {
     let request: Value = serde_json::from_str(body).unwrap_or(Value::Null);
     match script(&request) {
         Script::Title => sse(&[with_role(content_chunks(TITLE_DELTAS)), finish_chunk("stop")].concat()),
         Script::ToolCall => sse(&[
-            with_role([reasoning_chunks(REASONING_DELTAS), tool_call_chunks()].concat()),
+            with_role(
+                [
+                    reasoning_chunks(REASONING_DELTAS),
+                    tool_call_chunks(tool, command),
+                ]
+                .concat(),
+            ),
             finish_chunk("tool_calls"),
         ]
         .concat()),
@@ -181,36 +242,35 @@ fn reasoning_chunks(deltas: &[&str]) -> Vec<Value> {
         .collect()
 }
 
-/// The streamed `bash` tool call: its id and name arrive on the first delta,
-/// its arguments split across one delta each — the OpenAI wire shape.
-fn tool_call_chunks() -> Vec<Value> {
-    let (first, rest) = TOOL_ARGUMENT_DELTAS
-        .split_first()
-        .expect("the tool call needs at least one argument delta");
+/// The streamed shell tool call: its id and name arrive on the first delta,
+/// its arguments split across two deltas — the OpenAI wire shape, and enough
+/// fragmentation to prove the client reassembles them. The name is the
+/// generation's (`bash` / `shell`); the arguments encode `command`.
+fn tool_call_chunks(tool: Tool, command: ToolCommand) -> Vec<Value> {
+    let arguments = json!({ "command": command.text() }).to_string();
+    let (first, rest) = arguments.split_at(arguments.len() / 2);
     let mut chunks = vec![chunk(
         json!({
             "tool_calls": [{
                 "index": 0,
                 "id": TOOL_CALL_ID,
                 "type": "function",
-                "function": { "name": "bash", "arguments": first },
+                "function": { "name": tool.name(), "arguments": first },
             }],
         }),
         None,
         false,
     )];
-    chunks.extend(rest.iter().map(|arguments| {
-        chunk(
-            json!({
-                "tool_calls": [{
-                    "index": 0,
-                    "function": { "arguments": arguments },
-                }],
-            }),
-            None,
-            false,
-        )
-    }));
+    chunks.push(chunk(
+        json!({
+            "tool_calls": [{
+                "index": 0,
+                "function": { "arguments": rest },
+            }],
+        }),
+        None,
+        false,
+    ));
     chunks
 }
 
@@ -347,7 +407,11 @@ mod tests {
 
     #[test]
     fn the_title_script_streams_its_text_in_multiple_deltas() {
-        let events = sse_events(&completion_body(&request(Script::Title).to_string()));
+        let events = sse_events(&completion_body(
+            &request(Script::Title).to_string(),
+            Tool::Bash,
+            ToolCommand::Fast,
+        ));
         assert_streamed(
             &streamed_fragments(&events, "content"),
             TITLE_TEXT,
@@ -359,7 +423,11 @@ mod tests {
 
     #[test]
     fn the_tool_call_script_streams_reasoning_and_split_arguments() {
-        let events = sse_events(&completion_body(&request(Script::ToolCall).to_string()));
+        let events = sse_events(&completion_body(
+            &request(Script::ToolCall).to_string(),
+            Tool::Bash,
+            ToolCommand::Fast,
+        ));
 
         assert_streamed(
             &streamed_fragments(&events, "reasoning_content"),
@@ -383,9 +451,56 @@ mod tests {
         );
     }
 
+    /// The streamed tool call's name is the generation's own (`bash` on V1,
+    /// `shell` on V2).
+    #[test]
+    fn the_scripted_tool_name_is_the_generations_shell() {
+        for tool in [Tool::Bash, Tool::Shell] {
+            let events = sse_events(&completion_body(
+                &request(Script::ToolCall).to_string(),
+                tool,
+                ToolCommand::Fast,
+            ));
+            assert_eq!(
+                events.iter().find_map(|event| {
+                    event["choices"][0]["delta"]["tool_calls"][0]["function"]["name"].as_str()
+                }),
+                Some(tool.name()),
+                "{tool:?}"
+            );
+        }
+    }
+
+    /// Both scripted commands stream as fragmented argument deltas and
+    /// assemble to the exact `{"command": …}` JSON — the slow one is what keeps
+    /// the V2 in-flight read deterministic.
+    #[test]
+    fn the_scripted_command_is_parameterized_and_reassembles() {
+        for command in [ToolCommand::Fast, ToolCommand::Slow] {
+            let events = sse_events(&completion_body(
+                &request(Script::ToolCall).to_string(),
+                Tool::Shell,
+                command,
+            ));
+            assert_streamed(
+                &streamed_argument_fragments(&events),
+                &json!({ "command": command.text() }).to_string(),
+                "the tool-call arguments",
+            );
+        }
+        assert!(
+            ToolCommand::Slow.text().starts_with("sleep"),
+            "the slow command must keep the tool running"
+        );
+    }
+
     #[test]
     fn the_final_script_streams_its_text_in_multiple_deltas() {
-        let events = sse_events(&completion_body(&request(Script::FinalText).to_string()));
+        let events = sse_events(&completion_body(
+            &request(Script::FinalText).to_string(),
+            Tool::Bash,
+            ToolCommand::Fast,
+        ));
         assert_streamed(
             &streamed_fragments(&events, "content"),
             FINAL_TEXT,
@@ -404,7 +519,7 @@ mod tests {
     #[test]
     fn every_script_terminates_with_the_done_sentinel() {
         for script in [Script::Title, Script::ToolCall, Script::FinalText] {
-            let body = completion_body(&request(script).to_string());
+            let body = completion_body(&request(script).to_string(), Tool::Bash, ToolCommand::Fast);
             assert!(body.ends_with("data: [DONE]\n\n"), "{script:?}: {body}");
         }
     }
