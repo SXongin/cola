@@ -218,8 +218,8 @@ impl Client {
     /// cursor is followed to the end, so the limit can never hide rows —
     /// recently updated sub-task children used to fill the newest page and
     /// crowd roots out of the window (issue #325). Children stay in the
-    /// returned set: `/list --all` and `/attach` resolve them, and each card
-    /// filters them per its own policy (ADR-0008).
+    /// returned set — the child policy belongs to each caller (ADR-0008), so a
+    /// roots-only view is a per-surface filter, not this listing's job.
     ///
     /// The plain `GET /session` is PROJECT-scoped: it only returns the server's
     /// *own* directory's project (the instance's cwd), so cola's sessions in
@@ -1306,7 +1306,7 @@ mod wire_tests {
         assert_eq!(request.path, "/experimental/session");
         assert_eq!(
             request.query, "",
-            "no roots filter: children stay in the set for /list --all and /attach"
+            "no roots filter: children stay in the set for the caller's child policy"
         );
         assert_eq!(server.request_count(), 1, "one page, no cursor to follow");
     }

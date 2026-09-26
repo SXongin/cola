@@ -1,86 +1,10 @@
 use crate::bridge::test_support::*;
 
+/// Repeated session-list reads through the `/switch` card within the 30 s
+/// TTL must not re-hit the server; an external rename is only visible after
+/// invalidation/expiry.
 #[tokio::test]
-async fn list_shows_global_sessions_marking_own() {
-    let _wd = test_work_dir();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    let mut backend = MockBackend::new(realistic_parts());
-    backend.given_sessions(vec![
-        list_session("ses_alpha01", "外部会话", "/tmp/ext", 100),
-        list_session("ses_beta02", "本地会话", "/work/cola", 300),
-    ]);
-    let (app, platform) = build_app(cfg, backend).await;
-    // Our own lobby session, so /list marks it active (ADR-0022: only the
-    // active session is marked; the 本会话 ownership marker is gone).
-    seed_entry(
-        &app,
-        crate::config::SessionEntry {
-            thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-            session_id: "ses_beta02".into(),
-            directory: "/work/cola".into(),
-            agent: None,
-            model: None,
-            auto_accept: false,
-            topic_anchor: None,
-            topic_root: None,
-            variant: None,
-        },
-    )
-    .await;
-
-    send_command(&app, "/switch list", "msg_list").await;
-
-    let text = platform.texts().await.join("\n");
-    assert!(text.contains("外部会话"), "external session visible: {text}");
-    assert!(text.contains("本地会话"), "own session visible: {text}");
-    // The newest (updated 300) sorts first; own session marked active.
-    let pos_ext = text.find("外部会话").unwrap();
-    let pos_local = text.find("本地会话").unwrap();
-    assert!(pos_local < pos_ext, "own (newer) session sorts first: {text}");
-    assert!(text.contains("(active)"), "active session marked: {text}");
-    assert!(!text.contains("本会话"), "ownership marker dropped: {text}");
-}
-
-#[tokio::test]
-async fn list_filters_by_keyword_and_hides_children() {
-    let _wd = test_work_dir();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    let mut backend = MockBackend::new(realistic_parts());
-    backend.given_sessions(vec![
-        list_session("ses_alpha01", "重写登录模块", "/work/auth", 100),
-        list_session("ses_beta02", "修 bug", "/work/cola", 300),
-        opencode::types::SessionListInfo {
-            parent_id: Some("ses_alpha01".into()),
-            ..list_session("ses_child09", "Child session - x", "/work/auth", 400)
-        },
-    ]);
-    let (app, platform) = build_app(cfg, backend).await;
-
-    // Keyword filters by title.
-    send_command(&app, "/switch list 登录", "msg_list").await;
-    let text = platform.texts().await.join("\n");
-    assert!(text.contains("重写登录模块"), "keyword match: {text}");
-    assert!(!text.contains("修 bug"), "non-matching title filtered: {text}");
-
-    // Without --all the child is hidden even though it is newest.
-    platform.calls.lock().await.clear();
-    send_command(&app, "/switch list", "msg_list2").await;
-    let text = platform.texts().await.join("\n");
-    assert!(!text.contains("Child session"), "child hidden by default: {text}");
-
-    // --all reveals the child.
-    platform.calls.lock().await.clear();
-    send_command(&app, "/switch list --all", "msg_list3").await;
-    let text = platform.texts().await.join("\n");
-    assert!(text.contains("child09"), "child shown with --all: {text}");
-}
-
-/// Repeated `/list` within the 30 s TTL must not re-hit the server; an
-/// external rename is only visible after invalidation/expiry.
-#[tokio::test]
-async fn list_is_cached_within_ttl_and_invalidated_on_rename() {
+async fn switch_card_is_cached_within_ttl_and_invalidated_on_rename() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -105,10 +29,10 @@ async fn list_is_cached_within_ttl_and_invalidated_on_rename() {
     )
     .await;
 
-    // Two /list in a row → one server fetch.
+    // Two `/switch` cards in a row → one server fetch.
     send_command_in(
         &app,
-        "/switch list",
+        "/switch",
         key.clone(),
         "m1",
         crate::config::ConversationKind::P2p,
@@ -116,7 +40,7 @@ async fn list_is_cached_within_ttl_and_invalidated_on_rename() {
     .await;
     send_command_in(
         &app,
-        "/switch list",
+        "/switch",
         key.clone(),
         "m2",
         crate::config::ConversationKind::P2p,
@@ -124,7 +48,7 @@ async fn list_is_cached_within_ttl_and_invalidated_on_rename() {
     .await;
     assert_eq!(calls_counter.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-    // A rename invalidates the cache → next /list refetches.
+    // A rename invalidates the cache → the next card refetches.
     send_command_in(
         &app,
         "/name 新名字",
@@ -133,15 +57,45 @@ async fn list_is_cached_within_ttl_and_invalidated_on_rename() {
         crate::config::ConversationKind::P2p,
     )
     .await;
-    send_command_in(
-        &app,
-        "/switch list",
-        key,
-        "m4",
-        crate::config::ConversationKind::P2p,
-    )
-    .await;
+    send_command_in(&app, "/switch", key, "m4", crate::config::ConversationKind::P2p).await;
     assert_eq!(calls_counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// The retired text list gets no dedicated reply: `/switch list` is an
+/// ordinary keyword query, so it takes the normal no-match path — the switch
+/// card, pre-filtered by the keyword — never a list-shaped text response.
+#[tokio::test]
+async fn switch_list_is_an_ordinary_keyword_with_no_dedicated_reply() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![list_session("ses_alpha01", "重写登录", "/work/auth", 100)]);
+    let (app, platform) = build_app(cfg, backend).await;
+
+    send_command(&app, "/switch list", "msg_list").await;
+
+    let card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .next()
+        .expect("no match opens the switch card");
+    let text = card_text(&card);
+    assert!(text.contains("会话管理"), "the switch card is the reply: {text}");
+    assert!(
+        text.contains("无匹配会话"),
+        "the card carries the ordinary empty result: {text}"
+    );
+    assert!(
+        card.to_string().contains("\"default_value\":\"list\""),
+        "the card is pre-filtered by the keyword: {card}"
+    );
+    assert!(
+        platform.texts().await.is_empty(),
+        "no dedicated text reply: {:?}",
+        platform.texts().await
+    );
 }
 
 #[tokio::test]

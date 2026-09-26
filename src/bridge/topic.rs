@@ -135,7 +135,7 @@ async fn open_topic_inner(
                 &handles.snapshot_handles(),
                 "接管",
                 &info,
-                // The topic form has no switch list to return to.
+                // The topic form has no switch card to return to.
                 None,
             )
             .await;

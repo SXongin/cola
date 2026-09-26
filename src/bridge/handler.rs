@@ -1120,9 +1120,9 @@ impl App {
     /// ADR-0028), persist the new active entry, and settle the snapshot's
     /// claimed pendings. The returned card patches the clicked card in place
     /// (ADR-0028 one-card rule), so no second message is sent. `back` is the
-    /// switch list the adoption came from (ADR-0052): both snapshot forms
-    /// carry its 返回列表 button, and the claim registry keeps it across
-    /// rebuilds.
+    /// switch card's list state the adoption came from (ADR-0052): both
+    /// snapshot forms carry its 返回列表 button, and the claim registry keeps it
+    /// across rebuilds.
     ///
     /// The steal is `set_active`'s: it removes any existing entry with this
     /// session id, so a `force_adopt` from another thread leaves that owner
