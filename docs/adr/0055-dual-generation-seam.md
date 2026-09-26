@@ -50,12 +50,15 @@ V1 serves its web UI through a catch-all, so `/api/info` on V1 is a **200
 1.18.31). The status alone therefore cannot discriminate. The rule implemented
 in `src/opencode/generation.rs` (spec #364, slice S3) is:
 
-- a 200 whose body is V2's JSON info envelope (`{version, pid, urls, paths}`)
-  is V2;
-- a 404 (no `/api` surface) is V1;
-- anything else — a 200 without the envelope, 401, 503, a transport error — is
-  **inconclusive**: cola stays serverless and Lazy Start / the reconnect scan
-  retries. A generation is never guessed;
+- **200 + V2's JSON info envelope = V2.** The envelope is recognised by its
+  `version` string and `urls` array (V2 serves `{version, pid, urls, paths}`;
+  only those two keys are required);
+- **200 `text/html` = V1** (the web-UI catch-all);
+- **404 = V1** (no `/api` surface);
+- **everything else = inconclusive**: a 200 without the envelope (JSON or any
+  other content type), 401, 503, a transport error. An inconclusive probe is
+  never guessed at — cola stays serverless and Lazy Start / the reconnect scan
+  retries;
 - `[opencode] generation = "auto" | "v1" | "v2"` still forces the choice when
   the probe cannot be trusted, with a WARN on a contradicting classified probe.
 

@@ -138,8 +138,9 @@ impl OpenCodeConfig {
 
 /// The explicit port of an endpoint URL (`http://localhost:4096`,
 /// `http://127.0.0.1:49374/`), `None` when it carries none. The one parser for
-/// both the config's `[opencode] url` tiebreaker and the V2 registration URL
-/// discovery reads — an endpoint port is never parsed twice differently.
+/// the config's `[opencode] url` tiebreaker, the V2 registration URL discovery
+/// reads, and the attached server URL the ownership/yield check parses — an
+/// endpoint port is never parsed twice differently.
 pub(crate) fn port_from_url(url: &str) -> Option<u16> {
     url.rsplit(':').next()?.trim_end_matches('/').parse().ok()
 }
