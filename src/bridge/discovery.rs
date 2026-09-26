@@ -60,19 +60,22 @@ pub(crate) const DEFAULT_SERVER_USERNAME: &str = "opencode";
 /// fields, this carries BOTH username and password — discovery always supplies
 /// both, so the client never silently sends unauthenticated requests (the
 /// server 401s without a username even when the password matches).
+/// The struct stays nominally `pub` because the `Backend` trait's `reconnect`
+/// takes it; its fields are uniformly `pub(crate)` — the whole crate is one
+/// binary, so nothing here is an external interface.
 #[derive(Debug, Clone)]
 pub struct ResolvedServer {
-    pub url: String,
-    pub username: String,
-    pub password: String,
+    pub(crate) url: String,
+    pub(crate) username: String,
+    pub(crate) password: String,
     /// The pid of the attached server, when the attach path knew it: the
     /// neutral identity token the reconnect loop compares to notice a
     /// replacement on the same port (a new generation or a new password).
-    pub pid: Option<i32>,
+    pub(crate) pid: Option<i32>,
     /// The generation attach detection resolved for this server, with the
     /// `[opencode] generation` override applied (spec #364 §2). A property of
     /// the attachment — never guessed, never per-session (ADR-0055).
-    pub generation: Generation,
+    pub(crate) generation: Generation,
 }
 
 impl ResolvedServer {

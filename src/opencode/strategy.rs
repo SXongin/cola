@@ -135,7 +135,7 @@ pub(crate) trait GenerationStrategy: Send + Sync {
 
 /// An OpenCode protocol generation cola can speak (CONTEXT.md "Generation").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Generation {
+pub(crate) enum Generation {
     /// The 1.18.x unprefixed compatibility surface.
     V1,
     /// The 2.0.x `/api`-only surface.

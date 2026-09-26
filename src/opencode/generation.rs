@@ -1,20 +1,24 @@
 //! Attach-time generation detection (spec #364 §2, ADR-0055).
 //!
 //! The discriminator is a plain HTTP probe of `GET /api/info` with the
-//! credentials the attach already holds: a 200 carrying V2's info envelope
-//! (`{version, pid, urls, paths}`) is V2; a 404 (no `/api` surface at all) is
-//! V1. Anything else — a 401, a 503, a transport failure, a 200 whose body is
-//! not the envelope — is **inconclusive**, and an inconclusive probe is never
-//! guessed at: cola stays serverless and Lazy Start / the reconnect scan
-//! retries (spec #364 §2).
+//! credentials the attach already holds. One rule, and every record states it
+//! the same way:
 //!
-//! One measured wrinkle against real V1 servers: V1 answers unknown paths with
-//! its web UI through a catch-all, so `GET /api/info` on V1 is a **200
-//! `text/html`**, not a 404 (verified against the running 1.18.23 and the
-//! pinned 1.18.31). A 200 whose body is not V2's JSON envelope is therefore
-//! classified V1. The `[opencode] generation` override exists for proxies and
-//! unusual builds where the probe cannot be trusted (CONTEXT.md "Generation
-//! Override").
+//! - **200 + V2's JSON info envelope = V2.** The envelope is recognised by its
+//!   `version` string and `urls` array (V2 serves `{version, pid, urls,
+//!   paths}`; only those two keys are required).
+//! - **200 `text/html` = V1.** Measured against real V1 servers: V1 answers
+//!   unknown paths with its web UI through a catch-all, so `GET /api/info` on
+//!   V1 is a 200 HTML page, not a 404 (verified against the running 1.18.23
+//!   and the pinned 1.18.31).
+//! - **404 = V1** (no `/api` surface at all).
+//! - **Everything else = inconclusive**: a 200 without the envelope (JSON or
+//!   any other content type), 401, 503, a transport error. An inconclusive
+//!   probe is never guessed at — cola stays serverless and Lazy Start / the
+//!   reconnect scan retries (spec #364 §2).
+//!
+//! The `[opencode] generation` override exists for proxies and unusual builds
+//! where the probe cannot be trusted (CONTEXT.md "Generation Override").
 
 use std::time::Duration;
 
@@ -99,8 +103,9 @@ pub(crate) async fn probe_transport(transport: &Transport) -> ProbeOutcome {
 }
 
 /// Turn one HTTP response into a probe outcome. The status alone is not
-/// enough (V1's UI catch-all answers 200 to `/api/info`), so a 200 is only V2
-/// when the body is V2's info envelope; every other status is judged by its
+/// enough (V1's UI catch-all answers 200 to `/api/info`), so a 200 is V2 only
+/// when the body is V2's info envelope, V1 when it is the HTML catch-all, and
+/// inconclusive otherwise; a 404 is V1 and every other status is judged by its
 /// own evidence.
 fn classify(status: u16, content_type: Option<&str>, body: &[u8], url: &str) -> ProbeOutcome {
     let content_type = content_type.unwrap_or("-");
@@ -335,6 +340,12 @@ mod tests {
             let server = TestHttpServer::start().await;
             server.route_raw("GET", "/api/info", status, content_type, body);
             let outcome = probe_server(&server, "opencode", PASSWORD).await;
+            // Positive control first: the absence check must not pass
+            // vacuously on an empty evidence string.
+            assert!(
+                !outcome.evidence.is_empty(),
+                "status {status} produced no evidence to inspect"
+            );
             assert!(
                 !outcome.evidence.contains(PASSWORD),
                 "status {status} leaked the password: {}",
@@ -354,6 +365,10 @@ mod tests {
         );
         transport.disable_env_proxy(Some("opencode"), Some(PASSWORD));
         let outcome = probe_transport(&transport).await;
+        assert!(
+            !outcome.evidence.is_empty(),
+            "the unreachable path produced no evidence to inspect"
+        );
         assert!(
             !outcome.evidence.contains(PASSWORD),
             "the unreachable evidence leaked the password: {}",
