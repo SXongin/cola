@@ -36,7 +36,7 @@ use crate::backend::SessionTranscript;
 use crate::error::Result;
 
 use super::strategy::GenerationStrategy;
-use super::transport::{Transport, body_preview, read_failure};
+use super::transport::{Transport, body_preview, read_failure, read_failure_detailed};
 use super::types::{
     AgentInfo, FormAnswer, FormValue, ImageInput, ModelInfo, PermissionRequest, PromptResponse,
     ProviderModels, QuestionRequest, SessionInfo, SessionListInfo, SessionStatus,
@@ -770,7 +770,9 @@ impl V2Strategy {
         loop {
             let response = http.client().get(http.url(SESSION_ACTIVE)).send().await?;
             if !response.status().is_success() {
-                return Err(read_failure(response, "session status").await);
+                // This error leaves `prompt` as the surfaced diagnostic, so it
+                // keeps the body preview the other status reads only log.
+                return Err(read_failure_detailed(response, "session status").await);
             }
             let text = response.text().await?;
             let active: wire::ActiveSessions = serde_json::from_str(&text).map_err(|error| {

@@ -360,6 +360,15 @@ pub fn build_form_answers(questions: &[QuestionInfo], answers: &[Option<Vec<Stri
         .collect()
 }
 
+/// `i64::MIN` as an f64 (`-2^63`): the inclusive lower bound for narrowing a
+/// whole f64 into [`FormValue::Integer`].
+const INTEGER_MIN_F64: f64 = -9_223_372_036_854_775_808.0;
+/// The exclusive upper bound for that narrowing: `2^63` (one past `i64::MAX`),
+/// the first f64 beyond the i64 range. A plain `<= i64::MAX as f64` would admit
+/// `2^63` itself (both round to the same f64), which `as i64` saturates rather
+/// than represents.
+const INTEGER_LIMIT_F64: f64 = 9_223_372_036_854_775_808.0;
+
 /// Decode one finalized field's typed answer, or `None` to leave the field
 /// unanswered (V2 omits the key; V1 keeps an empty positional slot).
 fn field_answer(field: &QuestionInfo, values: &[String]) -> Option<FormValue> {
@@ -386,7 +395,15 @@ fn field_answer(field: &QuestionInfo, values: &[String]) -> Option<FormValue> {
             .first()?
             .parse::<f64>()
             .ok()
-            .filter(|number| number.is_finite() && number.fract() == 0.0)
+            .filter(|number| {
+                number.is_finite()
+                    && number.fract() == 0.0
+                    // Reject anything outside the i64 range: an `as i64` cast
+                    // SATURATES (`1e30` would become `i64::MAX`), which would
+                    // submit a wrong answer instead of reporting the field as
+                    // unanswered.
+                    && (INTEGER_MIN_F64..INTEGER_LIMIT_F64).contains(number)
+            })
             .map(|number| FormValue::Integer(number as i64)),
         FormFieldKind::String => {
             let text = values.first().cloned().unwrap_or_default();
@@ -561,6 +578,29 @@ mod tests {
         assert_eq!(
             field_answer(&field("n", FormFieldKind::Number), &["NaN".into()]),
             None
+        );
+        // Whole but out-of-range values must not saturate into a wrong answer:
+        // `1e30 as i64` would clamp to `i64::MAX`.
+        assert_eq!(
+            field_answer(&field("i", FormFieldKind::Integer), &["1e30".into()]),
+            None
+        );
+        assert_eq!(
+            field_answer(&field("i", FormFieldKind::Integer), &["-1e30".into()]),
+            None
+        );
+        // `2^63` is one past the i64 range (the exclusive upper bound).
+        assert_eq!(
+            field_answer(
+                &field("i", FormFieldKind::Integer),
+                &["9223372036854775808".into()]
+            ),
+            None
+        );
+        // A large in-range value still narrows.
+        assert_eq!(
+            field_answer(&field("i", FormFieldKind::Integer), &["9007199254740992".into()]),
+            Some(FormValue::Integer(9_007_199_254_740_992))
         );
         // An unanswered slot stays unanswered in field order.
         let unanswered = build_form_answers(&questions, &[None, None, None]);
