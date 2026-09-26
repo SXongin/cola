@@ -16,7 +16,7 @@ use crate::bridge::handles::{CardsHandle, RequestsHandle, SessionsHandle, TurnHa
 use crate::bridge::span;
 use crate::bridge::turn::state::{RenderedPart, StreamAccumulator};
 use crate::config::ThreadKey;
-use crate::feishu::card::tool_render::TaskLiveness;
+use crate::feishu::card::tool_render::{ChildActivity, TaskLiveness};
 
 use super::Turn;
 
@@ -376,21 +376,24 @@ fn child_liveness(transcript: &SessionTranscript) -> Option<TaskLiveness> {
             newest_ms = Some(newest_ms.map_or(at, |current: i64| current.max(at)));
         }
     };
-    // The newest live tool by server start time; an untimed call (a pending
-    // part with no clock) only wins when nothing timed is running.
-    let mut current: Option<(i64, String)> = None;
+    // The newest live tool by server start time (an untimed call only wins
+    // when nothing timed is running), and the newest part for the phase when
+    // nothing is live.
+    let mut current: Option<(i64, String, Option<i64>)> = None;
+    let mut newest_part: Option<&Part> = None;
     for message in &transcript.messages {
         if let Some(time) = &message.time {
             observe(Some(time.completed.unwrap_or(time.created)));
         }
         for part in &message.parts {
+            newest_part = Some(part);
             match part {
                 Part::Tool(call) => {
                     observe(call.started_at);
                     if call.status.is_live() {
                         let at = call.started_at.unwrap_or(i64::MIN);
-                        if current.as_ref().is_none_or(|(best, _)| at >= *best) {
-                            current = Some((at, call.identity.name.clone()));
+                        if current.as_ref().is_none_or(|(best, _, _)| at >= *best) {
+                            current = Some((at, call.identity.name.clone(), call.started_at));
                         }
                     }
                 }
@@ -400,9 +403,17 @@ fn child_liveness(transcript: &SessionTranscript) -> Option<TaskLiveness> {
             }
         }
     }
+    let activity = match current {
+        Some((_, name, started_at)) => ChildActivity::Tool { name, started_at },
+        None => match newest_part {
+            Some(Part::Reasoning(_)) => ChildActivity::Reasoning,
+            Some(Part::Text(_)) => ChildActivity::Replying,
+            _ => ChildActivity::Thinking,
+        },
+    };
     Some(TaskLiveness {
+        activity,
         last_activity_ms: newest_ms?,
-        current_tool: current.map(|(_, name)| name),
         wait: None,
     })
 }
@@ -1903,8 +1914,11 @@ Index: /x/src/main.rs
         assert_eq!(
             child_liveness(&transcript),
             Some(TaskLiveness {
+                activity: ChildActivity::Tool {
+                    name: "bash".into(),
+                    started_at: Some(9_000),
+                },
                 last_activity_ms: 9_000,
-                current_tool: Some("bash".into()),
                 wait: None,
             })
         );
@@ -1932,8 +1946,38 @@ Index: /x/src/main.rs
         assert_eq!(
             child_liveness(&transcript),
             Some(TaskLiveness {
+                activity: ChildActivity::Reasoning,
                 last_activity_ms: 8_000,
-                current_tool: None,
+                wait: None,
+            })
+        );
+    }
+
+    /// The phase follows the newest part: streamed reply text reads 回复中, and
+    /// a completed tool with nothing newer reads 思考中 (the model is working
+    /// through the result).
+    #[test]
+    fn child_liveness_derives_the_phase_from_the_newest_part() {
+        let replying = SessionTranscript::new(vec![message("a1", 5_000, vec![text_part("hi")])]);
+        assert_eq!(
+            child_liveness(&replying),
+            Some(TaskLiveness {
+                activity: ChildActivity::Replying,
+                last_activity_ms: 5_000,
+                wait: None,
+            })
+        );
+
+        let thinking = SessionTranscript::new(vec![message(
+            "a1",
+            5_000,
+            vec![tool("bash", "c1", ToolStatus::Completed, Some(6_000), None, None)],
+        )]);
+        assert_eq!(
+            child_liveness(&thinking),
+            Some(TaskLiveness {
+                activity: ChildActivity::Thinking,
+                last_activity_ms: 6_000,
                 wait: None,
             })
         );
@@ -2005,8 +2049,8 @@ Index: /x/src/main.rs
         let updates = platform.updated_cards().await;
         let first = updates.last().expect("a live flush").to_string();
         assert!(
-            first.contains("前 · bash"),
-            "the first poll shows the child's running tool: {first}"
+            first.contains("bash 5s") || first.contains("bash 6s"),
+            "the first poll shows the child's running tool and its elapsed time: {first}"
         );
 
         let _ = render_and_flush(
@@ -2021,7 +2065,7 @@ Index: /x/src/main.rs
         let updates = platform.updated_cards().await;
         let second = updates.last().expect("a refresh flush").to_string();
         assert!(
-            second.contains("前 · read"),
+            second.contains("read 1s") || second.contains("read 2s"),
             "the next poll refreshes the child's liveness: {second}"
         );
     }
