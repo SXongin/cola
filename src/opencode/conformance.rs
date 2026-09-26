@@ -5,7 +5,7 @@
 //! assert only what the Bridge consumes; generation-distinctive wire details
 //! stay in that generation's own wire suite.
 //!
-//! Each generation contributes a [`SessionReadCase`] from its own module
+//! Each generation contributes a [`SessionCase`] from its own module
 //! (`v1::conformance` / `v2::conformance`), so a V1 route literal never leaves
 //! the V1 strategy (the coupling guard, spec #364 §1) and V1 retirement deletes
 //! its case with the rest of the strategy. The payload *values* are shared via
@@ -21,7 +21,7 @@ use crate::test_http::TestHttpServer;
 /// mount that generation's fake routes. The suite grows a scenario per neutral
 /// capability (reads today, writes as they land); each mount translates the
 /// shared fixture values into the generation's own wire shapes.
-pub(crate) struct SessionReadCase {
+pub(crate) struct SessionCase {
     pub(crate) generation: Generation,
     /// Mount the generation's fake session-read routes (a two-page list, one
     /// session get, the run-state reads), publishing the shared
@@ -164,7 +164,7 @@ impl Default for TranscriptFixture {
     }
 }
 
-impl SessionReadCase {
+impl SessionCase {
     /// The real adapter, pointed at the fake server and speaking this case's
     /// generation — production's construction with only the transport swapped
     /// for the no-proxy test one (ADR-0031).
@@ -209,10 +209,10 @@ impl Default for PromptFixture {
 
 /// Both generations under test. The suite grows a case per generation, never a
 /// scenario per generation.
-fn cases() -> [SessionReadCase; 2] {
+fn cases() -> [SessionCase; 2] {
     [
-        crate::opencode::v1::conformance::session_read_case(),
-        crate::opencode::v2::conformance::session_read_case(),
+        crate::opencode::v1::conformance::case(),
+        crate::opencode::v2::conformance::case(),
     ]
 }
 

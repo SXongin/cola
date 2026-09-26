@@ -499,8 +499,32 @@ async fn live_v2_scripted_write_chain() {
     assert_final_text(&transcript);
     assert_turn_complete(&transcript, &message_id);
 
+    // The steer reached the running turn's model call, not merely the
+    // transcript: the provider saw the supplement text on a later request.
+    let calls: Vec<Value> = provider
+        .requests()
+        .iter()
+        .filter(|request| request.path == "/v1/chat/completions")
+        .map(|request| serde_json::from_str(&request.body).expect("a provider request body must be JSON"))
+        .collect();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.to_string().contains(SUPPLEMENT_TEXT)),
+        "the steered supplement must reach the model turn: {calls:#?}"
+    );
+
     // Retry idempotency: the same cola id reconciles onto the durable message
-    // instead of admitting a second user message or running a second turn.
+    // instead of admitting a second user message or running a second turn. The
+    // baseline is taken before the retry: the assistant count and the provider
+    // call count must both be unchanged after it, and the session must still be
+    // idle (nothing ran).
+    let assistants_before = transcript
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::Assistant)
+        .count();
+    let completions_before = provider_completions(&provider);
     let retry = backend
         .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
         .await
@@ -528,6 +552,21 @@ async fn live_v2_scripted_write_chain() {
         1,
         "the retry must not disturb the supplement: {transcript:#?}"
     );
+    assert_eq!(
+        transcript
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Assistant)
+            .count(),
+        assistants_before,
+        "the retry must not run a second turn: {transcript:#?}"
+    );
+    assert_eq!(
+        provider_completions(&provider),
+        completions_before,
+        "the retry must not call the model again"
+    );
+    wait_for_idle(&backend, &session.id, &work_dir, &server).await;
 
     // Interrupt: a fresh slow turn is stopped mid-flight; the blocking prompt
     // unblocks, the interrupt answers as an accepted op, and the session idles.
@@ -606,6 +645,16 @@ fn has_live_tool(transcript: &SessionTranscript) -> bool {
         .iter()
         .flat_map(|message| message.parts.iter())
         .any(|part| matches!(part, Part::Tool(call) if call.status.is_live()))
+}
+
+/// How many model calls the scripted provider has received so far — the
+/// baseline a retry must not move.
+fn provider_completions(provider: &crate::test_http::TestHttpServer) -> usize {
+    provider
+        .requests()
+        .iter()
+        .filter(|request| request.path == "/v1/chat/completions")
+        .count()
 }
 
 /// The reproducing command stamped into a captured fixture.

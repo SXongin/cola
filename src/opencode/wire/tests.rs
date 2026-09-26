@@ -6,7 +6,7 @@
 //! the follow renderers consume.
 
 use crate::backend::{MessageRole, Part, SessionTranscript, ToolStatus};
-use crate::opencode::conformance::SessionReadCase;
+use crate::opencode::conformance::SessionCase;
 use crate::opencode::strategy::Generation;
 use crate::test_http::TestHttpServer;
 
@@ -124,7 +124,7 @@ fn assert_completed_turn(transcript: &SessionTranscript) {
 
 /// Mount one recorded body on its generation's transcript route and decode it
 /// through the real adapter.
-async fn decode_recorded(case: &SessionReadCase, recorded: &RecordedResponse) -> SessionTranscript {
+async fn decode_recorded(case: &SessionCase, recorded: &RecordedResponse) -> SessionTranscript {
     let server = TestHttpServer::start().await;
     (case.mount_recorded_transcript)(&server, RECORDED_SESSION, &recorded.response.to_string());
     case.backend(&server)
@@ -139,8 +139,8 @@ async fn decode_recorded(case: &SessionReadCase, recorded: &RecordedResponse) ->
 #[tokio::test]
 async fn recorded_transcript_turns_decode_on_both_generations() {
     for case in [
-        crate::opencode::v1::conformance::session_read_case(),
-        crate::opencode::v2::conformance::session_read_case(),
+        crate::opencode::v1::conformance::case(),
+        crate::opencode::v2::conformance::case(),
     ] {
         let generation = case.generation.as_str();
         let recorded = match case.generation {
@@ -185,7 +185,7 @@ async fn recorded_v2_inflight_step_keeps_the_turn_open() {
     let recorded = v2_transcript_inflight();
     assert_eq!(recorded.capture.generation, "v2");
 
-    let case = crate::opencode::v2::conformance::session_read_case();
+    let case = crate::opencode::v2::conformance::case();
     let transcript = decode_recorded(&case, &recorded).await;
 
     let user = transcript
