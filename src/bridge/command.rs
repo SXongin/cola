@@ -196,18 +196,19 @@ pub fn parse_command(text: &str) -> Option<Command> {
             }
         },
         // `/sub [list [keyword]]` — the Active Session's direct children,
-        // read-only (spec #344). The `list` verb is optional: `/sub <keyword>`
-        // is the same card pre-filtered, mirroring `/switch <keyword>`.
+        // read-only (spec #344). The grammar is exactly the sanctioned forms:
+        // no-arg, `list`, `list <keyword>`. Any other first word (a bare
+        // keyword, or `attach` until #348 claims it) is not a form — it gets
+        // the `/sub` help topic instead of being read as a keyword.
         "/sub" => match arg {
             None => Some(Command::Sub(SubAction::List(String::new()))),
-            Some(a) => {
-                let mut words = a.split_whitespace();
-                let keyword = match words.next() {
-                    Some("list") => words.collect::<Vec<_>>().join(" "),
-                    _ => a.to_string(),
-                };
-                Some(Command::Sub(SubAction::List(keyword)))
-            }
+            Some(a) => match a.split_whitespace().next() {
+                Some("list") => {
+                    let keyword = a.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+                    Some(Command::Sub(SubAction::List(keyword)))
+                }
+                _ => Some(Command::Help(Some("sub".into()))),
+            },
         },
         "/new" => Some(Command::New(arg.map(|s| s.to_string()))),
         "/topic" => match arg {
@@ -2003,9 +2004,10 @@ mod tests {
         );
     }
 
-    /// Spec #344: `/sub`, `/sub list` and `/sub list <keyword>` all open the
-    /// child-session card; the no-verb form treats its argument as the keyword
-    /// (mirroring `/switch <keyword>`), and multi-word keywords stay whole.
+    /// Spec #344: `/sub`, `/sub list` and `/sub list <keyword>` are the whole
+    /// grammar. An unknown verb (a bare keyword, or `attach` until #348 claims
+    /// it) answers with the `/sub` help topic instead of being read as a
+    /// keyword.
     #[test]
     fn parse_sub_opens_the_child_card() {
         assert_eq!(
@@ -2028,10 +2030,16 @@ mod tests {
             parse_command("/sub list multi word"),
             Some(Command::Sub(SubAction::List("multi word".into())))
         );
-        // The `list` verb is optional sugar: a bare keyword is the same card.
+        // The sanctioned grammar has no bare-keyword form.
         assert_eq!(
             parse_command("/sub 渲染"),
-            Some(Command::Sub(SubAction::List("渲染".into())))
+            Some(Command::Help(Some("sub".into())))
+        );
+        // `attach` is not a verb yet (#348): it must not be swallowed as a
+        // keyword filter.
+        assert_eq!(
+            parse_command("/sub attach ses_abc"),
+            Some(Command::Help(Some("sub".into())))
         );
     }
 
