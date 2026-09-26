@@ -792,7 +792,10 @@ async fn sub_attach_already_active_child_is_idempotent() {
     send_command(&app, "/sub attach ses_c1", "m1").await;
 
     let text = platform.texts().await.join("\n");
-    assert!(text.contains("Already active"), "idempotent reply: {text}");
+    assert!(
+        text.contains("Already active: \"重写渲染\""),
+        "the idempotent reply names the child's real title: {text}"
+    );
     assert!(
         platform.replied_cards().await.is_empty(),
         "an already-active child gets no second snapshot"
@@ -805,6 +808,54 @@ async fn sub_attach_already_active_child_is_idempotent() {
     );
     let mapped = app.sessions.lock().await.list_thread(&key()).len();
     assert_eq!(mapped, 2, "parent and child stay mapped");
+}
+
+/// The already-active fallback is only for a server-reported CHILD: naming the
+/// Active Session when it is a ROOT is out of scope, so it takes the non-child
+/// refusal — never "Already active", never a write (the scope gate is not
+/// bypassable by the one session every chat has).
+#[tokio::test]
+async fn sub_attach_naming_the_active_root_is_refused() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let store_path = dir.path().join("sessions.json");
+    let cfg = test_config(&store_path);
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![
+        list_session("ses_root", "根会话", "/work/root", 100),
+        child_of("ses_c1", "重写渲染", "/work/root", 300, "ses_root", "build"),
+    ]);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key(), "ses_root", "/work/root"),
+    )
+    .await;
+    let before = std::fs::read(&store_path).expect("the seeded store is persisted");
+
+    for query in ["ses_root", "根会话"] {
+        send_command(&app, &format!("/sub attach {query}"), "m1").await;
+        let text = platform.texts().await.join("\n");
+        assert!(
+            text.contains("不是当前会话的直接子会话"),
+            "query {query}: the active root is refused as out of scope: {text}"
+        );
+        assert!(
+            !text.contains("Already active"),
+            "query {query}: an active root is not an idempotent child takeover: {text}"
+        );
+        assert!(
+            platform.replied_cards().await.is_empty(),
+            "query {query}: no Session Snapshot"
+        );
+        assert_eq!(
+            app.sessions.lock().await.get_active(&key()).unwrap().session_id,
+            "ses_root",
+            "query {query}: the Active Session is unchanged"
+        );
+        let after = std::fs::read(&store_path).expect("the store is still readable");
+        assert_eq!(before, after, "query {query}: the refusal writes no mapping");
+    }
 }
 
 /// Taking over a running child succeeds, and the Session Snapshot reflects its

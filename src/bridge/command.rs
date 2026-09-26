@@ -1573,7 +1573,7 @@ async fn handle_sub_attach(
     message_id: &str,
     kind: ConversationKind,
 ) -> crate::error::Result<()> {
-    let Some(active) = handles.flow.sessions.active_entry(thread_key).await else {
+    let Some(active_id) = handles.flow.sessions.get_session_id(thread_key).await else {
         handles
             .flow
             .platform
@@ -1587,7 +1587,6 @@ async fn handle_sub_attach(
             .await?;
         return Ok(());
     };
-    let active_id = active.session_id.as_str();
     let sessions = handles
         .flow
         .sessions
@@ -1595,7 +1594,7 @@ async fn handle_sub_attach(
         .await?;
     let children: Vec<crate::opencode::types::SessionListInfo> = sessions
         .iter()
-        .filter(|s| s.is_child_of(active_id) && !s.is_archived())
+        .filter(|s| s.is_child_of(&active_id) && !s.is_archived())
         .cloned()
         .collect();
     match resolve_session(&children, query) {
@@ -1609,30 +1608,23 @@ async fn handle_sub_attach(
         }
         SessionResolution::None => {
             // The already-active child can never appear in its own children
-            // list, so re-running `/sub attach` on it must be caught here. It
-            // goes through the same adoption path, whose already-active branch
-            // writes nothing and sends no snapshot.
-            let active_info = sessions
-                .iter()
-                .find(|s| s.id == active_id)
-                .cloned()
-                .unwrap_or_else(|| crate::opencode::types::SessionListInfo {
-                    id: active.session_id.clone(),
-                    title: crate::bridge::display::id_tail(&active.session_id),
-                    directory: active.directory.clone(),
-                    parent_id: None,
-                    agent: None,
-                    model: None,
-                    time: None,
-                });
-            if matches!(
-                resolve_session(std::slice::from_ref(&active_info), query),
-                SessionResolution::Hit(_)
-            ) {
+            // list, so re-running `/sub attach` on it must be caught here. The
+            // fallback is ONLY for a child the server reports: an active ROOT
+            // named by the query is a non-child and must fall through to the
+            // scope refusal, and a stale mapping absent from the fetched list
+            // is not in scope either — fabricating a record would bypass the
+            // scope gate. It goes through the same adoption path, whose
+            // already-active branch writes nothing and sends no snapshot.
+            if let Some(active_info) = sessions.iter().find(|s| s.id == active_id && s.is_child())
+                && matches!(
+                    resolve_session(std::slice::from_ref(active_info), query),
+                    SessionResolution::Hit(_)
+                )
+            {
                 return adopt_session(
                     handles,
                     thread_key,
-                    &active_info,
+                    active_info,
                     message_id,
                     kind,
                     force,
@@ -1646,7 +1638,7 @@ async fn handle_sub_attach(
             // so they read as no-match.
             let out_of_scope: Vec<crate::opencode::types::SessionListInfo> = sessions
                 .iter()
-                .filter(|s| !s.is_child_of(active_id) && !s.is_archived())
+                .filter(|s| !s.is_child_of(&active_id) && !s.is_archived())
                 .cloned()
                 .collect();
             match resolve_session(&out_of_scope, query) {
