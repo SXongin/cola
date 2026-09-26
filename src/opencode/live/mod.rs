@@ -3,9 +3,9 @@
 //! provider, in an isolated store.
 //!
 //! These tests are `#[ignore]`-gated, so `cargo test --workspace --locked`
-//! stays hermetic and credential-free. Run the live suite with the pinned
-//! 1.18.31 binary — the same fingerprint `.github/actions/install-opencode-v1`
-//! installs for the `Live V1` CI job — via:
+//! stays hermetic and credential-free. Run the live suite with the pinned V1
+//! binary — the fingerprint `.github/actions/install-opencode-v1` installs for
+//! the `Live V1` CI job — via:
 //!
 //! ```text
 //! COLA_LIVE_OPENCODE_BIN=/path/to/opencode cargo test --locked -- --ignored live
@@ -37,8 +37,11 @@ use server::LiveServer;
 
 /// The prompt text; asserted back from the user message.
 const PROMPT_TEXT: &str = "run the live harness command";
-/// How long any poll waits before failing the test.
+/// How long the readiness and permission polls wait before failing the test.
 const POLL_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the post-prompt idle wait gets — the run state clears a beat after
+/// the synchronous response, so this is deliberately shorter.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The gap between polls of a live read.
 const POLL_INTERVAL: Duration = Duration::from_millis(150);
 
@@ -197,7 +200,7 @@ async fn answer_permission(
 async fn wait_for_idle(backend: &OpenCodeBackend, session_id: &str, directory: &str, server: &LiveServer) {
     poll_until(
         "the session to read idle",
-        Duration::from_secs(10),
+        IDLE_TIMEOUT,
         || async {
             backend
                 .session_status(session_id, Some(directory))
