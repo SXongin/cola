@@ -148,19 +148,28 @@ async fn recorded_transcript_turns_decode_on_both_generations() {
             Generation::V2 => v2_transcript_turn(),
         };
         assert_eq!(recorded.capture.generation, generation, "stamp generation");
+        let source = recorded.capture.source.as_str();
+        let version = source
+            .strip_prefix("opencode ")
+            .unwrap_or_else(|| panic!("{generation}: the stamp names the capture source: {source:?}"));
+        let version = version.strip_prefix('v').unwrap_or(version);
         assert!(
-            recorded.capture.source.starts_with("opencode "),
-            "{generation}: the stamp names the capture source: {:?}",
-            recorded.capture.source
+            version.starts_with(|c: char| c.is_ascii_digit()) && version.contains('.'),
+            "{generation}: the source names a version, not just the artifact: {source:?}"
         );
+        let live_test = match case.generation {
+            Generation::V1 => "live_v1_scripted_capability_chain",
+            Generation::V2 => "live_v2_scripted_transcript_read",
+        };
         assert!(
-            recorded.capture.command.contains("cargo test"),
-            "{generation}: the stamp names the re-recording command: {:?}",
+            recorded.capture.command.contains("cargo test") && recorded.capture.command.contains(live_test),
+            "{generation}: the command names the re-recording live test `{live_test}`: {:?}",
             recorded.capture.command
         );
         assert!(
-            !recorded.capture.captured_at.is_empty(),
-            "{generation}: the stamp names the capture date"
+            chrono::NaiveDate::parse_from_str(&recorded.capture.captured_at, "%Y-%m-%d").is_ok(),
+            "{generation}: the capture date is a YYYY-MM-DD date: {:?}",
+            recorded.capture.captured_at
         );
 
         let transcript = decode_recorded(&case, &recorded).await;
