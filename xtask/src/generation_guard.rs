@@ -12,10 +12,17 @@
 //! porosity exception where built-in-tool payload field names are tailored
 //! (ADR-0042/ADR-0053).
 //!
+//! The denylist is generation-scoped: it names V1 route and field literals
+//! only. Current-generation (`/api/...`) routes are deliberately not policed —
+//! V1 retirement must not delete them (both generations serve session creation
+//! and compaction, and they live on the generation-blind adapter), and the
+//! spec charges this guard with V1 coupling, not with a V2 allow-list.
+//!
 //! Matching is deliberately conservative so prose does not trip it: route
 //! patterns carry their opening quote (a route is always a string literal in
-//! Rust, while "permission/question cards" is prose), and the two ambiguous
-//! roots are matched in URL-call form.
+//! Rust, while "permission/question cards" is prose), and the one ambiguous
+//! root (`/agent`, which collides with cola's own Feishu command) is matched in
+//! URL-call form.
 
 use std::path::{Path, PathBuf};
 
@@ -30,9 +37,13 @@ pub(crate) const ALLOWED_PREFIXES: &[&str] = &[
 
 /// The V1-distinctive literals, as `(pattern, what)`.
 ///
-/// `"/agent"` and `"/provider"` share their spelling with cola's own Feishu
-/// vocabulary (`/agent` is a command; `/provider` is not used, but the root is
-/// too generic to scan bare), so the agent route is matched in URL-call form.
+/// `/agent` shares its spelling with cola's own Feishu command, so it is
+/// matched in URL-call form; the other route roots are unambiguous enough to
+/// scan as quoted literals.
+///
+/// Deliberately absent: field names both generations carry — `sessionID`,
+/// `providerID`, `parentID`, `messageID` — are not V1-distinctive (spec #364
+/// §3), so denylisting them would be a false positive, not a guard.
 pub(crate) const FORBIDDEN: &[(&str, &str)] = &[
     ("\"/session", "V1 route literal"),
     ("\"/experimental/session", "V1 route literal"),
@@ -79,15 +90,18 @@ fn repo_root() -> PathBuf {
 }
 
 /// Scan `root`'s Rust sources recursively.
-pub(crate) fn scan_tree(root: &Path) -> Vec<Finding> {
+///
+/// IO failures are errors, never skipped files: a missing or unreadable `src/`
+/// must fail the command loudly rather than report a clean tree (a guard that
+/// fails open is no guard).
+pub(crate) fn scan_tree(root: &Path) -> Result<Vec<Finding>, String> {
     let mut files = Vec::new();
-    collect_rust_files(root, &mut files);
+    collect_rust_files(root, &mut files)?;
     files.sort();
     let mut findings = Vec::new();
     for file in files {
-        let Ok(content) = std::fs::read_to_string(&file) else {
-            continue;
-        };
+        let content = std::fs::read_to_string(&file)
+            .map_err(|e| format!("error: cannot read scan candidate {}: {e}", file.display()))?;
         let relative = file
             .strip_prefix(root)
             .unwrap_or(&file)
@@ -98,7 +112,7 @@ pub(crate) fn scan_tree(root: &Path) -> Vec<Finding> {
         let path = format!("{}/{}", root_name(root), relative);
         findings.extend(scan_source(&path, &content));
     }
-    findings
+    Ok(findings)
 }
 
 /// The directory name of the scanned root (`src`), used to build the
@@ -132,24 +146,35 @@ pub(crate) fn scan_source(path: &str, content: &str) -> Vec<Finding> {
     findings
 }
 
-fn collect_rust_files(dir: &Path, files: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
+fn collect_rust_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| {
+        format!(
+            "error: cannot scan generation-guard directory {}: {e}",
+            dir.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("error: cannot read an entry of {}: {e}", dir.display()))?;
         let path = entry.path();
         if path.is_dir() {
-            collect_rust_files(&path, files);
+            collect_rust_files(&path, files)?;
         } else if path.extension().is_some_and(|ext| ext == "rs") {
             files.push(path);
         }
     }
+    Ok(())
 }
 
 /// `cargo xtask check-generation`: fail when a V1 wire literal escaped the V1
-/// strategy.
+/// strategy, or when the sources cannot be scanned at all.
 pub(crate) fn run() {
-    let findings = scan_tree(&repo_root().join("src"));
+    let findings = match scan_tree(&repo_root().join("src")) {
+        Ok(findings) => findings,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    };
     if findings.is_empty() {
         return;
     }
@@ -232,7 +257,7 @@ let help = \"/agent build\";\n";
         std::fs::write(nested.join("planted.rs"), "let url = \"/question\";\n").unwrap();
         std::fs::write(root.join("src").join("README.md"), "\"/question\"\n").unwrap();
 
-        let findings = scan_tree(&root.join("src"));
+        let findings = scan_tree(&root.join("src")).expect("the planted tree is readable");
         std::fs::remove_dir_all(&root).unwrap();
 
         assert_eq!(
@@ -243,11 +268,30 @@ let help = \"/agent build\";\n";
         assert_eq!(findings[0].path, "src/bridge/nested/planted.rs");
     }
 
+    /// A missing or unreadable scan root is a loud error, never a clean tree:
+    /// the guard must not fail open (a silently empty scan would make CI green
+    /// while nothing was checked).
+    #[test]
+    fn an_unreadable_scan_root_is_a_loud_error() {
+        let missing =
+            std::env::temp_dir().join(format!("cola-generation-guard-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        let error = scan_tree(&missing).expect_err("a missing root must fail the scan");
+        assert!(
+            error.contains("cannot scan generation-guard directory"),
+            "the error must name the failing path: {error}"
+        );
+        assert!(
+            error.contains(missing.to_string_lossy().as_ref()),
+            "unexpected: {error}"
+        );
+    }
+
     /// The acceptance criterion's "passes on the tree": the repository's own
     /// sources are clean, so any future escape fails this test and CI.
     #[test]
     fn the_repository_tree_is_clean() {
-        let findings = scan_tree(&repo_root().join("src"));
+        let findings = scan_tree(&repo_root().join("src")).expect("the repository tree must be readable");
         assert!(
             findings.is_empty(),
             "V1 wire coupling outside the V1 strategy:\n{}",
