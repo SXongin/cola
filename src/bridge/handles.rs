@@ -506,18 +506,15 @@ impl RequestsHandle {
 
     /// The wait blocking `session_id`, if any (ADR-0054): the two kinds'
     /// pending records combine into the card's wait vocabulary.
-    pub(crate) async fn wait_for(
-        &self,
-        session_id: &str,
-    ) -> Option<crate::feishu::card::tool_render::WaitState> {
-        use crate::feishu::card::tool_render::WaitState;
+    pub(crate) async fn wait_for(&self, session_id: &str) -> Option<crate::feishu::card::AwaitingAction> {
+        use crate::feishu::card::AwaitingAction;
         match (
             self.permission.is_pending_for(session_id).await,
             self.question.is_pending_for(session_id).await,
         ) {
-            (true, true) => Some(WaitState::Both),
-            (true, false) => Some(WaitState::Permission),
-            (false, true) => Some(WaitState::Question),
+            (true, true) => Some(AwaitingAction::Both),
+            (true, false) => Some(AwaitingAction::Permission),
+            (false, true) => Some(AwaitingAction::Question),
             (false, false) => None,
         }
     }

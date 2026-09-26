@@ -10,7 +10,7 @@
 use crate::backend::TurnAnchor;
 use crate::bridge::handles::CardsHandle;
 use crate::feishu::card::shell::CardBuilder;
-use crate::feishu::card::tool_render::{TaskLiveness, ToolPanel};
+use crate::feishu::card::tool_render::{TASK_TOOL, TaskLiveness, ToolPanel};
 use crate::feishu::card::{AwaitingAction, CardState};
 use indexmap::IndexMap;
 use std::sync::Arc;
@@ -1053,7 +1053,7 @@ impl StreamAccumulator {
     pub(super) fn live_task_children(&self) -> Vec<(String, String)> {
         self.tools
             .iter()
-            .filter(|(_, panel)| panel.is_live() && panel.name() == "task")
+            .filter(|(_, panel)| panel.is_live() && panel.name() == TASK_TOOL)
             .filter_map(|(call_id, panel)| {
                 panel
                     .child_session_id()

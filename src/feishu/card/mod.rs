@@ -102,6 +102,20 @@ impl AwaitingAction {
             AwaitingAction::Both => Some(AWAITING_BOTH_TITLE),
         }
     }
+
+    /// The wait's words without the header's icon: the same vocabulary the
+    /// task liveness line reuses (ADR-0054). Kept in lockstep with [`title`]
+    /// by a test, so the card can never say two things for one state.
+    ///
+    /// [`title`]: Self::title
+    pub(crate) fn label(self) -> Option<&'static str> {
+        match self {
+            AwaitingAction::None => None,
+            AwaitingAction::Permission => Some("等待你的授权"),
+            AwaitingAction::Question => Some("等待你的回答"),
+            AwaitingAction::Both => Some("等待你的授权/回答"),
+        }
+    }
 }
 
 /// Progress/liveness signals for the card header (ADR-0014): which request
@@ -222,6 +236,24 @@ pub(crate) fn truncate_md(text: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The liveness line's wait label (ADR-0054) must always be the header
+    /// title minus its icon — one vocabulary, two render sites.
+    #[test]
+    fn awaiting_labels_are_the_header_titles_without_the_icon() {
+        for action in [
+            AwaitingAction::Permission,
+            AwaitingAction::Question,
+            AwaitingAction::Both,
+        ] {
+            assert_eq!(
+                action.title().unwrap(),
+                format!("⏳ {}", action.label().unwrap()),
+                "the wait vocabulary drifted for {action:?}"
+            );
+        }
+        assert_eq!(AwaitingAction::None.label(), None);
+    }
 
     /// #183: both panel headers and the card header date read the same local
     /// clock through these helpers. The expected strings are built from a local

@@ -358,34 +358,27 @@ pub(super) async fn render_and_flush(
     // ADR-0054: refresh every live task panel's child-session liveness. A
     // change must flush even when no part, header second or context figure
     // moved — the line is the only thing that changed.
-    let liveness_changed = refresh_task_liveness(cards, requests, backend, session_id, now_ms()).await;
+    let liveness_changed = refresh_task_liveness(cards, requests, backend, session_id).await;
     if changed || header_changed || context_changed || liveness_changed {
         Turn::flush_card(cards, session_id).await;
     }
     Some((new_parts, text_len, reasoning_len))
 }
 
-/// Wall-clock now in epoch ms, the reference the child-liveness ages are
-/// measured against (server times are epoch ms too).
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-/// A child session's liveness as its transcript reports it (ADR-0054): the age
-/// of its newest activity and its newest still-running tool. `None` when the
-/// transcript carries no timestamp at all (a child that just started, or a
-/// payload without times) — no line is better than a made-up age.
-fn child_liveness(transcript: &SessionTranscript, now_ms: i64) -> Option<(u64, Option<String>)> {
+/// A child session's liveness as its transcript reports it (ADR-0054): the
+/// timestamp of its newest activity and its newest still-running tool. `None`
+/// when the transcript carries no timestamp at all (a child that just started,
+/// or a payload without times) — no line is better than a made-up age.
+fn child_liveness(transcript: &SessionTranscript) -> Option<TaskLiveness> {
     let mut newest_ms: Option<i64> = None;
-    let mut current_tool: Option<String> = None;
     let mut observe = |at: Option<i64>| {
         if let Some(at) = at {
             newest_ms = Some(newest_ms.map_or(at, |current: i64| current.max(at)));
         }
     };
+    // The newest live tool by server start time; an untimed call (a pending
+    // part with no clock) only wins when nothing timed is running.
+    let mut current: Option<(i64, String)> = None;
     for message in &transcript.messages {
         if let Some(time) = &message.time {
             observe(Some(time.completed.unwrap_or(time.created)));
@@ -394,8 +387,11 @@ fn child_liveness(transcript: &SessionTranscript, now_ms: i64) -> Option<(u64, O
             match part {
                 Part::Tool(call) => {
                     observe(call.started_at);
-                    if matches!(call.status, ToolStatus::Running | ToolStatus::Pending) {
-                        current_tool = Some(call.identity.name.clone());
+                    if call.status.is_live() {
+                        let at = call.started_at.unwrap_or(i64::MIN);
+                        if current.as_ref().is_none_or(|(best, _)| at >= *best) {
+                            current = Some((at, call.identity.name.clone()));
+                        }
                     }
                 }
                 Part::Text(text) => observe(text.started_at),
@@ -404,21 +400,24 @@ fn child_liveness(transcript: &SessionTranscript, now_ms: i64) -> Option<(u64, O
             }
         }
     }
-    let newest_ms = newest_ms?;
-    Some((((now_ms - newest_ms).max(0) / 1000) as u64, current_tool))
+    Some(TaskLiveness {
+        last_activity_ms: newest_ms?,
+        current_tool: current.map(|(_, name)| name),
+        wait: None,
+    })
 }
 
 /// Read and attach the child-session liveness of every live `task` panel on
 /// `session_id`'s card (ADR-0054): one transcript read per distinct child, the
 /// wait from the request flows' pending record. Returns true when a panel
-/// changed. Every read is best-effort: a failure leaves the previous line in
-/// place rather than clearing it.
+/// changed. Every read is best-effort: a failure keeps the previous line (its
+/// stored activity time keeps the age growing truthfully) instead of clearing
+/// it or inventing one.
 async fn refresh_task_liveness(
     cards: &CardsHandle,
     requests: &RequestsHandle,
     backend: &Arc<dyn crate::backend::Backend>,
     session_id: &str,
-    now_ms: i64,
 ) -> bool {
     let tasks: Vec<(String, String)> = {
         let live = cards.cards.lock().await;
@@ -440,18 +439,12 @@ async fn refresh_task_liveness(
             failed.insert(child.clone());
             continue;
         };
-        let Some((last_activity_ago_secs, current_tool)) = child_liveness(&transcript, now_ms) else {
+        let Some(mut liveness) = child_liveness(&transcript) else {
             failed.insert(child.clone());
             continue;
         };
-        gathered.insert(
-            child.clone(),
-            TaskLiveness {
-                last_activity_ago_secs,
-                current_tool,
-                wait: requests.wait_for(child).await,
-            },
-        );
+        liveness.wait = requests.wait_for(child).await;
+        gathered.insert(child.clone(), liveness);
     }
     let mut live = cards.cards.lock().await;
     let Some(card) = live.get_mut(session_id) else {
@@ -1908,8 +1901,12 @@ Index: /x/src/main.rs
             ),
         ]);
         assert_eq!(
-            child_liveness(&transcript, 21_000),
-            Some((12, Some("bash".into())))
+            child_liveness(&transcript),
+            Some(TaskLiveness {
+                last_activity_ms: 9_000,
+                current_tool: Some("bash".into()),
+                wait: None,
+            })
         );
     }
 
@@ -1918,7 +1915,7 @@ Index: /x/src/main.rs
     #[test]
     fn child_liveness_without_any_timestamp_is_none() {
         let transcript = SessionTranscript::new(vec![typed_message("u", MessageRole::User, None, vec![])]);
-        assert_eq!(child_liveness(&transcript, 21_000), None);
+        assert_eq!(child_liveness(&transcript), None);
     }
 
     /// While the child thinks (no live tool), only the age is shown.
@@ -1932,7 +1929,14 @@ Index: /x/src/main.rs
                 reasoning_at("thinking", 8_000),
             ],
         )]);
-        assert_eq!(child_liveness(&transcript, 10_000), Some((2, None)));
+        assert_eq!(
+            child_liveness(&transcript),
+            Some(TaskLiveness {
+                last_activity_ms: 8_000,
+                current_tool: None,
+                wait: None,
+            })
+        );
     }
 
     /// A typed `task` call: running, with the child session id in its metadata
@@ -1958,7 +1962,7 @@ Index: /x/src/main.rs
         let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
-        let now = now_ms();
+        let now = chrono::Utc::now().timestamp_millis();
         let mut backend = MockBackend::new(realistic_parts());
         let child = |started: i64, name: &str| {
             SessionTranscript::new(vec![message(
