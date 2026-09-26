@@ -854,6 +854,44 @@ async fn poll_fallback_stops_with_a_warning_at_its_timeout() {
         warning.contains("ses_1"),
         "the warning names the session: {warning}"
     );
+    assert!(
+        !logs.contains("idle not confirmed"),
+        "the last read was active, so the expiry must not claim an unconfirmed absence: {logs}"
+    );
+}
+
+/// The expiry WARN tells the truth about which state it gave up on: a server
+/// whose last reads were absent-but-unconfirmed (fewer than the confirmation
+/// window) must not be reported as "still active".
+#[tokio::test]
+async fn poll_fallback_timeout_warning_reports_an_unconfirmed_absence() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "GET",
+        "/api/session/active",
+        200,
+        serde_json::json!({"data": {}}).to_string(),
+    );
+    let http = Transport::new(Some("opencode"), Some("secret"), server.base_url());
+    http.disable_env_proxy(Some("opencode"), Some("secret"));
+
+    let (result, logs) = crate::bridge::test_support::capture_logs(async {
+        V2Strategy
+            .poll_until_idle(&http, "ses_1", std::time::Duration::from_millis(300))
+            .await
+    })
+    .await;
+
+    assert!(result.is_ok(), "{result:?}");
+    let warning = crate::bridge::test_support::assert_line_level(&logs, "idle not confirmed", "WARN");
+    assert!(
+        warning.contains("ses_1") && warning.contains("confirmation window"),
+        "the warning explains the unconfirmed absence and names the session: {warning}"
+    );
+    assert!(
+        !logs.contains("still active"),
+        "the last read was absent, so the expiry must not claim an active session: {logs}"
+    );
 }
 
 /// The settled turn's failure is surfaced: the assistant message's `error`
@@ -1022,6 +1060,18 @@ async fn interrupt_accepts_the_idle_no_op_and_compact_sends_an_empty_payload() {
         404,
         r#"{"_tag":"SessionNotFoundError","message":"gone"}"#,
     );
+    server.route(
+        "POST",
+        "/api/session/ses_gone/compact",
+        404,
+        r#"{"_tag":"SessionNotFoundError","message":"gone"}"#,
+    );
+    server.route(
+        "POST",
+        "/api/session/ses_proxy/compact",
+        404,
+        r#"{"message":"proxy has no such route"}"#,
+    );
     let client = v2_wire_client(&server);
 
     client.interrupt("ses_1").await.unwrap();
@@ -1042,6 +1092,19 @@ async fn interrupt_accepts_the_idle_no_op_and_compact_sends_an_empty_payload() {
 
     let error = client.interrupt("ses_gone").await.unwrap_err();
     assert!(matches!(error, BridgeError::SessionNotFound(_)), "{error:?}");
+    // Compact gets the same mapping as the other write calls: a tagged 404 is
+    // the missing session, an untagged one is not (a raw error_for_status()
+    // would leak it as an Http 404, which reads as missing regardless of tag).
+    let error = client.compact("ses_gone").await.unwrap_err();
+    assert!(
+        matches!(error, BridgeError::SessionNotFound(_)),
+        "a tagged compact 404 is SessionNotFound: {error:?}"
+    );
+    let error = client.compact("ses_proxy").await.unwrap_err();
+    assert!(
+        matches!(error, BridgeError::OpenCode(_)),
+        "an untagged compact 404 must not trigger the recreate heal: {error:?}"
+    );
 }
 
 /// Attaching to V2 must never pretend a missing capability worked: a caller

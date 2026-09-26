@@ -499,19 +499,27 @@ async fn live_v2_scripted_write_chain() {
     assert_final_text(&transcript);
     assert_turn_complete(&transcript, &message_id);
 
-    // The steer reached the running turn's model call, not merely the
-    // transcript: the provider saw the supplement text on a later request.
+    // The steer merged into the running turn's model call: the call carrying
+    // the supplement text already has the first turn's tool result in its
+    // conversation and no closing text yet (a new turn could only run after
+    // the closing text, so this is what separates "merged" from "forked").
     let calls: Vec<Value> = provider
         .requests()
         .iter()
         .filter(|request| request.path == "/v1/chat/completions")
         .map(|request| serde_json::from_str(&request.body).expect("a provider request body must be JSON"))
         .collect();
+    let steer_call = calls
+        .iter()
+        .find(|call| call.to_string().contains(SUPPLEMENT_TEXT))
+        .unwrap_or_else(|| panic!("the steered supplement must reach the model turn: {calls:#?}"));
     assert!(
-        calls
-            .iter()
-            .any(|call| call.to_string().contains(SUPPLEMENT_TEXT)),
-        "the steered supplement must reach the model turn: {calls:#?}"
+        provider::has_tool_result(steer_call),
+        "the steered call must already carry the running turn's tool result: {steer_call:#?}"
+    );
+    assert!(
+        !steer_call.to_string().contains(provider::FINAL_TEXT),
+        "the supplement must merge before the closing text, not start a turn after it: {steer_call:#?}"
     );
 
     // Retry idempotency: the same cola id reconciles onto the durable message

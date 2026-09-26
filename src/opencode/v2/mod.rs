@@ -506,14 +506,21 @@ impl GenerationStrategy for V2Strategy {
     /// Compact the session's context (`POST /api/session/{id}/compact`). V2
     /// declares an all-optional payload, so an absent body fails the server's
     /// payload decode and `{}` is the empty request; the `{data}` response is
-    /// ignored (any 2xx is success, as V1's 204 is).
+    /// ignored (any 2xx is success, as V1's 204 is). Failures go through the
+    /// same mapping as the other write calls: the tagged 404 the endpoint
+    /// declares is session-not-found, and an untagged proxy 404 is not — a raw
+    /// `error_for_status()` would leak it as an Http 404, which
+    /// `is_session_not_found()` reads as a missing session regardless of tag.
     async fn compact(&self, http: &Transport, session_id: &str) -> Result<()> {
-        http.client()
+        let response = http
+            .client()
             .post(http.url(&format!("{SESSION}/{session_id}/compact")))
             .json(&serde_json::json!({}))
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        if !response.status().is_success() {
+            return Err(write_failure(response, session_id, "compact").await);
+        }
         Ok(())
     }
 }
@@ -653,6 +660,11 @@ impl V2Strategy {
     ) -> Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut absent_reads = 0usize;
+        // What the LAST read saw, so the expiry WARN describes the state the
+        // loop actually gave up on: an active session, or an absence it could
+        // not confirm inside the window. Assigned by every loop iteration
+        // before its first read.
+        let mut last_read_active;
         loop {
             let response = http.client().get(http.url(SESSION_ACTIVE)).send().await?;
             let status = response.status();
@@ -669,20 +681,30 @@ impl V2Strategy {
                     body_preview(&text)
                 ))
             })?;
-            if active.state(session_id).is_none() {
+            last_read_active = active.state(session_id).is_some();
+            if last_read_active {
+                absent_reads = 0;
+            } else {
                 absent_reads += 1;
                 if absent_reads >= IDLE_CONFIRMATIONS {
                     return Ok(());
                 }
-            } else {
-                absent_reads = 0;
             }
             if tokio::time::Instant::now() >= deadline {
-                tracing::warn!(
-                    "session {session_id}: still active after {}s of session.active polling; \
-                     returning to the caller instead of polling forever",
-                    timeout.as_secs()
-                );
+                if last_read_active {
+                    tracing::warn!(
+                        "session {session_id}: still active after {}s of session.active polling; \
+                         returning to the caller instead of polling forever",
+                        timeout.as_secs()
+                    );
+                } else {
+                    tracing::warn!(
+                        "session {session_id}: idle not confirmed after {}s of session.active \
+                         polling (the last read was absent, but the confirmation window did not \
+                         complete); returning to the caller instead of polling forever",
+                        timeout.as_secs()
+                    );
+                }
                 return Ok(());
             }
             tokio::time::sleep(IDLE_POLL_INTERVAL).await;
