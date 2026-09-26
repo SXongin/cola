@@ -2,11 +2,10 @@ use serde_json::json;
 
 use super::shell::card_shell;
 
-/// Feishu rejects JSON 2.0 cards with more than 200 total components/elements
-/// (ErrCode 11310 "element exceeds the limit"). A single collapsible panel
-/// counts as multiple components (panel + header title + icon + nested
-/// markdown), so cap the number of tool panels rendered in one card.
-/// A question with more options than this collapses them into a folding/// `overflow` group instead of a tall stack of buttons.
+/// A single-select question with more options than this collapses them all
+/// into a folding `overflow` group instead of a tall stack of buttons (the
+/// heading still lists every option). Multi-selects always stay on buttons so
+/// clicks toggle the running selection.
 const MAX_VISIBLE_OPTIONS: usize = 3;
 
 /// Display cap for a Custom Answer button label. Long or multiline answers

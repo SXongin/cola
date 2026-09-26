@@ -25,7 +25,7 @@ use crate::backend::SessionTranscript;
 use crate::error::Result;
 
 use super::strategy::GenerationStrategy;
-use super::transport::{REPLY_TIMEOUT, Transport};
+use super::transport::{REPLY_TIMEOUT, Transport, read_failure};
 use super::types::{
     AgentInfo, FormAnswer, FormFieldKind, ImageInput, ModelInfo, ModelOption, PermissionRequest,
     PromptResponse, ProviderModels, QuestionInfo, QuestionOption, QuestionRequest, SessionInfo,
@@ -382,18 +382,8 @@ impl GenerationStrategy for V1Strategy {
             url.query_pairs_mut().append_pair("directory", d);
         }
         let resp = http.client().get(url).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            tracing::warn!(
-                "GET /permission failed: {} — body: {}",
-                status,
-                &text[..text.len().min(500)]
-            );
-            return Err(crate::error::BridgeError::OpenCode(format!(
-                "permission list failed: {}",
-                status
-            )));
+        if !resp.status().is_success() {
+            return Err(read_failure(resp, "permission list").await);
         }
         let wire: Vec<WirePermission> = resp.json().await?;
         Ok(wire.into_iter().map(WirePermission::into_neutral).collect())
@@ -439,18 +429,8 @@ impl GenerationStrategy for V1Strategy {
             url.query_pairs_mut().append_pair("directory", d);
         }
         let resp = http.client().get(url).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            tracing::warn!(
-                "GET /session/status failed: {} — body: {}",
-                status,
-                &text[..text.len().min(500)]
-            );
-            return Err(crate::error::BridgeError::OpenCode(format!(
-                "session status failed: {}",
-                status
-            )));
+        if !resp.status().is_success() {
+            return Err(read_failure(resp, "session status").await);
         }
         let text = resp.text().await?;
         let map: std::collections::HashMap<String, serde_json::Value> =
@@ -478,18 +458,8 @@ impl GenerationStrategy for V1Strategy {
             url.query_pairs_mut().append_pair("directory", d);
         }
         let resp = http.client().get(url).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            eprintln!(
-                "list_questions failed: {} — body: {}",
-                status,
-                &text[..text.len().min(500)]
-            );
-            return Err(crate::error::BridgeError::OpenCode(format!(
-                "question list failed: {}",
-                status
-            )));
+        if !resp.status().is_success() {
+            return Err(read_failure(resp, "question list").await);
         }
         let wire: Vec<WireQuestion> = resp.json().await?;
         Ok(wire.into_iter().map(WireQuestion::into_neutral).collect())
