@@ -7,11 +7,9 @@
 //! generation-blind and reaches this module only through the
 //! [`GenerationStrategy`] trait, so **deleting this module is V1 retirement**.
 //!
-//! Session creation is the one deliberate exception to "unprefixed only": the
-//! mounted `/api/session` surface is where `location.directory` (the session's
-//! working directory) lives, and 1.18.x serves it alongside the unprefixed
-//! routes (ADR-0026 / ADR-0053 record the choice). Compact has no V1 route cola
-//! has ever used.
+//! Session creation and compaction are not here: they use the `/api` surface
+//! both generations serve and live on the generation-blind adapter instead
+//! (`OpenCodeBackend::create_session` / `compact`).
 
 mod wire;
 
@@ -26,9 +24,8 @@ use crate::error::Result;
 use super::strategy::GenerationStrategy;
 use super::transport::{REPLY_TIMEOUT, Transport};
 use super::types::{
-    AgentInfo, CreateSessionInput, CreateSessionResponse, ImageInput, Location, ModelInfo, ModelOption,
-    PermissionRequest, PromptResponse, ProviderModels, QuestionRequest, Session, SessionInfo,
-    SessionListInfo, SessionStatus,
+    AgentInfo, ImageInput, ModelInfo, ModelOption, PermissionRequest, PromptResponse, ProviderModels,
+    QuestionRequest, SessionInfo, SessionListInfo, SessionStatus,
 };
 
 /// Hard stop for the `x-next-cursor` follow in [`V1Strategy::list_sessions`]: a
@@ -53,39 +50,12 @@ const QUESTION: &str = "/question";
 const PROVIDER: &str = "/provider";
 /// The agent catalog.
 const AGENT: &str = "/agent";
-/// Session creation, on the mounted `/api` surface where `location.directory`
-/// lives (ADR-0053 amendment).
-const API_SESSION: &str = "/api/session";
 
 /// The strategy that speaks the V1 generation.
 pub(crate) struct V1Strategy;
 
 #[async_trait]
 impl GenerationStrategy for V1Strategy {
-    fn new_session_input(&self, model: Option<&ModelInfo>, directory: Option<&str>) -> CreateSessionInput {
-        CreateSessionInput {
-            id: None,
-            agent: None,
-            model: model.cloned(),
-            location: directory.map(|d| Location {
-                directory: d.to_string(),
-            }),
-        }
-    }
-
-    /// Create a new session with an optional directory and agent.
-    async fn create_session(&self, http: &Transport, input: &CreateSessionInput) -> Result<Session> {
-        let resp = http
-            .client()
-            .post(http.url(API_SESSION))
-            .json(input)
-            .send()
-            .await?
-            .error_for_status()?;
-        let body: CreateSessionResponse = resp.json().await?;
-        Ok(body.data)
-    }
-
     /// List sessions across the shared store, most recently active first.
     ///
     /// Uses the cross-project list `GET /experimental/session`
@@ -620,16 +590,6 @@ impl GenerationStrategy for V1Strategy {
         // old `/api/session/{id}/interrupt` 404'd so `/stop` silently failed.
         http.client()
             .post(http.url(&format!("{SESSION}/{session_id}/abort")))
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(())
-    }
-
-    /// Compact a session's context.
-    async fn compact(&self, http: &Transport, session_id: &str) -> Result<()> {
-        http.client()
-            .post(http.url(&format!("{API_SESSION}/{session_id}/compact")))
             .send()
             .await?
             .error_for_status()?;
