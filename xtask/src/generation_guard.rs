@@ -41,9 +41,12 @@ pub(crate) const ALLOWED_PREFIXES: &[&str] = &[
 /// matched in URL-call form; the other route roots are unambiguous enough to
 /// scan as quoted literals.
 ///
-/// Deliberately absent: field names both generations carry — `sessionID`,
-/// `providerID`, `parentID`, `messageID` — are not V1-distinctive (spec #364
-/// §3), so denylisting them would be a false positive, not a guard.
+/// Deliberately absent: field names and literals both generations carry —
+/// `sessionID`, `providerID`, `parentID`, `messageID` (spec #364 §3) and the
+/// finish reason `"tool-calls"` (V2's `FinishReason` literal set spells
+/// `stop | length | tool-calls | content-filter | error | unknown` exactly as
+/// V1 does) — are not V1-distinctive, so denylisting them would be a false
+/// positive, not a guard.
 pub(crate) const FORBIDDEN: &[(&str, &str)] = &[
     ("\"/session", "V1 route literal"),
     ("\"/experimental/session", "V1 route literal"),
@@ -57,7 +60,6 @@ pub(crate) const FORBIDDEN: &[(&str, &str)] = &[
     ("\"modelID\"", "V1 wire field name"),
     ("\"step-start\"", "V1 wire part type"),
     ("\"step-finish\"", "V1 wire part type"),
-    ("\"tool-calls\"", "V1 wire finish reason"),
     ("\"x-next-cursor\"", "V1 pagination header"),
 ];
 
@@ -246,6 +248,16 @@ mod tests {
 let command = \"/agent\";\n\
 let help = \"/agent build\";\n";
         assert_eq!(scan_source("src/bridge/handler.rs", content), Vec::new());
+    }
+
+    /// A literal both generations spell is not V1 coupling: V2's `FinishReason`
+    /// set carries `tool-calls` verbatim, so the V2 decoder must decode it
+    /// without tripping the guard.
+    #[test]
+    fn a_shared_generation_literal_does_not_trip_the_guard() {
+        let content = "Some(\"tool-calls\") => FinishReason::ToolCalls,\n";
+        assert_eq!(scan_source("src/opencode/v2/wire.rs", content), Vec::new());
+        assert_eq!(scan_source("src/opencode/v1/wire/mod.rs", content), Vec::new());
     }
 
     /// The walk is recursive and only looks at `.rs` files.
