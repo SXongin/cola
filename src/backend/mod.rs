@@ -26,8 +26,8 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 use crate::opencode::types::{
-    AgentInfo, CreateSessionInput, ImageInput, ModelInfo, PermissionRequest, PromptResponse, ProviderModels,
-    QuestionRequest, Session, SessionInfo, SessionListInfo, SessionStatus,
+    AgentInfo, CreateSessionInput, FormAnswer, ImageInput, ModelInfo, PermissionRequest, PromptResponse,
+    ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionStatus,
 };
 
 /// A directory-scoped handle to the backend. Instance routing lives here: the
@@ -39,13 +39,13 @@ use crate::opencode::types::{
 pub trait DirectoryBackend: Send + Sync {
     async fn list_permissions(&self) -> Result<Vec<PermissionRequest>>;
 
-    async fn reply_permission(&self, request_id: &str, reply: &str) -> Result<()>;
+    async fn reply_permission(&self, session_id: &str, request_id: &str, reply: &str) -> Result<()>;
 
     async fn list_questions(&self) -> Result<Vec<QuestionRequest>>;
 
-    async fn reply_question(&self, request_id: &str, answers: &[Vec<String>]) -> Result<()>;
+    async fn reply_question(&self, session_id: &str, request_id: &str, answers: &[FormAnswer]) -> Result<()>;
 
-    async fn reject_question(&self, request_id: &str) -> Result<()>;
+    async fn reject_question(&self, session_id: &str, request_id: &str) -> Result<()>;
 
     async fn session_info(&self, session_id: &str) -> Result<SessionInfo>;
 }
@@ -71,9 +71,9 @@ impl DirectoryBackend for BackendDirectory {
         self.backend.list_permissions(Some(&self.directory)).await
     }
 
-    async fn reply_permission(&self, request_id: &str, reply: &str) -> Result<()> {
+    async fn reply_permission(&self, session_id: &str, request_id: &str, reply: &str) -> Result<()> {
         self.backend
-            .reply_permission(request_id, reply, Some(&self.directory))
+            .reply_permission(session_id, request_id, reply, Some(&self.directory))
             .await
     }
 
@@ -81,15 +81,15 @@ impl DirectoryBackend for BackendDirectory {
         self.backend.list_questions(Some(&self.directory)).await
     }
 
-    async fn reply_question(&self, request_id: &str, answers: &[Vec<String>]) -> Result<()> {
+    async fn reply_question(&self, session_id: &str, request_id: &str, answers: &[FormAnswer]) -> Result<()> {
         self.backend
-            .reply_question(request_id, answers, Some(&self.directory))
+            .reply_question(session_id, request_id, answers, Some(&self.directory))
             .await
     }
 
-    async fn reject_question(&self, request_id: &str) -> Result<()> {
+    async fn reject_question(&self, session_id: &str, request_id: &str) -> Result<()> {
         self.backend
-            .reject_question(request_id, Some(&self.directory))
+            .reject_question(session_id, request_id, Some(&self.directory))
             .await
     }
 
@@ -171,20 +171,34 @@ pub trait Backend: Send + Sync {
         message_id: Option<&str>,
     ) -> Result<()>;
 
-    async fn reply_permission(&self, request_id: &str, reply: &str, directory: Option<&str>) -> Result<()>;
+    async fn reply_permission(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        reply: &str,
+        directory: Option<&str>,
+    ) -> Result<()>;
 
     async fn list_permissions(&self, directory: Option<&str>) -> Result<Vec<PermissionRequest>>;
 
     async fn list_questions(&self, directory: Option<&str>) -> Result<Vec<QuestionRequest>>;
 
+    /// Answer a pending form/question with keyed answers (V2's `Form.Answer`);
+    /// V1 flattens the values into its positional `answers` arrays.
     async fn reply_question(
         &self,
+        session_id: &str,
         request_id: &str,
-        answers: &[Vec<String>],
+        answers: &[FormAnswer],
         directory: Option<&str>,
     ) -> Result<()>;
 
-    async fn reject_question(&self, request_id: &str, directory: Option<&str>) -> Result<()>;
+    async fn reject_question(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        directory: Option<&str>,
+    ) -> Result<()>;
 
     /// Read one Session as a neutral [`SessionTranscript`] — the read model the
     /// Bridge consumes (ADR-0053). The adapter's wire envelope never reaches

@@ -1109,45 +1109,286 @@ async fn interrupt_accepts_the_idle_no_op_and_compact_sends_an_empty_payload() {
 
 /// Attaching to V2 must never pretend a missing capability worked: a caller
 /// gets an error naming the method and the generation (spec #364, S3). S4a
-/// landed the session reads, S4b the transcript, S5 the writes, so this pins
-/// the capabilities still waiting for their slices: permissions/forms (S6) and
-/// the session-scoped model/agent catalogs (S7).
+/// landed the session reads, S4b the transcript, S5 the writes and S6 the
+/// permissions/forms, so this pins the capabilities still waiting for their
+/// slices: the session-scoped model/agent catalogs (S7).
 #[tokio::test]
 async fn remaining_capabilities_fail_loudly_until_their_slice_lands() {
     let strategy = V2Strategy;
     let http = Transport::new(Some("opencode"), Some("pw"), "http://127.0.0.1:1");
-    for (method, error) in [
-        (
-            "reply_permission",
-            strategy
-                .reply_permission(&http, "p1", "once", None)
-                .await
-                .unwrap_err(),
-        ),
-        (
-            "list_permissions",
-            strategy.list_permissions(&http, None).await.unwrap_err(),
-        ),
-        (
-            "list_questions",
-            strategy.list_questions(&http, None).await.unwrap_err(),
-        ),
-        (
-            "reply_question",
-            strategy.reply_question(&http, "q1", &[], None).await.unwrap_err(),
-        ),
-        (
-            "model_context_window",
-            strategy.model_context_window(&http, "p", "m").await.unwrap_err(),
-        ),
-    ] {
-        let error = error.to_string();
-        assert!(error.contains("V2 strategy"), "{method}: unexpected: {error}");
-        assert!(error.contains(method), "{method}: unexpected: {error}");
-        assert!(error.contains("not implemented"), "{method}: unexpected: {error}");
-    }
+    let error = strategy.model_context_window(&http, "p", "m").await.unwrap_err();
+    let error = error.to_string();
+    assert!(error.contains("V2 strategy"), "unexpected: {error}");
+    assert!(error.contains("model_context_window"), "unexpected: {error}");
+    assert!(error.contains("not implemented"), "unexpected: {error}");
     // The two catalog reads degrade to empty with a warning instead of an
     // error (their card surfaces tolerate emptiness).
     assert!(strategy.list_agents(&http).await.is_empty());
     assert!(strategy.list_models(&http).await.is_empty());
+}
+
+/// The location-scoped pending-permission read: `GET /api/permission/request`
+/// with V2's deepObject `location[directory]` query, the `{location, data}`
+/// envelope, and the renamed request fields (`action`/`resources`/`save`).
+#[tokio::test]
+async fn list_permissions_reads_the_location_scoped_envelope_and_renamed_fields() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "GET",
+        "/api/permission/request",
+        200,
+        serde_json::json!({
+            "location": {"directory": "/work/cola"},
+            "data": [{
+                "id": "per_1",
+                "sessionID": "ses_1",
+                "action": "shell",
+                "resources": ["rm -rf *"],
+                "save": ["rm *"],
+                "metadata": {"command": "rm"},
+            }],
+        })
+        .to_string(),
+    );
+    let client = v2_wire_client(&server);
+
+    let permissions = client.list_permissions(Some("/work/cola")).await.unwrap();
+
+    assert_eq!(permissions.len(), 1);
+    assert_eq!(permissions[0].request_id, "per_1");
+    assert_eq!(permissions[0].session_id.as_deref(), Some("ses_1"));
+    assert_eq!(permissions[0].permission.as_deref(), Some("shell"));
+    assert_eq!(permissions[0].patterns, vec!["rm -rf *"]);
+    assert_eq!(permissions[0].always, vec!["rm *"]);
+
+    let request = last_request(&server);
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.path, "/api/permission/request");
+    assert_eq!(
+        request.query_param("location[directory]").as_deref(),
+        Some("/work/cola"),
+        "V2 scopes the list with the deepObject location query: {}",
+        request.query
+    );
+}
+
+/// The session-scoped permission reply: `POST
+/// /api/session/{id}/permission/{requestID}/reply` with V2's `decision` body
+/// and 204. A 404 (gone) and a 409 (settled) are both the benign "already
+/// handled" taxonomy, never a failure card.
+#[tokio::test]
+async fn reply_permission_posts_the_session_scoped_decision_body() {
+    let server = TestHttpServer::start().await;
+    server.route("POST", "/api/session/ses_1/permission/per_1/reply", 204, "");
+    server.route(
+        "POST",
+        "/api/session/ses_1/permission/per_gone/reply",
+        404,
+        serde_json::json!({"_tag": "PermissionNotFoundError", "requestID": "per_gone", "message": "gone"})
+            .to_string(),
+    );
+    server.route(
+        "POST",
+        "/api/session/ses_1/permission/per_settled/reply",
+        409,
+        serde_json::json!({"_tag": "ConflictError", "message": "settled"}).to_string(),
+    );
+    let client = v2_wire_client(&server);
+
+    client
+        .reply_permission("ses_1", "per_1", "always", None)
+        .await
+        .unwrap();
+
+    let request = last_request(&server);
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.path, "/api/session/ses_1/permission/per_1/reply");
+    assert_eq!(body_json(&request), serde_json::json!({"decision": "always"}));
+
+    for (id, label) in [("per_gone", "404"), ("per_settled", "409")] {
+        let error = client
+            .reply_permission("ses_1", id, "once", None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.is_not_found(),
+            "{label} must read as already handled: {error:?}"
+        );
+    }
+}
+
+/// The location-scoped pending-form read: one `GET /api/form` per known
+/// directory, never one per session, with V2's typed `Form.Field` union decoded
+/// into the neutral fields — keys, kinds, option values vs display labels.
+#[tokio::test]
+async fn list_questions_decodes_typed_form_fields_from_the_location_list() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "GET",
+        "/api/form",
+        200,
+        serde_json::json!({
+            "location": {"directory": "/work/cola"},
+            "data": [{
+                "id": "frm_1",
+                "sessionID": "ses_1",
+                "title": "Questions",
+                "fields": [
+                    {
+                        "key": "q0",
+                        "title": "目录",
+                        "description": "选哪个目录？",
+                        "type": "string",
+                        "required": true,
+                        "custom": true,
+                        "options": [
+                            {"value": "/a", "label": "目录 A", "description": "第一个"},
+                            {"value": "/b", "label": "目录 B"},
+                        ],
+                    },
+                    {
+                        "key": "q1",
+                        "title": "水果",
+                        "description": "选水果",
+                        "type": "multiselect",
+                        "options": [{"value": "apple", "label": "苹果"}],
+                    },
+                    {"key": "q2", "title": "确认", "description": "确定吗", "type": "boolean"},
+                    {"key": "q3", "title": "数量", "description": "几个", "type": "integer"},
+                    {"key": "q4", "title": "链接", "description": "打开", "type": "external", "url": "https://example.com/x"},
+                ],
+            }],
+        })
+        .to_string(),
+    );
+    let client = v2_wire_client(&server);
+
+    let forms = client.list_questions(Some("/work/cola")).await.unwrap();
+
+    assert_eq!(forms.len(), 1);
+    let form = &forms[0];
+    assert_eq!(form.id, "frm_1");
+    assert_eq!(form.session_id, "ses_1");
+    assert_eq!(form.title, "Questions");
+    let fields = &form.questions;
+    assert_eq!(fields.len(), 5);
+    assert_eq!(fields[0].key, "q0");
+    assert_eq!(fields[0].header, "目录");
+    assert_eq!(fields[0].question, "选哪个目录？");
+    assert!(fields[0].required);
+    assert!(fields[0].custom_allowed());
+    assert_eq!(fields[0].kind, crate::opencode::types::FormFieldKind::String);
+    // The submitted value and the display label are distinct.
+    assert_eq!(fields[0].options[0].answer_value(), "/a");
+    assert_eq!(fields[0].options[0].label, "目录 A");
+    assert_eq!(fields[0].display_values(&["/a".into()]), vec!["目录 A"]);
+    assert!(fields[1].is_multi());
+    assert_eq!(fields[2].kind, crate::opencode::types::FormFieldKind::Boolean);
+    assert_eq!(fields[3].kind, crate::opencode::types::FormFieldKind::Integer);
+    assert_eq!(fields[4].kind, crate::opencode::types::FormFieldKind::External);
+    assert_eq!(fields[4].url.as_deref(), Some("https://example.com/x"));
+
+    let request = last_request(&server);
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.path, "/api/form");
+    assert_eq!(
+        request.query_param("location[directory]").as_deref(),
+        Some("/work/cola")
+    );
+}
+
+/// The session-scoped form reply: `POST /api/session/{id}/form/{formID}/reply`
+/// with the keyed `{answer: {key: value}}` object whose values keep the field
+/// types (string / array / boolean / number). A settled form (409) is the same
+/// benign "already handled" outcome as a missing one (404).
+#[tokio::test]
+async fn reply_question_posts_the_keyed_typed_answer_object() {
+    use crate::opencode::types::{FormAnswer, FormValue};
+
+    let server = TestHttpServer::start().await;
+    server.route("POST", "/api/session/ses_1/form/frm_1/reply", 204, "");
+    server.route(
+        "POST",
+        "/api/session/ses_1/form/frm_settled/reply",
+        409,
+        serde_json::json!({"_tag": "FormAlreadySettledError", "id": "frm_settled", "message": "settled"})
+            .to_string(),
+    );
+    let client = v2_wire_client(&server);
+
+    let answers = vec![
+        FormAnswer {
+            key: "q0".into(),
+            value: Some(FormValue::Text("/a".into())),
+        },
+        FormAnswer {
+            key: "q1".into(),
+            value: Some(FormValue::List(vec!["apple".into(), "梨".into()])),
+        },
+        FormAnswer {
+            key: "q2".into(),
+            value: Some(FormValue::Bool(true)),
+        },
+        FormAnswer {
+            key: "q3".into(),
+            value: Some(FormValue::Number(3.0)),
+        },
+    ];
+    client
+        .reply_question("ses_1", "frm_1", &answers, Some("/work/cola"))
+        .await
+        .unwrap();
+
+    let request = last_request(&server);
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.path, "/api/session/ses_1/form/frm_1/reply");
+    assert_eq!(
+        body_json(&request),
+        serde_json::json!({"answer": {
+            "q0": "/a",
+            "q1": ["apple", "梨"],
+            "q2": true,
+            "q3": 3.0,
+        }})
+    );
+
+    let error = client
+        .reply_question("ses_1", "frm_settled", &answers, None)
+        .await
+        .unwrap_err();
+    assert!(error.is_not_found(), "a settled form reads as handled: {error:?}");
+}
+
+/// Cancelling a V2 form is `DELETE /api/session/{id}/form/{formID}` (there is
+/// no reject endpoint); a gone or settled form is the benign NotFound taxonomy.
+#[tokio::test]
+async fn reject_question_deletes_the_session_scoped_form() {
+    let server = TestHttpServer::start().await;
+    server.route("DELETE", "/api/session/ses_1/form/frm_1", 204, "");
+    server.route(
+        "DELETE",
+        "/api/session/ses_1/form/frm_gone",
+        404,
+        serde_json::json!({"_tag": "FormNotFoundError", "id": "frm_gone", "message": "gone"}).to_string(),
+    );
+    server.route(
+        "DELETE",
+        "/api/session/ses_1/form/frm_settled",
+        409,
+        serde_json::json!({"_tag": "FormAlreadySettledError", "id": "frm_settled", "message": "settled"})
+            .to_string(),
+    );
+    let client = v2_wire_client(&server);
+
+    client.reject_question("ses_1", "frm_1", None).await.unwrap();
+
+    let request = last_request(&server);
+    assert_eq!(request.method, "DELETE");
+    assert_eq!(request.path, "/api/session/ses_1/form/frm_1");
+    assert_eq!(request.body, "", "cancel carries no body");
+
+    for id in ["frm_gone", "frm_settled"] {
+        let error = client.reject_question("ses_1", id, None).await.unwrap_err();
+        assert!(error.is_not_found(), "{id} must read as handled: {error:?}");
+    }
 }

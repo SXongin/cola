@@ -84,6 +84,9 @@ pub(crate) fn turn_anchor(created_ms: i64) -> TurnAnchor {
 /// A recorded `reply_question` call: (request_id, answers).
 type QuestionReplyRecord = (String, Vec<Vec<String>>);
 
+/// A recorded keyed `reply_question` call: (request_id, form answers).
+type KeyedQuestionReply = (String, Vec<opencode::types::FormAnswer>);
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // the recording adapter captures full call details for assertions
 pub enum PlatformCall {
@@ -703,6 +706,9 @@ pub struct MockBackend {
     pub external_user_created: Arc<std::sync::Mutex<Option<i64>>>,
     /// Records every `reply_permission` call: (request_id, reply).
     pub reply_permission_calls: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
+    /// The session id each `reply_permission` was routed with, in call order —
+    /// the child-session routing assertion (V2's reply is session-scoped).
+    pub reply_permission_sessions: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// Records every `interrupt` call's session id (the `/stop` path).
     pub interrupt_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// Records every `compact` call's session id (the `/compact` path).
@@ -741,8 +747,13 @@ pub struct MockBackend {
     pub transcript_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// Pending questions served by `list_questions`.
     pub questions: Vec<opencode::types::QuestionRequest>,
-    /// Records `reply_question` calls: (request_id, answers).
+    /// Records `reply_question` calls: (request_id, answers). The answers are
+    /// the positional string form the keyed neutral answers flatten to, so the
+    /// existing click assertions read the submitted selection.
     pub reply_question_calls: Arc<tokio::sync::Mutex<Vec<QuestionReplyRecord>>>,
+    /// The keyed answers each `reply_question` carried, in call order — the
+    /// form-model assertion (V2 submits `Form.Answer` objects).
+    pub reply_question_keyed_calls: Arc<tokio::sync::Mutex<Vec<KeyedQuestionReply>>>,
     /// Question ids cola answered/submitted/rejected via `reply_question` —
     /// filtered out of `list_questions` like the real server drops a replied
     /// request. A test simulating resolution by ANOTHER client inserts the id
@@ -881,6 +892,7 @@ impl MockBackend {
             external_reply_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             external_user_created: Arc::new(std::sync::Mutex::new(None)),
             reply_permission_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            reply_permission_sessions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             interrupt_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             compact_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             replied_permissions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
@@ -893,6 +905,7 @@ impl MockBackend {
             transcript_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             questions: Vec::new(),
             reply_question_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            reply_question_keyed_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             replied_questions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             prompt_error: None,
             fail_prompt_count: std::sync::atomic::AtomicUsize::new(0).into(),
@@ -1280,17 +1293,23 @@ impl MockBackend {
     }
 
     /// Shared recording/error policy for the question reply endpoints: record
-    /// the call, honor a scripted 404, then mark the request replied (like the
-    /// real server drops a replied request from the pending list).
+    /// the call (positional for the click assertions, keyed for the form-model
+    /// assertions), honor a scripted 404, then mark the request replied (like
+    /// the real server drops a replied request from the pending list).
     async fn record_question_reply(
         &self,
         request_id: &str,
         answers: Vec<Vec<String>>,
+        keyed: Vec<opencode::types::FormAnswer>,
     ) -> crate::error::Result<()> {
         self.reply_question_calls
             .lock()
             .await
             .push((request_id.to_string(), answers));
+        self.reply_question_keyed_calls
+            .lock()
+            .await
+            .push((request_id.to_string(), keyed));
         if self.reply_question_not_found {
             return Err(crate::error::BridgeError::NotFound(format!(
                 "question {request_id}"
@@ -1665,19 +1684,45 @@ impl crate::backend::Backend for MockBackend {
 
     async fn reply_question(
         &self,
+        _session_id: &str,
         request_id: &str,
-        answers: &[Vec<String>],
+        answers: &[opencode::types::FormAnswer],
         _d: Option<&str>,
     ) -> crate::error::Result<()> {
-        self.record_question_reply(request_id, answers.to_vec()).await
-    }
-
-    async fn reject_question(&self, request_id: &str, _d: Option<&str>) -> crate::error::Result<()> {
-        self.record_question_reply(request_id, vec![vec!["__reject__".to_string()]])
+        let positional = answers
+            .iter()
+            .map(|answer| {
+                answer
+                    .value
+                    .as_ref()
+                    .map_or_else(Vec::new, opencode::types::FormValue::to_strings)
+            })
+            .collect();
+        self.record_question_reply(request_id, positional, answers.to_vec())
             .await
     }
 
-    async fn reply_permission(&self, r: &str, reply: &str, _d: Option<&str>) -> crate::error::Result<()> {
+    async fn reject_question(
+        &self,
+        _session_id: &str,
+        request_id: &str,
+        _d: Option<&str>,
+    ) -> crate::error::Result<()> {
+        self.record_question_reply(request_id, vec![vec!["__reject__".to_string()]], Vec::new())
+            .await
+    }
+
+    async fn reply_permission(
+        &self,
+        session_id: &str,
+        r: &str,
+        reply: &str,
+        _d: Option<&str>,
+    ) -> crate::error::Result<()> {
+        self.reply_permission_sessions
+            .lock()
+            .await
+            .push(session_id.to_string());
         self.reply_permission_calls
             .lock()
             .await

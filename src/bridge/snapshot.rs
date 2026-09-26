@@ -534,14 +534,17 @@ mod tests {
                     question: "继续?".into(),
                     header: "确认".into(),
                     options: vec![],
-                    multiple: None,
+                    kind: crate::opencode::types::FormFieldKind::String,
                     custom: None,
+                    ..Default::default()
                 }],
+                ..Default::default()
             },
             QuestionRequest {
                 id: "q_other".into(),
                 session_id: "ses_sibling".into(),
                 questions: vec![],
+                ..Default::default()
             },
         ]);
         let snap = gather_from_typed_backend(mock).await;

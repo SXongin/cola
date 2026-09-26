@@ -782,7 +782,7 @@ async fn answer_permission(
         "the scripted tool call must be gated as a bash ask: {permission:?}"
     );
     backend
-        .reply_permission(&permission.request_id, "once", Some(directory))
+        .reply_permission(session_id, &permission.request_id, "once", Some(directory))
         .await
         .expect("the permission reply must be accepted");
     permission

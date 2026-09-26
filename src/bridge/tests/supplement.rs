@@ -21,9 +21,11 @@ fn question_fixture(text: &str, header: &str, label: &str) -> crate::opencode::t
         options: vec![QuestionOption {
             label: label.into(),
             description: String::new(),
+            ..Default::default()
         }],
-        multiple: None,
+        kind: crate::opencode::types::FormFieldKind::String,
         custom: None,
+        ..Default::default()
     }
 }
 
@@ -36,6 +38,7 @@ fn question_request(request_id: &str, session_id: &str) -> crate::opencode::type
             question_fixture("选目录", "目录", "/a"),
             question_fixture("选分支", "分支", "main"),
         ],
+        ..Default::default()
     }
 }
 

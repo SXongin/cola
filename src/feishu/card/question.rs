@@ -120,19 +120,17 @@ pub fn question_elements(
     answered: &[Option<Vec<String>>],
     done: &[bool],
 ) -> Vec<serde_json::Value> {
-    // A multi-select question (`multiple`) is NEVER finalized by clicking an
-    // option: clicks toggle labels in its answer set until the user hits the
-    // per-question "确定该题" button. Single-select questions are finalized the
-    // moment an option is clicked.
-    let is_multi = |i: usize| -> bool { questions.get(i).is_some_and(|q| q.multiple == Some(true)) };
+    use crate::opencode::types::FormFieldKind;
+
     let is_done = |i: usize| -> bool { done.get(i).copied().unwrap_or(false) };
+    let selected = |i: usize| -> Option<&Vec<String>> { answered.get(i).and_then(|slot| slot.as_ref()) };
     let mut elements: Vec<serde_json::Value> = Vec::new();
     // Question text comes from the model: sanitize it for the card dialect
     // (one budget for the block; a question rarely carries tables).
     let mut md = super::sanitize::CardMarkdown::new();
 
     for (i, q) in questions.iter().enumerate() {
-        let multi = is_multi(i);
+        let multi = q.is_multi();
         let finalized = is_done(i);
 
         // Per-question heading: number + text + status, option bullets while
@@ -140,17 +138,19 @@ pub fn question_elements(
         // with the controls right below), and the running selection.
         let mut heading = String::new();
         if finalized {
-            heading.push_str(&format!("✅ **{}. {}**", i + 1, q.question));
-        } else {
-            let title = if q.header.is_empty() {
-                q.question.clone()
+            // The finished block keeps the full question text (falling back to
+            // the short title when the field has no description).
+            let label = if q.question.is_empty() {
+                q.title()
             } else {
-                q.header.clone()
+                q.question.as_str()
             };
+            heading.push_str(&format!("✅ **{}. {}**", i + 1, label));
+        } else {
             heading.push_str(&format!(
                 "**{}. {}{}**",
                 i + 1,
-                title,
+                q.title(),
                 if multi { "（可多选）" } else { "" }
             ));
             if !q.header.is_empty() && q.header != q.question {
@@ -163,9 +163,12 @@ pub fn question_elements(
                     heading.push_str(&format!("\n- {} ({})", opt.label, opt.description));
                 }
             }
+            if let Some(url) = &q.url {
+                heading.push_str(&format!("\n🔗 {url}"));
+            }
         }
-        if let Some(Some(labels)) = answered.get(i) {
-            heading.push_str(&format!("\n👉 已选：{}", labels.join("、")));
+        if let Some(values) = selected(i).filter(|values| !values.is_empty()) {
+            heading.push_str(&format!("\n👉 已选：{}", q.display_values(values).join("、")));
         }
         let heading = md.clean(&heading);
         elements.push(json!({ "tag": "markdown", "content": heading }));
@@ -173,179 +176,139 @@ pub fn question_elements(
         if finalized {
             // Answered / confirmed: no controls, just the 已选 line above.
         } else {
-            // Option picker: raw buttons when the set is small; a single-select
-            // with many options collapses into an `overflow` group (the heading
-            // above keeps the full option list visible). Multi-select always
-            // stays on buttons so clicks toggle the running set.
-            if !multi && q.options.len() > MAX_VISIBLE_OPTIONS {
-                let options: Vec<serde_json::Value> = q
-                    .options
-                    .iter()
-                    .map(|opt| {
-                        json!({
-                            "text": { "tag": "plain_text", "content": opt.label },
-                            "value": format!("{}|{}", i, opt.label),
-                        })
-                    })
-                    .collect();
-                elements.push(json!({
-                    "tag": "overflow",
-                    "width": "fill",
-                    "options": options,
-                    "value": {
-                        "action": "question",
-                        "reply": "answer",
-                        "request_id": request_id,
-                        "session_id": session_id,
-                        "directory": directory,
-                    },
-                }));
-            } else {
-                for opt in &q.options {
-                    // Multi-select buttons show their selected state so the user
-                    // can see what's already picked while still toggling.
-                    let selected = multi
-                        && answered
-                            .get(i)
-                            .and_then(|a| a.as_ref())
-                            .is_some_and(|labels| labels.iter().any(|l| l == &opt.label));
+            match q.kind {
+                // An external link is not answerable; acknowledging it is the
+                // only valid answer (the form schema requires the `true`).
+                FormFieldKind::External => {
+                    let mut value = question_value(request_id, session_id, directory, i, "answer");
+                    value["answer"] = json!("true");
                     elements.push(json!({
                         "tag": "button",
-                        "text": {
-                            "tag": "plain_text",
-                            "content": if selected {
-                                format!("✅ {}", opt.label)
-                            } else {
-                                opt.label.clone()
-                            },
-                        },
-                        "type": if selected { "primary" } else { "default" },
-                        "value": {
-                            "action": "question",
-                            "reply": "answer",
-                            "request_id": request_id,
-                            "session_id": session_id,
-                            "directory": directory,
-                            "question_index": i,
-                            "answer": opt.label,
-                        },
-                    }));
-                }
-            }
-
-            // Custom Answers: user-typed entries in the selection, rendered as
-            // selected buttons exactly like a picked option — a click removes
-            // the entry through the same toggle path (`reply: "answer"`). The
-            // button label is display-only (whitespace collapsed, long text
-            // truncated); the value carries the raw answer verbatim.
-            if multi && let Some(Some(labels)) = answered.get(i) {
-                for label in labels {
-                    if q.options.iter().any(|opt| &opt.label == label) {
-                        continue;
-                    }
-                    elements.push(json!({
-                        "tag": "button",
-                        "text": {
-                            "tag": "plain_text",
-                            "content": format!("✅ {}", custom_answer_label(label)),
-                        },
+                        "text": { "tag": "plain_text", "content": "✅ 我已了解" },
                         "type": "primary",
-                        "value": {
-                            "action": "question",
-                            "reply": "answer",
-                            "request_id": request_id,
-                            "session_id": session_id,
-                            "directory": directory,
-                            "question_index": i,
-                            "answer": label,
-                        },
+                        "value": value,
                     }));
                 }
-            }
-
-            // Free-text answer (OpenCode questions allow custom by default). The
-            // typed text arrives in `action.form_value`; ws.rs injects it into
-            // the answer payload. Single-select submits a replacement
-            // (`reply: "answer"`); a multi-select ADDS the typed label to the
-            // toggled set (`reply: "custom"`), so the two never collide. Rendered
-            // for the overflow path too: a many-option single-select still needs
-            // a way to type an answer outside the listed set.
-            if q.custom.unwrap_or(true) {
-                let (reply, name_prefix) = if multi {
-                    ("custom", "submitm")
-                } else {
-                    ("answer", "submit")
-                };
-                let input_name = format!("custom_{}", i);
-                elements.push(json!({
-                    "tag": "form",
-                    "name": format!("form_{}", i),
-                    "elements": [
-                        {
-                            "tag": "input",
-                            "name": input_name,
-                            // Multiline box instead of the default single line:
-                            // the single-line input is a cramped one-row strip
-                            // that types poorly on both PC and mobile. rows:1
-                            // starts it at one line; auto_resize grows it with
-                            // the text (Feishu's docs say PC-only, but mobile
-                            // grows too in practice). Callbacks arrive unchanged
-                            // via `action.form_value`.
-                            "input_type": "multiline_text",
-                            "rows": 1,
-                            "auto_resize": true,
-                            "max_rows": 8,
-                            "placeholder": { "tag": "plain_text", "content": "✍️ 输入自定义答案" },
-                            "max_length": 500,
-                            "width": "fill",
-                        },
-                        {
+                // A boolean finalizes on one click, like a single-select: the
+                // answer value is the JSON boolean the form schema expects.
+                FormFieldKind::Boolean => {
+                    for (label, answer, button_type) in
+                        [("✅ 是", "true", "primary"), ("否", "false", "default")]
+                    {
+                        let mut value = question_value(request_id, session_id, directory, i, "answer");
+                        value["answer"] = json!(answer);
+                        elements.push(json!({
                             "tag": "button",
-                            "text": { "tag": "plain_text", "content": "✍️ 自定义" },
-                            "type": "default",
-                            "form_action_type": "submit",
-                            // Form submit callbacks don't always carry the button
-                            // `value`, so the routing payload is ALSO encoded in the
-                            // `name` ("submit|req|ses|qi", or "submitm|…" for a
-                            // multi-select custom addition) — ws.rs rebuilds the
-                            // value from it when `action.value` is absent. The
-                            // directory is deliberately NOT in the name: Feishu
-                            // caps `name` at 100 chars and `submit|req|ses|qi|dir`
-                            // overflows on deep paths, killing the whole card update
-                            // (ErrCode 11310 "name exceed the default maximum 100").
-                            // The handler re-resolves the directory from the store /
-                            // request flow when the fallback fires.
-                            "name": format!("{}|{}|{}|{}", name_prefix, request_id, session_id, i),
-                            "value": {
-                                "action": "question",
-                                "reply": reply,
-                                "request_id": request_id,
-                                "session_id": session_id,
-                                "directory": directory,
-                                "question_index": i,
-                            },
-                        },
-                    ],
-                }));
-            }
+                            "text": { "tag": "plain_text", "content": label },
+                            "type": button_type,
+                            "value": value,
+                        }));
+                    }
+                }
+                // A numeric field has no options: a typed input plus its
+                // submit is its only control, and the text is parsed into the
+                // field's number at reply time.
+                FormFieldKind::Number | FormFieldKind::Integer => {
+                    elements.push(number_answer_form(request_id, session_id, directory, i));
+                }
+                // String / Multiselect: an option picker when the field
+                // declares options (the question tool always does) plus the
+                // custom-answer input; a String with none is just the input.
+                FormFieldKind::String | FormFieldKind::Multiselect => {
+                    if !multi && q.options.len() > MAX_VISIBLE_OPTIONS {
+                        let options: Vec<serde_json::Value> = q
+                            .options
+                            .iter()
+                            .map(|opt| {
+                                json!({
+                                    "text": { "tag": "plain_text", "content": opt.label },
+                                    "value": format!("{}|{}", i, opt.answer_value()),
+                                })
+                            })
+                            .collect();
+                        elements.push(json!({
+                            "tag": "overflow",
+                            "width": "fill",
+                            "options": options,
+                            "value": question_value(request_id, session_id, directory, i, "answer"),
+                        }));
+                    } else {
+                        for opt in &q.options {
+                            // Multi-select buttons show their selected state so
+                            // the user can see what's already picked while
+                            // still toggling. Selection matches the submitted
+                            // VALUE; the label is display only.
+                            let is_selected = multi
+                                && selected(i).is_some_and(|values| {
+                                    values.iter().any(|value| value == opt.answer_value())
+                                });
+                            let mut value = question_value(request_id, session_id, directory, i, "answer");
+                            value["answer"] = json!(opt.answer_value());
+                            elements.push(json!({
+                                "tag": "button",
+                                "text": {
+                                    "tag": "plain_text",
+                                    "content": if is_selected {
+                                        format!("✅ {}", opt.label)
+                                    } else {
+                                        opt.label.clone()
+                                    },
+                                },
+                                "type": if is_selected { "primary" } else { "default" },
+                                "value": value,
+                            }));
+                        }
+                    }
 
-            // Multi-select: the commit action sits right under its own options
-            // instead of a far-away bottom submit. Clicking locks the toggled
-            // set (empty allowed — "不选") and collapses the question to 已选.
-            if multi {
-                elements.push(json!({
-                    "tag": "button",
-                    "text": { "tag": "plain_text", "content": "✅ 确定该题" },
-                    "type": "primary",
-                    "value": {
-                        "action": "question",
-                        "reply": "confirm",
-                        "request_id": request_id,
-                        "session_id": session_id,
-                        "directory": directory,
-                        "question_index": i,
-                    },
-                }));
+                    // Custom Answers: user-typed entries in the selection,
+                    // rendered as selected buttons exactly like a picked option
+                    // — a click removes the entry through the same toggle path
+                    // (`reply: "answer"`). The button label is display-only
+                    // (whitespace collapsed, long text truncated); the value
+                    // carries the raw answer verbatim.
+                    if multi && let Some(values) = selected(i) {
+                        for value in values {
+                            if q.options.iter().any(|opt| opt.answer_value() == value) {
+                                continue;
+                            }
+                            let mut payload = question_value(request_id, session_id, directory, i, "answer");
+                            payload["answer"] = json!(value);
+                            elements.push(json!({
+                                "tag": "button",
+                                "text": {
+                                    "tag": "plain_text",
+                                    "content": format!("✅ {}", custom_answer_label(value)),
+                                },
+                                "type": "primary",
+                                "value": payload,
+                            }));
+                        }
+                    }
+
+                    // Free-text answer (V1 questions allow custom by default).
+                    // The typed text arrives in `action.form_value`; ws.rs
+                    // injects it into the answer payload. Single-select submits
+                    // a replacement (`reply: "answer"`); a multi-select ADDS
+                    // the typed label to the toggled set (`reply: "custom"`),
+                    // so the two never collide. A String field with no options
+                    // always renders it — otherwise the field has no control.
+                    if q.custom_allowed() || (q.kind == FormFieldKind::String && q.options.is_empty()) {
+                        elements.push(custom_answer_form(request_id, session_id, directory, i, multi));
+                    }
+
+                    // Multi-select: the commit action sits right under its own
+                    // options instead of a far-away bottom submit. Clicking
+                    // locks the toggled set (empty allowed — "不选") and
+                    // collapses the question to 已选.
+                    if multi {
+                        elements.push(json!({
+                            "tag": "button",
+                            "text": { "tag": "plain_text", "content": "✅ 确定该题" },
+                            "type": "primary",
+                            "value": question_value(request_id, session_id, directory, i, "confirm"),
+                        }));
+                    }
+                }
             }
         }
 
@@ -389,6 +352,124 @@ pub fn question_elements(
     elements
 }
 
+/// The routing payload every per-question control carries: which request, which
+/// session (V2's session-scoped reply), the owning directory (ADR-0010) and
+/// which field the click answers.
+fn question_value(
+    request_id: &str,
+    session_id: &str,
+    directory: &str,
+    index: usize,
+    reply: &str,
+) -> serde_json::Value {
+    json!({
+        "action": "question",
+        "reply": reply,
+        "request_id": request_id,
+        "session_id": session_id,
+        "directory": directory,
+        "question_index": index,
+    })
+}
+
+/// The submit action's `name`: form submit callbacks do not always carry the
+/// button `value`, so the routing payload is ALSO encoded here ("submit|req|
+/// ses|qi", or "submitm|…" for a multi-select custom addition) and ws.rs
+/// rebuilds the value from it when `action.value` is absent. The directory is
+/// deliberately NOT in the name: Feishu caps `name` at 100 chars and
+/// `submit|req|ses|qi|dir` overflows on deep paths, killing the whole card
+/// update (ErrCode 11310 "name exceed the default maximum 100"). The handler
+/// re-resolves the directory from the store / request flow when the fallback
+/// fires.
+fn submit_name(name_prefix: &str, request_id: &str, session_id: &str, index: usize) -> String {
+    format!("{name_prefix}|{request_id}|{session_id}|{index}")
+}
+
+/// A custom (free-text) answer input plus its submit button, one per field.
+/// Single-select submits a replacement; a multi-select ADDS the typed label to
+/// the toggled set. The typed text arrives in `action.form_value` and is
+/// injected by ws.rs.
+fn custom_answer_form(
+    request_id: &str,
+    session_id: &str,
+    directory: &str,
+    index: usize,
+    multi: bool,
+) -> serde_json::Value {
+    let (reply, name_prefix) = if multi {
+        ("custom", "submitm")
+    } else {
+        ("answer", "submit")
+    };
+    let mut value = question_value(request_id, session_id, directory, index, reply);
+    value["question_index"] = json!(index);
+    json!({
+        "tag": "form",
+        "name": format!("form_{}", index),
+        "elements": [
+            {
+                "tag": "input",
+                "name": format!("custom_{}", index),
+                // Multiline box instead of the default single line: the
+                // single-line input is a cramped one-row strip that types
+                // poorly on both PC and mobile. rows:1 starts it at one line;
+                // auto_resize grows it with the text (Feishu's docs say
+                // PC-only, but mobile grows too in practice). Callbacks arrive
+                // unchanged via `action.form_value`.
+                "input_type": "multiline_text",
+                "rows": 1,
+                "auto_resize": true,
+                "max_rows": 8,
+                "placeholder": { "tag": "plain_text", "content": "✍️ 输入自定义答案" },
+                "max_length": 500,
+                "width": "fill",
+            },
+            {
+                "tag": "button",
+                "text": { "tag": "plain_text", "content": "✍️ 自定义" },
+                "type": "default",
+                "form_action_type": "submit",
+                "name": submit_name(name_prefix, request_id, session_id, index),
+                "value": value,
+            },
+        ],
+    })
+}
+
+/// A numeric field's answer form: one single-line input plus its submit. The
+/// typed text is parsed into the field's number at reply time; a value that
+/// cannot parse is left unanswered rather than posted as an invalid answer.
+fn number_answer_form(
+    request_id: &str,
+    session_id: &str,
+    directory: &str,
+    index: usize,
+) -> serde_json::Value {
+    let value = question_value(request_id, session_id, directory, index, "answer");
+    json!({
+        "tag": "form",
+        "name": format!("form_{}", index),
+        "elements": [
+            {
+                "tag": "input",
+                "name": format!("custom_{}", index),
+                "input_type": "text",
+                "placeholder": { "tag": "plain_text", "content": "✍️ 输入数字" },
+                "max_length": 40,
+                "width": "fill",
+            },
+            {
+                "tag": "button",
+                "text": { "tag": "plain_text", "content": "✅ 确定" },
+                "type": "primary",
+                "form_action_type": "submit",
+                "name": submit_name("submit", request_id, session_id, index),
+                "value": value,
+            },
+        ],
+    })
+}
+
 /// Display label for a Custom Answer button: whitespace (newlines included)
 /// collapses to single spaces and long text truncates with an ellipsis. The
 /// stored answer and the callback value keep the raw text.
@@ -404,8 +485,10 @@ fn custom_answer_label(raw: &str) -> String {
 }
 
 /// Build the interactive question card (JSON 2.0): a header plus the question
-/// body elements from `question_elements`.
+/// body elements from `question_elements`. V2 forms carry their own title; V1
+/// questions have none and get the generic header.
 pub fn build_question_card(
+    title: &str,
     request_id: &str,
     session_id: &str,
     questions: &[crate::opencode::types::QuestionInfo],
@@ -414,7 +497,12 @@ pub fn build_question_card(
     done: &[bool],
 ) -> serde_json::Value {
     let elements = question_elements(request_id, session_id, questions, directory, answered, done);
-    card_shell("❓ AI 想问你", "blue", elements)
+    let header = if title.is_empty() {
+        "❓ AI 想问你".to_string()
+    } else {
+        format!("❓ {title}")
+    };
+    card_shell(&header, "blue", elements)
 }
 
 #[cfg(test)]
@@ -430,16 +518,27 @@ mod tests {
                 crate::opencode::types::QuestionOption {
                     label: "/a".into(),
                     description: "dir a".into(),
+                    ..Default::default()
                 },
                 crate::opencode::types::QuestionOption {
                     label: "/b".into(),
                     description: String::new(),
+                    ..Default::default()
                 },
             ],
-            multiple: None,
+            kind: crate::opencode::types::FormFieldKind::String,
             custom: None,
+            ..Default::default()
         }];
-        let card = build_question_card("que_1", "ses_1", &questions, "/tmp/proj/lib", &[None], &[false]);
+        let card = build_question_card(
+            "",
+            "que_1",
+            "ses_1",
+            &questions,
+            "/tmp/proj/lib",
+            &[None],
+            &[false],
+        );
         let text = card.to_string();
         assert!(
             text.contains("选择要在哪个目录继续"),
@@ -474,20 +573,23 @@ mod tests {
             .map(|i| crate::opencode::types::QuestionOption {
                 label: format!("/a{}", i),
                 description: String::new(),
+                ..Default::default()
             })
             .collect();
         crate::opencode::types::QuestionInfo {
             question: "选一个目录".into(),
             header: "目录".into(),
             options,
-            multiple: None,
+            kind: crate::opencode::types::FormFieldKind::String,
             custom: None,
+            ..Default::default()
         }
     }
 
     #[test]
     fn question_card_many_options_collapse_into_overflow() {
         let card = build_question_card(
+            "",
             "que_1",
             "ses_1",
             &[many_option_question()],
@@ -518,6 +620,7 @@ mod tests {
     #[test]
     fn question_card_overflow_path_keeps_custom_answer_form() {
         let card = build_question_card(
+            "",
             "que_1",
             "ses_1",
             &[many_option_question()],
@@ -538,7 +641,7 @@ mod tests {
     fn question_card_overflow_custom_disabled_has_no_form() {
         let mut q = many_option_question();
         q.custom = Some(false);
-        let card = build_question_card("que_1", "ses_1", &[q], "/tmp/proj/lib", &[None], &[false]);
+        let card = build_question_card("", "que_1", "ses_1", &[q], "/tmp/proj/lib", &[None], &[false]);
         let elements = card["body"]["elements"].as_array().unwrap();
         assert!(
             elements.iter().any(|e| e["tag"] == "overflow"),
@@ -559,11 +662,21 @@ mod tests {
             options: vec![crate::opencode::types::QuestionOption {
                 label: "/a".into(),
                 description: String::new(),
+                ..Default::default()
             }],
-            multiple: None,
-            custom: None, // default: custom answers allowed
+            kind: crate::opencode::types::FormFieldKind::String,
+            custom: None, // default: custom answers allowed,
+            ..Default::default()
         }];
-        let card = build_question_card("que_1", "ses_1", &questions, "/tmp/proj/lib", &[None], &[false]);
+        let card = build_question_card(
+            "",
+            "que_1",
+            "ses_1",
+            &questions,
+            "/tmp/proj/lib",
+            &[None],
+            &[false],
+        );
         let elements = card["body"]["elements"].as_array().unwrap();
         let form = elements
             .iter()
@@ -590,11 +703,21 @@ mod tests {
             options: vec![crate::opencode::types::QuestionOption {
                 label: "/a".into(),
                 description: String::new(),
+                ..Default::default()
             }],
-            multiple: None,
+            kind: crate::opencode::types::FormFieldKind::String,
             custom: Some(false),
+            ..Default::default()
         }];
-        let card = build_question_card("que_1", "ses_1", &questions, "/tmp/proj/lib", &[None], &[false]);
+        let card = build_question_card(
+            "",
+            "que_1",
+            "ses_1",
+            &questions,
+            "/tmp/proj/lib",
+            &[None],
+            &[false],
+        );
         let elements = card["body"]["elements"].as_array().unwrap();
         assert!(
             elements.iter().all(|e| e["tag"] != "form"),
@@ -611,11 +734,21 @@ mod tests {
             options: vec![crate::opencode::types::QuestionOption {
                 label: "苹果".into(),
                 description: String::new(),
+                ..Default::default()
             }],
-            multiple: Some(true),
+            kind: crate::opencode::types::FormFieldKind::Multiselect,
             custom: None,
+            ..Default::default()
         }];
-        let card = build_question_card("que_1", "ses_1", &questions, "/tmp/proj/lib", &[None], &[false]);
+        let card = build_question_card(
+            "",
+            "que_1",
+            "ses_1",
+            &questions,
+            "/tmp/proj/lib",
+            &[None],
+            &[false],
+        );
         let elements = card["body"]["elements"].as_array().unwrap();
         // The per-question 确定该题 button commits the toggled selection.
         let confirm = elements
@@ -650,14 +783,24 @@ mod tests {
             options: vec![crate::opencode::types::QuestionOption {
                 label: "苹果".into(),
                 description: String::new(),
+                ..Default::default()
             }],
-            multiple: Some(true),
+            kind: crate::opencode::types::FormFieldKind::Multiselect,
             custom: None,
+            ..Default::default()
         }];
         // The selection holds an option and a multiline Custom Answer; the
         // custom label is not an option label, so it gets its own chip.
         let answered = vec![Some(vec!["苹果".to_string(), "自定\n答案".to_string()])];
-        let card = build_question_card("que_1", "ses_1", &questions, "/tmp/proj/lib", &answered, &[false]);
+        let card = build_question_card(
+            "",
+            "que_1",
+            "ses_1",
+            &questions,
+            "/tmp/proj/lib",
+            &answered,
+            &[false],
+        );
         let elements = card["body"]["elements"].as_array().unwrap();
         let chip = elements
             .iter()
@@ -704,12 +847,22 @@ mod tests {
             options: vec![crate::opencode::types::QuestionOption {
                 label: "/a".into(),
                 description: String::new(),
+                ..Default::default()
             }],
-            multiple: None,
+            kind: crate::opencode::types::FormFieldKind::String,
             custom: None,
+            ..Default::default()
         }];
         let answered = vec![Some(vec!["自定".to_string()])];
-        let card = build_question_card("que_1", "ses_1", &questions, "/tmp/proj/lib", &answered, &[false]);
+        let card = build_question_card(
+            "",
+            "que_1",
+            "ses_1",
+            &questions,
+            "/tmp/proj/lib",
+            &answered,
+            &[false],
+        );
         let elements = card["body"]["elements"].as_array().unwrap();
         assert!(
             elements
@@ -728,12 +881,15 @@ mod tests {
             options: vec![crate::opencode::types::QuestionOption {
                 label: "苹果".into(),
                 description: String::new(),
+                ..Default::default()
             }],
-            multiple: Some(true),
+            kind: crate::opencode::types::FormFieldKind::Multiselect,
             custom: None,
+            ..Default::default()
         }];
         // Confirmed (done) multi-select: no option buttons, no confirm, no form.
         let card = build_question_card(
+            "",
             "que_1",
             "ses_1",
             &questions,
@@ -768,12 +924,19 @@ mod tests {
             options: vec![crate::opencode::types::QuestionOption {
                 label: "选项".into(),
                 description: String::new(),
+                ..Default::default()
             }],
-            multiple: if multi { Some(true) } else { None },
+            kind: if multi {
+                crate::opencode::types::FormFieldKind::Multiselect
+            } else {
+                crate::opencode::types::FormFieldKind::String
+            },
             custom: None,
+            ..Default::default()
         };
         let questions = vec![mk("选目录", "目录", false), mk("选水果", "水果", true)];
         let card = build_question_card(
+            "",
             "que_1",
             "ses_1",
             &questions,
@@ -858,5 +1021,146 @@ mod tests {
         let autoaccept = values.iter().find(|v| v["reply"] == "autoaccept").unwrap();
         assert_eq!(autoaccept["session_id"], "ses_abc");
         assert_eq!(autoaccept["request_id"], "per_123");
+    }
+
+    /// A V2 form's typed fields render as their own controls: a string field's
+    /// options show the display label but submit the option value; a boolean
+    /// gets 是/否 buttons whose values are JSON booleans; a number gets a typed
+    /// input form; an external field shows its link and an acknowledgement
+    /// button.
+    #[test]
+    fn form_card_renders_typed_fields() {
+        use crate::opencode::types::{FormFieldKind, QuestionInfo, QuestionOption};
+        let string_field = QuestionInfo {
+            key: "q0".into(),
+            question: "选哪个目录？".into(),
+            header: "目录".into(),
+            kind: FormFieldKind::String,
+            options: vec![QuestionOption {
+                value: "/a".into(),
+                label: "目录 A".into(),
+                description: "第一个".into(),
+            }],
+            custom: Some(false),
+            required: true,
+            url: None,
+        };
+        let boolean = QuestionInfo {
+            key: "q1".into(),
+            question: "确定吗".into(),
+            header: "确认".into(),
+            kind: FormFieldKind::Boolean,
+            ..Default::default()
+        };
+        let integer = QuestionInfo {
+            key: "q2".into(),
+            question: "几个".into(),
+            header: "数量".into(),
+            kind: FormFieldKind::Integer,
+            ..Default::default()
+        };
+        let external = QuestionInfo {
+            key: "q3".into(),
+            question: "打开链接".into(),
+            header: "链接".into(),
+            kind: FormFieldKind::External,
+            url: Some("https://example.com/x".into()),
+            ..Default::default()
+        };
+        let card = build_question_card(
+            "Questions",
+            "frm_1",
+            "ses_1",
+            &[string_field, boolean, integer, external],
+            "/tmp/proj",
+            &[None, None, None, None],
+            &[false, false, false, false],
+        );
+        let text = card.to_string();
+        assert_eq!(card["header"]["title"]["content"], "❓ Questions");
+        assert!(
+            text.contains("https://example.com/x"),
+            "external link missing: {text}"
+        );
+
+        // The option button displays the LABEL and submits the VALUE.
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let option = elements
+            .iter()
+            .find(|e| e["tag"] == "button" && e["text"]["content"] == "目录 A")
+            .expect("option button missing");
+        assert_eq!(option["value"]["answer"], "/a");
+
+        // Boolean: 是 / 否 with boolean answer values.
+        let yes = elements
+            .iter()
+            .find(|e| e["tag"] == "button" && e["text"]["content"] == "✅ 是")
+            .expect("boolean 是 button missing");
+        assert_eq!(yes["value"]["answer"], "true");
+        assert_eq!(yes["value"]["question_index"], 1);
+        let no = elements
+            .iter()
+            .find(|e| e["tag"] == "button" && e["text"]["content"] == "否")
+            .expect("boolean 否 button missing");
+        assert_eq!(no["value"]["answer"], "false");
+
+        // Number: an input form whose submit routes as an answer.
+        let number_form = elements
+            .iter()
+            .find(|e| e["tag"] == "form" && e["value"].is_null())
+            .expect("numeric form missing");
+        assert!(
+            number_form.to_string().contains("输入数字"),
+            "numeric placeholder missing: {number_form}"
+        );
+        let number_button = &number_form["elements"][1];
+        assert_eq!(number_button["value"]["question_index"], 2);
+        assert_eq!(number_button["value"]["reply"], "answer");
+
+        // External: an acknowledgement button answering `true`.
+        let ack = elements
+            .iter()
+            .find(|e| e["tag"] == "button" && e["text"]["content"] == "✅ 我已了解")
+            .expect("external ack missing");
+        assert_eq!(ack["value"]["answer"], "true");
+    }
+
+    /// A submitted answer VALUE renders as its option's display LABEL while
+    /// the payload keeps the raw value; a custom (non-option) value renders
+    /// collapsed but is carried verbatim in the click payload.
+    #[test]
+    fn form_card_maps_values_to_labels_and_keeps_custom_verbatim() {
+        use crate::opencode::types::{FormFieldKind, QuestionInfo, QuestionOption};
+        let field = QuestionInfo {
+            key: "q0".into(),
+            question: "选水果".into(),
+            header: "水果".into(),
+            kind: FormFieldKind::Multiselect,
+            options: vec![QuestionOption {
+                value: "apple".into(),
+                label: "苹果".into(),
+                description: String::new(),
+            }],
+            ..Default::default()
+        };
+        let answered = vec![Some(vec!["apple".to_string(), "自定\n答案".to_string()])];
+        let card = build_question_card("", "frm_1", "ses_1", &[field], "/tmp/proj", &answered, &[false]);
+        let text = card.to_string();
+        assert!(
+            text.contains("已选：苹果、自定 答案"),
+            "display labels must replace submitted values: {text}"
+        );
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let custom = elements
+            .iter()
+            .find(|e| e["tag"] == "button" && e["value"]["answer"] == "自定\n答案")
+            .expect("custom chip must carry the raw value");
+        assert_eq!(custom["text"]["content"], "✅ 自定 答案");
+        // Clicking the option chip toggles off the option VALUE, not the label.
+        let option = elements
+            .iter()
+            .find(|e| e["tag"] == "button" && e["text"]["content"] == "✅ 苹果")
+            .expect("selected option button missing");
+        assert_eq!(option["value"]["answer"], "apple");
     }
 }

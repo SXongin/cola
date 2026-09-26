@@ -37,10 +37,13 @@ fn question(id: &str, session_id: &str) -> opencode::types::QuestionRequest {
             options: vec![opencode::types::QuestionOption {
                 label: "继续".into(),
                 description: String::new(),
+                ..Default::default()
             }],
-            multiple: None,
+            kind: crate::opencode::types::FormFieldKind::String,
             custom: None,
+            ..Default::default()
         }],
+        ..Default::default()
     }
 }
 

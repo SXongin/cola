@@ -38,8 +38,8 @@ use crate::error::Result;
 use async_trait::async_trait;
 use client::OpenCodeBackend;
 use types::{
-    AgentInfo, CreateSessionInput, ImageInput, ModelInfo, PermissionRequest, PromptResponse, ProviderModels,
-    QuestionRequest, Session, SessionInfo, SessionListInfo, SessionStatus,
+    AgentInfo, CreateSessionInput, FormAnswer, ImageInput, ModelInfo, PermissionRequest, PromptResponse,
+    ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionStatus,
 };
 
 #[async_trait]
@@ -90,8 +90,14 @@ impl Backend for OpenCodeBackend {
         OpenCodeBackend::prompt_async(self, session_id, text, images, model, variant, agent, message_id).await
     }
 
-    async fn reply_permission(&self, request_id: &str, reply: &str, directory: Option<&str>) -> Result<()> {
-        OpenCodeBackend::reply_permission(self, request_id, reply, directory).await
+    async fn reply_permission(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        reply: &str,
+        directory: Option<&str>,
+    ) -> Result<()> {
+        OpenCodeBackend::reply_permission(self, session_id, request_id, reply, directory).await
     }
 
     async fn list_permissions(&self, directory: Option<&str>) -> Result<Vec<PermissionRequest>> {
@@ -104,15 +110,21 @@ impl Backend for OpenCodeBackend {
 
     async fn reply_question(
         &self,
+        session_id: &str,
         request_id: &str,
-        answers: &[Vec<String>],
+        answers: &[FormAnswer],
         directory: Option<&str>,
     ) -> Result<()> {
-        OpenCodeBackend::reply_question(self, request_id, answers, directory).await
+        OpenCodeBackend::reply_question(self, session_id, request_id, answers, directory).await
     }
 
-    async fn reject_question(&self, request_id: &str, directory: Option<&str>) -> Result<()> {
-        OpenCodeBackend::reject_question(self, request_id, directory).await
+    async fn reject_question(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        directory: Option<&str>,
+    ) -> Result<()> {
+        OpenCodeBackend::reject_question(self, session_id, request_id, directory).await
     }
 
     async fn transcript(&self, session_id: &str) -> Result<SessionTranscript> {

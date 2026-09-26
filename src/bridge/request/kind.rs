@@ -283,7 +283,9 @@ impl RequestKind for PermissionKind {
         let PendingRequest::Permission(p) = req else {
             return Ok(());
         };
-        backend.reply_permission(&p.request_id, "reject").await
+        backend
+            .reply_permission(p.session_id.as_deref().unwrap_or(""), &p.request_id, "reject")
+            .await
     }
 
     async fn prepare(
@@ -308,7 +310,7 @@ impl RequestKind for PermissionKind {
             .backend
             .clone()
             .for_directory(dir)
-            .reply_permission(&p.request_id, "once")
+            .reply_permission(&sid, &p.request_id, "once")
             .await
         {
             Ok(()) => tracing::info!(
@@ -468,7 +470,7 @@ impl RequestKind for PermissionKind {
                     .backend
                     .clone()
                     .for_directory(dir)
-                    .reply_permission(req_id, reply)
+                    .reply_permission(session_id, req_id, reply)
                     .await
             }
             None => Err(crate::error::BridgeError::OpenCode(
@@ -653,7 +655,7 @@ pub(crate) async fn approve_pending_for_session(
         match backend
             .clone()
             .for_directory(directory)
-            .reply_permission(&p.request_id, "once")
+            .reply_permission(&sid, &p.request_id, "once")
             .await
         {
             Ok(()) => {
@@ -724,8 +726,9 @@ fn permission_receipt(target: &str, reply: &str) -> String {
 /// The Interaction Receipt for a resolved question:
 /// `✅ 已回答：目录 /a、分支 main` — each question's header (or a clipped
 /// question text) with the answers chosen for it; a skipped slot reads
-/// 未作答. `answers[i]` is the selection submitted for question `i`.
-fn question_receipt(questions: &[opencode::types::QuestionInfo], answers: &[Vec<String>]) -> String {
+/// 未作答. `answers[i]` is the finalized selection for field `i` (`None` =
+/// never answered); option values render as their display labels.
+fn question_receipt(questions: &[opencode::types::QuestionInfo], answers: &[Option<Vec<String>>]) -> String {
     let parts: Vec<String> = questions
         .iter()
         .enumerate()
@@ -735,8 +738,12 @@ fn question_receipt(questions: &[opencode::types::QuestionInfo], answers: &[Vec<
             } else {
                 truncate(&qi.header, 24)
             };
-            match answers.get(i).filter(|a| !a.is_empty()) {
-                Some(a) => format!("{label} {}", a.join("、")),
+            match answers
+                .get(i)
+                .and_then(|slot| slot.as_ref())
+                .filter(|a| !a.is_empty())
+            {
+                Some(values) => format!("{label} {}", qi.display_values(values).join("、")),
                 None => format!("{label} （未作答）"),
             }
         })
@@ -814,7 +821,7 @@ impl RequestKind for QuestionKind {
         let PendingRequest::Question(q) = req else {
             return Ok(());
         };
-        backend.reject_question(&q.id).await?;
+        backend.reject_question(&q.session_id, &q.id).await?;
         // The reply landed: drop the in-flight state like a reject click does,
         // so nothing serves stale answers.
         flow.remove_question(&q.id).await;
@@ -930,6 +937,7 @@ impl RequestKind for QuestionKind {
             return serde_json::json!({});
         };
         crate::feishu::card::question::build_question_card(
+            &q.title,
             &q.id,
             &q.session_id,
             &q.questions,
@@ -1113,19 +1121,27 @@ impl RequestKind for QuestionKind {
                     }
                     // The claim does not pin the state: re-validate so a sweep
                     // racing the claim cannot submit an empty snapshot.
-                    let Some((questions, answers)) = flow.question_snapshot(req_id).await else {
+                    let Some((questions, slots)) = flow.question_snapshot(req_id).await else {
                         return Some(
                             flow.missing_after_claim(&handles.requests, req_id, directory, inline)
                                 .await,
                         );
                     };
+                    let answers = opencode::types::build_form_answers(&questions, &slots);
                     if let Some(r) = settle_question_reply(
                         flow,
                         &handles.cards,
                         &handles.requests,
                         req_id,
                         self.label(),
-                        reply_question_scoped(&handles.backend, req_id, Some(&answers), directory).await,
+                        reply_question_scoped(
+                            &handles.backend,
+                            session_id,
+                            req_id,
+                            Some(&answers),
+                            directory,
+                        )
+                        .await,
                         inline,
                         host,
                         session_id,
@@ -1149,10 +1165,10 @@ impl RequestKind for QuestionKind {
                         session_id,
                         Origin::Click { clicked },
                         &[req_id.to_string()],
-                        Residue::PerBlock(&|_| question_receipt(&questions, &answers)),
+                        Residue::PerBlock(&|_| question_receipt(&questions, &slots)),
                     )
                     .await;
-                    let mut r = result_card("✅ 已回答", "green", &qa_completion_body(&questions, &answers));
+                    let mut r = result_card("✅ 已回答", "green", &qa_completion_body(&questions, &slots));
                     r.toast = Some("已回答".to_string());
                     settle_ack(&handles.cards, host, session_id, inline, cached, &mut r).await;
                     // Re-served verbatim to a losing double-click.
@@ -1201,6 +1217,7 @@ impl RequestKind for QuestionKind {
                         return Some(flow.missing_question_result(directory, inline).await);
                     };
                     let card = crate::feishu::card::question::build_question_card(
+                        &req.title,
                         req_id,
                         &req.session_id,
                         &req.questions,
@@ -1242,19 +1259,21 @@ impl RequestKind for QuestionKind {
                 }
                 // The claim does not pin the state: re-validate so a sweep
                 // racing the claim cannot turn this into a blind reply.
-                let Some((questions, answers)) = flow.question_snapshot(req_id).await else {
+                let Some((questions, slots)) = flow.question_snapshot(req_id).await else {
                     return Some(
                         flow.missing_after_claim(&handles.requests, req_id, directory, inline)
                             .await,
                     );
                 };
+                let answers = opencode::types::build_form_answers(&questions, &slots);
                 if let Some(r) = settle_question_reply(
                     flow,
                     &handles.cards,
                     &handles.requests,
                     req_id,
                     self.label(),
-                    reply_question_scoped(&handles.backend, req_id, Some(&answers), directory).await,
+                    reply_question_scoped(&handles.backend, session_id, req_id, Some(&answers), directory)
+                        .await,
                     inline,
                     host,
                     session_id,
@@ -1278,10 +1297,10 @@ impl RequestKind for QuestionKind {
                     session_id,
                     Origin::Click { clicked },
                     &[req_id.to_string()],
-                    Residue::PerBlock(&|_| question_receipt(&questions, &answers)),
+                    Residue::PerBlock(&|_| question_receipt(&questions, &slots)),
                 )
                 .await;
-                let mut r = result_card("✅ 已回答", "green", &qa_completion_body(&questions, &answers));
+                let mut r = result_card("✅ 已回答", "green", &qa_completion_body(&questions, &slots));
                 r.toast = Some("已提交".to_string());
                 settle_ack(&handles.cards, host, session_id, inline, cached, &mut r).await;
                 // Re-served verbatim to a losing double-click.
@@ -1329,7 +1348,7 @@ impl RequestKind for QuestionKind {
                     &handles.requests,
                     req_id,
                     self.label(),
-                    reply_question_scoped(&handles.backend, req_id, None, directory).await,
+                    reply_question_scoped(&handles.backend, session_id, req_id, None, directory).await,
                     inline,
                     host,
                     session_id,
@@ -1426,13 +1445,16 @@ async fn settle_question_reply(
     }
 }
 
-/// Route a question reply/reject to the instance owning the session. The card
-/// carries the owning directory (ADR-0010); without it the reply can't be
-/// routed, so surface the failure instead of guessing at the server cwd instance.
+/// Route a question reply/cancel to the instance owning the session. The card
+/// carries the owning directory (ADR-0010) and the form's session id (V2's
+/// session-scoped reply routes); without the directory the reply can't be
+/// routed, so surface the failure instead of guessing at the server cwd
+/// instance.
 async fn reply_question_scoped(
     backend: &Arc<dyn crate::backend::Backend>,
+    session_id: &str,
     req_id: &str,
-    answers: Option<&[Vec<String>]>,
+    answers: Option<&[opencode::types::FormAnswer]>,
     directory: Option<&str>,
 ) -> crate::error::Result<()> {
     let Some(dir) = directory else {
@@ -1442,8 +1464,8 @@ async fn reply_question_scoped(
     };
     let backend = backend.clone().for_directory(dir);
     match answers {
-        Some(a) => backend.reply_question(req_id, a).await,
-        None => backend.reject_question(req_id).await,
+        Some(answers) => backend.reply_question(session_id, req_id, answers).await,
+        None => backend.reject_question(session_id, req_id).await,
     }
 }
 

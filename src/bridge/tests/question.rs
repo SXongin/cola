@@ -11,10 +11,13 @@ fn question_request(id: &str) -> opencode::types::QuestionRequest {
             options: vec![opencode::types::QuestionOption {
                 label: "/a".into(),
                 description: String::new(),
+                ..Default::default()
             }],
-            multiple: None,
+            kind: crate::opencode::types::FormFieldKind::String,
             custom: None,
+            ..Default::default()
         }],
+        ..Default::default()
     }
 }
 
@@ -55,10 +58,13 @@ async fn question_poller_recovers_when_a_list_call_hangs() {
             options: vec![opencode::types::QuestionOption {
                 label: "继续".into(),
                 description: String::new(),
+                ..Default::default()
             }],
-            multiple: None,
+            kind: crate::opencode::types::FormFieldKind::String,
             custom: None,
+            ..Default::default()
         }],
+        ..Default::default()
     }]);
     // The first list call hangs forever, like a request in flight when the
     // server was SIGTERM'd; later calls serve normally.
@@ -127,15 +133,19 @@ async fn question_card_action_posts_answer_back() {
                         opencode::types::QuestionOption {
                             label: "/a".into(),
                             description: String::new(),
+                            ..Default::default()
                         },
                         opencode::types::QuestionOption {
                             label: "/b".into(),
                             description: String::new(),
+                            ..Default::default()
                         },
                     ],
-                    multiple: None,
+                    kind: crate::opencode::types::FormFieldKind::String,
                     custom: None,
+                    ..Default::default()
                 }],
+                ..Default::default()
             },
             "/work",
         )
@@ -184,6 +194,104 @@ async fn question_card_action_posts_answer_back() {
     assert_eq!(calls[0].1, vec![vec!["/a".to_string()]]);
 }
 
+/// A V2 form submits KEYED answers: each field's key travels with its value, a
+/// multi-select submits its option VALUES (not display labels), and a typed
+/// custom answer is kept verbatim (newlines included).
+#[tokio::test]
+async fn form_reply_submits_keyed_answers_and_keeps_custom_verbatim() {
+    use crate::opencode::types::{FormAnswer, FormValue, QuestionInfo, QuestionOption};
+
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let keyed = backend.reply_question_keyed_calls.clone();
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
+
+    let field = |key: &str, kind| QuestionInfo {
+        key: key.into(),
+        question: format!("{key}?"),
+        header: key.into(),
+        kind,
+        options: vec![QuestionOption {
+            value: "v-x".into(),
+            label: "显示 X".into(),
+            description: String::new(),
+        }],
+        custom: None,
+        ..Default::default()
+    };
+    app.question
+        .remember_question(
+            &opencode::types::QuestionRequest {
+                id: "frm_1".into(),
+                session_id: "ses_1".into(),
+                title: "Questions".into(),
+                questions: vec![
+                    field("choice", crate::opencode::types::FormFieldKind::String),
+                    field("many", crate::opencode::types::FormFieldKind::Multiselect),
+                ],
+            },
+            "/work",
+        )
+        .await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            session_id: "ses_1".into(),
+            directory: "/work".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    // The single-select click carries the option VALUE; the multi-select
+    // toggles a value, adds a raw custom answer, then confirms.
+    let click = |reply: &str, index: u64, answer: Option<&str>| {
+        let mut value = serde_json::json!({
+            "action": "question",
+            "reply": reply,
+            "request_id": "frm_1",
+            "session_id": "ses_1",
+            "question_index": index,
+        });
+        if let Some(answer) = answer {
+            value["answer"] = serde_json::json!(answer);
+        }
+        value
+    };
+    app.host_action(click("answer", 0, Some("v-x"))).await;
+    app.host_action(click("answer", 1, Some("v-x"))).await;
+    app.host_action(click("custom", 1, Some("自定\n答案"))).await;
+    let result = app.host_action(click("confirm", 1, None)).await;
+    assert!(result.is_some(), "confirming the last field submits the form");
+
+    let calls = keyed.lock().await.clone();
+    assert_eq!(calls.len(), 1, "one keyed reply expected: {calls:?}");
+    assert_eq!(calls[0].0, "frm_1");
+    assert_eq!(
+        calls[0].1,
+        vec![
+            FormAnswer {
+                key: "choice".into(),
+                value: Some(FormValue::Text("v-x".into())),
+            },
+            FormAnswer {
+                key: "many".into(),
+                value: Some(FormValue::List(vec!["v-x".into(), "自定\n答案".into()])),
+            },
+        ],
+        "the keyed answers must keep values verbatim"
+    );
+}
+
 #[tokio::test]
 async fn completing_last_question_replaces_card_with_full_qa_summary() {
     let _wd = test_work_dir();
@@ -206,14 +314,17 @@ async fn completing_last_question_replaces_card_with_full_qa_summary() {
                             opencode::types::QuestionOption {
                                 label: "/a1".into(),
                                 description: String::new(),
+                                ..Default::default()
                             },
                             opencode::types::QuestionOption {
                                 label: "/a2".into(),
                                 description: String::new(),
+                                ..Default::default()
                             },
                         ],
-                        multiple: None,
+                        kind: crate::opencode::types::FormFieldKind::String,
                         custom: None,
+                        ..Default::default()
                     },
                     opencode::types::QuestionInfo {
                         question: "问题乙".into(),
@@ -222,16 +333,20 @@ async fn completing_last_question_replaces_card_with_full_qa_summary() {
                             opencode::types::QuestionOption {
                                 label: "/b1".into(),
                                 description: String::new(),
+                                ..Default::default()
                             },
                             opencode::types::QuestionOption {
                                 label: "/b2".into(),
                                 description: String::new(),
+                                ..Default::default()
                             },
                         ],
-                        multiple: None,
+                        kind: crate::opencode::types::FormFieldKind::String,
                         custom: None,
+                        ..Default::default()
                     },
                 ],
+                ..Default::default()
             },
             "/work",
         )
@@ -358,10 +473,13 @@ async fn double_click_on_same_request_replies_once() {
                     options: vec![opencode::types::QuestionOption {
                         label: "/a".into(),
                         description: String::new(),
+                        ..Default::default()
                     }],
-                    multiple: None,
+                    kind: crate::opencode::types::FormFieldKind::String,
                     custom: None,
+                    ..Default::default()
                 }],
+                ..Default::default()
             },
             "/work",
         )
@@ -420,10 +538,13 @@ async fn question_reply_404_renders_neutral_already_handled() {
                     options: vec![opencode::types::QuestionOption {
                         label: "/a".into(),
                         description: String::new(),
+                        ..Default::default()
                     }],
-                    multiple: None,
+                    kind: crate::opencode::types::FormFieldKind::String,
                     custom: None,
+                    ..Default::default()
                 }],
+                ..Default::default()
             },
             "/work",
         )
@@ -465,9 +586,11 @@ async fn question_with_multiple_parts_waits_for_all_answers() {
                 options: vec![opencode::types::QuestionOption {
                     label: "/a".into(),
                     description: String::new(),
+                    ..Default::default()
                 }],
-                multiple: None,
+                kind: crate::opencode::types::FormFieldKind::String,
                 custom: None,
+                ..Default::default()
             },
             opencode::types::QuestionInfo {
                 question: "选择分支".into(),
@@ -475,9 +598,11 @@ async fn question_with_multiple_parts_waits_for_all_answers() {
                 options: vec![opencode::types::QuestionOption {
                     label: "main".into(),
                     description: String::new(),
+                    ..Default::default()
                 }],
-                multiple: None,
+                kind: crate::opencode::types::FormFieldKind::String,
                 custom: None,
+                ..Default::default()
             },
         ]
     };
@@ -487,6 +612,7 @@ async fn question_with_multiple_parts_waits_for_all_answers() {
                 id: "que_2".into(),
                 session_id: "ses_1".into(),
                 questions: mk_questions(),
+                ..Default::default()
             },
             "/work",
         )
@@ -555,19 +681,24 @@ async fn multi_select_question_toggles_until_submit() {
                         opencode::types::QuestionOption {
                             label: "苹果".into(),
                             description: String::new(),
+                            ..Default::default()
                         },
                         opencode::types::QuestionOption {
                             label: "香蕉".into(),
                             description: String::new(),
+                            ..Default::default()
                         },
                         opencode::types::QuestionOption {
                             label: "橙子".into(),
                             description: String::new(),
+                            ..Default::default()
                         },
                     ],
-                    multiple: Some(true),
+                    kind: crate::opencode::types::FormFieldKind::Multiselect,
                     custom: None,
+                    ..Default::default()
                 }],
+                ..Default::default()
             },
             "/work",
         )
@@ -658,10 +789,13 @@ async fn multi_select_can_submit_empty_selection() {
                     options: vec![opencode::types::QuestionOption {
                         label: "苹果".into(),
                         description: String::new(),
+                        ..Default::default()
                     }],
-                    multiple: Some(true),
+                    kind: crate::opencode::types::FormFieldKind::Multiselect,
                     custom: None,
+                    ..Default::default()
                 }],
+                ..Default::default()
             },
             "/work",
         )
@@ -739,9 +873,11 @@ async fn stale_confirm_on_done_multi_select_is_a_no_op() {
                         options: vec![opencode::types::QuestionOption {
                             label: "/a".into(),
                             description: String::new(),
+                            ..Default::default()
                         }],
-                        multiple: None,
+                        kind: crate::opencode::types::FormFieldKind::String,
                         custom: None,
+                        ..Default::default()
                     },
                     opencode::types::QuestionInfo {
                         question: "选择水果".into(),
@@ -749,11 +885,14 @@ async fn stale_confirm_on_done_multi_select_is_a_no_op() {
                         options: vec![opencode::types::QuestionOption {
                             label: "苹果".into(),
                             description: String::new(),
+                            ..Default::default()
                         }],
-                        multiple: Some(true),
+                        kind: crate::opencode::types::FormFieldKind::Multiselect,
                         custom: None,
+                        ..Default::default()
                     },
                 ],
+                ..Default::default()
             },
             "/work",
         )
@@ -840,9 +979,11 @@ async fn mixed_single_and_multi_question_waits_for_all_confirmed() {
                         options: vec![opencode::types::QuestionOption {
                             label: "/a".into(),
                             description: String::new(),
+                            ..Default::default()
                         }],
-                        multiple: None,
+                        kind: crate::opencode::types::FormFieldKind::String,
                         custom: None,
+                        ..Default::default()
                     },
                     opencode::types::QuestionInfo {
                         question: "选择水果".into(),
@@ -850,11 +991,14 @@ async fn mixed_single_and_multi_question_waits_for_all_confirmed() {
                         options: vec![opencode::types::QuestionOption {
                             label: "苹果".into(),
                             description: String::new(),
+                            ..Default::default()
                         }],
-                        multiple: Some(true),
+                        kind: crate::opencode::types::FormFieldKind::Multiselect,
                         custom: None,
+                        ..Default::default()
                     },
                 ],
+                ..Default::default()
             },
             "/work",
         )
@@ -950,10 +1094,13 @@ async fn multi_select_custom_answer_appends_dedupes_and_removes() {
                     options: vec![opencode::types::QuestionOption {
                         label: "苹果".into(),
                         description: String::new(),
+                        ..Default::default()
                     }],
-                    multiple: Some(true),
+                    kind: crate::opencode::types::FormFieldKind::Multiselect,
                     custom: None,
+                    ..Default::default()
                 }],
+                ..Default::default()
             },
             "/work",
         )
@@ -1041,9 +1188,11 @@ async fn inline_question_answered_on_streaming_card() {
                 options: vec![opencode::types::QuestionOption {
                     label: "/a".into(),
                     description: String::new(),
+                    ..Default::default()
                 }],
-                multiple: None,
+                kind: crate::opencode::types::FormFieldKind::String,
                 custom: None,
+                ..Default::default()
             },
             opencode::types::QuestionInfo {
                 question: "选分支".into(),
@@ -1051,11 +1200,14 @@ async fn inline_question_answered_on_streaming_card() {
                 options: vec![opencode::types::QuestionOption {
                     label: "main".into(),
                     description: String::new(),
+                    ..Default::default()
                 }],
-                multiple: None,
+                kind: crate::opencode::types::FormFieldKind::String,
                 custom: None,
+                ..Default::default()
             },
         ],
+        ..Default::default()
     }]);
     let backend = Arc::new(mock);
     let platform = Arc::new(RecordingPlatform::new());
@@ -1275,15 +1427,19 @@ async fn sweep_keeps_partial_multi_select_toggles() {
                 opencode::types::QuestionOption {
                     label: "苹果".into(),
                     description: String::new(),
+                    ..Default::default()
                 },
                 opencode::types::QuestionOption {
                     label: "香蕉".into(),
                     description: String::new(),
+                    ..Default::default()
                 },
             ],
-            multiple: Some(true),
+            kind: crate::opencode::types::FormFieldKind::Multiselect,
             custom: None,
+            ..Default::default()
         }],
+        ..Default::default()
     };
     let mut backend = MockBackend::new(realistic_parts());
     // The request is still pending, so the sweep refreshes instead of pruning.
@@ -1625,9 +1781,11 @@ async fn inline_question_submit_and_reject_leave_receipts() {
                     options: vec![opencode::types::QuestionOption {
                         label: "/a".into(),
                         description: String::new(),
+                        ..Default::default()
                     }],
-                    multiple: None,
+                    kind: crate::opencode::types::FormFieldKind::String,
                     custom: None,
+                    ..Default::default()
                 },
                 opencode::types::QuestionInfo {
                     question: "选分支".into(),
@@ -1635,11 +1793,14 @@ async fn inline_question_submit_and_reject_leave_receipts() {
                     options: vec![opencode::types::QuestionOption {
                         label: "main".into(),
                         description: String::new(),
+                        ..Default::default()
                     }],
-                    multiple: None,
+                    kind: crate::opencode::types::FormFieldKind::String,
                     custom: None,
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         },
         opencode::types::QuestionRequest {
             id: "que_reject".into(),
@@ -1650,10 +1811,13 @@ async fn inline_question_submit_and_reject_leave_receipts() {
                 options: vec![opencode::types::QuestionOption {
                     label: "继续".into(),
                     description: String::new(),
+                    ..Default::default()
                 }],
-                multiple: None,
+                kind: crate::opencode::types::FormFieldKind::String,
                 custom: None,
+                ..Default::default()
             }],
+            ..Default::default()
         },
     ]);
     let backend = Arc::new(backend);
@@ -1798,10 +1962,13 @@ async fn inline_question_click_after_remote_resolution_gets_receipt() {
             options: vec![opencode::types::QuestionOption {
                 label: "/a".into(),
                 description: String::new(),
+                ..Default::default()
             }],
-            multiple: None,
+            kind: crate::opencode::types::FormFieldKind::String,
             custom: None,
+            ..Default::default()
         }],
+        ..Default::default()
     }]);
     backend.question_resolved_elsewhere();
     let backend = Arc::new(backend);

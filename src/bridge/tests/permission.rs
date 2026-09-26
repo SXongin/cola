@@ -952,6 +952,7 @@ async fn auto_accept_session_answers_permission_without_card() {
         always: Vec::new(),
     }]);
     let perm_calls = mock.reply_permission_calls.clone();
+    let reply_sessions = mock.reply_permission_sessions.clone();
     let (app, platform) = build_app(cfg, mock).await;
 
     // Enable `/autoaccept` on the session.
@@ -988,6 +989,13 @@ async fn auto_accept_session_answers_permission_without_card() {
         calls,
         vec![("per_aa".to_string(), "once".to_string())],
         "auto-accept should reply once"
+    );
+    // The auto-accept reply is session-scoped on V2: it must carry the
+    // request's own session id.
+    assert_eq!(
+        reply_sessions.lock().await.as_slice(),
+        &["ses_test".to_string()],
+        "auto-accept must route via the request's session id"
     );
     let sent = platform.calls.lock().await.clone();
     assert!(

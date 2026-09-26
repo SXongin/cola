@@ -2,7 +2,7 @@
 //!
 //! This module is where every V2 path, payload, decoder and semantic lands.
 //! Attach detection (slice S3, [`super::generation`]) can already select it,
-//! but its capabilities arrive slice by slice (S4a session reads, S4b
+//! and its capabilities arrive slice by slice (S4a session reads, S4b
 //! transcript, S5 writes, S6 permissions/forms, S7 session-scoped switches).
 //! Until a capability lands, its method fails with an explicit
 //! "not implemented yet" error naming the method — attaching to a V2 server is
@@ -14,7 +14,9 @@
 //! assistant message's `retry` field. S4b is the transcript decode proper,
 //! behind [`V2Strategy::transcript`] and the private [`wire`] module. S5 is
 //! the write surface: prompt dispatch (admit + `session.wait`/poll polyfill),
-//! the steer supplement, interrupt and compact.
+//! the steer supplement, interrupt and compact. S6 is permissions and forms:
+//! the location-scoped pending lists, the session-scoped decision/keyed-answer
+//! replies, and the cancel-by-delete path.
 //!
 //! Session creation (`POST /api/session`) is NOT here: both generations serve
 //! that request identically, so it lives on the generation-blind adapter
@@ -36,8 +38,8 @@ use crate::error::Result;
 use super::strategy::GenerationStrategy;
 use super::transport::Transport;
 use super::types::{
-    AgentInfo, ImageInput, ModelInfo, PermissionRequest, PromptResponse, ProviderModels, QuestionRequest,
-    SessionInfo, SessionListInfo, SessionStatus,
+    AgentInfo, FormAnswer, FormValue, ImageInput, ModelInfo, PermissionRequest, PromptResponse,
+    ProviderModels, QuestionRequest, SessionInfo, SessionListInfo, SessionStatus,
 };
 
 /// The session root: list, get, update (PATCH), delete, and the per-session
@@ -59,6 +61,11 @@ const SESSION_ACTIVE: &str = "/api/session/active";
 /// The per-session projected-message read: the S4b transcript decode and, for
 /// active sessions, the run state's retry derivation.
 const SESSION_MESSAGES_SUFFIX: &str = "/message";
+/// The location-scoped pending-permission list (`GET
+/// /api/permission/request?location[directory]=…`).
+const PERMISSION_REQUEST: &str = "/api/permission/request";
+/// The location-scoped pending-form list (`GET /api/form?location[directory]=…`).
+const FORM: &str = "/api/form";
 
 /// How long the poll fallback waits between `session.active` reads. The wait
 /// endpoint resolves as soon as the drain settles; the fallback matches that
@@ -129,9 +136,53 @@ fn not_implemented(method: &str) -> String {
     )
 }
 
-/// [`not_implemented`] as the error the `Result` methods return.
-fn not_implemented_error(method: &str) -> crate::error::BridgeError {
-    crate::error::BridgeError::OpenCode(not_implemented(method))
+/// The location-scoped list URL: V2 selects an instance/workspace with the
+/// deepObject query `location[directory]=…` (V1's flat `directory=`). Without a
+/// directory the server's default location answers, exactly like V1's cwd
+/// instance.
+fn location_url(base: &str, directory: Option<&str>) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(base)?;
+    if let Some(directory) = directory {
+        url.query_pairs_mut()
+            .append_pair("location[directory]", directory);
+    }
+    Ok(url)
+}
+
+/// Encode one neutral form answer into V2's `Form.Value` union: a string, a
+/// number, a boolean or a string array.
+fn answer_json(value: &FormValue) -> serde_json::Value {
+    match value {
+        FormValue::Text(text) => serde_json::Value::String(text.clone()),
+        FormValue::Number(number) => serde_json::json!(number),
+        FormValue::Bool(flag) => serde_json::Value::Bool(*flag),
+        FormValue::List(values) => serde_json::json!(values),
+    }
+}
+
+/// Consume a failed permission/form reply into the neutral error. A 404 (the
+/// request, form or session is gone) and a 409 (the form is already settled)
+/// both mean "already handled" to the bridge's neutral card, so they become
+/// [`crate::error::BridgeError::NotFound`]; anything else is a real failure
+/// naming the operation and carrying a body preview. One mapping for both reply
+/// families, so their diagnostics cannot drift.
+async fn reply_failure(
+    response: reqwest::Response,
+    what: &str,
+    request_id: &str,
+) -> crate::error::BridgeError {
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if matches!(
+        status,
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::CONFLICT
+    ) {
+        return crate::error::BridgeError::NotFound(format!("{what} {request_id}"));
+    }
+    crate::error::BridgeError::OpenCode(format!(
+        "{what} reply {request_id} failed: HTTP {status} — {}",
+        body_preview(&body)
+    ))
 }
 
 /// Whether a V2 error body names the session as missing (`{_tag:
@@ -318,49 +369,138 @@ impl GenerationStrategy for V2Strategy {
         Ok(())
     }
 
+    /// Reply to one pending permission request (`POST
+    /// /api/session/{id}/permission/{requestID}/reply` with
+    /// `{"decision": once|always|reject}`). V2 answers 204; a 404 (request or
+    /// session gone) and a 409 (settled) both mean "already handled" to the
+    /// bridge's neutral card, so both map to [`crate::error::BridgeError::NotFound`].
     async fn reply_permission(
         &self,
-        _http: &Transport,
-        _request_id: &str,
-        _reply: &str,
+        http: &Transport,
+        session_id: &str,
+        request_id: &str,
+        reply: &str,
         _directory: Option<&str>,
     ) -> Result<()> {
-        Err(not_implemented_error("reply_permission"))
+        let response = http
+            .client()
+            .post(http.url(&format!("{SESSION}/{session_id}/permission/{request_id}/reply")))
+            .json(&serde_json::json!({ "decision": reply }))
+            .send()
+            .await?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        Err(reply_failure(response, "permission", request_id).await)
     }
 
+    /// List pending permissions for one location (`GET
+    /// /api/permission/request?location[directory]=…`) — one call per known
+    /// session directory, exactly like the V1 read, never one per session. The
+    /// response is V2's `{location, data: Permission.Request[]}` envelope whose
+    /// request fields are renamed (`action`/`resources`/`save`).
     async fn list_permissions(
         &self,
-        _http: &Transport,
-        _directory: Option<&str>,
+        http: &Transport,
+        directory: Option<&str>,
     ) -> Result<Vec<PermissionRequest>> {
-        Err(not_implemented_error("list_permissions"))
+        let url = location_url(&http.url(PERMISSION_REQUEST), directory)?;
+        let resp = http.client().get(url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                "GET {PERMISSION_REQUEST} failed: {} — body: {}",
+                status,
+                body_preview(&text)
+            );
+            return Err(crate::error::BridgeError::OpenCode(format!(
+                "permission list failed: {}",
+                status
+            )));
+        }
+        let page: wire::DataEnvelope<Vec<wire::RawPermission>> = resp.json().await?;
+        Ok(page
+            .data
+            .into_iter()
+            .map(wire::RawPermission::into_neutral)
+            .collect())
     }
 
+    /// List pending forms for one location (`GET /api/form?location[directory]=…`).
+    /// The same one-call-per-directory shape as the permission read; the visible
+    /// units are V2's typed `Form.Field`s, not V1's positional questions.
     async fn list_questions(
         &self,
-        _http: &Transport,
-        _directory: Option<&str>,
+        http: &Transport,
+        directory: Option<&str>,
     ) -> Result<Vec<QuestionRequest>> {
-        Err(not_implemented_error("list_questions"))
+        let url = location_url(&http.url(FORM), directory)?;
+        let resp = http.client().get(url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            tracing::warn!("GET {FORM} failed: {} — body: {}", status, body_preview(&text));
+            return Err(crate::error::BridgeError::OpenCode(format!(
+                "form list failed: {}",
+                status
+            )));
+        }
+        let page: wire::DataEnvelope<Vec<wire::RawForm>> = resp.json().await?;
+        Ok(page.data.into_iter().map(wire::RawForm::into_neutral).collect())
     }
 
+    /// Answer a pending form (`POST /api/session/{id}/form/{formID}/reply`)
+    /// with V2's keyed `{"answer": {key: value}}` body. The neutral answers are
+    /// rendered into the typed JSON values the form schema expects.
     async fn reply_question(
         &self,
-        _http: &Transport,
-        _request_id: &str,
-        _answers: &[Vec<String>],
+        http: &Transport,
+        session_id: &str,
+        request_id: &str,
+        answers: &[FormAnswer],
         _directory: Option<&str>,
     ) -> Result<()> {
-        Err(not_implemented_error("reply_question"))
+        let answer: serde_json::Map<String, serde_json::Value> = answers
+            .iter()
+            .filter_map(|answer| {
+                answer
+                    .value
+                    .as_ref()
+                    .map(|value| (answer.key.clone(), answer_json(value)))
+            })
+            .collect();
+        let response = http
+            .client()
+            .post(http.url(&format!("{SESSION}/{session_id}/form/{request_id}/reply")))
+            .json(&serde_json::json!({ "answer": answer }))
+            .send()
+            .await?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        Err(reply_failure(response, "form", request_id).await)
     }
 
+    /// Cancel a pending form (`DELETE /api/session/{id}/form/{formID}`) — V2's
+    /// replacement for V1's `reject` (there is no reject endpoint). A 404/409
+    /// is the same benign "already settled" outcome as a reply.
     async fn reject_question(
         &self,
-        _http: &Transport,
-        _request_id: &str,
+        http: &Transport,
+        session_id: &str,
+        request_id: &str,
         _directory: Option<&str>,
     ) -> Result<()> {
-        Err(not_implemented_error("reject_question"))
+        let response = http
+            .client()
+            .delete(http.url(&format!("{SESSION}/{session_id}/form/{request_id}")))
+            .send()
+            .await?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        Err(reply_failure(response, "form", request_id).await)
     }
 
     /// Fetch one session's Session Transcript through the V2 projected-message
@@ -453,7 +593,9 @@ impl GenerationStrategy for V2Strategy {
         _provider: &str,
         _model: &str,
     ) -> Result<Option<i64>> {
-        Err(not_implemented_error("model_context_window"))
+        Err(crate::error::BridgeError::OpenCode(not_implemented(
+            "model_context_window",
+        )))
     }
 
     async fn list_agents(&self, _http: &Transport) -> Vec<AgentInfo> {

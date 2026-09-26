@@ -2346,9 +2346,11 @@ mod tests {
                 options: vec![crate::opencode::types::QuestionOption {
                     label: "继续".into(),
                     description: String::new(),
+                    ..Default::default()
                 }],
-                multiple: None,
+                kind: crate::opencode::types::FormFieldKind::String,
                 custom: None,
+                ..Default::default()
             }],
             directory: "/w".into(),
             answers: vec![None],

@@ -266,18 +266,14 @@ impl RequestFlow {
     /// state must stay intact so the click can be retried. `None` when the
     /// state vanished (a sweep raced the click) — the caller must classify
     /// that (#130), never reply from an empty snapshot.
+    #[allow(clippy::type_complexity)] // the (fields, per-field answers) pair is the snapshot
     pub(crate) async fn question_snapshot(
         &self,
         req_id: &str,
-    ) -> Option<(Vec<opencode::types::QuestionInfo>, Vec<Vec<String>>)> {
+    ) -> Option<(Vec<opencode::types::QuestionInfo>, Vec<Option<Vec<String>>>)> {
         let states = self.question_state.lock().await;
         let state = states.get(req_id)?;
-        let answers = state
-            .answers()
-            .iter()
-            .map(|a| a.clone().unwrap_or_default())
-            .collect();
-        Some((state.request().questions.clone(), answers))
+        Some((state.request().questions.clone(), state.answers().to_vec()))
     }
 
     /// The live state the kind contributes to a Session Snapshot re-render

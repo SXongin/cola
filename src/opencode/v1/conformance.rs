@@ -6,7 +6,9 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::opencode::conformance::{PromptFixture, SessionCase, SessionReadFixture, TranscriptFixture};
+use crate::opencode::conformance::{
+    PromptFixture, RequestFixture, SessionCase, SessionReadFixture, TranscriptFixture,
+};
 use crate::opencode::strategy::Generation;
 use crate::test_http::{MockResponse, TestHttpServer};
 
@@ -20,6 +22,7 @@ pub(crate) fn case() -> SessionCase {
         mount_transcript,
         mount_recorded_transcript,
         mount_prompt,
+        mount_requests,
     }
 }
 
@@ -196,5 +199,62 @@ fn mount_prompt(server: &TestHttpServer, fixture: &PromptFixture) {
             ],
         })
         .to_string(),
+    );
+}
+
+/// Mount V1's global permission/question routes: a bare list array, the
+/// `{"reply"}` / `{"answers"}` reply bodies, and the reject endpoint. V1 has no
+/// field keys or typed options — the question's label is its submitted value.
+fn mount_requests(server: &TestHttpServer, fixture: &RequestFixture) {
+    server.route(
+        "GET",
+        "/permission",
+        200,
+        json!([{
+            "id": fixture.permission_id,
+            "sessionID": fixture.session,
+            "permission": fixture.action,
+            "patterns": [fixture.resource],
+            "always": [],
+            "metadata": {},
+        }])
+        .to_string(),
+    );
+    server.route(
+        "POST",
+        &format!("/permission/{}/reply", fixture.permission_id),
+        200,
+        "true",
+    );
+    server.route(
+        "GET",
+        "/question",
+        200,
+        json!([{
+            "id": fixture.form_id,
+            "sessionID": fixture.session,
+            "questions": [{
+                "question": fixture.field_question,
+                "header": fixture.field_title,
+                "options": [
+                    {"label": fixture.option_value, "description": ""},
+                ],
+                "multiple": false,
+                "custom": false,
+            }],
+        }])
+        .to_string(),
+    );
+    server.route(
+        "POST",
+        &format!("/question/{}/reply", fixture.form_id),
+        200,
+        "true",
+    );
+    server.route(
+        "POST",
+        &format!("/question/{}/reject", fixture.form_id),
+        200,
+        "true",
     );
 }
