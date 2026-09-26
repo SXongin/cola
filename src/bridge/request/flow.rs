@@ -24,6 +24,15 @@ use super::delivery::{
 };
 use super::kind::{PendingRequest, RequestKind};
 
+/// One question request's captured reply inputs (spec #364, S6): the request's
+/// fields and the index-aligned per-field answer slots (`answers[i]` is `None`
+/// until the field is finalized). Named because the pair travels together
+/// through the reply path; captured under one lock, cloned for the reply.
+pub(crate) struct QuestionSnapshot {
+    pub fields: Vec<opencode::types::QuestionInfo>,
+    pub answers: Vec<Option<Vec<String>>>,
+}
+
 /// A request card cola sent: the live Message id, the summary shown when the
 /// card is marked stale, and the owning directory. The directory lets the
 /// sweep skip cleanups for a directory whose list call failed — "absent from
@@ -266,14 +275,13 @@ impl RequestFlow {
     /// state must stay intact so the click can be retried. `None` when the
     /// state vanished (a sweep raced the click) — the caller must classify
     /// that (#130), never reply from an empty snapshot.
-    #[allow(clippy::type_complexity)] // the (fields, per-field answers) pair is the snapshot
-    pub(crate) async fn question_snapshot(
-        &self,
-        req_id: &str,
-    ) -> Option<(Vec<opencode::types::QuestionInfo>, Vec<Option<Vec<String>>>)> {
+    pub(crate) async fn question_snapshot(&self, req_id: &str) -> Option<QuestionSnapshot> {
         let states = self.question_state.lock().await;
         let state = states.get(req_id)?;
-        Some((state.request().questions.clone(), state.answers().to_vec()))
+        Some(QuestionSnapshot {
+            fields: state.request().questions.clone(),
+            answers: state.answers().to_vec(),
+        })
     }
 
     /// The live state the kind contributes to a Session Snapshot re-render

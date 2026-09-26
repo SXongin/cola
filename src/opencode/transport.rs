@@ -1,11 +1,12 @@
 //! The generation-blind HTTP transport shared by the adapter and its
 //! generation strategies (ADR-0055).
 //!
-//! Base URL, credentials, the reqwest client and the reply-endpoint policy
-//! live here; nothing protocol-generation-specific does. The server cola talks
-//! to can be restarted/replaced at runtime (another tool like OpenChamber
-//! manages it), which may change its port and password, so the live endpoint is
-//! held behind a lock and can be swapped wholesale on reconnect.
+//! Base URL, credentials, the reqwest client, the reply-endpoint policy and the
+//! shared read diagnostics (`read_failure` / `body_preview`) live here; nothing
+//! protocol-generation-specific does. The server cola talks to can be
+//! restarted/replaced at runtime (another tool like OpenChamber manages it),
+//! which may change its port and password, so the live endpoint is held behind
+//! a lock and can be swapped wholesale on reconnect.
 
 use base64::Engine;
 use std::sync::{Arc, RwLock};
@@ -16,6 +17,33 @@ use std::sync::{Arc, RwLock};
 /// ack budget. Prompt POSTs deliberately keep the transport's no-total-timeout
 /// policy: real turns run for minutes.
 pub(crate) const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// How much of a failed response body a diagnostic carries. One cap for every
+/// read on both generations, so no two diagnostics of the same response
+/// truncate differently; a body is a debug aid, not data.
+pub(crate) const BODY_PREVIEW_CHARS: usize = 500;
+
+/// The first [`BODY_PREVIEW_CHARS`] characters of a failed response body, for a
+/// diagnostic. Char-based, so truncating a multi-byte body can never split a
+/// character and panic.
+pub(crate) fn body_preview(body: &str) -> &str {
+    match body.char_indices().nth(BODY_PREVIEW_CHARS) {
+        Some((index, _)) => &body[..index],
+        None => body,
+    }
+}
+
+/// Consume a failed read response into the neutral error: one WARN naming the
+/// operation and the status with a bounded body preview, and the
+/// [`crate::error::BridgeError::OpenCode`] the caller returns. Both
+/// generations' list/status reads share it, so their diagnostics cannot drift
+/// (and none of them silently writes to stderr).
+pub(crate) async fn read_failure(response: reqwest::Response, what: &str) -> crate::error::BridgeError {
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    tracing::warn!("{what} failed: {status} — body: {}", body_preview(&body));
+    crate::error::BridgeError::OpenCode(format!("{what} failed: {status}"))
+}
 
 /// The live endpoint: the reqwest client (with its baked-in auth headers) and
 /// the base URL. Shared behind an `Arc` so [`Transport::repoint`] can replace

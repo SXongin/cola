@@ -305,6 +305,9 @@ impl QuestionInfo {
 pub enum FormValue {
     Text(String),
     Number(f64),
+    /// An `integer`-kind field's answer, kept integral so the wire value is a
+    /// JSON integer (never `3.0`) — V2 validates `Number.isInteger`.
+    Integer(i64),
     Bool(bool),
     List(Vec<String>),
 }
@@ -317,6 +320,7 @@ impl FormValue {
         match self {
             FormValue::Text(text) => vec![text.clone()],
             FormValue::Number(number) => vec![number.to_string()],
+            FormValue::Integer(integer) => vec![integer.to_string()],
             FormValue::Bool(flag) => vec![flag.to_string()],
             FormValue::List(values) => values.clone(),
         }
@@ -335,50 +339,66 @@ pub struct FormAnswer {
 /// Build the keyed answers a form reply carries from the positional string
 /// answers the card accumulates, one entry per field in order. `answers[i]` is
 /// `None` until field `i` is finalized (a confirmed multi-select may be
-/// `Some(vec![])` — "不选"); a numeric field whose typed text cannot parse is
-/// left unanswered — never sent as a value the server's schema would reject.
+/// `Some(vec![])` — "不选"); a numeric field whose typed text cannot parse (or a
+/// non-integral value in an `integer` field) is left unanswered — never sent as
+/// a value the server's schema would reject.
 pub fn build_form_answers(questions: &[QuestionInfo], answers: &[Option<Vec<String>>]) -> Vec<FormAnswer> {
-    let mut out = Vec::new();
-    for (index, field) in questions.iter().enumerate() {
-        let key = if field.key.is_empty() {
-            format!("q{index}")
-        } else {
-            field.key.clone()
-        };
-        let value = answers
-            .get(index)
-            .and_then(|slot| slot.as_ref())
-            .and_then(|values| {
-                match field.kind {
-                    // External fields are acknowledged (not answered): a `true`
-                    // answer records the acknowledgement.
-                    FormFieldKind::External => values
-                        .iter()
-                        .any(|value| value == "true")
-                        .then_some(FormValue::Bool(true)),
-                    FormFieldKind::Multiselect => Some(FormValue::List(values.clone())),
-                    FormFieldKind::Boolean => {
-                        Some(FormValue::Bool(values.first().is_some_and(|v| v == "true")))
-                    }
-                    FormFieldKind::Number | FormFieldKind::Integer => values
-                        .first()
-                        .and_then(|v| v.parse::<f64>().ok())
-                        .map(FormValue::Number),
-                    FormFieldKind::String => {
-                        let text = values.first().cloned().unwrap_or_default();
-                        if text.is_empty() && field.required {
-                            // A required string must not be submitted empty; leave
-                            // it unanswered so the server reports the missing field.
-                            None
-                        } else {
-                            Some(FormValue::Text(text))
-                        }
-                    }
-                }
-            });
-        out.push(FormAnswer { key, value });
+    questions
+        .iter()
+        .enumerate()
+        .map(|(index, field)| FormAnswer {
+            key: if field.key.is_empty() {
+                format!("q{index}")
+            } else {
+                field.key.clone()
+            },
+            value: answers
+                .get(index)
+                .and_then(|slot| slot.as_ref())
+                .and_then(|values| field_answer(field, values)),
+        })
+        .collect()
+}
+
+/// Decode one finalized field's typed answer, or `None` to leave the field
+/// unanswered (V2 omits the key; V1 keeps an empty positional slot).
+fn field_answer(field: &QuestionInfo, values: &[String]) -> Option<FormValue> {
+    match field.kind {
+        // External fields are acknowledged (not answered): a `true` answer
+        // records the acknowledgement.
+        FormFieldKind::External => values
+            .iter()
+            .any(|value| value == "true")
+            .then_some(FormValue::Bool(true)),
+        FormFieldKind::Multiselect => Some(FormValue::List(values.to_vec())),
+        FormFieldKind::Boolean => Some(FormValue::Bool(values.first().is_some_and(|v| v == "true"))),
+        // A numeric answer must be a finite JSON number; `NaN`/`inf` parse as
+        // f64 but cannot be represented on the wire.
+        FormFieldKind::Number => values
+            .first()?
+            .parse::<f64>()
+            .ok()
+            .filter(|number| number.is_finite())
+            .map(FormValue::Number),
+        // An integer answer must also be whole: `3.0` is accepted and narrowed
+        // to `3`, a fractional value is invalid and leaves the field open.
+        FormFieldKind::Integer => values
+            .first()?
+            .parse::<f64>()
+            .ok()
+            .filter(|number| number.is_finite() && number.fract() == 0.0)
+            .map(|number| FormValue::Integer(number as i64)),
+        FormFieldKind::String => {
+            let text = values.first().cloned().unwrap_or_default();
+            if text.is_empty() && field.required {
+                // A required string must not be submitted empty; leave it
+                // unanswered so the server reports the missing field.
+                None
+            } else {
+                Some(FormValue::Text(text))
+            }
+        }
     }
-    out
 }
 
 /// A pending question (V1) / form (V2) request: the AI asks the user one or
@@ -488,5 +508,78 @@ mod tests {
             serde_json::from_str(r#"{"id":"ses_a","title":"t","directory":"/w"}"#).unwrap();
         assert!(!info.is_archived());
         assert!(!info.is_child());
+    }
+
+    fn field(key: &str, kind: FormFieldKind) -> QuestionInfo {
+        QuestionInfo {
+            key: key.into(),
+            kind,
+            ..Default::default()
+        }
+    }
+
+    /// The typed answer decode: a whole value in an `integer` field narrows to
+    /// an `Integer` (never a float), a fractional one is invalid and leaves the
+    /// field unanswered, and a required empty string is omitted.
+    #[test]
+    fn form_answers_decode_integers_and_reject_invalid_numbers() {
+        let questions = vec![
+            field("count", FormFieldKind::Integer),
+            field("ratio", FormFieldKind::Number),
+            QuestionInfo {
+                key: "required".into(),
+                kind: FormFieldKind::String,
+                required: true,
+                ..Default::default()
+            },
+        ];
+        let slots = vec![
+            Some(vec!["3".to_string()]),
+            Some(vec!["2.5".to_string()]),
+            Some(Vec::new()),
+        ];
+        let decoded = build_form_answers(&questions, &slots);
+        assert_eq!(decoded[0].value, Some(FormValue::Integer(3)));
+        assert_eq!(decoded[1].value, Some(FormValue::Number(2.5)));
+        assert_eq!(decoded[2].value, None, "a required empty string is omitted");
+        // The positional wire form keeps the integer integral.
+        assert_eq!(decoded[0].value.as_ref().unwrap().to_strings(), vec!["3"]);
+
+        // `3.0` is whole and narrows; `2.5` (or a garbled/NaN value) is not.
+        assert_eq!(
+            field_answer(&field("i", FormFieldKind::Integer), &["3.0".into()]),
+            Some(FormValue::Integer(3))
+        );
+        assert_eq!(
+            field_answer(&field("i", FormFieldKind::Integer), &["2.5".into()]),
+            None
+        );
+        assert_eq!(
+            field_answer(&field("i", FormFieldKind::Integer), &["many".into()]),
+            None
+        );
+        assert_eq!(
+            field_answer(&field("n", FormFieldKind::Number), &["NaN".into()]),
+            None
+        );
+        // An unanswered slot stays unanswered in field order.
+        let unanswered = build_form_answers(&questions, &[None, None, None]);
+        assert_eq!(unanswered.len(), 3);
+        assert!(unanswered.iter().all(|answer| answer.value.is_none()));
+    }
+
+    /// V1 questions carry no key: the neutral decode synthesizes the positional
+    /// `q{i}` key, and an external acknowledgement is the `true` answer.
+    #[test]
+    fn form_answers_synthesize_positional_keys_and_acknowledge_external_fields() {
+        let questions = vec![
+            field("", FormFieldKind::String),
+            field("link", FormFieldKind::External),
+        ];
+        let decoded = build_form_answers(&questions, &[Some(vec!["/a".into()]), Some(vec!["true".into()])]);
+        assert_eq!(decoded[0].key, "q0");
+        assert_eq!(decoded[0].value, Some(FormValue::Text("/a".into())));
+        assert_eq!(decoded[1].key, "link");
+        assert_eq!(decoded[1].value, Some(FormValue::Bool(true)));
     }
 }

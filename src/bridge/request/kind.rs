@@ -1121,13 +1121,13 @@ impl RequestKind for QuestionKind {
                     }
                     // The claim does not pin the state: re-validate so a sweep
                     // racing the claim cannot submit an empty snapshot.
-                    let Some((questions, slots)) = flow.question_snapshot(req_id).await else {
+                    let Some(snapshot) = flow.question_snapshot(req_id).await else {
                         return Some(
                             flow.missing_after_claim(&handles.requests, req_id, directory, inline)
                                 .await,
                         );
                     };
-                    let answers = opencode::types::build_form_answers(&questions, &slots);
+                    let answers = opencode::types::build_form_answers(&snapshot.fields, &snapshot.answers);
                     if let Some(r) = settle_question_reply(
                         flow,
                         &handles.cards,
@@ -1165,10 +1165,14 @@ impl RequestKind for QuestionKind {
                         session_id,
                         Origin::Click { clicked },
                         &[req_id.to_string()],
-                        Residue::PerBlock(&|_| question_receipt(&questions, &slots)),
+                        Residue::PerBlock(&|_| question_receipt(&snapshot.fields, &snapshot.answers)),
                     )
                     .await;
-                    let mut r = result_card("✅ 已回答", "green", &qa_completion_body(&questions, &slots));
+                    let mut r = result_card(
+                        "✅ 已回答",
+                        "green",
+                        &qa_completion_body(&snapshot.fields, &snapshot.answers),
+                    );
                     r.toast = Some("已回答".to_string());
                     settle_ack(&handles.cards, host, session_id, inline, cached, &mut r).await;
                     // Re-served verbatim to a losing double-click.
@@ -1259,13 +1263,13 @@ impl RequestKind for QuestionKind {
                 }
                 // The claim does not pin the state: re-validate so a sweep
                 // racing the claim cannot turn this into a blind reply.
-                let Some((questions, slots)) = flow.question_snapshot(req_id).await else {
+                let Some(snapshot) = flow.question_snapshot(req_id).await else {
                     return Some(
                         flow.missing_after_claim(&handles.requests, req_id, directory, inline)
                             .await,
                     );
                 };
-                let answers = opencode::types::build_form_answers(&questions, &slots);
+                let answers = opencode::types::build_form_answers(&snapshot.fields, &snapshot.answers);
                 if let Some(r) = settle_question_reply(
                     flow,
                     &handles.cards,
@@ -1297,10 +1301,14 @@ impl RequestKind for QuestionKind {
                     session_id,
                     Origin::Click { clicked },
                     &[req_id.to_string()],
-                    Residue::PerBlock(&|_| question_receipt(&questions, &slots)),
+                    Residue::PerBlock(&|_| question_receipt(&snapshot.fields, &snapshot.answers)),
                 )
                 .await;
-                let mut r = result_card("✅ 已回答", "green", &qa_completion_body(&questions, &slots));
+                let mut r = result_card(
+                    "✅ 已回答",
+                    "green",
+                    &qa_completion_body(&snapshot.fields, &snapshot.answers),
+                );
                 r.toast = Some("已提交".to_string());
                 settle_ack(&handles.cards, host, session_id, inline, cached, &mut r).await;
                 // Re-served verbatim to a losing double-click.

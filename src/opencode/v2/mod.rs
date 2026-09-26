@@ -36,7 +36,7 @@ use crate::backend::SessionTranscript;
 use crate::error::Result;
 
 use super::strategy::GenerationStrategy;
-use super::transport::Transport;
+use super::transport::{Transport, body_preview, read_failure};
 use super::types::{
     AgentInfo, FormAnswer, FormValue, ImageInput, ModelInfo, PermissionRequest, PromptResponse,
     ProviderModels, QuestionRequest, SessionInfo, SessionListInfo, SessionStatus,
@@ -106,23 +106,8 @@ const MAX_MESSAGE_PAGES: usize = 100;
 /// page is the difference between one request and many on a long session.
 const MESSAGE_PAGE_LIMIT: &str = "200";
 
-/// How much of a failed response body a status diagnostic carries. One cap for
-/// every warn and error in this module, so no two diagnostics of the same read
-/// truncate differently; a body is a debug aid, not data.
-const BODY_PREVIEW_CHARS: usize = 500;
-
 /// The strategy that speaks the V2 generation.
 pub(crate) struct V2Strategy;
-
-/// The first [`BODY_PREVIEW_CHARS`] characters of a failed response body, for a
-/// diagnostic. Char-based, so truncating a multi-byte body can never split a
-/// character and panic.
-fn body_preview(body: &str) -> &str {
-    match body.char_indices().nth(BODY_PREVIEW_CHARS) {
-        Some((index, _)) => &body[..index],
-        None => body,
-    }
-}
 
 /// The visible failure text of a capability that has not landed yet: names the
 /// method and the generation, so an attached V2 server's missing surface is
@@ -150,11 +135,12 @@ fn location_url(base: &str, directory: Option<&str>) -> Result<reqwest::Url> {
 }
 
 /// Encode one neutral form answer into V2's `Form.Value` union: a string, a
-/// number, a boolean or a string array.
+/// number, an integer, a boolean or a string array.
 fn answer_json(value: &FormValue) -> serde_json::Value {
     match value {
         FormValue::Text(text) => serde_json::Value::String(text.clone()),
         FormValue::Number(number) => serde_json::json!(number),
+        FormValue::Integer(integer) => serde_json::json!(integer),
         FormValue::Bool(flag) => serde_json::Value::Bool(*flag),
         FormValue::List(values) => serde_json::json!(values),
     }
@@ -406,18 +392,8 @@ impl GenerationStrategy for V2Strategy {
     ) -> Result<Vec<PermissionRequest>> {
         let url = location_url(&http.url(PERMISSION_REQUEST), directory)?;
         let resp = http.client().get(url).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            tracing::warn!(
-                "GET {PERMISSION_REQUEST} failed: {} — body: {}",
-                status,
-                body_preview(&text)
-            );
-            return Err(crate::error::BridgeError::OpenCode(format!(
-                "permission list failed: {}",
-                status
-            )));
+        if !resp.status().is_success() {
+            return Err(read_failure(resp, "permission list").await);
         }
         let page: wire::DataEnvelope<Vec<wire::RawPermission>> = resp.json().await?;
         Ok(page
@@ -437,14 +413,8 @@ impl GenerationStrategy for V2Strategy {
     ) -> Result<Vec<QuestionRequest>> {
         let url = location_url(&http.url(FORM), directory)?;
         let resp = http.client().get(url).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            tracing::warn!("GET {FORM} failed: {} — body: {}", status, body_preview(&text));
-            return Err(crate::error::BridgeError::OpenCode(format!(
-                "form list failed: {}",
-                status
-            )));
+        if !resp.status().is_success() {
+            return Err(read_failure(resp, "form list").await);
         }
         let page: wire::DataEnvelope<Vec<wire::RawForm>> = resp.json().await?;
         Ok(page.data.into_iter().map(wire::RawForm::into_neutral).collect())
@@ -547,18 +517,8 @@ impl GenerationStrategy for V2Strategy {
         _directory: Option<&str>,
     ) -> Result<Option<SessionStatus>> {
         let resp = http.client().get(http.url(SESSION_ACTIVE)).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            tracing::warn!(
-                "GET /api/session/active failed: {} — body: {}",
-                status,
-                body_preview(&text)
-            );
-            return Err(crate::error::BridgeError::OpenCode(format!(
-                "session status failed: {}",
-                status
-            )));
+        if !resp.status().is_success() {
+            return Err(read_failure(resp, "session status").await);
         }
         let text = resp.text().await?;
         let active: wire::ActiveSessions = serde_json::from_str(&text).map_err(|e| {
@@ -809,14 +769,10 @@ impl V2Strategy {
         let mut last_read_active;
         loop {
             let response = http.client().get(http.url(SESSION_ACTIVE)).send().await?;
-            let status = response.status();
-            let text = response.text().await?;
-            if !status.is_success() {
-                return Err(crate::error::BridgeError::OpenCode(format!(
-                    "session status failed: {status} — body: {}",
-                    body_preview(&text)
-                )));
+            if !response.status().is_success() {
+                return Err(read_failure(response, "session status").await);
             }
+            let text = response.text().await?;
             let active: wire::ActiveSessions = serde_json::from_str(&text).map_err(|error| {
                 crate::error::BridgeError::OpenCode(format!(
                     "session status parse: {error} — body: {}",

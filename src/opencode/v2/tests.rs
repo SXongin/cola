@@ -1299,8 +1299,9 @@ async fn list_questions_decodes_typed_form_fields_from_the_location_list() {
 
 /// The session-scoped form reply: `POST /api/session/{id}/form/{formID}/reply`
 /// with the keyed `{answer: {key: value}}` object whose values keep the field
-/// types (string / array / boolean / number). A settled form (409) is the same
-/// benign "already handled" outcome as a missing one (404).
+/// types (string / array / boolean / number / integer — the integer stays a
+/// JSON integer, never `3.0`). A settled form (409) is the same benign
+/// "already handled" outcome as a missing one (404).
 #[tokio::test]
 async fn reply_question_posts_the_keyed_typed_answer_object() {
     use crate::opencode::types::{FormAnswer, FormValue};
@@ -1331,7 +1332,11 @@ async fn reply_question_posts_the_keyed_typed_answer_object() {
         },
         FormAnswer {
             key: "q3".into(),
-            value: Some(FormValue::Number(3.0)),
+            value: Some(FormValue::Number(3.5)),
+        },
+        FormAnswer {
+            key: "q4".into(),
+            value: Some(FormValue::Integer(4)),
         },
     ];
     client
@@ -1342,14 +1347,24 @@ async fn reply_question_posts_the_keyed_typed_answer_object() {
     let request = last_request(&server);
     assert_eq!(request.method, "POST");
     assert_eq!(request.path, "/api/session/ses_1/form/frm_1/reply");
+    let body = body_json(&request);
     assert_eq!(
-        body_json(&request),
+        body,
         serde_json::json!({"answer": {
             "q0": "/a",
             "q1": ["apple", "梨"],
             "q2": true,
-            "q3": 3.0,
+            "q3": 3.5,
+            "q4": 4,
         }})
+    );
+    assert!(
+        body["answer"]["q4"].is_i64(),
+        "an integer field must reach the wire as a JSON integer: {body}"
+    );
+    assert!(
+        body["answer"]["q3"].is_f64(),
+        "a number field keeps its fractional value: {body}"
     );
 
     let error = client
