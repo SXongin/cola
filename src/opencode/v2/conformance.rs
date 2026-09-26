@@ -1,8 +1,8 @@
 //! The V2 half of the generation-parameterized conformance suite (spec #364,
 //! "Testing Decisions"). The same neutral scenario bodies run against these
 //! `/api` routes and V2's envelopes (a `{data}` wrapper, a body cursor, an
-//! active map plus the transcript-derived retry). The payload values come from
-//! the shared
+//! active map whose running sessions get their Retry state from the newest
+//! assistant message's `retry` field). The payload values come from the shared
 //! [`SessionReadFixture`](crate::opencode::conformance::SessionReadFixture).
 
 use serde_json::{Map, json};
