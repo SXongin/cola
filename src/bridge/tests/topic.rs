@@ -705,10 +705,10 @@ async fn topic_command_created_topic_routes_messages_to_its_session() {
 
 /// The topic command gate (ADR-0007, ADR-0023) is one rule table
 /// (`Command::topic_rejection`, called from `handle_command`): `/topic` and
-/// its adopt forms are rejected in ANY topic; `/dir`, `/switch` and `/new`
-/// only once the topic is bound. This table drives every class through the
-/// real dispatcher — a banned command gets exactly one rejection reply and
-/// nothing else, an allowed command is never intercepted.
+/// its adopt forms are rejected in ANY topic; `/dir`, `/switch`, `/sub attach`
+/// and `/new` only once the topic is bound. This table drives every class
+/// through the real dispatcher — a banned command gets exactly one rejection
+/// reply and nothing else, an allowed command is never intercepted.
 #[tokio::test]
 async fn topic_command_gate_rejects_banned_commands_and_lets_others_through() {
     use crate::bridge::command::{
@@ -772,6 +772,11 @@ async fn topic_command_gate_rejects_banned_commands_and_lets_others_through() {
             rejection: Some(TOPIC_SELECTION_REJECTION),
         },
         Case {
+            text: "/sub attach ses_x".to_string(),
+            has_session: true,
+            rejection: Some(TOPIC_SELECTION_REJECTION),
+        },
+        Case {
             text: "/new".to_string(),
             has_session: true,
             rejection: Some(TOPIC_SELECTION_REJECTION),
@@ -800,6 +805,19 @@ async fn topic_command_gate_rejects_banned_commands_and_lets_others_through() {
         Case {
             text: "/switch ses_x".to_string(),
             has_session: false,
+            rejection: None,
+        },
+        Case {
+            // An unbound topic passes the gate; with no Active Session the
+            // handler reports that plainly (never a prompt, never a mapping).
+            text: "/sub attach ses_x".to_string(),
+            has_session: false,
+            rejection: None,
+        },
+        // The read-only child view is never gated, bound or not.
+        Case {
+            text: "/sub list".to_string(),
+            has_session: true,
             rejection: None,
         },
         Case {

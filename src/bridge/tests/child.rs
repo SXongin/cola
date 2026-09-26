@@ -427,3 +427,420 @@ async fn sub_status_read_failure_keeps_the_rows_without_a_state() {
         "a status failure is not an empty list: {text}"
     );
 }
+
+/// `/sub attach <id>` adopts a direct child: the chat receives exactly one
+/// Session Snapshot receipt, the child becomes the Active Session, and the
+/// parent stays mapped — `/switch` switches back to it. No prompt is ever sent
+/// into the child (spec #344, ADR-0054).
+#[tokio::test]
+async fn sub_attach_adopts_a_direct_child_and_keeps_the_parent_mapped() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![
+        list_session("ses_root", "根会话", "/work/root", 100),
+        child_of("ses_c1", "重写渲染", "/work/root", 300, "ses_root", "build"),
+        list_session("ses_other", "别的根", "/work/other", 400),
+    ]);
+    let prompts = backend.prompt_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key(), "ses_root", "/work/root"),
+    )
+    .await;
+
+    send_command(&app, "/sub attach ses_c1", "m1").await;
+
+    // Exactly one receipt, and it is the Session Snapshot with the adopt verb.
+    let cards = platform.replied_cards().await;
+    assert_eq!(cards.len(), 1, "one Session Snapshot receipt: {cards:?}");
+    assert!(
+        card_text(&cards[0]).contains("已接管 重写渲染"),
+        "snapshot header: {}",
+        card_text(&cards[0])
+    );
+    assert!(
+        prompts.lock().await.is_empty(),
+        "taking over a child never injects a message into it"
+    );
+
+    // The child is the Active Session with its own directory.
+    let entry = app.sessions.lock().await.get_active(&key()).cloned().unwrap();
+    assert_eq!(entry.session_id, "ses_c1");
+    assert_eq!(entry.directory, "/work/root");
+
+    // The parent stays mapped alongside the child...
+    let mapped: Vec<String> = app
+        .sessions
+        .lock()
+        .await
+        .list_thread(&key())
+        .into_iter()
+        .map(|e| e.session_id.clone())
+        .collect();
+    assert!(
+        mapped.contains(&"ses_c1".to_string()) && mapped.contains(&"ses_root".to_string()),
+        "both parent and child stay mapped: {mapped:?}"
+    );
+
+    // ...and `/switch` still switches back to it.
+    send_command(&app, "/switch ses_root", "m2").await;
+    assert_eq!(
+        app.sessions.lock().await.get_active(&key()).unwrap().session_id,
+        "ses_root",
+        "the parent is still a normal switch target"
+    );
+}
+
+/// The query takes the `/switch` id forms within the child scope: a unique
+/// id-prefix (including the bare card hash) and a unique title substring both
+/// resolve.
+#[tokio::test]
+async fn sub_attach_resolves_id_prefix_and_title_like_switch() {
+    for query in ["child0001", "ses_child0001abcd", "重写渲染"] {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.given_sessions(vec![
+            list_session("ses_root", "根会话", "/work/root", 100),
+            child_of(
+                "ses_child0001abcd",
+                "重写渲染",
+                "/work/root",
+                300,
+                "ses_root",
+                "build",
+            ),
+        ]);
+        let (app, _platform) = build_app(cfg, backend).await;
+        seed_entry(
+            &app,
+            crate::config::SessionEntry::new(key(), "ses_root", "/work/root"),
+        )
+        .await;
+
+        send_command(&app, &format!("/sub attach {query}"), "m1").await;
+
+        assert_eq!(
+            app.sessions.lock().await.get_active(&key()).unwrap().session_id,
+            "ses_child0001abcd",
+            "query {query} adopts the child"
+        );
+    }
+}
+
+/// An ambiguous query lists the candidate children and adopts nothing.
+#[tokio::test]
+async fn sub_attach_ambiguous_query_lists_candidates() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![
+        list_session("ses_root", "根会话", "/work/root", 100),
+        child_of("ses_c1", "任务 A", "/work/root", 300, "ses_root", "build"),
+        child_of("ses_c2", "任务 B", "/work/root", 200, "ses_root", "review"),
+    ]);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key(), "ses_root", "/work/root"),
+    )
+    .await;
+
+    send_command(&app, "/sub attach 任务", "m1").await;
+
+    let text = platform.texts().await.join("\n");
+    assert!(text.contains("找到多个子会话"), "ambiguity is reported: {text}");
+    assert!(
+        text.contains("任务 A") && text.contains("任务 B"),
+        "both candidates are listed: {text}"
+    );
+    assert!(
+        platform.replied_cards().await.is_empty(),
+        "an ambiguous query adopts nothing"
+    );
+    assert_eq!(
+        app.sessions.lock().await.get_active(&key()).unwrap().session_id,
+        "ses_root",
+        "the Active Session is unchanged"
+    );
+}
+
+/// An unknown query reports a plain no-match; nothing is adopted.
+#[tokio::test]
+async fn sub_attach_unknown_query_reports_no_match() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![
+        list_session("ses_root", "根会话", "/work/root", 100),
+        child_of("ses_c1", "重写渲染", "/work/root", 300, "ses_root", "build"),
+    ]);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key(), "ses_root", "/work/root"),
+    )
+    .await;
+
+    send_command(&app, "/sub attach 不存在的子会话", "m1").await;
+
+    let text = platform.texts().await.join("\n");
+    assert!(text.contains("没有匹配的子会话"), "plain no-match: {text}");
+    assert!(platform.replied_cards().await.is_empty(), "nothing adopted");
+    assert_eq!(
+        app.sessions.lock().await.get_active(&key()).unwrap().session_id,
+        "ses_root"
+    );
+}
+
+/// No Active Session (a fresh chat, or a Pending Session — ADR-0041) reports
+/// plainly; there is nothing to attach a child to.
+#[tokio::test]
+async fn sub_attach_without_an_active_session_reports_plainly() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![
+        list_session("ses_root", "根会话", "/work/root", 100),
+        child_of("ses_c1", "重写渲染", "/work/root", 300, "ses_root", "build"),
+    ]);
+    let (app, platform) = build_app(cfg, backend).await;
+
+    send_command(&app, "/sub attach ses_c1", "m1").await;
+
+    let text = platform.texts().await.join("\n");
+    assert!(text.contains("没有活动会话"), "plain no-session report: {text}");
+    assert!(
+        platform.replied_cards().await.is_empty(),
+        "nothing is adopted without an Active Session"
+    );
+}
+
+/// A query that names a session outside the child scope is refused: neither a
+/// sibling root nor a nested descendant (a grandchild) is adoptable here.
+#[tokio::test]
+async fn sub_attach_refuses_a_session_that_is_not_a_direct_child() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![
+        list_session("ses_root", "根会话", "/work/root", 100),
+        child_of("ses_c1", "重写渲染", "/work/root", 300, "ses_root", "build"),
+        child_of("ses_nested", "孙会话", "/work/root", 150, "ses_c1", "build"),
+        list_session("ses_other", "别的根", "/work/other", 400),
+    ]);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key(), "ses_root", "/work/root"),
+    )
+    .await;
+
+    for query in ["ses_other", "别的根", "ses_nested"] {
+        send_command(&app, &format!("/sub attach {query}"), "m1").await;
+        let text = platform.texts().await.join("\n");
+        assert!(
+            text.contains("不是当前会话的直接子会话"),
+            "query {query} is refused as out of scope: {text}"
+        );
+        assert!(
+            platform.replied_cards().await.is_empty(),
+            "query {query} adopts nothing"
+        );
+        assert_eq!(
+            app.sessions.lock().await.get_active(&key()).unwrap().session_id,
+            "ses_root",
+            "query {query} leaves the Active Session unchanged"
+        );
+    }
+}
+
+/// The owner check matches `/switch`: a child mapped to another chat is
+/// refused with its owner info and a `/sub attach ... --force` pointer, and no
+/// mapping is written.
+#[tokio::test]
+async fn sub_attach_owned_child_is_refused_without_force() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![
+        list_session("ses_root", "根会话", "/work/root", 100),
+        child_of("ses_c1", "重写渲染", "/work/root", 300, "ses_root", "build"),
+    ]);
+    let mut platform = RecordingPlatform::new();
+    platform
+        .chat_names
+        .insert("oc_group_other".into(), "隔壁群".into());
+    let platform = Arc::new(platform);
+    let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key(), "ses_root", "/work/root"),
+    )
+    .await;
+    let other = crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(other.clone(), "ses_c1", "/work/root"),
+    )
+    .await;
+
+    send_command(&app, "/sub attach ses_c1", "m1").await;
+
+    let text = platform.texts().await.join("\n");
+    assert!(text.contains("隔壁群"), "the owner chat is named: {text}");
+    assert!(
+        text.contains("/sub attach") && text.contains("--force"),
+        "the refusal points at the sanctioned force form: {text}"
+    );
+    assert!(
+        platform.replied_cards().await.is_empty(),
+        "a refused adoption sends no Session Snapshot"
+    );
+    assert_eq!(
+        app.sessions.lock().await.get_active(&key()).unwrap().session_id,
+        "ses_root",
+        "the child was not stolen"
+    );
+    assert_eq!(
+        app.sessions.lock().await.get_active(&other).unwrap().session_id,
+        "ses_c1",
+        "the other chat keeps its mapping"
+    );
+}
+
+/// `--force` steals a child mapped to another chat: this chat adopts it and the
+/// other chat becomes sessionless (the `/switch --force` semantics on the
+/// scoped path).
+#[tokio::test]
+async fn sub_attach_force_steals_the_child_from_another_chat() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![
+        list_session("ses_root", "根会话", "/work/root", 100),
+        child_of("ses_c1", "重写渲染", "/work/root", 300, "ses_root", "build"),
+    ]);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key(), "ses_root", "/work/root"),
+    )
+    .await;
+    let other = crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(other.clone(), "ses_c1", "/work/root"),
+    )
+    .await;
+
+    send_command(&app, "/sub attach ses_c1 --force", "m1").await;
+
+    assert_eq!(
+        app.sessions.lock().await.get_active(&key()).unwrap().session_id,
+        "ses_c1",
+        "the child is adopted after the steal"
+    );
+    assert!(
+        app.sessions.lock().await.get_active(&other).is_none(),
+        "the old owner becomes sessionless"
+    );
+    let cards = platform.replied_cards().await;
+    assert_eq!(cards.len(), 1, "the steal still ends in one snapshot: {cards:?}");
+    assert!(card_text(&cards[0]).contains("已接管 重写渲染"), "{cards:?}");
+}
+
+/// Re-running `/sub attach` for the already-active child is idempotent: the
+/// reply says so, no Session Snapshot is sent, and the store is not written
+/// again.
+#[tokio::test]
+async fn sub_attach_already_active_child_is_idempotent() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let store_path = dir.path().join("sessions.json");
+    let cfg = test_config(&store_path);
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![
+        list_session("ses_root", "根会话", "/work/root", 100),
+        child_of("ses_c1", "重写渲染", "/work/root", 300, "ses_root", "build"),
+    ]);
+    let (app, platform) = build_app(cfg, backend).await;
+    // The child was already taken over: it is active, the parent stays mapped.
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key(), "ses_root", "/work/root"),
+    )
+    .await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key(), "ses_c1", "/work/root"),
+    )
+    .await;
+    let before = std::fs::read(&store_path).expect("the seeded store is persisted");
+
+    send_command(&app, "/sub attach ses_c1", "m1").await;
+
+    let text = platform.texts().await.join("\n");
+    assert!(text.contains("Already active"), "idempotent reply: {text}");
+    assert!(
+        platform.replied_cards().await.is_empty(),
+        "an already-active child gets no second snapshot"
+    );
+    let after = std::fs::read(&store_path).expect("the store is still readable");
+    assert_eq!(before, after, "no second mapping write");
+    assert_eq!(
+        app.sessions.lock().await.get_active(&key()).unwrap().session_id,
+        "ses_c1"
+    );
+    let mapped = app.sessions.lock().await.list_thread(&key()).len();
+    assert_eq!(mapped, 2, "parent and child stay mapped");
+}
+
+/// Taking over a running child succeeds, and the Session Snapshot reflects its
+/// live state (运行中) rather than hiding it.
+#[tokio::test]
+async fn sub_attach_running_child_snapshot_shows_its_live_state() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![
+        list_session("ses_root", "根会话", "/work/root", 100),
+        child_of("ses_c1", "重写渲染", "/work/root", 300, "ses_root", "build"),
+    ]);
+    backend.with_session_status("ses_c1", Some(SessionStatus::Busy));
+    let prompts = backend.prompt_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key(), "ses_root", "/work/root"),
+    )
+    .await;
+
+    send_command(&app, "/sub attach ses_c1", "m1").await;
+
+    let card = first_card(&platform).await;
+    let text = card_text(&card);
+    assert!(
+        text.contains(crate::feishu::snapshot_card::BUSY_CHIP),
+        "the snapshot shows the child's live run state: {text}"
+    );
+    assert_eq!(
+        app.sessions.lock().await.get_active(&key()).unwrap().session_id,
+        "ses_c1"
+    );
+    assert!(
+        prompts.lock().await.is_empty(),
+        "the running child is never messaged"
+    );
+}

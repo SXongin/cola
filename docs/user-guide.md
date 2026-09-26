@@ -375,6 +375,7 @@ detailed help for any of these.
 | `/switch forget` | Un-map this chat's session (the server session stays) |
 | `/sub` | Child-session card: the current session's direct child sessions, read-only (运行中/空闲 per row) |
 | `/sub list [kw]` | Same card, filtered by keyword (title/dir/id); the filter and page round-trip like `/switch` |
+| `/sub attach <id\|标题> [--force]` | Take over one of the current session's direct child sessions into this chat (Session Snapshot receipt; `--force` steals a mapping owned by another chat) |
 | `/new [name]` | Declare a new session in the current project — created by the next message (no session → default dir) |
 | `/topic [dir] [name]` | Open a new Feishu topic in `<dir>`; its first message creates the session (bare `/topic` uses the current project) |
 | `/topic --adopt <kw> [--force]` | Open a topic around an existing session |
@@ -410,7 +411,19 @@ Notes:
   no transcripts). `list <kw>` narrows by title/dir/id, six rows per page, and
   the keyword/page survive every rebuild like the `/switch` card. A
   conversation with no Active Session (or a Pending Session) opens the plain
-  empty state. Observation only: cola never messages a child from this view.
+  empty state. The `/sub list` view is observation only: it never messages a
+  child. `/sub attach <id|id-prefix|title> [--force]` takes one of the current
+  session's **direct** children over into this chat — the same adoption as
+  `/switch` (Session Snapshot receipt with its pending permissions/questions;
+  an owner refusal naming the other chat unless `--force`, which steals that
+  mapping). The query accepts the same forms as `/switch` (exact id, unique
+  id-prefix, title substring), scoped to those children: unknown and ambiguous
+  queries are reported, and a session that is not a direct child is refused.
+  Taking over a running child is allowed and the snapshot shows its live state.
+  The parent stays mapped, so `/switch` switches back, and re-running `/sub
+  attach` for the already-active child changes nothing. This is cola's only
+  sanctioned way to take over a child; no message is ever injected into a
+  running one (ADR-0054).
 - The `/dir` card's rows are a **union** (ADR-0046): the shared store's session
   directories, the directories cola has mapped — they survive another client
   deleting their sessions — and the conversation's current directory, so 当前
@@ -429,10 +442,10 @@ Notes:
   a real session and keep their "还没有会话" replies on a pending.
 - `/restart-opencode` leaves a server launched by another tool alone — it only
   restarts a server cola started itself.
-- Topic rule: inside a topic already bound to a session, `/switch`, `/new` and
-  `/dir` are rejected — go back to the main conversation. A topic that has never
-  bound a session (including a `/topic`-opened topic still waiting for its first
-  message) can use them to bind its single session.
+- Topic rule: inside a topic already bound to a session, `/switch`, `/new`,
+  `/dir` and `/sub attach` are rejected — go back to the main conversation. A
+  topic that has never bound a session (including a `/topic`-opened topic still
+  waiting for its first message) can use them to bind its single session.
 
 ## FAQ / troubleshooting
 
