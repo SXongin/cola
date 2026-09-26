@@ -6,8 +6,16 @@
 //! (`~/.local/share/opencode`). cola therefore attaches to any OpenCode server
 //! running on the default store (whoever started it — OpenChamber, a manual
 //! `opencode serve`, another tool) and only starts its own when none exists.
+//!
+//! The server's protocol generation is not discovery's call: it is learned by
+//! probing at attach time (`crate::opencode::generation`, spec #364 §2). A V2
+//! managed service (`serve --service`) carries no `--port` flag, so its port
+//! and private password come from the registration file its state dir holds —
+//! the official client's discovery contract.
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+use crate::opencode::strategy::Generation;
 
 /// An `opencode serve` process discovered on the machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +50,26 @@ pub struct ResolvedServer {
     pub url: String,
     pub username: String,
     pub password: String,
+    /// The generation attach detection resolved for this server, with the
+    /// `[opencode] generation` override applied (spec #364 §2). A property of
+    /// the attachment — never guessed, never per-session (ADR-0055).
+    pub(crate) generation: Generation,
+}
+
+impl ResolvedServer {
+    /// The attachment to a server cola started itself. [`spawn_self_server`]
+    /// runs the `opencode` binary (the V1 lineage), so the generation is known
+    /// from the command rather than probed — a probe would also race the
+    /// server's startup window (`wait_for_server_ready` exists for exactly
+    /// that swallowed-request hazard).
+    pub(crate) fn self_started(url: String, password: String) -> Self {
+        Self {
+            url,
+            username: DEFAULT_SERVER_USERNAME.to_string(),
+            password,
+            generation: Generation::V1,
+        }
+    }
 }
 
 /// The data directory OpenCode resolves as its default on every platform.
@@ -66,12 +94,105 @@ fn default_data_home() -> std::path::PathBuf {
 /// The effective basic-auth username of a server, from its environment lines
 /// (`KEY=VALUE` pairs as sysinfo returns them). `OPENCODE_SERVER_USERNAME` if
 /// set, else the server's own default `"opencode"`.
+///
+/// V1 only: a V2 server ignores `OPENCODE_SERVER_USERNAME` and always accepts
+/// the username `opencode` (spec #364 §2), so V2 candidates never consult this.
 fn username_from_env(env: &[String]) -> String {
     env.iter()
         .find_map(|kv| kv.strip_prefix("OPENCODE_SERVER_USERNAME="))
         .filter(|u| !u.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| DEFAULT_SERVER_USERNAME.to_string())
+}
+
+/// The state home of a server process, from its environment lines: the
+/// server's `XDG_STATE_HOME` if set, else `~/.local/state` (OpenCode's
+/// xdg-basedir rule on every platform). Deliberately NOT cola's own
+/// `XDG_STATE_HOME`: a managed service registers where the daemon's own
+/// environment pointed it.
+fn state_home_from_env(env: &[String]) -> std::path::PathBuf {
+    env.iter()
+        .find_map(|kv| kv.strip_prefix("XDG_STATE_HOME="))
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".local")
+                .join("state")
+        })
+}
+
+/// A V2 managed service's registration file (`{id, version, url, pid,
+/// password}`, mode 0600), the official client's discovery contract (spec #364
+/// §2). Only the fields discovery needs are parsed; `id`/`version` are ignored.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+struct ServiceRegistration {
+    url: String,
+    password: String,
+    #[serde(default)]
+    pid: Option<i32>,
+}
+
+/// The port of a registration URL (`http://127.0.0.1:49374`). `None` when the
+/// URL carries no explicit port — this fallback only ever sees a URL the
+/// daemon wrote for itself, which always includes the listening port.
+fn port_from_url(url: &str) -> Option<u16> {
+    url.rsplit(':').next()?.trim_end_matches('/').parse().ok()
+}
+
+/// Read a `serve --service` process's registration file and return its port
+/// and private password. The file lives at
+/// `$XDG_STATE_HOME/opencode/service.json` as the daemon's environment defines
+/// it. A registration whose recorded pid is not the process being scanned is
+/// stale (the daemon self-heals a replaced registration), so it is ignored
+/// rather than attached to through another instance's credentials.
+///
+/// The username is NOT taken from anywhere: it is always `opencode` (the only
+/// one V2 accepts).
+fn service_registration_credentials(env: &[String], pid: i32) -> Option<(u16, String)> {
+    let path = state_home_from_env(env).join("opencode").join("service.json");
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let registration: ServiceRegistration = serde_json::from_str(&raw).ok()?;
+    if registration.pid.is_some_and(|registered| registered != pid) {
+        tracing::debug!(
+            "ignoring stale V2 service registration {} (pid {:?} != {pid})",
+            path.display(),
+            registration.pid
+        );
+        return None;
+    }
+    let port = port_from_url(&registration.url)?;
+    Some((port, registration.password))
+}
+
+/// Resolve one server process's attach credentials — port, username and
+/// password — or `None` when discovery cannot reach it.
+///
+/// A classic `serve --port P` process carries its port in argv and its
+/// credentials in the process environment (V1's model). A V2 managed service
+/// (`serve --service`) has no `--port`; its registration file is the fallback
+/// attach path (spec #364 §2), and its username is fixed at `opencode` so a
+/// poisoned `OPENCODE_SERVER_USERNAME` cannot break the attach.
+fn resolve_credentials(args: &[String], env: &[String], pid: i32) -> Option<(u16, String, String)> {
+    if let Some(port) = args
+        .iter()
+        .position(|a| a == "--port")
+        .and_then(|idx| args.get(idx + 1))
+        .and_then(|p| p.parse::<u16>().ok())
+    {
+        let password = env
+            .iter()
+            .find_map(|kv| kv.strip_prefix("OPENCODE_SERVER_PASSWORD="))
+            .unwrap_or("")
+            .to_string();
+        return Some((port, username_from_env(env), password));
+    }
+    if !args.iter().any(|a| a == "--service") {
+        return None;
+    }
+    let (port, password) = service_registration_credentials(env, pid)?;
+    Some((port, DEFAULT_SERVER_USERNAME.to_string(), password))
 }
 
 /// The sysinfo refresh shape for a server scan.
@@ -117,22 +238,13 @@ pub fn scan_processes() -> Vec<ServerCandidate> {
             if !is_server {
                 return None;
             }
-            let port = args
-                .iter()
-                .position(|a| a == "--port")
-                .and_then(|idx| args.get(idx + 1))
-                .and_then(|p| p.parse().ok())?;
             let env: Vec<String> = proc_
                 .environ()
                 .iter()
                 .map(|s| s.to_string_lossy().into_owned())
                 .collect();
-            let password = env
-                .iter()
-                .find_map(|kv| kv.strip_prefix("OPENCODE_SERVER_PASSWORD="))
-                .unwrap_or("")
-                .to_string();
-            let username = username_from_env(&env);
+            let pid = proc_.pid().as_u32() as i32;
+            let (port, username, password) = resolve_credentials(&args, &env, pid)?;
             let xdg = env
                 .iter()
                 .find_map(|kv| kv.strip_prefix("XDG_DATA_HOME="))
@@ -147,7 +259,7 @@ pub fn scan_processes() -> Vec<ServerCandidate> {
                 Some(home) => home == default_store,
             };
             Some(ServerCandidate {
-                pid: proc_.pid().as_u32() as i32,
+                pid,
                 port,
                 password,
                 username,
@@ -422,13 +534,10 @@ pub async fn spawn_own_server(preferred_port: Option<u16>) -> anyhow::Result<Res
     let password = "cola-secret".to_string();
     spawn_self_server(port, &password)?;
     wait_for_port(port).await?;
-    Ok(ResolvedServer {
-        url: format!("http://localhost:{}", port),
-        // cola's own server strips an inherited username (self_start_command)
-        // and always uses the server default `opencode` — send exactly that.
-        username: DEFAULT_SERVER_USERNAME.to_string(),
+    Ok(ResolvedServer::self_started(
+        format!("http://localhost:{}", port),
         password,
-    })
+    ))
 }
 
 /// Outcome of `/restart-opencode`.
@@ -678,6 +787,125 @@ mod tests {
         assert!(!cmd.is_empty());
         // A non-existent pid yields no cmdline.
         assert!(process_cmd(999_999_999).is_none());
+    }
+
+    /// Environment lines the way sysinfo returns them (`KEY=VALUE`).
+    fn env_lines(pairs: &[(&str, &str)]) -> Vec<String> {
+        pairs.iter().map(|(k, v)| format!("{k}={v}")).collect()
+    }
+
+    #[test]
+    fn port_from_url_requires_an_explicit_port() {
+        assert_eq!(port_from_url("http://127.0.0.1:49374"), Some(49374));
+        assert_eq!(port_from_url("http://127.0.0.1:49374/"), Some(49374));
+        assert_eq!(port_from_url("http://127.0.0.1"), None);
+        assert_eq!(port_from_url("nonsense"), None);
+    }
+
+    #[test]
+    fn state_home_prefers_the_servers_own_xdg_state_home() {
+        let env = env_lines(&[("XDG_STATE_HOME", "/srv/state"), ("PATH", "/usr/bin")]);
+        assert_eq!(state_home_from_env(&env), std::path::PathBuf::from("/srv/state"));
+
+        let default = dirs::home_dir().unwrap().join(".local").join("state");
+        assert_eq!(state_home_from_env(&[]), default);
+        // An empty value falls back like an unset one (xdg-basedir's rule).
+        let empty = env_lines(&[("XDG_STATE_HOME", "")]);
+        assert_eq!(state_home_from_env(&empty), default);
+    }
+
+    #[test]
+    fn port_server_credentials_come_from_argv_and_env() {
+        let args: Vec<String> = [
+            "/usr/bin/opencode",
+            "serve",
+            "--port",
+            "4096",
+            "--hostname",
+            "127.0.0.1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let env = env_lines(&[
+            ("OPENCODE_SERVER_USERNAME", "admin"),
+            ("OPENCODE_SERVER_PASSWORD", "secret"),
+        ]);
+        assert_eq!(
+            resolve_credentials(&args, &env, 7),
+            Some((4096, "admin".to_string(), "secret".to_string()))
+        );
+    }
+
+    /// The V2 managed service has no `--port` flag: its registration file is
+    /// the attach path, and the username is always `opencode` — both a
+    /// poisoned `OPENCODE_SERVER_USERNAME` and a different
+    /// `OPENCODE_SERVER_PASSWORD` in the process env must be ignored.
+    #[test]
+    fn service_credentials_come_from_the_registration_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(state.join("opencode")).unwrap();
+        std::fs::write(
+            state.join("opencode").join("service.json"),
+            r#"{"id":"reg","version":"2.0.18","url":"http://127.0.0.1:49374","pid":42,"password":"reg-pw"}"#,
+        )
+        .unwrap();
+        let env = env_lines(&[
+            ("XDG_STATE_HOME", state.to_str().unwrap()),
+            ("OPENCODE_SERVER_USERNAME", "poison"),
+            ("OPENCODE_SERVER_PASSWORD", "env-pw"),
+        ]);
+        let args: Vec<String> = ["/opt/opencode-v2/opencode", "serve", "--service"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        assert_eq!(
+            resolve_credentials(&args, &env, 42),
+            Some((49374, "opencode".to_string(), "reg-pw".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_stale_registration_pid_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(state.join("opencode")).unwrap();
+        std::fs::write(
+            state.join("opencode").join("service.json"),
+            r#"{"url":"http://127.0.0.1:49374","pid":99,"password":"reg-pw"}"#,
+        )
+        .unwrap();
+        let env = env_lines(&[("XDG_STATE_HOME", state.to_str().unwrap())]);
+        let args: Vec<String> = ["opencode", "serve", "--service"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        assert_eq!(
+            resolve_credentials(&args, &env, 42),
+            None,
+            "pid 99 != scanned pid 42"
+        );
+    }
+
+    #[test]
+    fn a_service_without_a_registration_is_unresolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_lines(&[("XDG_STATE_HOME", dir.path().to_str().unwrap())]);
+        let args: Vec<String> = ["opencode", "serve", "--service"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        assert_eq!(resolve_credentials(&args, &env, 42), None);
+    }
+
+    #[test]
+    fn a_serve_without_a_port_or_service_registration_is_unresolved() {
+        let args: Vec<String> = ["opencode", "serve"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(resolve_credentials(&args, &[], 42), None);
     }
 
     #[test]

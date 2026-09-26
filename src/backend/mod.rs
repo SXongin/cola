@@ -213,10 +213,12 @@ pub trait Backend: Send + Sync {
 
     async fn compact(&self, session_id: &str) -> Result<()>;
 
-    /// Re-point the backend at a different OpenCode server (port/password
-    /// changed because the server was restarted/replaced at runtime). No-op for
-    /// mocks.
-    async fn reconnect(&self, url: &str, password: &str) -> Result<()>;
+    /// Re-point the backend at a (re)discovered attachment, selecting that
+    /// attachment's generation strategy (the server was restarted/replaced at
+    /// runtime, or Lazy Start raised one). `None` goes serverless. The caller
+    /// has already resolved the generation (attach detection, spec #364 §2) —
+    /// this never guesses and never probes. No-op for mocks.
+    async fn reconnect(&self, server: Option<&crate::bridge::discovery::ResolvedServer>) -> Result<()>;
 
     /// The base URL this backend currently targets (used by the reconnect loop
     /// to detect a changed server). Empty when serverless (Lazy Start hasn't

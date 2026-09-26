@@ -25,6 +25,12 @@ app_secret = "your-app-secret"
 #           OpenCode is unavailable.
 #   eager — the old behavior: spawn an own server at boot when none is running.
 # start_server = "auto"
+# Which OpenCode protocol generation cola speaks. `auto` (default) probes the
+# attached server (`GET /api/info`) on every attach/reconnect and logs the
+# evidence; `v1` / `v2` force the generation (a contradicting probe logs a
+# warning). Set this only for a proxy or an unusual build where the probe
+# cannot be trusted.
+# generation = "auto"
 # Model cola's own sessions use by default. It must exist on the server cola
 # attaches to. Optional: when unset (or removed), cola does NOT pin a model and
 # the OpenCode server uses ITS default model — so on most setups you can just

@@ -123,17 +123,29 @@ async fn resolve_opencode_server(
     let candidates = bridge::discovery::scan_processes();
     let self_pid = bridge::discovery::self_spawned_pid();
     if let Some(server) = bridge::discovery::pick_server(&candidates, cfg.preferred_port(), self_pid) {
-        tracing::info!("Attached to OpenCode server at http://localhost:{}", server.port);
-        return Ok(Some(bridge::discovery::ResolvedServer {
-            url: format!("http://localhost:{}", server.port),
-            username: server.username.clone(),
-            password: server.password.clone(),
-        }));
+        // Attach-time generation detection (spec #364 §2): probe the server
+        // with the credentials discovery resolved and log the positive
+        // evidence. An inconclusive probe is never guessed — cola stays
+        // serverless and Lazy Start / the reconnect scan retries. It also
+        // never falls through to the eager spawn below: a server IS running,
+        // so raising a second one against the same store is exactly the
+        // hazard ADR-0013 exists to prevent.
+        return match bridge::attach::resolve_candidate(server, cfg.generation).await {
+            Ok(resolved) => Ok(Some(resolved)),
+            Err(evidence) => {
+                tracing::warn!("generation probe inconclusive; staying serverless: {evidence}");
+                Ok(None)
+            }
+        };
     }
 
     if cfg.start_server == config::ServerStartPolicy::Eager {
         let spawned = bridge::discovery::spawn_own_server(cfg.preferred_port()).await?;
-        tracing::info!("Started cola's own OpenCode server at {}", spawned.url);
+        tracing::info!(
+            "Started cola's own OpenCode server at {} — generation={} (self-started `opencode serve`)",
+            spawned.url,
+            spawned.generation.as_str()
+        );
         return Ok(Some(spawned));
     }
 

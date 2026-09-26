@@ -1,4 +1,5 @@
 pub mod access;
+pub(crate) mod attach;
 pub mod card_handles;
 pub mod command;
 pub mod core;

@@ -687,6 +687,9 @@ pub(crate) struct ServerHandle {
     pub(crate) start_policy: ServerStartPolicy,
     /// Preferred port from `[opencode] url`, a tiebreaker in `pick_server`.
     pub(crate) preferred_port: Option<u16>,
+    /// `[opencode] generation`: the override the reconnect loop applies when
+    /// it re-probes a changed server (spec #364 §2).
+    pub(crate) generation: crate::config::GenerationOverride,
     /// Serializes every server mutation — Lazy Start spawns, the reconnect
     /// loop's re-attach/yield.
     pub(crate) lock: Arc<Mutex<()>>,
