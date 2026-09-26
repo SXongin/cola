@@ -1554,14 +1554,11 @@ async fn handle_sub_attach(
         .sessions
         .cached_session_list(&handles.flow.backend)
         .await?;
-    let archived = |s: &&crate::opencode::types::SessionListInfo| {
-        s.time.as_ref().map(|t| t.is_archived()).unwrap_or(false)
-    };
-    let child_of_active = |s: &&crate::opencode::types::SessionListInfo| {
-        s.parent_id.as_deref() == Some(active_id) && !archived(s)
-    };
-    let children: Vec<crate::opencode::types::SessionListInfo> =
-        sessions.iter().filter(child_of_active).cloned().collect();
+    let children: Vec<crate::opencode::types::SessionListInfo> = sessions
+        .iter()
+        .filter(|s| s.is_child_of(active_id) && !s.is_archived())
+        .cloned()
+        .collect();
     match resolve_session(&children, query) {
         SessionResolution::Hit(s) => {
             adopt_session(handles, thread_key, s, message_id, kind, force, "/sub attach").await
@@ -1610,7 +1607,7 @@ async fn handle_sub_attach(
             // so they read as no-match.
             let out_of_scope: Vec<crate::opencode::types::SessionListInfo> = sessions
                 .iter()
-                .filter(|s| !child_of_active(s) && !archived(s))
+                .filter(|s| !s.is_child_of(active_id) && !s.is_archived())
                 .cloned()
                 .collect();
             match resolve_session(&out_of_scope, query) {
