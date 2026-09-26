@@ -41,6 +41,19 @@ impl SessionListInfo {
     pub fn is_child(&self) -> bool {
         self.parent_id.is_some()
     }
+
+    /// Whether this session is a direct child of `parent_id` (`parentID`
+    /// equals it) — the scoped lookup behind `/sub` and the `/sub attach`
+    /// takeover.
+    pub fn is_child_of(&self, parent_id: &str) -> bool {
+        self.parent_id.as_deref() == Some(parent_id)
+    }
+
+    /// Whether the session is archived (`time.archived` set). A missing `time`
+    /// reads as not archived, like every session surface that excludes them.
+    pub fn is_archived(&self) -> bool {
+        self.time.as_ref().is_some_and(|t| t.is_archived())
+    }
 }
 
 /// An available agent (`GET /agent`, `Agent.Info`): `name`, `mode`
@@ -265,6 +278,8 @@ mod tests {
         assert_eq!(info.time.as_ref().unwrap().created, 1700000000000);
         assert_eq!(info.time.as_ref().unwrap().updated, 1700000100000);
         assert!(info.is_child());
+        assert!(info.is_child_of("ses_parent"));
+        assert!(!info.is_archived());
     }
 
     #[test]
@@ -275,6 +290,8 @@ mod tests {
         )
         .unwrap();
         assert!(info.is_child());
+        assert!(info.is_child_of("ses_parent"));
+        assert!(!info.is_child_of("ses_other"));
         assert_eq!(info.parent_id.as_deref(), Some("ses_parent"));
     }
 
@@ -286,5 +303,16 @@ mod tests {
         )
         .unwrap();
         assert!(info.time.as_ref().unwrap().is_archived());
+        assert!(info.is_archived());
+    }
+
+    /// A missing `time` (or one without `archived`) reads as not archived,
+    /// which the session surfaces rely on when they exclude archived entries.
+    #[test]
+    fn missing_time_is_not_archived() {
+        let info: SessionListInfo =
+            serde_json::from_str(r#"{"id":"ses_a","title":"t","directory":"/w"}"#).unwrap();
+        assert!(!info.is_archived());
+        assert!(!info.is_child());
     }
 }

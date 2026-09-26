@@ -81,7 +81,7 @@ pub(crate) async fn switch_card_data(
         .into_iter()
         .filter(|s| {
             !s.is_child()
-                && !s.time.as_ref().map(|t| t.is_archived()).unwrap_or(false)
+                && !s.is_archived()
                 && if lower.is_empty() {
                     true
                 } else {
@@ -166,8 +166,8 @@ pub(crate) async fn child_card_data(
     let mut children: Vec<crate::opencode::types::SessionListInfo> = sessions
         .into_iter()
         .filter(|s| {
-            s.parent_id.as_deref() == Some(active_id.as_str())
-                && !s.time.as_ref().map(|t| t.is_archived()).unwrap_or(false)
+            s.is_child_of(active_id.as_str())
+                && !s.is_archived()
                 && (lower.is_empty() || matches_keyword(s, &lower))
         })
         .collect();
@@ -242,7 +242,7 @@ pub(crate) async fn dir_card_data(
     // recently active session's `time.updated`.
     let mut by_dir: Vec<(String, i64)> = Vec::new();
     for s in sessions {
-        if s.is_child() || s.time.as_ref().map(|t| t.is_archived()).unwrap_or(false) {
+        if s.is_child() || s.is_archived() {
             continue;
         }
         let updated = s.time.as_ref().map(|t| t.updated).unwrap_or(0);
