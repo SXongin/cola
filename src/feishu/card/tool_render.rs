@@ -142,31 +142,57 @@ pub(crate) const TASK_TOOL: &str = "task";
 /// call plus one read-only line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskLiveness {
-    /// Epoch ms of the child's newest observed activity. Stored as a time, not
-    /// an age: the panel keeps showing a growing age from the last observation
-    /// even while a read fails, instead of freezing a made-up "5s 前".
+    /// The child's current activity: its newest live tool, or the phase its
+    /// newest part implies.
+    pub activity: ChildActivity,
+    /// Epoch ms of the child's newest observed activity: the timer a phase
+    /// (no tool running) counts from. Stored as a time, not an age, so a
+    /// failed read never freezes a made-up "5s".
     pub last_activity_ms: i64,
-    /// The child's newest still-running tool, when it has one.
-    pub current_tool: Option<String>,
     /// The child's pending wait, in the header's own vocabulary (ADR-0054).
     pub wait: Option<AwaitingAction>,
 }
 
+/// What a child session is doing right now, as its transcript reports it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChildActivity {
+    /// The child's newest live tool. `started_at` is the server clock the
+    /// duration counts from; a call with no clock yet shows its name alone.
+    Tool { name: String, started_at: Option<i64> },
+    /// Between steps: nothing live, waiting on the model.
+    Thinking,
+    /// Its newest part is reasoning.
+    Reasoning,
+    /// Its newest part is streamed reply text.
+    Replying,
+}
+
 impl TaskLiveness {
-    /// The title fragment a live task panel appends: the activity age, the
-    /// current tool and the wait, each only when known. `now_ms` is passed in
-    /// so the age is measured at card build time.
+    /// The title fragment a live task panel appends, in the header's own
+    /// shape — the activity first, then how long it has run: `bash 28s`,
+    /// `推理中 12s`, `bash · 等待你的授权`. `now_ms` is passed in so the
+    /// elapsed time is measured at card build time.
     pub fn title_fragment(&self, now_ms: i64) -> String {
-        let ago = ((now_ms - self.last_activity_ms).max(0) / 1000) as u64;
-        let mut parts = vec![format!("{} 前", fmt_elapsed(ago))];
-        if let Some(tool) = &self.current_tool {
-            parts.push(tool.clone());
-        }
+        let (label, at) = match &self.activity {
+            ChildActivity::Tool { name, started_at } => (name.clone(), *started_at),
+            ChildActivity::Thinking => ("思考中".to_string(), Some(self.last_activity_ms)),
+            ChildActivity::Reasoning => ("推理中".to_string(), Some(self.last_activity_ms)),
+            ChildActivity::Replying => ("回复中".to_string(), Some(self.last_activity_ms)),
+        };
+        let mut parts = match at {
+            Some(at) => vec![format!("{label} {}", fmt_elapsed(secs_since(at, now_ms)))],
+            None => vec![label],
+        };
         if let Some(wait) = self.wait.and_then(|wait| wait.label()) {
             parts.push(wait.to_string());
         }
         parts.join(" · ")
     }
+}
+
+/// Seconds between two epoch-ms clocks, never negative.
+fn secs_since(at_ms: i64, now_ms: i64) -> u64 {
+    ((now_ms - at_ms).max(0) / 1000) as u64
 }
 
 /// The text a tool panel renders for a call: the decoder's text blocks joined
@@ -1172,8 +1198,11 @@ mod tests {
             None,
         );
         tool.set_liveness(Some(TaskLiveness {
+            activity: ChildActivity::Tool {
+                name: "bash".into(),
+                started_at: Some(chrono::Utc::now().timestamp_millis() - 12_000),
+            },
             last_activity_ms: chrono::Utc::now().timestamp_millis() - 12_000,
-            current_tool: Some("bash".into()),
             wait: Some(AwaitingAction::Permission),
         }));
         let card = CardBuilder::new()
@@ -1183,8 +1212,8 @@ mod tests {
         let elements = card["body"]["elements"].as_array().unwrap();
         let title = elements[0]["header"]["title"]["content"].as_str().unwrap();
         assert!(
-            title.starts_with("⏳ task · ") && title.contains("前 · bash · 等待你的授权"),
-            "the collapsed task title carries the child liveness: {title}"
+            title.starts_with("⏳ task · ") && title.contains("bash 1") && title.contains("等待你的授权"),
+            "the collapsed task title carries the child activity before its wait: {title}"
         );
     }
 
@@ -1194,8 +1223,8 @@ mod tests {
     fn settled_task_panel_drops_child_liveness() {
         let mut tool = ToolPanel::for_test("task", ToolStatus::Completed, None, Some("done"));
         tool.set_liveness(Some(TaskLiveness {
+            activity: ChildActivity::Thinking,
             last_activity_ms: 1,
-            current_tool: None,
             wait: None,
         }));
         let card = CardBuilder::new()
@@ -1209,25 +1238,39 @@ mod tests {
         );
     }
 
-    /// The fragment composes only the parts that are known; the age alone is
-    /// the floor, and the wait reuses the header's own vocabulary.
+    /// The fragment names the activity first and its elapsed time second —
+    /// the header's own shape. A phase with no tool falls back to the time
+    /// since the newest activity; an untimed tool shows its name alone.
     #[test]
-    fn liveness_fragment_composes_known_parts() {
+    fn liveness_fragment_names_the_activity_before_its_elapsed_time() {
         let now = 1_000_000;
-        let liveness = |ago_ms: i64, tool: Option<&str>, wait| TaskLiveness {
+        let tool = |ago_ms: i64, name: &str| TaskLiveness {
+            activity: ChildActivity::Tool {
+                name: name.into(),
+                started_at: Some(now - ago_ms),
+            },
             last_activity_ms: now - ago_ms,
-            current_tool: tool.map(str::to_string),
-            wait,
+            wait: None,
         };
-        assert_eq!(liveness(5_000, None, None).title_fragment(now), "5s 前");
-        assert_eq!(
-            liveness(90_000, Some("read"), None).title_fragment(now),
-            "1m30s 前 · read"
-        );
-        assert_eq!(
-            liveness(7_200_000, Some("bash"), Some(AwaitingAction::Both)).title_fragment(now),
-            "2h0m 前 · bash · 等待你的授权/回答"
-        );
+        assert_eq!(tool(5_000, "bash").title_fragment(now), "bash 5s");
+        assert_eq!(tool(7_200_000, "bash").title_fragment(now), "bash 2h0m");
+
+        let thinking = TaskLiveness {
+            activity: ChildActivity::Thinking,
+            last_activity_ms: now - 90_000,
+            wait: Some(AwaitingAction::Both),
+        };
+        assert_eq!(thinking.title_fragment(now), "思考中 1m30s · 等待你的授权/回答");
+
+        let untimed = TaskLiveness {
+            activity: ChildActivity::Tool {
+                name: "bash".into(),
+                started_at: None,
+            },
+            last_activity_ms: now - 1_000,
+            wait: None,
+        };
+        assert_eq!(untimed.title_fragment(now), "bash");
     }
 
     /// The child session id is read from a task call's metadata only
