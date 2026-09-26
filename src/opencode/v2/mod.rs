@@ -51,6 +51,11 @@ const SESSION_MESSAGES_SUFFIX: &str = "/message";
 /// page is 50 rows, so 100 pages is 5k sessions — far past any real store.
 const MAX_SESSION_PAGES: usize = 100;
 
+/// How much of a failed response body a status diagnostic carries. One cap for
+/// every warn and error in this module, so no two diagnostics of the same read
+/// truncate differently; a body is a debug aid, not data.
+const BODY_PREVIEW_CHARS: usize = 500;
+
 /// The strategy that speaks the V2 generation.
 pub(crate) struct V2Strategy;
 
@@ -247,7 +252,7 @@ impl GenerationStrategy for V2Strategy {
             tracing::warn!(
                 "GET /api/session/active failed: {} — body: {}",
                 status,
-                &text[..text.len().min(500)]
+                &text[..text.len().min(BODY_PREVIEW_CHARS)]
             );
             return Err(crate::error::BridgeError::OpenCode(format!(
                 "session status failed: {}",
@@ -258,7 +263,7 @@ impl GenerationStrategy for V2Strategy {
         let active: wire::ActiveSessions = serde_json::from_str(&text).map_err(|e| {
             crate::error::BridgeError::OpenCode(format!(
                 "session status parse: {e} — body: {}",
-                &text[..text.len().min(300)]
+                &text[..text.len().min(BODY_PREVIEW_CHARS)]
             ))
         })?;
         Ok(match active.state(session_id) {
@@ -345,14 +350,14 @@ impl V2Strategy {
             let text = resp.text().await.unwrap_or_default();
             return Err(crate::error::BridgeError::OpenCode(format!(
                 "session retry read failed: {status} — body: {}",
-                &text[..text.len().min(300)]
+                &text[..text.len().min(BODY_PREVIEW_CHARS)]
             )));
         }
         let text = resp.text().await?;
         let page: wire::MessagesPage = serde_json::from_str(&text).map_err(|e| {
             crate::error::BridgeError::OpenCode(format!(
                 "session retry read parse: {e} — body: {}",
-                &text[..text.len().min(300)]
+                &text[..text.len().min(BODY_PREVIEW_CHARS)]
             ))
         })?;
         Ok(page.newest_assistant_retrying())
