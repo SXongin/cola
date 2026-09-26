@@ -109,6 +109,7 @@ async fn run(
                     &handles.cards,
                     &handles.sessions,
                     &handles.backend,
+                    &handles.requests,
                     &session_id,
                     &transcript,
                 )
@@ -134,6 +135,7 @@ async fn run(
                     &handles.cards,
                     &handles.sessions,
                     &handles.backend,
+                    &handles.requests,
                     &session_id,
                     &transcript,
                 )

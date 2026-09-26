@@ -588,6 +588,7 @@ async fn external_render_loop(
             &handles.cards,
             &handles.sessions,
             &handles.backend,
+            &handles.requests,
             &session_id,
             &transcript,
         )

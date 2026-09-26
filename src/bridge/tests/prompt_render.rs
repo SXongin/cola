@@ -732,6 +732,7 @@ async fn render_poll_shows_live_context_and_memoizes_the_window() {
         &app.cards_handle(),
         &app.sessions_handle(),
         &app.opencode,
+        &app.requests_handle(),
         sid,
         &transcript(42_000),
     )
@@ -755,6 +756,7 @@ async fn render_poll_shows_live_context_and_memoizes_the_window() {
         &app.cards_handle(),
         &app.sessions_handle(),
         &app.opencode,
+        &app.requests_handle(),
         sid,
         &transcript(55_000),
     )
