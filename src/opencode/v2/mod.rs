@@ -216,29 +216,30 @@ impl GenerationStrategy for V2Strategy {
     }
 
     /// The run state for ONE session (V2 `GET /api/session/active`), with the
-    /// retry state derived from the transcript's assistant `retry` field.
+    /// retry state derived from the newest assistant message's `retry` field.
     ///
-    /// V2 has no retry status: the active map only carries `{type:"running"}`
-    /// and a scheduled retry keeps the session's drain active, so the map alone
-    /// cannot tell retry from running. The neutral view keeps Idle/Busy/Retry
-    /// (the Session Snapshot's status line), so cola reads the newest assistant
-    /// message and maps a scheduled `retry` to [`SessionStatus::Retry`] **ahead
-    /// of** the active map. No transcript decode is involved (slice S4b): the
-    /// read asks only for the newest assistant message.
+    /// V2 has no retry entry: the active map only carries `{type:"running"}`,
+    /// and a scheduled retry keeps the session's drain active, so a retrying
+    /// session is indistinguishable from a running one by the map alone. The
+    /// neutral view keeps Idle/Busy/Retry (the Session Snapshot's status line),
+    /// so an ACTIVE session's newest assistant message is read and a scheduled
+    /// `retry` wins over Running. That second read is paid only for active
+    /// sessions — absence from the map is idle (the server's own contract)
+    /// with no extra request — and a failed assistant read degrades to Running
+    /// with a warning rather than failing the run state: the active map already
+    /// answered the primary question, and a transient read failure must not
+    /// finalize a live Turn. No transcript decode is involved (slice S4b).
     ///
-    /// Absence from the active map is idle (the server's own contract). An
-    /// active entry whose type cola does not recognise yields `Ok(None)` —
-    /// never guessed — matching the V1 read. Both paths are global across
-    /// locations; `directory` is ignored (V2 scopes by session id).
+    /// An active entry whose type cola does not recognise yields `Ok(None)` —
+    /// never guessed — matching the V1 read; a failed active-map read is an
+    /// error, as on V1. Both paths are global across locations; `directory` is
+    /// ignored (V2 scopes by session id).
     async fn session_status(
         &self,
         http: &Transport,
         session_id: &str,
         _directory: Option<&str>,
     ) -> Result<Option<SessionStatus>> {
-        if self.newest_assistant_retrying(http, session_id).await? {
-            return Ok(Some(SessionStatus::Retry));
-        }
         let resp = http.client().get(http.url(SESSION_ACTIVE)).send().await?;
         let status = resp.status();
         if !status.is_success() {
@@ -261,7 +262,19 @@ impl GenerationStrategy for V2Strategy {
             ))
         })?;
         Ok(match active.state(session_id) {
-            Some(true) => Some(SessionStatus::Busy),
+            // Running: the retry field can only be set while the drain owns the
+            // session, so this is where the second read is worth paying.
+            Some(true) => match self.newest_assistant_retrying(http, session_id).await {
+                Ok(true) => Some(SessionStatus::Retry),
+                Ok(false) => Some(SessionStatus::Busy),
+                // The active map already said the session is running; a failed
+                // retry read degrades to that, with the retry-read error (and
+                // its body) in the warning.
+                Err(error) => {
+                    tracing::warn!("session {session_id} run state: {error}; reporting running");
+                    Some(SessionStatus::Busy)
+                }
+            },
             // Present but with an unrecognised type: never guessed.
             Some(false) => None,
             None => Some(SessionStatus::Idle),
@@ -317,7 +330,8 @@ impl V2Strategy {
     /// Whether the newest assistant message of `session_id` carries a scheduled
     /// `retry`. Reads ONE projected message (`type=assistant&order=desc&
     /// limit=1`) — the minimal wire read that answers the run-state question
-    /// without decoding the transcript (S4b).
+    /// without decoding the transcript (S4b). Failures name the retry read, so
+    /// a caller can tell them apart from the active-map read.
     async fn newest_assistant_retrying(&self, http: &Transport, session_id: &str) -> Result<bool> {
         let mut url =
             reqwest::Url::parse(&http.url(&format!("{SESSION}/{session_id}{SESSION_MESSAGES_SUFFIX}")))?;
@@ -329,14 +343,9 @@ impl V2Strategy {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            tracing::warn!(
-                "GET /api/session/{session_id}/message (retry read) failed: {} — body: {}",
-                status,
-                &text[..text.len().min(500)]
-            );
             return Err(crate::error::BridgeError::OpenCode(format!(
-                "session status failed: {}",
-                status
+                "session retry read failed: {status} — body: {}",
+                &text[..text.len().min(300)]
             )));
         }
         let text = resp.text().await?;

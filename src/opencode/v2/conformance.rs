@@ -1,11 +1,13 @@
 //! The V2 half of the generation-parameterized conformance suite (spec #364,
 //! "Testing Decisions"). The same neutral scenario bodies run against these
 //! `/api` routes and V2's envelopes (a `{data}` wrapper, a body cursor, an
-//! active map plus the transcript-derived retry).
+//! active map plus the transcript-derived retry). The payload values come from
+//! the shared
+//! [`SessionReadFixture`](crate::opencode::conformance::SessionReadFixture).
 
-use serde_json::json;
+use serde_json::{Map, json};
 
-use crate::opencode::conformance::{SessionReadCase, SessionReadIds};
+use crate::opencode::conformance::{SessionReadCase, SessionReadFixture};
 use crate::opencode::strategy::Generation;
 use crate::test_http::{MockResponse, TestHttpServer};
 
@@ -18,7 +20,7 @@ pub(crate) fn session_read_case() -> SessionReadCase {
     }
 }
 
-fn mount(server: &TestHttpServer) -> SessionReadIds {
+fn mount(server: &TestHttpServer, fixture: &SessionReadFixture) {
     // Two pages plus the terminating empty page: V2 emits `cursor.next` for
     // every non-empty page, so the follow-up always sees an end-of-list page.
     server.route_sequence(
@@ -29,18 +31,18 @@ fn mount(server: &TestHttpServer) -> SessionReadIds {
                 json!({
                     "data": [
                         {
-                            "id": "ses_new",
-                            "title": "新",
-                            "agent": "build",
-                            "model": {"id": "deepseek-v4-flash", "providerID": "opencode-go"},
-                            "location": {"directory": "/work/cola"},
+                            "id": fixture.newest,
+                            "title": fixture.title,
+                            "agent": fixture.agent,
+                            "model": {"id": fixture.model, "providerID": fixture.provider},
+                            "location": {"directory": fixture.directory},
                             "time": {"created": 1, "updated": 3},
                         },
                         {
-                            "id": "ses_child",
-                            "title": "子会话",
-                            "parentID": "ses_parent",
-                            "location": {"directory": "/work/cola"},
+                            "id": fixture.child,
+                            "title": fixture.child_title,
+                            "parentID": fixture.parent,
+                            "location": {"directory": fixture.directory},
                             "time": {"created": 1, "updated": 2},
                         }
                     ],
@@ -51,9 +53,9 @@ fn mount(server: &TestHttpServer) -> SessionReadIds {
             MockResponse::json(
                 json!({
                     "data": [{
-                        "id": "ses_old",
-                        "title": "旧",
-                        "location": {"directory": "/work/other"},
+                        "id": fixture.oldest,
+                        "title": fixture.other_title,
+                        "location": {"directory": fixture.other_directory},
                         "time": {"created": 1, "updated": 1},
                     }],
                     "cursor": {"next": "c2"},
@@ -65,25 +67,32 @@ fn mount(server: &TestHttpServer) -> SessionReadIds {
     );
     server.route(
         "GET",
-        "/api/session/ses_child",
+        &format!("/api/session/{}", fixture.child),
         200,
         json!({
             "data": {
-                "id": "ses_child",
-                "parentID": "ses_parent",
-                "title": "子会话",
-                "model": {"providerID": "opencode-go", "id": "deepseek-v4-flash"},
-                "location": {"directory": "/work/cola"},
+                "id": fixture.child,
+                "parentID": fixture.parent,
+                "title": fixture.child_title,
+                "model": {"providerID": fixture.provider, "id": fixture.model},
+                "location": {"directory": fixture.directory},
                 "time": {"created": 1, "updated": 2},
             },
         })
         .to_string(),
     );
+    // The active map is keyed by session id, so it is built rather than
+    // literal-keyed. Both the running and the retrying fixture sessions are
+    // active: a scheduled retry keeps the drain active (that is why the retry
+    // read is only paid for active sessions).
+    let mut active = Map::new();
+    active.insert(fixture.busy.to_string(), json!({"type": "running"}));
+    active.insert(fixture.retrying.to_string(), json!({"type": "running"}));
     server.route(
         "GET",
         "/api/session/active",
         200,
-        json!({"data": {"ses_busy": {"type": "running"}}}).to_string(),
+        json!({"data": active}).to_string(),
     );
     // The retry derivation's minimal assistant read: clear for everyone except
     // the retrying session, whose newest assistant carries the field.
@@ -95,7 +104,7 @@ fn mount(server: &TestHttpServer) -> SessionReadIds {
     );
     server.route(
         "GET",
-        "/api/session/ses_retry/message",
+        &format!("/api/session/{}/message", fixture.retrying),
         200,
         json!({
             "data": [{"type": "assistant", "retry": {"attempt": 1, "at": 5000, "error": {"message": "boom"}}}],
@@ -103,20 +112,4 @@ fn mount(server: &TestHttpServer) -> SessionReadIds {
         })
         .to_string(),
     );
-
-    SessionReadIds {
-        newest: "ses_new",
-        child: "ses_child",
-        oldest: "ses_old",
-        parent: "ses_parent",
-        directory: "/work/cola",
-        other_directory: "/work/other",
-        title: "新",
-        child_title: "子会话",
-        provider: "opencode-go",
-        model: "deepseek-v4-flash",
-        idle: "ses_idle",
-        busy: "ses_busy",
-        retrying: "ses_retry",
-    }
 }

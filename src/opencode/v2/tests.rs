@@ -248,8 +248,8 @@ async fn update_title_and_delete_accept_204_without_a_success_body() {
 }
 
 /// The run-state read: `session.active` says only `{type:"running"}`; absence
-/// is idle; the newest assistant message's `retry` field maps to Retry ahead of
-/// the active map (a scheduled retry keeps the drain active).
+/// is idle; an active session's newest assistant message's `retry` field maps
+/// to Retry ahead of Running. The retry read is paid only for active sessions.
 #[tokio::test]
 async fn session_status_derives_retry_from_the_newest_assistant_message() {
     let server = TestHttpServer::start().await;
@@ -260,6 +260,7 @@ async fn session_status_derives_retry_from_the_newest_assistant_message() {
         serde_json::json!({
             "data": {
                 "ses_busy": {"type": "running"},
+                "ses_retry": {"type": "running"},
                 "ses_weird": {"type": "zombie"},
             },
         })
@@ -291,7 +292,7 @@ async fn session_status_derives_retry_from_the_newest_assistant_message() {
             .await
             .unwrap(),
         Some(SessionStatus::Retry),
-        "a scheduled retry is Retry even while the session is active"
+        "a scheduled retry is Retry while the session is active"
     );
     assert_eq!(
         client.session_status("ses_busy", None).await.unwrap(),
@@ -308,33 +309,33 @@ async fn session_status_derives_retry_from_the_newest_assistant_message() {
         "an unrecognised active type is never guessed"
     );
 
-    // The retry read asks the server for exactly the newest assistant message
-    // and happens BEFORE the active map, so a retrying session is one request.
-    let retry_read = request_at(&server, 0);
+    // The active map is the first and only read for idle/unknown sessions; an
+    // active one pays one more request for the newest assistant message.
+    let active = request_at(&server, 0);
+    assert_eq!(active.path, "/api/session/active");
+    assert_eq!(active.query, "", "the active map is global; no directory scope");
+    let retry_read = request_at(&server, 1);
     assert_eq!(retry_read.path, "/api/session/ses_retry/message");
     assert_eq!(retry_read.query_param("type").as_deref(), Some("assistant"));
     assert_eq!(retry_read.query_param("order").as_deref(), Some("desc"));
     assert_eq!(retry_read.query_param("limit").as_deref(), Some("1"));
-    assert_eq!(request_at(&server, 1).path, "/api/session/ses_busy/message");
-    let active = request_at(&server, 2);
-    assert_eq!(active.path, "/api/session/active");
-    assert_eq!(active.query, "", "the active map is global; no directory scope");
-    assert_eq!(request_at(&server, 3).path, "/api/session/ses_idle/message");
+    assert_eq!(request_at(&server, 2).path, "/api/session/active");
+    assert_eq!(request_at(&server, 3).path, "/api/session/ses_busy/message");
     assert_eq!(request_at(&server, 4).path, "/api/session/active");
-    assert_eq!(server.request_count(), 7, "retry=1, busy=2, idle=2, weird=2");
+    assert_eq!(request_at(&server, 5).path, "/api/session/active");
+    assert_eq!(
+        server.request_count(),
+        6,
+        "retry=2, busy=2, idle=1 (no retry read), weird=1 (no retry read)"
+    );
 }
 
 /// Both status reads surface their failures: the active map's non-success and
-/// garbled body, and the retry read's non-success.
+/// garbled body hard-fail, while a failed retry read degrades to Running with
+/// a warning (the active map already answered the primary question).
 #[tokio::test]
 async fn session_status_surfaces_failures() {
     let failed = TestHttpServer::start().await;
-    failed.route(
-        "GET",
-        "/api/session/",
-        200,
-        serde_json::json!({"data": [], "cursor": {}}).to_string(),
-    );
     failed.route("GET", "/api/session/active", 500, r#"{"message":"boom"}"#);
     let client = v2_wire_client(&failed);
     let message = opencode_error(client.session_status("ses_1", None).await.unwrap_err());
@@ -342,12 +343,6 @@ async fn session_status_surfaces_failures() {
     assert!(message.contains("500"), "unexpected: {message}");
 
     let garbled = TestHttpServer::start().await;
-    garbled.route(
-        "GET",
-        "/api/session/",
-        200,
-        serde_json::json!({"data": [], "cursor": {}}).to_string(),
-    );
     garbled.route_raw(
         "GET",
         "/api/session/active",
@@ -360,12 +355,53 @@ async fn session_status_surfaces_failures() {
     assert!(message.contains("session status parse"), "unexpected: {message}");
     assert!(message.contains("nope"), "unexpected: {message}");
 
+    // A failed retry read never fails the status: the active map said running.
     let retry_down = TestHttpServer::start().await;
+    retry_down.route(
+        "GET",
+        "/api/session/active",
+        200,
+        serde_json::json!({"data": {"ses_1": {"type": "running"}}}).to_string(),
+    );
     retry_down.route("GET", "/api/session/ses_1/message", 500, r#"{"message":"boom"}"#);
     let client = v2_wire_client(&retry_down);
-    let message = opencode_error(client.session_status("ses_1", None).await.unwrap_err());
-    assert!(message.contains("session status failed"), "unexpected: {message}");
-    assert_eq!(last_request(&retry_down).path, "/api/session/ses_1/message");
+    let (status, logs) =
+        crate::bridge::test_support::capture_logs(async { client.session_status("ses_1", None).await }).await;
+    assert_eq!(
+        status.unwrap(),
+        Some(SessionStatus::Busy),
+        "the failed retry read degrades to Running"
+    );
+    let warning = crate::bridge::test_support::assert_line_level(&logs, "session retry read failed", "WARN");
+    assert!(
+        warning.contains("session ses_1") && warning.contains("500"),
+        "the warning names the session and the status: {warning}"
+    );
+
+    // The same applies to a garbled retry read.
+    let retry_garbled = TestHttpServer::start().await;
+    retry_garbled.route(
+        "GET",
+        "/api/session/active",
+        200,
+        serde_json::json!({"data": {"ses_1": {"type": "running"}}}).to_string(),
+    );
+    retry_garbled.route_raw(
+        "GET",
+        "/api/session/ses_1/message",
+        200,
+        "text/html",
+        "<html>nope</html>",
+    );
+    let client = v2_wire_client(&retry_garbled);
+    let (status, logs) =
+        crate::bridge::test_support::capture_logs(async { client.session_status("ses_1", None).await }).await;
+    assert_eq!(status.unwrap(), Some(SessionStatus::Busy));
+    let warning = crate::bridge::test_support::assert_line_level(&logs, "session retry read parse", "WARN");
+    assert!(
+        warning.contains("nope"),
+        "the warning carries the body: {warning}"
+    );
 }
 
 /// Attaching to V2 must never pretend a missing capability worked: a caller
