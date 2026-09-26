@@ -630,7 +630,7 @@ async fn main() -> anyhow::Result<()> {
 
     let feishu_client = feishu::client::Client::new(cfg.feishu.clone());
 
-    let opencode_client = opencode::client::Client::new(cfg.opencode.model.as_deref(), server);
+    let opencode_client = opencode::client::OpenCodeBackend::new(cfg.opencode.model.as_deref(), server);
     let app = Arc::new(bridge::App::new(
         cfg.clone(),
         Arc::new(opencode_client),

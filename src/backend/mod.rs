@@ -11,7 +11,7 @@
 //! normalized where it is displayed (`bridge::display::model_display`).
 //!
 //! Every caller imports these traits from here, never from the adapter; the
-//! HTTP adapter ([`crate::opencode::client::Client`]) and the test mock
+//! HTTP adapter ([`crate::opencode::client::OpenCodeBackend`]) and the test mock
 //! implement them.
 
 pub mod transcript;
@@ -52,7 +52,7 @@ pub trait DirectoryBackend: Send + Sync {
 
 /// The single concrete [`DirectoryBackend`]: wraps any [`Backend`] and forwards
 /// the carried directory into its directory-scoped methods. Both the real
-/// [`Client`](crate::opencode::client::Client) and test mocks produce this via
+/// [`OpenCodeBackend`](crate::opencode::client::OpenCodeBackend) and test mocks produce this via
 /// [`Backend::for_directory`], so the directory-scoped seam is implemented once.
 pub struct BackendDirectory {
     backend: Arc<dyn Backend>,
@@ -100,7 +100,7 @@ impl DirectoryBackend for BackendDirectory {
 
 /// The backend, abstracted so tests can drive the bridge with canned responses
 /// instead of a live server. The real implementation is the adapter's
-/// [`Client`](crate::opencode::client::Client); mock implementations feed
+/// [`OpenCodeBackend`](crate::opencode::client::OpenCodeBackend); mock implementations feed
 /// scripted transcripts/permissions and verify what cola renders from them.
 #[async_trait]
 pub trait Backend: Send + Sync {
