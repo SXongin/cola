@@ -7,9 +7,10 @@
 //! generation-blind and reaches this module only through the
 //! [`GenerationStrategy`] trait, so **deleting this module is V1 retirement**.
 //!
-//! Session creation and compaction are not here: they use the `/api` surface
-//! both generations serve and live on the generation-blind adapter instead
-//! (`OpenCodeBackend::create_session` / `compact`).
+//! Session creation is not here: `POST /api/session` is served identically by
+//! both generations and lives on the generation-blind adapter instead
+//! (`OpenCodeBackend::create_session`). Compaction is here despite its `/api`
+//! path — V1's bodyless/204 contract is this generation's own shape.
 
 mod wire;
 

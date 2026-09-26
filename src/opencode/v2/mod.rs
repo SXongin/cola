@@ -12,11 +12,14 @@
 //! S4a is the session-level read surface: list/get/update/delete, and the run
 //! state (`session.active`) with the retry status derived from the newest
 //! assistant message's `retry` field. S4b is the transcript decode proper,
-//! behind [`V2Strategy::transcript`] and the private [`wire`] module.
+//! behind [`V2Strategy::transcript`] and the private [`wire`] module. S5 is
+//! the write surface: prompt dispatch (admit + `session.wait`/poll polyfill),
+//! the steer supplement, interrupt and compact.
 //!
-//! The shared `/api/session` create/compact calls are NOT here: both
-//! generations serve them, so they live on the generation-blind adapter
-//! (`OpenCodeBackend::create_session` / `compact`).
+//! Session creation (`POST /api/session`) is NOT here: both generations serve
+//! that request identically, so it lives on the generation-blind adapter
+//! (`OpenCodeBackend::create_session`). Compaction is here — the path is
+//! shared, but V2's body/response contract is not.
 
 mod wire;
 
@@ -60,7 +63,26 @@ const SESSION_MESSAGES_SUFFIX: &str = "/message";
 /// How long the poll fallback waits between `session.active` reads. The wait
 /// endpoint resolves as soon as the drain settles; the fallback matches that
 /// latency closely enough for a card that renders on its own poll anyway.
-const IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+const IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How many consecutive absent reads the fallback requires before it trusts
+/// "idle". A single absence cannot distinguish "the run finished before the
+/// first read" from "the server has not registered the run yet": the prompt
+/// admit only *schedules* execution, so absence is confirmed across a bounded
+/// window ([`IDLE_CONFIRMATIONS`] × [`IDLE_POLL_INTERVAL`]) instead of being
+/// believed once. v2.0.18 registers the execution synchronously inside the
+/// prompt handler, but the fallback must stay correct for a server that
+/// schedules asynchronously.
+const IDLE_CONFIRMATIONS: usize = 3;
+
+/// The poll fallback's overall backstop: how long it follows `session.active`
+/// before giving up. This is not a turn limit — V1's blocking prompt has no
+/// client deadline at all and real turns run long — so it is sized past any
+/// plausible turn. On expiry the fallback stops observing with a WARN and the
+/// prompt returns the turn as read so far; the Bridge's own drain and status
+/// read then decide completion (a still-running turn is followed, never
+/// falsely finalized).
+const IDLE_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// Hard stop for the body-cursor follow in [`V2Strategy::list_sessions`]: a
 /// misbehaving server must not spin the client forever. The server's default
@@ -84,6 +106,16 @@ const BODY_PREVIEW_CHARS: usize = 500;
 
 /// The strategy that speaks the V2 generation.
 pub(crate) struct V2Strategy;
+
+/// The first [`BODY_PREVIEW_CHARS`] characters of a failed response body, for a
+/// diagnostic. Char-based, so truncating a multi-byte body can never split a
+/// character and panic.
+fn body_preview(body: &str) -> &str {
+    match body.char_indices().nth(BODY_PREVIEW_CHARS) {
+        Some((index, _)) => &body[..index],
+        None => body,
+    }
+}
 
 /// The visible failure text of a capability that has not landed yet: names the
 /// method and the generation, so an attached V2 server's missing surface is
@@ -109,6 +141,27 @@ fn not_implemented_error(method: &str) -> crate::error::BridgeError {
 fn is_session_not_found(body: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(body)
         .is_ok_and(|value| value.get("_tag").and_then(|tag| tag.as_str()) == Some("SessionNotFoundError"))
+}
+
+/// Consume a failed write-path response into the neutral error: a tagged
+/// `SessionNotFoundError` becomes the bridge's SessionNotFound (the taxonomy
+/// the recreate-and-retry heal reads), anything else an OpenCode error naming
+/// the operation (`"prompt"`, `"interrupt"`), the session and a body preview.
+/// One mapping for every write call, so their diagnostics cannot drift.
+async fn write_failure(
+    response: reqwest::Response,
+    session_id: &str,
+    what: &str,
+) -> crate::error::BridgeError {
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if status == reqwest::StatusCode::NOT_FOUND && is_session_not_found(&body) {
+        return crate::error::BridgeError::SessionNotFound(session_id.to_string());
+    }
+    crate::error::BridgeError::OpenCode(format!(
+        "{what} {session_id} failed: HTTP {status} — {}",
+        body_preview(&body)
+    ))
 }
 
 /// The response for an admitted prompt whose reply could not be assembled
@@ -360,7 +413,7 @@ impl GenerationStrategy for V2Strategy {
             tracing::warn!(
                 "GET /api/session/active failed: {} — body: {}",
                 status,
-                &text[..text.len().min(BODY_PREVIEW_CHARS)]
+                body_preview(&text)
             );
             return Err(crate::error::BridgeError::OpenCode(format!(
                 "session status failed: {}",
@@ -371,7 +424,7 @@ impl GenerationStrategy for V2Strategy {
         let active: wire::ActiveSessions = serde_json::from_str(&text).map_err(|e| {
             crate::error::BridgeError::OpenCode(format!(
                 "session status parse: {e} — body: {}",
-                &text[..text.len().min(BODY_PREVIEW_CHARS)]
+                body_preview(&text)
             ))
         })?;
         Ok(match active.state(session_id) {
@@ -444,18 +497,10 @@ impl GenerationStrategy for V2Strategy {
             .post(http.url(&format!("{SESSION}/{session_id}{SESSION_INTERRUPT_SUFFIX}")))
             .send()
             .await?;
-        let status = response.status();
-        if status.is_success() {
-            return Ok(());
+        if !response.status().is_success() {
+            return Err(write_failure(response, session_id, "interrupt").await);
         }
-        let text = response.text().await.unwrap_or_default();
-        if status == reqwest::StatusCode::NOT_FOUND && is_session_not_found(&text) {
-            return Err(crate::error::BridgeError::SessionNotFound(session_id.to_string()));
-        }
-        Err(crate::error::BridgeError::OpenCode(format!(
-            "interrupt {session_id} failed: HTTP {status} — {}",
-            &text[..text.len().min(BODY_PREVIEW_CHARS)]
-        )))
+        Ok(())
     }
 
     /// Compact the session's context (`POST /api/session/{id}/compact`). V2
@@ -519,22 +564,15 @@ impl V2Strategy {
             .json(&body)
             .send()
             .await?;
-        let status = response.status();
-        let text_body = response.text().await?;
-        if !status.is_success() {
-            if status == reqwest::StatusCode::NOT_FOUND && is_session_not_found(&text_body) {
-                return Err(crate::error::BridgeError::SessionNotFound(session_id.to_string()));
-            }
-            return Err(crate::error::BridgeError::OpenCode(format!(
-                "prompt {session_id} failed: HTTP {status} — {}",
-                &text_body[..text_body.len().min(BODY_PREVIEW_CHARS)]
-            )));
+        if !response.status().is_success() {
+            return Err(write_failure(response, session_id, "prompt").await);
         }
+        let text_body = response.text().await?;
         let admitted: wire::DataEnvelope<wire::RawAdmittedPrompt> = serde_json::from_str(&text_body)
             .map_err(|error| {
                 crate::error::BridgeError::OpenCode(format!(
                     "prompt admit decode: {error} — body: {}",
-                    &text_body[..text_body.len().min(BODY_PREVIEW_CHARS)]
+                    body_preview(&text_body)
                 ))
             })?;
         Ok(admitted.data.id)
@@ -555,7 +593,7 @@ impl V2Strategy {
                     "session {session_id}: wait endpoint unavailable ({reason}); \
                      falling back to session.active polling"
                 );
-                self.poll_until_idle(http, session_id).await
+                self.poll_until_idle(http, session_id, IDLE_POLL_TIMEOUT).await
             }
         }
     }
@@ -585,16 +623,36 @@ impl V2Strategy {
         }
         Err(WaitFailure::Unavailable(format!(
             "HTTP {status} — {}",
-            &text[..text.len().min(BODY_PREVIEW_CHARS)]
+            body_preview(&text)
         )))
     }
 
-    /// Poll `GET /api/session/active` until the session is absent — the same
-    /// event the `wait` endpoint resolves on (an execution owns the session
-    /// until its last successor settles). An entry with a type this build does
-    /// not recognise still counts as active: only absence means idle, never a
-    /// guess.
-    async fn poll_until_idle(&self, http: &Transport, session_id: &str) -> Result<()> {
+    /// Poll `GET /api/session/active` until the session has been absent for
+    /// [`IDLE_CONFIRMATIONS`] consecutive reads — the same event the `wait`
+    /// endpoint resolves on (an execution owns the session until its last
+    /// successor settles). An entry with a type this build does not recognise
+    /// still counts as active: only confirmed absence means idle, never a guess.
+    ///
+    /// Absence is confirmed rather than believed once: the prompt admit only
+    /// schedules execution, so a first read can precede the run's registration
+    /// on a server that schedules asynchronously (v2.0.18 registers
+    /// synchronously, but the fallback must not depend on that), and believing
+    /// it would return a live turn as an empty reply.
+    ///
+    /// `timeout` bounds the whole fallback (see [`IDLE_POLL_TIMEOUT`] for the
+    /// production value): when it passes, the loop warns and stops observing —
+    /// the caller returns the turn as read so far and the Bridge's own
+    /// drain/status read decides completion instead of this call hanging the
+    /// Turn forever. Returns `Err` only when a read itself fails; a garbled
+    /// active map is an error, never a silent idle.
+    async fn poll_until_idle(
+        &self,
+        http: &Transport,
+        session_id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut absent_reads = 0usize;
         loop {
             let response = http.client().get(http.url(SESSION_ACTIVE)).send().await?;
             let status = response.status();
@@ -602,16 +660,29 @@ impl V2Strategy {
             if !status.is_success() {
                 return Err(crate::error::BridgeError::OpenCode(format!(
                     "session status failed: {status} — body: {}",
-                    &text[..text.len().min(BODY_PREVIEW_CHARS)]
+                    body_preview(&text)
                 )));
             }
             let active: wire::ActiveSessions = serde_json::from_str(&text).map_err(|error| {
                 crate::error::BridgeError::OpenCode(format!(
                     "session status parse: {error} — body: {}",
-                    &text[..text.len().min(BODY_PREVIEW_CHARS)]
+                    body_preview(&text)
                 ))
             })?;
             if active.state(session_id).is_none() {
+                absent_reads += 1;
+                if absent_reads >= IDLE_CONFIRMATIONS {
+                    return Ok(());
+                }
+            } else {
+                absent_reads = 0;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    "session {session_id}: still active after {}s of session.active polling; \
+                     returning to the caller instead of polling forever",
+                    timeout.as_secs()
+                );
                 return Ok(());
             }
             tokio::time::sleep(IDLE_POLL_INTERVAL).await;
@@ -705,13 +776,13 @@ impl V2Strategy {
             if !status.is_success() {
                 return Err(crate::error::BridgeError::OpenCode(format!(
                     "transcript read failed: {status} — body: {}",
-                    &text[..text.len().min(BODY_PREVIEW_CHARS)]
+                    body_preview(&text)
                 )));
             }
             let page: wire::MessagesPage = serde_json::from_str(&text).map_err(|e| {
                 crate::error::BridgeError::OpenCode(format!(
                     "transcript read parse: {e} — body: {}",
-                    &text[..text.len().min(BODY_PREVIEW_CHARS)]
+                    body_preview(&text)
                 ))
             })?;
             let empty = page.data.is_empty();
@@ -747,14 +818,14 @@ impl V2Strategy {
             let text = resp.text().await.unwrap_or_default();
             return Err(crate::error::BridgeError::OpenCode(format!(
                 "session retry read failed: {status} — body: {}",
-                &text[..text.len().min(BODY_PREVIEW_CHARS)]
+                body_preview(&text)
             )));
         }
         let text = resp.text().await?;
         let page: wire::MessagesPage = serde_json::from_str(&text).map_err(|e| {
             crate::error::BridgeError::OpenCode(format!(
                 "session retry read parse: {e} — body: {}",
-                &text[..text.len().min(BODY_PREVIEW_CHARS)]
+                body_preview(&text)
             ))
         })?;
         Ok(page.newest_assistant_retrying())

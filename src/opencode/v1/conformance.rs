@@ -6,15 +6,15 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::opencode::conformance::{PromptFixture, SessionReadCase, SessionReadFixture, TranscriptFixture};
+use crate::opencode::conformance::{PromptFixture, SessionCase, SessionReadFixture, TranscriptFixture};
 use crate::opencode::strategy::Generation;
 use crate::test_http::{MockResponse, TestHttpServer};
 
-/// The V1 session-read case: the unprefixed read routes, with V1's response
-/// shapes (a bare list array + a header cursor, a bare session object, a status
-/// map).
-pub(crate) fn session_read_case() -> SessionReadCase {
-    SessionReadCase {
+/// The V1 conformance case: the unprefixed routes, with V1's response shapes
+/// (a bare list array + a header cursor, a bare session object, a status map,
+/// the blocking prompt response).
+pub(crate) fn case() -> SessionCase {
+    SessionCase {
         generation: Generation::V1,
         mount,
         mount_transcript,

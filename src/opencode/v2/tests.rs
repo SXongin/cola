@@ -698,8 +698,8 @@ async fn prompt_omits_empty_files_and_an_absent_message_id() {
 }
 
 /// When the experimental wait route is absent (or failing), the blocking
-/// prompt falls back to polling `session.active` until the session is absent —
-/// the same transition wait resolves on. Paused time keeps the poll cadence
+/// prompt falls back to polling `session.active` until the session has been
+/// absent for the confirmation window. Paused time keeps the poll cadence
 /// free.
 #[tokio::test(start_paused = true)]
 async fn prompt_falls_back_to_active_map_polling_when_wait_is_unavailable() {
@@ -722,6 +722,8 @@ async fn prompt_falls_back_to_active_map_polling_when_wait_is_unavailable() {
         vec![
             MockResponse::json(serde_json::json!({"data": {"ses_1": {"type": "running"}}}).to_string()),
             MockResponse::json(serde_json::json!({"data": {}}).to_string()),
+            MockResponse::json(serde_json::json!({"data": {}}).to_string()),
+            MockResponse::json(serde_json::json!({"data": {}}).to_string()),
         ],
     );
     server.route(
@@ -740,12 +742,118 @@ async fn prompt_falls_back_to_active_map_polling_when_wait_is_unavailable() {
     assert_eq!(response.id, "msg_a1");
     assert_eq!(
         server.request_count(),
-        5,
-        "admit + wait + two active polls + transcript"
+        7,
+        "admit + wait + four active reads (running then three absences) + transcript"
     );
-    assert_eq!(request_at(&server, 2).path, "/api/session/active");
-    assert_eq!(request_at(&server, 3).path, "/api/session/active");
-    assert_eq!(request_at(&server, 4).path, "/api/session/ses_1/message");
+    for index in 2..6 {
+        assert_eq!(request_at(&server, index).path, "/api/session/active");
+    }
+    assert_eq!(request_at(&server, 6).path, "/api/session/ses_1/message");
+}
+
+/// A single absent read is not trusted: the prompt admit only schedules
+/// execution, so the poll fallback confirms absence across a bounded window. A
+/// run that registers right after the first (pre-registration) read must be
+/// followed to its reply, not mistaken for an already-idle session and
+/// degraded to the empty admitted response.
+#[tokio::test(start_paused = true)]
+async fn poll_fallback_confirms_absence_and_never_mistakes_a_registration_race_for_idle() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "POST",
+        "/api/session/ses_1/prompt",
+        200,
+        admitted_body("msg_cola_1"),
+    );
+    server.route(
+        "POST",
+        "/api/experimental/session/ses_1/wait",
+        404,
+        r#"{"message":"no such route"}"#,
+    );
+    // The first read races ahead of the run's registration, then the run
+    // appears and finishes; absence must then be confirmed three times.
+    server.route_sequence(
+        "GET",
+        "/api/session/active",
+        vec![
+            MockResponse::json(serde_json::json!({"data": {}}).to_string()),
+            MockResponse::json(serde_json::json!({"data": {"ses_1": {"type": "running"}}}).to_string()),
+            MockResponse::json(serde_json::json!({"data": {}}).to_string()),
+            MockResponse::json(serde_json::json!({"data": {}}).to_string()),
+            MockResponse::json(serde_json::json!({"data": {}}).to_string()),
+        ],
+    );
+    server.route(
+        "GET",
+        "/api/session/ses_1/message",
+        200,
+        prompt_transcript("msg_cola_1", None),
+    );
+    let client = v2_wire_client(&server);
+
+    let response = client
+        .prompt("ses_1", "hi", &[], None, None, None, Some("msg_cola_1"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.id, "msg_a1",
+        "the fallback must not degrade to the empty admitted response on a registration race"
+    );
+    assert!(
+        !response.parts.is_empty(),
+        "the followed turn's reply must be in the response: {response:#?}"
+    );
+    assert_eq!(
+        server.request_count(),
+        8,
+        "admit + wait + five active reads (absence, running, then three absences) + transcript"
+    );
+    for index in 2..7 {
+        assert_eq!(request_at(&server, index).path, "/api/session/active");
+    }
+}
+
+/// The poll fallback is bounded: a server that never reports the session idle
+/// stops the fallback at its timeout with a warning instead of hanging the
+/// blocking prompt (and the Turn) forever. The production timeout is an hour;
+/// the test drives the same loop with a short one so it stops within one poll
+/// interval of the bound (real time — paused time would let HTTP-client timers
+/// jump the clock past the deadline).
+#[tokio::test]
+async fn poll_fallback_stops_with_a_warning_at_its_timeout() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "GET",
+        "/api/session/active",
+        200,
+        serde_json::json!({"data": {"ses_1": {"type": "running"}}}).to_string(),
+    );
+    let http = Transport::new(Some("opencode"), Some("secret"), server.base_url());
+    http.disable_env_proxy(Some("opencode"), Some("secret"));
+
+    let (result, logs) = crate::bridge::test_support::capture_logs(async {
+        V2Strategy
+            .poll_until_idle(&http, "ses_1", std::time::Duration::from_millis(300))
+            .await
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "a timeout is a degradation, not an error: {result:?}"
+    );
+    assert!(
+        (1..=2).contains(&server.request_count()),
+        "the loop must stop within one poll interval of the bound, not keep polling: {}",
+        server.request_count()
+    );
+    let warning = crate::bridge::test_support::assert_line_level(&logs, "still active after", "WARN");
+    assert!(
+        warning.contains("ses_1"),
+        "the warning names the session: {warning}"
+    );
 }
 
 /// The settled turn's failure is surfaced: the assistant message's `error`

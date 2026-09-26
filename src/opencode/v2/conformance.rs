@@ -7,14 +7,15 @@
 
 use serde_json::{Map, json};
 
-use crate::opencode::conformance::{PromptFixture, SessionReadCase, SessionReadFixture, TranscriptFixture};
+use crate::opencode::conformance::{PromptFixture, SessionCase, SessionReadFixture, TranscriptFixture};
 use crate::opencode::strategy::Generation;
 use crate::test_http::{MockResponse, TestHttpServer};
 
-/// The V2 session-read case: the `/api` read routes, with V2's response
-/// shapes.
-pub(crate) fn session_read_case() -> SessionReadCase {
-    SessionReadCase {
+/// The V2 conformance case: the `/api` routes, with V2's response shapes
+/// (`{data}` envelopes, a body cursor, the active map, and the admit + wait +
+/// transcript write path).
+pub(crate) fn case() -> SessionCase {
+    SessionCase {
         generation: Generation::V2,
         mount,
         mount_transcript,
