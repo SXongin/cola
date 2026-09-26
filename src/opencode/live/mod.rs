@@ -7,9 +7,13 @@
 //! call → permission round-trip → final text) and the **V2** chains — the
 //! transcript read with the production prompt (`live_v2_scripted_transcript_read`:
 //! the blocking prompt runs while the turn streams, then the decoded transcript
-//! and its projections are asserted) and the write surface
+//! and its projections are asserted), the write surface
 //! (`live_v2_scripted_write_chain`: supplement steering, retry idempotency,
-//! interrupt, compact and title rename). Each test spawns the binary of its own
+//! interrupt, compact and title rename), the permission round-trip
+//! (`live_v2_scripted_permission_chain`: a gated shell tool answered through the
+//! session-scoped decision) and the form round-trip
+//! (`live_v2_scripted_form_chain`: a typed question form answered with a keyed
+//! value, plus a cancellation by delete). Each test spawns the binary of its own
 //! generation into its own temp store, so neither can touch the machine's
 //! default store, credentials or config; each refuses a binary of the other
 //! generation.
@@ -646,6 +650,376 @@ async fn live_v2_scripted_write_chain() {
     );
 }
 
+/// The V2 permission round-trip against the pinned V2 server: the production
+/// prompt blocks on a pending form/tool gate, the location-scoped pending list
+/// surfaces the ask, the session-scoped decision releases it, and the turn
+/// finishes with the tool result and closing text.
+#[tokio::test]
+#[ignore = "live: needs a V2 binary (see the module docs)"]
+async fn live_v2_scripted_permission_chain() {
+    use server::V2Permissions;
+
+    let binary = live_v2_binary();
+    let version = server::ensure_v2_binary(&binary).await;
+    eprintln!("live V2 binary: {binary} ({version})");
+
+    let provider = provider::start_with(provider::Tool::Shell, provider::ToolCommand::Fast).await;
+    let server = LiveServer::start_v2_with(&binary, &provider.base_url(), V2Permissions::AskShell).await;
+
+    let backend = OpenCodeBackend::with_generation(
+        Some(provider::MODEL_REF),
+        server.base_url(),
+        Some("opencode"),
+        Some(server::PASSWORD),
+        Generation::V2,
+        None,
+    );
+    backend.disable_env_proxy(Some("opencode"), Some(server::PASSWORD));
+
+    wait_for_ready(&backend, &server).await;
+
+    let work_dir = server.work_dir();
+    let session = backend
+        .create_session(&backend.new_session_input(Some(&work_dir)))
+        .await
+        .unwrap_or_else(|error| panic!("create session failed: {error}\n{}", server.stderr()));
+
+    let message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
+    let prompt_backend = backend.clone();
+    let prompt_session = session.id.clone();
+    let prompt_message_id = message_id.clone();
+    let prompt = tokio::spawn(async move {
+        prompt_backend
+            .prompt(
+                &prompt_session,
+                PROMPT_TEXT,
+                &[],
+                None,
+                None,
+                None,
+                Some(&prompt_message_id),
+            )
+            .await
+    });
+
+    // The turn blocks on the shell ask; the location-scoped pending list must
+    // surface it (one call per directory, never per session).
+    let permission = poll_until(
+        &format!("a V2 permission ask for session {}", session.id),
+        POLL_TIMEOUT,
+        || async {
+            backend
+                .list_permissions(Some(&work_dir))
+                .await
+                .map(|pending| pending.into_iter().next())
+        },
+        || server.stderr(),
+    )
+    .await;
+    assert_eq!(
+        permission.session_id.as_deref(),
+        Some(session.id.as_str()),
+        "the ask must belong to the prompted session"
+    );
+    assert_eq!(
+        permission.permission.as_deref(),
+        Some("shell"),
+        "the scripted shell tool must be gated as a shell ask: {permission:?}"
+    );
+
+    // The session-scoped decision releases the run.
+    backend
+        .reply_permission(&session.id, &permission.request_id, "once", Some(&work_dir))
+        .await
+        .unwrap_or_else(|error| panic!("permission reply failed: {error}\n{}", server.stderr()));
+
+    let response = prompt
+        .await
+        .expect("the prompt task must not panic")
+        .unwrap_or_else(|error| panic!("prompt failed: {error}\n{}", server.stderr()));
+    assert!(
+        response.error.is_none(),
+        "the answered turn must not report a model error: {:?}",
+        response.error
+    );
+    assert!(
+        backend
+            .list_permissions(Some(&work_dir))
+            .await
+            .unwrap_or_else(|error| panic!("permission list failed: {error}\n{}", server.stderr()))
+            .is_empty(),
+        "the replied request must leave the pending list"
+    );
+
+    let transcript = backend
+        .transcript(&session.id)
+        .await
+        .unwrap_or_else(|error| panic!("transcript read failed: {error}\n{}", server.stderr()));
+    assert_user_anchor(&transcript, &message_id);
+    assert_tool_call(&transcript, provider::Tool::Shell, provider::ToolCommand::Fast);
+    assert_streamed_reasoning(&transcript);
+    assert_final_text(&transcript);
+    assert_turn_complete(&transcript, &message_id);
+    wait_for_idle(&backend, &session.id, &work_dir, &server).await;
+
+    // The other two decisions round-trip too. `reject` runs first: it declines
+    // the tool without saving anything, while `always` persists an approval for
+    // the same resource — a later ask would then be auto-allowed and never
+    // surface. `always`'s own turn completes like the `once` one.
+    for decision in ["reject", "always"] {
+        let session = backend
+            .create_session(&backend.new_session_input(Some(&work_dir)))
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{decision}: create session failed: {error}\n{}", server.stderr())
+            });
+        let message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
+        let prompt_backend = backend.clone();
+        let prompt_session = session.id.clone();
+        let prompt_message_id = message_id.clone();
+        let prompt = tokio::spawn(async move {
+            prompt_backend
+                .prompt(
+                    &prompt_session,
+                    PROMPT_TEXT,
+                    &[],
+                    None,
+                    None,
+                    None,
+                    Some(&prompt_message_id),
+                )
+                .await
+        });
+        let permission = poll_until(
+            &format!("a V2 permission ask ({decision})"),
+            POLL_TIMEOUT,
+            || async {
+                backend
+                    .list_permissions(Some(&work_dir))
+                    .await
+                    .map(|pending| pending.into_iter().next())
+            },
+            || server.stderr(),
+        )
+        .await;
+        assert_eq!(permission.permission.as_deref(), Some("shell"), "{decision}");
+        backend
+            .reply_permission(&session.id, &permission.request_id, decision, Some(&work_dir))
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{decision}: permission reply failed: {error}\n{}",
+                    server.stderr()
+                )
+            });
+        // The replied request leaves the pending list whichever decision it was.
+        poll_until(
+            &format!("the {decision} reply to leave the pending list"),
+            POLL_TIMEOUT,
+            || async {
+                backend.list_permissions(Some(&work_dir)).await.map(|pending| {
+                    pending
+                        .iter()
+                        .all(|request| request.request_id != permission.request_id)
+                        .then_some(())
+                })
+            },
+            || server.stderr(),
+        )
+        .await;
+        let result = tokio::time::timeout(POLL_TIMEOUT, prompt)
+            .await
+            .unwrap_or_else(|_| panic!("{decision}: the prompt must return\n{}", server.stderr()))
+            .expect("the prompt task must not panic");
+        if decision == "always" {
+            let response = result.unwrap_or_else(|error| {
+                panic!(
+                    "always: the approved turn must complete: {error}\n{}",
+                    server.stderr()
+                )
+            });
+            assert!(response.error.is_none(), "always: {response:?}");
+        }
+        // `reject` deliberately declines the tool (a defect tunnel upstream), so
+        // only the run settling is asserted — never a specific turn outcome.
+        wait_for_idle(&backend, &session.id, &work_dir, &server).await;
+    }
+}
+
+/// The V2 form round-trip against the pinned V2 server: the scripted question
+/// tool blocks the turn on a typed form, the location-scoped list surfaces it,
+/// the keyed answer releases it, and a second form cancels by delete.
+#[tokio::test]
+#[ignore = "live: needs a V2 binary (see the module docs)"]
+async fn live_v2_scripted_form_chain() {
+    use crate::opencode::types::{FormAnswer, FormFieldKind, FormValue};
+    use server::V2Permissions;
+
+    let binary = live_v2_binary();
+    let version = server::ensure_v2_binary(&binary).await;
+    eprintln!("live V2 binary: {binary} ({version})");
+
+    let provider = provider::start_with(provider::Tool::Question, provider::ToolCommand::Fast).await;
+    let server = LiveServer::start_v2_with(&binary, &provider.base_url(), V2Permissions::AllowQuestion).await;
+
+    let backend = OpenCodeBackend::with_generation(
+        Some(provider::MODEL_REF),
+        server.base_url(),
+        Some("opencode"),
+        Some(server::PASSWORD),
+        Generation::V2,
+        None,
+    );
+    backend.disable_env_proxy(Some("opencode"), Some(server::PASSWORD));
+
+    wait_for_ready(&backend, &server).await;
+
+    let work_dir = server.work_dir();
+    let session = backend
+        .create_session(&backend.new_session_input(Some(&work_dir)))
+        .await
+        .unwrap_or_else(|error| panic!("create session failed: {error}\n{}", server.stderr()));
+
+    let message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
+    let prompt_backend = backend.clone();
+    let prompt_session = session.id.clone();
+    let prompt_message_id = message_id.clone();
+    let prompt = tokio::spawn(async move {
+        prompt_backend
+            .prompt(
+                &prompt_session,
+                PROMPT_TEXT,
+                &[],
+                None,
+                None,
+                None,
+                Some(&prompt_message_id),
+            )
+            .await
+    });
+
+    let form = poll_until(
+        &format!("a V2 form for session {}", session.id),
+        POLL_TIMEOUT,
+        || async {
+            backend
+                .list_questions(Some(&work_dir))
+                .await
+                .map(|forms| forms.into_iter().next())
+        },
+        || server.stderr(),
+    )
+    .await;
+    assert_eq!(form.session_id, session.id, "the form belongs to the session");
+    assert_eq!(form.questions.len(), 1, "one scripted field: {form:?}");
+    let field = &form.questions[0];
+    assert_eq!(field.key, "q0", "the question tool keys fields qN: {field:?}");
+    assert_eq!(field.kind, FormFieldKind::String, "a single-select string field");
+    assert!(
+        field
+            .options
+            .iter()
+            .any(|option| option.answer_value() == provider::QUESTION_OPTION),
+        "the scripted option must be offered: {field:?}"
+    );
+
+    // The keyed answer releases the question tool; the turn continues to the
+    // scripted closing text.
+    let answers = vec![FormAnswer {
+        key: field.key.clone(),
+        value: Some(FormValue::Text(provider::QUESTION_OPTION.to_string())),
+    }];
+    backend
+        .reply_question(&session.id, &form.id, &answers, Some(&work_dir))
+        .await
+        .unwrap_or_else(|error| panic!("form reply failed: {error}\n{}", server.stderr()));
+
+    let response = prompt
+        .await
+        .expect("the prompt task must not panic")
+        .unwrap_or_else(|error| panic!("prompt failed: {error}\n{}", server.stderr()));
+    assert!(
+        response.error.is_none(),
+        "the answered turn must not report a model error: {:?}",
+        response.error
+    );
+    assert_eq!(
+        backend
+            .list_questions(Some(&work_dir))
+            .await
+            .unwrap_or_else(|error| panic!("form list failed: {error}\n{}", server.stderr()))
+            .len(),
+        0,
+        "the answered form must leave the pending list"
+    );
+
+    let transcript = backend
+        .transcript(&session.id)
+        .await
+        .unwrap_or_else(|error| panic!("transcript read failed: {error}\n{}", server.stderr()));
+    assert_user_anchor(&transcript, &message_id);
+    assert_question_tool_call(&transcript);
+    assert_final_text(&transcript);
+    assert_turn_complete(&transcript, &message_id);
+    wait_for_idle(&backend, &session.id, &work_dir, &server).await;
+
+    // A second, cancelled form on a fresh session: the delete removes it from
+    // the pending list and unblocks the run (the tool fails with the
+    // cancellation; the prompt outcome itself is not asserted).
+    let cancel_session = backend
+        .create_session(&backend.new_session_input(Some(&work_dir)))
+        .await
+        .unwrap_or_else(|error| panic!("create cancel session failed: {error}\n{}", server.stderr()));
+    let cancel_backend = backend.clone();
+    let cancel_session_id = cancel_session.id.clone();
+    let cancel_message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
+    let cancelled = tokio::spawn(async move {
+        cancel_backend
+            .prompt(
+                &cancel_session_id,
+                PROMPT_TEXT,
+                &[],
+                None,
+                None,
+                None,
+                Some(&cancel_message_id),
+            )
+            .await
+    });
+    let cancelled_form = poll_until(
+        "the second V2 form",
+        POLL_TIMEOUT,
+        || async {
+            backend
+                .list_questions(Some(&work_dir))
+                .await
+                .map(|forms| forms.into_iter().next())
+        },
+        || server.stderr(),
+    )
+    .await;
+    assert_eq!(cancelled_form.session_id, cancel_session.id);
+    backend
+        .reject_question(&cancel_session.id, &cancelled_form.id, Some(&work_dir))
+        .await
+        .unwrap_or_else(|error| panic!("form cancel failed: {error}\n{}", server.stderr()));
+    poll_until(
+        "the cancelled form to leave the pending list",
+        POLL_TIMEOUT,
+        || async {
+            backend
+                .list_questions(Some(&work_dir))
+                .await
+                .map(|forms| forms.is_empty().then_some(()))
+        },
+        || server.stderr(),
+    )
+    .await;
+    // The cancelled turn may settle with a tool failure; drain it so the
+    // server is not left with a blocked run.
+    let _ = tokio::time::timeout(IDLE_TIMEOUT, cancelled).await;
+}
+
 /// Whether any decoded part of the transcript is a still-live tool call.
 fn has_live_tool(transcript: &SessionTranscript) -> bool {
     transcript
@@ -858,6 +1232,47 @@ fn assert_tool_call(
             .iter()
             .any(|block| matches!(block, ContentBlock::Text(text) if text.contains("live-harness-tool"))),
         "the command output must be in the tool result: {tool:#?}"
+    );
+}
+
+/// The question tool call ran to completion: the fragmented arguments
+/// reassembled into the scripted question and options, and the answered form
+/// (not a cancellation) came back.
+fn assert_question_tool_call(transcript: &crate::backend::SessionTranscript) {
+    let tool = transcript
+        .messages
+        .iter()
+        .flat_map(|message| message.parts.iter())
+        .find_map(|part| match part {
+            Part::Tool(tool) if tool.identity.name == provider::Tool::Question.name() => Some(tool),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the question tool call must be in the transcript: {transcript:#?}"));
+    assert_eq!(
+        tool.status,
+        ToolStatus::Completed,
+        "the answered question tool must have completed: {tool:#?}"
+    );
+    let input = tool.input.as_ref().expect("the question tool carries its input");
+    let first = input
+        .get("questions")
+        .and_then(Value::as_array)
+        .and_then(|questions| questions.first())
+        .unwrap_or_else(|| panic!("the reassembled input must carry questions: {tool:#?}"));
+    assert_eq!(
+        first.get("question").and_then(Value::as_str),
+        Some(provider::QUESTION_TEXT),
+        "the split argument deltas must reassemble into the scripted question: {tool:#?}"
+    );
+    assert_eq!(
+        first
+            .get("options")
+            .and_then(Value::as_array)
+            .and_then(|options| options.first())
+            .and_then(|option| option.get("label"))
+            .and_then(Value::as_str),
+        Some(provider::QUESTION_OPTION),
+        "the scripted options must reassemble: {tool:#?}"
     );
 }
 

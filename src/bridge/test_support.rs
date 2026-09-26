@@ -673,6 +673,13 @@ pub struct MockBackend {
     /// Same as `hang_list_permissions`, for `list_sessions` (the Lazy Start
     /// readiness probe).
     pub hang_list_sessions: Arc<std::sync::atomic::AtomicUsize>,
+    /// Counts `list_permissions` calls. The sweep lists once per known
+    /// directory — never once per session — so a store with many sessions in
+    /// one directory still makes exactly one call per sweep (the V2 poller's
+    /// no-iteration-storm contract).
+    pub list_permission_calls: Arc<std::sync::atomic::AtomicUsize>,
+    /// Counts `list_questions` calls, one per known directory per sweep.
+    pub list_question_calls: Arc<std::sync::atomic::AtomicUsize>,
     /// When set, `messages` returns this as a fresh user message (simulates
     /// a message posted from OpenChamber).
     pub external_user_message: Option<String>,
@@ -884,6 +891,8 @@ impl MockBackend {
             hang_transcript: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             hang_session_info: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             hang_list_sessions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            list_permission_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            list_question_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             external_user_message: None,
             external_user_messages: std::collections::HashMap::new(),
             cola_user_messages: std::collections::HashMap::new(),
@@ -1636,6 +1645,8 @@ impl crate::backend::Backend for MockBackend {
         &self,
         _d: Option<&str>,
     ) -> crate::error::Result<Vec<opencode::types::PermissionRequest>> {
+        self.list_permission_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         hang_if_scripted(&self.hang_list_permissions).await;
         let replied = self.replied_permissions.lock().await;
         let mut out: Vec<_> = self
@@ -1654,6 +1665,8 @@ impl crate::backend::Backend for MockBackend {
         &self,
         _d: Option<&str>,
     ) -> crate::error::Result<Vec<opencode::types::QuestionRequest>> {
+        self.list_question_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         hang_if_scripted(&self.hang_list_questions).await;
         let replied = self.replied_questions.lock().await;
         Ok(self
