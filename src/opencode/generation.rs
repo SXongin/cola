@@ -70,14 +70,10 @@ impl ProbeOutcome {
     }
 }
 
-/// Probe a server's generation with the credentials the attach holds.
-pub(crate) async fn probe(url: &str, username: &str, password: &str) -> ProbeOutcome {
-    probe_transport(&Transport::new(Some(username), Some(password), url)).await
-}
-
-/// [`probe`] over a caller-built transport, so tests can point it at the fake
-/// HTTP server without a developer shell's `http_proxy` intercepting loopback
-/// (the wire-test pattern, ADR-0031).
+/// Probe a server's generation over the caller's transport (the credential
+/// holder the attach path built) — tests point it at the fake HTTP server with
+/// the env proxy disabled so a developer shell's `http_proxy` cannot intercept
+/// loopback (the wire-test pattern, ADR-0031).
 pub(crate) async fn probe_transport(transport: &Transport) -> ProbeOutcome {
     let url = transport.url(INFO_PATH);
     let attempt = async {
@@ -146,8 +142,8 @@ fn v2_info_version(body: &[u8]) -> Option<String> {
 /// proxy or an unusual build the probe cannot classify — but an unreachable
 /// server stays serverless even when forced: there is nothing to attach to,
 /// and Lazy Start / the reconnect scan retries.
-pub(crate) fn decide(override_: GenerationOverride, probe: &ProbeOutcome) -> Option<Generation> {
-    match override_ {
+pub(crate) fn decide(generation_override: GenerationOverride, probe: &ProbeOutcome) -> Option<Generation> {
+    match generation_override {
         GenerationOverride::Auto => probe.generation,
         GenerationOverride::V1 if probe.reachable => Some(Generation::V1),
         GenerationOverride::V2 if probe.reachable => Some(Generation::V2),
@@ -160,15 +156,15 @@ pub(crate) fn decide(override_: GenerationOverride, probe: &ProbeOutcome) -> Opt
 /// (spec #364 §2 — "a contradicting probe logs a WARN with the evidence").
 pub(crate) fn log_attached(
     url: &str,
-    override_: GenerationOverride,
+    generation_override: GenerationOverride,
     probe: &ProbeOutcome,
     generation: Generation,
 ) {
-    let forced = override_ != GenerationOverride::Auto;
+    let forced = generation_override != GenerationOverride::Auto;
     if forced && probe.generation.is_some_and(|probed| probed != generation) {
         tracing::warn!(
             "generation override {} contradicts the probe: {}; forcing generation={}",
-            override_,
+            generation_override,
             probe.evidence,
             generation.as_str()
         );
@@ -176,7 +172,10 @@ pub(crate) fn log_attached(
     let note = if forced && probe.generation.is_none() {
         // The override is the reason this attachment exists at all: say so,
         // with the inconclusive evidence.
-        format!("generation override {}; probe: {}", override_, probe.evidence)
+        format!(
+            "generation override {}; probe: {}",
+            generation_override, probe.evidence
+        )
     } else {
         format!("probe: {}", probe.evidence)
     };
@@ -316,6 +315,50 @@ mod tests {
         assert_eq!(outcome.generation, None);
         assert!(outcome.reachable);
         assert!(outcome.evidence.contains("not a V2 info envelope"));
+    }
+
+    /// The evidence string flows into the attach log (and, on an inconclusive
+    /// probe, into a `BridgeError` that can reach a card): it must never carry
+    /// the Basic-auth password.
+    #[tokio::test]
+    async fn probe_evidence_never_carries_the_password() {
+        const PASSWORD: &str = "super-secret-probe-pw";
+        let cases: &[(u16, &str, &str)] = &[
+            (200, "application/json", r#"{"version":"2.0.18","urls":[]}"#),
+            (200, "text/html", "<!doctype html>"),
+            (200, "application/json", r#"{"error":"gateway"}"#),
+            (401, "application/json", r#"{"error":"Unauthorized"}"#),
+            (503, "text/plain", "migrating"),
+            (404, "application/json", r#"{"error":"Not Found"}"#),
+        ];
+        for &(status, content_type, body) in cases {
+            let server = TestHttpServer::start().await;
+            server.route_raw("GET", "/api/info", status, content_type, body);
+            let outcome = probe_server(&server, "opencode", PASSWORD).await;
+            assert!(
+                !outcome.evidence.contains(PASSWORD),
+                "status {status} leaked the password: {}",
+                outcome.evidence
+            );
+        }
+
+        // The unreachable path builds its evidence from the transport error,
+        // which can echo the URL but never the credentials.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let transport = Transport::new(
+            Some("opencode"),
+            Some(PASSWORD),
+            format!("http://127.0.0.1:{port}"),
+        );
+        transport.disable_env_proxy(Some("opencode"), Some(PASSWORD));
+        let outcome = probe_transport(&transport).await;
+        assert!(
+            !outcome.evidence.contains(PASSWORD),
+            "the unreachable evidence leaked the password: {}",
+            outcome.evidence
+        );
     }
 
     #[tokio::test]

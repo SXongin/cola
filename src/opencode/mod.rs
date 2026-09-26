@@ -156,6 +156,10 @@ impl Backend for OpenCodeBackend {
         OpenCodeBackend::base_url(self)
     }
 
+    fn attached_server_pid(&self) -> Option<i32> {
+        OpenCodeBackend::attached_server_pid(self)
+    }
+
     fn can_self_start_server(&self) -> bool {
         true
     }

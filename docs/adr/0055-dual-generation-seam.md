@@ -40,3 +40,23 @@ Tool-payload knowledge stays Platform contract, not protocol coupling
 
 The effort, its detection/override rules and its slicing are spec #364
 (OpenCode V2 dual-generation support).
+
+## Amendment (2026-09-27): the probe classifies by body, not by status
+
+The Decision above says the generation is detected via `GET /api/info`
+"200 = V2, 404 = V1". Measured on this machine, that status rule does not hold:
+V1 serves its web UI through a catch-all, so `/api/info` on V1 is a **200
+`text/html`** page, not a 404 (both the running 1.18.23 and the pinned
+1.18.31). The status alone therefore cannot discriminate. The rule implemented
+in `src/opencode/generation.rs` (spec #364, slice S3) is:
+
+- a 200 whose body is V2's JSON info envelope (`{version, pid, urls, paths}`)
+  is V2;
+- a 404 (no `/api` surface) is V1;
+- anything else — a 200 without the envelope, 401, 503, a transport error — is
+  **inconclusive**: cola stays serverless and Lazy Start / the reconnect scan
+  retries. A generation is never guessed;
+- `[opencode] generation = "auto" | "v1" | "v2"` still forces the choice when
+  the probe cannot be trusted, with a WARN on a contradicting classified probe.
+
+Everything else in this ADR stands.

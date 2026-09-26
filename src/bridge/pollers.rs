@@ -25,10 +25,23 @@ async fn busy(waits: &WaitsHandle) -> bool {
 /// Coexistent Server.
 fn current_is_owned(candidates: &[ServerCandidate], self_pid: Option<i32>, current: &str) -> bool {
     let Some(self_pid) = self_pid else { return false };
-    let Some(port) = current.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) else {
+    let Some(port) = crate::config::port_from_url(current) else {
         return false;
     };
     candidates.iter().any(|c| c.port == port && c.pid == self_pid)
+}
+
+/// Whether this reconcile pass must re-resolve the attachment: the picked
+/// server is not the one currently attached.
+///
+/// Identity, not just the URL, decides: a server replaced on the SAME port —
+/// a new pid — may be the other generation or carry a new password, and
+/// `auto` re-probes on every attach/reconnect (spec #364 §2). Comparing only
+/// the URL would keep a stale strategy (and stale credentials) for that
+/// replacement. A `None` attached pid means the attach path did not carry an
+/// identity, so the pass re-resolves.
+fn needs_reattach(current_url: &str, attached_pid: Option<i32>, picked: &ServerCandidate) -> bool {
+    current_url != picked.url() || attached_pid != Some(picked.pid)
 }
 
 /// Terminate cola's Owned Server (verified by pid against the live candidates)
@@ -200,18 +213,25 @@ async fn reconcile(
         }
         return Ok(false);
     };
-    let url = format!("http://localhost:{}", server.port);
+    let url = server.url();
     let current = handles.flow.backend.base_url();
+    let attached_pid = handles.flow.backend.attached_server_pid();
     let pick_is_owned = self_pid == Some(server.pid);
 
-    if url != current {
+    if needs_reattach(&current, attached_pid, server) {
         let current_is_owned = current_is_owned(&candidates, self_pid, &current);
         if current_is_owned && !pick_is_owned && busy(&handles.flow.waits).await {
             // Defer the yield: keep streaming on our Owned Server until idle,
             // so the in-flight generation isn't truncated.
             return Ok(true);
         }
-        tracing::warn!("OpenCode server changed ({} -> {}); reconnecting", current, url);
+        tracing::warn!(
+            "OpenCode server changed ({} pid {} -> {} pid {}); reconnecting",
+            current,
+            attached_pid.map_or("?".to_string(), |p| p.to_string()),
+            url,
+            server.pid
+        );
         // Resolve the new attachment's generation before re-pointing (spec
         // #364 §2). A probe that cannot classify the server is never guessed
         // at: cola drops to serverless and the next pass retries — an error
@@ -547,6 +567,35 @@ mod tests {
         assert!(!current_is_owned(&servers, Some(7), "http://localhost:4097"));
         assert!(!current_is_owned(&servers, Some(7), "http://mock"));
         assert!(!current_is_owned(&servers, Some(7), ""));
+    }
+
+    /// Same-URL replacements are the reason identity (pid), not just the URL,
+    /// decides: a server swapped on the same port may speak the other
+    /// generation or carry a new password, and `auto` re-probes on every
+    /// attach/reconnect (spec #364 §2).
+    #[test]
+    fn needs_reattach_on_url_or_pid_change() {
+        let picked = cand(7, 4096);
+        assert!(
+            !needs_reattach("http://localhost:4096", Some(7), &picked),
+            "the same server stays attached"
+        );
+        assert!(
+            needs_reattach("http://localhost:4096", Some(8), &picked),
+            "a replacement on the same port must re-resolve"
+        );
+        assert!(
+            needs_reattach("http://localhost:4097", Some(7), &picked),
+            "a server on another port must re-resolve"
+        );
+        assert!(
+            needs_reattach("", None, &picked),
+            "serverless re-attaches at the picked server"
+        );
+        assert!(
+            needs_reattach("http://localhost:4096", None, &picked),
+            "an unknown identity re-resolves rather than trust the URL"
+        );
     }
 
     #[test]

@@ -28,25 +28,31 @@ use super::types::{
 /// The strategy that speaks the V2 generation.
 pub(crate) struct V2Strategy;
 
-/// The visible failure of a capability that has not landed yet: an
-/// `OpenCode` error naming the method, so an attached V2 server's missing
-/// surface is diagnosable from the log and the card (spec #364, S3 "errors are
-/// visible, never silent").
-fn not_implemented(method: &str) -> crate::error::BridgeError {
-    crate::error::BridgeError::OpenCode(format!(
+/// The visible failure text of a capability that has not landed yet: names the
+/// method and the generation, so an attached V2 server's missing surface is
+/// diagnosable from the log and the card (spec #364, S3 "errors are visible,
+/// never silent"). One message for both the `Result` methods and the two
+/// catalog warns.
+fn not_implemented(method: &str) -> String {
+    format!(
         "OpenCode V2 strategy: {method} is not implemented yet (spec #364 slice S4+); \
          cola is attached to a V2 server"
-    ))
+    )
+}
+
+/// [`not_implemented`] as the error the `Result` methods return.
+fn not_implemented_error(method: &str) -> crate::error::BridgeError {
+    crate::error::BridgeError::OpenCode(not_implemented(method))
 }
 
 #[async_trait]
 impl GenerationStrategy for V2Strategy {
     async fn list_sessions(&self, _http: &Transport) -> Result<Vec<SessionListInfo>> {
-        Err(not_implemented("list_sessions"))
+        Err(not_implemented_error("list_sessions"))
     }
 
     async fn update_session_title(&self, _http: &Transport, _session_id: &str, _title: &str) -> Result<()> {
-        Err(not_implemented("update_session_title"))
+        Err(not_implemented_error("update_session_title"))
     }
 
     #[allow(clippy::too_many_arguments)] // matches the trait's prompt axes
@@ -61,7 +67,7 @@ impl GenerationStrategy for V2Strategy {
         _agent: Option<&str>,
         _message_id: Option<&str>,
     ) -> Result<PromptResponse> {
-        Err(not_implemented("prompt"))
+        Err(not_implemented_error("prompt"))
     }
 
     #[allow(clippy::too_many_arguments)] // matches the trait's prompt axes
@@ -76,7 +82,7 @@ impl GenerationStrategy for V2Strategy {
         _agent: Option<&str>,
         _message_id: Option<&str>,
     ) -> Result<()> {
-        Err(not_implemented("prompt_async"))
+        Err(not_implemented_error("prompt_async"))
     }
 
     async fn reply_permission(
@@ -86,7 +92,7 @@ impl GenerationStrategy for V2Strategy {
         _reply: &str,
         _directory: Option<&str>,
     ) -> Result<()> {
-        Err(not_implemented("reply_permission"))
+        Err(not_implemented_error("reply_permission"))
     }
 
     async fn list_permissions(
@@ -94,7 +100,7 @@ impl GenerationStrategy for V2Strategy {
         _http: &Transport,
         _directory: Option<&str>,
     ) -> Result<Vec<PermissionRequest>> {
-        Err(not_implemented("list_permissions"))
+        Err(not_implemented_error("list_permissions"))
     }
 
     async fn list_questions(
@@ -102,7 +108,7 @@ impl GenerationStrategy for V2Strategy {
         _http: &Transport,
         _directory: Option<&str>,
     ) -> Result<Vec<QuestionRequest>> {
-        Err(not_implemented("list_questions"))
+        Err(not_implemented_error("list_questions"))
     }
 
     async fn reply_question(
@@ -112,7 +118,7 @@ impl GenerationStrategy for V2Strategy {
         _answers: &[Vec<String>],
         _directory: Option<&str>,
     ) -> Result<()> {
-        Err(not_implemented("reply_question"))
+        Err(not_implemented_error("reply_question"))
     }
 
     async fn reject_question(
@@ -121,11 +127,11 @@ impl GenerationStrategy for V2Strategy {
         _request_id: &str,
         _directory: Option<&str>,
     ) -> Result<()> {
-        Err(not_implemented("reject_question"))
+        Err(not_implemented_error("reject_question"))
     }
 
     async fn transcript(&self, _http: &Transport, _session_id: &str) -> Result<SessionTranscript> {
-        Err(not_implemented("transcript"))
+        Err(not_implemented_error("transcript"))
     }
 
     async fn session_status(
@@ -134,7 +140,7 @@ impl GenerationStrategy for V2Strategy {
         _session_id: &str,
         _directory: Option<&str>,
     ) -> Result<Option<SessionStatus>> {
-        Err(not_implemented("session_status"))
+        Err(not_implemented_error("session_status"))
     }
 
     async fn model_context_window(
@@ -143,16 +149,16 @@ impl GenerationStrategy for V2Strategy {
         _provider: &str,
         _model: &str,
     ) -> Result<Option<i64>> {
-        Err(not_implemented("model_context_window"))
+        Err(not_implemented_error("model_context_window"))
     }
 
     async fn list_agents(&self, _http: &Transport) -> Vec<AgentInfo> {
-        tracing::warn!("OpenCode V2 strategy: list_agents is not implemented yet (spec #364 slice S4+)");
+        tracing::warn!("{}", not_implemented("list_agents"));
         Vec::new()
     }
 
     async fn list_models(&self, _http: &Transport) -> Vec<ProviderModels> {
-        tracing::warn!("OpenCode V2 strategy: list_models is not implemented yet (spec #364 slice S4+)");
+        tracing::warn!("{}", not_implemented("list_models"));
         Vec::new()
     }
 
@@ -162,11 +168,11 @@ impl GenerationStrategy for V2Strategy {
         _session_id: &str,
         _directory: Option<&str>,
     ) -> Result<SessionInfo> {
-        Err(not_implemented("session_info"))
+        Err(not_implemented_error("session_info"))
     }
 
     async fn interrupt(&self, _http: &Transport, _session_id: &str) -> Result<()> {
-        Err(not_implemented("interrupt"))
+        Err(not_implemented_error("interrupt"))
     }
 }
 

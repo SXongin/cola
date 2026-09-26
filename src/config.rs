@@ -132,11 +132,16 @@ impl OpenCodeConfig {
     /// `pick_server` among servers of the same class (ADR-0013), never an
     /// absolute pin.
     pub fn preferred_port(&self) -> Option<u16> {
-        self.url
-            .as_deref()
-            .and_then(|u| u.rsplit(':').next())
-            .and_then(|s| s.parse().ok())
+        self.url.as_deref().and_then(port_from_url)
     }
+}
+
+/// The explicit port of an endpoint URL (`http://localhost:4096`,
+/// `http://127.0.0.1:49374/`), `None` when it carries none. The one parser for
+/// both the config's `[opencode] url` tiebreaker and the V2 registration URL
+/// discovery reads — an endpoint port is never parsed twice differently.
+pub(crate) fn port_from_url(url: &str) -> Option<u16> {
+    url.rsplit(':').next()?.trim_end_matches('/').parse().ok()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -424,6 +429,26 @@ mod tests {
         assert!(cfg.start_server.spawns_when_needed());
         assert!(!ServerStartPolicy::Never.spawns_when_needed());
         assert!(ServerStartPolicy::Eager.spawns_when_needed());
+    }
+
+    #[test]
+    fn port_from_url_requires_an_explicit_port() {
+        assert_eq!(port_from_url("http://localhost:4096"), Some(4096));
+        assert_eq!(port_from_url("http://127.0.0.1:49374/"), Some(49374));
+        assert_eq!(port_from_url("http://localhost"), None);
+        assert_eq!(port_from_url("nonsense"), None);
+    }
+
+    #[test]
+    fn preferred_port_parses_the_configured_url() {
+        let url = |u: &str| {
+            toml::from_str::<OpenCodeConfig>(&format!("url = \"{u}\""))
+                .unwrap()
+                .preferred_port()
+        };
+        assert_eq!(url("http://localhost:4096"), Some(4096));
+        assert_eq!(url("http://localhost:4096/"), Some(4096));
+        assert_eq!(url("http://localhost"), None);
     }
 
     #[test]

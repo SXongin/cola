@@ -225,6 +225,15 @@ pub trait Backend: Send + Sync {
     /// attached or spawned yet).
     fn base_url(&self) -> String;
 
+    /// The pid of the server this backend is attached to, when the attach path
+    /// knew it. A neutral identity token: the reconnect loop compares it with
+    /// the discovered candidate's pid so a replacement on the SAME port (a new
+    /// generation or password) is noticed and re-probed (spec #364 §2). `None`
+    /// for mocks and for attachments whose identity was not carried.
+    fn attached_server_pid(&self) -> Option<i32> {
+        None
+    }
+
     /// Whether this backend can lazily start its own OpenCode server when none
     /// is running. The real adapter can; test mocks cannot (there is no
     /// process to spawn), so the Lazy Start hook is a no-op in tests.

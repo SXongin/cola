@@ -15,6 +15,7 @@
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
+use crate::config::port_from_url;
 use crate::opencode::strategy::Generation;
 
 /// An `opencode serve` process discovered on the machine.
@@ -35,6 +36,20 @@ pub struct ServerCandidate {
     pub uses_default_store: bool,
 }
 
+impl ServerCandidate {
+    /// The loopback endpoint discovery reached this server on. The one
+    /// spelling of a discovered server's URL (attach, reconnect and the
+    /// config tiebreaker all go through it).
+    pub(crate) fn url(&self) -> String {
+        local_url(self.port)
+    }
+}
+
+/// The loopback URL of a server port (`http://localhost:4096`).
+pub(crate) fn local_url(port: u16) -> String {
+    format!("http://localhost:{port}")
+}
+
 /// The basic-auth username an `opencode serve` accepts. Mirrors the server's
 /// own default (`auth.ts`): `OPENCODE_SERVER_USERNAME` if set, else `opencode`.
 pub(crate) const DEFAULT_SERVER_USERNAME: &str = "opencode";
@@ -50,10 +65,14 @@ pub struct ResolvedServer {
     pub url: String,
     pub username: String,
     pub password: String,
+    /// The pid of the attached server, when the attach path knew it: the
+    /// neutral identity token the reconnect loop compares to notice a
+    /// replacement on the same port (a new generation or a new password).
+    pub pid: Option<i32>,
     /// The generation attach detection resolved for this server, with the
     /// `[opencode] generation` override applied (spec #364 §2). A property of
     /// the attachment — never guessed, never per-session (ADR-0055).
-    pub(crate) generation: Generation,
+    pub generation: Generation,
 }
 
 impl ResolvedServer {
@@ -62,11 +81,12 @@ impl ResolvedServer {
     /// from the command rather than probed — a probe would also race the
     /// server's startup window (`wait_for_server_ready` exists for exactly
     /// that swallowed-request hazard).
-    pub(crate) fn self_started(url: String, password: String) -> Self {
+    pub(crate) fn self_started(url: String, password: String, pid: i32) -> Self {
         Self {
             url,
             username: DEFAULT_SERVER_USERNAME.to_string(),
             password,
+            pid: Some(pid),
             generation: Generation::V1,
         }
     }
@@ -132,13 +152,6 @@ struct ServiceRegistration {
     password: String,
     #[serde(default)]
     pid: Option<i32>,
-}
-
-/// The port of a registration URL (`http://127.0.0.1:49374`). `None` when the
-/// URL carries no explicit port — this fallback only ever sees a URL the
-/// daemon wrote for itself, which always includes the listening port.
-fn port_from_url(url: &str) -> Option<u16> {
-    url.rsplit(':').next()?.trim_end_matches('/').parse().ok()
 }
 
 /// Read a `serve --service` process's registration file and return its port
@@ -532,12 +545,9 @@ pub async fn spawn_own_server(preferred_port: Option<u16>) -> anyhow::Result<Res
         port += 1;
     }
     let password = "cola-secret".to_string();
-    spawn_self_server(port, &password)?;
+    let pid = spawn_self_server(port, &password)?;
     wait_for_port(port).await?;
-    Ok(ResolvedServer::self_started(
-        format!("http://localhost:{}", port),
-        password,
-    ))
+    Ok(ResolvedServer::self_started(local_url(port), password, pid))
 }
 
 /// Outcome of `/restart-opencode`.
@@ -795,11 +805,9 @@ mod tests {
     }
 
     #[test]
-    fn port_from_url_requires_an_explicit_port() {
-        assert_eq!(port_from_url("http://127.0.0.1:49374"), Some(49374));
-        assert_eq!(port_from_url("http://127.0.0.1:49374/"), Some(49374));
-        assert_eq!(port_from_url("http://127.0.0.1"), None);
-        assert_eq!(port_from_url("nonsense"), None);
+    fn server_candidate_url_uses_the_one_loopback_spelling() {
+        assert_eq!(cand(7, 4096, "x", true).url(), "http://localhost:4096");
+        assert_eq!(local_url(49374), "http://localhost:49374");
     }
 
     #[test]

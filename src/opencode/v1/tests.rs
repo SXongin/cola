@@ -221,6 +221,7 @@ async fn new_binds_the_resolved_server_url_and_credentials() {
                 url: server.base_url(),
                 username: "custom-user".to_string(),
                 password: "custom-pass".to_string(),
+                pid: None,
                 generation: super::super::strategy::Generation::V1,
             }),
         ),
