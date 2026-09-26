@@ -6,12 +6,11 @@
 //!
 //! These DTOs are the [`crate::backend`] contract's shapes and the documented
 //! out-of-scope exception to the generation seam (spec #332): a strategy
-//! decodes its generation's payloads straight into them, so a few V1-era shapes
-//! (the session-list entry, the question form, the status fan-out) still
-//! surface here. Splitting generation-private wire structs out of these DTOs is
-//! the V2 read-model slice's work (spec #364, S4), where the first real
-//! divergence decides the shape; no generation-distinctive literal is added
-//! here in the meantime.
+//! decodes its generation's payloads into them, so a few V1-era shapes (the
+//! session-list entry, the question form, the status fan-out) still surface
+//! here. Generation-private wire structs live with the strategy instead (the V2
+//! read model's landed in `opencode::v2::wire`, spec #364 S4a) and convert into
+//! these neutral shapes; no generation-distinctive field literal is added here.
 
 #![allow(dead_code)] // protocol types — field coverage matches server contract
 

@@ -9,9 +9,20 @@
 //! never silently broken, and the failing call is visible in the log and on the
 //! card.
 //!
+//! S4a is the session-level read surface: list/get/update/delete, and the run
+//! state (`session.active`) with the retry status derived from the newest
+//! assistant message's `retry` field. The transcript decode proper is S4b.
+//!
 //! The shared `/api/session` create/compact calls are NOT here: both
 //! generations serve them, so they live on the generation-blind adapter
 //! (`OpenCodeBackend::create_session` / `compact`).
+
+mod wire;
+
+#[cfg(test)]
+pub(crate) mod conformance;
+#[cfg(test)]
+mod tests;
 
 use async_trait::async_trait;
 
@@ -25,6 +36,21 @@ use super::types::{
     SessionInfo, SessionListInfo, SessionStatus,
 };
 
+/// The session root: list, get, update (PATCH), delete, and the per-session
+/// sub-routes. Unlike V1's unprefixed surface, every V2 route lives under
+/// `/api`.
+const SESSION: &str = "/api/session";
+/// The active-session run-state map (`{data: Record<SessionID, {type:"running"}>}`).
+const SESSION_ACTIVE: &str = "/api/session/active";
+/// The per-session projected-message read; S4a uses it only for the retry
+/// derivation (S4b decodes the transcript).
+const SESSION_MESSAGES_SUFFIX: &str = "/message";
+
+/// Hard stop for the body-cursor follow in [`V2Strategy::list_sessions`]: a
+/// misbehaving server must not spin the client forever. The server's default
+/// page is 50 rows, so 100 pages is 5k sessions — far past any real store.
+const MAX_SESSION_PAGES: usize = 100;
+
 /// The strategy that speaks the V2 generation.
 pub(crate) struct V2Strategy;
 
@@ -35,7 +61,7 @@ pub(crate) struct V2Strategy;
 /// catalog warns.
 fn not_implemented(method: &str) -> String {
     format!(
-        "OpenCode V2 strategy: {method} is not implemented yet (spec #364 slice S4+); \
+        "OpenCode V2 strategy: {method} is not implemented yet (spec #364; a later slice); \
          cola is attached to a V2 server"
     )
 }
@@ -47,12 +73,67 @@ fn not_implemented_error(method: &str) -> crate::error::BridgeError {
 
 #[async_trait]
 impl GenerationStrategy for V2Strategy {
-    async fn list_sessions(&self, _http: &Transport) -> Result<Vec<SessionListInfo>> {
-        Err(not_implemented_error("list_sessions"))
+    /// List sessions across the shared store, most recently active first.
+    ///
+    /// `GET /api/session` returns `{data: Session.Info[], cursor: {previous,
+    /// next}}` with an **opaque body cursor** (not V1's `x-next-cursor`
+    /// header). The server generates `cursor.next` for every non-empty page, so
+    /// the follow-up loop stops on the first empty page. Unlike the V1 read
+    /// there is no 404 fallback: a server with no `/api/session` is not a V2
+    /// server, and attach detection already decided the generation.
+    ///
+    /// Children stay in the returned set — the child policy belongs to each
+    /// caller (ADR-0008) — and no `parentID` filter is sent.
+    async fn list_sessions(&self, http: &Transport) -> Result<Vec<SessionListInfo>> {
+        let mut sessions = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_SESSION_PAGES {
+            let mut url = reqwest::Url::parse(&http.url(SESSION))?;
+            if let Some(cursor) = &cursor {
+                url.query_pairs_mut().append_pair("cursor", cursor);
+            }
+            let resp = http.client().get(url).send().await?;
+            let page: wire::SessionListPage = resp.error_for_status()?.json().await?;
+            let next = page.cursor.next.clone();
+            let empty = page.data.is_empty();
+            sessions.extend(page.data.into_iter().map(wire::RawSessionInfo::into_list_info));
+            match next {
+                Some(next) if !empty => cursor = Some(next),
+                _ => return Ok(sessions),
+            }
+        }
+        tracing::warn!(
+            "session list: cursor.next still present after {MAX_SESSION_PAGES} pages; \
+             returning the {} sessions fetched so far",
+            sessions.len()
+        );
+        Ok(sessions)
     }
 
-    async fn update_session_title(&self, _http: &Transport, _session_id: &str, _title: &str) -> Result<()> {
-        Err(not_implemented_error("update_session_title"))
+    /// Rename a session server-side (`PATCH /api/session/{id}` with
+    /// `{"title": ...}`). V2 answers **204 No Content** (V1 returned the
+    /// updated info), so only the status is read. The change is durable session
+    /// state, visible to every client sharing the store.
+    async fn update_session_title(&self, http: &Transport, session_id: &str, title: &str) -> Result<()> {
+        let body = serde_json::json!({ "title": title });
+        http.client()
+            .patch(http.url(&format!("{SESSION}/{session_id}")))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Delete a session server-side (`DELETE /api/session/{id}`). V2 answers
+    /// **204 No Content** and cascades to the session's child sessions.
+    async fn delete_session(&self, http: &Transport, session_id: &str) -> Result<()> {
+        http.client()
+            .delete(http.url(&format!("{SESSION}/{session_id}")))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)] // matches the trait's prompt axes
@@ -134,13 +215,57 @@ impl GenerationStrategy for V2Strategy {
         Err(not_implemented_error("transcript"))
     }
 
+    /// The run state for ONE session (V2 `GET /api/session/active`), with the
+    /// retry state derived from the transcript's assistant `retry` field.
+    ///
+    /// V2 has no retry status: the active map only carries `{type:"running"}`
+    /// and a scheduled retry keeps the session's drain active, so the map alone
+    /// cannot tell retry from running. The neutral view keeps Idle/Busy/Retry
+    /// (the Session Snapshot's status line), so cola reads the newest assistant
+    /// message and maps a scheduled `retry` to [`SessionStatus::Retry`] **ahead
+    /// of** the active map. No transcript decode is involved (slice S4b): the
+    /// read asks only for the newest assistant message.
+    ///
+    /// Absence from the active map is idle (the server's own contract). An
+    /// active entry whose type cola does not recognise yields `Ok(None)` —
+    /// never guessed — matching the V1 read. Both paths are global across
+    /// locations; `directory` is ignored (V2 scopes by session id).
     async fn session_status(
         &self,
-        _http: &Transport,
-        _session_id: &str,
+        http: &Transport,
+        session_id: &str,
         _directory: Option<&str>,
     ) -> Result<Option<SessionStatus>> {
-        Err(not_implemented_error("session_status"))
+        if self.newest_assistant_retrying(http, session_id).await? {
+            return Ok(Some(SessionStatus::Retry));
+        }
+        let resp = http.client().get(http.url(SESSION_ACTIVE)).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                "GET /api/session/active failed: {} — body: {}",
+                status,
+                &text[..text.len().min(500)]
+            );
+            return Err(crate::error::BridgeError::OpenCode(format!(
+                "session status failed: {}",
+                status
+            )));
+        }
+        let text = resp.text().await?;
+        let active: wire::ActiveSessions = serde_json::from_str(&text).map_err(|e| {
+            crate::error::BridgeError::OpenCode(format!(
+                "session status parse: {e} — body: {}",
+                &text[..text.len().min(300)]
+            ))
+        })?;
+        Ok(match active.state(session_id) {
+            Some(true) => Some(SessionStatus::Busy),
+            // Present but with an unrecognised type: never guessed.
+            Some(false) => None,
+            None => Some(SessionStatus::Idle),
+        })
     }
 
     async fn model_context_window(
@@ -162,13 +287,25 @@ impl GenerationStrategy for V2Strategy {
         Vec::new()
     }
 
+    /// Fetch a session's info (`GET /api/session/{id}`), unwrapping the
+    /// `{data: ...}` envelope. V2 resolves the session id globally, so the
+    /// handle's `directory` is not sent; the directory itself lives in
+    /// `location.directory`, which the parent-chain/card consumers do not read
+    /// from this DTO (the list read carries it for the cards).
     async fn session_info(
         &self,
-        _http: &Transport,
-        _session_id: &str,
+        http: &Transport,
+        session_id: &str,
         _directory: Option<&str>,
     ) -> Result<SessionInfo> {
-        Err(not_implemented_error("session_info"))
+        let resp = http
+            .client()
+            .get(http.url(&format!("{SESSION}/{session_id}")))
+            .send()
+            .await?
+            .error_for_status()?;
+        let body: wire::DataEnvelope<wire::RawSessionInfo> = resp.json().await?;
+        Ok(body.data.into_session_info()?)
     }
 
     async fn interrupt(&self, _http: &Transport, _session_id: &str) -> Result<()> {
@@ -176,24 +313,39 @@ impl GenerationStrategy for V2Strategy {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn every_capability_fails_loudly_until_its_slice_lands() {
-        // Attaching to V2 must never pretend a missing capability worked: a
-        // caller gets an error naming the method and the generation (spec
-        // #364, S3).
-        let strategy = V2Strategy;
-        let http = Transport::new(Some("opencode"), Some("pw"), "http://127.0.0.1:1");
-        let error = strategy.list_sessions(&http).await.unwrap_err().to_string();
-        assert!(error.contains("V2 strategy"), "unexpected: {error}");
-        assert!(error.contains("list_sessions"), "unexpected: {error}");
-        assert!(error.contains("not implemented"), "unexpected: {error}");
-        // The two catalog reads degrade to empty with a warning instead of an
-        // error (their card surfaces tolerate emptiness).
-        assert!(strategy.list_agents(&http).await.is_empty());
-        assert!(strategy.list_models(&http).await.is_empty());
+impl V2Strategy {
+    /// Whether the newest assistant message of `session_id` carries a scheduled
+    /// `retry`. Reads ONE projected message (`type=assistant&order=desc&
+    /// limit=1`) — the minimal wire read that answers the run-state question
+    /// without decoding the transcript (S4b).
+    async fn newest_assistant_retrying(&self, http: &Transport, session_id: &str) -> Result<bool> {
+        let mut url =
+            reqwest::Url::parse(&http.url(&format!("{SESSION}/{session_id}{SESSION_MESSAGES_SUFFIX}")))?;
+        url.query_pairs_mut()
+            .append_pair("type", "assistant")
+            .append_pair("order", "desc")
+            .append_pair("limit", "1");
+        let resp = http.client().get(url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                "GET /api/session/{session_id}/message (retry read) failed: {} — body: {}",
+                status,
+                &text[..text.len().min(500)]
+            );
+            return Err(crate::error::BridgeError::OpenCode(format!(
+                "session status failed: {}",
+                status
+            )));
+        }
+        let text = resp.text().await?;
+        let page: wire::MessagesPage = serde_json::from_str(&text).map_err(|e| {
+            crate::error::BridgeError::OpenCode(format!(
+                "session retry read parse: {e} — body: {}",
+                &text[..text.len().min(300)]
+            ))
+        })?;
+        Ok(page.newest_assistant_retrying())
     }
 }

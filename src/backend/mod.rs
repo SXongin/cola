@@ -114,6 +114,16 @@ pub trait Backend: Send + Sync {
     /// Rename a session server-side (`PATCH /session/{id}` with a title).
     async fn update_session_title(&self, session_id: &str, title: &str) -> Result<()>;
 
+    /// Delete a session server-side. V2 cascades to the session's child
+    /// sessions and answers 204; V1 deletes the one session (boolean body).
+    /// Un-mapping a chat from a session is a separate, local act.
+    ///
+    /// No Bridge command deletes a session yet (`/switch forget` deliberately
+    /// keeps the server session); the capability completes the session surface
+    /// across generations (spec #364, S4a) and is pinned by the wire tests.
+    #[allow(dead_code)] // no bridge caller yet; the generation wire tests drive it
+    async fn delete_session(&self, session_id: &str) -> Result<()>;
+
     /// `model` is the per-session `/model` override (parsed "provider/model");
     /// None → the configured default applies, and if that's also unset the
     /// server uses its own default model.
