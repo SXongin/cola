@@ -1,14 +1,20 @@
 # Switch card defaults to the current directory; Feishu-side terms split from 会话
 
-The `/switch` card used to show every recent session in the shared store, and
-the word 「会话」 meant both the Feishu conversation and the OpenCode session.
-Users reported two problems: "why are so many sessions all 本会话?" and "I want
-to see the sessions of the directory I'm working in."
+The `/switch` card and `/switch list` used to show every recent session in the
+shared store, and the word 「会话」 meant both the Feishu conversation and the
+OpenCode session. Users reported two problems: "why are so many sessions all
+本会话?" and "I want to see the sessions of the directory I'm working in."
 
 > **Amended by ADR-0041**: the switch card's default scope falls back to the
 > Pending Session's directory when one exists (a conversation with a pending has
 > no active session). The terminology rule stands: 会话 stays reserved for a real
 > Session, and the pending state is never labelled with the noun.
+
+> **Amended by the 2026-09-26 update below**: the text `/switch list` is deleted
+> outright, not retired — its root-session find role passes to the card's 全部
+> scope + keyword search, and `--all`'s child listing to `/sub list`. The
+> `/switch list` passages below are superseded on that point; everything else
+> stands.
 
 ## Context
 
@@ -56,10 +62,12 @@ to see the sessions of the directory I'm working in."
   - No active session (fresh conversation) → fall back to the global-recent
     view (current behavior).
   - A 「全部」 toggle expands from the current directory to the whole store,
-    still hiding sub-task children (children are `/sub`'s surface — the
-    read-only `/sub list` and the explicit `/sub attach` — never the switch
-    card's). The toggle state rides in the card's routing payload so it persists
-    across search/rebuilds; the card header shows the directory when scoped.
+    still hiding sub-task children (the text `/switch list --all` remains the
+    only children escape hatch. **Superseded by the 2026-09-26 update**: the
+    text list is deleted; children are `/sub`'s surface — `/sub list` read-only,
+    `/sub attach` takeover — and the switch card stays roots-only). The toggle
+    state rides in the card's routing payload so it persists across
+    search/rebuilds; the card header shows the directory when scoped.
   - Keyword search stays within the current scope (directory or all).
 
 ### Marking: only the active session
@@ -69,11 +77,20 @@ to see the sessions of the directory I'm working in."
 - Mapped-but-not-active rows keep the **切换** button (they belong to this
   conversation); unmapped foreign sessions keep **接管**.
 
-### The `/switch <keyword>` text form
+### Text forms stay global and lean
 
+> **Partly superseded by the 2026-09-26 update**: only the `/switch <keyword>`
+> text form remains — the text list is deleted outright, so nothing carries the
+> `--all` child listing any more.
+
+- `/switch list` stays global (the reliable "find any session anywhere"
+  escape hatch) and keeps only the `(active)` marker — the 「本会话」 marker is
+  dropped. **Superseded by the 2026-09-26 update: the command was deleted
+  outright (no tombstone, no `--all`), and `/switch list` is now an ordinary
+  keyword query.**
 - `/switch <keyword>` keeps its resolution order unchanged: thread-mapped
-  matches first, then the global store (roots-only — children are `/sub`'s).
-  The directory filter is a switch-card concern only.
+  matches first, then the global store. The directory filter is a switch-card
+  concern only.
 
 ## Why
 
@@ -84,9 +101,12 @@ to see the sessions of the directory I'm working in."
   always names an OpenCode Session, so "why are so many sessions 本会话" cannot
   arise — only one row is ever marked, and the mark says ✅ 当前 (active), not
   ownership.
-- The card's 全部 scope + keyword search is the lossless path: it finds anything
-  and can adopt it in place, so the scoped quick-switcher and the find-anything
-  surface are one card instead of two drifting ones.
+- Keeping text forms global preserves a lossless path: `/switch list` finds
+  anything, the card is the scoped quick-switcher. The 全部 toggle is the card's
+  own escape hatch for the same job. **Superseded by the 2026-09-26 update**:
+  the text list is deleted; the card's 全部 scope + keyword search carries the
+  find-anything role for root sessions, and `--all`'s child listing is replaced
+  by `/sub list`.
 - Marking only the active session removes the "several 本会话" surprise without
   losing information: the 切换 button still distinguishes this-conversation
   sessions from foreign ones.
@@ -102,18 +122,24 @@ to see the sessions of the directory I'm working in."
   directory-default filter is the sharper answer.
 - **Directory-filter the text forms too**: forces an escape hatch into every
   text command and breaks the "text = global, card = scoped" story. Rejected.
-- **全部 also shows children**: blurs the card's child-hiding policy; children
-  have their own scoped surface (`/sub list`, `/sub attach`), so the switch
-  card stays roots-only.
+- **全部 also shows children**: blurs the card's child-hiding policy; the text
+  `--all` already exists. **Partly superseded by the 2026-09-26 update**: the
+  text list (and `--all`) is deleted; children have their own scoped surface
+  (`/sub list`, `/sub attach`), so the switch card stays roots-only.
 
 ## Risks / open questions
 
 - The directory default hides sessions of *other* directories that a lobby has
   mapped; a user who wants one must hit 全部. Mitigated by the 全部 toggle and
-  `/switch <keyword>`'s global search.
+  the still-global text forms.
 - The switch-card header needs a visible directory line when scoped, so a user
   understands *why* the list shrank. Undecided exact wording; implement with
   「本目录」+ the directory basename.
+- `/switch list` keeps `(active)` but drops the ownership marker; a lobby user
+  loses the "which sessions belong to this conversation" signal from the text
+  list. Acceptable — the card carries it (切换 vs 接管). **Superseded by the
+  2026-09-26 update: the command is deleted outright, so the trade-off no
+  longer applies.**
 - The card a `/switch <keyword>` opens after a no-match search is deliberately
   sent in the `All` scope, not the directory default — the text form searched
   the whole store, so a directory-scoped card would hide the candidates the
@@ -124,11 +150,18 @@ to see the sessions of the directory I'm working in."
 
 The text `/switch list` is **deleted outright, not retired** (spec #344):
 `/switch list` now parses as an ordinary `/switch list` keyword query — no
-tombstone reply, no `--all` flag, and nothing forwarded to the model. The card's
-全部 scope + keyword search is therefore the lossless find-anything path, the
-role the deleted text list and its `--all` escape hatch held in the original
-decisions above (those text-list bullets and their "text forms stay global"
-rationale are removed, since they no longer describe shipped behaviour). The
-`/switch <keyword>` resolution order and the directory default stand. Child
-discovery and takeover moved to the scoped `/sub` family (`/sub list`
-read-only, `/sub attach` explicit) — the switch card stays roots-only.
+tombstone reply, no `--all` flag, and nothing forwarded to the model.
+
+- **Root sessions.** The card's 全部 scope + keyword search is now the lossless
+  find-anything path for root sessions: both card scopes stay roots-only, so
+  every root session anywhere remains reachable, and a row's 接管 button adopts
+  it in place. That is the role the deleted text list played for roots.
+- **Children.** `--all`'s child listing has exactly one replacement: `/sub
+  list` — read-only, scoped to the Active Session's direct children — with
+  `/sub attach` for the explicit takeover. Children of other sessions and
+  nested descendants are not reachable from the switch surface at all: the card
+  and `/switch <keyword>` never offer a child, and a `/switch` adoption attempt
+  on a child this chat has not mapped is refused, naming `/sub attach`
+  (ADR-0008's 2026-09-26 update).
+
+The `/switch <keyword>` resolution order and the directory default stand.

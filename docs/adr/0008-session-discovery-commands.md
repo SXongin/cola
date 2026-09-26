@@ -105,9 +105,10 @@ How a user finds and takes over sessions that were not created in Feishu
 - `/list` caching can serve up to 30 s-stale data after external renames or
   activity; acceptable for a listing command.
 - Sub-task children show by id-tail/directory only (their titles are
-  `Child session - ...`); child takeover is the explicit `/sub attach`, never a
-  `/switch` result or auto-adoption, and a `/switch --force` adoption attempt on
-  a child is refused with a pointer to it. See the 2026-09-26 update.
+  `Child session - ...`); the switch card and `/switch <keyword>` stay
+  roots-only, child takeover is the explicit `/sub attach`, and an adoption
+  attempt on a child this chat has not mapped (`--force` or a card button) is
+  refused with a pointer to it. See the 2026-09-26 update.
 
 ## Update (2026-09-25)
 
@@ -133,7 +134,7 @@ deleted outright rather than retired (spec #344). The `--all` flag in the
 updates above is gone with it.
 
 - **`/switch` never adopts a child.** The card and `/switch <keyword>` stay
-  roots-only, and the `--force` attach path — the text form and the card's
+  roots-only, and an adoption attempt — `/switch <id> --force`, or the card's
   接管/强制接管 buttons — refuses a child this chat has not already mapped,
   naming `/sub attach`; `--force` does not open that door. A child this chat
   adopted behaves like any mapped session: `/switch` re-activates it and a
@@ -147,11 +148,13 @@ updates above is gone with it.
 - **The text list is deleted, not retired.** `/switch list` (with or without
   `--all`) parses as an ordinary `/switch list` keyword query: no tombstone
   reply, no flag, and nothing forwarded to the model. The switch card's 全部
-  scope + keyword search is the lossless find-anything path (ADR-0022's
-  2026-09-26 update).
-- **The Risk bullet above is replaced**: hidden became rejected — "adoption of
-  a child is possible and deliberately left out of `/switch` auto-adoption" no
-  longer describes the behaviour.
+  scope + keyword search is the lossless find-anything path over root sessions
+  (ADR-0022's 2026-09-26 update).
+- **The Risk bullet above is replaced.** Children stay hidden from the card
+  and `/switch <keyword>`; an adoption attempt (`--force` or a card button) on
+  a child this chat has not mapped is refused, naming `/sub attach`. The old
+  wording — "adoption of a child is possible and deliberately left out of
+  `/switch` auto-adoption" — no longer describes the behaviour.
 - **ADR-0016's `/topic --adopt` child rejection stands**: a child is never a
   topic's own session; the takeover above adopts a child into the current Chat,
   not into a new Topic.
