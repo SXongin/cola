@@ -492,9 +492,26 @@ fn child_row_text(
     status: Option<crate::opencode::types::SessionStatus>,
     now_ms: i64,
 ) -> String {
-    let mut parts = vec![crate::bridge::display::title_or_id_tail(child)];
-    if let Some(agent) = child.agent.as_deref().filter(|a| !a.is_empty()) {
-        parts.push(agent.to_string());
+    let mut title = crate::bridge::display::title_or_id_tail(child);
+    let mut agent = None;
+    if let Some(name) = child.agent.as_deref().filter(|a| !a.is_empty()) {
+        // The `task` tool names a child `<description> (@<subagent> subagent)`
+        // AND records the subagent in `agent` (opencode task.ts), so the
+        // standalone agent segment below would otherwise repeat the name. Drop
+        // the redundant suffix; a title that was only the suffix falls back to
+        // the id tail, like any other empty title.
+        if let Some(stripped) = strip_task_agent_suffix(&title, name) {
+            title = if stripped.is_empty() {
+                crate::bridge::display::id_tail(&child.id)
+            } else {
+                stripped
+            };
+        }
+        agent = Some(name.to_string());
+    }
+    let mut parts = vec![title];
+    if let Some(agent) = agent {
+        parts.push(agent);
     }
     parts.push(format!("`{}`", crate::bridge::display::id_tail(&child.id)));
     if let Some(updated) = child.time.as_ref().map(|t| t.updated) {
@@ -504,6 +521,21 @@ fn child_row_text(
         parts.push(state.to_string());
     }
     parts.join(" · ")
+}
+
+/// Strip the `task` tool's redundant `(@<agent> subagent)` title suffix when it
+/// matches the session's recorded agent exactly. The marker is matched without
+/// its leading space because `clean_session_label` normalises whitespace
+/// (`strip_mention_tokens`), so a title that is only the marker — an empty
+/// description — renders without one. Returns the trimmed description, or
+/// `None` when the title does not end with that exact marker — the caller then
+/// keeps the title verbatim (e.g. a suffixed title whose session has no `agent`
+/// field: no standalone segment, so no duplication and nothing to strip).
+fn strip_task_agent_suffix(title: &str, agent: &str) -> Option<String> {
+    let marker = format!("(@{agent} subagent)");
+    title
+        .strip_suffix(&marker)
+        .map(|description| description.trim().to_string())
 }
 
 /// Build the read-only `/sub` child-session card (spec #344): the Active
@@ -1249,6 +1281,70 @@ mod tests {
         assert_eq!(child_state_label(Some(SessionStatus::Retry)), Some(CHILD_RUNNING));
         assert_eq!(child_state_label(Some(SessionStatus::Idle)), Some(CHILD_IDLE));
         assert_eq!(child_state_label(None), None);
+    }
+
+    /// The `task` tool names a child `<description> (@<subagent> subagent)` and
+    /// records the same subagent in `agent` (opencode task.ts), so the row must
+    /// not show the name twice: a matching suffix is stripped and the standalone
+    /// agent segment keeps it. A suffixed title with no `agent` field, a normal
+    /// title, and a title that is only the suffix all behave as documented.
+    #[test]
+    fn child_row_text_strips_the_redundant_task_agent_suffix() {
+        use crate::opencode::types::SessionStatus;
+        let now = 1_700_000_000_000;
+
+        // The realistic fixture: title suffix + matching agent.
+        let suffixed = child_session(
+            "ses_child_task",
+            "Research token-saving tools (@general subagent)",
+            Some("general"),
+            now - 60_000,
+        );
+        let text = child_row_text(&suffixed, Some(SessionStatus::Busy), now);
+        assert!(text.contains("Research token-saving tools"), "{text}");
+        assert_eq!(
+            text.matches("general").count(),
+            1,
+            "the agent renders exactly once: {text}"
+        );
+        assert!(
+            !text.contains("(@general subagent)"),
+            "the redundant suffix is stripped: {text}"
+        );
+        assert!(text.contains("`child_t`"), "id tail present: {text}");
+        assert!(text.contains(CHILD_RUNNING), "state present: {text}");
+
+        // A stored child whose title carries the suffix but whose `agent` is
+        // absent is left verbatim — no standalone segment, so no duplication.
+        let agentless = child_session(
+            "ses_child_agentless",
+            "Research token-saving tools (@general subagent)",
+            None,
+            now,
+        );
+        let text = child_row_text(&agentless, None, now);
+        assert!(
+            text.contains("(@general subagent)"),
+            "no agent field means no stripping: {text}"
+        );
+        assert!(
+            !text.contains(" · general · "),
+            "no standalone agent segment: {text}"
+        );
+
+        // A title that is only the suffix (an empty description: the tool still
+        // emits the leading space) falls back to the id tail.
+        let bare = child_session("ses_child_bare", " (@general subagent)", Some("general"), now);
+        let text = child_row_text(&bare, None, now);
+        assert!(!text.contains("(@general subagent)"), "{text}");
+        assert!(text.contains("`child_b`"), "falls back to the id tail: {text}");
+
+        // A normal title is untouched.
+        let normal = child_session("ses_child_norm", "普通子任务", Some("general"), now);
+        assert_eq!(
+            child_row_text(&normal, Some(SessionStatus::Idle), now),
+            format!("普通子任务 · general · `child_n` · 0s · {CHILD_IDLE}"),
+        );
     }
 
     /// Spec #344: each rendered row carries the child's title, id tail, agent,
