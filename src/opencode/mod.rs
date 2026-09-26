@@ -7,13 +7,15 @@
 //! request bodies and response decoders, and the adapter forwards every call to
 //! the selected one. The V1 strategy (the unprefixed 1.18.x surface) lives under
 //! [`v1`], together with the legacy wire decoder — deleting that module is V1
-//! retirement.
+//! retirement. The V2 strategy (the `/api`-only 2.0.x surface) lives under
+//! [`v2`], and attach-time detection lives in [`generation`] (spec #364 §2).
 //!
 //! Protocol field names for the message/transcript read live only in the
 //! strategy's private wire decoder; everything else imports the contract from
 //! [`crate::backend`], never from here.
 
 pub mod client;
+pub(crate) mod generation;
 #[cfg(test)]
 mod live;
 pub(crate) mod parsing;
@@ -23,6 +25,7 @@ mod tests;
 pub(crate) mod transport;
 pub mod types;
 pub(crate) mod v1;
+pub(crate) mod v2;
 
 use std::sync::Arc;
 
@@ -144,8 +147,8 @@ impl Backend for OpenCodeBackend {
         OpenCodeBackend::compact(self, session_id).await
     }
 
-    async fn reconnect(&self, url: &str, password: &str) -> Result<()> {
-        OpenCodeBackend::reconnect(self, url, password).await;
+    async fn reconnect(&self, server: Option<&crate::bridge::discovery::ResolvedServer>) -> Result<()> {
+        OpenCodeBackend::reconnect(self, server);
         Ok(())
     }
 

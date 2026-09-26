@@ -150,11 +150,7 @@ async fn reconcile(
             let spawned = discovery::spawn_own_server(handles.server.preferred_port)
                 .await
                 .map_err(|e| crate::error::BridgeError::OpenCode(format!("lazy start failed: {e}")))?;
-            handles
-                .flow
-                .backend
-                .reconnect(&spawned.url, &spawned.password)
-                .await?;
+            handles.flow.backend.reconnect(Some(&spawned)).await?;
             // The spawned server only serves requests after a short startup
             // window (requests landing in it are swallowed forever). Wait until
             // it actually responds, so the message flow's first request lands
@@ -177,15 +173,20 @@ async fn reconcile(
                         }
                     }
                 }
-                let _ = handles.flow.backend.reconnect("", "").await;
+                let _ = handles.flow.backend.reconnect(None).await;
                 return Err(e);
             }
             if allow_spawn {
-                tracing::info!("lazily started own OpenCode server at {}", spawned.url);
+                tracing::info!(
+                    "lazily started own OpenCode server at {} (generation={})",
+                    spawned.url,
+                    spawned.generation.as_str()
+                );
             } else {
                 tracing::warn!(
-                    "attached server died mid-turn; started own OpenCode server at {}",
-                    spawned.url
+                    "attached server died mid-turn; started own OpenCode server at {} (generation={})",
+                    spawned.url,
+                    spawned.generation.as_str()
                 );
             }
             return Ok(true);
@@ -195,7 +196,7 @@ async fn reconcile(
         // dead endpoint forever.
         if !handles.flow.backend.base_url().is_empty() {
             tracing::warn!("attached OpenCode server is gone; going serverless");
-            handles.flow.backend.reconnect("", "").await?;
+            handles.flow.backend.reconnect(None).await?;
         }
         return Ok(false);
     };
@@ -211,7 +212,23 @@ async fn reconcile(
             return Ok(true);
         }
         tracing::warn!("OpenCode server changed ({} -> {}); reconnecting", current, url);
-        handles.flow.backend.reconnect(&url, &server.password).await?;
+        // Resolve the new attachment's generation before re-pointing (spec
+        // #364 §2). A probe that cannot classify the server is never guessed
+        // at: cola drops to serverless and the next pass retries — an error
+        // return lets the PollLoop's latch report it once, not every tick.
+        let resolved = match crate::bridge::attach::resolve_candidate(server, handles.server.generation).await
+        {
+            Ok(resolved) => resolved,
+            Err(evidence) => {
+                if !current.is_empty() {
+                    handles.flow.backend.reconnect(None).await?;
+                }
+                return Err(crate::error::BridgeError::OpenCode(format!(
+                    "generation probe inconclusive at {url}; staying serverless: {evidence}"
+                )));
+            }
+        };
+        handles.flow.backend.reconnect(Some(&resolved)).await?;
     }
 
     // Attached to the preferred server. If it's a Coexistent Server, reap a

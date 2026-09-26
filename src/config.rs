@@ -63,6 +63,34 @@ impl ServerStartPolicy {
     }
 }
 
+/// How cola picks the attached server's protocol generation (spec #364 §2,
+/// ADR-0055). The glossary calls this the **Generation Override**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum GenerationOverride {
+    /// Probe `GET /api/info` on every attach/reconnect and trust the result.
+    /// An inconclusive probe leaves cola serverless (never guessed). The
+    /// default.
+    #[default]
+    Auto,
+    /// Force the V1 strategy even when the probe disagrees; the contradicting
+    /// probe is logged at WARN with its evidence.
+    V1,
+    /// Force the V2 strategy even when the probe disagrees; the contradicting
+    /// probe is logged at WARN with its evidence.
+    V2,
+}
+
+impl std::fmt::Display for GenerationOverride {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenCodeConfig {
     /// Preferred/fallback port. Optional: discovery rewrites the effective
@@ -82,6 +110,10 @@ pub struct OpenCodeConfig {
     /// the default), `never` (attach-only), `eager` (spawn at boot).
     #[serde(default)]
     pub start_server: ServerStartPolicy,
+    /// How the attached server's protocol generation is chosen (spec #364 §2):
+    /// `auto` probes `GET /api/info` (default), `v1`/`v2` force the strategy.
+    #[serde(default)]
+    pub generation: GenerationOverride,
 }
 
 impl Default for OpenCodeConfig {
@@ -90,6 +122,7 @@ impl Default for OpenCodeConfig {
             url: None,
             model: None,
             start_server: ServerStartPolicy::Auto,
+            generation: GenerationOverride::Auto,
         }
     }
 }
@@ -391,6 +424,23 @@ mod tests {
         assert!(cfg.start_server.spawns_when_needed());
         assert!(!ServerStartPolicy::Never.spawns_when_needed());
         assert!(ServerStartPolicy::Eager.spawns_when_needed());
+    }
+
+    #[test]
+    fn generation_override_deserializes_three_states() {
+        let parse = |s: &str| toml::from_str::<OpenCodeConfig>(s).unwrap().generation;
+        assert_eq!(parse(r#"generation = "auto""#), GenerationOverride::Auto);
+        assert_eq!(parse(r#"generation = "v1""#), GenerationOverride::V1);
+        assert_eq!(parse(r#"generation = "v2""#), GenerationOverride::V2);
+    }
+
+    #[test]
+    fn generation_override_defaults_to_auto_and_rejects_unknown() {
+        let cfg: OpenCodeConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.generation, GenerationOverride::Auto);
+        assert_eq!(cfg.generation.to_string(), "auto");
+        // A typo must be a loud config error, never a silent fallback to auto.
+        assert!(toml::from_str::<OpenCodeConfig>(r#"generation = "v3""#).is_err());
     }
 
     /// Instant Reminder is opt-in (ADR-0043): absent or explicit `false` must

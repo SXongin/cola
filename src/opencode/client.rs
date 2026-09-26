@@ -8,7 +8,7 @@
 //! response decoders; V1's lives under [`crate::opencode::v1`], and deleting
 //! that module is V1 retirement.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::backend::SessionTranscript;
 
@@ -34,14 +34,15 @@ const API_SESSION: &str = "/api/session";
 /// `Arc<dyn Backend>`.
 pub struct OpenCodeBackend {
     transport: Transport,
-    /// The username used for Basic auth (reused on reconnect).
+    /// The username used for Basic auth (reused when going serverless).
     username: Option<String>,
     /// Default model for new sessions, e.g. "opencode/deepseek-v4-flash-free"
     pub model: Option<ModelInfo>,
-    /// The strategy that speaks the attached server's generation. The
-    /// selection arm ([`Generation::V1`]) is fixed until attach detection
-    /// lands (spec #364, S3).
-    strategy: Arc<dyn GenerationStrategy>,
+    /// The strategy that speaks the attached server's generation. Attach
+    /// detection resolves the generation (spec #364 §2); [`Self::reconnect`]
+    /// swaps this arm without dropping a backend handle, so it lives behind a
+    /// lock shared across clones.
+    strategy: Arc<RwLock<Arc<dyn GenerationStrategy>>>,
 }
 
 impl Clone for OpenCodeBackend {
@@ -61,57 +62,96 @@ impl OpenCodeBackend {
     /// base URL and does no requests until `reconnect` points it at a real
     /// server; the username is still pinned so a later reconnect carries Basic
     /// auth with both parts.
+    ///
+    /// The attachment's generation was resolved by attach detection (spec #364
+    /// §2), which selects the generation strategy here.
     pub fn new(model: Option<&str>, server: Option<crate::bridge::discovery::ResolvedServer>) -> Self {
         match server {
             Some(crate::bridge::discovery::ResolvedServer {
                 url,
                 username,
                 password,
-            }) => Self::with_base_url(model, url, Some(&username), Some(&password)),
-            None => Self::with_base_url(
+                generation,
+            }) => Self::with_generation(model, url, Some(&username), Some(&password), generation),
+            None => Self::with_generation(
                 model,
                 String::new(),
                 Some(crate::bridge::discovery::DEFAULT_SERVER_USERNAME),
                 None,
+                Generation::V1,
             ),
         }
     }
 
-    /// Build a backend against an explicit base URL and credentials.
-    /// Production normally goes through [`OpenCodeBackend::new`] (a discovered
-    /// server) or [`OpenCodeBackend::reconnect`] (the live endpoint was
-    /// replaced); this constructor also lets tests point the real backend at a
-    /// local fake server so the HTTP layer is exercised end to end (ADR-0031).
-    /// A trailing slash is tolerated.
+    /// Build a backend against an explicit base URL and credentials, speaking
+    /// V1 — the constructor tests use to point the real backend at a local fake
+    /// server so the HTTP layer is exercised end to end (ADR-0031). A trailing
+    /// slash is tolerated.
     ///
     /// Basic auth is attached only when BOTH username and password are present
     /// — a half-credential must never reach the wire (the server checks the
     /// username too, so a password-only request 401s).
+    #[cfg(test)]
     pub fn with_base_url(
         model: Option<&str>,
         base_url: impl Into<String>,
         username: Option<&str>,
         password: Option<&str>,
     ) -> Self {
+        Self::with_generation(model, base_url, username, password, Generation::V1)
+    }
+
+    /// [`Self::with_base_url`] with the generation strategy made explicit.
+    pub(crate) fn with_generation(
+        model: Option<&str>,
+        base_url: impl Into<String>,
+        username: Option<&str>,
+        password: Option<&str>,
+        generation: Generation,
+    ) -> Self {
         Self {
             transport: Transport::new(username, password, base_url),
             username: username.map(str::to_string),
             model: model.and_then(parse_model),
-            // The selection arm: detection is not wired yet, so every
-            // attachment speaks V1 (spec #364, S3 adds the probe).
-            strategy: Generation::V1.strategy(),
+            strategy: Arc::new(RwLock::new(generation.strategy())),
         }
     }
 
-    /// Point this backend at a different server (port/password changed because
-    /// the old one was restarted/replaced). Rare; only called by the reconnect
-    /// loop when discovery finds the attached server is gone.
+    /// The strategy that speaks the currently attached generation.
+    fn strategy(&self) -> Arc<dyn GenerationStrategy> {
+        self.strategy
+            .read()
+            .expect("the strategy lock is never poisoned")
+            .clone()
+    }
+
+    /// Point this backend at a (re)discovered attachment, selecting its
+    /// generation strategy; `None` goes serverless. The generation was
+    /// resolved by attach detection before this call (spec #364 §2) — the
+    /// backend never probes and never guesses.
     ///
-    /// The generation strategy is deliberately NOT re-selected here yet:
-    /// re-probing on reconnect arrives with attach detection (spec #364, S3).
-    pub async fn reconnect(&self, url: &str, password: &str) {
-        self.transport.repoint(url, password, self.username.as_deref());
-        tracing::info!("reconnected opencode backend to {}", url);
+    /// Rare; only the reconnect loop (a server restarted/replaced) and Lazy
+    /// Start call it.
+    pub fn reconnect(&self, server: Option<&crate::bridge::discovery::ResolvedServer>) {
+        match server {
+            Some(server) => {
+                self.transport
+                    .repoint(&server.url, &server.password, Some(&server.username));
+                *self
+                    .strategy
+                    .write()
+                    .expect("the strategy lock is never poisoned") = server.generation.strategy();
+                tracing::info!(
+                    "reconnected opencode backend to {} (generation={})",
+                    server.url,
+                    server.generation.as_str()
+                );
+            }
+            None => {
+                self.transport.repoint("", "", self.username.as_deref());
+                tracing::info!("opencode backend is serverless (the attached server is gone)");
+            }
+        }
     }
 
     /// The current base URL.
@@ -155,11 +195,11 @@ impl OpenCodeBackend {
     }
 
     pub async fn list_sessions(&self) -> crate::error::Result<Vec<SessionListInfo>> {
-        self.strategy.list_sessions(&self.transport).await
+        self.strategy().list_sessions(&self.transport).await
     }
 
     pub async fn update_session_title(&self, session_id: &str, title: &str) -> crate::error::Result<()> {
-        self.strategy
+        self.strategy()
             .update_session_title(&self.transport, session_id, title)
             .await
     }
@@ -179,7 +219,7 @@ impl OpenCodeBackend {
         // default): which model runs is cola policy, how it is spelled on the
         // wire is the strategy's business.
         let model = model.or(self.model.as_ref());
-        self.strategy
+        self.strategy()
             .prompt(
                 &self.transport,
                 session_id,
@@ -205,7 +245,7 @@ impl OpenCodeBackend {
         message_id: Option<&str>,
     ) -> crate::error::Result<()> {
         let model = model.or(self.model.as_ref());
-        self.strategy
+        self.strategy()
             .prompt_async(
                 &self.transport,
                 session_id,
@@ -225,7 +265,7 @@ impl OpenCodeBackend {
         reply: &str,
         directory: Option<&str>,
     ) -> crate::error::Result<()> {
-        self.strategy
+        self.strategy()
             .reply_permission(&self.transport, request_id, reply, directory)
             .await
     }
@@ -234,14 +274,14 @@ impl OpenCodeBackend {
         &self,
         directory: Option<&str>,
     ) -> crate::error::Result<Vec<PermissionRequest>> {
-        self.strategy.list_permissions(&self.transport, directory).await
+        self.strategy().list_permissions(&self.transport, directory).await
     }
 
     pub async fn list_questions(
         &self,
         directory: Option<&str>,
     ) -> crate::error::Result<Vec<QuestionRequest>> {
-        self.strategy.list_questions(&self.transport, directory).await
+        self.strategy().list_questions(&self.transport, directory).await
     }
 
     pub async fn reply_question(
@@ -250,7 +290,7 @@ impl OpenCodeBackend {
         answers: &[Vec<String>],
         directory: Option<&str>,
     ) -> crate::error::Result<()> {
-        self.strategy
+        self.strategy()
             .reply_question(&self.transport, request_id, answers, directory)
             .await
     }
@@ -260,13 +300,13 @@ impl OpenCodeBackend {
         request_id: &str,
         directory: Option<&str>,
     ) -> crate::error::Result<()> {
-        self.strategy
+        self.strategy()
             .reject_question(&self.transport, request_id, directory)
             .await
     }
 
     pub async fn transcript(&self, session_id: &str) -> crate::error::Result<SessionTranscript> {
-        self.strategy.transcript(&self.transport, session_id).await
+        self.strategy().transcript(&self.transport, session_id).await
     }
 
     pub async fn session_status(
@@ -274,7 +314,7 @@ impl OpenCodeBackend {
         session_id: &str,
         directory: Option<&str>,
     ) -> crate::error::Result<Option<SessionStatus>> {
-        self.strategy
+        self.strategy()
             .session_status(&self.transport, session_id, directory)
             .await
     }
@@ -284,17 +324,17 @@ impl OpenCodeBackend {
         provider: &str,
         model: &str,
     ) -> crate::error::Result<Option<i64>> {
-        self.strategy
+        self.strategy()
             .model_context_window(&self.transport, provider, model)
             .await
     }
 
     pub async fn list_agents(&self) -> Vec<AgentInfo> {
-        self.strategy.list_agents(&self.transport).await
+        self.strategy().list_agents(&self.transport).await
     }
 
     pub async fn list_models(&self) -> Vec<ProviderModels> {
-        self.strategy.list_models(&self.transport).await
+        self.strategy().list_models(&self.transport).await
     }
 
     pub async fn session_info(
@@ -302,13 +342,13 @@ impl OpenCodeBackend {
         session_id: &str,
         directory: Option<&str>,
     ) -> crate::error::Result<SessionInfo> {
-        self.strategy
+        self.strategy()
             .session_info(&self.transport, session_id, directory)
             .await
     }
 
     pub async fn interrupt(&self, session_id: &str) -> crate::error::Result<()> {
-        self.strategy.interrupt(&self.transport, session_id).await
+        self.strategy().interrupt(&self.transport, session_id).await
     }
 
     /// Compact a session's context, on the current-generation `/api/session`

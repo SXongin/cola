@@ -1745,7 +1745,10 @@ impl crate::backend::Backend for MockBackend {
         self.compact_calls.lock().await.push(_s.to_string());
         Ok(())
     }
-    async fn reconnect(&self, _url: &str, _password: &str) -> crate::error::Result<()> {
+    async fn reconnect(
+        &self,
+        _server: Option<&crate::bridge::discovery::ResolvedServer>,
+    ) -> crate::error::Result<()> {
         Ok(())
     }
     fn base_url(&self) -> String {
@@ -1767,6 +1770,7 @@ pub fn test_config(session_file: &std::path::Path) -> crate::config::Config {
             url: Some("http://localhost:1".into()),
             model: Some("test/model".into()),
             start_server: crate::config::ServerStartPolicy::Auto,
+            generation: crate::config::GenerationOverride::Auto,
         },
         feishu: crate::config::FeishuConfig {
             app_id: "app".into(),

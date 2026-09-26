@@ -7,10 +7,12 @@
 //! the Turn, the pollers, the cards and the SessionStore never branch on a
 //! generation; they call the adapter, which forwards to the selected strategy.
 //!
-//! V1 is the only strategy today, and the selection arm
-//! ([`Generation::strategy`]) defaults to it. Attach-time detection
-//! (`GET /api/info`) arrives with a later slice (spec #364, S3); until then
-//! every attachment speaks V1, and deleting [`super::v1`] is V1 retirement.
+//! The selection arm ([`Generation::strategy`]) is driven by attach-time
+//! detection ([`super::generation`], spec #364 §2): every attach/reconnect
+//! probes `GET /api/info` and selects the generation the server reported (or
+//! the `[opencode] generation` override forces). Deleting [`super::v1`] is V1
+//! retirement; [`super::v2`] is the V2 strategy, whose capabilities land slice
+//! by slice.
 
 use std::sync::Arc;
 
@@ -136,16 +138,26 @@ pub(crate) trait GenerationStrategy: Send + Sync {
 pub(crate) enum Generation {
     /// The 1.18.x unprefixed compatibility surface.
     V1,
+    /// The 2.0.x `/api`-only surface.
+    V2,
 }
 
 impl Generation {
-    /// The selection arm: the strategy that speaks this generation. Detection
-    /// is not wired yet (spec #364, S3), so [`Generation::V1`] is the only arm
-    /// the adapter can select; adding V2 is a variant plus a match arm, not an
-    /// adapter change.
+    /// The log/config spelling of this generation (`v1` / `v2`).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Generation::V1 => "v1",
+            Generation::V2 => "v2",
+        }
+    }
+
+    /// The selection arm: the strategy that speaks this generation. Choosing
+    /// the arm is the adapter's only generation-aware act; detection lives in
+    /// [`super::generation`].
     pub(crate) fn strategy(self) -> Arc<dyn GenerationStrategy> {
         match self {
             Generation::V1 => Arc::new(super::v1::V1Strategy),
+            Generation::V2 => Arc::new(super::v2::V2Strategy),
         }
     }
 }

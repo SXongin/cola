@@ -172,6 +172,9 @@ pub struct SharedCore {
     /// Preferred port from `[opencode] url`, a tiebreaker among servers of the
     /// same class in `pick_server` (ADR-0013).
     pub preferred_port: Option<u16>,
+    /// `[opencode] generation`: how the reconnect loop's re-attach resolves
+    /// the changed server's generation (spec #364 §2).
+    pub generation: crate::config::GenerationOverride,
     /// Serializes every server mutation — Lazy Start spawns, the reconnect
     /// loop's re-attach/yield — so concurrent first messages can't double-spawn
     /// or race a yield with a reconnect.
@@ -252,6 +255,7 @@ impl SharedCore {
             feishu,
             server_start: cfg.opencode.start_server,
             preferred_port: cfg.opencode.preferred_port(),
+            generation: cfg.opencode.generation,
             server_lock: Arc::new(tokio::sync::Mutex::new(())),
             card_write_locks: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -294,6 +298,7 @@ impl SharedCore {
             server: crate::bridge::handles::ServerHandle {
                 start_policy: self.server_start,
                 preferred_port: self.preferred_port,
+                generation: self.generation,
                 lock: Arc::clone(&self.server_lock),
             },
         }
