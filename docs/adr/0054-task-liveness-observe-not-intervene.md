@@ -34,10 +34,12 @@ child session.
   per-child abort/continue control (a `/stop` on the parent already aborts its
   task call with well-defined semantics).
 - **One liveness line on the running panel.** While a task Tool Panel is live
-  it carries the child's newest running tool (by server start time), the age of
-  its last observed activity, and — when the child has a pending
-  Permission/Question — the wait state, in the header's own vocabulary
-  (等待你的授权 / 等待你的回答 / 等待你的授权/回答).
+  it carries what the child is doing and for how long, in the header's own
+  shape: its newest running tool and that call's elapsed time (`bash 28s`), or
+  — when no tool is live — its phase and the time since its newest activity
+  (`推理中 12s`). A pending Permission/Question appends the header's wait
+  vocabulary (等待你的授权 / 等待你的回答 / 等待你的授权/回答), and a live tool
+  with no server clock yet shows its name alone.
 - **Live only, direct child only.** The line renders only while the panel is
   live; a settled panel keeps its ordinary final form. It reads only the
   panel's direct child session, never nested descendants (subagents cannot
@@ -66,10 +68,13 @@ child session.
   call's `sessionId`: the child's transcript read plus the existing pending-wait
   records. It opens no new write path, and ADR-0045 already keeps a running
   panel on the live card.
-- The wait reflects the request sweep's cadence (seconds), and the age is kept
-  as the last observed activity TIME, not an age snapshot: a failed child read
-  makes the age keep growing truthfully instead of freezing at "5s 前" or
-  inventing a new one.
+- The wait reflects the request sweep's cadence (seconds), and the elapsed time
+  is always derived from a stored TIME (the tool's server start, or the newest
+  activity), never from an age snapshot: a failed child read makes the number
+  keep growing truthfully instead of freezing at "5s" or inventing a new one.
+- An unchanged tool name with a growing duration is that call's runtime — the
+  operator's cue to look. cola makes no stuck judgement: long commands are
+  legitimately slow, and a pending wait names itself.
 - A resumed task shows the same child's state on whichever panel is running;
   the operator reads it as the session continuing, not as a new sub-task.
 - If direct child messaging is ever wanted, it needs its own decision: the
