@@ -39,6 +39,8 @@ use server::LiveServer;
 const PROMPT_TEXT: &str = "run the live harness command";
 /// How long any poll waits before failing the test.
 const POLL_TIMEOUT: Duration = Duration::from_secs(30);
+/// The gap between polls of a live read.
+const POLL_INTERVAL: Duration = Duration::from_millis(150);
 
 /// The binary under test: the pinned V1 path when set, else `opencode` on PATH.
 fn live_binary() -> String {
@@ -52,7 +54,8 @@ fn live_binary() -> String {
 #[ignore = "live: needs the pinned V1 binary (see the module docs)"]
 async fn live_v1_scripted_capability_chain() {
     let binary = live_binary();
-    server::ensure_v1_binary(&binary).await;
+    let version = server::ensure_v1_binary(&binary).await;
+    eprintln!("live V1 binary: {binary} ({version})");
 
     let provider = provider::start().await;
     let server = LiveServer::start(&binary, &provider.base_url()).await;
@@ -80,7 +83,7 @@ async fn live_v1_scripted_capability_chain() {
     // the permission poll and the prompt run concurrently — exactly the shape
     // the Bridge's Turn is built around.
     let prompt = backend.prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id));
-    let answer = answer_permission(&backend, &work_dir, &session.id);
+    let answer = answer_permission(&backend, &work_dir, &session.id, &server);
 
     let (prompt_result, permission) = tokio::join!(prompt, answer);
     let response =
@@ -107,26 +110,54 @@ async fn live_v1_scripted_capability_chain() {
     assert_final_text(&transcript);
     assert_turn_complete(&transcript, &message_id);
 
-    let status = wait_for_idle(&backend, &session.id, &work_dir).await;
-    assert_eq!(status, SessionStatus::Idle, "a finished turn must read idle");
+    // The finished turn reads idle once the run state clears.
+    wait_for_idle(&backend, &session.id, &work_dir, &server).await;
 
     assert_provider_requests(&provider.requests());
+}
+
+/// Poll `read` until it yields a value, failing the test at `timeout`.
+/// `diagnostics` is appended to the timeout panic — the child's stderr, so a
+/// hung poll is debuggable from the failure alone — and the last read error is
+/// always reported, so a persistent failure is never masked by a bare timeout.
+async fn poll_until<T, F, Fut>(
+    what: &str,
+    timeout: Duration,
+    mut read: F,
+    diagnostics: impl Fn() -> String,
+) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = crate::error::Result<Option<T>>>,
+{
+    let deadline = Instant::now() + timeout;
+    let mut last_error = None;
+    loop {
+        match read().await {
+            Ok(Some(value)) => return value,
+            Ok(None) => {}
+            Err(error) => last_error = Some(error),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out after {}s waiting for {what} (last error: {last_error:?})\n{}",
+            timeout.as_secs(),
+            diagnostics()
+        );
+        sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// Poll `GET /session` until the freshly started child answers — the server
 /// can accept TCP before its dispatch is wired (AGENTS.md pitfall #12).
 async fn wait_for_ready(backend: &OpenCodeBackend, server: &LiveServer) {
-    let deadline = Instant::now() + POLL_TIMEOUT;
-    loop {
-        match backend.list_sessions().await {
-            Ok(_) => return,
-            Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(250)).await,
-            Err(error) => panic!(
-                "the child V1 server never became ready: {error}\n{}",
-                server.stderr()
-            ),
-        }
-    }
+    poll_until(
+        "the child V1 server to answer",
+        POLL_TIMEOUT,
+        || async { backend.list_sessions().await.map(|_| Some(())) },
+        || server.stderr(),
+    )
+    .await;
 }
 
 /// Wait for the tool permission ask and answer it with `once`, returning it.
@@ -134,25 +165,21 @@ async fn answer_permission(
     backend: &OpenCodeBackend,
     directory: &str,
     session_id: &str,
+    server: &LiveServer,
 ) -> crate::opencode::types::PermissionRequest {
-    let deadline = Instant::now() + POLL_TIMEOUT;
-    let mut last_error = None;
-    let permission = loop {
-        match backend.list_permissions(Some(directory)).await {
-            Ok(pending) => {
-                if let Some(permission) = pending.into_iter().next() {
-                    break permission;
-                }
-            }
-            Err(error) => last_error = Some(error),
-        }
-        assert!(
-            Instant::now() < deadline,
-            "no permission ask arrived for session {session_id} within {}s (last error: {last_error:?})",
-            POLL_TIMEOUT.as_secs()
-        );
-        sleep(Duration::from_millis(150)).await;
-    };
+    let what = format!("a permission ask for session {session_id}");
+    let permission = poll_until(
+        &what,
+        POLL_TIMEOUT,
+        || async {
+            backend
+                .list_permissions(Some(directory))
+                .await
+                .map(|pending| pending.into_iter().next())
+        },
+        || server.stderr(),
+    )
+    .await;
     assert_eq!(
         permission.permission.as_deref(),
         Some("bash"),
@@ -165,20 +192,21 @@ async fn answer_permission(
     permission
 }
 
-/// Poll until the server reports the session idle — the run state may clear a
+/// Wait until the server reports the session idle — the run state may clear a
 /// beat after the synchronous prompt response.
-async fn wait_for_idle(backend: &OpenCodeBackend, session_id: &str, directory: &str) -> SessionStatus {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Ok(Some(SessionStatus::Idle)) = backend.session_status(session_id, Some(directory)).await {
-            return SessionStatus::Idle;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the session never read idle after the prompt returned"
-        );
-        sleep(Duration::from_millis(200)).await;
-    }
+async fn wait_for_idle(backend: &OpenCodeBackend, session_id: &str, directory: &str, server: &LiveServer) {
+    poll_until(
+        "the session to read idle",
+        Duration::from_secs(10),
+        || async {
+            backend
+                .session_status(session_id, Some(directory))
+                .await
+                .map(|status| status.filter(|status| *status == SessionStatus::Idle).map(|_| ()))
+        },
+        || server.stderr(),
+    )
+    .await;
 }
 
 /// The user message is present, under the cola-chosen id (ADR-0026), with the
@@ -210,6 +238,14 @@ fn assert_tool_call(transcript: &crate::backend::SessionTranscript) {
         ToolStatus::Completed,
         "the answered tool call must have completed: {tool:#?}"
     );
+    assert_eq!(
+        tool.input
+            .as_ref()
+            .and_then(|input| input.get("command"))
+            .and_then(Value::as_str),
+        Some(provider::TOOL_COMMAND),
+        "the split argument deltas must reassemble into the scripted command: {tool:#?}"
+    );
     assert!(
         tool.output
             .blocks
@@ -219,39 +255,60 @@ fn assert_tool_call(transcript: &crate::backend::SessionTranscript) {
     );
 }
 
-/// Reasoning streamed as its own part, before the tool call it announced.
+/// Reasoning streamed as its own part, before the tool call it announced, and
+/// assembled exactly once from the deltas (no duplicate render).
 fn assert_streamed_reasoning(transcript: &crate::backend::SessionTranscript) {
     let message = transcript
         .messages
         .iter()
         .find(|message| message.parts.iter().any(|part| matches!(part, Part::Tool(_))))
         .unwrap_or_else(|| panic!("no assistant message carries the tool call: {transcript:#?}"));
-    let reasoning_at = message
+    let reasoning: Vec<&str> = message
         .parts
         .iter()
-        .position(|part| matches!(part, Part::Reasoning(reasoning) if reasoning.text.contains(provider::REASONING_TEXT)));
+        .filter_map(|part| match part {
+            Part::Reasoning(reasoning) => Some(reasoning.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reasoning,
+        vec![provider::REASONING_TEXT],
+        "the reasoning deltas must assemble into exactly one part: {message:#?}"
+    );
     let tool_at = message
         .parts
         .iter()
-        .position(|part| matches!(part, Part::Tool(_)));
-    match (reasoning_at, tool_at) {
-        (Some(reasoning_at), Some(tool_at)) => assert!(
-            reasoning_at < tool_at,
-            "streamed reasoning must precede the tool call it announced: {message:#?}"
-        ),
-        _ => panic!("the reasoning and tool parts must both be present: {message:#?}"),
-    }
+        .position(|part| matches!(part, Part::Tool(_)))
+        .expect("the tool part is present");
+    assert!(
+        message
+            .parts
+            .iter()
+            .position(|part| matches!(part, Part::Reasoning(_)))
+            .unwrap()
+            < tool_at,
+        "streamed reasoning must precede the tool call it announced: {message:#?}"
+    );
 }
 
-/// The closing text streamed after the tool result.
+/// The closing text streamed after the tool result: the deltas assemble into
+/// exactly one part equal to the scripted text (no double render).
 fn assert_final_text(transcript: &crate::backend::SessionTranscript) {
-    assert!(
-        transcript
-            .messages
-            .iter()
-            .any(|message| message.role == MessageRole::Assistant
-                && message.text().contains(provider::FINAL_TEXT)),
-        "the final text must be in the transcript: {transcript:#?}"
+    let texts: Vec<&str> = transcript
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::Assistant)
+        .flat_map(|message| message.parts.iter())
+        .filter_map(|part| match part {
+            Part::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        texts.iter().filter(|text| **text == provider::FINAL_TEXT).count(),
+        1,
+        "the closing deltas must assemble into exactly one part: {texts:#?}"
     );
 }
 

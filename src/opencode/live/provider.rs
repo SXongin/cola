@@ -11,6 +11,13 @@
 //! - **final text** — any call whose conversation already carries a tool
 //!   result: stream the closing text.
 //!
+//! Every script streams its content as **multiple SSE deltas** (text,
+//! reasoning and tool-call arguments alike), so the suite exercises the
+//! incremental path — a server that ignored SSE framing and answered in one
+//! shot would not produce the assembled parts. The unit tests below pin that
+//! the deltas concatenate to the full scripted values; the live test pins that
+//! the transcript the adapter decoded carries exactly those values.
+//!
 //! Everything the server sent is recorded by the hosting [`TestHttpServer`],
 //! so the test asserts both the request side (the tool schema was offered, the
 //! tool result came back) and the response side (the transcript the adapter
@@ -26,13 +33,29 @@ pub const PROVIDER: &str = "scripted";
 pub const MODEL: &str = "scripted-model";
 /// The full `provider/model` reference cola prompts with.
 pub const MODEL_REF: &str = "scripted/scripted-model";
-/// Reasoning the scripted model streams on the tool-call script.
+
+/// The reasoning deltas the tool-call script streams, in order. Assembled they
+/// must equal [`REASONING_TEXT`] (pinned by a unit test below).
+const REASONING_DELTAS: &[&str] = &["live-harness-", "reasoning"];
+/// The assembled reasoning the transcript must carry.
 pub const REASONING_TEXT: &str = "live-harness-reasoning";
+
 /// The `bash` command the scripted tool call asks to run.
 pub const TOOL_COMMAND: &str = "echo live-harness-tool";
-/// The closing text the scripted model streams after the tool result.
+/// The tool-call argument fragments, streamed in order. Assembled they must be
+/// `{"command": TOOL_COMMAND}` (pinned by a unit test below).
+const TOOL_ARGUMENT_DELTAS: &[&str] = &[r#"{"command":"echo live-"#, r#"harness-tool"}"#];
+/// The correlation id the streamed tool call declares once, on its first delta.
+const TOOL_CALL_ID: &str = "call_live_harness_1";
+
+/// The closing-text deltas, streamed in order. Assembled they must equal
+/// [`FINAL_TEXT`] (pinned by a unit test below).
+const FINAL_TEXT_DELTAS: &[&str] = &["live-harness-final", "-text"];
+/// The assembled closing text the transcript must carry.
 pub const FINAL_TEXT: &str = "live-harness-final-text";
-/// Plain text answering the title-generation call.
+
+/// The title-generation deltas; assembled they equal `TITLE_TEXT`.
+const TITLE_DELTAS: &[&str] = &["live harness ", "title"];
 const TITLE_TEXT: &str = "live harness title";
 
 /// Start a provider that answers `POST /v1/chat/completions` from the scripts.
@@ -59,23 +82,14 @@ enum Script {
 fn completion_body(body: &str) -> String {
     let request: Value = serde_json::from_str(body).unwrap_or(Value::Null);
     match script(&request) {
-        Script::Title => sse(&[
-            chunk(json!({ "role": "assistant", "content": TITLE_TEXT }), None, false),
-            chunk(json!({}), Some("stop"), true),
-        ]),
+        Script::Title => sse(&[content_chunks(TITLE_DELTAS), finish_chunk("stop")].concat()),
         Script::ToolCall => sse(&[
-            chunk(
-                json!({ "role": "assistant", "reasoning_content": REASONING_TEXT }),
-                None,
-                false,
-            ),
-            chunk(tool_call_delta(), None, false),
-            chunk(json!({}), Some("tool_calls"), true),
-        ]),
-        Script::FinalText => sse(&[
-            chunk(json!({ "role": "assistant", "content": FINAL_TEXT }), None, false),
-            chunk(json!({}), Some("stop"), true),
-        ]),
+            reasoning_chunks(REASONING_DELTAS),
+            tool_call_chunks(),
+            finish_chunk("tool_calls"),
+        ]
+        .concat()),
+        Script::FinalText => sse(&[content_chunks(FINAL_TEXT_DELTAS), finish_chunk("stop")].concat()),
     }
 }
 
@@ -139,20 +153,58 @@ fn chunk(delta: Value, finish_reason: Option<&str>, usage: bool) -> Value {
     value
 }
 
-/// The streamed `bash` tool call, with its arguments as the JSON string the
-/// OpenAI wire carries.
-fn tool_call_delta() -> Value {
-    json!({
-        "tool_calls": [{
-            "index": 0,
-            "id": "call_live_harness_1",
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": json!({ "command": TOOL_COMMAND }).to_string(),
-            },
-        }],
-    })
+/// One `content` delta per fragment, in order.
+fn content_chunks(deltas: &[&str]) -> Vec<Value> {
+    deltas
+        .iter()
+        .map(|delta| chunk(json!({ "role": "assistant", "content": delta }), None, false))
+        .collect()
+}
+
+/// One `reasoning_content` delta per fragment, in order.
+fn reasoning_chunks(deltas: &[&str]) -> Vec<Value> {
+    deltas
+        .iter()
+        .map(|delta| chunk(json!({ "reasoning_content": delta }), None, false))
+        .collect()
+}
+
+/// The streamed `bash` tool call: its id and name arrive on the first delta,
+/// its arguments split across one delta each — the OpenAI wire shape.
+fn tool_call_chunks() -> Vec<Value> {
+    let (first, rest) = TOOL_ARGUMENT_DELTAS
+        .split_first()
+        .expect("the tool call needs at least one argument delta");
+    let mut chunks = vec![chunk(
+        json!({
+            "tool_calls": [{
+                "index": 0,
+                "id": TOOL_CALL_ID,
+                "type": "function",
+                "function": { "name": "bash", "arguments": first },
+            }],
+        }),
+        None,
+        false,
+    )];
+    chunks.extend(rest.iter().map(|arguments| {
+        chunk(
+            json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "function": { "arguments": arguments },
+                }],
+            }),
+            None,
+            false,
+        )
+    }));
+    chunks
+}
+
+/// The script's closing chunk: an empty delta, the finish reason, and usage.
+fn finish_chunk(finish_reason: &str) -> Vec<Value> {
+    vec![chunk(json!({}), Some(finish_reason), true)]
 }
 
 /// Join chunks into an SSE body, terminated with the OpenAI `[DONE]` sentinel.
@@ -170,6 +222,69 @@ fn sse(chunks: &[Value]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The SSE events of a body, `[DONE]` excluded.
+    fn sse_events(body: &str) -> Vec<Value> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).expect("an SSE event must be JSON"))
+            .collect()
+    }
+
+    /// Every value of a streamed delta field, in event order.
+    fn streamed_fragments(events: &[Value], field: &str) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| event["choices"][0]["delta"][field].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// Every streamed tool-call argument fragment, in event order.
+    fn streamed_argument_fragments(events: &[Value]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| {
+                event["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// The stream must arrive as 2+ deltas, and assembling them must yield the
+    /// full scripted value — the property a one-shot answer would not have.
+    fn assert_streamed(fragments: &[String], expected: &str, what: &str) {
+        assert!(
+            fragments.len() >= 2,
+            "{what} must stream as multiple SSE deltas, got {fragments:?}"
+        );
+        assert_eq!(
+            fragments.concat(),
+            expected,
+            "{what} must assemble to the full scripted value"
+        );
+    }
+
+    fn request(script: Script) -> Value {
+        match script {
+            Script::Title => json!({ "model": MODEL, "messages": [{ "role": "user", "content": "hi" }] }),
+            Script::ToolCall => json!({
+                "model": MODEL,
+                "tools": [{ "type": "function", "function": { "name": "bash" } }],
+                "messages": [{ "role": "user", "content": "run something" }],
+            }),
+            Script::FinalText => json!({
+                "model": MODEL,
+                "tools": [{ "type": "function", "function": { "name": "bash" } }],
+                "messages": [
+                    { "role": "user", "content": "run something" },
+                    { "role": "assistant", "tool_calls": [] },
+                    { "role": "tool", "content": "live-harness-tool" },
+                ],
+            }),
+        }
+    }
 
     #[test]
     fn a_request_without_tools_selects_the_title_script() {
@@ -204,34 +319,62 @@ mod tests {
     }
 
     #[test]
-    fn the_tool_call_script_streams_reasoning_then_the_bash_call() {
-        let request = json!({
-            "model": MODEL,
-            "tools": [{ "type": "function", "function": { "name": "bash" } }],
-            "messages": [],
-        });
-        let body = completion_body(&request.to_string());
-        assert!(body.contains(REASONING_TEXT), "reasoning must stream: {body}");
-        assert!(
-            body.contains("call_live_harness_1"),
-            "tool call must stream: {body}"
+    fn the_title_script_streams_its_text_in_multiple_deltas() {
+        let events = sse_events(&completion_body(&request(Script::Title).to_string()));
+        assert_streamed(
+            &streamed_fragments(&events, "content"),
+            TITLE_TEXT,
+            "the title text",
         );
-        assert!(
-            body.contains("tool_calls"),
-            "the call must finish with tool_calls: {body}"
-        );
-        assert!(body.contains("[DONE]"), "the stream must terminate: {body}");
     }
 
     #[test]
-    fn the_final_script_streams_the_closing_text() {
-        let request = json!({
-            "model": MODEL,
-            "tools": [{ "type": "function", "function": { "name": "bash" } }],
-            "messages": [{ "role": "tool", "content": "done" }],
-        });
-        let body = completion_body(&request.to_string());
-        assert!(body.contains(FINAL_TEXT), "final text must stream: {body}");
-        assert!(!body.contains(TOOL_COMMAND), "no second tool call: {body}");
+    fn the_tool_call_script_streams_reasoning_and_split_arguments() {
+        let events = sse_events(&completion_body(&request(Script::ToolCall).to_string()));
+
+        assert_streamed(
+            &streamed_fragments(&events, "reasoning_content"),
+            REASONING_TEXT,
+            "the reasoning",
+        );
+        assert_streamed(
+            &streamed_argument_fragments(&events),
+            &json!({ "command": TOOL_COMMAND }).to_string(),
+            "the tool-call arguments",
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.to_string().contains("tool_calls")),
+            "the call must finish with tool_calls: {events:#?}"
+        );
+        assert!(
+            events.len() >= 4,
+            "reasoning + tool call must stream as separate events"
+        );
+    }
+
+    #[test]
+    fn the_final_script_streams_its_text_in_multiple_deltas() {
+        let events = sse_events(&completion_body(&request(Script::FinalText).to_string()));
+        assert_streamed(
+            &streamed_fragments(&events, "content"),
+            FINAL_TEXT,
+            "the closing text",
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.to_string().contains(TOOL_COMMAND)),
+            "no second tool call: {events:#?}"
+        );
+    }
+
+    #[test]
+    fn every_script_terminates_with_the_done_sentinel() {
+        for script in [Script::Title, Script::ToolCall, Script::FinalText] {
+            let body = completion_body(&request(script).to_string());
+            assert!(body.ends_with("data: [DONE]\n\n"), "{script:?}: {body}");
+        }
     }
 }
