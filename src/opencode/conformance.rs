@@ -9,21 +9,29 @@
 //! (`v1::conformance` / `v2::conformance`), so a V1 route literal never leaves
 //! the V1 strategy (the coupling guard, spec #364 §1) and V1 retirement deletes
 //! its case with the rest of the strategy. The payload *values* are shared via
-//! [`SessionReadFixture`], so the two generations' fixtures cannot drift —
-//! only the wire spellings around them differ.
+//! [`SessionReadFixture`] and [`TranscriptFixture`], so the two generations'
+//! fixtures cannot drift — only the wire spellings around them differ.
 
 use crate::opencode::client::OpenCodeBackend;
 use crate::opencode::strategy::Generation;
 use crate::test_http::TestHttpServer;
 
-/// One generation's session-read conformance case: which strategy to speak, and
-/// how to mount that generation's fake routes.
+/// One generation's read-surface conformance case: which strategy to speak,
+/// and how to mount that generation's fake routes.
 pub(crate) struct SessionReadCase {
     pub(crate) generation: Generation,
     /// Mount the generation's fake session-read routes (a two-page list, one
     /// session get, the run-state reads), publishing the shared
     /// [`SessionReadFixture`] values in that generation's envelope shapes.
     pub(crate) mount: fn(&TestHttpServer, &SessionReadFixture),
+    /// Mount the generation's fake transcript read, publishing the shared
+    /// [`TranscriptFixture`] values in that generation's message shape.
+    pub(crate) mount_transcript: fn(&TestHttpServer, &TranscriptFixture),
+    /// Serve one recorded transcript response body verbatim on the
+    /// generation's transcript route. A paginated generation also answers the
+    /// follow-up cursor page with the empty end-of-list page, so a recorded
+    /// body's real `cursor.next` is exercised rather than stripped out.
+    pub(crate) mount_recorded_transcript: fn(&TestHttpServer, &str, &str),
 }
 
 /// The neutral values both generations' session-read payloads publish. One
@@ -71,11 +79,87 @@ impl Default for SessionReadFixture {
     }
 }
 
+/// The neutral values both generations' transcript payloads publish. One
+/// shared default keeps the per-generation mounts from carrying duplicate
+/// literals that could drift; only the wire spellings around these values
+/// differ, and they stay in the generation modules.
+///
+/// The fixture describes one session with three assistant messages around one
+/// user message: a previous turn's completed reply (before the anchor), an
+/// in-flight step created before the anchor (the #310 case), and this turn's
+/// completed reply. The turn projections and the tail are asserted on it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TranscriptFixture {
+    pub(crate) session: &'static str,
+    pub(crate) user_id: &'static str,
+    pub(crate) user_text: &'static str,
+    pub(crate) user_created_ms: i64,
+    pub(crate) previous_id: &'static str,
+    pub(crate) previous_text: &'static str,
+    pub(crate) previous_created_ms: i64,
+    pub(crate) previous_completed_ms: i64,
+    pub(crate) inflight_id: &'static str,
+    pub(crate) inflight_reasoning: &'static str,
+    pub(crate) inflight_created_ms: i64,
+    pub(crate) inflight_call_id: &'static str,
+    pub(crate) assistant_id: &'static str,
+    pub(crate) assistant_created_ms: i64,
+    pub(crate) assistant_completed_ms: i64,
+    pub(crate) assistant_reasoning: &'static str,
+    pub(crate) assistant_text: &'static str,
+    pub(crate) tool_call_id: &'static str,
+    pub(crate) tool_command: &'static str,
+    pub(crate) tool_output: &'static str,
+    pub(crate) provider: &'static str,
+    pub(crate) model: &'static str,
+    pub(crate) input_tokens: i64,
+    pub(crate) output_tokens: i64,
+    pub(crate) reasoning_tokens: i64,
+    pub(crate) cache_read_tokens: i64,
+    pub(crate) cache_write_tokens: i64,
+    pub(crate) total_tokens: i64,
+}
+
+impl Default for TranscriptFixture {
+    fn default() -> Self {
+        Self {
+            session: "ses_transcript",
+            user_id: "msg_cola_transcript",
+            user_text: "第几个问题",
+            user_created_ms: 1_700_000_000_000,
+            previous_id: "msg_prev",
+            previous_text: "上一个回合的回答",
+            previous_created_ms: 1_699_999_999_000,
+            previous_completed_ms: 1_699_999_999_500,
+            inflight_id: "msg_inflight",
+            inflight_reasoning: "还在思考",
+            inflight_created_ms: 1_699_999_999_800,
+            inflight_call_id: "call_inflight",
+            assistant_id: "msg_answer",
+            assistant_created_ms: 1_700_000_000_100,
+            assistant_completed_ms: 1_700_000_000_300,
+            assistant_reasoning: "先想想",
+            assistant_text: "回答",
+            tool_call_id: "call_transcript",
+            tool_command: "echo transcript",
+            tool_output: "transcript-output\n",
+            provider: "opencode-go",
+            model: "deepseek-v4-flash",
+            input_tokens: 11,
+            output_tokens: 7,
+            reasoning_tokens: 3,
+            cache_read_tokens: 5,
+            cache_write_tokens: 2,
+            total_tokens: 28,
+        }
+    }
+}
+
 impl SessionReadCase {
     /// The real adapter, pointed at the fake server and speaking this case's
     /// generation — production's construction with only the transport swapped
     /// for the no-proxy test one (ADR-0031).
-    fn backend(&self, server: &TestHttpServer) -> OpenCodeBackend {
+    pub(crate) fn backend(&self, server: &TestHttpServer) -> OpenCodeBackend {
         let backend = OpenCodeBackend::with_generation(
             None,
             server.base_url(),
@@ -230,5 +314,211 @@ async fn session_status_maps_idle_busy_retry_on_every_generation() {
                 .unwrap_or_else(|e| panic!("{generation}/{label}: session_status failed: {e}"));
             assert_eq!(status, expected, "{generation}/{label}: run state");
         }
+    }
+}
+
+/// The transcript read has the same neutral outcome on both generations: the
+/// server's order, the user anchor, the typed assistant content (reasoning,
+/// tool, text), the model/token facts, and the two projections the Bridge's
+/// read paths consume — the Turn (membership + completion) and the
+/// recent-conversation tail. The generation-specific spellings (`parts` vs
+/// `content[]`, `step-finish` vs `finish`) stay in the mounts.
+#[tokio::test]
+async fn transcript_reads_the_same_neutral_view_on_every_generation() {
+    use crate::backend::{ContentBlock, MessageRole, Part, ToolStatus};
+
+    for case in cases() {
+        let generation = case.generation.as_str();
+        let fixture = TranscriptFixture::default();
+        let server = TestHttpServer::start().await;
+        (case.mount_transcript)(&server, &fixture);
+        let backend = case.backend(&server);
+
+        let transcript = backend
+            .transcript(fixture.session)
+            .await
+            .unwrap_or_else(|e| panic!("{generation}: transcript failed: {e}"));
+
+        let ids: Vec<&str> = transcript.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                fixture.previous_id,
+                fixture.inflight_id,
+                fixture.user_id,
+                fixture.assistant_id
+            ],
+            "{generation}: server order"
+        );
+        assert_eq!(
+            transcript
+                .messages
+                .iter()
+                .filter(|m| m.role == MessageRole::User)
+                .count(),
+            1,
+            "{generation}: one user message"
+        );
+        assert_eq!(
+            transcript
+                .messages
+                .iter()
+                .filter(|m| m.role == MessageRole::Assistant)
+                .count(),
+            3,
+            "{generation}: three assistant messages"
+        );
+
+        // The user message anchors the Turn: identity together with its server
+        // time, and the text verbatim.
+        let user = transcript.newest_user().expect("a user message exists");
+        assert_eq!(user.id.as_str(), fixture.user_id, "{generation}: anchor id");
+        assert_eq!(user.text(), fixture.user_text, "{generation}: anchor text");
+        let anchor = user.anchor().expect("the user message carries a server time");
+        assert_eq!(anchor.created_ms, fixture.user_created_ms);
+
+        // Turn membership: the previous completed reply is out, the in-flight
+        // step created before the anchor and this Turn's reply are in, and the
+        // terminal finish completes the Turn.
+        let turn = transcript.turn_for_user(&anchor);
+        let turn_ids: Vec<&str> = turn.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            turn_ids,
+            [fixture.inflight_id, fixture.assistant_id],
+            "{generation}: turn membership"
+        );
+        assert!(
+            turn.complete,
+            "{generation}: the terminal finish completes the turn"
+        );
+
+        // The in-flight step has no completion stamp and a live tool.
+        let inflight = transcript
+            .messages
+            .iter()
+            .find(|m| m.id.as_str() == fixture.inflight_id)
+            .expect("the in-flight message is present");
+        assert!(
+            inflight.time.unwrap().completed.is_none(),
+            "{generation}: an in-flight step has no completion stamp"
+        );
+        let live = inflight
+            .parts
+            .iter()
+            .find_map(|part| match part {
+                Part::Tool(call) => Some(call),
+                _ => None,
+            })
+            .expect("the in-flight tool call decodes");
+        assert_eq!(live.identity.call_id, fixture.inflight_call_id);
+        assert!(live.status.is_live(), "{generation}: the call is still live");
+
+        // The completed answer's typed facts, in content order.
+        let answer = transcript
+            .messages
+            .iter()
+            .find(|m| m.id.as_str() == fixture.assistant_id)
+            .expect("the answer is present");
+        assert_eq!(
+            answer
+                .model
+                .as_ref()
+                .expect("the answer names its model")
+                .provider_id,
+            fixture.provider
+        );
+        assert_eq!(answer.model.as_ref().unwrap().model_id, fixture.model);
+        let tokens = answer.tokens.expect("the answer reports usage");
+        assert_eq!(tokens.total, fixture.total_tokens, "{generation}: neutral total");
+        assert_eq!(
+            tokens.context_used(),
+            fixture.total_tokens,
+            "{generation}: the footer's context figure"
+        );
+
+        let reasoning: Vec<&str> = answer
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                Part::Reasoning(reasoning) => Some(reasoning.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reasoning,
+            [fixture.assistant_reasoning],
+            "{generation}: reasoning"
+        );
+        let texts: Vec<&str> = answer
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                Part::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, [fixture.assistant_text], "{generation}: answer text");
+        let tool = answer
+            .parts
+            .iter()
+            .find_map(|part| match part {
+                Part::Tool(call) => Some(call),
+                _ => None,
+            })
+            .expect("the settled tool call decodes");
+        assert_eq!(tool.identity.call_id, fixture.tool_call_id);
+        assert_eq!(tool.status, ToolStatus::Completed);
+        assert_eq!(
+            tool.input
+                .as_ref()
+                .and_then(|input| input.get("command"))
+                .and_then(|v| v.as_str()),
+            Some(fixture.tool_command),
+            "{generation}: the tool input survives"
+        );
+        assert_eq!(
+            tool.output.blocks,
+            vec![ContentBlock::Text(fixture.tool_output.to_string())],
+            "{generation}: the tool content decodes into one text block"
+        );
+        let position = |predicate: &dyn Fn(&Part) -> bool| answer.parts.iter().position(predicate);
+        let reasoning_at = position(&|p| matches!(p, Part::Reasoning(_))).expect("reasoning position");
+        let tool_at = position(&|p| matches!(p, Part::Tool(_))).expect("tool position");
+        let text_at = position(&|p| matches!(p, Part::Text(_))).expect("text position");
+        assert!(
+            reasoning_at < tool_at && tool_at < text_at,
+            "{generation}: content order is reasoning, tool, text"
+        );
+
+        // No text renders twice across the transcript (the content/ordinal
+        // dedup the Turn's renderer applies would see each text exactly once).
+        let rendered: Vec<&str> = transcript
+            .messages
+            .iter()
+            .flat_map(|message| message.parts.iter())
+            .filter_map(|part| match part {
+                Part::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        for expected in [fixture.previous_text, fixture.user_text, fixture.assistant_text] {
+            assert_eq!(
+                rendered.iter().filter(|text| **text == expected).count(),
+                1,
+                "{generation}: `{expected}` must appear exactly once: {rendered:?}"
+            );
+        }
+
+        // The Session Snapshot tail: the text-bearing conversation, newest
+        // last, with the tool-only in-flight step excluded.
+        let tail = transcript.transcript_tail();
+        let tail_texts: Vec<&str> = tail.iter().map(|entry| entry.text.as_str()).collect();
+        assert_eq!(
+            tail_texts,
+            [fixture.previous_text, fixture.user_text, fixture.assistant_text],
+            "{generation}: tail"
+        );
+        assert_eq!(tail[2].role, MessageRole::Assistant);
+        assert_eq!(tail[2].created_ms, fixture.assistant_created_ms);
     }
 }

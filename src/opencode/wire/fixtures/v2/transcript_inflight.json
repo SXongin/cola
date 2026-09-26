@@ -1,0 +1,68 @@
+{
+  "capture": {
+    "captured_at": "2026-09-26",
+    "command": "COLA_LIVE_OPENCODE_V2_BIN=<v2-binary> COLA_LIVE_CAPTURE_DIR=<dir> cargo test --locked -- --ignored live_v2_scripted_transcript_read",
+    "generation": "v2",
+    "source": "opencode v2.0.18"
+  },
+  "response": {
+    "cursor": {
+      "next": "cursor_next_fixture",
+      "previous": "cursor_previous_fixture"
+    },
+    "data": [
+      {
+        "id": "msg_cola_live_fixture",
+        "text": "run the live harness command",
+        "time": {
+          "created": 1700000000000
+        },
+        "type": "user"
+      },
+      {
+        "agent": "build",
+        "content": [
+          {
+            "state": {
+              "reasoningField": "reasoning_content"
+            },
+            "text": "live-harness-reasoning",
+            "time": {
+              "completed": 1700000000083,
+              "created": 1700000000071
+            },
+            "type": "reasoning"
+          },
+          {
+            "executed": false,
+            "id": "call_live_harness_1",
+            "name": "shell",
+            "state": {
+              "input": {
+                "command": "sleep 2; echo live-harness-tool"
+              },
+              "metadata": {},
+              "status": "running"
+            },
+            "time": {
+              "created": 1700000000077,
+              "ran": 1700000000089
+            },
+            "type": "tool"
+          }
+        ],
+        "id": "msg_live_step",
+        "model": {
+          "id": "scripted-model",
+          "providerID": "scripted",
+          "variant": "default"
+        },
+        "time": {
+          "created": 1700000000039,
+          "streamed": 1700000000093
+        },
+        "type": "assistant"
+      }
+    ]
+  }
+}

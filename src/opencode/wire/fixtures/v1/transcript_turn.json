@@ -1,0 +1,197 @@
+{
+  "capture": {
+    "captured_at": "2026-09-26",
+    "command": "COLA_LIVE_OPENCODE_BIN=<pinned-v1-binary> COLA_LIVE_CAPTURE_DIR=<dir> cargo test --locked -- --ignored live_v1_scripted_capability_chain",
+    "generation": "v1",
+    "source": "opencode 1.18.31"
+  },
+  "response": [
+    {
+      "info": {
+        "agent": "build",
+        "id": "msg_cola_live_fixture",
+        "model": {
+          "modelID": "scripted-model",
+          "providerID": "scripted"
+        },
+        "role": "user",
+        "sessionID": "ses_live_fixture",
+        "time": {
+          "created": 1700000000000
+        }
+      },
+      "parts": [
+        {
+          "id": "prt_live_1",
+          "messageID": "msg_cola_live_fixture",
+          "sessionID": "ses_live_fixture",
+          "text": "run the live harness command",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "info": {
+        "agent": "build",
+        "cost": 0,
+        "finish": "tool-calls",
+        "id": "msg_live_step",
+        "mode": "build",
+        "modelID": "scripted-model",
+        "parentID": "msg_cola_live_fixture",
+        "path": {
+          "cwd": "/work/cola",
+          "root": "/"
+        },
+        "providerID": "scripted",
+        "role": "assistant",
+        "sessionID": "ses_live_fixture",
+        "time": {
+          "completed": 1700000002149,
+          "created": 1700000000879
+        },
+        "tokens": {
+          "cache": {
+            "read": 0,
+            "write": 0
+          },
+          "input": 11,
+          "output": 7,
+          "reasoning": 0,
+          "total": 18
+        }
+      },
+      "parts": [
+        {
+          "id": "prt_live_2",
+          "messageID": "msg_live_step",
+          "sessionID": "ses_live_fixture",
+          "type": "step-start"
+        },
+        {
+          "id": "prt_live_3",
+          "messageID": "msg_live_step",
+          "sessionID": "ses_live_fixture",
+          "text": "live-harness-reasoning",
+          "time": {
+            "end": 1700000001740,
+            "start": 1700000001734
+          },
+          "type": "reasoning"
+        },
+        {
+          "callID": "call_live_harness_1",
+          "id": "prt_live_4",
+          "messageID": "msg_live_step",
+          "sessionID": "ses_live_fixture",
+          "state": {
+            "input": {
+              "command": "echo live-harness-tool"
+            },
+            "metadata": {
+              "exit": 0,
+              "output": "live-harness-tool\n",
+              "truncated": false
+            },
+            "output": "live-harness-tool\n",
+            "status": "completed",
+            "time": {
+              "end": 1700000002126,
+              "start": 1700000001759
+            },
+            "title": "echo live-harness-tool"
+          },
+          "tool": "bash",
+          "type": "tool"
+        },
+        {
+          "cost": 0,
+          "id": "prt_live_5",
+          "messageID": "msg_live_step",
+          "reason": "tool-calls",
+          "sessionID": "ses_live_fixture",
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 11,
+            "output": 7,
+            "reasoning": 0,
+            "total": 18
+          },
+          "type": "step-finish"
+        }
+      ]
+    },
+    {
+      "info": {
+        "agent": "build",
+        "cost": 0,
+        "finish": "stop",
+        "id": "msg_live_answer",
+        "mode": "build",
+        "modelID": "scripted-model",
+        "parentID": "msg_cola_live_fixture",
+        "path": {
+          "cwd": "/work/cola",
+          "root": "/"
+        },
+        "providerID": "scripted",
+        "role": "assistant",
+        "sessionID": "ses_live_fixture",
+        "time": {
+          "completed": 1700000002278,
+          "created": 1700000002155
+        },
+        "tokens": {
+          "cache": {
+            "read": 0,
+            "write": 0
+          },
+          "input": 11,
+          "output": 7,
+          "reasoning": 0,
+          "total": 18
+        }
+      },
+      "parts": [
+        {
+          "id": "prt_live_6",
+          "messageID": "msg_live_answer",
+          "sessionID": "ses_live_fixture",
+          "type": "step-start"
+        },
+        {
+          "id": "prt_live_7",
+          "messageID": "msg_live_answer",
+          "sessionID": "ses_live_fixture",
+          "text": "live-harness-final-text",
+          "time": {
+            "end": 1700000002268,
+            "start": 1700000002262
+          },
+          "type": "text"
+        },
+        {
+          "cost": 0,
+          "id": "prt_live_8",
+          "messageID": "msg_live_answer",
+          "reason": "stop",
+          "sessionID": "ses_live_fixture",
+          "tokens": {
+            "cache": {
+              "read": 0,
+              "write": 0
+            },
+            "input": 11,
+            "output": 7,
+            "reasoning": 0,
+            "total": 18
+          },
+          "type": "step-finish"
+        }
+      ]
+    }
+  ]
+}
