@@ -1,4 +1,5 @@
-//! V2 wire shapes for the session read surface (spec #364, S4a).
+//! V2 wire shapes for the read surface (spec #364, S4a session reads + S4b
+//! transcript decode).
 //!
 //! V2's session payloads differ from V1's in ways the neutral DTOs cannot
 //! express: every read is wrapped in a `{data: ...}` envelope, the directory
@@ -7,19 +8,31 @@
 //! header. The run state has no `retry` entry at all, so the strategy derives
 //! it from the newest assistant message's `retry` field.
 //!
-//! These private shapes decode that wire into the generation-blind DTOs
-//! ([`SessionListInfo`], [`SessionInfo`]); nothing here escapes the strategy
-//! (ADR-0055). The V1 coupling guard's denylist never applies to V2 literals,
-//! but generation-distinctive names still stay inside this module.
+//! The transcript read is not V1's `{info, parts}` envelope: a projected
+//! message is a tagged union (`type: user | assistant | …`), an assistant's
+//! body is `content[]` (text / reasoning / tool — only a tool carries an id),
+//! and a step's completion is the message's `finish` field rather than a
+//! `step-finish` part. The decode below re-derives the neutral transcript from
+//! those shapes exactly as tolerantly as the V1 decoder: unknown message kinds
+//! and content items keep their raw payload, and a missing field never fails
+//! the read (ADR-0053).
 //!
-//! The transcript decode proper is slice S4b's work: the assistant read here
-//! only answers "is the last assistant scheduled for retry?".
+//! These private shapes decode that wire into the generation-blind DTOs
+//! ([`SessionListInfo`], [`SessionInfo`], [`SessionTranscript`]); nothing here
+//! escapes the strategy (ADR-0055). The V1 coupling guard's denylist never
+//! applies to V2 literals, but generation-distinctive names still stay inside
+//! this module.
 
 use std::collections::HashMap;
 
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::backend::{
+    ContentBlock, FinishReason, MessageId, MessageRole, MessageTime, ModelIdentity, OtherPart, Part,
+    ReasoningPart, SessionTranscript, StepFinish, TextPart, TokenUsage, ToolCall, ToolIdentity, ToolOutput,
+    ToolStatus, TranscriptMessage,
+};
 use crate::opencode::types::{SessionInfo, SessionListInfo, SessionModel, SessionTime};
 
 /// `{data: T}` — the envelope most V2 reads share (R2's "unwrap per route —
@@ -122,21 +135,17 @@ impl ActiveSessions {
     }
 }
 
-/// One projected message, reduced to the fields the run-state read needs. The
-/// full `content[]` decode is S4b.
-#[derive(Debug, Deserialize)]
-pub(super) struct RawMessage {
-    #[serde(rename = "type", default)]
-    pub(super) kind: Option<String>,
-    #[serde(default)]
-    pub(super) retry: Option<Value>,
-}
-
 /// `GET /api/session/{id}/message` — `{data: Session.Message.Info[], cursor}`.
+///
+/// Items stay raw [`Value`]s: the projected message is an eleven-arm tagged
+/// union whose bodies differ per type, and the decode below must preserve
+/// unknown arms verbatim (the V1 decoder's policy, for the same reason).
 #[derive(Debug, Deserialize)]
 pub(super) struct MessagesPage {
     #[serde(default)]
-    pub(super) data: Vec<RawMessage>,
+    pub(super) data: Vec<Value>,
+    #[serde(default)]
+    pub(super) cursor: PageCursor,
 }
 
 impl MessagesPage {
@@ -149,9 +158,347 @@ impl MessagesPage {
     pub(super) fn newest_assistant_retrying(&self) -> bool {
         self.data
             .iter()
-            .find(|message| message.kind.as_deref() == Some("assistant"))
-            .and_then(|message| message.retry.as_ref())
+            .find(|message| message.get("type").and_then(Value::as_str) == Some("assistant"))
+            .and_then(|message| message.get("retry"))
             .is_some_and(|retry| !retry.is_null())
+    }
+}
+
+/// Decode a session's projected messages — the `data` arrays a
+/// `GET /api/session/{id}/message` read carries, in server order — into the
+/// neutral [`SessionTranscript`].
+///
+/// The neutral model's completion contract is an assistant message's terminal
+/// step finish, so each assistant message's `finish` becomes a
+/// [`Part::StepFinish`]: on V2 the finish reason is a message field, not a
+/// part. An explicit `"unknown"` is a spelled-out reason (the provider ended
+/// the step without naming why) and stays terminal, unlike a missing reason —
+/// the same distinction the neutral [`FinishReason::Unknown`] documents.
+pub(super) fn decode_messages(data: &[Value]) -> SessionTranscript {
+    SessionTranscript::new(data.iter().map(decode_message).collect())
+}
+
+/// Decode one projected message. Its identity, role and server time are the
+/// neutral facts; the body depends on the message type.
+fn decode_message(message: &Value) -> TranscriptMessage {
+    let kind = message.get("type").and_then(Value::as_str);
+    let (role, parts) = decode_body(kind, message);
+    TranscriptMessage {
+        id: MessageId::new(
+            message
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        role,
+        time: decode_time(message),
+        model: decode_model(message.get("model")),
+        tokens: decode_tokens(message.get("tokens")),
+        parts,
+    }
+}
+
+/// The neutral server time. A message without a numeric `time.created` cannot
+/// be ordered or anchored and reads as timeless — never as epoch 0.
+fn decode_time(message: &Value) -> Option<MessageTime> {
+    let created = message.pointer("/time/created").and_then(Value::as_i64)?;
+    Some(MessageTime {
+        created,
+        // `streamed` (the provider body ended, tools may still settle) is not a
+        // completion stamp: a message without `completed` is still in flight.
+        completed: message.pointer("/time/completed").and_then(Value::as_i64),
+    })
+}
+
+/// The model that produced an assistant message (`Model.Ref`), when named.
+fn decode_model(model: Option<&Value>) -> Option<ModelIdentity> {
+    let model = model?;
+    let model_id = model.get("id").and_then(Value::as_str)?;
+    Some(ModelIdentity {
+        provider_id: model
+            .get("providerID")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        model_id: model_id.to_string(),
+        variant: model.get("variant").and_then(Value::as_str).map(str::to_string),
+    })
+}
+
+/// The token usage an assistant message reports. V2 carries no `total`, so the
+/// neutral total is the server's own sum — `input + output + reasoning +
+/// cache.read + cache.write` (`TokenUsage.total()` upstream) — which is what
+/// the footer's context figure reads.
+fn decode_tokens(tokens: Option<&Value>) -> Option<TokenUsage> {
+    let tokens = tokens?;
+    let read = |field: &str| tokens.get(field).and_then(Value::as_i64).unwrap_or(0);
+    let cache_read = tokens.pointer("/cache/read").and_then(Value::as_i64).unwrap_or(0);
+    let cache_write = tokens
+        .pointer("/cache/write")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let input = read("input");
+    let output = read("output");
+    let reasoning = read("reasoning");
+    Some(TokenUsage {
+        input,
+        output,
+        total: input + output + reasoning + cache_read + cache_write,
+        cache_read,
+        cache_write,
+    })
+}
+
+/// Decode a message body into its neutral role and parts. Conversation is only
+/// ever user/assistant; the message types that are neither (system, synthetic,
+/// skill, shell, compaction, idle, the switch markers) stay out of the
+/// conversation projections by role, and unknown kinds keep their raw payload
+/// so a newer server never breaks the read.
+fn decode_body(kind: Option<&str>, message: &Value) -> (MessageRole, Vec<Part>) {
+    match kind {
+        Some("user") => (MessageRole::User, decode_user_parts(message)),
+        Some("assistant") => (MessageRole::Assistant, decode_assistant_parts(message)),
+        Some("system") => (MessageRole::System, decode_text_body(message)),
+        // A synthetic/system-style message is not a User: it must never become
+        // a Turn anchor. The verbatim type keeps it distinguishable.
+        Some("synthetic") => (
+            MessageRole::Other("synthetic".to_string()),
+            decode_text_body(message),
+        ),
+        Some("skill") => (MessageRole::Other("skill".to_string()), decode_text_body(message)),
+        Some(other) => (
+            MessageRole::Other(other.to_string()),
+            vec![raw_message_part(other, message)],
+        ),
+        None => (MessageRole::Unknown, vec![raw_message_part("", message)]),
+    }
+}
+
+/// A user message's parts: its `text` (a malformed one stays raw, like V1's
+/// decoder) followed by one raw part per `files` attachment, so the payload is
+/// preserved without growing a file part kind the neutral model does not have.
+fn decode_user_parts(message: &Value) -> Vec<Part> {
+    let mut parts = Vec::new();
+    match message.get("text") {
+        Some(Value::String(text)) => parts.push(Part::Text(TextPart {
+            text: text.clone(),
+            started_at: None,
+        })),
+        Some(other) => parts.push(Part::Other(OtherPart {
+            kind: "text".to_string(),
+            raw: other.clone(),
+        })),
+        None => {}
+    }
+    if let Some(files) = message.get("files").and_then(Value::as_array) {
+        for file in files {
+            parts.push(Part::Other(OtherPart {
+                kind: "file".to_string(),
+                raw: file.clone(),
+            }));
+        }
+    }
+    parts
+}
+
+/// An assistant message's parts: its `content[]` in order, then the message's
+/// step completion as a [`Part::StepFinish`] (absent while in flight).
+fn decode_assistant_parts(message: &Value) -> Vec<Part> {
+    let mut parts = decode_content(message.get("content"));
+    if let Some(reason) = message.get("finish").and_then(Value::as_str) {
+        parts.push(Part::StepFinish(StepFinish {
+            reason: decode_finish_reason(Some(reason)),
+        }));
+    }
+    parts
+}
+
+/// A message whose conversational body is a plain `text` field (system,
+/// synthetic, skill): the guarded text arm, or nothing when it carries none.
+fn decode_text_body(message: &Value) -> Vec<Part> {
+    match message.get("text") {
+        Some(Value::String(text)) => vec![Part::Text(TextPart {
+            text: text.clone(),
+            started_at: None,
+        })],
+        Some(other) => vec![Part::Other(OtherPart {
+            kind: "text".to_string(),
+            raw: other.clone(),
+        })],
+        None => Vec::new(),
+    }
+}
+
+/// A message kind this build does not model, kept raw as one part so the
+/// payload survives for later slices.
+fn raw_message_part(kind: &str, message: &Value) -> Part {
+    Part::Other(OtherPart {
+        kind: kind.to_string(),
+        raw: message.clone(),
+    })
+}
+
+/// Decode an assistant's `content[]`.
+fn decode_content(content: Option<&Value>) -> Vec<Part> {
+    content
+        .and_then(Value::as_array)
+        .map(|items| items.iter().map(decode_content_item).collect())
+        .unwrap_or_default()
+}
+
+/// One content item: text, reasoning, or a tool call. A text item whose `text`
+/// is not a string is malformed and stays raw (V1's arm, so a valid+malformed
+/// pair never joins an extra line); reasoning has no id anywhere, so the
+/// decoded order is the whole identity, and dedup stays content-based in the
+/// renderer (AGENTS.md #9).
+fn decode_content_item(item: &Value) -> Part {
+    match item.get("type").and_then(Value::as_str) {
+        Some("text") => match item.get("text").and_then(Value::as_str) {
+            Some(text) => Part::Text(TextPart {
+                text: text.to_string(),
+                started_at: None,
+            }),
+            None => Part::Other(OtherPart {
+                kind: "text".to_string(),
+                raw: item.clone(),
+            }),
+        },
+        Some("reasoning") => Part::Reasoning(ReasoningPart {
+            text: item
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            started_at: item.pointer("/time/created").and_then(Value::as_i64),
+        }),
+        Some("tool") => Part::Tool(decode_tool(item)),
+        Some(other) => Part::Other(OtherPart {
+            kind: other.to_string(),
+            raw: item.clone(),
+        }),
+        None => Part::Other(OtherPart {
+            kind: String::new(),
+            raw: item.clone(),
+        }),
+    }
+}
+
+/// One assistant `tool` content item. `id` is the tool call's own id (the only
+/// content identity that exists), and the item carries the call's timing;
+/// `state` carries status/input/metadata/content.
+fn decode_tool(item: &Value) -> ToolCall {
+    let state = non_null(item.get("state"));
+    let identity = decode_tool_identity(item.get("name"), item.get("id"));
+    let status = decode_tool_status(state.and_then(|state| state.get("status")));
+    ToolCall {
+        identity,
+        status: status.clone(),
+        started_at: item.pointer("/time/created").and_then(Value::as_i64),
+        // The raw structured input (a string while `streaming`: the arguments
+        // are still arriving, so there is nothing structured to read yet).
+        input: state.and_then(|state| non_null(state.get("input"))).cloned(),
+        metadata: state.and_then(|state| non_null(state.get("metadata"))).cloned(),
+        output: decode_tool_output(state),
+    }
+}
+
+/// A tool's identity: its built-in name — the historical `"tool"` fallback
+/// when the payload lost it — and the call's id, falling back to the name so a
+/// call without one still folds onto a single panel.
+fn decode_tool_identity(name: Option<&Value>, call_id: Option<&Value>) -> ToolIdentity {
+    let name = name.and_then(Value::as_str).unwrap_or("tool").to_string();
+    let call_id = call_id
+        .and_then(Value::as_str)
+        .unwrap_or(name.as_str())
+        .to_string();
+    ToolIdentity { name, call_id }
+}
+
+/// A tool lifecycle status. `streaming` (the model is still sending the call's
+/// arguments) maps onto the neutral pending arm: the call has not executed yet.
+/// Anything else keeps its spelling; a missing one is its own arm.
+fn decode_tool_status(status: Option<&Value>) -> ToolStatus {
+    match status.and_then(Value::as_str) {
+        Some("streaming") => ToolStatus::Pending,
+        Some("pending") => ToolStatus::Pending,
+        Some("running") => ToolStatus::Running,
+        Some("completed") => ToolStatus::Completed,
+        Some("error") => ToolStatus::Error,
+        Some(other) => ToolStatus::Other(other.to_string()),
+        None => ToolStatus::Unknown,
+    }
+}
+
+/// Why a step finished. V2 spells the reason out (its `unknown` literal is a
+/// reported reason, so it stays terminal); a missing one never declares
+/// completion.
+fn decode_finish_reason(reason: Option<&str>) -> FinishReason {
+    match reason {
+        Some("tool-calls") => FinishReason::ToolCalls,
+        Some("stop") => FinishReason::Stop,
+        Some("length") => FinishReason::Length,
+        Some("content-filter") => FinishReason::ContentFilter,
+        Some("error") => FinishReason::Error,
+        Some(other) => FinishReason::Other(other.to_string()),
+        None => FinishReason::Unknown,
+    }
+}
+
+/// Decode a tool state's output side: its `content` blocks and the failure
+/// message. Text blocks carry their text verbatim; any other block stays raw
+/// (ADR-0042's per-tool presentation reads [`ToolOutput::blocks`]). A decoded
+/// failure's message lives apart, exactly as V1's does, so the panel appends
+/// its `❌ …` line once. V2 has no `metadata.output` fallback rung: the state's
+/// `content` is the output source.
+fn decode_tool_output(state: Option<&Value>) -> ToolOutput {
+    let Some(state) = state else {
+        return ToolOutput::default();
+    };
+    let mut blocks = Vec::new();
+    let content = non_null(state.get("content"));
+    if let Some(items) = content.and_then(Value::as_array) {
+        for item in items {
+            match item.get("text").and_then(Value::as_str) {
+                Some(text) if item.get("type").and_then(Value::as_str) == Some("text") => {
+                    blocks.push(ContentBlock::Text(text.to_string()));
+                }
+                _ => blocks.push(ContentBlock::Other(item.clone())),
+            }
+        }
+    }
+    ToolOutput {
+        // The output payload the state actually carries; an empty content array
+        // is the server saying "no output".
+        raw: content.filter(|value| has_payload(value)).cloned(),
+        blocks,
+        error: state.get("error").and_then(decode_error),
+    }
+}
+
+/// Normalize a failure payload: a plain string message or an object carrying
+/// `message` (V2 serializes `SessionError.Error` as `{type, message, status?}`).
+fn decode_error(error: &Value) -> Option<String> {
+    match error {
+        Value::String(message) => Some(message.clone()),
+        Value::Object(fields) => fields.get("message").and_then(Value::as_str).map(str::to_string),
+        _ => None,
+    }
+}
+
+/// A JSON field that was actually reported: absent and explicit `null` both
+/// read as "not there".
+fn non_null(value: Option<&Value>) -> Option<&Value> {
+    value.filter(|value| !value.is_null())
+}
+
+/// Whether a payload field carries anything: an empty array or object is the
+/// server saying "no output", not an output.
+fn has_payload(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(fields) => !fields.is_empty(),
+        _ => true,
     }
 }
 
@@ -272,5 +619,253 @@ mod tests {
 
         let no_cursor: SessionListPage = serde_json::from_value(serde_json::json!({"data": []})).unwrap();
         assert!(no_cursor.cursor.next.is_none());
+    }
+
+    /// Decode one message's parts, for the content-level tests.
+    fn parts_of(message: Value) -> Vec<Part> {
+        decode_messages(&[message])
+            .messages
+            .into_iter()
+            .next()
+            .unwrap()
+            .parts
+    }
+
+    /// A user message's `text` is its text part; a message with no text has no
+    /// text part (never a manufactured empty one).
+    #[test]
+    fn a_user_message_decodes_its_text_and_never_invents_one() {
+        let parts = parts_of(serde_json::json!({"id": "msg_u", "type": "user", "text": "你好"}));
+        assert_eq!(
+            parts,
+            vec![Part::Text(TextPart {
+                text: "你好".into(),
+                started_at: None
+            })]
+        );
+
+        assert!(parts_of(serde_json::json!({"id": "msg_u", "type": "user"})).is_empty());
+        // A non-string text is malformed and stays raw, as in V1.
+        assert_eq!(
+            parts_of(serde_json::json!({"id": "msg_u", "type": "user", "text": 7})),
+            vec![Part::Other(OtherPart {
+                kind: "text".into(),
+                raw: Value::Number(7.into())
+            })]
+        );
+    }
+
+    /// A synthetic message is NOT a user message: it must never become a Turn
+    /// anchor. Its verbatim type and text survive into the neutral view.
+    #[test]
+    fn a_synthetic_message_keeps_its_type_and_stays_out_of_the_user_role() {
+        let transcript = decode_messages(&[serde_json::json!({
+            "id": "msg_s", "type": "synthetic", "text": "continue"
+        })]);
+        let message = &transcript.messages[0];
+        assert_eq!(message.role, MessageRole::Other("synthetic".into()));
+        assert_eq!(message.text(), "continue");
+        assert!(transcript.newest_user().is_none());
+    }
+
+    /// Assistant content decodes in order: text, reasoning (with its per-item
+    /// start time) and tool; the message's `finish` closes the step.
+    #[test]
+    fn assistant_content_decodes_in_order_with_finish_as_a_step_finish_part() {
+        let transcript = decode_messages(&[serde_json::json!({
+            "id": "msg_a",
+            "type": "assistant",
+            "time": {"created": 1000, "streamed": 1100, "completed": 1200},
+            "model": {"id": "deepseek-v4-flash", "providerID": "opencode-go", "variant": "high"},
+            "tokens": {"input": 11, "output": 7, "reasoning": 3, "cache": {"read": 5, "write": 2}},
+            "content": [
+                {"type": "text", "text": "答案"},
+                {"type": "reasoning", "text": "想想", "time": {"created": 1050, "completed": 1060}},
+                {"type": "tool", "id": "call_1", "name": "shell",
+                 "state": {"status": "completed", "input": {"command": "ls"},
+                           "content": [{"type": "text", "text": "a.rs"}],
+                           "metadata": {"exit": 0}},
+                 "time": {"created": 1070, "ran": 1080, "completed": 1190}}
+            ],
+            "finish": "stop"
+        })]);
+        let message = &transcript.messages[0];
+
+        assert_eq!(message.role, MessageRole::Assistant);
+        assert_eq!(message.time.unwrap().created, 1000);
+        assert_eq!(message.time.unwrap().completed, Some(1200));
+        let model = message.model.as_ref().unwrap();
+        assert_eq!(model.provider_id, "opencode-go");
+        assert_eq!(model.model_id, "deepseek-v4-flash");
+        assert_eq!(model.variant.as_deref(), Some("high"));
+        assert_eq!(
+            message.tokens.unwrap(),
+            TokenUsage {
+                input: 11,
+                output: 7,
+                total: 28,
+                cache_read: 5,
+                cache_write: 2,
+            },
+            "V2's token shape has no total; the neutral total is upstream's own sum"
+        );
+
+        assert_eq!(
+            message.parts[0],
+            Part::Text(TextPart {
+                text: "答案".into(),
+                started_at: None
+            })
+        );
+        assert_eq!(
+            message.parts[1],
+            Part::Reasoning(ReasoningPart {
+                text: "想想".into(),
+                started_at: Some(1050)
+            })
+        );
+        let Part::Tool(tool) = &message.parts[2] else {
+            panic!("expected a tool part: {:?}", message.parts[2]);
+        };
+        assert_eq!(tool.identity.name, "shell");
+        assert_eq!(tool.identity.call_id, "call_1");
+        assert_eq!(tool.status, ToolStatus::Completed);
+        assert_eq!(tool.started_at, Some(1070));
+        assert_eq!(tool.input.as_ref().unwrap()["command"], "ls");
+        assert_eq!(tool.metadata.as_ref().unwrap()["exit"], 0);
+        assert_eq!(tool.output.blocks, vec![ContentBlock::Text("a.rs".into())]);
+        assert_eq!(
+            message.parts[3],
+            Part::StepFinish(StepFinish {
+                reason: FinishReason::Stop
+            })
+        );
+    }
+
+    /// An assistant still in flight has no completion stamp and no finish: it
+    /// belongs to whatever turn is current.
+    #[test]
+    fn an_inflight_assistant_has_no_completion_and_no_finish_part() {
+        let transcript = decode_messages(&[serde_json::json!({
+            "id": "msg_a",
+            "type": "assistant",
+            "time": {"created": 1000, "streamed": 1100},
+            "content": [{"type": "reasoning", "text": "还在想"}]
+        })]);
+        let message = &transcript.messages[0];
+        assert_eq!(message.time.unwrap().completed, None);
+        assert!(
+            !message
+                .parts
+                .iter()
+                .any(|part| matches!(part, Part::StepFinish(_))),
+            "an unreported finish is not a completion: {:?}",
+            message.parts
+        );
+    }
+
+    /// The tool states: `streaming` is the not-yet-executed pending arm,
+    /// `running`/`completed`/`error` keep their neutral arms, and an unknown or
+    /// missing one is never guessed.
+    #[test]
+    fn tool_states_map_onto_the_neutral_arms() {
+        let tool = |state: Value| {
+            let parts = parts_of(serde_json::json!({
+                "id": "msg_a", "type": "assistant", "content": [
+                    {"type": "tool", "id": "call_1", "name": "shell", "state": state}
+                ]
+            }));
+            let Part::Tool(call) = &parts[0] else {
+                panic!("expected a tool part: {:?}", parts[0]);
+            };
+            call.clone()
+        };
+
+        let streaming = tool(serde_json::json!({"status": "streaming", "input": "{\"command\":"}));
+        assert_eq!(streaming.status, ToolStatus::Pending);
+        assert_eq!(
+            streaming.input.as_ref().unwrap().as_str().unwrap(),
+            "{\"command\":"
+        );
+        assert!(streaming.output.blocks.is_empty());
+
+        let running = tool(serde_json::json!({"status": "running", "input": {}, "metadata": {}}));
+        assert_eq!(running.status, ToolStatus::Running);
+        assert!(running.status.is_live());
+
+        let failed = tool(serde_json::json!({
+            "status": "error",
+            "input": {},
+            "error": {"type": "Tool.Error", "message": "boom"},
+            "content": [{"type": "text", "text": "partial"}]
+        }));
+        assert_eq!(failed.status, ToolStatus::Error);
+        assert_eq!(failed.output.error.as_deref(), Some("boom"));
+        assert_eq!(failed.output.blocks, vec![ContentBlock::Text("partial".into())]);
+
+        assert_eq!(
+            tool(serde_json::json!({"status": "weird"})).status,
+            ToolStatus::Other("weird".into())
+        );
+        assert_eq!(tool(serde_json::json!({})).status, ToolStatus::Unknown);
+    }
+
+    /// A `file` output block stays raw: only `text` content is text, and
+    /// per-tool payload knowledge is the Platform's (ADR-0042).
+    #[test]
+    fn a_file_output_block_stays_raw() {
+        let file = serde_json::json!({"type": "file", "uri": "file:///a", "mime": "text/plain"});
+        let parts = parts_of(serde_json::json!({
+            "id": "msg_a", "type": "assistant", "content": [
+                {"type": "tool", "id": "call_1", "name": "read",
+                 "state": {"status": "completed", "input": {},
+                           "content": [file.clone(), {"type": "text", "text": "a.rs"}]}}
+            ]
+        }));
+        let Part::Tool(call) = &parts[0] else {
+            panic!("expected a tool part: {:?}", parts[0]);
+        };
+        assert_eq!(
+            call.output.blocks,
+            vec![ContentBlock::Other(file), ContentBlock::Text("a.rs".into())]
+        );
+        assert_eq!(call.output.raw.as_ref().unwrap().as_array().unwrap().len(), 2);
+    }
+
+    /// Every message type this build does not model (shell, compaction, idle,
+    /// the switch markers) keeps its raw payload as one part and stays out of
+    /// the conversation roles.
+    #[test]
+    fn unmodelled_message_types_keep_their_raw_payload() {
+        let transcript = decode_messages(&[
+            serde_json::json!({"id": "msg_c", "type": "compaction", "status": "completed", "summary": "s"}),
+            serde_json::json!({"id": "msg_i", "type": "idle", "outcome": "succeeded", "time": {"created": 1}}),
+        ]);
+
+        for (message, kind) in transcript.messages.iter().zip(["compaction", "idle"]) {
+            assert_eq!(message.role, MessageRole::Other(kind.into()));
+            let Part::Other(raw) = &message.parts[0] else {
+                panic!("expected a raw part: {:?}", message.parts[0]);
+            };
+            assert_eq!(raw.kind, kind);
+            assert_eq!(raw.raw.get("type").and_then(Value::as_str), Some(kind));
+        }
+    }
+
+    /// The message id survives verbatim (V2's `msg_` rule is tighter than V1's
+    /// but the neutral model only carries it), and a message without a numeric
+    /// `time.created` is timeless rather than anchored at epoch 0.
+    #[test]
+    fn id_survives_and_a_message_without_a_numeric_time_is_timeless() {
+        let transcript = decode_messages(&[serde_json::json!({
+            "id": "msg_cola_live_fixture",
+            "type": "user",
+            "text": "hi",
+            "time": {"created": "not-a-number"}
+        })]);
+        let message = &transcript.messages[0];
+        assert_eq!(message.id.as_str(), "msg_cola_live_fixture");
+        assert!(message.time.is_none());
+        assert!(message.anchor().is_none());
     }
 }

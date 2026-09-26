@@ -2,7 +2,8 @@
 //! selected) against a local fake server, asserting both sides of every
 //! exchange — the recorded request (method / path / query / body) and what the
 //! client parsed back (ADR-0031). These pin the V2 read contract: the `{data}`
-//! envelopes, the body cursor, the 204 mutations, and the run-state derivation.
+//! envelopes, the body cursor, the transcript decode and its pagination, the
+//! 204 mutations, and the run-state derivation.
 
 use super::V2Strategy;
 use crate::error::BridgeError;
@@ -224,6 +225,147 @@ async fn session_info_unwraps_the_data_envelope_and_sends_no_directory_scope() {
     );
 }
 
+/// The transcript read: `order=asc` on the first page, then `cursor.next`
+/// follow-ups that MUST NOT repeat `order` (V2 answers `InvalidCursorError`
+/// otherwise), decoded through the strategy into the neutral transcript. The
+/// server mints `next` for every non-empty page, so the follow ends on the
+/// first empty one.
+#[tokio::test]
+async fn transcript_follows_the_body_cursor_in_ascending_order() {
+    let server = TestHttpServer::start().await;
+    server.route_sequence(
+        "GET",
+        "/api/session/ses_1/message",
+        vec![
+            MockResponse::json(
+                serde_json::json!({
+                    "data": [
+                        {
+                            "id": "msg_u1",
+                            "type": "user",
+                            "time": {"created": 1700000000000i64},
+                            "text": "问题",
+                        },
+                        {
+                            "id": "msg_a1",
+                            "type": "assistant",
+                            "time": {"created": 1700000000100i64, "completed": 1700000000200i64},
+                            "model": {"id": "deepseek-v4-flash", "providerID": "opencode-go"},
+                            "tokens": {"input": 11, "output": 7, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+                            "content": [
+                                {"type": "reasoning", "text": "想想", "time": {"created": 1700000000120i64}},
+                                {"type": "tool", "id": "call_1", "name": "shell",
+                                 "state": {"status": "completed", "input": {"command": "echo hi"},
+                                           "content": [{"type": "text", "text": "hi\n"}]},
+                                 "time": {"created": 1700000000130i64, "completed": 1700000000190i64}},
+                                {"type": "text", "text": "答案"},
+                            ],
+                            "finish": "stop",
+                        },
+                    ],
+                    "cursor": {"next": "c1"},
+                })
+                .to_string(),
+            ),
+            MockResponse::json(
+                serde_json::json!({
+                    "data": [{"id": "msg_i1", "type": "idle", "time": {"created": 1700000000300i64}, "outcome": "succeeded"}],
+                    "cursor": {"next": "c2"},
+                })
+                .to_string(),
+            ),
+            MockResponse::json(serde_json::json!({"data": [], "cursor": {"previous": "c2"}}).to_string()),
+        ],
+    );
+    let client = v2_wire_client(&server);
+
+    let transcript = client.transcript("ses_1").await.unwrap();
+
+    let ids: Vec<&str> = transcript.messages.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["msg_u1", "msg_a1", "msg_i1"],
+        "every page merged in server order"
+    );
+    let user = transcript
+        .newest_user()
+        .expect("the user message anchors the turn");
+    assert_eq!(user.text(), "问题");
+    let anchor = user.anchor().expect("the user message carries a server time");
+    assert_eq!(anchor.created_ms, 1700000000000);
+    let turn = transcript.turn_for_user(&anchor);
+    assert!(turn.complete, "the terminal finish ends the turn");
+    assert_eq!(turn.messages.len(), 1, "only the assistant message belongs");
+    let tool_part = turn.messages[0]
+        .parts
+        .iter()
+        .find_map(|part| match part {
+            crate::backend::Part::Tool(tool) => Some(tool),
+            _ => None,
+        })
+        .expect("the tool content decodes into a typed call");
+    assert_eq!(tool_part.identity.name, "shell");
+    assert_eq!(tool_part.identity.call_id, "call_1");
+    assert_eq!(tool_part.status, crate::backend::ToolStatus::Completed);
+    assert_eq!(tool_part.input.as_ref().unwrap()["command"], "echo hi");
+    assert_eq!(
+        tool_part.output.blocks,
+        vec![crate::backend::ContentBlock::Text("hi\n".into())]
+    );
+
+    assert_eq!(
+        server.request_count(),
+        3,
+        "two pages plus the terminating empty page"
+    );
+    let first = request_at(&server, 0);
+    assert_eq!(first.path, "/api/session/ses_1/message");
+    assert_eq!(first.query_param("order").as_deref(), Some("asc"));
+    assert_eq!(first.query_param("limit").as_deref(), Some("200"));
+    assert_eq!(first.query_param("cursor"), None, "the first page has no cursor");
+    for (index, cursor) in [(1, "c1"), (2, "c2")] {
+        let request = request_at(&server, index);
+        assert_eq!(request.query_param("cursor").as_deref(), Some(cursor));
+        assert_eq!(request.query_param("limit").as_deref(), Some("200"));
+        assert_eq!(
+            request.query_param("order"),
+            None,
+            "a cursor must never be combined with order (V2 answers InvalidCursorError)"
+        );
+    }
+}
+
+/// A failed transcript read names itself and carries the body preview; a
+/// garbled body is a parse error, never a silently empty transcript.
+#[tokio::test]
+async fn transcript_surfaces_read_failures() {
+    let failed = TestHttpServer::start().await;
+    failed.route("GET", "/api/session/ses_1/message", 500, r#"{"message":"boom"}"#);
+    let client = v2_wire_client(&failed);
+    let message = opencode_error(client.transcript("ses_1").await.unwrap_err());
+    assert!(
+        message.contains("transcript read failed"),
+        "unexpected: {message}"
+    );
+    assert!(
+        message.contains("500") && message.contains("boom"),
+        "unexpected: {message}"
+    );
+
+    let garbled = TestHttpServer::start().await;
+    garbled.route_raw(
+        "GET",
+        "/api/session/ses_1/message",
+        200,
+        "text/html",
+        "<html>nope</html>",
+    );
+    let client = v2_wire_client(&garbled);
+    let message = opencode_error(client.transcript("ses_1").await.unwrap_err());
+    assert!(message.contains("transcript read parse"), "unexpected: {message}");
+    assert!(message.contains("nope"), "unexpected: {message}");
+}
+
 /// The 204 mutations: V2's PATCH and DELETE answer no content, so the client
 /// must not expect (or attempt to parse) a success body.
 #[tokio::test]
@@ -406,15 +548,19 @@ async fn session_status_surfaces_failures() {
 
 /// Attaching to V2 must never pretend a missing capability worked: a caller
 /// gets an error naming the method and the generation (spec #364, S3). S4a
-/// landed the session reads, so this pins a capability still waiting for its
-/// slice (transcript is S4b).
+/// landed the session reads and S4b the transcript, so this pins capabilities
+/// still waiting for their slices (writes are S5, permissions/forms S6).
 #[tokio::test]
 async fn remaining_capabilities_fail_loudly_until_their_slice_lands() {
     let strategy = V2Strategy;
     let http = Transport::new(Some("opencode"), Some("pw"), "http://127.0.0.1:1");
-    let error = strategy.transcript(&http, "ses_1").await.unwrap_err().to_string();
+    let error = strategy
+        .prompt(&http, "ses_1", "hi", &[], None, None, None, None)
+        .await
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("V2 strategy"), "unexpected: {error}");
-    assert!(error.contains("transcript"), "unexpected: {error}");
+    assert!(error.contains("prompt"), "unexpected: {error}");
     assert!(error.contains("not implemented"), "unexpected: {error}");
     // The two catalog reads degrade to empty with a warning instead of an
     // error (their card surfaces tolerate emptiness).
