@@ -124,7 +124,8 @@ impl TestHttpServer {
         }
     }
 
-    /// The base URL to hand to `Client::with_base_url` (no trailing slash).
+    /// The base URL to hand to `OpenCodeBackend::with_base_url` (no trailing
+    /// slash).
     pub fn base_url(&self) -> String {
         format!("http://{}", self.addr)
     }
