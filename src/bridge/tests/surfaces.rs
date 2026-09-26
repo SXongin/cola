@@ -616,8 +616,8 @@ async fn sweep_records_pending_sessions_for_liveness() {
     sweep(&app.question, &app).await;
     assert_eq!(
         app.requests_handle().wait_for("ses_child").await,
-        Some(crate::feishu::card::tool_render::WaitState::Both),
-        "both kinds pending combine into the card's wait vocabulary"
+        Some(crate::feishu::card::AwaitingAction::Both),
+        "both kinds pending combine into the header's awaiting vocabulary"
     );
 
     // A failed list says nothing: the record must survive it (#130).
@@ -638,7 +638,7 @@ async fn sweep_records_pending_sessions_for_liveness() {
     sweep(&app.permission, &app).await;
     assert_eq!(
         app.requests_handle().wait_for("ses_child").await,
-        Some(crate::feishu::card::tool_render::WaitState::Question),
+        Some(crate::feishu::card::AwaitingAction::Question),
         "the resolved permission leaves only the question"
     );
     backend.question_resolved_by_another("q_1").await;

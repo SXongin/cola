@@ -1,8 +1,8 @@
 use crate::backend::{ContentBlock, ToolCall, ToolStatus};
 
 use super::sanitize::CardMarkdown;
-use super::shell::{collapsible_panel, panel_time_suffix};
-use super::{fenced_code, truncate_md};
+use super::shell::{collapsible_panel, fmt_elapsed, panel_time_suffix};
+use super::{AwaitingAction, fenced_code, truncate_md};
 
 /// Cap for a tool's OUTPUT shown inside its collapsible panel. Higher than the
 /// old 800: code-wrapped output renders without line wrapping, so a file or
@@ -110,8 +110,9 @@ impl ToolPanel {
         self.liveness.as_ref()
     }
 
-    /// Attach or clear the gathered liveness (the accumulator's refresh path;
-    /// `None` clears a stale line once the call settles).
+    /// Attach or replace the gathered liveness (the accumulator's refresh
+    /// path). Rendering only shows it while the call is live, so a settled
+    /// panel's stale snapshot is never visible.
     pub(crate) fn set_liveness(&mut self, liveness: Option<TaskLiveness>) {
         self.liveness = liveness;
     }
@@ -120,7 +121,7 @@ impl ToolPanel {
     /// camelCase field the event contract carries (AGENTS.md #2). `None` for
     /// any other tool, or when the payload recorded no session id.
     pub(crate) fn child_session_id(&self) -> Option<&str> {
-        if self.call.identity.name != "task" {
+        if self.call.identity.name != TASK_TOOL {
             return None;
         }
         self.call
@@ -131,61 +132,40 @@ impl ToolPanel {
     }
 }
 
+/// The built-in tool a child session hangs off (`task`): the one call kind
+/// whose panel carries liveness, checked by name in the card and the Bridge.
+pub(crate) const TASK_TOOL: &str = "task";
+
 /// A live `task` call's child-session liveness (ADR-0054): what the child is
 /// doing right now, as the panel title shows it. Display-only data — the Bridge
 /// gathers it, the Platform formats it — so the panel stays a view over the
 /// call plus one read-only line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskLiveness {
-    /// Age of the child's newest activity, measured when gathered.
-    pub last_activity_ago_secs: u64,
+    /// Epoch ms of the child's newest observed activity. Stored as a time, not
+    /// an age: the panel keeps showing a growing age from the last observation
+    /// even while a read fails, instead of freezing a made-up "5s 前".
+    pub last_activity_ms: i64,
     /// The child's newest still-running tool, when it has one.
     pub current_tool: Option<String>,
-    /// The child's pending Permission/Question, when it waits on one.
-    pub wait: Option<WaitState>,
-}
-
-/// Which user-facing wait currently blocks a child session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WaitState {
-    Permission,
-    Question,
-    Both,
-}
-
-impl WaitState {
-    /// The card's existing wait vocabulary, as the liveness line reuses it.
-    pub fn label(self) -> &'static str {
-        match self {
-            WaitState::Permission => "等待授权",
-            WaitState::Question => "等待回答",
-            WaitState::Both => "等待授权/回答",
-        }
-    }
+    /// The child's pending wait, in the header's own vocabulary (ADR-0054).
+    pub wait: Option<AwaitingAction>,
 }
 
 impl TaskLiveness {
     /// The title fragment a live task panel appends: the activity age, the
-    /// current tool and the wait, each only when known.
-    pub fn title_fragment(&self) -> String {
-        let mut parts = vec![format!("{} 前", age_label(self.last_activity_ago_secs))];
+    /// current tool and the wait, each only when known. `now_ms` is passed in
+    /// so the age is measured at card build time.
+    pub fn title_fragment(&self, now_ms: i64) -> String {
+        let ago = ((now_ms - self.last_activity_ms).max(0) / 1000) as u64;
+        let mut parts = vec![format!("{} 前", fmt_elapsed(ago))];
         if let Some(tool) = &self.current_tool {
             parts.push(tool.clone());
         }
-        if let Some(wait) = self.wait {
-            parts.push(wait.label().to_string());
+        if let Some(wait) = self.wait.and_then(|wait| wait.label()) {
+            parts.push(wait.to_string());
         }
         parts.join(" · ")
-    }
-}
-
-/// A coarse age label (`12s`, `3m`, `1h`): the liveness line needs a
-/// glanceable magnitude, not precision.
-fn age_label(secs: u64) -> String {
-    match secs {
-        0..=59 => format!("{secs}s"),
-        60..=3599 => format!("{}m", secs / 60),
-        _ => format!("{}h", secs / 3600),
     }
 }
 
@@ -396,7 +376,10 @@ pub(super) fn tool_panel_element(
     if tool.is_live()
         && let Some(liveness) = tool.liveness()
     {
-        title.push_str(&format!(" · {}", liveness.title_fragment()));
+        title.push_str(&format!(
+            " · {}",
+            liveness.title_fragment(chrono::Utc::now().timestamp_millis())
+        ));
     }
     collapsible_panel(&title, &content, element_id)
 }
@@ -1189,18 +1172,19 @@ mod tests {
             None,
         );
         tool.set_liveness(Some(TaskLiveness {
-            last_activity_ago_secs: 12,
+            last_activity_ms: chrono::Utc::now().timestamp_millis() - 12_000,
             current_tool: Some("bash".into()),
-            wait: Some(WaitState::Permission),
+            wait: Some(AwaitingAction::Permission),
         }));
         let card = CardBuilder::new()
             .with_state(CardState::Streaming)
             .with_tool(tool)
             .build();
         let elements = card["body"]["elements"].as_array().unwrap();
-        assert_eq!(
-            elements[0]["header"]["title"]["content"].as_str().unwrap(),
-            "⏳ task · 12s 前 · bash · 等待授权"
+        let title = elements[0]["header"]["title"]["content"].as_str().unwrap();
+        assert!(
+            title.starts_with("⏳ task · ") && title.contains("前 · bash · 等待你的授权"),
+            "the collapsed task title carries the child liveness: {title}"
         );
     }
 
@@ -1210,7 +1194,7 @@ mod tests {
     fn settled_task_panel_drops_child_liveness() {
         let mut tool = ToolPanel::for_test("task", ToolStatus::Completed, None, Some("done"));
         tool.set_liveness(Some(TaskLiveness {
-            last_activity_ago_secs: 12,
+            last_activity_ms: 1,
             current_tool: None,
             wait: None,
         }));
@@ -1226,19 +1210,23 @@ mod tests {
     }
 
     /// The fragment composes only the parts that are known; the age alone is
-    /// the floor, and the wait reuses the card's wait vocabulary.
+    /// the floor, and the wait reuses the header's own vocabulary.
     #[test]
     fn liveness_fragment_composes_known_parts() {
-        let liveness = |ago, tool: Option<&str>, wait| TaskLiveness {
-            last_activity_ago_secs: ago,
+        let now = 1_000_000;
+        let liveness = |ago_ms: i64, tool: Option<&str>, wait| TaskLiveness {
+            last_activity_ms: now - ago_ms,
             current_tool: tool.map(str::to_string),
             wait,
         };
-        assert_eq!(liveness(5, None, None).title_fragment(), "5s 前");
-        assert_eq!(liveness(90, Some("read"), None).title_fragment(), "1m 前 · read");
+        assert_eq!(liveness(5_000, None, None).title_fragment(now), "5s 前");
         assert_eq!(
-            liveness(7200, Some("bash"), Some(WaitState::Both)).title_fragment(),
-            "2h 前 · bash · 等待授权/回答"
+            liveness(90_000, Some("read"), None).title_fragment(now),
+            "1m30s 前 · read"
+        );
+        assert_eq!(
+            liveness(7_200_000, Some("bash"), Some(AwaitingAction::Both)).title_fragment(now),
+            "2h0m 前 · bash · 等待你的授权/回答"
         );
     }
 
