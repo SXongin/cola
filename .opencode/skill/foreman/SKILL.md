@@ -131,4 +131,4 @@ Re-run `/foreman <spec>` after an interruption. The branch log and the progress 
 
 ## Setup
 
-The implementer inherits this session's model and takes the user's permission rules, except where its own block sets them (`task` and `todowrite` are denied). For an unattended batch, allow `git checkout`/`switch`, `git fetch`/`pull`/`rebase`, and `gh issue view`/`list`/`comment`/`api`; keep `git push` and `gh pr create` on ask, so acceptance is enforced twice.
+The implementer inherits this session's model and takes the user's permission rules, except where its own block sets them (`subagent` — V1's `task` — is denied). For an unattended batch, allow `git checkout`/`switch`, `git fetch`/`pull`/`rebase`, and `gh issue view`/`list`/`comment`/`api`; keep `git push` and `gh pr create` on ask, so acceptance is enforced twice.
