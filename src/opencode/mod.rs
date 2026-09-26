@@ -14,6 +14,8 @@
 //! [`crate::backend`], never from here.
 
 pub mod client;
+#[cfg(test)]
+mod live;
 pub(crate) mod parsing;
 pub(crate) mod strategy;
 #[cfg(test)]
