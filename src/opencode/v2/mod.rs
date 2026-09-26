@@ -11,7 +11,8 @@
 //!
 //! S4a is the session-level read surface: list/get/update/delete, and the run
 //! state (`session.active`) with the retry status derived from the newest
-//! assistant message's `retry` field. The transcript decode proper is S4b.
+//! assistant message's `retry` field. S4b is the transcript decode proper,
+//! behind [`V2Strategy::transcript`] and the private [`wire`] module.
 //!
 //! The shared `/api/session` create/compact calls are NOT here: both
 //! generations serve them, so they live on the generation-blind adapter
@@ -42,14 +43,24 @@ use super::types::{
 const SESSION: &str = "/api/session";
 /// The active-session run-state map (`{data: Record<SessionID, {type:"running"}>}`).
 const SESSION_ACTIVE: &str = "/api/session/active";
-/// The per-session projected-message read; S4a uses it only for the retry
-/// derivation (S4b decodes the transcript).
+/// The per-session projected-message read: the S4b transcript decode and, for
+/// active sessions, the run state's retry derivation.
 const SESSION_MESSAGES_SUFFIX: &str = "/message";
 
 /// Hard stop for the body-cursor follow in [`V2Strategy::list_sessions`]: a
 /// misbehaving server must not spin the client forever. The server's default
 /// page is 50 rows, so 100 pages is 5k sessions — far past any real store.
 const MAX_SESSION_PAGES: usize = 100;
+
+/// Hard stop for the body-cursor follow in [`V2Strategy::transcript`], for the
+/// same reason: 100 pages of the endpoint's 200-row maximum is 20k messages,
+/// far past any real session.
+const MAX_MESSAGE_PAGES: usize = 100;
+
+/// The page size the transcript read asks for — the endpoint's documented
+/// maximum. The whole history is re-read every render poll, so the largest
+/// page is the difference between one request and many on a long session.
+const MESSAGE_PAGE_LIMIT: &str = "200";
 
 /// How much of a failed response body a status diagnostic carries. One cap for
 /// every warn and error in this module, so no two diagnostics of the same read
@@ -216,8 +227,60 @@ impl GenerationStrategy for V2Strategy {
         Err(not_implemented_error("reject_question"))
     }
 
-    async fn transcript(&self, _http: &Transport, _session_id: &str) -> Result<SessionTranscript> {
-        Err(not_implemented_error("transcript"))
+    /// Fetch one session's Session Transcript through the V2 projected-message
+    /// read (`GET /api/session/{id}/message`), decoded by [`wire`].
+    ///
+    /// The read pages over `cursor.next` in `order=asc` (oldest first, the
+    /// neutral transcript's order), with the largest page the endpoint allows.
+    /// V2's cursor is opaque and **cannot be combined with `order`**, so the
+    /// first request sends `order=asc&limit` and each follow-up only
+    /// `cursor&limit` — the cursor carries the order it was minted with. The
+    /// server emits `cursor.next` for every non-empty page (even the last one),
+    /// so the loop stops on the first empty page; a failed read names itself
+    /// and carries a body preview, like the module's other reads.
+    async fn transcript(&self, http: &Transport, session_id: &str) -> Result<SessionTranscript> {
+        let mut data: Vec<serde_json::Value> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let url = http.url(&format!("{SESSION}/{session_id}{SESSION_MESSAGES_SUFFIX}"));
+        for _ in 0..MAX_MESSAGE_PAGES {
+            let mut request = reqwest::Url::parse(&url)?;
+            {
+                let mut query = request.query_pairs_mut();
+                if let Some(cursor) = &cursor {
+                    query.append_pair("cursor", cursor);
+                } else {
+                    query.append_pair("order", "asc");
+                }
+                query.append_pair("limit", MESSAGE_PAGE_LIMIT);
+            }
+            let resp = http.client().get(request).send().await?;
+            let status = resp.status();
+            let text = resp.text().await?;
+            if !status.is_success() {
+                return Err(crate::error::BridgeError::OpenCode(format!(
+                    "transcript read failed: {status} — body: {}",
+                    &text[..text.len().min(BODY_PREVIEW_CHARS)]
+                )));
+            }
+            let page: wire::MessagesPage = serde_json::from_str(&text).map_err(|e| {
+                crate::error::BridgeError::OpenCode(format!(
+                    "transcript read parse: {e} — body: {}",
+                    &text[..text.len().min(BODY_PREVIEW_CHARS)]
+                ))
+            })?;
+            let empty = page.data.is_empty();
+            data.extend(page.data);
+            match page.cursor.next {
+                Some(next) if !empty => cursor = Some(next),
+                _ => return Ok(wire::decode_messages(&data)),
+            }
+        }
+        tracing::warn!(
+            "transcript {session_id}: cursor.next still present after {MAX_MESSAGE_PAGES} pages; \
+             returning the {} messages fetched so far",
+            data.len()
+        );
+        Ok(wire::decode_messages(&data))
     }
 
     /// The run state for ONE session (V2 `GET /api/session/active`), with the
@@ -233,7 +296,8 @@ impl GenerationStrategy for V2Strategy {
     /// with no extra request — and a failed assistant read degrades to Running
     /// with a warning rather than failing the run state: the active map already
     /// answered the primary question, and a transient read failure must not
-    /// finalize a live Turn. No transcript decode is involved (slice S4b).
+    /// finalize a live Turn. The read is minimal (`type=assistant&order=desc&
+    /// limit=1`), so it never decodes the transcript.
     ///
     /// An active entry whose type cola does not recognise yields `Ok(None)` —
     /// never guessed — matching the V1 read; a failed active-map read is an
@@ -335,7 +399,7 @@ impl V2Strategy {
     /// Whether the newest assistant message of `session_id` carries a scheduled
     /// `retry`. Reads ONE projected message (`type=assistant&order=desc&
     /// limit=1`) — the minimal wire read that answers the run-state question
-    /// without decoding the transcript (S4b). Failures name the retry read, so
+    /// without decoding the whole transcript. Failures name the retry read, so
     /// a caller can tell them apart from the active-map read.
     async fn newest_assistant_retrying(&self, http: &Transport, session_id: &str) -> Result<bool> {
         let mut url =
