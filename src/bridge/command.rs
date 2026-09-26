@@ -1480,9 +1480,40 @@ fn decide_id_hits<'a>(
     }
 }
 
-/// `/attach <id|title> [--force]` — take over an arbitrary server session
+/// The child-adoption policy of the general session commands (spec #344): a
+/// child session is only ever taken over through `/sub attach`, so the
+/// `/switch ... --force` and `/switch` card adoption paths refuse one that is
+/// not already mapped to this chat — `force` never opens this door. A child
+/// this chat mapped itself is a normal switch target (re-activation, or a
+/// `--force` steal from a sibling thread) and passes. The refusal names the
+/// sanctioned command; it lives here, at the command layer, so the shared
+/// [`resolve_session`] stays a neutral resolver.
+pub(crate) fn child_adoption_refusal(
+    store: &crate::bridge::session::SessionStore,
+    thread_key: &ThreadKey,
+    info: &crate::opencode::types::SessionListInfo,
+) -> Option<String> {
+    if !info.is_child() {
+        return None;
+    }
+    let mapped_to_chat = store
+        .thread_for_session(&info.id)
+        .is_some_and(|owner| owner.chat_id == thread_key.chat_id);
+    if mapped_to_chat {
+        return None;
+    }
+    Some(format!(
+        "⚠️ 会话「{}」是子任务会话，不能用 `/switch` 接管；请用 `/sub attach {}` 接管它（该命令只接管当前会话的直接子会话）。",
+        crate::bridge::display::title_or_id_tail(info),
+        info.id
+    ))
+}
+
+/// `/attach <id|title> [--force]` — take over an arbitrary ROOT server session
 /// into the current thread (ADR-0008). Resolution: exact id → unique
-/// id-prefix → unique title substring; multiple hits list candidates.
+/// id-prefix → unique title substring; multiple hits list candidates. A child
+/// is refused unless this chat already mapped it — the takeover path for
+/// children is `/sub attach` (spec #344).
 async fn handle_attach(
     handles: &CommandHandles,
     thread_key: &ThreadKey,
@@ -1498,6 +1529,14 @@ async fn handle_attach(
         .await?;
     match resolve_session(&sessions, query) {
         SessionResolution::Hit(s) => {
+            let refusal = {
+                let store = handles.flow.sessions.store.lock().await;
+                child_adoption_refusal(&store, thread_key, s)
+            };
+            if let Some(refusal) = refusal {
+                handles.flow.platform.reply_text(message_id, &refusal).await?;
+                return Ok(());
+            }
             adopt_session(handles, thread_key, s, message_id, kind, force, "/switch").await
         }
         SessionResolution::Ambiguous(hits) => {

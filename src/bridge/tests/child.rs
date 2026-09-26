@@ -1,6 +1,7 @@
-//! `/sub` — the read-only child-session view (spec #344, ticket #346): the
-//! Active Session's direct children, scoped, keyword-filtered, paginated, with
-//! one live status read per rendered row.
+//! Child sessions (spec #344): the read-only `/sub` view of the Active
+//! Session's direct children (scoped, keyword-filtered, paginated, with one
+//! live status read per rendered row), the `/sub attach` takeover, and the
+//! child policy that keeps the general session surfaces roots-only.
 
 use crate::bridge::test_support::*;
 use crate::feishu::card::session::{CHILD_IDLE, CHILD_RUNNING};
@@ -843,4 +844,272 @@ async fn sub_attach_running_child_snapshot_shows_its_live_state() {
         prompts.lock().await.is_empty(),
         "the running child is never messaged"
     );
+}
+
+/// `/switch <child-id> --force` cannot adopt an unmapped child: the general
+/// command refuses with the `/sub attach` pointer before any mapping write or
+/// Session Snapshot (spec #344).
+#[tokio::test]
+async fn switch_force_refuses_an_unmapped_child_and_points_at_sub_attach() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let store_path = dir.path().join("sessions.json");
+    let cfg = test_config(&store_path);
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![
+        list_session("ses_root", "根会话", "/work/root", 100),
+        child_of("ses_c1", "重写渲染", "/work/root", 300, "ses_root", "build"),
+    ]);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key(), "ses_root", "/work/root"),
+    )
+    .await;
+    let before = std::fs::read(&store_path).expect("the seeded store is persisted");
+
+    send_command(&app, "/switch ses_c1 --force", "m1").await;
+
+    let text = platform.texts().await.join("\n");
+    assert!(
+        text.contains("子任务"),
+        "the refusal says why the child is not adoptable: {text}"
+    );
+    assert!(
+        text.contains("/sub attach"),
+        "the refusal names the sanctioned path: {text}"
+    );
+    assert!(
+        platform.replied_cards().await.is_empty(),
+        "a refused child gets no Session Snapshot"
+    );
+    assert_eq!(
+        app.sessions.lock().await.get_active(&key()).unwrap().session_id,
+        "ses_root",
+        "the Active Session is unchanged"
+    );
+    assert!(
+        app.sessions.lock().await.thread_for_session("ses_c1").is_none(),
+        "no mapping was written for the child"
+    );
+    let after = std::fs::read(&store_path).expect("the store is still readable");
+    assert_eq!(before, after, "the refusal writes nothing");
+}
+
+/// A child mapped to ANOTHER chat is refused too: `--force` does not steal a
+/// child through `/switch` — `/sub attach ... --force` is the sanctioned
+/// steal (spec #344).
+#[tokio::test]
+async fn switch_force_does_not_steal_a_child_mapped_to_another_chat() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![
+        list_session("ses_root", "根会话", "/work/root", 100),
+        child_of("ses_c1", "重写渲染", "/work/root", 300, "ses_root", "build"),
+    ]);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key(), "ses_root", "/work/root"),
+    )
+    .await;
+    let other = crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(other.clone(), "ses_c1", "/work/root"),
+    )
+    .await;
+
+    send_command(&app, "/switch ses_c1 --force", "m1").await;
+
+    let text = platform.texts().await.join("\n");
+    assert!(
+        text.contains("/sub attach"),
+        "the refusal names the sanctioned path: {text}"
+    );
+    assert!(
+        platform.replied_cards().await.is_empty(),
+        "a refused child gets no Session Snapshot"
+    );
+    assert_eq!(
+        app.sessions.lock().await.get_active(&key()).unwrap().session_id,
+        "ses_root",
+        "the child was not stolen into this chat"
+    );
+    assert_eq!(
+        app.sessions.lock().await.get_active(&other).unwrap().session_id,
+        "ses_c1",
+        "the other chat keeps its mapped child"
+    );
+}
+
+/// A child already taken over into this chat behaves like any mapped session
+/// (spec #344): `/switch <its keyword>` re-activates it, and the `--force`
+/// attach form adopts it too — no refusal for the chat's own child.
+#[tokio::test]
+async fn switch_reactivates_a_child_mapped_to_this_chat() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![
+        list_session("ses_root", "根会话", "/work/root", 100),
+        child_of("ses_c1", "重写渲染", "/work/root", 300, "ses_root", "build"),
+    ]);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key(), "ses_root", "/work/root"),
+    )
+    .await;
+
+    // The sanctioned takeover leaves the child active and both mapped.
+    send_command(&app, "/sub attach ses_c1", "m1").await;
+    assert_eq!(
+        app.sessions.lock().await.get_active(&key()).unwrap().session_id,
+        "ses_c1"
+    );
+
+    // The parent is still a normal switch target...
+    send_command(&app, "/switch ses_root", "m2").await;
+    assert_eq!(
+        app.sessions.lock().await.get_active(&key()).unwrap().session_id,
+        "ses_root"
+    );
+    // ...and `/switch <its keyword>` re-activates the mapped child.
+    send_command(&app, "/switch 重写渲染", "m3").await;
+    assert_eq!(
+        app.sessions.lock().await.get_active(&key()).unwrap().session_id,
+        "ses_c1",
+        "the chat's own child is re-activated like any mapped session"
+    );
+
+    // The `--force` attach form passes the child policy for this chat's child.
+    send_command(&app, "/switch ses_root", "m4").await;
+    send_command(&app, "/switch ses_c1 --force", "m5").await;
+    assert_eq!(
+        app.sessions.lock().await.get_active(&key()).unwrap().session_id,
+        "ses_c1"
+    );
+    let text = platform.texts().await.join("\n");
+    assert!(
+        !text.contains("子任务会话"),
+        "no child refusal for the chat's own mapped child: {text}"
+    );
+}
+
+/// The `/switch` card and the global keyword search stay roots-only (spec
+/// #344 regression): a child never renders as a card row, a keyword only the
+/// child matches finds nothing, and a keyword matching root and child resolves
+/// to the root alone.
+#[tokio::test]
+async fn switch_card_and_search_never_offer_children() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![
+        list_session("ses_root", "根会话", "/work/root", 100),
+        child_of("ses_c1", "重写渲染", "/work/root", 300, "ses_root", "build"),
+    ]);
+    let (app, platform) = build_app(cfg, backend).await;
+
+    // The card lists the root and never the child.
+    send_command(&app, "/switch", "m1").await;
+    let card = first_card(&platform).await;
+    let text = card_text(&card);
+    assert!(text.contains("根会话"), "the root still renders: {text}");
+    assert!(
+        !text.contains("重写渲染"),
+        "a child never renders as a card row: {text}"
+    );
+    assert!(
+        !card.to_string().contains("ses_c1"),
+        "no child payload rides the card: {card}"
+    );
+
+    // A child-only keyword finds no global candidate: the pre-filtered empty
+    // card, never an adoption.
+    send_command(&app, "/switch 重写渲染", "m2").await;
+    assert!(
+        app.sessions.lock().await.all_entries().is_empty(),
+        "nothing was adopted"
+    );
+    let mut cards = platform.replied_cards().await;
+    let empty = cards.pop().expect("the no-match card");
+    assert!(
+        card_text(&empty).contains("无匹配会话"),
+        "the child is not a candidate: {}",
+        card_text(&empty)
+    );
+
+    // A keyword matching both resolves to the root alone, never ambiguous.
+    send_command(&app, "/switch work/root", "m3").await;
+    assert_eq!(
+        app.sessions.lock().await.get_active(&key()).unwrap().session_id,
+        "ses_root"
+    );
+    let texts = platform.texts().await.join("\n");
+    assert!(
+        !texts.contains("找到多个会话"),
+        "children are not candidates: {texts}"
+    );
+}
+
+/// The card's adopt/force_adopt ops run the same child policy as the text
+/// path: a stale or forged callback naming a child is refused with the
+/// `/sub attach` pointer, and nothing is written (spec #344).
+#[tokio::test]
+async fn switch_card_adopt_refuses_an_unmapped_child() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let store_path = dir.path().join("sessions.json");
+    let cfg = test_config(&store_path);
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![
+        list_session("ses_root", "根会话", "/work/root", 100),
+        child_of("ses_c1", "重写渲染", "/work/root", 300, "ses_root", "build"),
+    ]);
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key(), "ses_root", "/work/root"),
+    )
+    .await;
+    let before = std::fs::read(&store_path).expect("the seeded store is persisted");
+
+    for op in ["adopt", "force_adopt"] {
+        let result = app
+            .host_action(serde_json::json!({
+                "action": "switch",
+                "op": op,
+                "chat_id": "chat_1",
+                "thread_id": "chat_1",
+                "session_id": "ses_c1",
+            }))
+            .await
+            .expect("the op returns a result");
+        assert!(
+            result.card.is_none(),
+            "{op}: a refused child gets no Session Snapshot"
+        );
+        let toast = result.toast.unwrap_or_default();
+        assert!(
+            toast.contains("/sub attach"),
+            "{op}: the refusal names the sanctioned path: {toast}"
+        );
+    }
+    assert_eq!(
+        app.sessions.lock().await.get_active(&key()).unwrap().session_id,
+        "ses_root",
+        "the card ops adopt nothing"
+    );
+    assert!(
+        app.sessions.lock().await.thread_for_session("ses_c1").is_none(),
+        "no mapping was written for the child"
+    );
+    let after = std::fs::read(&store_path).expect("the store is still readable");
+    assert_eq!(before, after, "the refusal writes nothing");
 }

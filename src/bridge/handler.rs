@@ -908,10 +908,24 @@ impl App {
                 // `adopt` op carries no `--force`: an occupied session patches
                 // the card to the force-confirm card, whose `force_adopt`
                 // button re-enters here. `force_adopt` skips the owner check and
-                // lets the adoption's `set_active` steal the mapping.
+                // lets the adoption's `set_active` steal the mapping. Either
+                // op refuses a child the chat has not mapped: the card's rows
+                // are roots-only, but a stale or forged callback can still name
+                // one, and the general surfaces never adopt a child (spec
+                // #344; the sanctioned path is `/sub attach`).
                 let force = op == "force_adopt";
                 let sessions = core.cached_session_list().await.ok()?;
                 let target = sessions.iter().find(|s| s.id == session_id)?.clone();
+                let child_refusal = {
+                    let store = core.sessions.lock().await;
+                    command::child_adoption_refusal(&store, &thread_key, &target)
+                };
+                if let Some(refusal) = child_refusal {
+                    return Some(CardActionResult {
+                        card: None,
+                        toast: Some(refusal),
+                    });
+                }
                 let already_active = {
                     let store = core.sessions.lock().await;
                     store
