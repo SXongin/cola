@@ -649,7 +649,7 @@ pub(crate) async fn handle_command(
         Command::Name(name) => {
             // `/name` renames the conversation's session (ADR-0007). An active
             // session is PATCHed server-side — visible to every client, and the
-            // `/list` cache is invalidated so the new title shows immediately;
+            // session-list cache is invalidated so the new title shows immediately;
             // for a cover-rooted topic, patch the cover card right away too
             // (the chat-list topic entry is its content, ADR-0023). On a
             // Pending Session (ADR-0041) there is nothing to PATCH yet: the

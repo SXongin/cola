@@ -735,7 +735,7 @@ impl App {
         let entry = pending.into_entry(session.id.clone());
         let thread_key = entry.thread_key.clone();
         // The core wrapper (not the raw store) so the session-list cache is
-        // invalidated: `/list`/`/switch` must see the just-created session.
+        // invalidated: `/switch` must see the just-created session.
         self.activate_session(entry).await?;
         // ADR-0041 + ADR-0023: a pending topic's cover still says
         // 「下一条消息创建」. Move its record onto the new session and re-render

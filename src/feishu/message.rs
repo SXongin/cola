@@ -206,7 +206,7 @@ pub(crate) fn strip_mentions(text: &str, mentions: &[Mention], bot_open_id: &str
 /// Remove Feishu @mention placeholder tokens (`@_user_N`) from arbitrary text,
 /// regardless of any mentions mapping. Used to clean stale session names that
 /// were persisted before mention stripping existed (they would otherwise leak
-/// `@_user_1` into the card header and `/list`).
+/// `@_user_1` into a card header or the `/switch` card).
 pub(crate) fn strip_mention_tokens(text: &str) -> String {
     text.split_whitespace()
         .filter(|w| !w.starts_with("@_user_"))
