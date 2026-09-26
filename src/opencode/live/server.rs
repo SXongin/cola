@@ -1,11 +1,12 @@
 //! The live suite's child pinned-V1 server (ADR-0057).
 //!
-//! Runs the real `opencode serve` binary — the exact pinned 1.18.31 artifact
-//! the release-notes and review workflows install — as a child process whose
-//! entire world is a temp directory: every XDG tree is relocated, the config
-//! points the only provider at the in-process scripted endpoint, and the store
-//! is fresh. It can never see the machine's default store, credentials or
-//! config (the spec's "never point a test server at the default store").
+//! Runs the real `opencode serve` binary — the exact pinned V1 artifact
+//! `.github/actions/install-opencode-v1` installs for the release-notes, review
+//! and live workflows — as a child process whose entire world is a temp
+//! directory: every XDG tree is relocated, the config points the only provider
+//! at the in-process scripted endpoint, and the store is fresh. It can never
+//! see the machine's default store, credentials or config (the spec's "never
+//! point a test server at the default store").
 //!
 //! The harness also refuses a V2 binary: running the live V1 contract on a
 //! different generation would assert the wrong protocol.
@@ -83,8 +84,8 @@ impl LiveServer {
             .unwrap_or_else(|error| {
                 panic!(
                     "cannot start the live OpenCode binary `{binary}`: {error}\n\
-                     set COLA_LIVE_OPENCODE_BIN to the pinned V1 1.18.31 binary \
-                     (or put `opencode` on PATH)"
+                     set COLA_LIVE_OPENCODE_BIN to the pinned V1 binary the composite \
+                     action installs (or put `opencode` on PATH)"
                 )
             });
 
@@ -179,11 +180,11 @@ impl Drop for LiveServer {
 /// reported. The live suite asserts V1's wire contract; a V2 binary would
 /// silently test the wrong generation.
 ///
-/// The check is the major generation only, deliberately: the exact pin
-/// (1.18.31) lives once in `.github/actions/install-opencode-v1`, and CI runs
-/// the binary that action installs. Hardcoding the version here would create
-/// the second copy a pin bump must chase (spec #364 §11); the local run just
-/// needs to be V1, and the version it used is printed as evidence.
+/// The check is the major generation only, deliberately: the exact version pin
+/// lives once in `.github/actions/install-opencode-v1`, and CI runs the binary
+/// that action installs. Hardcoding the version here would create the second
+/// copy a pin bump must chase (spec #364 §11); the local run just needs to be
+/// V1, and the version it used is printed as evidence.
 pub async fn ensure_v1_binary(binary: &str) -> String {
     let output = tokio::process::Command::new(binary)
         .arg("--version")
@@ -192,8 +193,8 @@ pub async fn ensure_v1_binary(binary: &str) -> String {
         .unwrap_or_else(|error| {
             panic!(
                 "cannot run the live OpenCode binary `{binary}`: {error}\n\
-                 set COLA_LIVE_OPENCODE_BIN to the pinned V1 1.18.31 binary \
-                 (or put `opencode` on PATH)"
+                 set COLA_LIVE_OPENCODE_BIN to the pinned V1 binary the composite \
+                 action installs (or put `opencode` on PATH)"
             )
         });
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -210,7 +211,7 @@ pub async fn ensure_v1_binary(binary: &str) -> String {
     assert_eq!(
         major, "1",
         "the live V1 suite runs only against a V1 binary (reported `{stdout}`); \
-         point COLA_LIVE_OPENCODE_BIN at the pinned 1.18.31 binary"
+         point COLA_LIVE_OPENCODE_BIN at the pinned V1 binary"
     );
     stdout
 }

@@ -82,14 +82,15 @@ enum Script {
 fn completion_body(body: &str) -> String {
     let request: Value = serde_json::from_str(body).unwrap_or(Value::Null);
     match script(&request) {
-        Script::Title => sse(&[content_chunks(TITLE_DELTAS), finish_chunk("stop")].concat()),
+        Script::Title => sse(&[with_role(content_chunks(TITLE_DELTAS)), finish_chunk("stop")].concat()),
         Script::ToolCall => sse(&[
-            reasoning_chunks(REASONING_DELTAS),
-            tool_call_chunks(),
+            with_role([reasoning_chunks(REASONING_DELTAS), tool_call_chunks()].concat()),
             finish_chunk("tool_calls"),
         ]
         .concat()),
-        Script::FinalText => sse(&[content_chunks(FINAL_TEXT_DELTAS), finish_chunk("stop")].concat()),
+        Script::FinalText => {
+            sse(&[with_role(content_chunks(FINAL_TEXT_DELTAS)), finish_chunk("stop")].concat())
+        }
     }
 }
 
@@ -153,15 +154,26 @@ fn chunk(delta: Value, finish_reason: Option<&str>, usage: bool) -> Value {
     value
 }
 
-/// One `content` delta per fragment, in order.
+/// Put `role: "assistant"` on the message's first delta only — the canonical
+/// OpenAI SSE shape; later deltas carry just their fields.
+fn with_role(mut chunks: Vec<Value>) -> Vec<Value> {
+    if let Some(first) = chunks.first_mut() {
+        first["choices"][0]["delta"]["role"] = json!("assistant");
+    }
+    chunks
+}
+
+/// One `content` delta per fragment, in order (the role is added once, on the
+/// message's first delta, by [`with_role`]).
 fn content_chunks(deltas: &[&str]) -> Vec<Value> {
     deltas
         .iter()
-        .map(|delta| chunk(json!({ "role": "assistant", "content": delta }), None, false))
+        .map(|delta| chunk(json!({ "content": delta }), None, false))
         .collect()
 }
 
-/// One `reasoning_content` delta per fragment, in order.
+/// One `reasoning_content` delta per fragment, in order (the role is added
+/// once, on the message's first delta, by [`with_role`]).
 fn reasoning_chunks(deltas: &[&str]) -> Vec<Value> {
     deltas
         .iter()
@@ -266,6 +278,21 @@ mod tests {
         );
     }
 
+    /// The finish reason on the final event — the only event that carries one.
+    fn finish_reason(events: &[Value]) -> Option<&str> {
+        events
+            .last()
+            .and_then(|event| event["choices"][0]["finish_reason"].as_str())
+    }
+
+    /// The `role` values the stream carries, in event order.
+    fn roles(events: &[Value]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| event["choices"][0]["delta"]["role"].as_str())
+            .collect()
+    }
+
     fn request(script: Script) -> Value {
         match script {
             Script::Title => json!({ "model": MODEL, "messages": [{ "role": "user", "content": "hi" }] }),
@@ -326,6 +353,8 @@ mod tests {
             TITLE_TEXT,
             "the title text",
         );
+        assert_eq!(finish_reason(&events), Some("stop"), "{events:#?}");
+        assert_eq!(roles(&events), vec!["assistant"], "role on the first delta only");
     }
 
     #[test]
@@ -342,12 +371,12 @@ mod tests {
             &json!({ "command": TOOL_COMMAND }).to_string(),
             "the tool-call arguments",
         );
-        assert!(
-            events
-                .iter()
-                .any(|event| event.to_string().contains("tool_calls")),
+        assert_eq!(
+            finish_reason(&events),
+            Some("tool_calls"),
             "the call must finish with tool_calls: {events:#?}"
         );
+        assert_eq!(roles(&events), vec!["assistant"], "role on the first delta only");
         assert!(
             events.len() >= 4,
             "reasoning + tool call must stream as separate events"
@@ -362,6 +391,8 @@ mod tests {
             FINAL_TEXT,
             "the closing text",
         );
+        assert_eq!(finish_reason(&events), Some("stop"), "{events:#?}");
+        assert_eq!(roles(&events), vec!["assistant"], "role on the first delta only");
         assert!(
             !events
                 .iter()
