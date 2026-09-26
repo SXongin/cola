@@ -8,6 +8,9 @@ pub enum Command {
     /// Session management (`/switch ...`): match, forget, adopt, or the
     /// interactive card. Absorbed the old `/attach` and `/forget`.
     Switch(SwitchAction),
+    /// Child-session view (`/sub ...`, spec #344): the Active Session's direct
+    /// child sessions, read-only.
+    Sub(SubAction),
     /// Create a fresh session, optionally named
     New(Option<String>),
     /// Create a real Feishu topic backed by a fresh session. `directory` is
@@ -127,6 +130,16 @@ pub enum SwitchAction {
     Attach { query: String, force: bool },
 }
 
+/// What `/sub` should do (spec #344): the read-only view of the Active
+/// Session's direct children. `/sub attach` (explicit takeover) arrives with
+/// ticket #348.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubAction {
+    /// `/sub`, `/sub list` or `/sub list <keyword>` — open the child-session
+    /// card, narrowed by the keyword when one was given.
+    List(String),
+}
+
 /// What `/autoaccept` should do: report the current state, or switch it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoAcceptAction {
@@ -180,6 +193,20 @@ pub fn parse_command(text: &str) -> Option<Command> {
                 } else {
                     Some(Command::Switch(SwitchAction::Match(query)))
                 }
+            }
+        },
+        // `/sub [list [keyword]]` — the Active Session's direct children,
+        // read-only (spec #344). The `list` verb is optional: `/sub <keyword>`
+        // is the same card pre-filtered, mirroring `/switch <keyword>`.
+        "/sub" => match arg {
+            None => Some(Command::Sub(SubAction::List(String::new()))),
+            Some(a) => {
+                let mut words = a.split_whitespace();
+                let keyword = match words.next() {
+                    Some("list") => words.collect::<Vec<_>>().join(" "),
+                    _ => a.to_string(),
+                };
+                Some(Command::Sub(SubAction::List(keyword)))
             }
         },
         "/new" => Some(Command::New(arg.map(|s| s.to_string()))),
@@ -278,6 +305,7 @@ pub fn help_text() -> String {
 `/switch <kw>` · Switch to a session by name/dir/id (adopts foreign ones)
 `/switch <id> [--force]` · Take over a session by id/title
 `/switch forget` · Un-map this chat's session (server session stays)
+`/sub [list [kw]]` · Child sessions of the current session, read-only (运行中/空闲)
 `/new [name]` · Declare a new session in the current project (created by the next message; no session → default dir)
 `/topic [dir] [name]` · Create a new Feishu topic in <dir>; the topic's first message creates the session (bare `/topic` uses the current project)
 `/topic --adopt <kw> [--force]` · Open a topic around an existing session
@@ -308,6 +336,9 @@ pub fn command_help(name: &str) -> Option<String> {
         }
         "switch" => {
             "/switch [action]\nSession management card and text forms.\n- `/switch` (no arg) — interactive session card (browse / search / adopt / new)\n- `/switch <keyword>` — switch by title/directory/id; the current chat's sessions win, otherwise a unique global match is adopted. Ambiguous keywords list candidates; no match opens the card pre-filtered by the keyword.\n- `/switch <id|title> [--force]` — take over a session (exact id → id-prefix → title; the card's short hash works too; reject if owned by another chat unless `--force`, or use the card's 强制接管 button)\n- `/switch forget` — un-map this chat's session (server session stays)\nExamples: `/switch backend`, `/switch ses_abc --force`"
+        }
+        "sub" => {
+            "/sub [list [keyword]]\nShow the child sessions of the current Active Session, read-only: each row carries the child's title, id tail, agent, last activity and live run state (运行中 when Busy/Retry, 空闲 when Idle — one status read per listed row). The view is scoped to THIS session: children of other sessions never appear, and only direct children are listed (no nested descendants, no transcripts).\n- `/sub` / `/sub list` — the child-session card\n- `/sub list <keyword>` — the same card pre-filtered (title/directory/id, whitespace-token AND)\nThe card's search box and pagination keep the active keyword/page through every rebuild (six rows per page, ADR-0052). Without an Active Session (a fresh chat, or a Pending Session declared by `/new`/`/dir`/`/topic`) the card opens with a plain empty state.\nExamples: `/sub`, `/sub list 渲染`"
         }
         "attach" => {
             "/switch <id|title> [--force]\nTake over a session created outside Feishu into this chat. Resolution: exact id → unique id-prefix (the short hash shown on the card works too) → unique title substring. If the session already belongs to another chat, show its owner and reject unless `--force`.\nExample: `/switch ses_abc123`"
@@ -565,6 +596,12 @@ pub(crate) async fn handle_command(
         Command::Switch(action) => {
             handle_switch_action(handles, &thread_key, action, message_id, kind).await?;
         }
+        Command::Sub(action) => match action {
+            SubAction::List(keyword) => {
+                crate::feishu::card::command::send_child_card(handles, &thread_key, &keyword, message_id)
+                    .await?;
+            }
+        },
         Command::New(name) => {
             // Lazy Session Creation (ADR-0041): `/new` records a Pending
             // Session in the current project (the pending's, else the active
@@ -1966,6 +2003,38 @@ mod tests {
         );
     }
 
+    /// Spec #344: `/sub`, `/sub list` and `/sub list <keyword>` all open the
+    /// child-session card; the no-verb form treats its argument as the keyword
+    /// (mirroring `/switch <keyword>`), and multi-word keywords stay whole.
+    #[test]
+    fn parse_sub_opens_the_child_card() {
+        assert_eq!(
+            parse_command("/sub"),
+            Some(Command::Sub(SubAction::List(String::new())))
+        );
+        assert_eq!(
+            parse_command(" /sub "),
+            Some(Command::Sub(SubAction::List(String::new())))
+        );
+        assert_eq!(
+            parse_command("/sub list"),
+            Some(Command::Sub(SubAction::List(String::new())))
+        );
+        assert_eq!(
+            parse_command("/sub list 渲染"),
+            Some(Command::Sub(SubAction::List("渲染".into())))
+        );
+        assert_eq!(
+            parse_command("/sub list multi word"),
+            Some(Command::Sub(SubAction::List("multi word".into())))
+        );
+        // The `list` verb is optional sugar: a bare keyword is the same card.
+        assert_eq!(
+            parse_command("/sub 渲染"),
+            Some(Command::Sub(SubAction::List("渲染".into())))
+        );
+    }
+
     #[test]
     fn parse_restart() {
         assert_eq!(parse_command("/restart"), Some(Command::Restart));
@@ -2157,6 +2226,7 @@ mod tests {
         assert!(command_help("think").unwrap().contains("/think"));
         assert!(command_help("dir").unwrap().contains("next non-command message"));
         assert!(command_help("version").unwrap().contains("/version"));
+        assert!(command_help("sub").unwrap().contains("/sub list"));
         assert_eq!(command_help("nonexistent"), None);
         // The retired text-list form has no help topic of its own.
         assert_eq!(command_help("list"), None);

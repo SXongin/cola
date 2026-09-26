@@ -373,6 +373,8 @@ detailed help for any of these.
 | `/switch <kw>` | Switch to a session by name/dir/id (adopts foreign ones; no match opens the card pre-filtered) |
 | `/switch <id> [--force]` | Take over a session by id/title |
 | `/switch forget` | Un-map this chat's session (the server session stays) |
+| `/sub` | Child-session card: the current session's direct child sessions, read-only (运行中/空闲 per row) |
+| `/sub list [kw]` | Same card, filtered by keyword (title/dir/id); the filter and page round-trip like `/switch` |
 | `/new [name]` | Declare a new session in the current project — created by the next message (no session → default dir) |
 | `/topic [dir] [name]` | Open a new Feishu topic in `<dir>`; its first message creates the session (bare `/topic` uses the current project) |
 | `/topic --adopt <kw> [--force]` | Open a topic around an existing session |
@@ -400,6 +402,15 @@ Notes:
   `/switch <id>` re-points the topic at an existing session instead. The `/dir`
   card's pick and 建话题 follow the same timing (建话题's cover card shows
   「下一条消息创建」 until then).
+- `/sub` is the read-only view of the current session's **child sessions** —
+  the ones its `task` tool calls created. Each row carries the child's title,
+  id, agent, last activity and live state (运行中 when Busy/Retry, 空闲 when
+  Idle), read one status call per rendered row; children of other sessions
+  never appear, and only **direct** children are listed (no nested descendants,
+  no transcripts). `list <kw>` narrows by title/dir/id, six rows per page, and
+  the keyword/page survive every rebuild like the `/switch` card. A
+  conversation with no Active Session (or a Pending Session) opens the plain
+  empty state. Observation only: cola never messages a child from this view.
 - The `/dir` card's rows are a **union** (ADR-0046): the shared store's session
   directories, the directories cola has mapped — they survive another client
   deleting their sessions — and the conversation's current directory, so 当前

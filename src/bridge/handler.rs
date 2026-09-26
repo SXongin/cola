@@ -793,6 +793,7 @@ impl App {
                 }
                 "retry" => self.handle_retry_action(&value).await,
                 "switch" => self.handle_switch_card_action(&self.core, &value).await,
+                "sub" => self.handle_sub_card_action(&self.core, &value).await,
                 "dir" => self.handle_dir_card_action(&self.core, &value).await,
                 "agent" => self.handle_agent_card_action(&self.core, &value, false).await,
                 "agent_clear" => self.handle_agent_card_action(&self.core, &value, true).await,
@@ -1273,6 +1274,67 @@ impl App {
             ),
             toast: Some("已建话题接管".to_string()),
         }
+    }
+
+    /// Handle a `/sub` child-session card button (spec #344): `op: "search"`
+    /// rebuilds the card with the typed keyword at page 1 (and drops the
+    /// session-list cache so a just-created child shows up); `op: "page"` flips
+    /// to the payload's page. Both carry the active keyword/page, so the
+    /// filtered window round-trips (ADR-0052). Read-only: these are the only
+    /// two ops the card has.
+    async fn handle_sub_card_action(
+        self: &Arc<Self>,
+        core: &Arc<SharedCore>,
+        value: &serde_json::Value,
+    ) -> Option<CardActionResult> {
+        let op = value.get("op").and_then(|v| v.as_str()).unwrap_or("");
+        let thread_key = thread_key_from_value(value);
+        let keyword = value
+            .get("keyword")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        // The card's stateless filter (ADR-0052): a missing/garbage page reads
+        // as 1; the builder clamps an out-of-range page to the last page.
+        let page = value.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
+        match op {
+            "search" => {
+                core.invalidate_session_list_cache().await;
+                Some(CardActionResult {
+                    card: Some(self.build_child_card_for(core, &thread_key, &keyword, 1).await),
+                    toast: None,
+                })
+            }
+            "page" => Some(CardActionResult {
+                card: Some(self.build_child_card_for(core, &thread_key, &keyword, page).await),
+                toast: None,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Rebuild the `/sub` child-session card for a thread, narrowed by
+    /// `keyword` and paged to `page` (ADR-0052). One status read per rendered
+    /// row, gathered by [`crate::feishu::card::command::child_card_data`].
+    async fn build_child_card_for(
+        self: &Arc<Self>,
+        core: &Arc<SharedCore>,
+        thread_key: &ThreadKey,
+        keyword: &str,
+        page: usize,
+    ) -> serde_json::Value {
+        let (children, statuses) =
+            crate::feishu::card::command::child_card_data(&core.command_handles(), thread_key, keyword, page)
+                .await;
+        crate::feishu::card::session::build_child_card(
+            thread_key,
+            &children,
+            &statuses,
+            keyword,
+            page,
+            chrono::Utc::now().timestamp_millis(),
+        )
     }
 
     /// Rebuild the `/dir` Recent Directories card for a thread, narrowed by

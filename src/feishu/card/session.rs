@@ -143,18 +143,108 @@ fn switch_card_row(
     vec![text_row, btn_row]
 }
 
-/// Rows a `/switch` or `/dir` list card shows per page (ADR-0052): the old
-/// row cap becomes the page size. The builders clamp a requested page into
+/// Rows a `/switch`, `/dir` or `/sub` list card shows per page (ADR-0052): the
+/// old row cap becomes the page size. The builders clamp a requested page into
 /// `[1, total_pages]` and slice the full filtered list themselves.
 pub const CARD_PAGE_SIZE: usize = 6;
 
-/// The three-column pagination control both list cards share (ADR-0052): a
-/// 上一页 button, the 「第 x/y 页 · 共 N 个」 indicator, and a 下一页 button.
-/// `page` is the already-clamped current page; the boundary buttons are
-/// `disabled` (never hidden, so the layout stays stable). Every button's value
-/// carries the routing payload plus the active filter (`keyword`, and `scope`
-/// when given) and the TARGET page, so a flip rebuilds the same filtered view.
-/// `None` when there is at most one page — the caller renders nothing.
+/// The window one page of a list card renders: the `[start, end)` slice of the
+/// full filtered list, the clamped 1-based page, and the total page count. One
+/// place owns the clamp/slice rule (ADR-0052), so a fetch that must read
+/// something per rendered row — the `/sub` card's one status read per child —
+/// windows exactly the rows the builder renders.
+pub(super) struct PageWindow {
+    pub(super) start: usize,
+    pub(super) end: usize,
+    pub(super) page: usize,
+    pub(super) total_pages: usize,
+}
+
+/// The `[1, total_pages]`-clamped page window over `total` rows for a requested
+/// 1-based `page` (missing/garbage reads as 1; an out-of-range page lands on
+/// the last page rather than springing back to the first, ADR-0052).
+pub(super) fn page_window(total: usize, page: usize) -> PageWindow {
+    let total_pages = total.div_ceil(CARD_PAGE_SIZE).max(1);
+    let page = page.clamp(1, total_pages);
+    let start = (page - 1) * CARD_PAGE_SIZE;
+    PageWindow {
+        start,
+        end: (start + CARD_PAGE_SIZE).min(total),
+        page,
+        total_pages,
+    }
+}
+
+/// The list cards' search form (`/switch`, `/dir` and `/sub`; ADR-0051,
+/// ADR-0052): an input + a submit button. The routing payload rides in the
+/// submit button's `name` (form submits don't always deliver the button
+/// `value`) and the typed keyword arrives as `form_value.search`. The submit
+/// name is `<prefix>|<chat>|<thread>` plus `|<scope>` when a scope rides
+/// along; `default_value` echoes the active keyword (NOT `value`, the passback
+/// field) so a re-render never blanks the box — an empty result stays
+/// tweakable instead of a retype.
+fn search_form(
+    form_name: &str,
+    submit_prefix: &str,
+    action: &str,
+    thread_key: &crate::config::ThreadKey,
+    scope: Option<SwitchScope>,
+    placeholder: &str,
+    keyword: &str,
+) -> serde_json::Value {
+    let mut submit_name = format!("{submit_prefix}|{}|{}", thread_key.chat_id, thread_key.thread_id);
+    let mut submit_value = json!({
+        "action": action,
+        "op": "search",
+        "chat_id": thread_key.chat_id,
+        "thread_id": thread_key.thread_id,
+    });
+    if let Some(scope) = scope {
+        submit_name.push_str(&format!("|{}", scope.as_str()));
+        submit_value["scope"] = json!(scope.as_str());
+    }
+    json!({
+        "tag": "form",
+        "name": form_name,
+        "elements": [
+            {
+                "tag": "input",
+                "name": "search",
+                // Multiline like the question card's custom-answer box: the
+                // single-line input types poorly on PC and mobile alike. rows:1
+                // starts it at one line for a keyword; auto_resize grows it as
+                // the user types. The submitted text is trimmed before
+                // filtering (see handler.rs) so stray newlines don't break the
+                // match.
+                "input_type": "multiline_text",
+                "rows": 1,
+                "auto_resize": true,
+                "max_rows": 4,
+                "placeholder": { "tag": "plain_text", "content": placeholder },
+                "default_value": keyword,
+                "max_length": 100,
+                "width": "fill",
+            },
+            {
+                "tag": "button",
+                "text": { "tag": "plain_text", "content": "搜索" },
+                "type": "primary",
+                "form_action_type": "submit",
+                "name": submit_name,
+                "value": submit_value,
+            },
+        ],
+    })
+}
+
+/// The three-column pagination control the list cards share (`/switch`, `/dir`
+/// and `/sub`; ADR-0052): a 上一页 button, the 「第 x/y 页 · 共 N 个」 indicator,
+/// and a 下一页 button. `page` is the already-clamped current page; the
+/// boundary buttons are `disabled` (never hidden, so the layout stays stable).
+/// Every button's value carries the routing payload plus the active filter
+/// (`keyword`, and `scope` when given) and the TARGET page, so a flip rebuilds
+/// the same filtered view. `None` when there is at most one page — the caller
+/// renders nothing.
 fn pager_element(
     action: &str,
     thread_key: &crate::config::ThreadKey,
@@ -239,61 +329,21 @@ pub fn build_switch_card(
     mapped_ids: &[String],
 ) -> serde_json::Value {
     let total = sessions.len();
-    let total_pages = total.div_ceil(CARD_PAGE_SIZE).max(1);
-    let page = page.clamp(1, total_pages);
+    let window = page_window(total, page);
+    let page = window.page;
     let mut elements: Vec<serde_json::Value> = Vec::new();
 
-    // Search form: an input + a submit button. The routing payload rides in the
-    // button's `name` (form submits don't always deliver the button `value`),
-    // and the typed keyword arrives as `form_value.search`.
-    elements.push(json!({
-        "tag": "form",
-        "name": "switch_search",
-        "elements": [
-            {
-                "tag": "input",
-                "name": "search",
-                // Multiline like the question card's custom-answer box: the
-                // single-line input types poorly on PC and mobile alike. rows:1
-                // starts it at one line for a keyword; auto_resize grows it as
-                // the user types. The submitted text is trimmed before
-                // filtering (see handler.rs) so stray newlines don't break the
-                // match.
-                "input_type": "multiline_text",
-                "rows": 1,
-                "auto_resize": true,
-                "max_rows": 4,
-                "placeholder": { "tag": "plain_text", "content": "🔍 搜索标题 / 目录 / ID" },
-                // `default_value` (NOT `value`) is what prefills the box, so a
-                // search that comes back empty keeps the keyword and the user can
-                // tweak it instead of retyping. `value` is the passback-data
-                // field and is never displayed — echoing keyword there left the
-                // input blank on every re-render.
-                "default_value": keyword,
-                "max_length": 100,
-                "width": "fill",
-            },
-            {
-                "tag": "button",
-                "text": { "tag": "plain_text", "content": "搜索" },
-                "type": "primary",
-                "form_action_type": "submit",
-                "name": format!(
-                    "switchsearch|{}|{}|{}",
-                    thread_key.chat_id,
-                    thread_key.thread_id,
-                    scope.as_str()
-                ),
-                "value": {
-                    "action": "switch",
-                    "op": "search",
-                    "chat_id": thread_key.chat_id,
-                    "thread_id": thread_key.thread_id,
-                    "scope": scope.as_str(),
-                },
-            },
-        ],
-    }));
+    // Search form (ADR-0022): keyword-prefilled; the scope rides its submit so
+    // a scoped search survives the round trip (ADR-0052).
+    elements.push(search_form(
+        "switch_search",
+        "switchsearch",
+        "switch",
+        thread_key,
+        Some(scope),
+        "🔍 搜索标题 / 目录 / ID",
+        keyword,
+    ));
 
     // The scope toggle: in `Directory` view show 全部, in `All` view show
     // 本目录 (ADR-0022). `All` from a fresh conversation has no directory, so
@@ -353,8 +403,7 @@ pub fn build_switch_card(
             "tag": "markdown",
             "content": crate::feishu::card::sanitize::sanitize_markdown(&header)
         }));
-        let start = (page - 1) * CARD_PAGE_SIZE;
-        for s in sessions.iter().skip(start).take(CARD_PAGE_SIZE) {
+        for s in &sessions[window.start..window.end] {
             let label = crate::bridge::display::title_or_id_tail(s);
             // ADR-0022: only the active session is marked; the 本会话 ownership
             // marker on mapped-but-not-active rows is dropped.
@@ -391,7 +440,7 @@ pub fn build_switch_card(
         keyword,
         Some(scope),
         page,
-        total_pages,
+        window.total_pages,
         total,
     ) {
         elements.push(pager);
@@ -415,6 +464,123 @@ pub fn build_switch_card(
     }));
 
     card_shell("📂 会话管理", "blue", elements)
+}
+
+/// The `/sub` child-session card's run-state labels (spec #344): the server's
+/// Busy and Retry both read 运行中 — anything but Idle is a child still doing
+/// work — while Idle reads 空闲. A row with no status to report (a failed or
+/// unrecognised read) omits the label rather than guessing (ADR-0028's rule).
+/// Exported so the bridge tests assert the copy from one source.
+pub const CHILD_RUNNING: &str = "⚙️ 运行中";
+pub const CHILD_IDLE: &str = "✅ 空闲";
+
+/// The run-state label for one child's status read; `None` = no report.
+fn child_state_label(status: Option<crate::opencode::types::SessionStatus>) -> Option<&'static str> {
+    use crate::opencode::types::SessionStatus;
+    match status {
+        Some(SessionStatus::Busy | SessionStatus::Retry) => Some(CHILD_RUNNING),
+        Some(SessionStatus::Idle) => Some(CHILD_IDLE),
+        None => None,
+    }
+}
+
+/// One `/sub` row's visible text: `title · agent · id-tail · last-activity ·
+/// run-state`, omitting the segments the payload does not carry (an absent
+/// agent, server time, or status read) instead of filling them with a guess.
+fn child_row_text(
+    child: &crate::opencode::types::SessionListInfo,
+    status: Option<crate::opencode::types::SessionStatus>,
+    now_ms: i64,
+) -> String {
+    let mut parts = vec![crate::bridge::display::title_or_id_tail(child)];
+    if let Some(agent) = child.agent.as_deref().filter(|a| !a.is_empty()) {
+        parts.push(agent.to_string());
+    }
+    parts.push(format!("`{}`", crate::bridge::display::id_tail(&child.id)));
+    if let Some(updated) = child.time.as_ref().map(|t| t.updated) {
+        parts.push(crate::bridge::display::relative_time(updated, now_ms));
+    }
+    if let Some(state) = child_state_label(status) {
+        parts.push(state.to_string());
+    }
+    parts.join(" · ")
+}
+
+/// Build the read-only `/sub` child-session card (spec #344): the Active
+/// Session's direct children, one plain text row each — title, id tail, agent,
+/// last activity and live run state — with no takeover buttons, no scope
+/// toggle and no ＋新建 footer. `children` is the caller's filtered,
+/// last-activity-sorted list; `statuses` holds the run state read for the rows
+/// on `page` only (one read per rendered row, bounded by the page size), so a
+/// missing or `None` entry omits the label. The card reuses the switch card's
+/// search box and pager with the same round-trip state (ADR-0052): `keyword`
+/// and the clamped `page` ride every button. `now_ms` is the build-time clock
+/// the relative last-activity stamps count from.
+pub fn build_child_card(
+    thread_key: &crate::config::ThreadKey,
+    children: &[crate::opencode::types::SessionListInfo],
+    statuses: &std::collections::HashMap<String, Option<crate::opencode::types::SessionStatus>>,
+    keyword: &str,
+    page: usize,
+    now_ms: i64,
+) -> serde_json::Value {
+    let total = children.len();
+    let window = page_window(total, page);
+    let mut elements: Vec<serde_json::Value> = Vec::new();
+
+    elements.push(search_form(
+        "sub_search",
+        "subsearch",
+        "sub",
+        thread_key,
+        None,
+        "🔍 搜索标题 / ID",
+        keyword,
+    ));
+
+    // A conversation with no Active Session, an Active Session with no
+    // children, and an empty search all land here: one plain line, never an
+    // error (a failure-shaped reply would be indistinguishable from a broken
+    // read).
+    if children.is_empty() {
+        let hint = if keyword.is_empty() {
+            "_(没有子会话)_"
+        } else {
+            "_(无匹配子会话)_"
+        };
+        elements.push(json!({ "tag": "markdown", "content": hint }));
+        return card_shell("🧩 子会话", "blue", elements);
+    }
+
+    let header = if keyword.is_empty() {
+        "**子会话**".to_string()
+    } else {
+        format!("**匹配 `{keyword}` 的子会话**")
+    };
+    elements.push(json!({
+        "tag": "markdown",
+        "content": crate::feishu::card::sanitize::sanitize_markdown(&header)
+    }));
+    for child in &children[window.start..window.end] {
+        let status = statuses.get(&child.id).copied().flatten();
+        elements.push(card_text_row(&child_row_text(child, status, now_ms)));
+    }
+
+    // Pagination (ADR-0052) below the rows — the only buttons the card has
+    // besides the search submit.
+    if let Some(pager) = pager_element(
+        "sub",
+        thread_key,
+        keyword,
+        None,
+        window.page,
+        window.total_pages,
+        total,
+    ) {
+        elements.push(pager);
+    }
+
+    card_shell("🧩 子会话", "blue", elements)
 }
 
 /// The confirmation card shown when a `/switch` card op targets a session owned
@@ -523,12 +689,20 @@ pub fn build_dir_card(
     page: usize,
 ) -> serde_json::Value {
     let total = dirs.len();
-    let total_pages = total.div_ceil(CARD_PAGE_SIZE).max(1);
-    let page = page.clamp(1, total_pages);
+    let window = page_window(total, page);
+    let page = window.page;
     let mut elements: Vec<serde_json::Value> = Vec::new();
 
     if total > CARD_PAGE_SIZE || !keyword.is_empty() {
-        elements.push(dir_search_form(thread_key, keyword));
+        elements.push(search_form(
+            "dir_search",
+            "dirsearch",
+            "dir",
+            thread_key,
+            None,
+            "🔍 搜索目录路径",
+            keyword,
+        ));
     }
 
     if dirs.is_empty() {
@@ -548,8 +722,7 @@ pub fn build_dir_card(
             "tag": "markdown",
             "content": crate::feishu::card::sanitize::sanitize_markdown(&header)
         }));
-        let start = (page - 1) * CARD_PAGE_SIZE;
-        for dir in dirs.iter().skip(start).take(CARD_PAGE_SIZE) {
+        for dir in &dirs[window.start..window.end] {
             let is_current = current_dir == Some(dir.as_str());
             let text = if is_current {
                 format!("`{dir}`\n_(当前)_")
@@ -566,56 +739,11 @@ pub fn build_dir_card(
     }
 
     // Pagination (ADR-0052) below the rows — the old overflow hints are gone.
-    if let Some(pager) = pager_element("dir", thread_key, keyword, None, page, total_pages, total) {
+    if let Some(pager) = pager_element("dir", thread_key, keyword, None, page, window.total_pages, total) {
         elements.push(pager);
     }
 
     card_shell("📂 最近目录", "blue", elements)
-}
-
-/// The `/dir` card's search form (ADR-0051), mirroring the `/switch` card's:
-/// the routing payload rides in the submit button's `name` (form submits don't
-/// always deliver the button `value`), and the typed keyword arrives as
-/// `form_value.search`. `default_value` echoes the active keyword so a
-/// re-render never blanks the box.
-fn dir_search_form(thread_key: &crate::config::ThreadKey, keyword: &str) -> serde_json::Value {
-    json!({
-        "tag": "form",
-        "name": "dir_search",
-        "elements": [
-            {
-                "tag": "input",
-                "name": "search",
-                // Multiline like the switch card's search box and the question
-                // card's custom answer: one row at rest, growing with the text.
-                "input_type": "multiline_text",
-                "rows": 1,
-                "auto_resize": true,
-                "max_rows": 4,
-                "placeholder": { "tag": "plain_text", "content": "🔍 搜索目录路径" },
-                "default_value": keyword,
-                "max_length": 100,
-                "width": "fill",
-            },
-            {
-                "tag": "button",
-                "text": { "tag": "plain_text", "content": "搜索" },
-                "type": "primary",
-                "form_action_type": "submit",
-                "name": format!(
-                    "dirsearch|{}|{}",
-                    thread_key.chat_id,
-                    thread_key.thread_id
-                ),
-                "value": {
-                    "action": "dir",
-                    "op": "search",
-                    "chat_id": thread_key.chat_id,
-                    "thread_id": thread_key.thread_id,
-                },
-            },
-        ],
-    })
 }
 
 /// One `/dir` card entry: a full-width text row plus a two-button row beneath
@@ -1108,6 +1236,262 @@ mod tests {
             .find(|e| {
                 e["tag"] == "column_set"
                     && e["columns"][0]["elements"][0]["value"]["session_id"] == session_id
+            })
+            .cloned()
+    }
+
+    /// The `/sub` card's run-state vocabulary: Busy and Retry both read 运行中,
+    /// Idle reads 空闲, and an unknown/failed read reports nothing.
+    #[test]
+    fn child_state_label_maps_busy_and_retry_to_running_and_idle_to_idle() {
+        use crate::opencode::types::SessionStatus;
+        assert_eq!(child_state_label(Some(SessionStatus::Busy)), Some(CHILD_RUNNING));
+        assert_eq!(child_state_label(Some(SessionStatus::Retry)), Some(CHILD_RUNNING));
+        assert_eq!(child_state_label(Some(SessionStatus::Idle)), Some(CHILD_IDLE));
+        assert_eq!(child_state_label(None), None);
+    }
+
+    /// Spec #344: each rendered row carries the child's title, id tail, agent,
+    /// last activity and run state — and nothing else. The card is observation
+    /// only: no takeover buttons, no scope toggle, no ＋新建 footer.
+    #[test]
+    fn child_card_rows_carry_title_agent_id_tail_activity_and_state() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let now = 1_700_000_000_000;
+        let children = vec![
+            child_session("ses_child_aa", "重构渲染", Some("build"), now - 90_000),
+            child_session("ses_child_bb", "跑测试", Some("review"), now - 3 * 3_600_000),
+        ];
+        let statuses = std::collections::HashMap::from([
+            (
+                "ses_child_aa".to_string(),
+                Some(crate::opencode::types::SessionStatus::Busy),
+            ),
+            (
+                "ses_child_bb".to_string(),
+                Some(crate::opencode::types::SessionStatus::Retry),
+            ),
+        ]);
+        let card = build_child_card(&key, &children, &statuses, "", 1, now);
+        let text = card.to_string();
+        for needle in [
+            "重构渲染",
+            "build",
+            "child_a",
+            "1m",
+            "跑测试",
+            "review",
+            "child_b",
+            "3h",
+        ] {
+            assert!(text.contains(needle), "row missing `{needle}`: {text}");
+        }
+        assert_eq!(
+            text.matches(CHILD_RUNNING).count(),
+            2,
+            "Busy and Retry both read 运行中: {text}"
+        );
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let rows = elements.iter().filter(|e| e["tag"] == "column_set").count();
+        assert_eq!(rows, 2, "one text row per child: {text}");
+        // Observation only (spec #344): the card's buttons are the search
+        // submit and the pager — no row action, no takeover, no ＋新建.
+        assert!(
+            !text.contains("\"session_id\""),
+            "no row buttons on the child card: {text}"
+        );
+        for op in ["adopt", "topic_adopt", "scope", "new"] {
+            assert!(
+                !text.contains(&format!("\"op\":\"{op}\"")),
+                "no `{op}` control on the child card: {text}"
+            );
+        }
+    }
+
+    /// A child whose payload carries no agent, no server time, or no status
+    /// read still renders — the absent segments are omitted, never guessed.
+    #[test]
+    fn child_card_omits_segments_the_payload_does_not_carry() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let mut bare = child_session("ses_child_bare", "无元数据", None, 0);
+        bare.time = None;
+        let card = build_child_card(&key, std::slice::from_ref(&bare), &Default::default(), "", 1, 0);
+        let text = card.to_string();
+        assert!(text.contains("无元数据"), "title renders: {text}");
+        assert!(text.contains("child_b"), "id tail renders: {text}");
+        assert!(
+            !text.contains(CHILD_RUNNING) && !text.contains(CHILD_IDLE),
+            "no state is invented: {text}"
+        );
+    }
+
+    /// ADR-0052: page two renders the next window of children and the pager
+    /// reports the position; every pager button carries the action, the active
+    /// keyword and the TARGET page, so the flip rebuilds the same view.
+    #[test]
+    fn child_card_page_two_windows_the_rows_and_labels_the_pager() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let now = 1_700_000_000_000;
+        let children = child_sessions(13, now);
+        let card = build_child_card(&key, &children, &Default::default(), "", 2, now);
+        let text = card.to_string();
+        for i in 7..=12 {
+            assert!(
+                text.contains(&format!("子会话{i}")),
+                "page 2 shows 子会话{i}: {text}"
+            );
+        }
+        assert!(
+            !text.contains("子会话6"),
+            "page 1's last row is off page 2: {text}"
+        );
+        assert!(!text.contains("子会话13"), "page 3's row is off page 2: {text}");
+        let pager = child_pager(&card).expect("a multi-page list renders the pager");
+        assert_eq!(
+            pager["columns"][1]["elements"][0]["content"], "第 2/3 页 · 共 13 个",
+            "indicator names the position and the total: {text}"
+        );
+        let prev = &pager["columns"][0]["elements"][0];
+        assert_eq!(prev["value"]["action"], "sub");
+        assert_eq!(prev["value"]["op"], "page");
+        assert_eq!(prev["value"]["chat_id"], "chat_1");
+        assert_eq!(prev["value"]["page"], 1, "上一页 targets page - 1");
+        let next = &pager["columns"][2]["elements"][0];
+        assert_eq!(next["value"]["page"], 3, "下一页 targets page + 1");
+    }
+
+    /// ADR-0052: a stale/out-of-range page clamps to the LAST page, and the
+    /// boundary buttons are disabled, never hidden.
+    #[test]
+    fn child_card_clamps_the_page_and_disables_the_boundary_buttons() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let now = 1_700_000_000_000;
+        let children = child_sessions(13, now);
+
+        let stale = build_child_card(&key, &children, &Default::default(), "", 99, now);
+        let text = stale.to_string();
+        assert!(
+            text.contains("子会话13") && !text.contains("子会话7"),
+            "clamped to the last page: {text}"
+        );
+        let pager = child_pager(&stale).unwrap();
+        let columns = pager["columns"].as_array().unwrap();
+        assert_eq!(
+            columns[1]["elements"][0]["content"], "第 3/3 页 · 共 13 个",
+            "the clamped page is reported: {text}"
+        );
+        assert_eq!(columns[0]["elements"][0]["disabled"], false);
+        assert_eq!(
+            columns[2]["elements"][0]["disabled"], true,
+            "the last page disables 下一页"
+        );
+    }
+
+    /// Spec #344: an empty child list (or an empty search) is one plain line —
+    /// no rows, no pager, nothing that reads like a failure.
+    #[test]
+    fn child_card_empty_state_is_a_plain_line() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let empty = build_child_card(&key, &[], &Default::default(), "", 1, 0);
+        let text = empty.to_string();
+        assert!(text.contains("没有子会话"), "empty hint: {text}");
+        assert!(
+            !text.contains("\"tag\":\"column_set\""),
+            "no rows/pager on the empty card: {text}"
+        );
+
+        let filtered = build_child_card(&key, &[], &Default::default(), "渲染", 1, 0);
+        let text = filtered.to_string();
+        assert!(text.contains("无匹配子会话"), "empty search hint: {text}");
+        assert!(
+            !text.contains("没有子会话"),
+            "an empty search is distinguishable from an empty list: {text}"
+        );
+    }
+
+    /// The `/sub` search box routes to the `sub` action and echoes the active
+    /// keyword in `default_value` (ADR-0051/ADR-0052), so a rebuild never
+    /// blanks it.
+    #[test]
+    fn child_card_search_form_routes_to_sub_and_echoes_the_keyword() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let now = 1_700_000_000_000;
+        let children = child_sessions(1, now);
+        let card = build_child_card(&key, &children, &Default::default(), "子会话1", 1, now);
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let form = elements
+            .iter()
+            .find(|e| e["tag"] == "form" && e["name"] == "sub_search")
+            .expect("child card has a search form");
+        let input = form["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["tag"] == "input")
+            .expect("search form has an input");
+        assert_eq!(input["default_value"], "子会话1");
+        let submit = form["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["tag"] == "button")
+            .expect("search form has a submit");
+        assert_eq!(submit["name"], "subsearch|chat_1|chat_1");
+        assert_eq!(submit["value"]["action"], "sub");
+        assert_eq!(submit["value"]["op"], "search");
+        assert!(
+            card.to_string().contains("匹配 `子会话1` 的子会话"),
+            "header names the filter: {card}"
+        );
+    }
+
+    /// `n` children of `ses_root`, newest activity first, each with an agent.
+    fn child_sessions(n: i64, now: i64) -> Vec<crate::opencode::types::SessionListInfo> {
+        (1..=n)
+            .map(|i| {
+                child_session(
+                    &format!("ses_c{i}"),
+                    &format!("子会话{i}"),
+                    Some("build"),
+                    now - i * 1000,
+                )
+            })
+            .collect()
+    }
+
+    /// One child session of `ses_root` with the given payload fields.
+    fn child_session(
+        id: &str,
+        title: &str,
+        agent: Option<&str>,
+        updated: i64,
+    ) -> crate::opencode::types::SessionListInfo {
+        crate::opencode::types::SessionListInfo {
+            id: id.into(),
+            title: title.into(),
+            directory: "/work/child".into(),
+            parent_id: Some("ses_root".into()),
+            agent: agent.map(str::to_string),
+            model: None,
+            time: Some(crate::opencode::types::SessionTime {
+                created: updated,
+                updated,
+                archived: None,
+            }),
+        }
+    }
+
+    /// The `/sub` pager: the three-column `column_set` whose buttons carry
+    /// `op: "page"`.
+    fn child_pager(card: &serde_json::Value) -> Option<serde_json::Value> {
+        card["body"]["elements"]
+            .as_array()?
+            .iter()
+            .find(|e| {
+                e["tag"] == "column_set"
+                    && e["columns"]
+                        .as_array()
+                        .is_some_and(|cols| cols.iter().any(|c| c["elements"][0]["value"]["op"] == "page"))
             })
             .cloned()
     }

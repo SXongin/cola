@@ -337,6 +337,15 @@ pub(crate) fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Va
                     "chat_id": parts[1],
                     "thread_id": parts[2],
                 })
+            } else if parts.len() == 3 && parts[0] == "subsearch" {
+                // `/sub` child-session card search form (spec #344): same
+                // shape as `dirsearch`, no scope segment.
+                serde_json::json!({
+                    "action": "sub",
+                    "op": "search",
+                    "chat_id": parts[1],
+                    "thread_id": parts[2],
+                })
             } else if parts[0] == "submitm" && (parts.len() == 4 || parts.len() == 5) {
                 // A multi-select custom-answer form submit: the routing payload
                 // is encoded in the name ("submitm|<req>|<ses>|<qi>[|<dir>]")
@@ -394,10 +403,13 @@ pub(crate) fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Va
                 break;
             }
         }
-        // `/switch` / `/dir` card search: the typed keyword from the search
-        // input.
+        // `/switch` / `/dir` / `/sub` card search: the typed keyword from the
+        // search input.
         let is_search = val.get("op").and_then(|v| v.as_str()) == Some("search")
-            && matches!(val.get("action").and_then(|v| v.as_str()), Some("switch" | "dir"));
+            && matches!(
+                val.get("action").and_then(|v| v.as_str()),
+                Some("switch" | "dir" | "sub")
+            );
         if is_search && let Some(s) = fv.get("search").and_then(|v| v.as_str()) {
             val["keyword"] = serde_json::Value::String(s.to_string());
         }
@@ -1069,6 +1081,31 @@ mod tests {
         assert_eq!(value["action"], "dir");
         assert_eq!(value["op"], "search");
         assert_eq!(value["keyword"], "auth");
+    }
+
+    /// The `/sub` child-session card's search form mirrors `/dir`'s: the
+    /// routing is rebuilt from the button `name` ("subsearch|<chat>|<thread>")
+    /// and the typed keyword is attached from `form_value.search` (spec #344).
+    #[test]
+    fn sub_search_form_submit_rebuilds_routing_and_keyword() {
+        let payload = r#"{
+            "schema": "2.0",
+            "event": {
+                "action": {
+                    "tag": "button",
+                    "name": "subsearch|chat_1|chat_1",
+                    "form_value": {
+                        "search": "渲染"
+                    }
+                }
+            }
+        }"#;
+        let value = extract_card_action_value(payload.as_bytes()).expect("value extracted");
+        assert_eq!(value["action"], "sub");
+        assert_eq!(value["op"], "search");
+        assert_eq!(value["chat_id"], "chat_1");
+        assert_eq!(value["thread_id"], "chat_1");
+        assert_eq!(value["keyword"], "渲染");
     }
 
     /// A plain button click keeps its value untouched (no option/form_value).

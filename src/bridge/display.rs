@@ -44,6 +44,24 @@ pub(crate) fn title_or_id_tail(s: &crate::opencode::types::SessionListInfo) -> S
     }
 }
 
+/// A compact age label for a Session's last activity (its server
+/// `time.updated`): `42s`, `5m`, `3h`, `2d`. The `/sub` card's last-activity
+/// stamp. `now_ms` is passed in so the age is measured at card build time (the
+/// card is a one-shot read, never a ticking one); a clock skewed into the
+/// future reads as `0s` instead of a negative age.
+pub(crate) fn relative_time(at_ms: i64, now_ms: i64) -> String {
+    let secs = ((now_ms - at_ms).max(0) / 1000) as u64;
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
 /// The display identity of a session's model from the list payload
 /// (`providerID/modelID@variant`), matching how cola renders model identity
 /// elsewhere. Returns None when the payload carries no model.
@@ -71,6 +89,19 @@ pub(crate) fn model_display(model: Option<&serde_json::Value>) -> Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `/sub` row's last-activity age: one unit, floor-rounded; a future
+    /// timestamp (clock skew) clamps to `0s` instead of going negative.
+    #[test]
+    fn relative_time_labels_each_magnitude() {
+        let now = 1_700_000_000_000;
+        assert_eq!(relative_time(now, now), "0s");
+        assert_eq!(relative_time(now - 42_000, now), "42s");
+        assert_eq!(relative_time(now - 83_000, now), "1m");
+        assert_eq!(relative_time(now - 3 * 3_600_000, now), "3h");
+        assert_eq!(relative_time(now - 2 * 86_400_000, now), "2d");
+        assert_eq!(relative_time(now + 5_000, now), "0s");
+    }
 
     #[test]
     fn model_display_formats_provider_model_and_variant() {
