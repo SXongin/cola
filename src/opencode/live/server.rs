@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -161,15 +161,30 @@ impl LiveServer {
 
 impl Drop for LiveServer {
     fn drop(&mut self) {
-        // `kill_on_drop` already guards the process; killing eagerly here keeps
-        // the temp-tree removal from racing a still-writing server.
+        // `kill_on_drop` guards the process, but the temp tree drops right
+        // after this — so reap the child (bounded) before the tree goes away,
+        // or a still-writing server could race the cleanup.
         let _ = self.child.start_kill();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
     }
 }
 
-/// Fail fast unless `binary` is a V1 binary. The live suite asserts V1's wire
-/// contract; a V2 binary would silently test the wrong generation.
-pub async fn ensure_v1_binary(binary: &str) {
+/// Fail fast unless `binary` is a V1 binary, and return the version it
+/// reported. The live suite asserts V1's wire contract; a V2 binary would
+/// silently test the wrong generation.
+///
+/// The check is the major generation only, deliberately: the exact pin
+/// (1.18.31) lives once in `.github/actions/install-opencode-v1`, and CI runs
+/// the binary that action installs. Hardcoding the version here would create
+/// the second copy a pin bump must chase (spec #364 §11); the local run just
+/// needs to be V1, and the version it used is printed as evidence.
+pub async fn ensure_v1_binary(binary: &str) -> String {
     let output = tokio::process::Command::new(binary)
         .arg("--version")
         .output()
@@ -197,6 +212,7 @@ pub async fn ensure_v1_binary(binary: &str) {
         "the live V1 suite runs only against a V1 binary (reported `{stdout}`); \
          point COLA_LIVE_OPENCODE_BIN at the pinned 1.18.31 binary"
     );
+    stdout
 }
 
 /// Write the isolated global config: one scripted provider, the model it

@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
-/// One response inside a [`Route::script`]: extra headers and a JSON body.
+/// One response inside a [`RouteKind::Script`]: extra headers and a JSON body.
 type ScriptedResponse = (Vec<(String, String)>, Vec<u8>);
 
 /// A response built per request by a [`TestHttpServer::route_dynamic`] handler.
@@ -44,27 +44,37 @@ impl DynamicResponse {
 /// A per-request response builder for [`TestHttpServer::route_dynamic`].
 type DynamicHandler = Arc<dyn Fn(&RecordedRequest) -> DynamicResponse + Send + Sync>;
 
-/// A scripted response for requests whose method and path prefix match.
+/// What a route answers with — one variant per registration method, so a route
+/// can never carry fields its answering mode does not use.
+enum RouteKind {
+    /// The same fixed response for every matching request.
+    Fixed {
+        status: u16,
+        content_type: String,
+        body: Vec<u8>,
+        /// Extra response headers, written after content-type.
+        headers: Vec<(String, String)>,
+        /// Held before the response is written — for exercising client timeouts.
+        delay: Duration,
+    },
+    /// One response per request, in order, the last repeating — for
+    /// cursor/pagination flows where the second request must see a different
+    /// response.
+    Script {
+        responses: Vec<ScriptedResponse>,
+        /// How many requests have been served from `responses`.
+        served: AtomicUsize,
+    },
+    /// The response is built from the recorded request — for an endpoint whose
+    /// answer depends on the request body (the live suite's scripted provider).
+    Dynamic(DynamicHandler),
+}
+
+/// A route: a method + path-prefix matcher and what it answers with.
 struct Route {
     method: String,
     path_prefix: String,
-    status: u16,
-    content_type: String,
-    body: Vec<u8>,
-    /// Extra response headers, written after content-type.
-    headers: Vec<(String, String)>,
-    /// Held before the response is written — for exercising client timeouts.
-    delay: Duration,
-    /// When non-empty, matched requests consume these in order (the last
-    /// repeats) instead of the fields above — for cursor/pagination flows
-    /// where the second request must see a different response.
-    script: Vec<ScriptedResponse>,
-    /// How many requests have been served from `script`.
-    served: AtomicUsize,
-    /// When set, the response is built from the recorded request instead of
-    /// the fixed fields — for a provider whose answer depends on the request
-    /// body (the live suite's scripted OpenAI-compatible endpoint).
-    handler: Option<DynamicHandler>,
+    kind: RouteKind,
 }
 
 /// One scripted response for [`TestHttpServer::route_sequence`]: extra
@@ -181,14 +191,13 @@ impl TestHttpServer {
         self.state.routes.lock().unwrap().push(Route {
             method: method.to_ascii_uppercase(),
             path_prefix: path_prefix.to_string(),
-            status,
-            content_type: content_type.to_string(),
-            body: body.into(),
-            headers: Vec::new(),
-            delay: Duration::ZERO,
-            script: Vec::new(),
-            served: AtomicUsize::new(0),
-            handler: None,
+            kind: RouteKind::Fixed {
+                status,
+                content_type: content_type.to_string(),
+                body: body.into(),
+                headers: Vec::new(),
+                delay: Duration::ZERO,
+            },
         });
     }
 
@@ -202,14 +211,7 @@ impl TestHttpServer {
         self.state.routes.lock().unwrap().push(Route {
             method: method.to_ascii_uppercase(),
             path_prefix: path_prefix.to_string(),
-            status: 200,
-            content_type: "application/json".to_string(),
-            body: Vec::new(),
-            headers: Vec::new(),
-            delay: Duration::ZERO,
-            script: Vec::new(),
-            served: AtomicUsize::new(0),
-            handler: Some(Arc::new(handler)),
+            kind: RouteKind::Dynamic(Arc::new(handler)),
         });
     }
 
@@ -224,17 +226,13 @@ impl TestHttpServer {
         self.state.routes.lock().unwrap().push(Route {
             method: method.to_ascii_uppercase(),
             path_prefix: path_prefix.to_string(),
-            status: 200,
-            content_type: "application/json".to_string(),
-            body: Vec::new(),
-            headers: Vec::new(),
-            delay: Duration::ZERO,
-            script: responses
-                .into_iter()
-                .map(|r| (r.headers, r.body.into_bytes()))
-                .collect(),
-            served: AtomicUsize::new(0),
-            handler: None,
+            kind: RouteKind::Script {
+                responses: responses
+                    .into_iter()
+                    .map(|r| (r.headers, r.body.into_bytes()))
+                    .collect(),
+                served: AtomicUsize::new(0),
+            },
         });
     }
 
@@ -251,14 +249,13 @@ impl TestHttpServer {
         self.state.routes.lock().unwrap().push(Route {
             method: method.to_ascii_uppercase(),
             path_prefix: path_prefix.to_string(),
-            status,
-            content_type: "application/json".to_string(),
-            body: body.into().into_bytes(),
-            headers: Vec::new(),
-            delay,
-            script: Vec::new(),
-            served: AtomicUsize::new(0),
-            handler: None,
+            kind: RouteKind::Fixed {
+                status,
+                content_type: "application/json".to_string(),
+                body: body.into().into_bytes(),
+                headers: Vec::new(),
+                delay,
+            },
         });
     }
 
@@ -358,37 +355,42 @@ fn response_for(
         .filter(|route| route.method == request.method && request.path.starts_with(&route.path_prefix))
         .max_by_key(|route| route.path_prefix.len());
     match matched {
-        Some(route) if route.handler.is_some() => {
-            let response = route.handler.as_ref().unwrap()(request);
-            (
-                response.status,
-                response.content_type,
-                response.headers,
-                response.body,
-                Duration::ZERO,
-            )
-        }
-        Some(route) if !route.script.is_empty() => {
-            let index = route
-                .served
-                .fetch_add(1, Ordering::Relaxed)
-                .min(route.script.len() - 1);
-            let (headers, body) = &route.script[index];
-            (
-                200,
-                "application/json".to_string(),
+        Some(route) => match &route.kind {
+            RouteKind::Dynamic(handler) => {
+                let response = handler(request);
+                (
+                    response.status,
+                    response.content_type,
+                    response.headers,
+                    response.body,
+                    Duration::ZERO,
+                )
+            }
+            RouteKind::Script { responses, served } => {
+                let index = served.fetch_add(1, Ordering::Relaxed).min(responses.len() - 1);
+                let (headers, body) = &responses[index];
+                (
+                    200,
+                    "application/json".to_string(),
+                    headers.clone(),
+                    body.clone(),
+                    Duration::ZERO,
+                )
+            }
+            RouteKind::Fixed {
+                status,
+                content_type,
+                body,
+                headers,
+                delay,
+            } => (
+                *status,
+                content_type.clone(),
                 headers.clone(),
                 body.clone(),
-                Duration::ZERO,
-            )
-        }
-        Some(route) => (
-            route.status,
-            route.content_type.clone(),
-            route.headers.clone(),
-            route.body.clone(),
-            route.delay,
-        ),
+                *delay,
+            ),
+        },
         None => (
             404,
             "application/json".to_string(),
