@@ -1,9 +1,10 @@
 ---
 description: Implements one ticket end-to-end on the branch a foreman batch prepared, committing Conventional Commits and reporting back. Dispatched by the foreman skill; never reviews, pushes, or touches other tickets.
 mode: subagent
-permission:
-  task: deny
-  todowrite: deny
+permissions:
+  - action: subagent
+    resource: "*"
+    effect: deny
 ---
 
 Work exactly the ticket in the dispatch prompt, on the current git branch.
