@@ -4,11 +4,19 @@
 # integrity pin; version, URL and digest move together as an ordinary bump
 # (ADR-0047 pin policy) and never as part of V1 retirement (#364 §11).
 #
-# The cache is keyed by the version, so a bump fetches the new artifact once
-# and every later run restores it; the digest is re-verified on every run, hit
-# or miss, so a poisoned cache fails loudly instead of installing.
+# The version lives once, in the `version` input default, and the download URL,
+# cache key and step names derive from it; the archive filename is
+# version-independent, so a bump changes the cache key and fetches the new
+# artifact once. The digest is re-verified on every run, hit or miss, so a
+# poisoned cache fails loudly instead of installing.
 name: Install OpenCode V1
-description: Download, verify and install the pinned OpenCode 1.18.31 (linux-x64-baseline) binary on PATH.
+description: Download, verify and install the pinned OpenCode V1 (linux-x64-baseline) binary on PATH.
+
+inputs:
+  version:
+    description: The pinned OpenCode version. Bumps move this and the SHA256 below together.
+    required: false
+    default: 1.18.31
 
 runs:
   using: composite
@@ -18,16 +26,18 @@ runs:
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ~/.cache/opencode-v1
-        key: opencode-v1-1.18.31-linux-x64-baseline
+        key: opencode-v1-${{ inputs.version }}-linux-x64-baseline
 
-    - name: Download OpenCode 1.18.31
+    - name: Download OpenCode ${{ inputs.version }}
       if: steps.cache.outputs.cache-hit != 'true'
       shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
       run: |
         set -euo pipefail
         mkdir -p "$HOME/.cache/opencode-v1"
         curl -fsSL \
-          "https://github.com/anomalyco/opencode/releases/download/v1.18.31/opencode-linux-x64-baseline.tar.gz" \
+          "https://github.com/anomalyco/opencode/releases/download/v${VERSION}/opencode-linux-x64-baseline.tar.gz" \
           -o "$HOME/.cache/opencode-v1/opencode-linux-x64-baseline.tar.gz"
 
     - name: Verify and install
