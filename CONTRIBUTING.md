@@ -96,9 +96,15 @@ Commits, `pre-push` runs the dependency audit. The full loop CI runs:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
+cargo xtask check-generation
 cargo test --workspace --locked
 cargo build --release --locked
 ```
+
+`cargo xtask check-generation` is the V1 coupling guard (spec #364): V1 route
+literals and wire field names may live only in the V1 generation strategy
+(`src/opencode/v1/`) or the explicitly allow-listed tool-render surface, so V1
+retirement stays a deletion rather than a scavenger hunt.
 
 Note: CI's Format job is `cargo fmt --all -- --check` — clippy and rustc do
 **not** check formatting, so a clean clippy does not mean a clean fmt.
