@@ -3,22 +3,23 @@
 //! the card layer already owns.
 //!
 //! The JSON builders keep their card families and their contract — structured
-//! inputs in, card JSON out: [`super::session::build_switch_card`] and
-//! [`super::session::build_dir_card`], [`super::picker::build_agent_card`],
+//! inputs in, card JSON out: [`super::session::build_switch_card`],
+//! [`super::session::build_dir_card`] and [`super::session::build_child_card`],
+//! [`super::picker::build_agent_card`],
 //! [`super::picker::build_model_provider_cards`],
 //! [`super::picker::build_think_card`],
 //! [`super::picker::build_autoaccept_card`], and
 //! [`super::help::build_help_card`]. This module is the form layer over them:
 //! it fetches the state each builder takes as its input, hands it over, and
 //! sends the result — the fetch → build → send path for the cards the slash
-//! commands pop (`/switch`, `/dir`, `/agent`, `/model`, `/think`,
+//! commands pop (`/switch`, `/dir`, `/sub`, `/agent`, `/model`, `/think`,
 //! `/autoaccept`, `/help`). `bridge::command` keeps the parser, the dispatch
 //! match and the text-command behavior.
 //!
 //! The fetch-and-shape functions ([`switch_card_data`], [`dir_card_data`],
-//! [`agent_card`], [`think_card`], [`current_model_label`]) are shared with the
-//! coordinator's card-ack refresh, which rebuilds a clicked card from the same
-//! one source of truth.
+//! [`child_card_data`], [`agent_card`], [`think_card`], [`current_model_label`])
+//! are shared with the coordinator's card-ack refresh, which rebuilds a clicked
+//! card from the same one source of truth.
 
 use serde_json::Value;
 
@@ -128,6 +129,88 @@ pub(crate) async fn send_switch_card(
         current_dir.as_deref(),
         active_id.as_deref(),
         &mapped_ids,
+    );
+    handles.flow.platform.reply_card(message_id, &card).await?;
+    Ok(())
+}
+
+/// Fetch + shape the data the `/sub` child-session card renders (spec #344):
+/// the Active Session's DIRECT children (`parentID` equal to its id), keyword-
+/// filtered and sorted by last activity newest-first, plus the live run state
+/// of each row on the requested page — one `session_status` read per rendered
+/// row, bounded by the page size. A conversation with no Active Session (a
+/// fresh chat, or a Pending Session superseding the mapping — ADR-0041) has no
+/// children by construction: the list comes back empty and no status is read.
+/// Archived children are excluded, like every other session surface. The
+/// status map's `None` (a failed or unrecognised read) omits the row's label
+/// rather than guessing (ADR-0028).
+pub(crate) async fn child_card_data(
+    handles: &CommandHandles,
+    thread_key: &ThreadKey,
+    keyword: &str,
+    page: usize,
+) -> (
+    Vec<crate::opencode::types::SessionListInfo>,
+    std::collections::HashMap<String, Option<crate::opencode::types::SessionStatus>>,
+) {
+    let Some(active_id) = handles.flow.sessions.get_session_id(thread_key).await else {
+        return (Vec::new(), std::collections::HashMap::new());
+    };
+    let sessions = handles
+        .flow
+        .sessions
+        .cached_session_list(&handles.flow.backend)
+        .await
+        .unwrap_or_default();
+    let lower = keyword.to_lowercase();
+    let mut children: Vec<crate::opencode::types::SessionListInfo> = sessions
+        .into_iter()
+        .filter(|s| {
+            s.parent_id.as_deref() == Some(active_id.as_str())
+                && !s.time.as_ref().map(|t| t.is_archived()).unwrap_or(false)
+                && (lower.is_empty() || matches_keyword(s, &lower))
+        })
+        .collect();
+    children.sort_by(|a, b| {
+        let ub = b.time.as_ref().map(|t| t.updated).unwrap_or(0);
+        let ua = a.time.as_ref().map(|t| t.updated).unwrap_or(0);
+        ub.cmp(&ua)
+    });
+
+    // One status read per row actually rendered: the window is clamped here the
+    // same way the builder clamps it, so pages do not read their siblings' rows.
+    let window = super::session::page_window(children.len(), page);
+    let mut statuses = std::collections::HashMap::new();
+    for child in &children[window.start..window.end] {
+        let status = handles
+            .flow
+            .backend
+            .session_status(&child.id, Some(&child.directory))
+            .await
+            .ok()
+            .flatten();
+        statuses.insert(child.id.clone(), status);
+    }
+    (children, statuses)
+}
+
+/// Build and send the read-only `/sub` child-session card (spec #344): the
+/// Active Session's direct children, starting on page 1. A conversation with
+/// no Active Session opens the card's plain empty state.
+pub(crate) async fn send_child_card(
+    handles: &CommandHandles,
+    thread_key: &ThreadKey,
+    keyword: &str,
+    message_id: &str,
+) -> Result<()> {
+    let (children, statuses) = child_card_data(handles, thread_key, keyword, 1).await;
+    let card = super::session::build_child_card(
+        thread_key,
+        &children,
+        &statuses,
+        keyword,
+        1,
+        chrono::Utc::now().timestamp_millis(),
     );
     handles.flow.platform.reply_card(message_id, &card).await?;
     Ok(())

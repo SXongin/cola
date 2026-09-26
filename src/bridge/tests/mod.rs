@@ -6,6 +6,7 @@
 pub(crate) mod access;
 pub(crate) mod card_handles;
 pub(crate) mod card_pull;
+pub(crate) mod child;
 pub(crate) mod config_commands;
 pub(crate) mod dir;
 pub(crate) mod drain;

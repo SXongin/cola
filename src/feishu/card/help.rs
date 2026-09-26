@@ -18,6 +18,7 @@ pub fn build_help_card() -> serde_json::Value {
                     "声明在新目录开会话（下一条消息创建；无参弹最近目录卡片）",
                 ),
                 ("/switch [关键字]", "会话卡片，或按名称/目录/ID 切换（含 forget）"),
+                ("/sub [list [关键字]]", "本会话的子会话（只读，含运行状态）"),
                 (
                     "/topic [目录] [名字]",
                     "新话题（下一条消息在该目录创建会话；无参用当前项目目录）",
@@ -80,6 +81,7 @@ mod tests {
             "/new",
             "/dir",
             "/switch",
+            "/sub",
             "/topic",
             "/name",
             "/agent",

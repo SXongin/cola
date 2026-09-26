@@ -842,6 +842,9 @@ pub struct MockBackend {
     /// follow) is watching it.
     pub session_statuses:
         Arc<tokio::sync::Mutex<std::collections::HashMap<String, Option<opencode::types::SessionStatus>>>>,
+    /// Records the session ids each `session_status` read targeted — the `/sub`
+    /// card asserts one read per rendered row (spec #344).
+    pub session_status_reads: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// When set, `session_status` fails with this message (simulates a read
     /// failure — the caller must not guess a status).
     pub session_status_error: Option<String>,
@@ -924,6 +927,7 @@ impl MockBackend {
             context_window_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_model: None,
             session_statuses: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            session_status_reads: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             session_status_error: None,
             status_busy_once: std::sync::atomic::AtomicBool::new(false),
             prompt_scripts: Vec::new(),
@@ -1709,6 +1713,10 @@ impl crate::backend::Backend for MockBackend {
         session_id: &str,
         _d: Option<&str>,
     ) -> crate::error::Result<Option<opencode::types::SessionStatus>> {
+        self.session_status_reads
+            .lock()
+            .await
+            .push(session_id.to_string());
         if let Some(err) = &self.session_status_error {
             return Err(crate::error::BridgeError::OpenCode(err.clone()));
         }
