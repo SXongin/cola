@@ -92,26 +92,29 @@ pub fn question_summary(questions: &[crate::opencode::types::QuestionInfo]) -> S
     super::sanitize::CardMarkdown::new().clean(&s)
 }
 
-/// Build the interactive question card (JSON 2.0). Each question renders as its
-/// own block: a markdown heading (number, text, status) followed by its
-/// controls, with a divider between blocks so single- and multi-select options
-/// never mix. Controls are option buttons (or a folding `overflow` group when a
-/// single-select has many options) plus — when `custom` is allowed (default
-/// true) — an input form; a multi-select question (`multiple`) renders toggle
-/// buttons whose clicks add/remove labels in the running selection ("已选"),
-/// committed by a per-question "确定该题" button right under its own options.
-/// Custom Answers (user-typed entries) render as selected toggle buttons too —
-/// clicking one removes it. `done[i]` marks a finalized question (a
-/// single-select answered by a click, a multi-select confirmed) — it renders as
-/// a static "✅ … 已选" line instead of controls, so answering one question
-/// never silently submits the others.
-/// `answered[i]` is the DISPLAY selection: the locked answer for done questions,
-/// or the in-progress toggles of an open multi-select. A submit button appears
-/// when some (but not all) questions are answered (skip remaining); a reject
-/// button sits at the bottom. The card callback (`action: "question"`) posts
-/// the answer back to the session.
-/// The body elements of a question prompt. Shared by the standalone question
-/// card and the inline section on the streaming card.
+/// The body elements of a form prompt (spec #364, S6). Each typed field renders
+/// as its own block — a markdown heading (number, title, description, status)
+/// followed by the controls its kind demands, with a divider between blocks:
+///
+/// - a `String` with options renders option buttons (or a folding `overflow`
+///   group when a single-select has many), displaying each option's label while
+///   submitting its value; a free-text input is added when `custom` allows (or
+///   when the field has no options at all);
+/// - a `Multiselect` renders toggle buttons whose clicks add/remove values in
+///   the running selection ("已选"), committed by a per-question "确定该题"
+///   button; typed custom answers render as removable chips kept verbatim;
+/// - a `Boolean` renders 是/否 buttons, a `Number`/`Integer` a typed input, and
+///   an `External` field its link plus an acknowledgement button.
+///
+/// `done[i]` marks a finalized field (a single-select/boolean answered by a
+/// click, a multi-select confirmed) — it renders as a static "✅ … 已选" line
+/// instead of controls, so answering one field never silently submits the
+/// others. `answered[i]` is the finalized answer's submitted VALUES (or an open
+/// multi-select's live toggles); the heading maps them to display labels. A
+/// submit button appears when some (but not all) fields are answered (skip
+/// remaining); a reject/cancel button sits at the bottom. The card callback
+/// (`action: "question"`) posts the keyed answer back to the session. Shared by
+/// the standalone question card and the inline section on the streaming card.
 pub fn question_elements(
     request_id: &str,
     session_id: &str,

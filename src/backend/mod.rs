@@ -171,6 +171,10 @@ pub trait Backend: Send + Sync {
         message_id: Option<&str>,
     ) -> Result<()>;
 
+    /// Reply to a pending permission with a decision (`once` / `always` /
+    /// `reject`). `session_id` is the requesting session (the child session for
+    /// a sub-task ask): V2's reply is session-scoped and needs it; V1 routes by
+    /// `directory` and ignores it.
     async fn reply_permission(
         &self,
         session_id: &str,
@@ -179,12 +183,18 @@ pub trait Backend: Send + Sync {
         directory: Option<&str>,
     ) -> Result<()>;
 
+    /// List the pending permissions for one directory/instance. V1 reads the
+    /// global `?directory=`-scoped list; V2 the location-scoped one — either
+    /// way one call per known directory, never per session.
     async fn list_permissions(&self, directory: Option<&str>) -> Result<Vec<PermissionRequest>>;
 
+    /// List the pending forms/questions for one directory/instance (the same
+    /// per-directory read as [`Self::list_permissions`]).
     async fn list_questions(&self, directory: Option<&str>) -> Result<Vec<QuestionRequest>>;
 
     /// Answer a pending form/question with keyed answers (V2's `Form.Answer`);
     /// V1 flattens the values into its positional `answers` arrays.
+    /// `session_id` is the requesting session (V2's reply is session-scoped).
     async fn reply_question(
         &self,
         session_id: &str,
@@ -193,6 +203,7 @@ pub trait Backend: Send + Sync {
         directory: Option<&str>,
     ) -> Result<()>;
 
+    /// Cancel a pending form (V2: DELETE) / reject a question (V1).
     async fn reject_question(
         &self,
         session_id: &str,
