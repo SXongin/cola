@@ -30,6 +30,33 @@ use super::provider;
 /// it with the default `opencode` username (AGENTS.md pitfall #12).
 pub const PASSWORD: &str = "live-harness-secret";
 
+/// Which permission rules the isolated V2 config declares. Each live chain
+/// needs a different gate: the read/write chains must not block on an ask, the
+/// permission chain must produce one, and the form chain must let the question
+/// tool through (V2 defaults an unmatched action to `ask`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V2Permissions {
+    /// `shell` allowed outright (the read/write chains).
+    AllowShell,
+    /// `shell` gated behind an ask (the permission round-trip).
+    AskShell,
+    /// `shell` allowed and the `question` tool allowed (the form round-trip).
+    AllowQuestion,
+}
+
+impl V2Permissions {
+    fn ruleset(self) -> serde_json::Value {
+        match self {
+            V2Permissions::AllowShell => json!([{ "action": "shell", "resource": "*", "effect": "allow" }]),
+            V2Permissions::AskShell => json!([{ "action": "shell", "resource": "*", "effect": "ask" }]),
+            V2Permissions::AllowQuestion => json!([
+                { "action": "shell", "resource": "*", "effect": "allow" },
+                { "action": "question", "resource": "*", "effect": "allow" },
+            ]),
+        }
+    }
+}
+
 /// How long the server gets to print its listening line (the first boot also
 /// creates the isolated store, so it is generous).
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
@@ -51,19 +78,37 @@ impl LiveServer {
     /// `provider_base_url` (`http://127.0.0.1:port`, no `/v1`) as the only
     /// configured provider.
     pub async fn start(binary: &str, provider_base_url: &str) -> Self {
-        Self::launch(Generation::V1, binary, provider_base_url).await
+        Self::launch(
+            Generation::V1,
+            binary,
+            provider_base_url,
+            V2Permissions::AllowShell,
+        )
+        .await
     }
 
     /// Start a V2 `binary serve` against an isolated store. V2's config shape
     /// is native (`providers`, `permissions`), for the same guarantee: no
-    /// default-store, credential or config coupling.
+    /// default-store, credential or config coupling. `shell` is allowed, as the
+    /// read/write chains expect.
     pub async fn start_v2(binary: &str, provider_base_url: &str) -> Self {
-        Self::launch(Generation::V2, binary, provider_base_url).await
+        Self::start_v2_with(binary, provider_base_url, V2Permissions::AllowShell).await
+    }
+
+    /// [`Self::start_v2`] with the permission ruleset the chain needs (the
+    /// permission chain asks for `shell`, the form chain allows `question`).
+    pub async fn start_v2_with(binary: &str, provider_base_url: &str, permissions: V2Permissions) -> Self {
+        Self::launch(Generation::V2, binary, provider_base_url, permissions).await
     }
 
     /// The shared launch path: one isolated temp world, the generation's own
     /// config, and the generation's own listening line.
-    async fn launch(generation: Generation, binary: &str, provider_base_url: &str) -> Self {
+    async fn launch(
+        generation: Generation,
+        binary: &str,
+        provider_base_url: &str,
+        v2_permissions: V2Permissions,
+    ) -> Self {
         let root = tempfile::tempdir().expect("create the live harness temp dir");
         let dirs = |name: &str| root.path().join(name);
         for name in ["data", "config", "cache", "state", "home", "tmp", "work"] {
@@ -72,7 +117,7 @@ impl LiveServer {
         let work_dir = dirs("work");
         match generation {
             Generation::V1 => write_v1_config(&dirs("config"), provider_base_url),
-            Generation::V2 => write_v2_config(&dirs("config"), provider_base_url),
+            Generation::V2 => write_v2_config(&dirs("config"), provider_base_url, v2_permissions),
         }
 
         let mut command = tokio::process::Command::new(binary);
@@ -323,10 +368,9 @@ fn write_v1_config(config_home: &Path, provider_base_url: &str) {
 /// Write the isolated V2 global config in V2's native shape: a provider whose
 /// package is the bundled `openai-compatible` entrypoint (a V1-style `npm`
 /// spec would send V2 to npm for the AI-SDK package it no longer resolves), and
-/// the V2 permissions list. `shell` (V2's renamed `bash`) is allowed outright:
-/// the read slice has no permission round-trip yet (S6), and the V2 chain is
-/// deliberately not gated on a card that cannot answer it.
-fn write_v2_config(config_home: &Path, provider_base_url: &str) {
+/// the V2 permissions list the chain needs. An unmatched action defaults to
+/// `ask`, so a chain that must not block (or must) declares its rule here.
+fn write_v2_config(config_home: &Path, provider_base_url: &str, permissions: V2Permissions) {
     let config = json!({
         "$schema": "https://opencode.ai/config.json",
         "model": provider::MODEL_REF,
@@ -334,7 +378,7 @@ fn write_v2_config(config_home: &Path, provider_base_url: &str) {
         "autoupdate": false,
         "share": "disabled",
         "snapshot": false,
-        "permissions": [ { "action": "shell", "resource": "*", "effect": "allow" } ],
+        "permissions": permissions.ruleset(),
         "providers": {
             provider::PROVIDER: {
                 "name": "Scripted live provider",
@@ -396,7 +440,7 @@ mod tests {
     #[test]
     fn the_isolated_v2_config_declares_the_native_provider_and_shell_permission() {
         let root = tempfile::tempdir().unwrap();
-        write_v2_config(root.path(), "http://127.0.0.1:1234");
+        write_v2_config(root.path(), "http://127.0.0.1:1234", V2Permissions::AllowShell);
         let text = std::fs::read_to_string(root.path().join("opencode/opencode.json")).unwrap();
         let config: serde_json::Value = serde_json::from_str(&text).unwrap();
 
@@ -416,6 +460,35 @@ mod tests {
         assert!(
             config["providers"][provider::PROVIDER]["models"][provider::MODEL].is_object(),
             "the scripted model must be declared"
+        );
+    }
+
+    /// The permission and form chains need their own gates: an unmatched V2
+    /// action defaults to `ask`, so the permission chain asks for `shell` while
+    /// the form chain must allow the `question` tool explicitly.
+    #[test]
+    fn the_v2_permission_variants_gate_the_right_actions() {
+        let root = tempfile::tempdir().unwrap();
+        write_v2_config(root.path(), "http://127.0.0.1:1", V2Permissions::AskShell);
+        let text = std::fs::read_to_string(root.path().join("opencode/opencode.json")).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(config["permissions"][0]["action"], "shell");
+        assert_eq!(config["permissions"][0]["effect"], "ask");
+
+        let root = tempfile::tempdir().unwrap();
+        write_v2_config(root.path(), "http://127.0.0.1:1", V2Permissions::AllowQuestion);
+        let text = std::fs::read_to_string(root.path().join("opencode/opencode.json")).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let rules = config["permissions"].as_array().unwrap();
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule["action"] == "question" && rule["effect"] == "allow"),
+            "the question tool must be allowed: {rules:?}"
+        );
+        assert!(
+            rules.iter().any(|rule| rule["action"] == "shell"),
+            "the shell gate must still be declared: {rules:?}"
         );
     }
 

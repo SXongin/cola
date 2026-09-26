@@ -1902,3 +1902,48 @@ async fn late_rendered_command_lands_above_the_receipt() {
         card
     );
 }
+
+/// The sweep lists pending requests once per known DIRECTORY, never once per
+/// session: V2's location-scoped list covers every session in a location, so a
+/// store with several sessions sharing one directory still makes exactly one
+/// pending-list call per kind per sweep (the no-iteration-storm contract).
+#[tokio::test]
+async fn sweep_lists_once_per_directory_not_per_session() {
+    use std::sync::atomic::Ordering;
+
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let permission_lists = backend.list_permission_calls.clone();
+    let question_lists = backend.list_question_calls.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+
+    // Three sessions mapped into the same directory: `directories()` dedupes
+    // them to one location.
+    for (thread, session) in [("chat_1", "ses_a"), ("chat_2", "ses_b"), ("chat_3", "ses_c")] {
+        seed_entry(
+            &app,
+            crate::config::SessionEntry::new(
+                crate::config::ThreadKey::new(thread.into(), thread.into()),
+                session,
+                "/work/shared",
+            ),
+        )
+        .await;
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    assert_eq!(
+        permission_lists.load(Ordering::SeqCst),
+        1,
+        "one permission list per directory, not one per session"
+    );
+    app.question.sweep(&app.flow_handles(), &mut seen).await;
+    assert_eq!(
+        question_lists.load(Ordering::SeqCst),
+        1,
+        "one form list per directory, not one per session"
+    );
+}

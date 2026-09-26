@@ -33,12 +33,16 @@ use crate::test_http::{DynamicResponse, TestHttpServer};
 
 /// The shell tool the scripted turn calls, per generation: V1 still calls it
 /// `bash`, V2 renamed it `shell` (the permission action follows the rename).
+/// [`Tool::Question`] is V2's form-producing tool (V1 has no equivalent
+/// scripted here — its question tool asks with positional questions instead).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
     /// V1's `bash` tool.
     Bash,
     /// V2's `shell` tool.
     Shell,
+    /// V2's `question` tool: the turn blocks on a form the test answers.
+    Question,
 }
 
 impl Tool {
@@ -47,6 +51,7 @@ impl Tool {
         match self {
             Tool::Bash => "bash",
             Tool::Shell => "shell",
+            Tool::Question => "question",
         }
     }
 }
@@ -90,6 +95,14 @@ pub const REASONING_TEXT: &str = "live-harness-reasoning";
 pub const TOOL_COMMAND: &str = "echo live-harness-tool";
 /// The correlation id the streamed tool call declares once, on its first delta.
 const TOOL_CALL_ID: &str = "call_live_harness_1";
+
+/// The question the scripted `question` tool call asks. Its form round-trip is
+/// asserted structurally: one field, keyed `q0`, with these options.
+pub const QUESTION_TEXT: &str = "live harness question?";
+/// The question's short header.
+pub const QUESTION_HEADER: &str = "harness";
+/// The option the form chain submits.
+pub const QUESTION_OPTION: &str = "继续";
 
 /// The closing-text deltas, streamed in order. Assembled they must equal
 /// [`FINAL_TEXT`] (pinned by a unit test below).
@@ -242,12 +255,33 @@ fn reasoning_chunks(deltas: &[&str]) -> Vec<Value> {
         .collect()
 }
 
-/// The streamed shell tool call: its id and name arrive on the first delta,
-/// its arguments split across two deltas — the OpenAI wire shape, and enough
+/// The streamed tool call's arguments: the shell tools carry `command`, the
+/// question tool carries V2's `questions` array (header, question text, options
+/// and `multiple`). Split across two SSE deltas below — the OpenAI wire shape,
+/// and enough fragmentation to prove the client reassembles them.
+fn tool_call_arguments(tool: Tool, command: ToolCommand) -> Value {
+    match tool {
+        Tool::Bash | Tool::Shell => json!({ "command": command.text() }),
+        Tool::Question => json!({
+            "questions": [{
+                "question": QUESTION_TEXT,
+                "header": QUESTION_HEADER,
+                "options": [
+                    { "label": QUESTION_OPTION, "description": "" },
+                    { "label": "停止", "description": "" },
+                ],
+                "multiple": false,
+            }],
+        }),
+    }
+}
+
+/// The streamed tool call: its id and name arrive on the first delta, its
+/// arguments split across two deltas — the OpenAI wire shape, and enough
 /// fragmentation to prove the client reassembles them. The name is the
-/// generation's (`bash` / `shell`); the arguments encode `command`.
+/// generation's (`bash` / `shell`) or the question tool's.
 fn tool_call_chunks(tool: Tool, command: ToolCommand) -> Vec<Value> {
-    let arguments = json!({ "command": command.text() }).to_string();
+    let arguments = tool_call_arguments(tool, command).to_string();
     let (first, rest) = arguments.split_at(arguments.len() / 2);
     let mut chunks = vec![chunk(
         json!({
@@ -469,6 +503,31 @@ mod tests {
                 "{tool:?}"
             );
         }
+    }
+
+    /// The question script streams V2's `question` tool call: the name and the
+    /// fragmented `questions` arguments reassemble into the form the live
+    /// chain asserts (one string field with two options).
+    #[test]
+    fn the_question_script_streams_the_form_arguments() {
+        let events = sse_events(&completion_body(
+            &request(Script::ToolCall).to_string(),
+            Tool::Question,
+            ToolCommand::Fast,
+        ));
+        assert_eq!(
+            events.iter().find_map(|event| {
+                event["choices"][0]["delta"]["tool_calls"][0]["function"]["name"].as_str()
+            }),
+            Some("question")
+        );
+        let fragments = streamed_argument_fragments(&events);
+        assert!(fragments.len() >= 2, "arguments must stream as deltas");
+        let arguments: Value = serde_json::from_str(&fragments.concat()).expect("valid JSON arguments");
+        assert_eq!(arguments["questions"][0]["question"], QUESTION_TEXT);
+        assert_eq!(arguments["questions"][0]["header"], QUESTION_HEADER);
+        assert_eq!(arguments["questions"][0]["options"][0]["label"], QUESTION_OPTION);
+        assert_eq!(arguments["questions"][0]["multiple"], false);
     }
 
     /// Both scripted commands stream as fragmented argument deltas and
