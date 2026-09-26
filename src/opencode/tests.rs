@@ -26,6 +26,43 @@ fn body_json(request: &RecordedRequest) -> serde_json::Value {
     serde_json::from_str(&request.body).expect("request body should be JSON")
 }
 
+/// The reconnect loop notices a same-URL replacement by comparing the
+/// attachment's pid (spec #364 §2): the adapter must carry it from the
+/// resolved server and clear it when it goes serverless.
+#[test]
+fn reconnect_tracks_the_attached_server_pid() {
+    let backend = OpenCodeBackend::new(
+        None,
+        Some(crate::bridge::discovery::ResolvedServer {
+            url: "http://localhost:4096".to_string(),
+            username: "opencode".to_string(),
+            password: "secret".to_string(),
+            pid: Some(4242),
+            generation: super::strategy::Generation::V1,
+        }),
+    );
+    assert_eq!(backend.attached_server_pid(), Some(4242));
+
+    backend.reconnect(Some(&crate::bridge::discovery::ResolvedServer {
+        url: "http://localhost:49374".to_string(),
+        username: "opencode".to_string(),
+        password: "new-secret".to_string(),
+        pid: Some(5252),
+        generation: super::strategy::Generation::V2,
+    }));
+    assert_eq!(backend.attached_server_pid(), Some(5252));
+
+    backend.reconnect(None);
+    assert_eq!(backend.attached_server_pid(), None);
+    assert_eq!(backend.base_url(), "");
+}
+
+#[test]
+fn a_serverless_backend_has_no_attached_pid() {
+    let backend = OpenCodeBackend::new(None, None);
+    assert_eq!(backend.attached_server_pid(), None);
+}
+
 #[tokio::test]
 async fn create_session_posts_the_input_and_parses_the_data_envelope() {
     let server = TestHttpServer::start().await;

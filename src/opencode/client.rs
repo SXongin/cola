@@ -43,6 +43,11 @@ pub struct OpenCodeBackend {
     /// swaps this arm without dropping a backend handle, so it lives behind a
     /// lock shared across clones.
     strategy: Arc<RwLock<Arc<dyn GenerationStrategy>>>,
+    /// The pid of the attached server, when the attach path knew it — the
+    /// neutral identity token the reconnect loop compares to notice a
+    /// replacement on the same port (a new generation or password). Shared
+    /// across clones like the strategy.
+    attached_pid: Arc<RwLock<Option<i32>>>,
 }
 
 impl Clone for OpenCodeBackend {
@@ -52,6 +57,7 @@ impl Clone for OpenCodeBackend {
             username: self.username.clone(),
             model: self.model.clone(),
             strategy: Arc::clone(&self.strategy),
+            attached_pid: Arc::clone(&self.attached_pid),
         }
     }
 }
@@ -71,14 +77,16 @@ impl OpenCodeBackend {
                 url,
                 username,
                 password,
+                pid,
                 generation,
-            }) => Self::with_generation(model, url, Some(&username), Some(&password), generation),
+            }) => Self::with_generation(model, url, Some(&username), Some(&password), generation, pid),
             None => Self::with_generation(
                 model,
                 String::new(),
                 Some(crate::bridge::discovery::DEFAULT_SERVER_USERNAME),
                 None,
                 Generation::V1,
+                None,
             ),
         }
     }
@@ -98,31 +106,45 @@ impl OpenCodeBackend {
         username: Option<&str>,
         password: Option<&str>,
     ) -> Self {
-        Self::with_generation(model, base_url, username, password, Generation::V1)
+        Self::with_generation(model, base_url, username, password, Generation::V1, None)
     }
 
-    /// [`Self::with_base_url`] with the generation strategy made explicit.
+    /// [`Self::with_base_url`] with the generation strategy and the attached
+    /// server's identity made explicit.
     pub(crate) fn with_generation(
         model: Option<&str>,
         base_url: impl Into<String>,
         username: Option<&str>,
         password: Option<&str>,
         generation: Generation,
+        attached_pid: Option<i32>,
     ) -> Self {
         Self {
             transport: Transport::new(username, password, base_url),
             username: username.map(str::to_string),
             model: model.and_then(parse_model),
             strategy: Arc::new(RwLock::new(generation.strategy())),
+            attached_pid: Arc::new(RwLock::new(attached_pid)),
         }
     }
 
-    /// The strategy that speaks the currently attached generation.
+    /// The strategy that speaks the currently attached generation. The clone
+    /// completes before the guard's temporary is dropped at the end of the
+    /// statement, and nothing is awaited while it is held.
     fn strategy(&self) -> Arc<dyn GenerationStrategy> {
         self.strategy
             .read()
             .expect("the strategy lock is never poisoned")
             .clone()
+    }
+
+    /// The pid of the attached server, when the attach path knew it: the
+    /// reconnect loop's identity check for a same-URL replacement.
+    pub fn attached_server_pid(&self) -> Option<i32> {
+        *self
+            .attached_pid
+            .read()
+            .expect("the attached-pid lock is never poisoned")
     }
 
     /// Point this backend at a (re)discovered attachment, selecting its
@@ -141,6 +163,10 @@ impl OpenCodeBackend {
                     .strategy
                     .write()
                     .expect("the strategy lock is never poisoned") = server.generation.strategy();
+                *self
+                    .attached_pid
+                    .write()
+                    .expect("the attached-pid lock is never poisoned") = server.pid;
                 tracing::info!(
                     "reconnected opencode backend to {} (generation={})",
                     server.url,
@@ -149,6 +175,10 @@ impl OpenCodeBackend {
             }
             None => {
                 self.transport.repoint("", "", self.username.as_deref());
+                *self
+                    .attached_pid
+                    .write()
+                    .expect("the attached-pid lock is never poisoned") = None;
                 tracing::info!("opencode backend is serverless (the attached server is gone)");
             }
         }
