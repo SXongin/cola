@@ -1,0 +1,44 @@
+# The pinned OpenCode **V1** install, in one place: the release-notes job, the
+# PR review workflow and the `Live V1` suite all run this exact fingerprint.
+# The archive ships no checksum file of its own, so the SHA256 below is the
+# integrity pin; version, URL and digest move together as an ordinary bump
+# (ADR-0047 pin policy) and never as part of V1 retirement (#364 §11).
+#
+# The cache is keyed by the version, so a bump fetches the new artifact once
+# and every later run restores it; the digest is re-verified on every run, hit
+# or miss, so a poisoned cache fails loudly instead of installing.
+name: Install OpenCode V1
+description: Download, verify and install the pinned OpenCode 1.18.31 (linux-x64-baseline) binary on PATH.
+
+runs:
+  using: composite
+  steps:
+    - name: Cache the pinned archive
+      id: cache
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ~/.cache/opencode-v1
+        key: opencode-v1-1.18.31-linux-x64-baseline
+
+    - name: Download OpenCode 1.18.31
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p "$HOME/.cache/opencode-v1"
+        curl -fsSL \
+          "https://github.com/anomalyco/opencode/releases/download/v1.18.31/opencode-linux-x64-baseline.tar.gz" \
+          -o "$HOME/.cache/opencode-v1/opencode-linux-x64-baseline.tar.gz"
+
+    - name: Verify and install
+      shell: bash
+      env:
+        SHA256: b283e8dbe9e6fc224bb4b79992ce3bd2174b8b7b0c3e7d1b4e6024a1d11edc84
+      run: |
+        set -euo pipefail
+        archive="$HOME/.cache/opencode-v1/opencode-linux-x64-baseline.tar.gz"
+        echo "$SHA256  $archive" | sha256sum -c -
+        mkdir -p "$HOME/.cache/opencode-v1/bin"
+        tar -xzf "$archive" -C "$HOME/.cache/opencode-v1/bin"
+        chmod 755 "$HOME/.cache/opencode-v1/bin/opencode"
+        echo "$HOME/.cache/opencode-v1/bin" >> "$GITHUB_PATH"

@@ -76,6 +76,10 @@ Standard local verification loop before pushing (CI's Format job is `cargo fmt -
 
 `cargo xtask check-generation` is the V1 coupling guard (spec #364): it rejects V1 route literals and wire field names outside `src/opencode/v1/` (plus the tool-render allow-list), so V1 retirement stays a deletion.
 
+The live V1 contract suite (ADR-0057) is opt-in: it is `#[ignore]`-gated and needs the pinned OpenCode **1.18.31** binary (the one `.github/actions/install-opencode-v1` installs — never V2, never the default store). CI installs it on `PATH`; locally point `COLA_LIVE_OPENCODE_BIN` at it, then run the same command:
+
+    COLA_LIVE_OPENCODE_BIN=/path/to/opencode cargo test --locked -- --ignored live
+
 ## Contribution guidelines
 
 - **Branch workflow (TBD, rebase-linear)**: `main` is the only long-lived branch. Every task runs the loop — start on `main`, branch off it, work, rebase on the latest `main`, open a PR with base `main`, get CI and review green — and then **stops: agents never merge a feature/task PR**. The user verifies the change themselves and gives the explicit go-ahead (or merges it themselves); only after the merge does the next task return to `main` (`CONTRIBUTING.md` "Branch workflow"). The one exception is the release cut: `cargo xtask release` merges its own CI-gated PR after the user confirms the smoke test (ADR-0033). The base is always `main`. Check `git branch --show-current` before editing.
