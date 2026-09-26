@@ -117,6 +117,15 @@ impl RawSessionInfo {
     }
 }
 
+/// `POST /api/session/{id}/prompt` — `{data: SessionInbox.User}`. The admitted
+/// item's `id` is the durable user-message id the caller chose (the server
+/// persists it and reconciles a retry onto the same row), and the only field
+/// the write path reads.
+#[derive(Debug, Deserialize)]
+pub(super) struct RawAdmittedPrompt {
+    pub(super) id: String,
+}
+
 /// `GET /api/session/active` — `{data: Record<SessionID, {type:"running"}>}`.
 /// Only `running` exists; absence means inactive.
 #[derive(Debug, Deserialize)]
@@ -176,6 +185,38 @@ impl MessagesPage {
 /// the same distinction the neutral [`FinishReason::Unknown`] documents.
 pub(super) fn decode_messages(data: &[Value]) -> SessionTranscript {
     SessionTranscript::new(data.iter().map(decode_message).collect())
+}
+
+/// The failure the turn anchored at `anchor_ms` recorded, if any: the newest
+/// assistant message belonging to that turn whose `error` field is set. A final
+/// model failure settles the session idle with its error on the assistant
+/// message, and the blocking prompt contract has to surface it — the neutral
+/// transcript deliberately carries no error field (it is a prompt-response
+/// fact). An older turn's error can never leak into a newer turn's response:
+/// membership mirrors the transcript's own rule (still in flight → belongs;
+/// completed → only when created within the turn or still producing as the
+/// turn began).
+pub(super) fn turn_error(data: &[Value], anchor_ms: i64) -> Option<String> {
+    data.iter()
+        .filter(|message| message.get("type").and_then(Value::as_str) == Some("assistant"))
+        .filter(|message| assistant_in_turn(message, anchor_ms))
+        .filter_map(|message| message.get("error"))
+        .rfind(|error| !error.is_null())
+        .and_then(decode_error)
+}
+
+/// Whether a projected assistant message belongs to the turn anchored at
+/// `anchor_ms` — the raw mirror of the neutral transcript's membership rule
+/// ([`crate::backend::SessionTranscript::turn_for_user`]). A message without a
+/// server time cannot be placed and stays out.
+fn assistant_in_turn(message: &Value, anchor_ms: i64) -> bool {
+    let Some(created) = message.pointer("/time/created").and_then(Value::as_i64) else {
+        return false;
+    };
+    match message.pointer("/time/completed").and_then(Value::as_i64) {
+        None => true,
+        Some(completed) => created >= anchor_ms || completed >= anchor_ms,
+    }
 }
 
 /// Decode one projected message. Its identity, role and server time are the
@@ -867,5 +908,87 @@ mod tests {
         assert_eq!(message.id.as_str(), "msg_cola_live_fixture");
         assert!(message.time.is_none());
         assert!(message.anchor().is_none());
+    }
+
+    /// The admitted prompt keeps its id and nothing else about the envelope
+    /// matters to the write path.
+    #[test]
+    fn admitted_prompt_reads_the_inbox_id() {
+        let admitted: RawAdmittedPrompt = serde_json::from_value(serde_json::json!({
+            "id": "msg_cola_1",
+            "sessionID": "ses_1",
+            "type": "user",
+            "delivery": "steer",
+            "time": {"created": 1},
+            "payload": {"text": "hi"},
+        }))
+        .unwrap();
+        assert_eq!(admitted.id, "msg_cola_1");
+    }
+
+    /// The turn's error is the newest assistant error *within* the turn: an
+    /// older turn's failure never leaks into a newer response, a still-in-flight
+    /// step created before the anchor belongs (the streaming rule), and an
+    /// unreadable error shape reads as no error.
+    #[test]
+    fn turn_error_reads_the_newest_error_inside_the_turn_only() {
+        let old_failure = serde_json::json!({
+            "id": "msg_old", "type": "assistant",
+            "time": {"created": 10, "completed": 20},
+            "error": {"type": "ProviderError", "message": "old boom"},
+        });
+        let in_flight_failure = serde_json::json!({
+            "id": "msg_inflight", "type": "assistant",
+            "time": {"created": 5},
+            "error": {"message": "still running"},
+        });
+        let new_success = serde_json::json!({
+            "id": "msg_new", "type": "assistant",
+            "time": {"created": 110, "completed": 120},
+            "error": null,
+        });
+        let new_failure = serde_json::json!({
+            "id": "msg_new", "type": "assistant",
+            "time": {"created": 110, "completed": 120},
+            "error": {"type": "ProviderError", "message": "new boom"},
+        });
+
+        assert_eq!(
+            turn_error(&[old_failure.clone(), new_success.clone()], 100),
+            None,
+            "an older turn's error must not leak into a newer response"
+        );
+        assert_eq!(
+            turn_error(&[old_failure.clone(), new_failure.clone()], 100).as_deref(),
+            Some("new boom")
+        );
+        assert_eq!(
+            turn_error(&[old_failure.clone(), in_flight_failure], 100).as_deref(),
+            Some("still running"),
+            "a still-in-flight step belongs to the current turn"
+        );
+        assert_eq!(
+            turn_error(
+                &[
+                    old_failure,
+                    serde_json::json!({"id": "msg_ts", "type": "assistant", "error": {"message": "x"}})
+                ],
+                100
+            ),
+            None,
+            "a message without a server time cannot be placed"
+        );
+        assert_eq!(
+            turn_error(
+                &[serde_json::json!({
+                    "id": "msg_str", "type": "assistant",
+                    "time": {"created": 110, "completed": 120},
+                    "error": "just a string"
+                })],
+                100
+            )
+            .as_deref(),
+            Some("just a string")
+        );
     }
 }

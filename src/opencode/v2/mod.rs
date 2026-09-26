@@ -41,11 +41,26 @@ use super::types::{
 /// sub-routes. Unlike V1's unprefixed surface, every V2 route lives under
 /// `/api`.
 const SESSION: &str = "/api/session";
+/// The durable prompt admit (`POST /api/session/{id}/prompt`) — V2's only
+/// prompt route, shared by the blocking dispatch and the supplement/steer path.
+const SESSION_PROMPT_SUFFIX: &str = "/prompt";
+/// The interrupt endpoint (`POST /api/session/{id}/interrupt`).
+const SESSION_INTERRUPT_SUFFIX: &str = "/interrupt";
+/// The experimental "wait for the agent loop to become idle" endpoint
+/// (`POST /api/experimental/session/{id}/wait`, 204) — ADR-0056's recorded
+/// dependency, deleted by the async-native Turn slice (S8). The poll fallback
+/// in [`V2Strategy::wait_until_idle`] is its mandatory degradation path.
+const SESSION_WAIT: &str = "/api/experimental/session";
 /// The active-session run-state map (`{data: Record<SessionID, {type:"running"}>}`).
 const SESSION_ACTIVE: &str = "/api/session/active";
 /// The per-session projected-message read: the S4b transcript decode and, for
 /// active sessions, the run state's retry derivation.
 const SESSION_MESSAGES_SUFFIX: &str = "/message";
+
+/// How long the poll fallback waits between `session.active` reads. The wait
+/// endpoint resolves as soon as the drain settles; the fallback matches that
+/// latency closely enough for a card that renders on its own poll anyway.
+const IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Hard stop for the body-cursor follow in [`V2Strategy::list_sessions`]: a
 /// misbehaving server must not spin the client forever. The server's default
@@ -85,6 +100,39 @@ fn not_implemented(method: &str) -> String {
 /// [`not_implemented`] as the error the `Result` methods return.
 fn not_implemented_error(method: &str) -> crate::error::BridgeError {
     crate::error::BridgeError::OpenCode(not_implemented(method))
+}
+
+/// Whether a V2 error body names the session as missing (`{_tag:
+/// "SessionNotFoundError", …}`). V2's 404s are tagged, so the bridge's
+/// recreate-the-session heal must key on the tag — a bare 404 from a proxy (or
+/// a missing route) is not a missing session and must not recreate anything.
+fn is_session_not_found(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .is_ok_and(|value| value.get("_tag").and_then(|tag| tag.as_str()) == Some("SessionNotFoundError"))
+}
+
+/// The response for an admitted prompt whose reply could not be assembled
+/// (transcript read failed, or the admitted message is not in the read): the
+/// neutral response with no parts and no error, so a completed turn is never
+/// painted as failed by a read hiccup. `wait` already observed the run settle,
+/// and the Bridge's own final read is the primary render source.
+fn admitted_response(session_id: &str, admitted_id: &str) -> PromptResponse {
+    PromptResponse {
+        id: admitted_id.to_string(),
+        session_id: Some(session_id.to_string()),
+        admitted_seq: None,
+        parent_id: Some(admitted_id.to_string()),
+        error: None,
+        parts: Vec::new(),
+    }
+}
+
+/// Why [`V2Strategy::wait_for_idle`] could not observe the idle transition:
+/// the session is gone (surface it — the bridge recreates the mapping), or the
+/// wait endpoint is unusable (fall back to polling `session.active`).
+enum WaitFailure {
+    SessionNotFound,
+    Unavailable(String),
 }
 
 #[async_trait]
@@ -152,34 +200,69 @@ impl GenerationStrategy for V2Strategy {
         Ok(())
     }
 
+    /// The blocking prompt contract, polyfilled for V2 (ADR-0056).
+    ///
+    /// V2's prompt is admit-then-return: `POST /api/session/{id}/prompt`
+    /// durably admits the message (under cola's `msg_cola_…` id, which the
+    /// server persists and reconciles a retry onto) and returns immediately.
+    /// The synchronous shape is then reconstructed in two steps: wait for the
+    /// agent loop to become idle through the experimental `session.wait`
+    /// endpoint (with the `session.active` poll fallback), then read the
+    /// transcript the turn produced through the same V2 decode the read
+    /// strategy uses.
+    ///
+    /// V2 has no per-prompt `model`/`variant`/`agent`: those are session-scoped
+    /// and durable, and slice S7 lands them. The session's recorded model
+    /// applies (new sessions record the configured default at create time); a
+    /// caller-supplied override is dropped, never silently sent in a shape the
+    /// protocol cannot carry.
     #[allow(clippy::too_many_arguments)] // matches the trait's prompt axes
     async fn prompt(
         &self,
-        _http: &Transport,
-        _session_id: &str,
-        _text: &str,
-        _images: &[ImageInput],
-        _model: Option<&ModelInfo>,
-        _variant: Option<&str>,
-        _agent: Option<&str>,
-        _message_id: Option<&str>,
+        http: &Transport,
+        session_id: &str,
+        text: &str,
+        images: &[ImageInput],
+        model: Option<&ModelInfo>,
+        variant: Option<&str>,
+        agent: Option<&str>,
+        message_id: Option<&str>,
     ) -> Result<PromptResponse> {
-        Err(not_implemented_error("prompt"))
+        if model.is_some() || variant.is_some() || agent.is_some() {
+            tracing::debug!(
+                "session {session_id}: V2 ignores per-prompt model/variant/agent \
+                 (session-scoped semantics land in S7)"
+            );
+        }
+        let admitted = self
+            .dispatch(http, session_id, text, images, message_id, None)
+            .await?;
+        self.wait_until_idle(http, session_id).await?;
+        self.completed_turn(http, session_id, &admitted).await
     }
 
+    /// Fire-and-forget prompt: the supplement path. V2 admits the message with
+    /// `delivery: "steer"`, so a message sent while a turn is in flight merges
+    /// into the running turn at its next step boundary — the same behaviour as
+    /// V1's `prompt_async` (ADR-0043) — and returns as soon as the admit is
+    /// durable. No wait is taken: the caller (the bridge) keeps its card live
+    /// through the render poll.
     #[allow(clippy::too_many_arguments)] // matches the trait's prompt axes
     async fn prompt_async(
         &self,
-        _http: &Transport,
-        _session_id: &str,
-        _text: &str,
-        _images: &[ImageInput],
+        http: &Transport,
+        session_id: &str,
+        text: &str,
+        images: &[ImageInput],
         _model: Option<&ModelInfo>,
         _variant: Option<&str>,
         _agent: Option<&str>,
-        _message_id: Option<&str>,
+        message_id: Option<&str>,
     ) -> Result<()> {
-        Err(not_implemented_error("prompt_async"))
+        self.dispatch(http, session_id, text, images, message_id, Some("steer"))
+            .await?;
+        tracing::info!("prompt_async sent to session {session_id} (V2 delivery=steer)");
+        Ok(())
     }
 
     async fn reply_permission(
@@ -239,48 +322,9 @@ impl GenerationStrategy for V2Strategy {
     /// so the loop stops on the first empty page; a failed read names itself
     /// and carries a body preview, like the module's other reads.
     async fn transcript(&self, http: &Transport, session_id: &str) -> Result<SessionTranscript> {
-        let mut data: Vec<serde_json::Value> = Vec::new();
-        let mut cursor: Option<String> = None;
-        let url = http.url(&format!("{SESSION}/{session_id}{SESSION_MESSAGES_SUFFIX}"));
-        for _ in 0..MAX_MESSAGE_PAGES {
-            let mut request = reqwest::Url::parse(&url)?;
-            {
-                let mut query = request.query_pairs_mut();
-                if let Some(cursor) = &cursor {
-                    query.append_pair("cursor", cursor);
-                } else {
-                    query.append_pair("order", "asc");
-                }
-                query.append_pair("limit", MESSAGE_PAGE_LIMIT);
-            }
-            let resp = http.client().get(request).send().await?;
-            let status = resp.status();
-            let text = resp.text().await?;
-            if !status.is_success() {
-                return Err(crate::error::BridgeError::OpenCode(format!(
-                    "transcript read failed: {status} — body: {}",
-                    &text[..text.len().min(BODY_PREVIEW_CHARS)]
-                )));
-            }
-            let page: wire::MessagesPage = serde_json::from_str(&text).map_err(|e| {
-                crate::error::BridgeError::OpenCode(format!(
-                    "transcript read parse: {e} — body: {}",
-                    &text[..text.len().min(BODY_PREVIEW_CHARS)]
-                ))
-            })?;
-            let empty = page.data.is_empty();
-            data.extend(page.data);
-            match page.cursor.next {
-                Some(next) if !empty => cursor = Some(next),
-                _ => return Ok(wire::decode_messages(&data)),
-            }
-        }
-        tracing::warn!(
-            "transcript {session_id}: cursor.next still present after {MAX_MESSAGE_PAGES} pages; \
-             returning the {} messages fetched so far",
-            data.len()
-        );
-        Ok(wire::decode_messages(&data))
+        Ok(wire::decode_messages(
+            &self.read_messages(http, session_id).await?,
+        ))
     }
 
     /// The run state for ONE session (V2 `GET /api/session/active`), with the
@@ -390,12 +434,301 @@ impl GenerationStrategy for V2Strategy {
         Ok(body.data.into_session_info()?)
     }
 
-    async fn interrupt(&self, _http: &Transport, _session_id: &str) -> Result<()> {
-        Err(not_implemented_error("interrupt"))
+    /// Interrupt the session's active execution (`POST
+    /// /api/session/{id}/interrupt`). The 200 `{interrupted: bool}` body is
+    /// deliberately ignored: `false` is the idle no-op (nothing to interrupt),
+    /// which is a success, not a failure.
+    async fn interrupt(&self, http: &Transport, session_id: &str) -> Result<()> {
+        let response = http
+            .client()
+            .post(http.url(&format!("{SESSION}/{session_id}{SESSION_INTERRUPT_SUFFIX}")))
+            .send()
+            .await?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let text = response.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::NOT_FOUND && is_session_not_found(&text) {
+            return Err(crate::error::BridgeError::SessionNotFound(session_id.to_string()));
+        }
+        Err(crate::error::BridgeError::OpenCode(format!(
+            "interrupt {session_id} failed: HTTP {status} — {}",
+            &text[..text.len().min(BODY_PREVIEW_CHARS)]
+        )))
+    }
+
+    /// Compact the session's context (`POST /api/session/{id}/compact`). V2
+    /// declares an all-optional payload, so an absent body fails the server's
+    /// payload decode and `{}` is the empty request; the `{data}` response is
+    /// ignored (any 2xx is success, as V1's 204 is).
+    async fn compact(&self, http: &Transport, session_id: &str) -> Result<()> {
+        http.client()
+            .post(http.url(&format!("{SESSION}/{session_id}/compact")))
+            .json(&serde_json::json!({}))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 }
 
 impl V2Strategy {
+    /// Durably admit one prompt (`POST /api/session/{id}/prompt`). `delivery`
+    /// is `Some("steer")` for the supplement path and `None` for the main
+    /// dispatch (the server default is steer as well). Returns the admitted
+    /// user-message id: the caller's `message_id` when set, else the server's.
+    ///
+    /// A 404 is mapped to [`crate::error::BridgeError::SessionNotFound`] only
+    /// when its `_tag` says so — the bridge's recreate-and-retry heal reads
+    /// that taxonomy, and an untagged proxy 404 must never trigger it.
+    async fn dispatch(
+        &self,
+        http: &Transport,
+        session_id: &str,
+        text: &str,
+        images: &[ImageInput],
+        message_id: Option<&str>,
+        delivery: Option<&str>,
+    ) -> Result<String> {
+        let mut body = serde_json::json!({ "text": text });
+        if !images.is_empty() {
+            body["files"] = serde_json::Value::Array(
+                images
+                    .iter()
+                    .map(|image| {
+                        // V2 attachments take a URI; a data URL is the inline
+                        // form the server decodes itself (V1's `file` part
+                        // carried the same URL).
+                        serde_json::json!({
+                            "uri": format!("data:{};base64,{}", image.mime, image.data_base64)
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        if let Some(message_id) = message_id {
+            body["id"] = serde_json::json!(message_id);
+        }
+        if let Some(delivery) = delivery {
+            body["delivery"] = serde_json::json!(delivery);
+        }
+        let response = http
+            .client()
+            .post(http.url(&format!("{SESSION}/{session_id}{SESSION_PROMPT_SUFFIX}")))
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        let text_body = response.text().await?;
+        if !status.is_success() {
+            if status == reqwest::StatusCode::NOT_FOUND && is_session_not_found(&text_body) {
+                return Err(crate::error::BridgeError::SessionNotFound(session_id.to_string()));
+            }
+            return Err(crate::error::BridgeError::OpenCode(format!(
+                "prompt {session_id} failed: HTTP {status} — {}",
+                &text_body[..text_body.len().min(BODY_PREVIEW_CHARS)]
+            )));
+        }
+        let admitted: wire::DataEnvelope<wire::RawAdmittedPrompt> = serde_json::from_str(&text_body)
+            .map_err(|error| {
+                crate::error::BridgeError::OpenCode(format!(
+                    "prompt admit decode: {error} — body: {}",
+                    &text_body[..text_body.len().min(BODY_PREVIEW_CHARS)]
+                ))
+            })?;
+        Ok(admitted.data.id)
+    }
+
+    /// Wait until the session's agent loop is idle: the experimental `wait`
+    /// endpoint first (ADR-0056), the `session.active` poll as its mandatory
+    /// degradation path when the route is absent or failing. A missing session
+    /// is surfaced either way.
+    async fn wait_until_idle(&self, http: &Transport, session_id: &str) -> Result<()> {
+        match self.wait_for_idle(http, session_id).await {
+            Ok(()) => Ok(()),
+            Err(WaitFailure::SessionNotFound) => {
+                Err(crate::error::BridgeError::SessionNotFound(session_id.to_string()))
+            }
+            Err(WaitFailure::Unavailable(reason)) => {
+                tracing::warn!(
+                    "session {session_id}: wait endpoint unavailable ({reason}); \
+                     falling back to session.active polling"
+                );
+                self.poll_until_idle(http, session_id).await
+            }
+        }
+    }
+
+    /// One `POST /api/experimental/session/{id}/wait` (204 = the agent loop is
+    /// idle). A 404 is only "the session is gone" when its `_tag` says so;
+    /// every other failure (an absent route, a 503 during migration, a
+    /// transport error) degrades to the poll fallback.
+    async fn wait_for_idle(
+        &self,
+        http: &Transport,
+        session_id: &str,
+    ) -> std::result::Result<(), WaitFailure> {
+        let response = http
+            .client()
+            .post(http.url(&format!("{SESSION_WAIT}/{session_id}/wait")))
+            .send()
+            .await
+            .map_err(|error| WaitFailure::Unavailable(format!("request failed: {error}")))?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let text = response.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::NOT_FOUND && is_session_not_found(&text) {
+            return Err(WaitFailure::SessionNotFound);
+        }
+        Err(WaitFailure::Unavailable(format!(
+            "HTTP {status} — {}",
+            &text[..text.len().min(BODY_PREVIEW_CHARS)]
+        )))
+    }
+
+    /// Poll `GET /api/session/active` until the session is absent — the same
+    /// event the `wait` endpoint resolves on (an execution owns the session
+    /// until its last successor settles). An entry with a type this build does
+    /// not recognise still counts as active: only absence means idle, never a
+    /// guess.
+    async fn poll_until_idle(&self, http: &Transport, session_id: &str) -> Result<()> {
+        loop {
+            let response = http.client().get(http.url(SESSION_ACTIVE)).send().await?;
+            let status = response.status();
+            let text = response.text().await?;
+            if !status.is_success() {
+                return Err(crate::error::BridgeError::OpenCode(format!(
+                    "session status failed: {status} — body: {}",
+                    &text[..text.len().min(BODY_PREVIEW_CHARS)]
+                )));
+            }
+            let active: wire::ActiveSessions = serde_json::from_str(&text).map_err(|error| {
+                crate::error::BridgeError::OpenCode(format!(
+                    "session status parse: {error} — body: {}",
+                    &text[..text.len().min(BODY_PREVIEW_CHARS)]
+                ))
+            })?;
+            if active.state(session_id).is_none() {
+                return Ok(());
+            }
+            tokio::time::sleep(IDLE_POLL_INTERVAL).await;
+        }
+    }
+
+    /// The prompt response for a turn that has settled: read the transcript,
+    /// anchor it at the admitted user message, and return the turn's assistant
+    /// parts plus any failure the turn recorded — the neutral contract V1's
+    /// blocking prompt answers inline.
+    ///
+    /// A read failure here is a downgrade, never a failed turn: `wait` already
+    /// observed the drain settle and the Bridge's own final read is the primary
+    /// render source, so an empty Ok response lets the turn complete there
+    /// instead of painting a finished turn as an error.
+    async fn completed_turn(
+        &self,
+        http: &Transport,
+        session_id: &str,
+        admitted_id: &str,
+    ) -> Result<PromptResponse> {
+        let raw = match self.read_messages(http, session_id).await {
+            Ok(raw) => raw,
+            Err(error) => {
+                tracing::warn!(
+                    "prompt {session_id}: transcript read failed after the wait ({error}); \
+                     returning the admitted id only"
+                );
+                return Ok(admitted_response(session_id, admitted_id));
+            }
+        };
+        let transcript = wire::decode_messages(&raw);
+        let anchor = transcript
+            .messages
+            .iter()
+            .find(|message| message.id.as_str() == admitted_id)
+            .and_then(|message| message.anchor());
+        let Some(anchor) = anchor else {
+            tracing::warn!(
+                "prompt {session_id}: admitted message {admitted_id} is not in the transcript; \
+                 returning the admitted id only"
+            );
+            return Ok(admitted_response(session_id, admitted_id));
+        };
+        let turn = transcript.turn_for_user(&anchor);
+        // The answer is the turn's newest assistant message; without one the
+        // admitted id is the only identity the response can carry.
+        let id = turn
+            .messages
+            .last()
+            .map(|message| message.id.as_str())
+            .unwrap_or(admitted_id)
+            .to_string();
+        Ok(PromptResponse {
+            id,
+            session_id: Some(session_id.to_string()),
+            admitted_seq: None,
+            // V1's `parent_id` is the user message the returned message
+            // answers; here the admitted message itself.
+            parent_id: Some(admitted_id.to_string()),
+            error: wire::turn_error(&raw, anchor.created_ms),
+            parts: turn
+                .messages
+                .iter()
+                .flat_map(|message| message.parts.iter().cloned())
+                .collect(),
+        })
+    }
+
+    /// Read the session's projected messages, decoded-ready: the raw `data`
+    /// arrays a `GET /api/session/{id}/message` read carries, in server order.
+    /// Shared by the transcript decode and the prompt response's turn read.
+    async fn read_messages(&self, http: &Transport, session_id: &str) -> Result<Vec<serde_json::Value>> {
+        let mut data: Vec<serde_json::Value> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let url = http.url(&format!("{SESSION}/{session_id}{SESSION_MESSAGES_SUFFIX}"));
+        for _ in 0..MAX_MESSAGE_PAGES {
+            let mut request = reqwest::Url::parse(&url)?;
+            {
+                let mut query = request.query_pairs_mut();
+                if let Some(cursor) = &cursor {
+                    query.append_pair("cursor", cursor);
+                } else {
+                    query.append_pair("order", "asc");
+                }
+                query.append_pair("limit", MESSAGE_PAGE_LIMIT);
+            }
+            let resp = http.client().get(request).send().await?;
+            let status = resp.status();
+            let text = resp.text().await?;
+            if !status.is_success() {
+                return Err(crate::error::BridgeError::OpenCode(format!(
+                    "transcript read failed: {status} — body: {}",
+                    &text[..text.len().min(BODY_PREVIEW_CHARS)]
+                )));
+            }
+            let page: wire::MessagesPage = serde_json::from_str(&text).map_err(|e| {
+                crate::error::BridgeError::OpenCode(format!(
+                    "transcript read parse: {e} — body: {}",
+                    &text[..text.len().min(BODY_PREVIEW_CHARS)]
+                ))
+            })?;
+            let empty = page.data.is_empty();
+            data.extend(page.data);
+            match page.cursor.next {
+                Some(next) if !empty => cursor = Some(next),
+                _ => return Ok(data),
+            }
+        }
+        tracing::warn!(
+            "transcript {session_id}: cursor.next still present after {MAX_MESSAGE_PAGES} pages; \
+             returning the {} messages fetched so far",
+            data.len()
+        );
+        Ok(data)
+    }
+
     /// Whether the newest assistant message of `session_id` carries a scheduled
     /// `retry`. Reads ONE projected message (`type=assistant&order=desc&
     /// limit=1`) — the minimal wire read that answers the run-state question

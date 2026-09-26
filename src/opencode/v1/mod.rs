@@ -42,6 +42,9 @@ const SESSION_LIST: &str = "/experimental/session";
 const SESSION_LIST_FALLBACK: &str = "/session";
 /// The session root (info, message read, prompt, abort).
 const SESSION: &str = "/session";
+/// The `/api` session root, shared with V2 for the calls V1 itself serves
+/// there (session creation on the adapter, compaction here).
+const API_SESSION: &str = "/api/session";
 /// The per-session run-state map.
 const SESSION_STATUS: &str = "/session/status";
 /// The global permission list / reply root.
@@ -604,6 +607,19 @@ impl GenerationStrategy for V1Strategy {
         // old `/api/session/{id}/interrupt` 404'd so `/stop` silently failed.
         http.client()
             .post(http.url(&format!("{SESSION}/{session_id}/abort")))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Compact a session's context (`POST /api/session/{id}/compact`, the
+    /// `/api` surface both generations serve). V1 sends no body and answers
+    /// **204 No Content**; V2's payload/response shape lives in its own
+    /// strategy.
+    async fn compact(&self, http: &Transport, session_id: &str) -> Result<()> {
+        http.client()
+            .post(http.url(&format!("{API_SESSION}/{session_id}/compact")))
             .send()
             .await?
             .error_for_status()?;

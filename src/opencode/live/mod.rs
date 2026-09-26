@@ -4,12 +4,15 @@
 //!
 //! Two generations share the harness: the **V1** capability chain
 //! (`live_v1_scripted_capability_chain`: prompt → streamed reasoning → tool
-//! call → permission round-trip → final text) and the **V2** read chain
-//! (`live_v2_scripted_transcript_read`: admit one scripted turn, then assert
-//! the decoded transcript and its projections). Each test spawns the binary of
-//! its own generation into its own temp store, so neither can touch the
-//! machine's default store, credentials or config; each refuses a binary of
-//! the other generation.
+//! call → permission round-trip → final text) and the **V2** chains — the
+//! transcript read with the production prompt (`live_v2_scripted_transcript_read`:
+//! the blocking prompt runs while the turn streams, then the decoded transcript
+//! and its projections are asserted) and the write surface
+//! (`live_v2_scripted_write_chain`: supplement steering, retry idempotency,
+//! interrupt, compact and title rename). Each test spawns the binary of its own
+//! generation into its own temp store, so neither can touch the machine's
+//! default store, credentials or config; each refuses a binary of the other
+//! generation.
 //!
 //! These tests are `#[ignore]`-gated, so `cargo test --workspace --locked`
 //! stays hermetic and credential-free. Run one generation with the pinned
@@ -26,9 +29,9 @@
 //! the harness needs (and is what keeps the default store untouched).
 //!
 //! The assertion is structural: ids and timestamps vary run to run; membership,
-//! order and content are asserted. The V2 turn's admit is raw protocol
-//! scaffolding (slice S5 owns production prompt dispatch); the read path under
-//! test is the production adapter's.
+//! order and content are asserted. Both V2 chains drive the production adapter:
+//! the prompt goes through the strategy's blocking polyfill (`session.wait`
+//! plus the poll fallback), never a raw protocol admit.
 //!
 //! ## Re-recording the fixture corpus
 //!
@@ -55,6 +58,10 @@ use server::LiveServer;
 
 /// The prompt text; asserted back from the user message.
 const PROMPT_TEXT: &str = "run the live harness command";
+/// The supplement text steered into the running V2 turn.
+const SUPPLEMENT_TEXT: &str = "also note the supplement";
+/// The title the V2 write chain renames the session to.
+const RENAMED_TITLE: &str = "live v2 renamed title";
 /// How long the readiness and permission polls wait before failing the test.
 const POLL_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the post-prompt idle wait gets — the run state clears a beat after
@@ -157,16 +164,11 @@ async fn live_v1_scripted_capability_chain() {
     assert_provider_requests(&provider.requests());
 }
 
-/// The V2 read chain against the pinned V2 server: create a session through
-/// the generation-blind adapter, admit one scripted turn, watch the transcript
-/// mid-turn and at rest, and assert the neutral projections the Session
-/// Snapshot tail, the external-message sync and the follow renderers consume —
-/// no duplicated text, correct turn anchoring.
-///
-/// The prompt itself is admitted raw: V2's production dispatch (the strategy's
-/// `prompt` plus its synchronous polyfill) is slice S5's work, and this read
-/// slice must run against a real server turn rather than a fixture. Slice S5
-/// replaces [`admit_v2_prompt`] with the adapter call.
+/// The V2 read chain against the pinned V2 server: prompt through the
+/// production adapter (the blocking polyfill holds while the turn streams),
+/// watch the transcript mid-turn and at rest, and assert the neutral
+/// projections the Session Snapshot tail, the external-message sync and the
+/// follow renderers consume — no duplicated text, correct turn anchoring.
 #[tokio::test]
 #[ignore = "live: needs a V2 binary (see the module docs)"]
 async fn live_v2_scripted_transcript_read() {
@@ -198,7 +200,25 @@ async fn live_v2_scripted_transcript_read() {
         .unwrap_or_else(|error| panic!("create session failed: {error}\n{}", server.stderr()));
 
     let message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
-    admit_v2_prompt(server.base_url(), &session.id, PROMPT_TEXT, &message_id).await;
+    // The V2 prompt is admit-then-wait, and the polyfill blocks until the run is
+    // idle, so the prompt runs concurrently with the in-flight read below —
+    // exactly the shape the Bridge's Turn is built around.
+    let prompt_backend = backend.clone();
+    let prompt_session = session.id.clone();
+    let prompt_message_id = message_id.clone();
+    let prompt = tokio::spawn(async move {
+        prompt_backend
+            .prompt(
+                &prompt_session,
+                PROMPT_TEXT,
+                &[],
+                None,
+                None,
+                None,
+                Some(&prompt_message_id),
+            )
+            .await
+    });
 
     // Mid-turn: the projected assistant message is one row that carries its
     // content while it streams, so the first read that sees a live tool captures
@@ -240,6 +260,33 @@ async fn live_v2_scripted_transcript_read() {
         &url,
     )
     .await;
+
+    // The production prompt's blocking wait returns with the turn's reply: the
+    // polyfill's decoded parts carry the closing text exactly once.
+    let response = prompt
+        .await
+        .expect("the prompt task must not panic")
+        .unwrap_or_else(|error| panic!("prompt failed: {error}\n{}", server.stderr()));
+    assert!(
+        response.error.is_none(),
+        "the prompt must not report a model error: {:?}",
+        response.error
+    );
+    assert_eq!(
+        response.parent_id.as_deref(),
+        Some(message_id.as_str()),
+        "the polyfilled response answers the admitted message"
+    );
+    assert_eq!(
+        response
+            .parts
+            .iter()
+            .filter(|part| matches!(part, Part::Text(text) if text.text == provider::FINAL_TEXT))
+            .count(),
+        1,
+        "the closing deltas assemble into exactly one part on the response: {:#?}",
+        response.parts
+    );
 
     // At rest: the terminal finish ends the turn and every marker is present
     // exactly once.
@@ -325,22 +372,230 @@ async fn live_v2_scripted_transcript_read() {
     );
 }
 
-/// Admit one V2 turn over the protocol's own prompt route. Slice S5 replaces
-/// this with the adapter's `prompt` (plus its synchronous polyfill); until
-/// then the read slice seeds a real server turn, never a fake one.
-async fn admit_v2_prompt(base_url: &str, session_id: &str, text: &str, message_id: &str) {
-    let response = crate::test_http::no_proxy_transport()
-        .post(format!("{base_url}/api/session/{session_id}/prompt"))
-        .basic_auth("opencode", Some(server::PASSWORD))
-        .json(&serde_json::json!({ "id": message_id, "text": text }))
-        .send()
+/// The V2 write surface against the pinned V2 server: the production prompt
+/// (blocking polyfill) with a mid-turn Supplement steered into the running
+/// turn, the cola-chosen id persisted and retry-idempotent, then interrupt,
+/// compact and the title rename.
+#[tokio::test]
+#[ignore = "live: needs a V2 binary (see the module docs)"]
+async fn live_v2_scripted_write_chain() {
+    let binary = live_v2_binary();
+    let version = server::ensure_v2_binary(&binary).await;
+    eprintln!("live V2 binary: {binary} ({version})");
+
+    let provider = provider::start_with(provider::Tool::Shell, provider::ToolCommand::Slow).await;
+    let server = LiveServer::start_v2(&binary, &provider.base_url()).await;
+
+    let backend = OpenCodeBackend::with_generation(
+        Some(provider::MODEL_REF),
+        server.base_url(),
+        Some("opencode"),
+        Some(server::PASSWORD),
+        Generation::V2,
+        None,
+    );
+    backend.disable_env_proxy(Some("opencode"), Some(server::PASSWORD));
+
+    wait_for_ready(&backend, &server).await;
+
+    let work_dir = server.work_dir();
+    let session = backend
+        .create_session(&backend.new_session_input(Some(&work_dir)))
         .await
-        .expect("admit the V2 prompt");
-    let status = response.status();
+        .unwrap_or_else(|error| panic!("create session failed: {error}\n{}", server.stderr()));
+
+    // The prompt blocks inside the polyfill; the supplement is steered in while
+    // the scripted slow tool runs, so the running turn must merge it.
+    let message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
+    let supplement_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
+    let prompt_backend = backend.clone();
+    let prompt_session = session.id.clone();
+    let prompt_message_id = message_id.clone();
+    let prompt = tokio::spawn(async move {
+        prompt_backend
+            .prompt(
+                &prompt_session,
+                PROMPT_TEXT,
+                &[],
+                None,
+                None,
+                None,
+                Some(&prompt_message_id),
+            )
+            .await
+    });
+    poll_until(
+        "the live tool so the supplement can steer mid-turn",
+        POLL_TIMEOUT,
+        || async {
+            let transcript = backend.transcript(&session.id).await?;
+            Ok(has_live_tool(&transcript).then_some(()))
+        },
+        || server.stderr(),
+    )
+    .await;
+    backend
+        .prompt_async(
+            &session.id,
+            SUPPLEMENT_TEXT,
+            &[],
+            None,
+            None,
+            None,
+            Some(&supplement_id),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("supplement admit failed: {error}\n{}", server.stderr()));
+
+    let response = prompt
+        .await
+        .expect("the prompt task must not panic")
+        .unwrap_or_else(|error| panic!("prompt failed: {error}\n{}", server.stderr()));
     assert!(
-        status.is_success(),
-        "the V2 prompt admit must succeed: {status} — {}",
-        response.text().await.unwrap_or_default()
+        response.error.is_none(),
+        "the supplemented turn must not report a model error: {:?}",
+        response.error
+    );
+
+    let transcript = poll_until(
+        "the supplemented V2 turn to complete",
+        POLL_TIMEOUT,
+        || async {
+            let transcript = backend.transcript(&session.id).await?;
+            let Some(anchor) = transcript
+                .messages
+                .iter()
+                .find(|message| message.id.as_str() == message_id)
+                .and_then(|message| message.anchor())
+            else {
+                return Ok(None);
+            };
+            Ok(transcript.turn_for_user(&anchor).complete.then_some(transcript))
+        },
+        || server.stderr(),
+    )
+    .await;
+
+    // The supplement merged into the same turn: both user messages carry their
+    // cola ids, and the turn closed on the scripted final text.
+    assert_user_anchor(&transcript, &message_id);
+    let supplement = transcript
+        .messages
+        .iter()
+        .find(|message| message.id.as_str() == supplement_id)
+        .unwrap_or_else(|| panic!("the steered supplement must be in the transcript: {transcript:#?}"));
+    assert_eq!(
+        supplement.role,
+        MessageRole::User,
+        "the supplement is a user message"
+    );
+    assert_eq!(supplement.text(), SUPPLEMENT_TEXT);
+    assert!(
+        crate::opencode::parsing::is_cola_message_id(supplement.id.as_str()),
+        "V2 must persist the supplement's cola-chosen id: {supplement:#?}"
+    );
+    assert_tool_call(&transcript, provider::Tool::Shell, provider::ToolCommand::Slow);
+    assert_streamed_reasoning(&transcript);
+    assert_final_text(&transcript);
+    assert_turn_complete(&transcript, &message_id);
+
+    // Retry idempotency: the same cola id reconciles onto the durable message
+    // instead of admitting a second user message or running a second turn.
+    let retry = backend
+        .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
+        .await
+        .unwrap_or_else(|error| panic!("retry failed: {error}\n{}", server.stderr()));
+    assert!(retry.error.is_none());
+    let transcript = backend
+        .transcript(&session.id)
+        .await
+        .unwrap_or_else(|error| panic!("transcript read failed: {error}\n{}", server.stderr()));
+    assert_eq!(
+        transcript
+            .messages
+            .iter()
+            .filter(|message| message.id.as_str() == message_id)
+            .count(),
+        1,
+        "a retry with the same id must not duplicate the user message: {transcript:#?}"
+    );
+    assert_eq!(
+        transcript
+            .messages
+            .iter()
+            .filter(|message| message.id.as_str() == supplement_id)
+            .count(),
+        1,
+        "the retry must not disturb the supplement: {transcript:#?}"
+    );
+
+    // Interrupt: a fresh slow turn is stopped mid-flight; the blocking prompt
+    // unblocks, the interrupt answers as an accepted op, and the session idles.
+    // A fresh session keeps the scripted provider's first call a tool call (the
+    // transcript above already carries a tool result).
+    let interrupt_session = backend
+        .create_session(&backend.new_session_input(Some(&work_dir)))
+        .await
+        .unwrap_or_else(|error| panic!("create interrupt session failed: {error}\n{}", server.stderr()));
+    let interrupt_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
+    let prompt_backend = backend.clone();
+    let prompt_session = interrupt_session.id.clone();
+    let interrupt_message_id = interrupt_id.clone();
+    let interrupted = tokio::spawn(async move {
+        prompt_backend
+            .prompt(
+                &prompt_session,
+                PROMPT_TEXT,
+                &[],
+                None,
+                None,
+                None,
+                Some(&interrupt_message_id),
+            )
+            .await
+    });
+    poll_until(
+        "the interrupt turn's live tool",
+        POLL_TIMEOUT,
+        || async {
+            let transcript = backend.transcript(&interrupt_session.id).await?;
+            Ok(has_live_tool(&transcript).then_some(()))
+        },
+        || server.stderr(),
+    )
+    .await;
+    backend
+        .interrupt(&interrupt_session.id)
+        .await
+        .unwrap_or_else(|error| panic!("interrupt failed: {error}\n{}", server.stderr()));
+    let interrupted = tokio::time::timeout(POLL_TIMEOUT, interrupted)
+        .await
+        .unwrap_or_else(|_| panic!("the interrupted prompt must return\n{}", server.stderr()))
+        .expect("the prompt task must not panic");
+    assert!(
+        interrupted.is_ok(),
+        "the interrupted prompt must complete, not fail: {interrupted:?}"
+    );
+    wait_for_idle(&backend, &interrupt_session.id, &work_dir, &server).await;
+
+    // Compact and the title rename: V2's compact needs its empty payload, and
+    // the 204 title patch must persist for the session surfaces.
+    backend
+        .compact(&session.id)
+        .await
+        .unwrap_or_else(|error| panic!("compact failed: {error}\n{}", server.stderr()));
+    backend
+        .update_session_title(&session.id, RENAMED_TITLE)
+        .await
+        .unwrap_or_else(|error| panic!("title rename failed: {error}\n{}", server.stderr()));
+    let info = backend
+        .session_info(&session.id, Some(&work_dir))
+        .await
+        .unwrap_or_else(|error| panic!("session info failed: {error}\n{}", server.stderr()));
+    assert_eq!(
+        info.title.as_deref(),
+        Some(RENAMED_TITLE),
+        "V2's 204 title patch must persist"
     );
 }
 

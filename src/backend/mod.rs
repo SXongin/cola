@@ -141,6 +141,9 @@ pub trait Backend: Send + Sync {
     /// create (ADR-0026: `msg_cola_` self-identifies cola-authored messages;
     /// the server persists it, and reusing it on a retry is idempotent). None
     /// falls back to a server-generated id.
+    ///
+    /// The blocking contract is generation-blind: V1 blocks natively, V2
+    /// polyfills the block with `session.wait` plus a poll fallback (ADR-0056).
     #[allow(clippy::too_many_arguments)] // prompt axes: session/text/images + model/variant/agent/message-id
     async fn prompt(
         &self,
@@ -221,6 +224,9 @@ pub trait Backend: Send + Sync {
 
     async fn interrupt(&self, session_id: &str) -> Result<()>;
 
+    /// Compact a session's context. V1 takes no request body and answers 204;
+    /// V2 takes an empty payload and answers `{data}` — the strategy owns the
+    /// generation's shape.
     async fn compact(&self, session_id: &str) -> Result<()>;
 
     /// Re-point the backend at a (re)discovered attachment, selecting that

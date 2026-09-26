@@ -1,0 +1,59 @@
+# The pinned OpenCode **V2** install, in one place: the advisory `Live V2` job
+# runs exactly this fingerprint. V2 ships as npm packages (`@opencode/cli` plus
+# a platform binary package), so unlike V1 there is no tarball URL; the version
+# lives once, in the `version` input default, and the cache key derives from it.
+# npm >= 12 blocks install scripts, so the metapackage's `postinstall.mjs` —
+# which links the platform binary into place — is run explicitly. The resolved
+# binary's SHA256 is re-verified on every run, hit or miss, so a poisoned cache
+# fails loudly instead of installing.
+#
+# The digest pins `@opencode/cli-linux-x64@<version>`'s binary, which is what
+# the postinstall resolves on GitHub's linux x64 runners (the metapackage picks
+# the `-baseline` build only when the CPU lacks AVX2, and that mismatch fails
+# the verification below by design). V2's pin is independent of V1's
+# (`.github/actions/install-opencode-v1`) and never moves with V1 retirement
+# (spec #364 §11).
+name: Install OpenCode V2
+description: Install and verify the pinned OpenCode V2 (linux-x64) binary and expose it as `opencode2` on PATH.
+
+inputs:
+  version:
+    description: The pinned OpenCode version. Bumps move this and the SHA256 below together.
+    required: false
+    default: 2.0.18
+
+runs:
+  using: composite
+  steps:
+    - name: Cache the pinned install
+      id: cache
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ~/.cache/opencode-v2
+        key: opencode-v2-${{ inputs.version }}-linux-x64
+
+    - name: Install OpenCode ${{ inputs.version }}
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        prefix="$HOME/.cache/opencode-v2"
+        mkdir -p "$prefix"
+        # `--ignore-scripts` keeps the install deterministic across npm
+        # versions; the postinstall is run explicitly right after.
+        npm install --no-audit --no-fund --ignore-scripts --prefix "$prefix" "@opencode/cli@${VERSION}"
+        (cd "$prefix/node_modules/@opencode/cli" && node ./postinstall.mjs)
+
+    - name: Verify and expose
+      shell: bash
+      env:
+        SHA256: 10d405161d8b9595f4a2ec31254e961969e6ca3f8239ac9bd55b6ff6431dc24f
+      run: |
+        set -euo pipefail
+        binary="$HOME/.cache/opencode-v2/node_modules/@opencode/cli/bin/opencode.exe"
+        echo "$SHA256  $binary" | sha256sum -c -
+        mkdir -p "$HOME/.cache/opencode-v2/bin"
+        ln -sf "$binary" "$HOME/.cache/opencode-v2/bin/opencode2"
+        echo "$HOME/.cache/opencode-v2/bin" >> "$GITHUB_PATH"

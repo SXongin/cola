@@ -7,7 +7,7 @@
 
 use serde_json::{Map, json};
 
-use crate::opencode::conformance::{SessionReadCase, SessionReadFixture, TranscriptFixture};
+use crate::opencode::conformance::{PromptFixture, SessionReadCase, SessionReadFixture, TranscriptFixture};
 use crate::opencode::strategy::Generation;
 use crate::test_http::{MockResponse, TestHttpServer};
 
@@ -19,6 +19,7 @@ pub(crate) fn session_read_case() -> SessionReadCase {
         mount,
         mount_transcript,
         mount_recorded_transcript,
+        mount_prompt,
     }
 }
 
@@ -201,5 +202,59 @@ fn mount_recorded_transcript(server: &TestHttpServer, session_id: &str, body: &s
             MockResponse::json(body),
             MockResponse::json(json!({"data": [], "cursor": {}}).to_string()),
         ],
+    );
+}
+
+/// Mount V2's write path with one scripted turn: the durable admit, the
+/// experimental wait (204), and the transcript read the synchronous polyfill
+/// performs to rebuild the reply. The shared [`PromptFixture`] names the
+/// values; only V2's spellings live here.
+fn mount_prompt(server: &TestHttpServer, fixture: &PromptFixture) {
+    server.route(
+        "POST",
+        &format!("/api/session/{}/prompt", fixture.session),
+        200,
+        json!({
+            "data": {
+                "id": fixture.message_id,
+                "sessionID": fixture.session,
+                "type": "user",
+                "delivery": "steer",
+                "time": {"created": 1},
+                "payload": {"text": fixture.text},
+            },
+        })
+        .to_string(),
+    );
+    server.route(
+        "POST",
+        &format!("/api/experimental/session/{}/wait", fixture.session),
+        204,
+        "",
+    );
+    server.route(
+        "GET",
+        &format!("/api/session/{}/message", fixture.session),
+        200,
+        json!({
+            "data": [
+                {
+                    "id": fixture.message_id,
+                    "type": "user",
+                    "time": {"created": 1000},
+                    "text": fixture.text,
+                },
+                {
+                    "id": fixture.answer_id,
+                    "type": "assistant",
+                    "time": {"created": 1010, "completed": 1100},
+                    "model": {"id": "deepseek-v4-flash", "providerID": "opencode-go"},
+                    "content": [{"type": "text", "text": fixture.answer_text}],
+                    "finish": "stop",
+                },
+            ],
+            "cursor": {},
+        })
+        .to_string(),
     );
 }

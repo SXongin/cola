@@ -50,7 +50,10 @@ pub(crate) trait GenerationStrategy: Send + Sync {
 
     /// A synchronous prompt: the call returns only when the turn is done, with
     /// the assistant response inline. `model` is already the effective model
-    /// (the adapter resolved the configured default before dispatch).
+    /// (the adapter resolved the configured default before dispatch). V1 blocks
+    /// natively; V2 has no synchronous prompt and polyfills the block with the
+    /// experimental `session.wait` endpoint plus a poll fallback (ADR-0056), so
+    /// the trait's contract is the same on both generations.
     #[allow(clippy::too_many_arguments)] // prompt axes: session/text/images + model/variant/agent/message-id
     async fn prompt(
         &self,
@@ -139,6 +142,13 @@ pub(crate) trait GenerationStrategy: Send + Sync {
     ) -> Result<SessionInfo>;
 
     async fn interrupt(&self, http: &Transport, session_id: &str) -> Result<()>;
+
+    /// Compact a session's context. The endpoint path is the `/api` surface
+    /// both generations serve, but the contract around it is not shared: V1
+    /// takes no body and answers 204, V2 takes an all-optional payload and
+    /// answers a `{data}` envelope. The strategy owns which body is sent (and
+    /// whether one is sent at all).
+    async fn compact(&self, http: &Transport, session_id: &str) -> Result<()>;
 }
 
 /// An OpenCode protocol generation cola can speak (CONTEXT.md "Generation").
