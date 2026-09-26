@@ -37,7 +37,7 @@ pub struct SessionListInfo {
 
 impl SessionListInfo {
     /// Sub-task child sessions (created by the `task` tool) keep a `parentID`
-    /// and are excluded from `/switch` auto-adoption and the default `/list`.
+    /// and are excluded from `/switch` auto-adoption and the `/switch` card.
     pub fn is_child(&self) -> bool {
         self.parent_id.is_some()
     }

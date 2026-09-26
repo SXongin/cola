@@ -370,8 +370,7 @@ detailed help for any of these.
 | `/claim <code>` | Claim this cola as Host (private chat only; code from the startup log) |
 | `/dir` | Recent Directories card: pick a folder and declare a session there, or open it as a fresh topic (每行「建话题」= `/topic <dir>` 的免打字版) |
 | `/switch` | Session card: browse / search / adopt / new |
-| `/switch <kw>` | Switch to a session by name/dir/id (adopts foreign ones) |
-| `/switch list [kw] [--all]` | List recent sessions across the shared store (up to 15) |
+| `/switch <kw>` | Switch to a session by name/dir/id (adopts foreign ones; no match opens the card pre-filtered) |
 | `/switch <id> [--force]` | Take over a session by id/title |
 | `/switch forget` | Un-map this chat's session (the server session stays) |
 | `/new [name]` | Declare a new session in the current project — created by the next message (no session → default dir) |

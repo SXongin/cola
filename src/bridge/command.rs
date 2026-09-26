@@ -5,8 +5,8 @@ pub enum Command {
     Dir(String),
     /// `/dir` (no args) — interactive Recent Directories card.
     DirCard,
-    /// Session management (`/switch ...`): match, list, forget, adopt, or the
-    /// interactive card. Absorbed the old `/list`, `/attach`, `/forget`.
+    /// Session management (`/switch ...`): match, forget, adopt, or the
+    /// interactive card. Absorbed the old `/attach` and `/forget`.
     Switch(SwitchAction),
     /// Create a fresh session, optionally named
     New(Option<String>),
@@ -121,8 +121,6 @@ pub enum SwitchAction {
     /// `/switch <keyword>` — matching rules: thread's sessions first, then a
     /// unique global match is adopted (ADR-0008).
     Match(String),
-    /// `/switch list [keyword] [--all]` — the old `/list`.
-    List { keyword: Option<String>, all: bool },
     /// `/switch forget` — the old `/forget`.
     Forget,
     /// `/switch <id|title> [--force]` — the old `/attach`.
@@ -169,20 +167,6 @@ pub fn parse_command(text: &str) -> Option<Command> {
                     } else {
                         words.push(w);
                     }
-                }
-                // `/switch list [keyword] [--all]` — the old `/list`.
-                if words.first().map(|w| w.to_lowercase()) == Some("list".into()) {
-                    let mut keyword = None;
-                    let mut all = false;
-                    for w in words.iter().skip(1) {
-                        if *w == "--all" {
-                            all = true;
-                        } else {
-                            keyword =
-                                Some(keyword.map_or_else(|| w.to_string(), |k: String| format!("{k} {w}")));
-                        }
-                    }
-                    return Some(Command::Switch(SwitchAction::List { keyword, all }));
                 }
                 // `/switch forget` — the old `/forget`.
                 if words.first().map(|w| w.to_lowercase()) == Some("forget".into()) && words.len() == 1 {
@@ -292,7 +276,6 @@ pub fn help_text() -> String {
 `/dir <path> [name]` · Declare a new session in a project directory (created by the next message)
 `/switch` · Session card: browse / search / adopt / new
 `/switch <kw>` · Switch to a session by name/dir/id (adopts foreign ones)
-`/switch list [kw] [--all]` · List recent sessions across the store
 `/switch <id> [--force]` · Take over a session by id/title
 `/switch forget` · Un-map this chat's session (server session stays)
 `/new [name]` · Declare a new session in the current project (created by the next message; no session → default dir)
@@ -324,10 +307,7 @@ pub fn command_help(name: &str) -> Option<String> {
             "/dir <path> [name]\nDeclare a new session rooted at <path>: nothing is created yet — the conversation's next non-command message creates the session in that directory and maps it here, so a mistaken `/dir` can be corrected with another `/dir`, `/new`, `/switch` or `/topic` and leaves no session behind.\n- `/dir` (no arg) — Recent Directories card: pick a recently-used folder and declare it there, or open it as a fresh topic (each row's 建话题 = `/topic <dir>` without typing; only from the main conversation). When there are many directories, the card carries a search box over the paths.\nExample: `/dir /root/proj/lib`"
         }
         "switch" => {
-            "/switch [action]\nSession management card and text forms.\n- `/switch` (no arg) — interactive session card (browse / search / adopt / new)\n- `/switch <keyword>` — switch by title/directory/id; the current chat's sessions win, otherwise a unique global match is adopted. Ambiguous keywords list candidates.\n- `/switch list [keyword] [--all]` — list recent sessions across the store (up to 15)\n- `/switch <id|title> [--force]` — take over a session (exact id → id-prefix → title; the card's short hash works too; reject if owned by another chat unless `--force`, or use the card's 强制接管 button)\n- `/switch forget` — un-map this chat's session (server session stays)\nExamples: `/switch backend`, `/switch list cola`, `/switch ses_abc --force`"
-        }
-        "list" => {
-            "/switch list [keyword] [--all]\nList recently-active sessions across the shared store (up to 15): title, directory, id and last activity. A keyword filters by title/directory/id; `--all` also shows sub-task child sessions.\nExample: `/switch list cola`"
+            "/switch [action]\nSession management card and text forms.\n- `/switch` (no arg) — interactive session card (browse / search / adopt / new)\n- `/switch <keyword>` — switch by title/directory/id; the current chat's sessions win, otherwise a unique global match is adopted. Ambiguous keywords list candidates; no match opens the card pre-filtered by the keyword.\n- `/switch <id|title> [--force]` — take over a session (exact id → id-prefix → title; the card's short hash works too; reject if owned by another chat unless `--force`, or use the card's 强制接管 button)\n- `/switch forget` — un-map this chat's session (server session stays)\nExamples: `/switch backend`, `/switch ses_abc --force`"
         }
         "attach" => {
             "/switch <id|title> [--force]\nTake over a session created outside Feishu into this chat. Resolution: exact id → unique id-prefix (the short hash shown on the card works too) → unique title substring. If the session already belongs to another chat, show its owner and reject unless `--force`.\nExample: `/switch ses_abc123`"
@@ -393,7 +373,7 @@ pub fn command_help(name: &str) -> Option<String> {
 // `card::help`); this module keeps the parser, the dispatch match and the
 // text-command behavior (spec #298, ticket D).
 
-use crate::bridge::display::{id_tail, title_or_id_tail};
+use crate::bridge::display::id_tail;
 use crate::bridge::handles::CommandHandles;
 use crate::config::{ConversationKind, SessionEntry, ThreadKey};
 use crate::feishu;
@@ -1176,9 +1156,6 @@ async fn handle_switch_action(
             Ok(())
         }
         SwitchAction::Match(keyword) => handle_switch(handles, thread_key, &keyword, message_id, kind).await,
-        SwitchAction::List { keyword, all } => {
-            handle_list(handles, thread_key, keyword.as_deref(), all, message_id).await
-        }
         SwitchAction::Forget => {
             let removed = handles.flow.sessions.remove_thread_sessions(thread_key).await?;
             if removed.is_empty() {
@@ -1194,7 +1171,7 @@ async fn handle_switch_action(
                     .reply_text(
                         message_id,
                         &format!(
-                            "已解除{}的映射（服务器会话仍保留，可用 `/switch list` 重新找到）。",
+                            "已解除{}的映射（服务器会话仍保留，可用 `/switch` 卡片或 `/switch <关键词>` 重新找到）。",
                             crate::bridge::display::feishu_side_label(thread_key)
                         ),
                     )
@@ -1271,7 +1248,7 @@ async fn handle_switch(
             &hit.id,
             &hit.directory,
             &hit.title,
-            // The text form has no switch list to return to.
+            // The text form has no card list to return to.
             None,
         )
         .await
@@ -1341,86 +1318,6 @@ async fn handle_switch(
         message_id,
     )
     .await?;
-    Ok(())
-}
-
-/// `/list [keyword] [--all]` — a cached, recently-active list of every
-/// session in the shared store (ADR-0008), so sessions created outside
-/// Feishu become visible. Sorted by last activity (client-side), capped at
-/// 15; children and archived hidden unless `--all`.
-async fn handle_list(
-    handles: &CommandHandles,
-    thread_key: &ThreadKey,
-    keyword: Option<&str>,
-    all: bool,
-    message_id: &str,
-) -> crate::error::Result<()> {
-    let sessions = handles
-        .flow
-        .sessions
-        .cached_session_list(&handles.flow.backend)
-        .await?;
-    let lower = keyword.map(|k| k.to_lowercase());
-    let mut shown: Vec<crate::opencode::types::SessionListInfo> = sessions
-        .into_iter()
-        .filter(|s| {
-            if !all && (s.is_child() || s.time.as_ref().map(|t| t.is_archived()).unwrap_or(false)) {
-                return false;
-            }
-            match &lower {
-                Some(l) => matches_keyword(s, l),
-                None => true,
-            }
-        })
-        .collect();
-    shown.sort_by(|a, b| {
-        let ub = b.time.as_ref().map(|t| t.updated).unwrap_or(0);
-        let ua = a.time.as_ref().map(|t| t.updated).unwrap_or(0);
-        ub.cmp(&ua)
-    });
-    shown.truncate(15);
-
-    if shown.is_empty() {
-        handles
-            .flow
-            .platform
-            .reply_text(message_id, "No sessions matching the filter.")
-            .await?;
-        return Ok(());
-    }
-
-    let active_id = {
-        let store = handles.flow.sessions.store.lock().await;
-        store.get_active(thread_key).map(|e| e.session_id.clone())
-    };
-    let mut list = String::from("**Recent sessions:**\n");
-    for s in &shown {
-        // ADR-0022: only the active session is marked; the confusing
-        // 「本会话」 ownership marker on mapped-but-not-active rows is dropped
-        // (the switch card carries the 切换/接管 distinction instead).
-        let mark = if active_id.as_deref() == Some(&s.id) {
-            " (active)"
-        } else {
-            ""
-        };
-        let rel = s
-            .time
-            .as_ref()
-            .map(|t| relative_time(t.updated))
-            .unwrap_or_default();
-        list.push_str(&format!(
-            "- {} · {} · {}{}\n  {}\n",
-            title_or_id_tail(s),
-            s.directory,
-            id_tail(&s.id),
-            mark,
-            rel
-        ));
-    }
-    if !all {
-        list.push_str("\n`/list --all` 显示子任务会话（当前隐藏）。");
-    }
-    handles.flow.platform.reply_text(message_id, &list).await?;
     Ok(())
 }
 
@@ -1859,8 +1756,8 @@ async fn resolve_directory_or_reply(
 }
 
 /// Case-insensitive keyword match on a session's title, directory or id
-/// (used by `/switch <keyword>`, `/list`/`/switch list`, and the `/switch`
-/// card's filtered list). `/attach` and `/topic --adopt` do NOT use this —
+/// (used by `/switch <keyword>` and the `/switch` card's filtered list).
+/// `/attach` and `/topic --adopt` do NOT use this —
 /// they resolve via `resolve_session` (exact id → id-prefix → whole-title
 /// substring) so adoption stays unambiguous.
 ///
@@ -1886,21 +1783,6 @@ fn candidates_list(header: &str, sessions: &[&crate::opencode::types::SessionLis
         list.push_str(&format!("- {} · {} · {}\n", s.title, s.directory, id_tail(&s.id)));
     }
     list
-}
-
-/// Compact relative-time label for a millisecond timestamp.
-fn relative_time(ms: i64) -> String {
-    let now = chrono::Utc::now().timestamp_millis();
-    let secs = ((now - ms) / 1000).max(0);
-    if secs < 60 {
-        format!("{}s", secs)
-    } else if secs < 3600 {
-        format!("{}m", secs / 60)
-    } else if secs < 86400 {
-        format!("{}h", secs / 3600)
-    } else {
-        format!("{}d", secs / 86400)
-    }
 }
 
 #[cfg(test)]
@@ -2028,53 +1910,40 @@ mod tests {
         );
     }
 
+    /// The retired text-list subcommand is gone: its first word is an ordinary
+    /// keyword, so it parses exactly like any other `/switch <keyword>` and the
+    /// bridge resolves "list" against the session store (no dedicated reply).
     #[test]
-    fn parse_switch_list() {
+    fn parse_switch_list_is_an_ordinary_keyword() {
         assert_eq!(
             parse_command("/switch list"),
-            Some(Command::Switch(SwitchAction::List {
-                keyword: None,
-                all: false
-            }))
+            Some(Command::Switch(SwitchAction::Match("list".into())))
         );
         assert_eq!(
             parse_command(" /switch list "),
-            Some(Command::Switch(SwitchAction::List {
-                keyword: None,
-                all: false
-            }))
+            Some(Command::Switch(SwitchAction::Match("list".into())))
         );
     }
 
+    /// The retired `--all` flag has no parser meaning: it stays in the keyword
+    /// like any other word.
     #[test]
-    fn parse_switch_list_keyword_and_all() {
+    fn parse_switch_list_args_are_ordinary_keywords() {
         assert_eq!(
             parse_command("/switch list cola"),
-            Some(Command::Switch(SwitchAction::List {
-                keyword: Some("cola".into()),
-                all: false
-            }))
+            Some(Command::Switch(SwitchAction::Match("list cola".into())))
         );
         assert_eq!(
             parse_command("/switch list --all"),
-            Some(Command::Switch(SwitchAction::List {
-                keyword: None,
-                all: true
-            }))
+            Some(Command::Switch(SwitchAction::Match("list --all".into())))
         );
         assert_eq!(
             parse_command("/switch list cola --all"),
-            Some(Command::Switch(SwitchAction::List {
-                keyword: Some("cola".into()),
-                all: true
-            }))
+            Some(Command::Switch(SwitchAction::Match("list cola --all".into())))
         );
         assert_eq!(
             parse_command("/switch list multi word"),
-            Some(Command::Switch(SwitchAction::List {
-                keyword: Some("multi word".into()),
-                all: false
-            }))
+            Some(Command::Switch(SwitchAction::Match("list multi word".into())))
         );
     }
 
@@ -2289,6 +2158,8 @@ mod tests {
         assert!(command_help("dir").unwrap().contains("next non-command message"));
         assert!(command_help("version").unwrap().contains("/version"));
         assert_eq!(command_help("nonexistent"), None);
+        // The retired text-list form has no help topic of its own.
+        assert_eq!(command_help("list"), None);
     }
 
     #[test]
@@ -2304,10 +2175,7 @@ mod tests {
     fn trailing_spaces_ignored() {
         assert_eq!(
             parse_command("  /switch list  "),
-            Some(Command::Switch(SwitchAction::List {
-                keyword: None,
-                all: false
-            }))
+            Some(Command::Switch(SwitchAction::Match("list".into())))
         );
     }
 
@@ -2316,10 +2184,7 @@ mod tests {
         assert_eq!(parse_command("/STOP"), Some(Command::Stop));
         assert_eq!(
             parse_command("/Switch List"),
-            Some(Command::Switch(SwitchAction::List {
-                keyword: None,
-                all: false
-            }))
+            Some(Command::Switch(SwitchAction::Match("List".into())))
         );
     }
 

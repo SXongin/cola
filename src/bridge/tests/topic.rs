@@ -762,11 +762,6 @@ async fn topic_command_gate_rejects_banned_commands_and_lets_others_through() {
             rejection: Some(TOPIC_SELECTION_REJECTION),
         },
         Case {
-            text: "/switch list".to_string(),
-            has_session: true,
-            rejection: Some(TOPIC_SELECTION_REJECTION),
-        },
-        Case {
             text: "/switch forget".to_string(),
             has_session: true,
             rejection: Some(TOPIC_SELECTION_REJECTION),
@@ -794,11 +789,6 @@ async fn topic_command_gate_rejects_banned_commands_and_lets_others_through() {
         },
         Case {
             text: "/switch kw".to_string(),
-            has_session: false,
-            rejection: None,
-        },
-        Case {
-            text: "/switch list".to_string(),
             has_session: false,
             rejection: None,
         },
@@ -1019,7 +1009,7 @@ async fn topic_adopt_opens_topic_around_existing_session() {
     );
     assert!(
         !seed_card.contains("返回列表"),
-        "a topic adoption has no switch list to return to: {seed_card}"
+        "a topic adoption has no session list to return to: {seed_card}"
     );
     assert!(
         !calls
