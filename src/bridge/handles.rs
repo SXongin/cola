@@ -48,7 +48,7 @@ use crate::{feishu, opencode};
 /// settings/model resolution the conversation reads.
 ///
 /// The store and cache travel together because a create/remove/activate changes
-/// what `/list` and `/switch` must show; a caller that only reads sessions still
+/// what `/switch` must show; a caller that only reads sessions still
 /// goes through the same handle. The settings ladder lives here too because
 /// every rung (a persisted override, the server-recorded model) is read from
 /// the same store.
@@ -61,7 +61,7 @@ use crate::{feishu, opencode};
 #[derive(Clone)]
 pub(crate) struct SessionsHandle {
     pub(crate) store: Arc<Mutex<SessionStore>>,
-    /// The 30 s session-list cache (`/list`/`/switch`/`/attach`), invalidated by
+    /// The 30 s session-list cache (`/switch`/`/attach`), invalidated by
     /// the write paths below. Private: [`Self::cached_session_list`] and
     /// [`Self::invalidate_cache`] are the accessors.
     cache: Arc<Mutex<Option<SessionListCache>>>,
@@ -168,7 +168,7 @@ impl SessionsHandle {
 
     /// Declare (or replace) the conversation's Pending Session and persist
     /// (ADR-0041). The session-list cache is untouched: a pending is not a
-    /// server session, so `/list`/`/switch` have nothing new to show.
+    /// server session, so `/switch` has nothing new to show.
     pub(crate) async fn set_pending(&self, pending: PendingEntry) -> crate::error::Result<()> {
         self.store.lock().await.set_pending(pending)
     }
@@ -204,7 +204,7 @@ impl SessionsHandle {
     }
 
     /// Persist `entry` as its thread's active session and drop the session-list
-    /// cache: creating or adopting a session changes what `/list` and `/switch`
+    /// cache: creating or adopting a session changes what `/switch`
     /// should offer. The cache is dropped even when the save fails, because the
     /// in-memory mapping already changed.
     pub(crate) async fn activate(&self, entry: SessionEntry) -> crate::error::Result<()> {
@@ -214,7 +214,7 @@ impl SessionsHandle {
     }
 
     /// Remove a mapping and persist, dropping the session-list cache (the
-    /// `/list`/`/switch` view may no longer mention it).
+    /// `/switch` view may no longer mention it).
     pub(crate) async fn remove_session(
         &self,
         session_id: &str,
@@ -235,14 +235,14 @@ impl SessionsHandle {
         result
     }
 
-    /// Drop the `/list` cache. Called whenever cola creates, adopts, forgets or
-    /// renames a session, so the next `/list`/`/switch`/`/attach` is fresh.
+    /// Drop the session-list cache. Called whenever cola creates, adopts, forgets or
+    /// renames a session, so the next `/switch`/`/attach` is fresh.
     pub(crate) async fn invalidate_cache(&self) {
         *self.cache.lock().await = None;
     }
 
     /// The current `GET /session` snapshot, fetching (and caching for 30 s) when
-    /// missing or stale. Used by `/list`, `/switch` and `/attach` so rapid
+    /// missing or stale. Used by `/switch` and `/attach` so rapid
     /// reuse stays off the wire.
     pub(crate) async fn cached_session_list(
         &self,

@@ -91,11 +91,8 @@ async fn switch_list_is_an_ordinary_keyword_with_no_dedicated_reply() {
         card.to_string().contains("\"default_value\":\"list\""),
         "the card is pre-filtered by the keyword: {card}"
     );
-    assert!(
-        platform.texts().await.is_empty(),
-        "no dedicated text reply: {:?}",
-        platform.texts().await
-    );
+    let replies = platform.texts().await;
+    assert!(replies.is_empty(), "no dedicated text reply: {replies:?}");
 }
 
 #[tokio::test]

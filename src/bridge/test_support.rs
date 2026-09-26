@@ -807,7 +807,7 @@ pub struct MockBackend {
     /// child session_id → parent session_id, served by `session_info`
     /// (simulates sub-task sessions created by the `task` tool).
     pub session_parents: std::collections::HashMap<String, String>,
-    /// The shared store served by `list_sessions` (for `/list`, `/attach`,
+    /// The shared store served by `list_sessions` (for `/attach` and
     /// `/switch` tests).
     pub session_list: Vec<opencode::types::SessionListInfo>,
     /// Records `update_session_title` calls: (session_id, title).
@@ -939,8 +939,8 @@ impl MockBackend {
     // permissions / fail this call". Fields stay public for the exotic axes;
     // these are the front door for the flows tests actually build.
 
-    /// Scenario: the shared store holds exactly `sessions` (drives `/list`,
-    /// `/switch`, `/dir` and the external poller's discovery).
+    /// Scenario: the shared store holds exactly `sessions` (drives `/switch`,
+    /// `/dir` and the external poller's discovery).
     pub(crate) fn given_sessions(&mut self, sessions: Vec<opencode::types::SessionListInfo>) -> &mut Self {
         self.session_list = sessions;
         self

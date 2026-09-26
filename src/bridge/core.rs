@@ -8,7 +8,7 @@ use crate::feishu;
 use crate::opencode;
 
 /// A cached session-list snapshot (cross-store, most recently active first)
-/// with its fetch time. The 30 s TTL keeps `/list`/`/switch`/`/attach` off the
+/// with its fetch time. The 30 s TTL keeps `/switch`/`/attach` off the
 /// wire for rapid reuse; cola invalidates it immediately on create/adopt/rename.
 #[derive(Clone)]
 pub struct SessionListCache {
@@ -160,7 +160,7 @@ pub struct SharedCore {
     /// list, so the reminder's list-level nudge leads to the waiting message.
     /// Same `[bridge] instant_reminder` opt-in as the reminder itself.
     pub message_pins: Arc<crate::bridge::message_pins::MessagePins>,
-    /// Cached session-list snapshot for `/list`, `/switch`, `/attach`
+    /// Cached session-list snapshot for `/switch`, `/attach`
     /// (30 s TTL; invalidated on create/adopt/rename). Private: the core's
     /// write wrappers and `invalidate_session_list_cache` own it.
     session_list_cache: Arc<Mutex<Option<SessionListCache>>>,
@@ -450,7 +450,7 @@ impl SharedCore {
     }
 
     /// The current `GET /session` snapshot, fetching (and caching for 30 s) when
-    /// missing or stale. Used by `/list`, `/switch` and `/attach` so rapid
+    /// missing or stale. Used by `/switch` and `/attach` so rapid
     /// reuse stays off the wire.
     pub(crate) async fn cached_session_list(
         &self,
@@ -458,14 +458,14 @@ impl SharedCore {
         self.sessions_handle().cached_session_list(&self.opencode).await
     }
 
-    /// Drop the `/list` cache. Called whenever cola creates, adopts, forgets or
-    /// renames a session, so the next `/list`/`/switch`/`/attach` is fresh.
+    /// Drop the session-list cache. Called whenever cola creates, adopts, forgets or
+    /// renames a session, so the next `/switch`/`/attach` is fresh.
     pub(crate) async fn invalidate_session_list_cache(&self) {
         self.sessions_handle().invalidate_cache().await;
     }
 
     /// Persist `entry` as its thread's active session and drop the session-list
-    /// cache: creating or adopting a session changes what `/list` and `/switch`
+    /// cache: creating or adopting a session changes what `/switch`
     /// should offer. The cache is dropped even when the save fails, because the
     /// in-memory mapping already changed.
     pub(crate) async fn activate_session(&self, entry: SessionEntry) -> crate::error::Result<()> {
@@ -550,7 +550,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     /// The cache rule is part of the session write interface: creates and
-    /// removes change what `/list` should show, overrides do not.
+    /// removes change what `/switch` should show, overrides do not.
     #[tokio::test]
     async fn activate_invalidates_list_cache_but_update_does_not() {
         let _wd = test_work_dir();

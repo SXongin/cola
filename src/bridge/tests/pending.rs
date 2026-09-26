@@ -653,7 +653,7 @@ async fn failed_title_patch_still_materialises_and_warns() {
 }
 
 /// Materialisation activates through the core wrapper, so the session-list
-/// cache is dropped and `/list`/`/switch` see the just-created session without
+/// cache is dropped and `/switch` sees the just-created session without
 /// waiting out the TTL.
 #[tokio::test]
 async fn materialisation_drops_the_session_list_cache() {
