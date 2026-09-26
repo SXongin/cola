@@ -8,8 +8,9 @@ pub enum Command {
     /// Session management (`/switch ...`): match, forget, adopt, or the
     /// interactive card. Absorbed the old `/attach` and `/forget`.
     Switch(SwitchAction),
-    /// Child-session view (`/sub ...`, spec #344): the Active Session's direct
-    /// child sessions, read-only.
+    /// Child-session family (`/sub ...`, spec #344): the Active Session's
+    /// direct child sessions — the read-only list, or the explicit takeover of
+    /// one of them into this chat.
     Sub(SubAction),
     /// Create a fresh session, optionally named
     New(Option<String>),
@@ -79,15 +80,22 @@ impl Command {
     ///
     /// - `/topic` and its adopt forms would nest a topic inside a topic: they
     ///   are rejected in ANY topic, whether or not it already has a session.
-    /// - Session selection/creation (`/dir`, the `/dir` card, `/switch`, `/new`)
-    ///   is allowed while the topic is unbound — the chosen session becomes the
-    ///   topic's one session — and rejected once the topic owns a session.
+    /// - Session selection/creation (`/dir`, the `/dir` card, `/switch`,
+    ///   `/sub attach`, `/new`) is allowed while the topic is unbound — the
+    ///   chosen session becomes the topic's one session — and rejected once the
+    ///   topic owns a session.
     /// - Every other command passes.
     pub(crate) fn topic_rejection(&self, has_session: bool) -> Option<&'static str> {
         match self {
             Command::Topic { .. } => Some(TOPIC_NEST_REJECTION),
             Command::TopicAdopt { .. } | Command::TopicAdoptCard => Some(TOPIC_ADOPT_NEST_REJECTION),
-            Command::Dir(_) | Command::DirCard | Command::Switch(_) | Command::New(_) if has_session => {
+            Command::Dir(_)
+            | Command::DirCard
+            | Command::Switch(_)
+            | Command::Sub(SubAction::Attach { .. })
+            | Command::New(_)
+                if has_session =>
+            {
                 Some(TOPIC_SELECTION_REJECTION)
             }
             _ => None,
@@ -131,13 +139,18 @@ pub enum SwitchAction {
 }
 
 /// What `/sub` should do (spec #344): the read-only view of the Active
-/// Session's direct children. `/sub attach` (explicit takeover) arrives with
-/// ticket #348.
+/// Session's direct children and the explicit takeover of one of them.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SubAction {
     /// `/sub`, `/sub list` or `/sub list <keyword>` — open the child-session
     /// card, narrowed by the keyword when one was given.
     List(String),
+    /// `/sub attach <id|id-prefix|title> [--force]` — take over one of the
+    /// Active Session's DIRECT children into the current chat. The query
+    /// resolves like `/switch` (exact id → unique id-prefix → title substring)
+    /// but scoped to the direct children; `force` steals a child mapped to
+    /// another chat.
+    Attach { query: String, force: bool },
 }
 
 /// What `/autoaccept` should do: report the current state, or switch it.
@@ -195,20 +208,43 @@ pub fn parse_command(text: &str) -> Option<Command> {
                 }
             }
         },
-        // `/sub [list [keyword]]` — the Active Session's direct children,
-        // read-only (spec #344). The grammar is exactly the sanctioned forms:
-        // no-arg, `list`, `list <keyword>`. Any other first word (a bare
-        // keyword, or `attach` until #348 claims it) is not a form — it gets
+        // `/sub [list [keyword]]` / `/sub attach <query> [--force]` — the
+        // Active Session's direct children, read-only or taken over (spec
+        // #344). The grammar is exactly the sanctioned forms: no-arg, `list`,
+        // `list <keyword>`, `attach <query> [--force]`. Any other first word (a
+        // bare keyword, or an `attach` with no query) is not a form — it gets
         // the `/sub` help topic instead of being read as a keyword.
         "/sub" => match arg {
             None => Some(Command::Sub(SubAction::List(String::new()))),
-            Some(a) => match a.split_whitespace().next() {
-                Some("list") => {
-                    let keyword = a.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
-                    Some(Command::Sub(SubAction::List(keyword)))
+            Some(a) => {
+                let mut words = a.split_whitespace();
+                match words.next() {
+                    Some("list") => {
+                        let keyword = words.collect::<Vec<_>>().join(" ");
+                        Some(Command::Sub(SubAction::List(keyword)))
+                    }
+                    Some("attach") => {
+                        let mut query: Vec<&str> = Vec::new();
+                        let mut force = false;
+                        for w in words {
+                            if w == "--force" {
+                                force = true;
+                            } else {
+                                query.push(w);
+                            }
+                        }
+                        if query.is_empty() {
+                            Some(Command::Help(Some("sub".into())))
+                        } else {
+                            Some(Command::Sub(SubAction::Attach {
+                                query: query.join(" "),
+                                force,
+                            }))
+                        }
+                    }
+                    _ => Some(Command::Help(Some("sub".into()))),
                 }
-                _ => Some(Command::Help(Some("sub".into()))),
-            },
+            }
         },
         "/new" => Some(Command::New(arg.map(|s| s.to_string()))),
         "/topic" => match arg {
@@ -307,6 +343,7 @@ pub fn help_text() -> String {
 `/switch <id> [--force]` · Take over a session by id/title
 `/switch forget` · Un-map this chat's session (server session stays)
 `/sub [list [kw]]` · Child sessions of the current session, read-only (运行中/空闲)
+`/sub attach <id|title> [--force]` · Take over one of the current session's direct child sessions into this chat
 `/new [name]` · Declare a new session in the current project (created by the next message; no session → default dir)
 `/topic [dir] [name]` · Create a new Feishu topic in <dir>; the topic's first message creates the session (bare `/topic` uses the current project)
 `/topic --adopt <kw> [--force]` · Open a topic around an existing session
@@ -324,7 +361,7 @@ pub fn help_text() -> String {
 `/version` · Show cola version & build provenance (release / crates.io / dev build)
 `/help <command>` · Show help for one command (e.g. `/help model`)
 
-话题规则：已绑定会话的话题里，`/switch`、`/new`、`/dir` 被拒绝，请回主对话操作。从未绑定过会话的话题可以用它们来绑定该话题的唯一会话。
+话题规则：已绑定会话的话题里，`/switch`、`/new`、`/dir`、`/sub attach` 被拒绝，请回主对话操作。从未绑定过会话的话题可以用它们来绑定该话题的唯一会话。
     "
     .to_string()
 }
@@ -339,7 +376,7 @@ pub fn command_help(name: &str) -> Option<String> {
             "/switch [action]\nSession management card and text forms.\n- `/switch` (no arg) — interactive session card (browse / search / adopt / new)\n- `/switch <keyword>` — switch by title/directory/id; the current chat's sessions win, otherwise a unique global match is adopted. Ambiguous keywords list candidates; no match opens the card pre-filtered by the keyword.\n- `/switch <id|title> [--force]` — take over a session (exact id → id-prefix → title; the card's short hash works too; reject if owned by another chat unless `--force`, or use the card's 强制接管 button)\n- `/switch forget` — un-map this chat's session (server session stays)\nExamples: `/switch backend`, `/switch ses_abc --force`"
         }
         "sub" => {
-            "/sub [list [keyword]]\nShow the child sessions of the current Active Session, read-only: each row carries the child's title, id tail, agent, last activity and live run state (运行中 when Busy/Retry, 空闲 when Idle — one status read per listed row). The view is scoped to THIS session: children of other sessions never appear, and only direct children are listed (no nested descendants, no transcripts).\n- `/sub` / `/sub list` — the child-session card\n- `/sub list <keyword>` — the same card pre-filtered (title/directory/id, whitespace-token AND)\nThe card's search box and pagination keep the active keyword/page through every rebuild (six rows per page, ADR-0052). Without an Active Session (a fresh chat, or a Pending Session declared by `/new`/`/dir`/`/topic`) the card opens with a plain empty state.\nExamples: `/sub`, `/sub list 渲染`"
+            "/sub [list [keyword]] | /sub attach <id|id-prefix|title> [--force]\nShow the child sessions of the current Active Session, read-only: each row carries the child's title, id tail, agent, last activity and live run state (运行中 when Busy/Retry, 空闲 when Idle — one status read per listed row). The view is scoped to THIS session: children of other sessions never appear, and only direct children are listed (no nested descendants, no transcripts).\n- `/sub` / `/sub list` — the child-session card\n- `/sub list <keyword>` — the same card pre-filtered (title/directory/id, whitespace-token AND)\n- `/sub attach <id|id-prefix|title> [--force]` — take over one of the current session's DIRECT children into this chat (the child becomes the Active Session and gets the usual Session Snapshot receipt). The query resolves like `/switch` (exact id → unique id-prefix → title substring) but only among this session's direct children: an unknown or ambiguous query is reported, and a session that is not a direct child is refused. If the child is mapped to another chat, the owner is named and it is refused unless `--force` (which steals the mapping). Taking over a running child is allowed and the snapshot shows its live state; re-running it for the already-active child changes nothing. The parent stays mapped — `/switch` switches back to it.\nThe card's search box and pagination keep the active keyword/page through every rebuild (six rows per page, ADR-0052). Without an Active Session (a fresh chat, or a Pending Session declared by `/new`/`/dir`/`/topic`) the card opens with a plain empty state.\nExamples: `/sub`, `/sub list 渲染`, `/sub attach 1a2b3c4`, `/sub attach 渲染 --force`"
         }
         "attach" => {
             "/switch <id|title> [--force]\nTake over a session created outside Feishu into this chat. Resolution: exact id → unique id-prefix (the short hash shown on the card works too) → unique title substring. If the session already belongs to another chat, show its owner and reject unless `--force`.\nExample: `/switch ses_abc123`"
@@ -601,6 +638,9 @@ pub(crate) async fn handle_command(
             SubAction::List(keyword) => {
                 crate::feishu::card::command::send_child_card(handles, &thread_key, &keyword, message_id)
                     .await?;
+            }
+            SubAction::Attach { query, force } => {
+                handle_sub_attach(handles, &thread_key, &query, force, message_id, kind).await?;
             }
         },
         Command::New(name) => {
@@ -1335,7 +1375,7 @@ async fn handle_switch(
         .collect();
     if global_hits.len() == 1 {
         let hit = global_hits[0].clone();
-        adopt_session(handles, thread_key, &hit, message_id, kind, false).await?;
+        adopt_session(handles, thread_key, &hit, message_id, kind, false, "/switch").await?;
         return Ok(());
     }
     if global_hits.len() > 1 {
@@ -1457,7 +1497,9 @@ async fn handle_attach(
         .cached_session_list(&handles.flow.backend)
         .await?;
     match resolve_session(&sessions, query) {
-        SessionResolution::Hit(s) => adopt_session(handles, thread_key, s, message_id, kind, force).await,
+        SessionResolution::Hit(s) => {
+            adopt_session(handles, thread_key, s, message_id, kind, force, "/switch").await
+        }
         SessionResolution::Ambiguous(hits) => {
             let list = candidates_list("找到多个会话，请用完整 ID：", &hits);
             handles.flow.platform.reply_text(message_id, &list).await?;
@@ -1470,6 +1512,134 @@ async fn handle_attach(
                 .reply_text(message_id, &format!("No session matching \"{}\"", query))
                 .await?;
             Ok(())
+        }
+    }
+}
+
+/// `/sub attach <id|id-prefix|title> [--force]` — take over one of the Active
+/// Session's DIRECT children into the current chat (spec #344). The query
+/// resolves among those children with the `/switch` rules (exact id → unique
+/// id-prefix → title substring); a session outside that scope is refused, never
+/// adopted — the child filter is this command's policy, not the shared
+/// resolver's (spec #344). Adoption then reuses [`adopt_session`] end to end:
+/// Session Mapping activation, the one Session Snapshot receipt with its
+/// claimable pendings, the owner check, and `--force` to steal a mapping owned
+/// by another chat. The parent stays mapped and switchable; no prompt is ever
+/// sent into the child (ADR-0054).
+async fn handle_sub_attach(
+    handles: &CommandHandles,
+    thread_key: &ThreadKey,
+    query: &str,
+    force: bool,
+    message_id: &str,
+    kind: ConversationKind,
+) -> crate::error::Result<()> {
+    let Some(active) = handles.flow.sessions.active_entry(thread_key).await else {
+        handles
+            .flow
+            .platform
+            .reply_text(
+                message_id,
+                &format!(
+                    "⚠️ {}没有活动会话，`/sub attach` 需要当前会话的直接子会话。先用 `/new`、`/dir` 或 `/switch` 建立会话。",
+                    crate::bridge::display::feishu_side_label(thread_key)
+                ),
+            )
+            .await?;
+        return Ok(());
+    };
+    let active_id = active.session_id.as_str();
+    let sessions = handles
+        .flow
+        .sessions
+        .cached_session_list(&handles.flow.backend)
+        .await?;
+    let archived = |s: &&crate::opencode::types::SessionListInfo| {
+        s.time.as_ref().map(|t| t.is_archived()).unwrap_or(false)
+    };
+    let child_of_active = |s: &&crate::opencode::types::SessionListInfo| {
+        s.parent_id.as_deref() == Some(active_id) && !archived(s)
+    };
+    let children: Vec<crate::opencode::types::SessionListInfo> =
+        sessions.iter().filter(child_of_active).cloned().collect();
+    match resolve_session(&children, query) {
+        SessionResolution::Hit(s) => {
+            adopt_session(handles, thread_key, s, message_id, kind, force, "/sub attach").await
+        }
+        SessionResolution::Ambiguous(hits) => {
+            let list = candidates_list("找到多个子会话，请用完整 ID：", &hits);
+            handles.flow.platform.reply_text(message_id, &list).await?;
+            Ok(())
+        }
+        SessionResolution::None => {
+            // The already-active child can never appear in its own children
+            // list, so re-running `/sub attach` on it must be caught here. It
+            // goes through the same adoption path, whose already-active branch
+            // writes nothing and sends no snapshot.
+            let active_info = sessions
+                .iter()
+                .find(|s| s.id == active_id)
+                .cloned()
+                .unwrap_or_else(|| crate::opencode::types::SessionListInfo {
+                    id: active.session_id.clone(),
+                    title: crate::bridge::display::id_tail(&active.session_id),
+                    directory: active.directory.clone(),
+                    parent_id: None,
+                    agent: None,
+                    model: None,
+                    time: None,
+                });
+            if matches!(
+                resolve_session(std::slice::from_ref(&active_info), query),
+                SessionResolution::Hit(_)
+            ) {
+                return adopt_session(
+                    handles,
+                    thread_key,
+                    &active_info,
+                    message_id,
+                    kind,
+                    force,
+                    "/sub attach",
+                )
+                .await;
+            }
+            // Not a direct child: resolve against the rest of the store to tell
+            // a scope refusal apart from a plain no-match. Archived sessions
+            // (children included) are no more adoptable than they are listable,
+            // so they read as no-match.
+            let out_of_scope: Vec<crate::opencode::types::SessionListInfo> = sessions
+                .iter()
+                .filter(|s| !child_of_active(s) && !archived(s))
+                .cloned()
+                .collect();
+            match resolve_session(&out_of_scope, query) {
+                SessionResolution::Hit(s) => {
+                    handles.flow.platform
+                        .reply_text(
+                            message_id,
+                            &format!(
+                                "⚠️ 会话「{}」不是当前会话的直接子会话，`/sub attach` 只能接管当前会话的直接子会话。",
+                                crate::bridge::display::title_or_id_tail(s)
+                            ),
+                        )
+                        .await?;
+                    Ok(())
+                }
+                SessionResolution::Ambiguous(hits) => {
+                    let list = candidates_list("⚠️ 匹配到的会话都不是当前会话的直接子会话：", &hits);
+                    handles.flow.platform.reply_text(message_id, &list).await?;
+                    Ok(())
+                }
+                SessionResolution::None => {
+                    handles
+                        .flow
+                        .platform
+                        .reply_text(message_id, &format!("没有匹配的子会话：\"{}\"", query))
+                        .await?;
+                    Ok(())
+                }
+            }
         }
     }
 }
@@ -1607,6 +1777,11 @@ async fn handle_topic_adopt(
 /// never-had-a-session topic it is sent inside the topic and doubles as the
 /// fallback-card anchor (`reply_card_in_thread`, ADR-0006); in the lobby it
 /// is the reply replacing the old 「已接管…」 text.
+///
+/// `force_hint` is the command the owner refusal points the user at (with
+/// `--force` appended): `/switch` for the general adoption path, `/sub attach`
+/// for the child-takeover path, so a refusal never advertises a route the
+/// caller's own policy would refuse.
 async fn adopt_session(
     handles: &CommandHandles,
     thread_key: &ThreadKey,
@@ -1614,6 +1789,7 @@ async fn adopt_session(
     message_id: &str,
     kind: ConversationKind,
     force: bool,
+    force_hint: &str,
 ) -> crate::error::Result<()> {
     // Idempotent: already the active session of this thread.
     {
@@ -1654,12 +1830,13 @@ async fn adopt_session(
                     .reply_text(
                         message_id,
                         &format!(
-                            "⚠️ 会话 `{}`（目录 `{}`）已被其他聊天占用：\n{}\n（{}，chat `{}`）\n\n可先请对方 `/switch forget` 解除，或使用 `/switch {} --force` 强行接管。",
+                            "⚠️ 会话 `{}`（目录 `{}`）已被其他聊天占用：\n{}\n（{}，chat `{}`）\n\n可先请对方 `/switch forget` 解除，或使用 `{} {} --force` 强行接管。",
                             info.title,
                             info.directory,
                             chat_name,
                             where_flag,
                             owner_key.chat_id,
+                            force_hint,
                             info.id
                         ),
                     )
@@ -2035,10 +2212,42 @@ mod tests {
             parse_command("/sub 渲染"),
             Some(Command::Help(Some("sub".into())))
         );
-        // `attach` is not a verb yet (#348): it must not be swallowed as a
-        // keyword filter.
+    }
+
+    /// Spec #344: `/sub attach <query> [--force]` is the takeover form. The
+    /// query follows the `/switch` id forms; a bare `attach` is not a form, so
+    /// it gets the help topic instead of an empty-query adoption.
+    #[test]
+    fn parse_sub_attach_takes_a_query_and_force() {
         assert_eq!(
-            parse_command("/sub attach ses_abc"),
+            parse_command("/sub attach ses_abc123"),
+            Some(Command::Sub(SubAction::Attach {
+                query: "ses_abc123".into(),
+                force: false
+            }))
+        );
+        assert_eq!(
+            parse_command("/sub attach ses_abc123 --force"),
+            Some(Command::Sub(SubAction::Attach {
+                query: "ses_abc123".into(),
+                force: true
+            }))
+        );
+        // `--force` is a flag wherever it appears; the rest is the query.
+        assert_eq!(
+            parse_command("/sub attach --force 重写 渲染"),
+            Some(Command::Sub(SubAction::Attach {
+                query: "重写 渲染".into(),
+                force: true
+            }))
+        );
+        // A bare `attach` (with or without the flag) is not a form.
+        assert_eq!(
+            parse_command("/sub attach"),
+            Some(Command::Help(Some("sub".into())))
+        );
+        assert_eq!(
+            parse_command("/sub attach --force"),
             Some(Command::Help(Some("sub".into())))
         );
     }
@@ -2235,6 +2444,10 @@ mod tests {
         assert!(command_help("dir").unwrap().contains("next non-command message"));
         assert!(command_help("version").unwrap().contains("/version"));
         assert!(command_help("sub").unwrap().contains("/sub list"));
+        assert!(
+            command_help("sub").unwrap().contains("/sub attach"),
+            "the sub help documents the takeover form"
+        );
         assert_eq!(command_help("nonexistent"), None);
         // The retired text-list form has no help topic of its own.
         assert_eq!(command_help("list"), None);
