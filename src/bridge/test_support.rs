@@ -815,8 +815,6 @@ pub struct MockBackend {
     /// When true, `update_session_title` fails — materialisation must keep the
     /// created session (never orphan it) and warn.
     pub fail_title_patch: bool,
-    /// Records every `delete_session` call's session id (V2's 204 path).
-    pub delete_session_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// Counts `list_sessions` invocations (asserts the 30 s cache).
     pub list_sessions_calls: Arc<std::sync::atomic::AtomicUsize>,
     /// Available agents served by `list_agents` (for the `/agent` card).
@@ -921,7 +919,6 @@ impl MockBackend {
             session_list: Vec::new(),
             update_title_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             fail_title_patch: false,
-            delete_session_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             list_sessions_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             agents: Vec::new(),
             provider_models: Vec::new(),
@@ -1474,11 +1471,10 @@ impl crate::backend::Backend for MockBackend {
         Ok(())
     }
 
-    async fn delete_session(&self, session_id: &str) -> crate::error::Result<()> {
-        self.delete_session_calls
-            .lock()
-            .await
-            .push(session_id.to_string());
+    /// The Bridge deliberately never deletes a server session (`/switch forget`
+    /// keeps it, ADR-0008); the capability exists on the seam for the generation
+    /// wire tests, so the mock is a no-op.
+    async fn delete_session(&self, _session_id: &str) -> crate::error::Result<()> {
         Ok(())
     }
 
