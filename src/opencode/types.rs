@@ -1,8 +1,17 @@
 //! Wire types for the OpenCode Server REST API.
 //!
 //! Every type mirrors the server's JSON contract; camelCase fields carry
-//! `#[serde(rename)]` (AGENTS.md pitfall #2). Pure parsing and request-body
-//! builders live in the sibling `parsing` module, HTTP transport in `client`.
+//! `#[serde(rename)]` (AGENTS.md pitfall #2). Request-body builders and
+//! payload parsing live with the generation strategy (`v1`), never here.
+//!
+//! These DTOs are the [`crate::backend`] contract's shapes and the documented
+//! out-of-scope exception to the generation seam (spec #332): a strategy
+//! decodes its generation's payloads straight into them, so a few V1-era shapes
+//! (the session-list entry, the question form, the status fan-out) still
+//! surface here. Splitting generation-private wire structs out of these DTOs is
+//! the V2 read-model slice's work (spec #364, S4), where the first real
+//! divergence decides the shape; no generation-distinctive literal is added
+//! here in the meantime.
 
 #![allow(dead_code)] // protocol types — field coverage matches server contract
 

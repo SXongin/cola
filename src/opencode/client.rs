@@ -16,9 +16,14 @@ use super::parsing::parse_model;
 use super::strategy::{Generation, GenerationStrategy};
 use super::transport::Transport;
 use super::types::{
-    AgentInfo, CreateSessionInput, ImageInput, ModelInfo, PermissionRequest, PromptResponse, ProviderModels,
-    QuestionRequest, Session, SessionInfo, SessionListInfo, SessionStatus,
+    AgentInfo, CreateSessionInput, CreateSessionResponse, ImageInput, Location, ModelInfo, PermissionRequest,
+    PromptResponse, ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionStatus,
 };
+
+/// Session creation and compaction, on the `/api` surface both generations
+/// serve. These are current-generation calls, not V1 coupling, so they live on
+/// the generation-blind adapter rather than in a strategy.
+const API_SESSION: &str = "/api/session";
 
 /// One OpenCode server attachment, generation-blind.
 ///
@@ -106,7 +111,7 @@ impl OpenCodeBackend {
     /// re-probing on reconnect arrives with attach detection (spec #364, S3).
     pub async fn reconnect(&self, url: &str, password: &str) {
         self.transport.repoint(url, password, self.username.as_deref());
-        tracing::info!("reconnected opencode client to {}", url);
+        tracing::info!("reconnected opencode backend to {}", url);
     }
 
     /// The current base URL.
@@ -123,11 +128,30 @@ impl OpenCodeBackend {
     /// The request body for a new session, applying the configured default
     /// model and an optional directory.
     pub fn new_session_input(&self, directory: Option<&str>) -> CreateSessionInput {
-        self.strategy.new_session_input(self.model.as_ref(), directory)
+        CreateSessionInput {
+            id: None,
+            agent: None,
+            model: self.model.clone(),
+            location: directory.map(|d| Location {
+                directory: d.to_string(),
+            }),
+        }
     }
 
+    /// Create a new session with an optional directory and agent, on the
+    /// current-generation `/api/session` route (where `location.directory`
+    /// lives; both generations serve it).
     pub async fn create_session(&self, input: &CreateSessionInput) -> crate::error::Result<Session> {
-        self.strategy.create_session(&self.transport, input).await
+        let resp = self
+            .transport
+            .client()
+            .post(self.transport.url(API_SESSION))
+            .json(input)
+            .send()
+            .await?
+            .error_for_status()?;
+        let body: CreateSessionResponse = resp.json().await?;
+        Ok(body.data)
     }
 
     pub async fn list_sessions(&self) -> crate::error::Result<Vec<SessionListInfo>> {
@@ -287,8 +311,16 @@ impl OpenCodeBackend {
         self.strategy.interrupt(&self.transport, session_id).await
     }
 
+    /// Compact a session's context, on the current-generation `/api/session`
+    /// route (shared by both generations).
     pub async fn compact(&self, session_id: &str) -> crate::error::Result<()> {
-        self.strategy.compact(&self.transport, session_id).await
+        self.transport
+            .client()
+            .post(self.transport.url(&format!("{API_SESSION}/{session_id}/compact")))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 
     /// Test-only: point the live transport at a no-proxy HTTP client so the

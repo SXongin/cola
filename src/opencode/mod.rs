@@ -16,6 +16,8 @@
 pub mod client;
 pub(crate) mod parsing;
 pub(crate) mod strategy;
+#[cfg(test)]
+mod tests;
 pub(crate) mod transport;
 pub mod types;
 pub(crate) mod v1;

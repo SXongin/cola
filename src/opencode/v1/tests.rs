@@ -152,7 +152,7 @@ fn parses_session_status_entry_types() {
 /// what discovery hands production. The transport is swapped for a
 /// no-proxy one so a developer shell's `http_proxy` cannot intercept the
 /// loopback fake server (ticket 09); construction itself stays production's.
-fn wire_client(server: &TestHttpServer, model: Option<&str>) -> OpenCodeBackend {
+fn v1_wire_client(server: &TestHttpServer, model: Option<&str>) -> OpenCodeBackend {
     without_env_proxy(
         OpenCodeBackend::with_base_url(model, server.base_url(), Some("opencode"), Some("secret")),
         Some("opencode"),
@@ -321,7 +321,7 @@ async fn prompt_posts_the_message_endpoint_with_parts_model_variant_agent_and_me
         })
         .to_string(),
     );
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
     let model = parse_model("opencode-go/deepseek-v4-flash").unwrap();
     let images = vec![ImageInput {
         mime: "image/png".to_string(),
@@ -387,7 +387,7 @@ async fn prompt_response_body_is_dumped_at_debug_not_info() {
         })
         .to_string(),
     );
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
     let (response, logs) = crate::bridge::test_support::capture_logs(async {
         client.prompt("ses_1", "hi", &[], None, None, None, None).await
     })
@@ -422,7 +422,7 @@ async fn prompt_model_prefers_the_override_then_the_configured_default_then_the_
         200,
         r#"{"info":{"id":"msg_3"},"parts":[]}"#,
     );
-    let client = wire_client(&server, Some("opencode-go/configured-model"));
+    let client = v1_wire_client(&server, Some("opencode-go/configured-model"));
     let override_model = parse_model("other/override-model").unwrap();
 
     client
@@ -433,7 +433,7 @@ async fn prompt_model_prefers_the_override_then_the_configured_default_then_the_
         .prompt("ses_default", "b", &[], None, None, None, None)
         .await
         .unwrap();
-    let client_without_default = wire_client(&server, None);
+    let client_without_default = v1_wire_client(&server, None);
     client_without_default
         .prompt("ses_server", "c", &[], None, None, None, None)
         .await
@@ -465,7 +465,7 @@ async fn prompt_surfaces_a_provider_error_carried_on_a_200_response() {
         })
         .to_string(),
     );
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
 
     let response = client
         .prompt("ses_1", "hi", &[], None, None, None, None)
@@ -478,7 +478,7 @@ async fn prompt_surfaces_a_provider_error_carried_on_a_200_response() {
 #[tokio::test]
 async fn prompt_maps_404_to_session_not_found() {
     let server = TestHttpServer::start().await; // no route -> 404
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
 
     let err = client
         .prompt("ses_gone", "hi", &[], None, None, None, None)
@@ -496,7 +496,7 @@ async fn prompt_maps_404_to_session_not_found() {
 async fn prompt_maps_a_failed_status_to_a_diagnostic_opencode_error() {
     let server = TestHttpServer::start().await;
     server.route("POST", "/session/ses_1/message", 500, r#"{"error":"boom"}"#);
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
 
     let message = opencode_error(
         client
@@ -520,7 +520,7 @@ async fn prompt_reports_a_non_json_success_body_as_a_decode_error() {
         "text/html",
         "<html>oops</html>",
     );
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
 
     let message = opencode_error(
         client
@@ -537,7 +537,7 @@ async fn prompt_reports_a_non_json_success_body_as_a_decode_error() {
 async fn prompt_async_posts_fire_and_forget_with_the_same_payload() {
     let server = TestHttpServer::start().await;
     server.route("POST", "/session/ses_1/prompt_async", 204, "");
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
     let model = parse_model("opencode-go/deepseek-v4-flash").unwrap();
 
     client
@@ -570,7 +570,7 @@ async fn prompt_async_posts_fire_and_forget_with_the_same_payload() {
 async fn prompt_async_maps_a_failed_status_to_a_diagnostic_opencode_error() {
     let server = TestHttpServer::start().await;
     server.route("POST", "/session/ses_1/prompt_async", 500, "nope");
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
 
     let message = opencode_error(
         client
@@ -587,7 +587,7 @@ async fn prompt_async_maps_a_failed_status_to_a_diagnostic_opencode_error() {
 #[tokio::test]
 async fn prompt_async_maps_404_to_session_not_found() {
     let server = TestHttpServer::start().await; // no route -> 404
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
 
     let err = client
         .prompt_async("ses_gone", "hi", &[], None, None, None, None)
@@ -598,59 +598,6 @@ async fn prompt_async_maps_404_to_session_not_found() {
         BridgeError::SessionNotFound(id) => assert_eq!(id, "ses_gone"),
         other => panic!("expected BridgeError::SessionNotFound, got: {other:?}"),
     }
-}
-
-#[tokio::test]
-async fn create_session_posts_the_input_and_parses_the_data_envelope() {
-    let server = TestHttpServer::start().await;
-    server.route(
-        "POST",
-        "/api/session",
-        200,
-        serde_json::json!({
-            "data": {
-                "id": "ses_new",
-                "projectID": "proj_x",
-                "agent": "build",
-                "cost": 0.0,
-                "time": {"created": 1700000000000i64, "updated": 1700000100000i64},
-                "title": "新会话",
-                "location": {"directory": "/work/cola"},
-            },
-        })
-        .to_string(),
-    );
-    let client = wire_client(&server, None);
-    let input = CreateSessionInput {
-        id: None,
-        agent: Some("build".to_string()),
-        model: parse_model("opencode-go/deepseek-v4-flash"),
-        location: Some(Location {
-            directory: "/work/cola".to_string(),
-        }),
-    };
-
-    let session = client.create_session(&input).await.unwrap();
-
-    assert_eq!(session.id, "ses_new");
-    assert_eq!(session.project_id.as_deref(), Some("proj_x"));
-    assert_eq!(session.title.as_deref(), Some("新会话"));
-    assert_eq!(session.agent.as_deref(), Some("build"));
-    assert_eq!(
-        session.time.as_ref().map(|time| time.created),
-        Some(1700000000000)
-    );
-
-    let request = last_request(&server);
-    assert_eq!(request.method, "POST");
-    assert_eq!(request.path, "/api/session");
-    assert_eq!(request.query, "");
-    let body = body_json(&request);
-    assert!(body.get("id").is_none(), "an unset id must be omitted: {body}");
-    assert_eq!(body["agent"], "build");
-    assert_eq!(body["model"]["providerID"], "opencode-go");
-    assert_eq!(body["model"]["id"], "deepseek-v4-flash");
-    assert_eq!(body["location"]["directory"], "/work/cola");
 }
 
 #[tokio::test]
@@ -671,7 +618,7 @@ async fn list_sessions_gets_the_experimental_route_and_parses_camelcase_entries(
         }])
         .to_string(),
     );
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
 
     let sessions = client.list_sessions().await.unwrap();
 
@@ -723,7 +670,7 @@ async fn list_sessions_follows_the_cursor_to_the_end() {
             ),
         ],
     );
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
 
     let sessions = client.list_sessions().await.unwrap();
 
@@ -761,7 +708,7 @@ async fn list_sessions_falls_back_to_the_project_scoped_route_on_404() {
         }])
         .to_string(),
     );
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
 
     let sessions = client.list_sessions().await.unwrap();
 
@@ -776,7 +723,7 @@ async fn list_sessions_falls_back_to_the_project_scoped_route_on_404() {
 async fn list_sessions_only_falls_back_on_404() {
     let server = TestHttpServer::start().await;
     server.route("GET", "/experimental/session", 500, r#"{"error":"boom"}"#);
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
 
     let err = client.list_sessions().await.unwrap_err();
 
@@ -789,7 +736,7 @@ async fn list_sessions_only_falls_back_on_404() {
 async fn update_session_title_patches_the_canonical_session_route() {
     let server = TestHttpServer::start().await;
     server.route("PATCH", "/session/ses_1", 200, r#"{"id":"ses_1"}"#);
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
 
     client.update_session_title("ses_1", "新标题").await.unwrap();
 
@@ -815,7 +762,7 @@ async fn session_info_sends_the_directory_scope_and_parses_the_parent_chain() {
         })
         .to_string(),
     );
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
 
     let info = client
         .session_info("ses_child", Some("/work/cola"))
@@ -853,7 +800,7 @@ async fn session_status_parses_each_status_and_treats_an_absent_session_as_idle(
         })
         .to_string(),
     );
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
 
     assert_eq!(
         client
@@ -888,14 +835,14 @@ async fn session_status_parses_each_status_and_treats_an_absent_session_as_idle(
 async fn session_status_surfaces_http_and_decode_failures() {
     let down = TestHttpServer::start().await;
     down.route("GET", "/session/status", 500, r#"{"error":"boom"}"#);
-    let client = wire_client(&down, None);
+    let client = v1_wire_client(&down, None);
     let message = opencode_error(client.session_status("ses_1", None).await.unwrap_err());
     assert!(message.contains("session status failed"), "unexpected: {message}");
     assert!(message.contains("500"), "unexpected: {message}");
 
     let garbled = TestHttpServer::start().await;
     garbled.route_raw("GET", "/session/status", 200, "text/html", "<html>nope</html>");
-    let client = wire_client(&garbled, None);
+    let client = v1_wire_client(&garbled, None);
     let message = opencode_error(client.session_status("ses_1", None).await.unwrap_err());
     assert!(message.contains("session status parse"), "unexpected: {message}");
     assert!(message.contains("nope"), "unexpected: {message}");
@@ -918,7 +865,7 @@ async fn list_permissions_sends_the_directory_scope_and_parses_requests() {
         }])
         .to_string(),
     );
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
 
     let permissions = client.list_permissions(Some("/work/cola")).await.unwrap();
 
@@ -938,7 +885,7 @@ async fn list_permissions_sends_the_directory_scope_and_parses_requests() {
 async fn list_permissions_maps_a_failed_status_to_a_diagnostic_opencode_error() {
     let server = TestHttpServer::start().await;
     server.route("GET", "/permission", 502, r#"{"error":"bad gateway"}"#);
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
 
     let message = opencode_error(client.list_permissions(None).await.unwrap_err());
 
@@ -959,7 +906,7 @@ async fn reply_permission_posts_the_reply_with_the_directory_scope() {
         404,
         r#"{"error":"not found"}"#,
     );
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
 
     client
         .reply_permission("per_1", "always", Some("/work/cola"))
@@ -1006,7 +953,7 @@ async fn list_questions_sends_the_directory_scope_and_parses_questions() {
         }])
         .to_string(),
     );
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
 
     let questions = client.list_questions(Some("/work/cola")).await.unwrap();
 
@@ -1028,7 +975,7 @@ async fn reply_question_posts_answers_with_the_directory_scope() {
     let server = TestHttpServer::start().await;
     server.route("POST", "/question/q_1/reply", 200, r#"{"code":0}"#);
     server.route("POST", "/question/q_gone/reply", 404, r#"{"error":"not found"}"#);
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
 
     client
         .reply_question(
@@ -1063,7 +1010,7 @@ async fn reply_endpoints_give_up_on_a_hung_server() {
     server.route_delayed("POST", "/question/q_1/reply", 200, r#"{"code":0}"#, hang);
     server.route_delayed("POST", "/question/q_1/reject", 200, r#"{"code":0}"#, hang);
     server.route_delayed("POST", "/permission/p_1/reply", 200, r#"{"code":0}"#, hang);
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
 
     for (label, err) in [
         (
@@ -1088,7 +1035,7 @@ async fn reject_question_posts_with_the_directory_scope() {
     let server = TestHttpServer::start().await;
     server.route("POST", "/question/q_1/reject", 200, r#"{"code":0}"#);
     server.route("POST", "/question/q_gone/reject", 404, r#"{"error":"not found"}"#);
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
 
     client.reject_question("q_1", Some("/work/cola")).await.unwrap();
 
@@ -1167,7 +1114,7 @@ async fn transcript_decodes_legacy_payloads_through_the_adapter() {
         200,
         transcript_fixture().to_string(),
     );
-    let backend: std::sync::Arc<dyn Backend> = std::sync::Arc::new(wire_client(&server, None));
+    let backend: std::sync::Arc<dyn Backend> = std::sync::Arc::new(v1_wire_client(&server, None));
 
     let transcript = backend.transcript("ses_1").await.unwrap();
 
@@ -1298,7 +1245,7 @@ async fn transcript_turn_completes_on_a_terminal_finish() {
         ])
         .to_string(),
     );
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
 
     let transcript = client.transcript("ses_done").await.unwrap();
     let anchor = transcript.newest_user().unwrap().anchor().unwrap();
@@ -1315,7 +1262,7 @@ async fn transcript_turn_completes_on_a_terminal_finish() {
 async fn transcript_surfaces_a_failed_message_read() {
     let server = TestHttpServer::start().await;
     server.route("GET", "/session/ses_gone/message", 500, r#"{"error":"boom"}"#);
-    let client = wire_client(&server, None);
+    let client = v1_wire_client(&server, None);
 
     assert!(client.transcript("ses_gone").await.is_err());
 }

@@ -21,8 +21,8 @@ use crate::error::Result;
 
 use super::transport::Transport;
 use super::types::{
-    AgentInfo, CreateSessionInput, ImageInput, ModelInfo, PermissionRequest, PromptResponse, ProviderModels,
-    QuestionRequest, Session, SessionInfo, SessionListInfo, SessionStatus,
+    AgentInfo, ImageInput, ModelInfo, PermissionRequest, PromptResponse, ProviderModels, QuestionRequest,
+    SessionInfo, SessionListInfo, SessionStatus,
 };
 
 /// One protocol generation's wire contract.
@@ -34,12 +34,6 @@ use super::types::{
 /// trait by forwarding here.
 #[async_trait]
 pub(crate) trait GenerationStrategy: Send + Sync {
-    /// The request body for a new session, applying cola's configured default
-    /// model when set.
-    fn new_session_input(&self, model: Option<&ModelInfo>, directory: Option<&str>) -> CreateSessionInput;
-
-    async fn create_session(&self, http: &Transport, input: &CreateSessionInput) -> Result<Session>;
-
     async fn list_sessions(&self, http: &Transport) -> Result<Vec<SessionListInfo>>;
 
     async fn update_session_title(&self, http: &Transport, session_id: &str, title: &str) -> Result<()>;
@@ -135,8 +129,6 @@ pub(crate) trait GenerationStrategy: Send + Sync {
     ) -> Result<SessionInfo>;
 
     async fn interrupt(&self, http: &Transport, session_id: &str) -> Result<()>;
-
-    async fn compact(&self, http: &Transport, session_id: &str) -> Result<()>;
 }
 
 /// An OpenCode protocol generation cola can speak (CONTEXT.md "Generation").
