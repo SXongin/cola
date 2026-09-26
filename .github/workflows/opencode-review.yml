@@ -48,22 +48,10 @@ jobs:
 
       # anomalyco/opencode/github installs the CLI from releases/latest at run
       # time, so pinning that action would not pin the code that actually runs.
-      # Installing a fixed release here does. The archive has no checksum file,
-      # so the SHA256 below (the asset's digest from the release metadata) is
-      # the integrity pin; version, URL, and digest move together.
-      - name: Install opencode 1.18.31
-        env:
-          SHA256: b283e8dbe9e6fc224bb4b79992ce3bd2174b8b7b0c3e7d1b4e6024a1d11edc84
-        run: |
-          set -euo pipefail
-          curl -fsSL \
-            "https://github.com/anomalyco/opencode/releases/download/v1.18.31/opencode-linux-x64-baseline.tar.gz" \
-            -o "$RUNNER_TEMP/opencode.tar.gz"
-          echo "$SHA256  $RUNNER_TEMP/opencode.tar.gz" | sha256sum -c -
-          mkdir -p "$RUNNER_TEMP/bin"
-          tar -xzf "$RUNNER_TEMP/opencode.tar.gz" -C "$RUNNER_TEMP/bin"
-          chmod 755 "$RUNNER_TEMP/bin/opencode"
-          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      # Installing a fixed release here does. Same pinned V1 install as the
+      # release-notes job and the Live V1 suite: version + SHA256 live once in
+      # the composite action (spec #364 §11).
+      - uses: ./.github/actions/install-opencode-v1
 
       - name: Review
         env:
