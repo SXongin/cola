@@ -61,7 +61,7 @@ A conversation's recorded intent for its next Session — directory, optional ti
 _Avoid_: Draft session, session intent, tentative session
 
 **Session**:
-A single conversation thread with an AI backend, identified by the server's session id and `title` (the server is the single source of truth for identity, ADR-0007). A session has a directory (project) and an optional agent selection. One session maps to at most one Feishu thread at a time.
+A single conversation thread with an AI backend, identified by the server's session id and `title` (the server is the single source of truth for identity, ADR-0007). A session has a directory (project) and an optional agent selection. One session maps to at most one Feishu thread at a time. A session created by a `task` tool call is a child session: parented to the session the call ran in, never mapped to a Chat/Topic (no Session Mapping, no Active Session), its Permissions/Questions re-homed to the parent's card. The `task` call is a Tool Panel, not the session — one child session can be driven by several `task` calls over time (a resume passes the prior `task_id`).
 _Avoid_: Chat, conversation, room
 _UI label_: 会话 — the ONLY meaning of 「会话」 in cola's UI; the Feishu side is never called 会话 (see Chat/Topic UI labels). Resolves the old "why are so many sessions 本会话" ambiguity: cola marks only the Active Session and uses 聊天/话题 for the Feishu side.
 
@@ -187,7 +187,7 @@ A **Turn**'s live task checklist, rendered as a card-TAIL status section instead
 _Avoid_: Todo card, task list card, progress panel
 
 **Tool Panel** (工具面板):
-The card element recording one tool call in a **Turn** — a folded collapsible panel carrying the tool's name, status icon and server start time, plus its rendered input and output. One call, one panel, and it is not interactive: dealing with a tool's **Permission** or **Question** lives in an **Interaction Block**. An unfinished call (`running`/`pending`) is live content: its panel rides the newest card of the **Card Chain** as a card-TAIL section, like the **Todo Panel**, so a split can never strand it; once the tool settles, the panel takes its ordered place in the card timeline. The `todowrite` status section is a **Todo Panel**, not a Tool Panel.
+The card element recording one tool call in a **Turn** — a folded collapsible panel carrying the tool's name, status icon and server start time, plus its rendered input and output. A live `task` call's panel also carries its child session's liveness in the title — the child's current tool, last-activity age and wait state, read-only (ADR-0054). One call, one panel, and it is not interactive: dealing with a tool's **Permission** or **Question** lives in an **Interaction Block**. An unfinished call (`running`/`pending`) is live content: its panel rides the newest card of the **Card Chain** as a card-TAIL section, like the **Todo Panel**, so a split can never strand it; once the tool settles, the panel takes its ordered place in the card timeline. The `todowrite` status section is a **Todo Panel**, not a Tool Panel.
 _Avoid_: tool card, call card, tool bubble
 
 **Built-in Tool**:
