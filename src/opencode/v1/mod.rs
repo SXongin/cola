@@ -617,7 +617,11 @@ impl GenerationStrategy for V1Strategy {
     /// Compact a session's context (`POST /api/session/{id}/compact`, the
     /// `/api` surface both generations serve). V1 sends no body and answers
     /// **204 No Content**; V2's payload/response shape lives in its own
-    /// strategy.
+    /// strategy. Unlike V2, V1's failure taxonomy is status-based (its prompt,
+    /// prompt_async and reply endpoints all read a 404 that way), so the
+    /// default `error_for_status` already yields a 404
+    /// `BridgeError::Http` that `is_session_not_found()` recognises — no
+    /// tag-aware mapping is missing here.
     async fn compact(&self, http: &Transport, session_id: &str) -> Result<()> {
         http.client()
             .post(http.url(&format!("{API_SESSION}/{session_id}/compact")))
