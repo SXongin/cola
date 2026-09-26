@@ -15,6 +15,35 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 /// One response inside a [`Route::script`]: extra headers and a JSON body.
 type ScriptedResponse = (Vec<(String, String)>, Vec<u8>);
 
+/// A response built per request by a [`TestHttpServer::route_dynamic`] handler.
+pub struct DynamicResponse {
+    pub status: u16,
+    pub content_type: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl DynamicResponse {
+    /// A `status` response with an explicit content type (SSE, JSON, ...).
+    pub fn new(status: u16, content_type: impl Into<String>, body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            status,
+            content_type: content_type.into(),
+            headers: Vec::new(),
+            body: body.into(),
+        }
+    }
+
+    /// Add a response header.
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+}
+
+/// A per-request response builder for [`TestHttpServer::route_dynamic`].
+type DynamicHandler = Arc<dyn Fn(&RecordedRequest) -> DynamicResponse + Send + Sync>;
+
 /// A scripted response for requests whose method and path prefix match.
 struct Route {
     method: String,
@@ -32,6 +61,10 @@ struct Route {
     script: Vec<ScriptedResponse>,
     /// How many requests have been served from `script`.
     served: AtomicUsize,
+    /// When set, the response is built from the recorded request instead of
+    /// the fixed fields — for a provider whose answer depends on the request
+    /// body (the live suite's scripted OpenAI-compatible endpoint).
+    handler: Option<DynamicHandler>,
 }
 
 /// One scripted response for [`TestHttpServer::route_sequence`]: extra
@@ -155,6 +188,28 @@ impl TestHttpServer {
             delay: Duration::ZERO,
             script: Vec::new(),
             served: AtomicUsize::new(0),
+            handler: None,
+        });
+    }
+
+    /// Answer matching requests with a handler that sees the recorded request
+    /// and builds the response from it. For endpoints whose answer depends on
+    /// the request body (the live suite's scripted model provider).
+    pub fn route_dynamic<F>(&self, method: &str, path_prefix: &str, handler: F)
+    where
+        F: Fn(&RecordedRequest) -> DynamicResponse + Send + Sync + 'static,
+    {
+        self.state.routes.lock().unwrap().push(Route {
+            method: method.to_ascii_uppercase(),
+            path_prefix: path_prefix.to_string(),
+            status: 200,
+            content_type: "application/json".to_string(),
+            body: Vec::new(),
+            headers: Vec::new(),
+            delay: Duration::ZERO,
+            script: Vec::new(),
+            served: AtomicUsize::new(0),
+            handler: Some(Arc::new(handler)),
         });
     }
 
@@ -179,6 +234,7 @@ impl TestHttpServer {
                 .map(|r| (r.headers, r.body.into_bytes()))
                 .collect(),
             served: AtomicUsize::new(0),
+            handler: None,
         });
     }
 
@@ -202,6 +258,7 @@ impl TestHttpServer {
             delay,
             script: Vec::new(),
             served: AtomicUsize::new(0),
+            handler: None,
         });
     }
 
@@ -301,6 +358,16 @@ fn response_for(
         .filter(|route| route.method == request.method && request.path.starts_with(&route.path_prefix))
         .max_by_key(|route| route.path_prefix.len());
     match matched {
+        Some(route) if route.handler.is_some() => {
+            let response = route.handler.as_ref().unwrap()(request);
+            (
+                response.status,
+                response.content_type,
+                response.headers,
+                response.body,
+                Duration::ZERO,
+            )
+        }
         Some(route) if !route.script.is_empty() => {
             let index = route
                 .served
@@ -401,6 +468,26 @@ mod tests {
         assert_eq!(requests[0].query_param("missing"), None);
         assert_eq!(requests[0].header("X-Test"), Some("yes"));
         assert_eq!(requests[0].body, "hello");
+    }
+
+    #[tokio::test]
+    async fn dynamic_route_builds_the_response_from_the_request() {
+        let server = TestHttpServer::start().await;
+        server.route_dynamic("POST", "/echo", |request| {
+            DynamicResponse::new(201, "text/event-stream", format!("data: {}\n\n", request.body))
+                .header("x-echo", "yes")
+        });
+
+        let response = no_proxy_transport()
+            .post(format!("{}/echo", server.base_url()))
+            .body("hello")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        assert_eq!(response.headers()["x-echo"], "yes");
+        assert_eq!(response.text().await.unwrap(), "data: hello\n\n");
     }
 
     #[tokio::test]
