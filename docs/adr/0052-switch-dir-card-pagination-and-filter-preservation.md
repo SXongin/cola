@@ -24,7 +24,7 @@ visibility rule and match rule stand.
   buttons drop the keyword entirely.
 - Deferred issue #318 recorded the open question — do row actions keep the
   keyword? — noting both cards must decide together.
-- ADR-0028's one-card rule patches the switch list card into the Session
+- ADR-0028's one-card rule patches the switch card into the Session
   Snapshot on adopt; the list is discarded (a risk it accepted).
 
 ## Decision
