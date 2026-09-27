@@ -378,6 +378,7 @@ fn write_v2_config(config_home: &Path, provider_base_url: &str, permissions: V2P
     let config = json!({
         "$schema": "https://opencode.ai/config.json",
         "model": provider::MODEL_REF,
+        "default_agent": provider::AGENT,
         "agents": {
             "title": { "model": provider::MODEL_REF },
             provider::AGENT: { "model": provider::MODEL_REF, "mode": "primary" },
@@ -474,6 +475,11 @@ mod tests {
         assert!(config["provider"].is_null(), "no V1 provider shape");
         assert_eq!(config["model"], provider::MODEL_REF);
         assert_eq!(config["agents"]["title"]["model"], provider::MODEL_REF);
+        assert_eq!(
+            config["default_agent"],
+            provider::AGENT,
+            "the configured default agent pins the selection chain's reset target"
+        );
         assert_eq!(
             config["agents"][provider::AGENT]["mode"],
             "primary",

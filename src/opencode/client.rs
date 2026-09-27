@@ -381,6 +381,12 @@ impl OpenCodeBackend {
             .await
     }
 
+    /// Whether the attached generation keeps model/agent choices as durable
+    /// session state (V2) rather than sending them per prompt (V1).
+    pub fn keeps_session_selection(&self) -> bool {
+        self.strategy().keeps_session_selection()
+    }
+
     pub async fn session_status(
         &self,
         session_id: &str,

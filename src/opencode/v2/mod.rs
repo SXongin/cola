@@ -557,7 +557,9 @@ impl GenerationStrategy for V2Strategy {
         session_id: &str,
         _directory: Option<&str>,
     ) -> Result<Option<SessionSelection>> {
-        Ok(Some(self.read_session_selection(http, session_id).await?))
+        Ok(Some(
+            self.read_raw_session(http, session_id).await?.into_selection()?,
+        ))
     }
 
     /// Switch the session's model (`POST /api/session/{id}/model`, 204) so
@@ -595,6 +597,11 @@ impl GenerationStrategy for V2Strategy {
             return Err(write_failure(response, session_id, "agent switch").await);
         }
         Ok(())
+    }
+
+    /// V2 keeps model/agent choices as durable session state.
+    fn keeps_session_selection(&self) -> bool {
+        true
     }
 
     /// The model's context-window size (tokens), from `GET /api/model`. Best
@@ -677,14 +684,10 @@ impl GenerationStrategy for V2Strategy {
         session_id: &str,
         _directory: Option<&str>,
     ) -> Result<SessionInfo> {
-        let resp = http
-            .client()
-            .get(http.url(&format!("{SESSION}/{session_id}")))
-            .send()
+        Ok(self
+            .read_raw_session(http, session_id)
             .await?
-            .error_for_status()?;
-        let body: wire::DataEnvelope<wire::RawSessionInfo> = resp.json().await?;
-        Ok(body.data.into_session_info()?)
+            .into_session_info()?)
     }
 
     /// Interrupt the session's active execution (`POST
@@ -974,20 +977,20 @@ impl V2Strategy {
 
     /// Read the session's durable selection (`GET /api/session/{id}`, the same
     /// envelope `session_info` unwraps), decoding the `Model.Ref` with its
-    /// variant and the selected agent. A failed read names itself and carries
-    /// a body preview, like the module's other reads; the ladder treats a
-    /// failure as "nothing durably selected" and falls back to cola's mirror.
-    async fn read_session_selection(&self, http: &Transport, session_id: &str) -> Result<SessionSelection> {
+    /// variant and the selected agent. A failed read names itself and carries a
+    /// body preview, like the module's other reads; the ladder treats a
+    /// failure as "unknown" and never falls back to a client-side mirror.
+    async fn read_raw_session(&self, http: &Transport, session_id: &str) -> Result<wire::RawSessionInfo> {
         let resp = http
             .client()
             .get(http.url(&format!("{SESSION}/{session_id}")))
             .send()
             .await?;
         if !resp.status().is_success() {
-            return Err(read_failure(resp, "session selection").await);
+            return Err(read_failure(resp, "session read").await);
         }
         let body: wire::DataEnvelope<wire::RawSessionInfo> = resp.json().await?;
-        Ok(body.data.into_selection()?)
+        Ok(body.data)
     }
 
     /// Read the session's projected messages, decoded-ready: the raw `data`

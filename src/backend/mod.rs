@@ -196,6 +196,13 @@ pub trait Backend: Send + Sync {
     /// rides each prompt.
     async fn switch_session_agent(&self, session_id: &str, agent: &str) -> Result<()>;
 
+    /// Whether this generation keeps model/agent choices as durable session
+    /// state (V2's session switches) rather than sending them with each prompt
+    /// (V1). A caller uses this to know a server-side switch is REQUIRED for a
+    /// pick to take effect; it must never infer it from a failed selection
+    /// read (which only says "unknown").
+    fn keeps_session_selection(&self) -> bool;
+
     /// Reply to a pending permission with a decision (`once` / `always` /
     /// `reject`). `session_id` is the requesting session (the child session for
     /// a sub-task ask): V2's reply is session-scoped and needs it; V1 routes by

@@ -436,6 +436,12 @@ impl GenerationStrategy for V1Strategy {
         Ok(())
     }
 
+    /// V1 sends model/variant/agent with each prompt, so it keeps no durable
+    /// session selection.
+    fn keeps_session_selection(&self) -> bool {
+        false
+    }
+
     /// The server's per-session run state for ONE session (canonical:
     /// `GET /session/status`, which returns `Record<sessionID, SessionStatus>`).
     ///

@@ -820,6 +820,11 @@ async fn session_switches_round_trip_only_where_the_generation_keeps_them() {
             .await
             .unwrap_or_else(|e| panic!("{generation}: agent switch failed: {e}"));
 
+        assert_eq!(
+            backend.keeps_session_selection(),
+            case.keeps_session_selection,
+            "{generation}: the capability must match whether the scenario keeps a selection"
+        );
         let selection = backend
             .session_selection(fixture.newest, Some(fixture.directory))
             .await

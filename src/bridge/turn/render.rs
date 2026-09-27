@@ -242,6 +242,27 @@ pub(super) fn capture_turn_anchor(acc: &mut StreamAccumulator, transcript: &Sess
     acc.turn_anchor = message.anchor();
 }
 
+/// Capture one assistant message's model facts into the card footer: the
+/// answering model, and — when the decoder reports one — its variant. V2's
+/// message model ref carries the variant (the session's selection at the time
+/// the message ran); V1's decoder deliberately reports none, so V1 keeps its
+/// turn-time capture (ADR-0019). Both the render poll and the final reconcile
+/// go through here, so the two cannot drift.
+pub(super) fn capture_footer_model(acc: &mut StreamAccumulator, message: &crate::backend::TranscriptMessage) {
+    let Some(model) = &message.model else {
+        return;
+    };
+    acc.model_id = Some(model.model_id.clone());
+    // The decoder reports an absent provider as an empty string; an empty
+    // value leaves the last known provider in place.
+    if !model.provider_id.is_empty() {
+        acc.provider_id = Some(model.provider_id.clone());
+    }
+    if let Some(variant) = &model.variant {
+        acc.variant = Some(variant.clone());
+    }
+}
+
 /// Render the parts of this turn's assistant messages that haven't been
 /// rendered yet. Returns true if anything new was rendered.
 ///
@@ -268,20 +289,7 @@ pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &Se
     let mut rendered_any = false;
     for message in transcript.turn_for_user(&anchor).messages {
         // Capture the answering model + token usage for the card footer.
-        if let Some(model) = &message.model {
-            acc.model_id = Some(model.model_id.clone());
-            // The decoder reports an absent provider as an empty string; an
-            // empty value leaves the last known provider in place.
-            if !model.provider_id.is_empty() {
-                acc.provider_id = Some(model.provider_id.clone());
-            }
-            // A decoder that reports the variant (V2's message model ref
-            // carries it) is authoritative for the footer; V1's decoder
-            // deliberately reports none, keeping its turn-time capture.
-            if let Some(variant) = &model.variant {
-                acc.variant = Some(variant.clone());
-            }
-        }
+        capture_footer_model(acc, message);
         // An in-flight step is its own assistant message and carries all-zero
         // usage until it finishes. Capturing that zero would wipe the last
         // completed step's figure and hide the footer's 📊 segment mid-turn.

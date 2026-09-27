@@ -147,6 +147,10 @@ impl Backend for OpenCodeBackend {
         OpenCodeBackend::switch_session_agent(self, session_id, agent).await
     }
 
+    fn keeps_session_selection(&self) -> bool {
+        OpenCodeBackend::keeps_session_selection(self)
+    }
+
     async fn session_status(
         &self,
         session_id: &str,

@@ -1195,3 +1195,87 @@ async fn pending_picks_are_switched_when_the_session_materialises() {
     assert_eq!(entry.variant.as_deref(), Some("high"));
     assert_eq!(entry.agent.as_deref(), Some("build"));
 }
+
+/// A Pending Session's `/model` pick is applied at materialisation through the
+/// same rule as a live pick: a variant the model does not declare is cleared
+/// (ADR-0020) instead of being written into the created session.
+#[tokio::test]
+async fn pending_variant_is_cleared_when_the_model_does_not_declare_it() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_models(vec![crate::opencode::types::ProviderModels {
+        provider: "p".into(),
+        models: vec![model_option("plain", &[])],
+    }]);
+    let switch_calls = backend.switch_model_calls.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let mut pending = PendingEntry::new(key(), "/work/proj");
+    pending.model = Some("p/plain".into());
+    pending.variant = Some("high".into());
+    seed_pending(&app, pending).await;
+
+    app.handle_message(incoming(
+        "msg_prompt".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+
+    let calls = switch_calls.lock().await.clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "ses_test");
+    assert_eq!(calls[0].1.id, "plain");
+    assert_eq!(calls[0].1.variant, None, "the undeclared variant is cleared");
+    assert!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .and_then(|e| e.variant.clone())
+            .is_none(),
+        "the created entry must not carry the variant either"
+    );
+}
+
+/// A variant-only Pending Session resolves the model the create recorded and
+/// attaches the variant to that ref (no `/model` pick to carry it).
+#[tokio::test]
+async fn variant_only_pending_switches_the_creates_recorded_model() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_models(vec![crate::opencode::types::ProviderModels {
+        provider: "p".into(),
+        models: vec![model_option("plain", &["high"])],
+    }]);
+    backend.with_session_model(crate::opencode::types::SessionModel {
+        provider_id: "p".into(),
+        id: "plain".into(),
+    });
+    let switch_calls = backend.switch_model_calls.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let mut pending = PendingEntry::new(key(), "/work/proj");
+    pending.variant = Some("high".into());
+    seed_pending(&app, pending).await;
+
+    app.handle_message(incoming(
+        "msg_prompt".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+
+    let calls = switch_calls.lock().await.clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1.id, "plain");
+    assert_eq!(calls[0].1.variant.as_deref(), Some("high"));
+}

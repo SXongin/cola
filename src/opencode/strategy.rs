@@ -146,6 +146,13 @@ pub(crate) trait GenerationStrategy: Send + Sync {
     /// a no-op because its agent rides the next prompt.
     async fn switch_session_agent(&self, http: &Transport, session_id: &str, agent: &str) -> Result<()>;
 
+    /// Whether the generation keeps model/agent choices as durable session
+    /// state (V2) rather than sending them per prompt (V1). Unlike
+    /// [`Self::session_selection`], this answers without a wire read, so a
+    /// caller can tell "this generation needs a switch" from "the read
+    /// failed".
+    fn keeps_session_selection(&self) -> bool;
+
     async fn session_status(
         &self,
         http: &Transport,
