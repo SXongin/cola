@@ -437,3 +437,50 @@ later); not releasing the guard while busy (the bound exists precisely so a
 merely-busy session cannot hold the guard).
 
 Source: #284.
+
+## Amendment (2026-09-28): no total budget — the bound is a lost-contact / stuck-panel grace
+
+The 2026-09-24 amendment above bounded the follow with a total ceiling: a
+session still running at the ceiling finalized Error. Live experience showed
+the ceiling firing where nothing was wrong — a Permission/Question wait (the
+card read 「⏳ 等待你的授权/回答」 right up to the moment it flipped to
+「❌ 出错」, and its retry affordance contradicted the pending block the
+operator still had to answer) and healthy long runs (subagent chains,
+provider retries). The wait is already discoverable — the Instant Reminder /
+Message Pin owns the nudge — so a clock could only turn a correct wait into a
+wrong error. The follow's real job is to bound the states where NOBODY can
+act (#386).
+
+- **No total budget.** A readable run may take as long as it takes; the
+  follow keeps rendering until the session reports non-busy, then finalizes
+  Done (or the settled failure's Error, unchanged). `/stop` remains the
+  operator's escape hatch, and a new Turn still replaces the accumulator and
+  ends the follow silently.
+- **The grace bounds only the two unobservable failure modes.** The injected
+  bound (`turn_follow_grace_ms`, default 10 min) is now a grace for:
+  - **lost contact** — no tick in the grace produced a full read pair (BOTH
+    the transcript and the status answered). A wedged read cannot be rendered
+    and cannot be ended; at the grace the card finalizes Error. Any
+    fully-answered tick resets the grace, so a flap costs nothing;
+  - **an unreconcilable live panel** — a readable, non-busy session carries a
+    `running`/`pending` panel past the grace (a crash-orphaned call). Done is
+    forbidden over a `⏳`, so the card finalizes Error.
+- **Waits are not special-cased.** With no total clock, a wait is unbounded by
+  construction: the accumulator's awaiting state keeps naming it and the
+  follow never consults the pending records. `/stop` still rejects the
+  requests it leaves behind (ADR-0038 rule 7).
+- **A terminal header wins over the awaiting override.** The header's
+  「等待你的授权/回答」 names an ACTIVE turn; a fallback Error under a
+  still-pending block previously stayed hidden behind it. Error/Done take
+  precedence now, so a dead card never reads as waiting for anyone.
+- **The completion notice stays tied to the card's real end** — both fallback
+  endings take the Error notice; a run still going server-side is never
+  announced as complete.
+
+Rejected: keeping a longer total budget (it only moves the false error
+later); pausing the ceiling while a wait is pending (the grace's whole point
+is bounding the unobservable, and a readable wait is the opposite — and a
+stale pending record must never suspend the fallback).
+
+Source: #386.
+

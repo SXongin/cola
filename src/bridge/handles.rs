@@ -884,20 +884,26 @@ pub(crate) struct TurnConfig {
     pub(crate) turn_render_poll_ms: Arc<AtomicU64>,
     /// Bound on a Turn's post-prompt drain (ms); injectable for tests.
     pub(crate) turn_drain_timeout_ms: Arc<AtomicU64>,
-    /// Ceiling on the out-of-turn drain follow (ms, #284); injectable for tests.
-    pub(crate) turn_follow_timeout_ms: Arc<AtomicU64>,
+    /// The lost-contact / stuck-panel grace on the out-of-turn drain follow
+    /// (ms, #284/#386); injectable for tests.
+    pub(crate) turn_follow_grace_ms: Arc<AtomicU64>,
+    /// Per-read bound on the out-of-turn drain follow (ms, #386); injectable
+    /// for tests.
+    pub(crate) turn_follow_read_timeout_ms: Arc<AtomicU64>,
     /// Default directory for new sessions (from `[bridge] work_dir`).
     work_dir: Option<String>,
 }
 
 impl TurnConfig {
+    #[allow(clippy::too_many_arguments)] // the turn knobs are a flat wiring list
     pub(crate) fn new(
         group_completion_notice: bool,
         long_task_notice: bool,
         long_task_notice_ms: Arc<AtomicU64>,
         turn_render_poll_ms: Arc<AtomicU64>,
         turn_drain_timeout_ms: Arc<AtomicU64>,
-        turn_follow_timeout_ms: Arc<AtomicU64>,
+        turn_follow_grace_ms: Arc<AtomicU64>,
+        turn_follow_read_timeout_ms: Arc<AtomicU64>,
         work_dir: Option<String>,
     ) -> Self {
         Self {
@@ -906,7 +912,8 @@ impl TurnConfig {
             long_task_notice_ms,
             turn_render_poll_ms,
             turn_drain_timeout_ms,
-            turn_follow_timeout_ms,
+            turn_follow_grace_ms,
+            turn_follow_read_timeout_ms,
             work_dir,
         }
     }
@@ -936,9 +943,15 @@ impl TurnConfig {
         self.turn_drain_timeout_ms.load(Ordering::Relaxed)
     }
 
-    /// The out-of-turn drain follow's ceiling (ms, #284).
-    pub(crate) fn follow_timeout_ms(&self) -> u64 {
-        self.turn_follow_timeout_ms.load(Ordering::Relaxed)
+    /// The out-of-turn drain follow's lost-contact / stuck-panel grace (ms,
+    /// #284/#386).
+    pub(crate) fn follow_grace_ms(&self) -> u64 {
+        self.turn_follow_grace_ms.load(Ordering::Relaxed)
+    }
+
+    /// The per-read bound on the out-of-turn drain follow (ms, #386).
+    pub(crate) fn follow_read_timeout_ms(&self) -> u64 {
+        self.turn_follow_read_timeout_ms.load(Ordering::Relaxed)
     }
 
     /// The long-task completion-notice threshold (ms).

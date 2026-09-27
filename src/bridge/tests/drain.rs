@@ -109,6 +109,9 @@ pub(crate) async fn scripted_app(
     // below assert the exits are state-driven, not the default 10 min bound.
     app.turn_render_poll_ms.store(5, Ordering::Relaxed);
     app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
+    // A tiny per-read bound: a scripted hung read must fail fast instead of
+    // eating a test's whole grace.
+    app.turn_follow_read_timeout_ms.store(20, Ordering::Relaxed);
     (dir, app, backend, platform)
 }
 
@@ -123,9 +126,9 @@ pub(crate) fn spawn_turn(
 
 /// The #284 scenario app: a Supplement whose `bash` tool is still `running`
 /// when the drain bound lands, on a Busy session, with a tiny drain bound and
-/// the given follow ceiling.
+/// the given follow grace.
 async fn busy_supplement_app(
-    follow_timeout_ms: u64,
+    follow_grace_ms: u64,
 ) -> (
     tempfile::TempDir,
     Arc<App>,
@@ -141,8 +144,7 @@ async fn busy_supplement_app(
     let (dir, app, backend, platform) =
         scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
     app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
-    app.turn_follow_timeout_ms
-        .store(follow_timeout_ms, Ordering::Relaxed);
+    app.turn_follow_grace_ms.store(follow_grace_ms, Ordering::Relaxed);
     (dir, app, backend, platform)
 }
 
@@ -548,9 +550,9 @@ async fn a_stopped_turn_logs_finalizing_once_per_turn() {
 
 /// A session that stays busy runs the drain to its bound. The TURN ends there
 /// (the guard is released, so the next message is a normal new Turn), but the
-/// CARD does not: it is handed to the out-of-turn follow, which keeps it live
-/// until its own ceiling and then finalizes Error — never Done under a session
-/// that is still running (#284).
+/// CARD does not: it is handed to the out-of-turn follow. The follow has no
+/// total budget (#386) — a readable run stays live for as long as it runs —
+/// so only the session going idle finalizes it, and only then Done (#284).
 #[tokio::test]
 async fn the_drain_bound_exits_cleanly_and_finishes_the_turn() {
     let _wd = test_work_dir();
@@ -560,10 +562,10 @@ async fn the_drain_bound_exits_cleanly_and_finishes_the_turn() {
     ];
     let (_dir, app, backend, platform) =
         scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
-    // Tiny bounds so the long-poll branch and the follow's ceiling run in
+    // Tiny bounds so the long-poll branch and the follow grace run in
     // milliseconds.
     app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
-    app.turn_follow_timeout_ms.store(30, Ordering::Relaxed);
+    app.turn_follow_grace_ms.store(30, Ordering::Relaxed);
     // Group + requester: the follow's finalization sends the completion notice.
     let mut context = ctx("ses_test", "第一条消息");
     context.is_group = true;
@@ -582,11 +584,30 @@ async fn the_drain_bound_exits_cleanly_and_finishes_the_turn() {
         "the drain must keep polling while the session is busy"
     );
 
-    // The follow kept the card live past the bound and ended it Error at its
-    // ceiling: a running session can never finalize Done.
-    wait_for_card_header(&platform, "出错").await;
+    // The follow keeps the card live well past the grace while the run stays
+    // readable: no total budget, no forced Error.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !platform
+            .updated_cards()
+            .await
+            .iter()
+            .any(|c| card_header(c).contains("出错")),
+        "a readable run must not error on a budget: {:?}",
+        platform.updated_cards().await
+    );
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Streaming),
+        "the card stays live while the session is readable and busy"
+    );
+
+    // It genuinely ends: the session goes idle and the follow finalizes Done.
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    wait_for_card_header(&platform, "完成").await;
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
-    assert!(card_header(&final_card).contains("出错"), "final card Error");
     assert!(card_text(&final_card).contains("第一轮回答。"));
     assert!(
         platform
@@ -594,8 +615,8 @@ async fn the_drain_bound_exits_cleanly_and_finishes_the_turn() {
             .lock()
             .await
             .iter()
-            .any(|c| matches!(c, PlatformCall::CompletionNotice { text, .. } if text.contains("处理出错"))),
-        "the completion notice reports the error: {:?}",
+            .any(|c| matches!(c, PlatformCall::CompletionNotice { text, .. } if text.contains("已完成"))),
+        "the completion notice reports the real end: {:?}",
         platform.calls.lock().await
     );
     assert_no_further_rendering(&backend, &platform).await;
@@ -729,7 +750,7 @@ async fn stop_during_the_follow_finalizes_promptly() {
     wait_for_card_header(&platform, "完成").await;
     assert!(
         started.elapsed() < Duration::from_secs(3),
-        "the follow must end on the stop, not the 60 s ceiling"
+        "the follow must end on the stop, not the 60 s grace"
     );
     assert!(
         platform.texts().await.iter().any(|t| t.contains("Interrupted")),
@@ -739,28 +760,231 @@ async fn stop_during_the_follow_finalizes_promptly() {
     assert_no_further_rendering(&backend, &platform).await;
 }
 
-/// A follow whose Backend reads hang ends in Error at its own ceiling: the
-/// card never sits on an eternal "streaming" state (#284).
+/// A follow whose Backend reads hang ends in the lost-contact Error: the card
+/// never sits on an eternal "streaming" state over a run cola cannot see
+/// (#284/#386).
 #[tokio::test]
 async fn a_hung_backend_ends_the_follow_in_error() {
     let _wd = test_work_dir();
     let (_dir, app, backend, platform) = busy_supplement_app(50).await;
     run_to_handoff(&app, &platform).await;
 
-    // Every read the follow makes now hangs (a wedged per-session read); the
-    // bounded call must expire at the ceiling and finalize Error.
+    // Every transcript read the follow makes now hangs (a wedged per-session
+    // read); the status read alone is not a full read pair, so the
+    // lost-contact grace ends the card.
     backend.hang_transcript_reads(100);
 
     let started = std::time::Instant::now();
     wait_for_card_header(&platform, "出错").await;
     assert!(
         started.elapsed() < Duration::from_secs(3),
-        "the hung read must end at the follow's ceiling, not DRAIN_REQUEST_TIMEOUT_MS"
+        "the hung read must end at the follow's grace, not the per-read bound"
     );
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
         !card_header(&final_card).contains("完成"),
         "never Done under a hung run"
+    );
+    assert!(
+        card_text(&final_card).contains("失去联系"),
+        "the lost-contact copy: {final_card}"
+    );
+    assert_no_further_rendering(&backend, &platform).await;
+}
+
+/// A live `⏳` panel on a readable, idle session that never settles is an
+/// unreconcilable panel: the follow gives it the grace to settle, then ends
+/// Error — never Done over a `⏳`, never an eternal card (#386).
+#[tokio::test]
+async fn an_orphaned_panel_ends_the_follow_in_error() {
+    let _wd = test_work_dir();
+    let (_dir, app, backend, platform) = busy_supplement_app(50).await;
+    run_to_handoff(&app, &platform).await;
+
+    // The run is gone (idle) but its last panel stays `running`: a crash
+    // orphan nothing will ever settle.
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+
+    wait_for_card_header(&platform, "出错").await;
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&final_card).contains("未收尾"),
+        "the orphaned-panel copy: {final_card}"
+    );
+    assert!(
+        card_text(&final_card).contains("⏳ bash"),
+        "the panel is still shown under the error: {final_card}"
+    );
+    // The invariant, over every card the turn ever sent.
+    for card in platform.updated_cards().await.iter() {
+        assert!(
+            !(card_header(card).contains("完成") && card_text(card).contains("⏳ bash")),
+            "a Done card must never show a running panel: {card}"
+        );
+    }
+    assert_no_further_rendering(&backend, &platform).await;
+}
+
+/// The lost-contact grace is CONTINUOUS: a read outage shorter than the grace
+/// must not end the card — the next fully-answered tick resets it (#386).
+#[tokio::test]
+async fn a_successful_read_resets_the_lost_contact_grace() {
+    let _wd = test_work_dir();
+    let (_dir, app, backend, platform) = busy_supplement_app(500).await;
+    run_to_handoff(&app, &platform).await;
+
+    // Three hung transcript reads: no full read pair for well under 500 ms.
+    backend.hang_transcript_reads(3);
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    // The counter is spent; the next tick answers in full and resets the grace.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(
+        !platform
+            .updated_cards()
+            .await
+            .iter()
+            .any(|c| card_header(c).contains("出错")),
+        "a flap shorter than the grace must not end the card: {:?}",
+        platform.updated_cards().await
+    );
+
+    // The same outage sustained without a full answer ends it.
+    backend.hang_transcript_reads(100);
+    wait_for_card_header(&platform, "出错").await;
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&final_card).contains("失去联系"),
+        "the lost-contact copy: {final_card}"
+    );
+    assert_no_further_rendering(&backend, &platform).await;
+}
+
+/// The wait scenario (#386): a Busy session with one pending permission
+/// inlined on its live card, driven through the drain-bound hand-off.
+async fn pending_permission_app() -> (
+    tempfile::TempDir,
+    Arc<App>,
+    Arc<MockBackend>,
+    Arc<RecordingPlatform>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_transcript(
+        "ses_test",
+        vec![SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "第一条消息"),
+            assistant(2_000, "第一轮回答。"),
+        ])],
+    );
+    backend.with_session_status("ses_test", Some(SessionStatus::Busy));
+    backend.ask_permissions(vec![crate::opencode::types::PermissionRequest {
+        request_id: "per_1".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("bash".into()),
+        patterns: vec!["ls -la".into()],
+        metadata: None,
+        always: Vec::new(),
+    }]);
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
+    app.turn_follow_grace_ms.store(30, Ordering::Relaxed);
+    app.turn_follow_read_timeout_ms.store(20, Ordering::Relaxed);
+
+    // Run the turn to its hand-off, then surface the permission the way
+    // `App::run` does — after the accumulator arms, so it inlines on the card.
+    let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    let armed = async {
+        while Turn::armed_turn_anchor(&app.cards_handle(), "ses_test")
+            .await
+            .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), armed)
+        .await
+        .expect("the accumulator must arm");
+    tokio::spawn({
+        let app = Arc::clone(&app);
+        async move {
+            app.permission.poll_interval_ms.store(20, Ordering::Relaxed);
+            let _ = app.permission.poll_loop(&app.flow_handles()).await;
+        }
+    });
+    let result = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn must hand off at the drain bound")
+        .unwrap();
+    result.unwrap();
+    wait_for_card_header(&platform, "等待你的授权").await;
+    (dir, app, backend, platform)
+}
+
+/// A Permission wait is unbounded (#386): the card keeps its 「等待你的授权」
+/// header for as long as the operator takes — the wait is never converted
+/// into an error and a retry — and answering resumes the run.
+#[tokio::test]
+async fn a_pending_permission_waits_past_the_grace_without_error() {
+    let _wd = test_work_dir();
+    let (_dir, app, backend, platform) = pending_permission_app().await;
+
+    // The wait outlives the grace several times over: still waiting, no Error.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Streaming),
+        "a wait must leave the card live"
+    );
+    assert!(
+        !platform
+            .updated_cards()
+            .await
+            .iter()
+            .any(|c| card_header(c).contains("出错")),
+        "a wait must never become an error: {:?}",
+        platform.updated_cards().await
+    );
+    assert!(
+        platform
+            .updated_cards()
+            .await
+            .last()
+            .is_some_and(|c| card_header(c).contains("等待你的授权")),
+        "the header still names the wait: {:?}",
+        platform.updated_cards().await
+    );
+
+    // The operator answers elsewhere and the run settles: the follow finalizes
+    // Done, not Error — the wait was never a failure.
+    backend.permission_resolved_by_another("per_1").await;
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    wait_for_card_header(&platform, "完成").await;
+    assert_no_further_rendering(&backend, &platform).await;
+}
+
+/// The wait is not a shield for a lost Backend (#386): a wait whose reads
+/// stopped answering still ends in the lost-contact Error — a stale pending
+/// record must not suspend the fallback forever.
+#[tokio::test]
+async fn a_pending_wait_with_lost_contact_still_ends_in_error() {
+    let _wd = test_work_dir();
+    let (_dir, _app, backend, platform) = pending_permission_app().await;
+
+    backend.hang_transcript_reads(100);
+    wait_for_card_header(&platform, "出错").await;
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&final_card).contains("失去联系"),
+        "the lost-contact copy under a wait: {final_card}"
     );
     assert_no_further_rendering(&backend, &platform).await;
 }

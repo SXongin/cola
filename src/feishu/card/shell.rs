@@ -321,13 +321,18 @@ impl CardBuilder {
 /// streaming header.
 /// Active states append the progress signals passed in from the accumulator;
 /// `progress.awaiting` (a pending permission and/or question) overrides the
-/// phase label entirely, naming whichever kind is pending.
+/// phase label entirely, naming whichever kind is pending. The override is for
+/// ACTIVE states only: a terminal card (Done/Error) is no longer waiting for
+/// anyone, and its state must win — or a fallback Error under a still-pending
+/// block would read as "waiting for your authorization" forever (#386).
 pub(crate) fn header_title_and_template(
     state: &CardState,
     running_tool: Option<&ToolPanel>,
     progress: &HeaderProgress,
 ) -> (String, &'static str) {
-    if let Some(title) = progress.awaiting.title() {
+    if !matches!(state, CardState::Done | CardState::Error)
+        && let Some(title) = progress.awaiting.title()
+    {
         return (title.to_string(), "orange");
     }
     let (label, template) = match state {
@@ -831,6 +836,27 @@ mod tests {
             "no awaiting -> phase label: {card}"
         );
         assert_eq!(card["header"]["template"].as_str().unwrap(), "blue");
+    }
+
+    #[test]
+    fn a_terminal_state_wins_over_a_pending_wait() {
+        // A fallback Error (or a Done) with a still-pending block must show its
+        // own header: the card is no longer waiting for anyone (#386).
+        for (state, title) in [(CardState::Error, "❌ 出错"), (CardState::Done, "✅ 完成")] {
+            let card = CardBuilder::new()
+                .with_state(state.clone())
+                .with_progress(HeaderProgress {
+                    awaiting: AwaitingAction::Permission,
+                    elapsed: Some(83),
+                    ..Default::default()
+                })
+                .build();
+            assert_eq!(
+                card["header"]["title"]["content"].as_str().unwrap(),
+                title,
+                "{state:?} must beat the awaiting override"
+            );
+        }
     }
 
     #[test]
