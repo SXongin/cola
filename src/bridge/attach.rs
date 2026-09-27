@@ -17,17 +17,23 @@ use crate::opencode::transport::Transport;
 
 use super::discovery::{DEFAULT_SERVER_USERNAME, ResolvedServer, ServerCandidate};
 
+/// The transport for a candidate's credentials — the one construction shared
+/// by the attach path and by a spawn's own resolution.
+pub(crate) fn candidate_transport(candidate: &ServerCandidate) -> Transport {
+    Transport::new(
+        Some(&candidate.username),
+        Some(&candidate.password),
+        candidate.url(),
+    )
+}
+
 /// Probe a discovered candidate and build the attachment, or return the probe
 /// evidence when the generation could not be resolved.
 pub(crate) async fn resolve_candidate(
     candidate: &ServerCandidate,
     generation_override: GenerationOverride,
 ) -> Result<ResolvedServer, String> {
-    let transport = Transport::new(
-        Some(&candidate.username),
-        Some(&candidate.password),
-        candidate.url(),
-    );
+    let transport = candidate_transport(candidate);
     resolve_candidate_over(&transport, candidate, generation_override).await
 }
 

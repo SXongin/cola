@@ -140,13 +140,26 @@ async fn resolve_opencode_server(
     }
 
     if cfg.start_server == config::ServerStartPolicy::Eager {
-        let spawned = bridge::discovery::spawn_own_server(cfg.preferred_port()).await?;
-        tracing::info!(
-            "Started cola's own OpenCode server at {} — generation={} (self-started `opencode serve`)",
-            spawned.url,
-            spawned.generation.as_str()
-        );
-        return Ok(Some(spawned));
+        match bridge::discovery::spawn_own_server(cfg.preferred_port(), cfg.generation).await {
+            Ok(spawned) => {
+                tracing::info!(
+                    "Started cola's own OpenCode server at {} — generation={} (self-started `opencode serve`)",
+                    spawned.url,
+                    spawned.generation.as_str()
+                );
+                return Ok(Some(spawned));
+            }
+            // A live child whose generation has not resolved yet (e.g. a V2
+            // store migration answering 503) is treated exactly like an
+            // inconclusive attach: stay serverless and let the reconnect loop
+            // attach once the probe classifies, instead of taking the bot down
+            // at boot. A spawn that never came up (no live child) stays loud.
+            Err(e) if bridge::discovery::self_spawned_pid().is_some_and(bridge::discovery::process_alive) => {
+                tracing::warn!("eager spawn could not resolve a generation yet; staying serverless: {e}");
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     tracing::info!(
