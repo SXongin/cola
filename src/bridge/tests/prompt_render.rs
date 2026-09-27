@@ -480,6 +480,294 @@ async fn error_card_retry_reuses_card_and_reruns_prompt() {
     );
 }
 
+/// One failed attempt's assistant message: distinctive text plus a completed
+/// Tool Panel, so a replayed window is unmistakable on the rebuilt card.
+fn failed_attempt_message() -> TranscriptMessage {
+    typed_message(
+        "msg_old",
+        MessageRole::Assistant,
+        Some(2_000),
+        vec![
+            text_part("旧尝试的结论：OLD_TEXT"),
+            tool_part(
+                "bash",
+                "call_old",
+                ToolStatus::Completed,
+                serde_json::json!({ "command": "ls-old" }),
+                "OLD_TOOL_OUTPUT",
+            ),
+        ],
+    )
+}
+
+/// The failed attempt's scripted turn window, anchored on the user message the
+/// retry reuses.
+fn failed_attempt_window(anchor: &str) -> SessionTranscript {
+    SessionTranscript::new(vec![
+        typed_message(anchor, MessageRole::User, Some(1_000), vec![text_part("hi")]),
+        failed_attempt_message(),
+    ])
+}
+
+/// [`failed_attempt_window`] plus `extra`'s messages, newest last — an
+/// attempt's window as the retry reads it.
+fn window_with(anchor: &str, extra: Vec<TranscriptMessage>) -> SessionTranscript {
+    let mut window = failed_attempt_window(anchor);
+    window.messages.extend(extra);
+    window
+}
+
+/// The first retry's own message; its recorded failure makes retry 1 end
+/// Error again, so the chain can be retried once more.
+fn first_retry_message() -> TranscriptMessage {
+    let mut message = typed_message(
+        "msg_new_1",
+        MessageRole::Assistant,
+        Some(3_000),
+        vec![text_part("第一次重试：RETRY1_TEXT")],
+    );
+    message.error = Some("provider 503".into());
+    message
+}
+
+/// #387: the retry reuses the failed attempt's `msg_cola_` user message
+/// (ADR-0026), so the failed attempt's messages are still in the turn window
+/// when the retry rebuilds the card. The retry must carry the failed attempt's
+/// rendered baseline: the rebuilt card streams only the new attempt instead of
+/// replaying every old part (122 tool panels on the live incident).
+#[tokio::test]
+async fn error_card_retry_does_not_replay_the_failed_attempt() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    const ANCHOR: &str = "msg_cola_retry";
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.fail_prompts(1, "Simulated provider failure");
+    let prompt_ids = mock.prompt_message_ids.clone();
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+
+    *backend
+        .transcript_scripts
+        .lock()
+        .await
+        .entry("ses_test".into())
+        .or_default() = vec![failed_attempt_window(ANCHOR)];
+
+    // Attempt 1 fails (provider hiccup); the Error card renders the failed
+    // attempt's content — the baseline the retry must carry.
+    crate::bridge::turn::Turn::run(
+        &app.turn_handles(),
+        crate::bridge::turn::PromptContext {
+            session_id: "ses_test".into(),
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            text: "hi".into(),
+            message_id: "msg_1".into(),
+            subtitle: "p2p".into(),
+            existing_card_id: None,
+            requester_open_id: None,
+            is_group: false,
+            cola_message_id: Some(ANCHOR.into()),
+            images: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    wait_for_card_update(
+        &platform,
+        "the failed attempt on the Error card",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("OLD_TEXT"),
+    )
+    .await;
+
+    // The retry's window: the same failed attempt plus the new run's message.
+    let retried = window_with(
+        ANCHOR,
+        vec![typed_message(
+            "msg_new",
+            MessageRole::Assistant,
+            Some(3_000),
+            vec![
+                text_part("新尝试的结论：NEW_TEXT"),
+                tool_part(
+                    "bash",
+                    "call_new",
+                    ToolStatus::Completed,
+                    serde_json::json!({ "command": "ls-new" }),
+                    "NEW_TOOL_OUTPUT",
+                ),
+            ],
+        )],
+    );
+    *backend
+        .transcript_scripts
+        .lock()
+        .await
+        .get_mut("ses_test")
+        .unwrap() = vec![retried];
+
+    let retry = app
+        .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
+        .await;
+    assert!(retry.is_some(), "retry ack card expected");
+    wait_for_card_update(&platform, "the retry's Done card", CardUpdates::Latest, |card| {
+        let text = card_text(card);
+        text.contains("NEW_TEXT") && text.contains("✅")
+    })
+    .await;
+
+    let ids = prompt_ids.lock().await.clone();
+    assert_eq!(
+        ids,
+        vec![Some(ANCHOR.to_string()), Some(ANCHOR.to_string())],
+        "the retry must re-submit the failed attempt's msg_cola_ id (ADR-0026)"
+    );
+
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&final_card);
+    assert!(text.contains("NEW_TEXT"), "the new attempt must render: {text}");
+    assert!(
+        !text.contains("OLD_TEXT"),
+        "the failed attempt's text must not replay: {text}"
+    );
+    assert!(
+        !text.contains("OLD_TOOL_OUTPUT"),
+        "the failed attempt's Tool Panel must not replay: {text}"
+    );
+}
+
+/// #387: retries chain. Each retry's accumulator unions the baseline it
+/// carried with every message its own attempt observed, so a retry after a
+/// retry suppresses the original attempt and the first retry alike — only the
+/// newest attempt renders into the rebuilt card.
+#[tokio::test]
+async fn retrying_again_suppresses_every_earlier_attempt() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    const ANCHOR: &str = "msg_cola_chain";
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.fail_prompts(1, "Simulated provider failure");
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+
+    *backend
+        .transcript_scripts
+        .lock()
+        .await
+        .entry("ses_test".into())
+        .or_default() = vec![failed_attempt_window(ANCHOR)];
+
+    crate::bridge::turn::Turn::run(
+        &app.turn_handles(),
+        crate::bridge::turn::PromptContext {
+            session_id: "ses_test".into(),
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            text: "hi".into(),
+            message_id: "msg_1".into(),
+            subtitle: "p2p".into(),
+            existing_card_id: None,
+            requester_open_id: None,
+            is_group: false,
+            cola_message_id: Some(ANCHOR.into()),
+            images: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    wait_for_card_update(
+        &platform,
+        "the failed attempt on the Error card",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("OLD_TEXT"),
+    )
+    .await;
+
+    // Retry 1's window: the failed attempt plus its own run, whose newest
+    // message records a fresh provider failure — retry 1 ends Error again.
+    let first_retry = window_with(ANCHOR, vec![first_retry_message()]);
+    *backend
+        .transcript_scripts
+        .lock()
+        .await
+        .get_mut("ses_test")
+        .unwrap() = vec![first_retry];
+
+    let retry = app
+        .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
+        .await;
+    assert!(retry.is_some(), "first retry ack card expected");
+    wait_for_card_update(
+        &platform,
+        "the first retry's Error card",
+        CardUpdates::Latest,
+        |card| {
+            let text = card_text(card);
+            text.contains("RETRY1_TEXT") && text.contains("❌")
+        },
+    )
+    .await;
+
+    // Retry 2's window: everything so far plus the second retry's clean run.
+    let second_retry = window_with(
+        ANCHOR,
+        vec![
+            first_retry_message(),
+            typed_message(
+                "msg_new_2",
+                MessageRole::Assistant,
+                Some(4_000),
+                vec![text_part("第二次重试：RETRY2_TEXT")],
+            ),
+        ],
+    );
+    *backend
+        .transcript_scripts
+        .lock()
+        .await
+        .get_mut("ses_test")
+        .unwrap() = vec![second_retry];
+
+    let retry = app
+        .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
+        .await;
+    assert!(retry.is_some(), "second retry ack card expected");
+    wait_for_card_update(
+        &platform,
+        "the second retry's Done card",
+        CardUpdates::Latest,
+        |card| {
+            let text = card_text(card);
+            text.contains("RETRY2_TEXT") && text.contains("✅")
+        },
+    )
+    .await;
+
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&final_card);
+    assert!(
+        text.contains("RETRY2_TEXT"),
+        "the newest attempt must render: {text}"
+    );
+    assert!(
+        !text.contains("RETRY1_TEXT"),
+        "the first retry's content must not replay: {text}"
+    );
+    assert!(
+        !text.contains("OLD_TEXT"),
+        "the original failed attempt must not replay: {text}"
+    );
+    assert!(
+        !text.contains("OLD_TOOL_OUTPUT"),
+        "the original failed attempt's Tool Panel must not replay: {text}"
+    );
+}
+
 #[tokio::test]
 async fn group_completion_sends_notice_to_requester() {
     let _wd = test_work_dir();

@@ -285,6 +285,14 @@ pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &Se
     };
     let mut rendered_any = false;
     for message in transcript.turn_for_user(&anchor).messages {
+        // An error-card retry carries the failed attempt's baseline (#387):
+        // its messages stay suppressed, so the rebuilt card streams only the
+        // new attempt instead of replaying the old window. Every message this
+        // attempt examines is recorded, so a later retry can suppress it too.
+        if acc.baseline.suppressed.contains(message.id.as_str()) {
+            continue;
+        }
+        acc.baseline.observed.insert(message.id.as_str().to_string());
         // Capture the answering model + token usage for the card footer.
         capture_footer_model(acc, message);
         // An in-flight step is its own assistant message and carries all-zero

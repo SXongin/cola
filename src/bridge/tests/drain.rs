@@ -185,43 +185,25 @@ async fn settle_tool(backend: &Arc<MockBackend>, status: ToolStatus, output: &st
 
 /// Await a card update carrying `needle`, or panic after 5 s.
 pub(crate) async fn wait_for_card_text(platform: &RecordingPlatform, needle: &str) {
-    let wait = async {
-        loop {
-            let seen = platform
-                .updated_cards()
-                .await
-                .iter()
-                .any(|c| card_text(c).contains(needle));
-            if seen {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), wait)
-        .await
-        .unwrap_or_else(|_| panic!("card text {needle:?} never rendered"));
+    wait_for_card_update(
+        platform,
+        &format!("card text {needle:?}"),
+        CardUpdates::Any,
+        |card| card_text(card).contains(needle),
+    )
+    .await;
 }
 
 /// Await a card update whose header carries `needle`, or panic after 5 s — the
 /// follow finalizes out of turn, so tests wait on the card, not on a handle.
 async fn wait_for_card_header(platform: &RecordingPlatform, needle: &str) {
-    let wait = async {
-        loop {
-            let seen = platform
-                .updated_cards()
-                .await
-                .iter()
-                .any(|c| card_header(c).contains(needle));
-            if seen {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), wait)
-        .await
-        .unwrap_or_else(|_| panic!("card header {needle:?} never rendered"));
+    wait_for_card_update(
+        platform,
+        &format!("card header {needle:?}"),
+        CardUpdates::Any,
+        |card| card_header(card).contains(needle),
+    )
+    .await;
 }
 
 /// The drain must stop touching the Backend and the card when the turn ends:

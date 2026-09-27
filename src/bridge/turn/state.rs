@@ -345,6 +345,22 @@ impl CardFallback {
     }
 }
 
+/// A retry's render baseline (#387). A retry reuses the failed attempt's
+/// `msg_cola_` user message (ADR-0026), so the failed attempt's messages are
+/// still in the turn window; the baseline keeps them out of the rebuilt card.
+/// It travels as one fact: `suppressed` is the carried frontier (written once
+/// at retry time), `observed` is what this attempt has examined (the next
+/// retry unions it in).
+#[derive(Default, Clone)]
+pub(super) struct AttemptBaseline {
+    /// Assistant message ids from EARLIER attempts: never rendered, their
+    /// footer model/token capture included.
+    pub(super) suppressed: std::collections::HashSet<String>,
+    /// Assistant message ids THIS attempt has examined: rendered normally,
+    /// and unioned into a later retry's `suppressed`.
+    pub(super) observed: std::collections::HashSet<String>,
+}
+
 /// Accumulates streaming state for one session.
 #[derive(Default, Clone)]
 pub(super) struct StreamAccumulator {
@@ -456,6 +472,11 @@ pub(super) struct StreamAccumulator {
     /// re-render happens exactly when the typed call's visible content changed
     /// (including a `todowrite` list rewritten with same-length items).
     pub(super) rendered_parts: std::collections::HashSet<RenderedPart>,
+    /// Assistant message ids this accumulator must NOT render and the ones it
+    /// has observed — the retry render baseline (#387). Kept as one fact: the
+    /// two sets are seeded and consumed together, and only this type's docs
+    /// carry the invariant.
+    pub(super) baseline: AttemptBaseline,
     /// The Turn's anchor, captured as one fact: the identity of the user
     /// message this turn answers together with that message's server time. An
     /// external render arms with the external message's anchor directly; a
@@ -490,6 +511,22 @@ impl StreamAccumulator {
             phase_started_at: Some(std::time::Instant::now()),
             ..Default::default()
         }
+    }
+
+    /// Carry a previous attempt's render baseline into this accumulator
+    /// (#387): every message the failed attempt SUPPRESSED or OBSERVED is
+    /// suppressed here. `Turn::start` calls this on an error-card retry, whose
+    /// fresh accumulator would otherwise replay the failed attempt's whole
+    /// turn window (the retry reuses the same `msg_cola_` user message,
+    /// ADR-0026) — the new attempt's messages alone render into the rebuilt
+    /// card, and the union chains across repeated retries.
+    pub(super) fn carry_attempt_baseline(&mut self, previous: &Self) {
+        self.baseline.suppressed = previous
+            .baseline
+            .suppressed
+            .union(&previous.baseline.observed)
+            .cloned()
+            .collect();
     }
 
     /// Capture the turn's work context without touching the accumulator — the
