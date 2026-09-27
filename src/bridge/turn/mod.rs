@@ -353,6 +353,10 @@ impl Turn {
             .sessions
             .effective_variant(&handles.backend, &self.session_id, Some(&self.directory))
             .await;
+        // The per-prompt axes: V1 sends these with the message, while a
+        // generation that keeps a durable selection (V2) deliberately drops
+        // them inside its strategy — the pick already lives on the session as
+        // a switch. Do NOT "fix" a V2 pick by making the strategy re-send them.
         let model = handles.sessions.model_override(&self.session_id).await;
         let agent = handles.sessions.agent_override(&self.session_id).await;
         let prompt_resp = handles

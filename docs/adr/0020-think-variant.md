@@ -17,3 +17,19 @@ Users could pick a model via `/model` but had no way to control how hard the mod
 - `inject_model` must now write `variant` (currently drops it); the turn footer renders `provider/model@variant` from the session store.
 - The `/think` card resolves the current model as session override → configured default → server-recorded session model (`GET /session/{id}`); with none of those it tells the user to `/model` first. A model with no declared variants gets a text prompt, not a card.
 - Out of scope: agent-config-pinned default variants (an explicit `/think` override wins) and sub-task child sessions.
+
+## Amendment (2026-09-27): the variant's storage and transport are per generation
+
+The Context and Decision above describe the variant as a per-session SessionStore
+field "applied server-side per prompt via `PromptInput.variant`". That is V1's
+mechanism. On V2 the variant lives inside the session's durable model ref
+(`Model.Ref.variant`) and `/think` rewrites that ref through
+`POST /api/session/{id}/model` (ADR-0055, spec #364 slice S7); V2 has no
+per-prompt `variant` field at all. Everything else decided here stands: there
+is still no universal scale, the value namespace still holds only real variant
+names, and **clearing is still a mechanism, never a value word**. The
+clear-on-model-switch rule is unchanged in intent and now applies against the
+session's own selection — a model that does not declare the current variant
+clears it from the durable ref, and a failed selection read is treated as
+unknown (the variant is dropped rather than revived from cola's mirror).
+"Unset" still means the server's default for that model.

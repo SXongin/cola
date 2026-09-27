@@ -18,3 +18,19 @@
 - `send_agent_card` now routes through a shared `agent_card` renderer (like `think_card`), so the text send path and the card-ack refresh show the same current agent; a thread with no active session gets a text nudge instead of a useless card.
 - `Command::Agent` and `handle_agent_card_action` treat `--reset`/`agent_clear` as a clear; `is_reset_flag` (formerly `is_think_reset`) is now the one flag definition shared by `/think` and `/agent`.
 - Adoption (`/switch`, `/topic --adopt`) still copies the server-recorded session agent into the entry's override, which now simply reads as the current override on the card.
+
+## Amendment (2026-09-27): the mechanism is V1's; V2 keeps the pick as a session switch
+
+The Decision above records `/agent` as a per-session override "sent as
+`PromptInput.agent` on the next message (the server has no agent-switch
+endpoint)". That premise held for the V1 surface only: V2 exposes
+`POST /api/session/{id}/agent`, a durable session switch owned by the V2
+strategy (ADR-0055, spec #364 slice S7). On V2 `/agent` — text form and the
+`agent`/`agent_clear` card buttons alike — switches the session's agent
+server-side, so the pick persists with nothing re-sent and is visible to every
+client sharing the store. V2 has no "unset" arm, so `/agent --reset` switches
+to the server's default agent id, resolved by the same `GET /agent`-order
+heuristic the card already uses. On V1 the pick still rides
+`PromptInput.agent` per prompt, exactly as decided here. The card's
+current-agent rule and "clearing is a mechanism, never a value word" stand
+unchanged on both generations.
