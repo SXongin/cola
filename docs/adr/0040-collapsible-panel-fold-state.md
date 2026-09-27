@@ -93,3 +93,20 @@ timeline entry it renders.**
   update path, but message cards are not card entities; adopting it reworks the
   send/update chain, and Feishu's component limit still forces splits. Deferred,
   not rejected.
+
+## Amendment (2026-09-28): a retry carries the failed attempt's render baseline
+
+The "a retry is a fresh read" acceptance above is superseded. An error-card
+retry reuses the failed attempt's `msg_cola_` user message (ADR-0026), so the
+failed attempt's messages are still in the Turn window; rendering them all into
+the rebuilt card replayed the whole old attempt — a live incident rebuilt 122
+Tool Panels (#387). The retry now carries the failed attempt's render baseline:
+the assistant message ids that attempt suppressed or observed. The render path
+skips those messages, so the rebuilt card streams only the new attempt; the
+union chains across repeated retries, and a fresh prompt starts clean.
+
+Fold state is unaffected as a mechanism — `seq` still restarts with the fresh
+accumulator, and the todo tail still starts folded — but the rationale changes:
+a retry no longer re-renders the old attempt's timeline panels at all, so none
+can come back wearing its id's old state. The todo tail's fixed `todo` id still
+inherits whatever the client held for it, by design.

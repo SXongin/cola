@@ -91,6 +91,11 @@ pub(crate) struct PromptContext {
     pub(crate) text: String,
     pub(crate) message_id: String,
     pub(crate) subtitle: String,
+    /// The live card a retry resets in place (the error-card retry); None
+    /// means a fresh message, which replies a new card. Its presence is also
+    /// the retry signal: `Turn::start` carries the failed attempt's render
+    /// baseline across so the rebuilt card renders only the new attempt
+    /// (#387).
     pub(crate) existing_card_id: Option<String>,
     pub(crate) requester_open_id: Option<String>,
     pub(crate) is_group: bool,
@@ -287,6 +292,17 @@ impl Turn {
         acc.prompt = Some(text.clone());
         acc.requester_open_id = requester_open_id.clone();
         acc.is_group = is_group;
+        // An error-card retry carries the failed attempt's render baseline
+        // (#387): the retry reuses the same `msg_cola_` user message
+        // (ADR-0026), so the failed attempt's messages are still in the turn
+        // window — the baseline keeps them from replaying into the rebuilt
+        // card. A fresh prompt starts clean.
+        if existing_card_id.is_some() {
+            let live = handles.cards.cards.lock().await;
+            if let Some(previous) = live.get(&session_id) {
+                acc.carry_attempt_baseline(&previous.acc);
+            }
+        }
         // Instant Reminder (ADR-0043): register this turn's generation for
         // the Chat/Topic, so the pending-request pollers pin towards THIS
         // turn's requester and a stale clear from an earlier turn can never

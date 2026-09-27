@@ -2175,6 +2175,42 @@ pub(crate) fn card_text(card: &serde_json::Value) -> String {
     card_texts(card).join("\n")
 }
 
+/// Which recorded card updates [`wait_for_card_update`] checks.
+#[derive(Clone, Copy)]
+pub(crate) enum CardUpdates {
+    /// Any update ever recorded — a side effect that happens (or happened).
+    Any,
+    /// Only the newest update — the card's current settled state.
+    Latest,
+}
+
+/// Await a recorded in-place card update satisfying `check`, or panic after
+/// 5 s. Keeps a test on an observed side effect instead of a sleep; `updates`
+/// selects whether any update or only the newest one counts.
+pub(crate) async fn wait_for_card_update(
+    platform: &RecordingPlatform,
+    label: &str,
+    updates: CardUpdates,
+    check: impl Fn(&serde_json::Value) -> bool,
+) {
+    let wait = async {
+        loop {
+            let cards = platform.updated_cards().await;
+            let matched = match updates {
+                CardUpdates::Any => cards.iter().any(&check),
+                CardUpdates::Latest => cards.last().is_some_and(&check),
+            };
+            if matched {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+        .await
+        .unwrap_or_else(|_| panic!("card never reached {label}"));
+}
+
 /// Every button element on a card, in walk order (buttons nest in column sets
 /// and action blocks) — for assertions on a button's `value` payload or label
 /// without string-matching the card's JSON dump.
