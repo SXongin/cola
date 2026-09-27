@@ -1106,12 +1106,12 @@ async fn a_supplement_landing_after_the_drain_exit_is_still_drained() {
     assert_no_further_rendering(&backend, &platform).await;
 }
 
-/// A submitted run may not have registered yet when the drain's first read
-/// happens (a prompt admit only *schedules* execution, ADR-0056): an idle
-/// status with no assistant content visible yet must NOT settle the turn — the
-/// answer that lands moments later must still render and finalize the card.
+/// A submitted run may not have registered yet when the drain's first reads
+/// happen (a prompt admit only *schedules* execution, ADR-0056): the first
+/// idle reads must NOT settle the turn while the confirmation window is open —
+/// the answer that lands inside it must still render and finalize the card.
 #[tokio::test]
-async fn an_unregistered_run_does_not_settle_the_drain() {
+async fn an_unregistered_run_is_not_settled_by_the_first_idle_read() {
     let _wd = test_work_dir();
     // The first snapshot carries only the admitted user message: the run has
     // produced nothing yet.
@@ -1122,15 +1122,18 @@ async fn an_unregistered_run_does_not_settle_the_drain() {
     ];
     let (_dir, app, backend, platform) =
         scripted_app(vec![SessionTranscript::new(admitted)], Some(SessionStatus::Idle)).await;
+    // One poll per 20 ms, so the 3-read confirmation window has not closed
+    // when the test asserts.
+    app.turn_render_poll_ms.store(20, Ordering::Relaxed);
 
     let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
 
-    // The idle status alone must not finalize: the guard stays held and the
-    // card is not Done while no assistant content is visible.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The early idle reads alone must not finalize: the guard stays held and
+    // the card is not Done while no run step is visible.
+    tokio::time::sleep(Duration::from_millis(30)).await;
     assert!(
         app.inflight.lock().await.contains("ses_test"),
-        "an unregistered run must keep the turn open"
+        "an unregistered run must keep the turn open through the window"
     );
     let state = Turn::card_state(&app.cards_handle(), "ses_test").await;
     assert!(
@@ -1161,6 +1164,80 @@ async fn an_unregistered_run_does_not_settle_the_drain() {
         !app.inflight.lock().await.contains("ses_test"),
         "the busy guard must be released"
     );
+}
+
+/// A run that never registers (the transcript never carries a step and the
+/// status stays idle) is bounded by the confirmation window, not the whole
+/// drain budget: the turn finalizes promptly instead of observing for minutes.
+#[tokio::test]
+async fn a_never_registering_run_settles_after_the_confirmation_window() {
+    let _wd = test_work_dir();
+    // Only the admitted user message, idle status, forever.
+    let admitted = vec![user("msg_cola_anchor", 1_000, "第一条消息")];
+    let (_dir, app, _backend, platform) =
+        scripted_app(vec![SessionTranscript::new(admitted)], Some(SessionStatus::Idle)).await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    // A bound the test would never wait out: only the window can end the drain.
+    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
+
+    let started = std::time::Instant::now();
+    Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
+        .await
+        .unwrap();
+
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the confirmation window must bound an unregistered submit: {:?}",
+        started.elapsed()
+    );
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(card_header(&final_card).contains("完成"), "final card Done");
+    assert!(!app.inflight.lock().await.contains("ses_test"));
+}
+
+/// A final reconcile whose transcript read no longer carries the turn (a
+/// failed/empty read) must not stamp Done over a failure the drain observed:
+/// the last observed failure is the fallback, so a read hiccup cannot erase
+/// the Error card.
+#[tokio::test]
+async fn a_failed_final_read_keeps_the_drains_observed_failure() {
+    let _wd = test_work_dir();
+    let mut failed = typed_message(
+        "msg_a1",
+        MessageRole::Assistant,
+        Some(2_000),
+        vec![text_part("失败的一步")],
+    );
+    failed.error = Some("provider 503".into());
+    let timeline = vec![user("msg_cola_anchor", 1_000, "第一条消息"), failed];
+    // Snapshot 1 is the settled failed turn the drain observes; snapshot 2 (and
+    // every read after it) is anchorless — the final reconcile's read hiccup.
+    let (_dir, app, _backend, platform) = scripted_app(
+        vec![
+            SessionTranscript::new(timeline),
+            SessionTranscript::new(Vec::new()),
+        ],
+        Some(SessionStatus::Idle),
+    )
+    .await;
+    app.turn_render_poll_ms.store(20, Ordering::Relaxed);
+    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
+        .await
+        .unwrap();
+
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_header(&final_card).contains("出错"),
+        "an observed failure must survive the final read: {}",
+        card_header(&final_card)
+    );
+    assert!(
+        card_text(&final_card).contains("provider 503"),
+        "the observed failure must reach the card: {final_card}"
+    );
+    assert!(!app.inflight.lock().await.contains("ses_test"));
 }
 
 /// A rejected submit schedules no run: when the transcript carries no admitted

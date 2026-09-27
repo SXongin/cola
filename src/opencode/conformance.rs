@@ -643,14 +643,9 @@ async fn prompt_submits_and_the_turn_is_observable_on_every_generation() {
             .transcript(fixture.session)
             .await
             .unwrap_or_else(|e| panic!("{generation}: transcript read failed: {e}"));
-        let anchor = transcript
-            .messages
-            .iter()
-            .find(|message| message.id.as_str() == fixture.message_id)
-            .and_then(|message| message.anchor())
-            .unwrap_or_else(|| {
-                panic!("{generation}: the admitted message must anchor the turn: {transcript:#?}")
-            });
+        let anchor = transcript.anchor_of_user(fixture.message_id).unwrap_or_else(|| {
+            panic!("{generation}: the admitted message must anchor the turn: {transcript:#?}")
+        });
         let turn = transcript.turn_for_user(&anchor);
         assert!(
             turn.complete,

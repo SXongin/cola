@@ -150,6 +150,44 @@ pub async fn start_with(tool: Tool, command: ToolCommand) -> TestHttpServer {
     server
 }
 
+/// The failure message the scripted provider error carries — what the server
+/// must project into the assistant message's `error` and the transcript read
+/// must surface.
+pub const FAILURE_TEXT: &str = "scripted provider failure";
+
+/// Start a provider whose FIRST turn model call answers a deterministic
+/// provider error (HTTP 400 + an OpenAI error body: non-retryable, so the
+/// server records the failure instead of trying again), then follows the
+/// scripts — the failing-then-retried turn shape. The title call (no tools
+/// offered) never fails, and the flag is consumed by the first turn call only.
+pub async fn start_failing_once(tool: Tool, command: ToolCommand) -> TestHttpServer {
+    let server = TestHttpServer::start().await;
+    let failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    server.route_dynamic("POST", "/v1/chat/completions", move |request| {
+        let parsed: Value = serde_json::from_str(&request.body).unwrap_or(Value::Null);
+        if script(&parsed) != Script::Title && !failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return DynamicResponse::new(
+                400,
+                "application/json",
+                json!({
+                    "error": {
+                        "message": FAILURE_TEXT,
+                        "type": "invalid_request_error",
+                        "code": "scripted_failure",
+                    }
+                })
+                .to_string(),
+            );
+        }
+        DynamicResponse::new(
+            200,
+            "text/event-stream",
+            completion_body(&request.body, tool, command),
+        )
+    });
+    server
+}
+
 /// Which script a request's body selects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Script {

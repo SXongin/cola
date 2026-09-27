@@ -247,11 +247,13 @@ impl GenerationStrategy for V2Strategy {
     /// cola's `msg_cola_…` id, which the server persists and reconciles a
     /// retry onto) and returns immediately — there is no synchronous V2
     /// prompt. The Turn observes the submitted turn's completion from the
-    /// transcript + run state (ADR-0056's submit+observe end state). Delivery
-    /// is explicit `steer` (the server's own default): when the session is
-    /// idle it starts the run, and while a turn is in flight it merges into it
-    /// at the next step boundary — the same call serves the main dispatch and
-    /// a mid-turn Supplement.
+    /// transcript + run state (ADR-0056's submit+observe end state).
+    ///
+    /// Delivery is explicit `steer` (also the server's current default), kept
+    /// on the wire because the same submit serves the main dispatch and a
+    /// mid-turn Supplement: when the session is idle it starts the run, and
+    /// while a turn is in flight it merges in at the next step boundary rather
+    /// than queueing behind it — the merge semantics cola wants either way.
     ///
     /// V2 has no per-prompt `model`/`variant`/`agent`: those are session-scoped
     /// and durable (S7), applied through `POST /api/session/{id}/model|agent`

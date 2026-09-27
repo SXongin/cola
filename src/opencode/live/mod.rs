@@ -167,6 +167,166 @@ async fn live_v1_scripted_capability_chain() {
     // The finished turn reads idle once the run state clears.
     wait_for_idle(&backend, &session.id, &work_dir, &server).await;
 
+    // Retry idempotency: re-submitting the same cola id upserts the one user
+    // message and runs no second turn — the settled assistant already carries a
+    // terminal finish, so the server's loop exits without another model call.
+    // This is the V1 counterpart of the V2 write chain's assertion (ADR-0026).
+    let assistants_before = transcript
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::Assistant)
+        .count();
+    let completions_before = provider_turn_completions(&provider);
+    backend
+        .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
+        .await
+        .unwrap_or_else(|error| panic!("retry submit failed: {error}\n{}", server.stderr()));
+    wait_for_idle(&backend, &session.id, &work_dir, &server).await;
+    let retried = backend
+        .transcript(&session.id)
+        .await
+        .unwrap_or_else(|error| panic!("transcript read failed: {error}\n{}", server.stderr()));
+    assert_eq!(
+        retried
+            .messages
+            .iter()
+            .filter(|message| message.id.as_str() == message_id)
+            .count(),
+        1,
+        "a retry with the same id must not duplicate the user message: {retried:#?}"
+    );
+    assert_eq!(
+        retried
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Assistant)
+            .count(),
+        assistants_before,
+        "the retry must not run a second turn: {retried:#?}"
+    );
+    assert_eq!(
+        provider_turn_completions(&provider),
+        completions_before,
+        "the retry must not call the model again"
+    );
+
+    assert_provider_requests(&provider.requests());
+}
+
+/// The V1 failure chain against the pinned binary: a scripted provider error
+/// must project into the transcript's assistant `error`, and re-submitting the
+/// SAME `msg_cola_` id after the failure must retry onto the one user message —
+/// the retried step recovers, and its clean newest message is what clears the
+/// failure (a recovered earlier step is not a failure). Without the projection
+/// the card would silently ship Done on a failed turn.
+#[tokio::test]
+#[ignore = "live: needs the pinned V1 binary (see the module docs)"]
+async fn live_v1_scripted_failure_and_retry_chain() {
+    let binary = live_v1_binary();
+    let version = server::ensure_v1_binary(&binary).await;
+    eprintln!("live V1 binary: {binary} ({version})");
+
+    let provider = provider::start_failing_once(provider::Tool::Bash, provider::ToolCommand::Fast).await;
+    let server = LiveServer::start(&binary, &provider.base_url()).await;
+
+    let backend = OpenCodeBackend::with_base_url(
+        Some(provider::MODEL_REF),
+        server.base_url(),
+        Some("opencode"),
+        Some(server::PASSWORD),
+    );
+    backend.disable_env_proxy(Some("opencode"), Some(server::PASSWORD));
+
+    wait_for_ready(&backend, &server).await;
+
+    let work_dir = server.work_dir();
+    let session = backend
+        .create_session(&backend.new_session_input(Some(&work_dir)))
+        .await
+        .unwrap_or_else(|error| panic!("create session failed: {error}\n{}", server.stderr()));
+
+    let message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
+    backend
+        .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
+        .await
+        .unwrap_or_else(|error| panic!("prompt submit failed: {error}\n{}", server.stderr()));
+
+    // The turn's failure must be OBSERVABLE: the assistant message carries the
+    // scripted provider error, and the turn never reads complete (a failed run
+    // has no terminal step finish). This is what the Turn's Error card rests on.
+    let failed = wait_for_turn(&backend, &session.id, &message_id, &server).await;
+    let error = turn_error(&failed, &message_id)
+        .unwrap_or_else(|| panic!("the provider failure must project into the transcript: {failed:#?}"));
+    assert!(
+        error.contains(provider::FAILURE_TEXT),
+        "the transcript must carry the provider's failure message ({error}); transcript: {failed:#?}"
+    );
+    let anchor = failed
+        .anchor_of_user(&message_id)
+        .expect("the admitted message anchors the failed turn");
+    assert!(
+        !failed.turn_for_user(&anchor).complete,
+        "a failed turn has no terminal finish: {failed:#?}"
+    );
+
+    // Retry with the SAME id (the error-card retry shape): the server upserts
+    // the one user message and, because the failed assistant has no finish,
+    // runs a new step. The retried step calls the scripted tool, so answer its
+    // ask; the turn then completes cleanly.
+    backend
+        .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
+        .await
+        .unwrap_or_else(|error| panic!("retry submit failed: {error}\n{}", server.stderr()));
+    answer_permission(&backend, &work_dir, &session.id, &server).await;
+
+    let retried = poll_until(
+        "the retried V1 turn to complete",
+        POLL_TIMEOUT,
+        || async {
+            let transcript = backend.transcript(&session.id).await?;
+            let Some(anchor) = transcript.anchor_of_user(&message_id) else {
+                return Ok(None);
+            };
+            Ok(transcript.turn_for_user(&anchor).complete.then_some(transcript))
+        },
+        || server.stderr(),
+    )
+    .await;
+
+    let anchor = retried
+        .anchor_of_user(&message_id)
+        .expect("the retried turn keeps the one user anchor");
+    let turn = retried.turn_for_user(&anchor);
+    assert_eq!(
+        turn.error, None,
+        "the recovered retry's newest message is clean: {retried:#?}"
+    );
+    assert_eq!(
+        retried
+            .messages
+            .iter()
+            .filter(|message| message.id.as_str() == message_id)
+            .count(),
+        1,
+        "the retry must upsert the one user message: {retried:#?}"
+    );
+    assert_final_text(&retried);
+    assert_turn_complete(&retried, &message_id);
+
+    capture_fixture(
+        "v1/transcript_failure_retry",
+        "v1",
+        &version,
+        &capture_command(
+            "COLA_LIVE_OPENCODE_BIN",
+            &binary,
+            "live_v1_scripted_failure_and_retry_chain",
+        ),
+        &format!("{}/session/{}/message", server.base_url(), session.id),
+    )
+    .await;
+
+    wait_for_idle(&backend, &session.id, &work_dir, &server).await;
     assert_provider_requests(&provider.requests());
 }
 
@@ -1158,6 +1318,21 @@ fn provider_completions(provider: &crate::test_http::TestHttpServer) -> usize {
         .count()
 }
 
+/// How many TURN model calls the scripted provider has received — the title
+/// calls offer no tools, so they are excluded and a retry's idempotency
+/// assertion cannot race the title agent.
+fn provider_turn_completions(provider: &crate::test_http::TestHttpServer) -> usize {
+    provider
+        .requests()
+        .iter()
+        .filter(|request| {
+            request.path == "/v1/chat/completions"
+                && serde_json::from_str::<Value>(&request.body)
+                    .is_ok_and(|body| provider::offers_tools(&body))
+        })
+        .count()
+}
+
 /// The reproducing command stamped into a captured fixture.
 fn capture_command(binary_env: &str, binary: &str, test: &str) -> String {
     format!("{binary_env}={binary} COLA_LIVE_CAPTURE_DIR=<dir> cargo test --locked -- --ignored {test}")
@@ -1315,12 +1490,7 @@ async fn wait_for_turn(
         POLL_TIMEOUT,
         || async {
             let transcript = backend.transcript(session_id).await?;
-            let Some(anchor) = transcript
-                .messages
-                .iter()
-                .find(|message| message.id.as_str() == message_id)
-                .and_then(|message| message.anchor())
-            else {
+            let Some(anchor) = transcript.anchor_of_user(message_id) else {
                 return Ok(None);
             };
             let turn = transcript.turn_for_user(&anchor);
@@ -1334,11 +1504,7 @@ async fn wait_for_turn(
 /// The failure the turn anchored at `message_id` recorded, if any — the
 /// neutral projection the Turn reads (ADR-0056).
 fn turn_error(transcript: &crate::backend::SessionTranscript, message_id: &str) -> Option<String> {
-    let anchor = transcript
-        .messages
-        .iter()
-        .find(|message| message.id.as_str() == message_id)
-        .and_then(|message| message.anchor())?;
+    let anchor = transcript.anchor_of_user(message_id)?;
     transcript.turn_for_user(&anchor).error
 }
 
@@ -1352,7 +1518,10 @@ fn assert_user_anchor(transcript: &crate::backend::SessionTranscript, message_id
         .unwrap_or_else(|| panic!("the user message must be in the transcript: {transcript:#?}"));
     assert_eq!(user.role, MessageRole::User);
     assert_eq!(user.text(), PROMPT_TEXT);
-    assert!(user.anchor().is_some(), "a live message carries a server time");
+    assert!(
+        transcript.anchor_of_user(message_id).is_some(),
+        "a live message carries a server time"
+    );
 }
 
 /// The generation's shell tool call ran to completion with the scripted
@@ -1498,12 +1667,9 @@ fn assert_final_text(transcript: &crate::backend::SessionTranscript) {
 
 /// The neutral Turn view derives completion from the transcript structurally.
 fn assert_turn_complete(transcript: &crate::backend::SessionTranscript, message_id: &str) {
-    let user = transcript
-        .messages
-        .iter()
-        .find(|message| message.id.as_str() == message_id)
-        .unwrap();
-    let anchor = user.anchor().expect("the user message carries a server time");
+    let anchor = transcript
+        .anchor_of_user(message_id)
+        .expect("the user message carries a server time");
     let turn = transcript.turn_for_user(&anchor);
     assert!(
         turn.complete,

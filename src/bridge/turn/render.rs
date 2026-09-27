@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::Instrument;
 
-use crate::backend::{MessageRole, Part, SessionTranscript, ToolStatus};
+use crate::backend::{Part, SessionTranscript, ToolStatus};
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
 use crate::bridge::handles::{CardsHandle, RequestsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
@@ -231,16 +231,9 @@ pub(super) fn capture_turn_anchor(acc: &mut StreamAccumulator, transcript: &Sess
     let Some(cola_message_id) = acc.cola_message_id.as_deref() else {
         return;
     };
-    let Some(message) = transcript
-        .messages
-        .iter()
-        .find(|message| message.role == MessageRole::User && message.id.as_str() == cola_message_id)
-    else {
-        return;
-    };
-    // `anchor()` keeps identity and server time together; a message with no
-    // server time cannot anchor (and is retried on the next poll).
-    acc.turn_anchor = message.anchor();
+    // `anchor_of_user` keeps identity and server time together; a message with
+    // no server time cannot anchor (and is retried on the next poll).
+    acc.turn_anchor = transcript.anchor_of_user(cola_message_id);
 }
 
 /// Capture one assistant message's model facts into the card footer: the
@@ -572,8 +565,8 @@ impl RenderPoll {
 mod tests {
     use super::*;
     use crate::backend::{
-        MessageId, MessageTime, ReasoningPart, StepFinish, StepStart, ToolCall, ToolIdentity, ToolOutput,
-        TranscriptMessage, TurnAnchor,
+        MessageId, MessageRole, MessageTime, ReasoningPart, StepFinish, StepStart, ToolCall, ToolIdentity,
+        ToolOutput, TranscriptMessage, TurnAnchor,
     };
     use crate::bridge::App;
     use crate::bridge::test_support::{

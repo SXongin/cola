@@ -38,7 +38,9 @@ Tool-payload knowledge stays Platform contract, not protocol coupling
 - ~~The experimental `wait` endpoint is a temporary, recorded dependency until
   the async-native Turn slice (ADR-0056).~~ **Removed 2026-09-27**: the
   async-native Turn slice (spec #364 S8) deleted the polyfill, so cola no
-  longer depends on any experimental endpoint (ADR-0056 amendment).
+  longer depends on the experimental `wait` endpoint (ADR-0056 amendment).
+  `GET /experimental/session` — the cross-project session list of ADR-0008 —
+  is a separate, older dependency and is unaffected.
 
 The effort, its detection/override rules and its slicing are spec #364
 (OpenCode V2 dual-generation support).

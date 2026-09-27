@@ -34,6 +34,19 @@ impl SessionTranscript {
             .max_by_key(|message| message.time.map(|time| time.created))
     }
 
+    /// The Turn anchor the user message `message_id` carries: the message's
+    /// identity together with its server time, one fact (ADR-0026's
+    /// `msg_cola_` id is how the Turn knows which message is its own). `None`
+    /// when the read has no such user message or it carries no server time.
+    /// The one derivation the renderer's anchor capture and the Turn's failure
+    /// read both use, so they cannot drift.
+    pub fn anchor_of_user(&self, message_id: &str) -> Option<TurnAnchor> {
+        self.messages
+            .iter()
+            .find(|message| message.role == MessageRole::User && message.id.as_str() == message_id)
+            .and_then(TranscriptMessage::anchor)
+    }
+
     /// The Turn anchored on the user message `anchor` names: the assistant
     /// messages that belong to it, in transcript order, plus whether it has
     /// finished.
@@ -264,13 +277,14 @@ pub struct TurnAnchor {
 }
 
 /// One Turn as read from a transcript: the assistant messages that belong to
-/// it (in-flight ones included), whether it has finished, and its newest
-/// recorded failure.
+/// it (in-flight ones included), whether it has finished, and the failure its
+/// newest assistant message recorded.
 #[derive(Debug)]
 pub struct TurnView<'a> {
     pub messages: Vec<&'a TranscriptMessage>,
     pub complete: bool,
-    /// The Turn's newest assistant failure message, if any.
+    /// The failure recorded on the Turn's NEWEST assistant message, if any — a
+    /// recovered earlier step is not a failure.
     pub error: Option<String>,
 }
 
