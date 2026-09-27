@@ -28,3 +28,7 @@ ignore:
   # count; excluding those needs nightly `#[coverage(off)]`.
   - "src/test_*.rs"
   - "src/bridge/test_support.rs"
+  # The opted-in live harness (ADR-0057): every test is `#[ignore]`-gated and
+  # needs a pinned binary, so the instrumented hermetic `coverage` job can
+  # never execute these lines — the advisory `Live V1`/`Live V2` jobs run them.
+  - "src/opencode/live/**"
