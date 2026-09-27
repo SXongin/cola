@@ -33,6 +33,7 @@ pub(crate) fn typed_message(
         }),
         model: None,
         tokens: None,
+        error: None,
         parts,
     }
 }
@@ -770,7 +771,8 @@ pub struct MockBackend {
     pub prompt_error: Option<String>,
     /// Number of initial `prompt` calls to fail (for testing retry-after-error).
     pub fail_prompt_count: Arc<std::sync::atomic::AtomicUsize>,
-    /// Records every `prompt` call's text (asserts retry re-submits).
+    /// Records every `prompt` call's text (the main dispatch and a Supplement
+    /// go through the same submit, ADR-0056).
     pub prompt_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// Records the number of images attached to each `prompt` call.
     pub prompt_images: Arc<tokio::sync::Mutex<Vec<usize>>>,
@@ -793,23 +795,6 @@ pub struct MockBackend {
     /// only afterwards let it finish — the mid-turn ordering the turn-end
     /// leftover rejection (#187) acts on.
     pub prompt_gate: Option<Arc<tokio::sync::Semaphore>>,
-    /// Records every `prompt_async` call's text (asserts supplement path).
-    pub prompt_async_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
-    /// When set, `prompt_async` fails with this message (a supplement whose
-    /// send to the Backend failed — the failure notice must still be followed
-    /// by the Card Chain split).
-    pub prompt_async_error: Option<String>,
-    /// Records the number of images attached to each `prompt_async` call.
-    pub prompt_async_images: Arc<tokio::sync::Mutex<Vec<usize>>>,
-    /// Records the model passed to each `prompt_async` call.
-    pub prompt_async_models: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
-    /// Records the variant passed to each `prompt_async` call.
-    pub prompt_async_variants: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
-    /// Records the agent passed to each `prompt_async` call.
-    pub prompt_async_agents: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
-    /// Records the message_id passed to each `prompt_async` call (asserts the
-    /// supplement path carries a `msg_cola_` id, ADR-0026).
-    pub prompt_async_message_ids: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
     /// The session id `create_session` returns.
     pub session_id: String,
     /// Every `create_session` call's requested directory (ADR-0041: asserts
@@ -898,6 +883,11 @@ pub struct MockBackend {
     /// The message counted `prompt` failures report (see
     /// [`MockBackend::fail_prompts`]); `None` keeps the generic one.
     fail_prompt_message: Option<String>,
+    /// Every `prompt` submit's `(message_id, text)`, recorded for the default
+    /// transcript: the user messages a real server would have persisted by the
+    /// time the Turn reads the turn (ADR-0056). An empty id falls back to the
+    /// historical `msg_user`.
+    prompts: std::sync::Mutex<Vec<(String, String)>>,
 }
 
 impl MockBackend {
@@ -945,13 +935,6 @@ impl MockBackend {
             prompt_message_ids: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             on_prompt: None,
             prompt_gate: None,
-            prompt_async_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            prompt_async_error: None,
-            prompt_async_images: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            prompt_async_models: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            prompt_async_variants: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            prompt_async_agents: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            prompt_async_message_ids: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             session_id: "ses_test".into(),
             created_session_dirs: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             fail_create_session_count: std::sync::atomic::AtomicUsize::new(0).into(),
@@ -980,6 +963,7 @@ impl MockBackend {
             prompt_scripts: Vec::new(),
             last_prompt_parts: std::sync::Mutex::new(None),
             fail_prompt_message: None,
+            prompts: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1343,13 +1327,6 @@ impl MockBackend {
         self
     }
 
-    /// Scenario: `prompt_async` fails with `message` (a Supplement whose send
-    /// failed).
-    pub(crate) fn fail_supplement(&mut self, message: &str) -> &mut Self {
-        self.prompt_async_error = Some(message.to_string());
-        self
-    }
-
     /// Scenario: `session_status` fails with `message` (the caller must not
     /// guess a status).
     pub(crate) fn status_read_fails(&mut self, message: &str) -> &mut Self {
@@ -1451,25 +1428,38 @@ impl MockBackend {
             }
             return SessionTranscript::new(messages);
         }
-        // No cola-authored or external user message modeled: return only the
-        // assistant side of cola's own turn (the default rendering path).
+        // No cola-authored or external user message modeled: return the
+        // assistant side of cola's own turn plus the user messages its prompts
+        // admitted. The async-native Turn anchors on the `msg_cola_` user
+        // message and renders the turn from the transcript (ADR-0056), so the
+        // default read must carry what a real server persists. A modeled
+        // cola-authored message keeps its historical shape (no assistant side).
         if !messages.is_empty() {
             return SessionTranscript::new(messages);
         }
-        // A matched prompt script's parts win over the construction-time
-        // `parts`: the render poll must see the same turn the prompt streamed.
         let parts = self
             .last_prompt_parts
             .lock()
             .unwrap()
             .clone()
             .unwrap_or_else(|| self.parts.clone());
-        SessionTranscript::new(vec![typed_message(
+        let mut messages: Vec<TranscriptMessage> = self
+            .prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, text)| {
+                let id = if id.is_empty() { "msg_user" } else { id.as_str() };
+                typed_message(id, MessageRole::User, Some(now), vec![text_part(text)])
+            })
+            .collect();
+        messages.push(typed_message(
             "msg_assist",
             MessageRole::Assistant,
             Some(now + 1000),
             parts,
-        )])
+        ));
+        SessionTranscript::new(messages)
     }
 }
 
@@ -1571,7 +1561,7 @@ impl crate::backend::Backend for MockBackend {
         variant: Option<&str>,
         agent: Option<&str>,
         message_id: Option<&str>,
-    ) -> crate::error::Result<opencode::types::PromptResponse> {
+    ) -> crate::error::Result<()> {
         self.prompt_calls.lock().await.push(text.to_string());
         self.prompt_images.lock().await.push(images.len());
         self.prompt_message_ids
@@ -1608,67 +1598,25 @@ impl crate::backend::Backend for MockBackend {
         if let Some(err) = &self.prompt_error {
             return Err(crate::error::BridgeError::OpenCode(err.clone()));
         }
+        // The admitted user message: a rejected submit leaves none behind, and
+        // the default transcript serves the ones a real server persisted so the
+        // async-native Turn can anchor and render the submitted turn.
+        self.prompts
+            .lock()
+            .unwrap()
+            .push((message_id.unwrap_or_default().to_string(), text.to_string()));
         if let Some(hook) = &self.on_prompt {
             hook();
         }
         // A prompt script wins over the construction-time `parts`: the prompt
-        // that matches streams its own parts, and `transcript` serves them too.
-        let parts = match self
+        // that matches makes `transcript` serve its own parts, so the submitted
+        // turn renders consistently through the observed read.
+        if let Some((_, parts)) = self
             .prompt_scripts
             .iter()
             .find(|(needle, _)| needle.is_empty() || text.contains(needle.as_str()))
         {
-            Some((_, parts)) => {
-                *self.last_prompt_parts.lock().unwrap() = Some(parts.clone());
-                parts.clone()
-            }
-            None => self.parts.clone(),
-        };
-        Ok(opencode::types::PromptResponse {
-            id: "msg_assist".into(),
-            session_id: Some(session_id.to_string()),
-            admitted_seq: None,
-            parent_id: Some("msg_user".into()),
-            error: None,
-            // The mock scripts typed parts: the prompt-response path carries
-            // the same neutral views the polled read does (spec #332).
-            parts,
-        })
-    }
-
-    async fn prompt_async(
-        &self,
-        session_id: &str,
-        text: &str,
-        images: &[opencode::types::ImageInput],
-        _model: Option<&opencode::types::ModelInfo>,
-        variant: Option<&str>,
-        agent: Option<&str>,
-        message_id: Option<&str>,
-    ) -> crate::error::Result<()> {
-        self.prompt_async_calls
-            .lock()
-            .await
-            .push(format!("{}:{}", session_id, text));
-        self.prompt_async_images.lock().await.push(images.len());
-        self.prompt_async_message_ids
-            .lock()
-            .await
-            .push(message_id.map(|s| s.to_string()));
-        self.prompt_async_models
-            .lock()
-            .await
-            .push(_model.map(|m| format!("{}/{}", m.provider_id, m.id)));
-        self.prompt_async_variants
-            .lock()
-            .await
-            .push(variant.map(|v| v.to_string()));
-        self.prompt_async_agents
-            .lock()
-            .await
-            .push(agent.map(|s| s.to_string()));
-        if let Some(err) = &self.prompt_async_error {
-            return Err(crate::error::BridgeError::OpenCode(err.clone()));
+            *self.last_prompt_parts.lock().unwrap() = Some(parts.clone());
         }
         Ok(())
     }

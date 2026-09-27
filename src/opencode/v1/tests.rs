@@ -311,18 +311,9 @@ async fn basic_auth_is_sent_only_when_both_credentials_are_present() {
 }
 
 #[tokio::test]
-async fn prompt_posts_the_message_endpoint_with_parts_model_variant_agent_and_message_id() {
+async fn prompt_posts_the_native_fire_and_forget_route_with_parts_model_variant_agent_and_message_id() {
     let server = TestHttpServer::start().await;
-    server.route(
-        "POST",
-        "/session/ses_1/message",
-        200,
-        serde_json::json!({
-            "info": {"id": "msg_a1", "parentID": "msg_u1"},
-            "parts": [{"type": "text", "text": "reply"}],
-        })
-        .to_string(),
-    );
+    server.route("POST", "/session/ses_1/prompt_async", 204, "");
     let client = v1_wire_client(&server, None);
     let model = parse_model("opencode-go/deepseek-v4-flash").unwrap();
     let images = vec![ImageInput {
@@ -330,7 +321,7 @@ async fn prompt_posts_the_message_endpoint_with_parts_model_variant_agent_and_me
         data_base64: "QUJD".to_string(),
     }];
 
-    let response = client
+    client
         .prompt(
             "ses_1",
             "hello",
@@ -343,20 +334,9 @@ async fn prompt_posts_the_message_endpoint_with_parts_model_variant_agent_and_me
         .await
         .unwrap();
 
-    assert_eq!(response.id, "msg_a1");
-    assert_eq!(response.parent_id.as_deref(), Some("msg_u1"));
-    assert_eq!(
-        response.parts,
-        vec![crate::backend::Part::Text(crate::backend::TextPart {
-            text: "reply".into(),
-            started_at: None,
-        })]
-    );
-    assert!(response.error.is_none());
-
     let request = last_request(&server);
     assert_eq!(request.method, "POST");
-    assert_eq!(request.path, "/session/ses_1/message");
+    assert_eq!(request.path, "/session/ses_1/prompt_async");
     assert_eq!(request.query, "");
     assert_eq!(request.header("content-type"), Some("application/json"));
     let expected = expected_basic("opencode", "secret");
@@ -374,56 +354,12 @@ async fn prompt_posts_the_message_endpoint_with_parts_model_variant_agent_and_me
     assert_eq!(body["messageID"], "msg_cola_abc");
 }
 
-/// ADR-0048: a successful prompt's response body is a full payload dump —
-/// DEBUG, never INFO. The body still parses; only its level moved.
-#[tokio::test]
-async fn prompt_response_body_is_dumped_at_debug_not_info() {
-    let server = TestHttpServer::start().await;
-    server.route(
-        "POST",
-        "/session/ses_1/message",
-        200,
-        serde_json::json!({
-            "info": {"id": "msg_a1"},
-            "parts": [{"type": "text", "text": "response body marker"}],
-        })
-        .to_string(),
-    );
-    let client = v1_wire_client(&server, None);
-    let (response, logs) = crate::bridge::test_support::capture_logs(async {
-        client.prompt("ses_1", "hi", &[], None, None, None, None).await
-    })
-    .await;
-    response.unwrap();
-
-    let dump = crate::bridge::test_support::assert_line_level(&logs, "prompt response:", "DEBUG");
-    assert!(
-        dump.contains("response body marker"),
-        "the dump carries the response body: {dump}"
-    );
-}
-
 #[tokio::test]
 async fn prompt_model_prefers_the_override_then_the_configured_default_then_the_server() {
     let server = TestHttpServer::start().await;
-    server.route(
-        "POST",
-        "/session/ses_override/message",
-        200,
-        r#"{"info":{"id":"msg_1"},"parts":[]}"#,
-    );
-    server.route(
-        "POST",
-        "/session/ses_default/message",
-        200,
-        r#"{"info":{"id":"msg_2"},"parts":[]}"#,
-    );
-    server.route(
-        "POST",
-        "/session/ses_server/message",
-        200,
-        r#"{"info":{"id":"msg_3"},"parts":[]}"#,
-    );
+    server.route("POST", "/session/ses_override/prompt_async", 204, "");
+    server.route("POST", "/session/ses_default/prompt_async", 204, "");
+    server.route("POST", "/session/ses_server/prompt_async", 204, "");
     let client = v1_wire_client(&server, Some("opencode-go/configured-model"));
     let override_model = parse_model("other/override-model").unwrap();
 
@@ -455,29 +391,6 @@ async fn prompt_model_prefers_the_override_then_the_configured_default_then_the_
 }
 
 #[tokio::test]
-async fn prompt_surfaces_a_provider_error_carried_on_a_200_response() {
-    let server = TestHttpServer::start().await;
-    server.route(
-        "POST",
-        "/session/ses_1/message",
-        200,
-        serde_json::json!({
-            "info": {"id": "msg_a1", "error": {"data": {"message": "provider 503"}}},
-            "parts": [],
-        })
-        .to_string(),
-    );
-    let client = v1_wire_client(&server, None);
-
-    let response = client
-        .prompt("ses_1", "hi", &[], None, None, None, None)
-        .await
-        .unwrap();
-
-    assert_eq!(response.error.as_deref(), Some("provider 503"));
-}
-
-#[tokio::test]
 async fn prompt_maps_404_to_session_not_found() {
     let server = TestHttpServer::start().await; // no route -> 404
     let client = v1_wire_client(&server, None);
@@ -491,13 +404,13 @@ async fn prompt_maps_404_to_session_not_found() {
         BridgeError::SessionNotFound(id) => assert_eq!(id, "ses_gone"),
         other => panic!("expected BridgeError::SessionNotFound, got: {other:?}"),
     }
-    assert_eq!(last_request(&server).path, "/session/ses_gone/message");
+    assert_eq!(last_request(&server).path, "/session/ses_gone/prompt_async");
 }
 
 #[tokio::test]
 async fn prompt_maps_a_failed_status_to_a_diagnostic_opencode_error() {
     let server = TestHttpServer::start().await;
-    server.route("POST", "/session/ses_1/message", 500, r#"{"error":"boom"}"#);
+    server.route("POST", "/session/ses_1/prompt_async", 500, r#"{"error":"boom"}"#);
     let client = v1_wire_client(&server, None);
 
     let message = opencode_error(
@@ -510,96 +423,6 @@ async fn prompt_maps_a_failed_status_to_a_diagnostic_opencode_error() {
     assert!(message.contains("prompt ses_1 failed"), "unexpected: {message}");
     assert!(message.contains("500"), "unexpected: {message}");
     assert!(message.contains("boom"), "unexpected: {message}");
-}
-
-#[tokio::test]
-async fn prompt_reports_a_non_json_success_body_as_a_decode_error() {
-    let server = TestHttpServer::start().await;
-    server.route_raw(
-        "POST",
-        "/session/ses_1/message",
-        200,
-        "text/html",
-        "<html>oops</html>",
-    );
-    let client = v1_wire_client(&server, None);
-
-    let message = opencode_error(
-        client
-            .prompt("ses_1", "hi", &[], None, None, None, None)
-            .await
-            .unwrap_err(),
-    );
-
-    assert!(message.contains("prompt decode"), "unexpected: {message}");
-    assert!(message.contains("oops"), "unexpected: {message}");
-}
-
-#[tokio::test]
-async fn prompt_async_posts_fire_and_forget_with_the_same_payload() {
-    let server = TestHttpServer::start().await;
-    server.route("POST", "/session/ses_1/prompt_async", 204, "");
-    let client = v1_wire_client(&server, None);
-    let model = parse_model("opencode-go/deepseek-v4-flash").unwrap();
-
-    client
-        .prompt_async(
-            "ses_1",
-            "supplement",
-            &[],
-            Some(&model),
-            Some("low"),
-            Some("build"),
-            Some("msg_cola_def"),
-        )
-        .await
-        .unwrap();
-
-    let request = last_request(&server);
-    assert_eq!(request.method, "POST");
-    assert_eq!(request.path, "/session/ses_1/prompt_async");
-    assert_eq!(request.query, "");
-    let body = body_json(&request);
-    assert_eq!(body["parts"][0]["type"], "text");
-    assert_eq!(body["parts"][0]["text"], "supplement");
-    assert_eq!(body["model"]["modelID"], "deepseek-v4-flash");
-    assert_eq!(body["variant"], "low");
-    assert_eq!(body["agent"], "build");
-    assert_eq!(body["messageID"], "msg_cola_def");
-}
-
-#[tokio::test]
-async fn prompt_async_maps_a_failed_status_to_a_diagnostic_opencode_error() {
-    let server = TestHttpServer::start().await;
-    server.route("POST", "/session/ses_1/prompt_async", 500, "nope");
-    let client = v1_wire_client(&server, None);
-
-    let message = opencode_error(
-        client
-            .prompt_async("ses_1", "hi", &[], None, None, None, None)
-            .await
-            .unwrap_err(),
-    );
-
-    assert!(message.contains("prompt_async ses_1"), "unexpected: {message}");
-    assert!(message.contains("500"), "unexpected: {message}");
-    assert!(message.contains("nope"), "unexpected: {message}");
-}
-
-#[tokio::test]
-async fn prompt_async_maps_404_to_session_not_found() {
-    let server = TestHttpServer::start().await; // no route -> 404
-    let client = v1_wire_client(&server, None);
-
-    let err = client
-        .prompt_async("ses_gone", "hi", &[], None, None, None, None)
-        .await
-        .unwrap_err();
-
-    match err {
-        BridgeError::SessionNotFound(id) => assert_eq!(id, "ses_gone"),
-        other => panic!("expected BridgeError::SessionNotFound, got: {other:?}"),
-    }
 }
 
 #[tokio::test]

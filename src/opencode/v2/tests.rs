@@ -5,12 +5,9 @@
 //! envelopes, the body cursor, the transcript decode and its pagination, the
 //! 204 mutations, and the run-state derivation.
 
-use super::V2Strategy;
-use crate::backend::{FinishReason, Part, StepFinish, TextPart};
 use crate::error::BridgeError;
 use crate::opencode::client::OpenCodeBackend;
 use crate::opencode::strategy::Generation;
-use crate::opencode::transport::Transport;
 use crate::opencode::types::{ImageInput, SessionStatus};
 use crate::test_http::{MockResponse, RecordedRequest, TestHttpServer};
 
@@ -563,38 +560,13 @@ fn admitted_body(id: &str) -> String {
     .to_string()
 }
 
-/// A projected transcript around one admitted user message and its answer.
-/// The optional `error` rides the assistant message, as a settled model
-/// failure does.
-fn prompt_transcript(user_id: &str, error: Option<&str>) -> String {
-    let mut answer = serde_json::json!({
-        "id": "msg_a1",
-        "type": "assistant",
-        "time": {"created": 1010, "completed": 1100},
-        "model": {"id": "deepseek-v4-flash", "providerID": "opencode-go"},
-        "content": [{"type": "text", "text": "答案"}],
-        "finish": "stop",
-    });
-    if let Some(message) = error {
-        answer["error"] = serde_json::json!({"type": "ProviderError", "message": message});
-        answer["finish"] = serde_json::Value::Null;
-    }
-    serde_json::json!({
-        "data": [
-            {"id": user_id, "type": "user", "time": {"created": 1000}, "text": "hi"},
-            answer,
-        ],
-        "cursor": {},
-    })
-    .to_string()
-}
-
-/// The blocking prompt: admit with the cola-chosen id and the text/files
-/// payload, wait through the experimental endpoint, then decode the turn's
-/// assistant content into the neutral response. The per-prompt
-/// model/variant/agent axes are V1 concepts — V2 must not put them on the wire.
+/// The prompt submit is V2's native admit-then-return: one POST durably
+/// admits the message (cola's id, text + files, explicit `steer` delivery) and
+/// returns immediately — no wait endpoint, no transcript read, no polling. The
+/// Turn observes the turn it scheduled from the transcript + run state
+/// (ADR-0056).
 #[tokio::test]
-async fn prompt_admits_the_text_files_and_id_then_waits_and_decodes_the_reply() {
+async fn prompt_admits_the_text_files_and_id_then_returns_without_waiting() {
     let server = TestHttpServer::start().await;
     server.route(
         "POST",
@@ -602,16 +574,9 @@ async fn prompt_admits_the_text_files_and_id_then_waits_and_decodes_the_reply() 
         200,
         admitted_body("msg_cola_1"),
     );
-    server.route("POST", "/api/experimental/session/ses_1/wait", 204, "");
-    server.route(
-        "GET",
-        "/api/session/ses_1/message",
-        200,
-        prompt_transcript("msg_cola_1", None),
-    );
     let client = v2_wire_client(&server);
 
-    let response = client
+    client
         .prompt(
             "ses_1",
             "hi",
@@ -627,27 +592,11 @@ async fn prompt_admits_the_text_files_and_id_then_waits_and_decodes_the_reply() 
         .await
         .unwrap();
 
-    assert_eq!(response.id, "msg_a1", "the answer's id");
-    assert_eq!(response.session_id.as_deref(), Some("ses_1"));
     assert_eq!(
-        response.parent_id.as_deref(),
-        Some("msg_cola_1"),
-        "the response answers the admitted user message"
+        server.request_count(),
+        1,
+        "admit only: the submit must not wait or read the transcript"
     );
-    assert!(response.error.is_none());
-    assert_eq!(
-        response.parts,
-        vec![
-            Part::Text(TextPart {
-                text: "答案".into(),
-                started_at: None
-            }),
-            Part::StepFinish(StepFinish {
-                reason: FinishReason::Stop
-            }),
-        ]
-    );
-
     let prompt = request_at(&server, 0);
     assert_eq!(prompt.method, "POST");
     assert_eq!(prompt.path, "/api/session/ses_1/prompt");
@@ -657,17 +606,10 @@ async fn prompt_admits_the_text_files_and_id_then_waits_and_decodes_the_reply() 
             "id": "msg_cola_1",
             "text": "hi",
             "files": [{"uri": "data:image/png;base64,AAAA"}],
+            "delivery": "steer",
         }),
-        "V2's prompt payload: text + files + the durable id; no model/agent axes"
+        "V2's prompt payload: text + files + the durable id + explicit steer; no model/agent axes"
     );
-    let wait = request_at(&server, 1);
-    assert_eq!(wait.method, "POST");
-    assert_eq!(wait.path, "/api/experimental/session/ses_1/wait");
-    assert_eq!(wait.body, "", "the wait endpoint takes no payload");
-    let read = request_at(&server, 2);
-    assert_eq!(read.path, "/api/session/ses_1/message");
-    assert_eq!(read.query_param("order").as_deref(), Some("asc"));
-    assert_eq!(server.request_count(), 3);
 }
 
 /// A prompt without images carries no `files` key at all (never an empty
@@ -676,13 +618,6 @@ async fn prompt_admits_the_text_files_and_id_then_waits_and_decodes_the_reply() 
 async fn prompt_omits_empty_files_and_an_absent_message_id() {
     let server = TestHttpServer::start().await;
     server.route("POST", "/api/session/ses_1/prompt", 200, admitted_body("msg_srv"));
-    server.route("POST", "/api/experimental/session/ses_1/wait", 204, "");
-    server.route(
-        "GET",
-        "/api/session/ses_1/message",
-        200,
-        prompt_transcript("msg_srv", None),
-    );
     let client = v2_wire_client(&server);
 
     client
@@ -692,262 +627,13 @@ async fn prompt_omits_empty_files_and_an_absent_message_id() {
 
     assert_eq!(
         body_json(&request_at(&server, 0)),
-        serde_json::json!({"text": "hi"}),
-        "no files, no id, no delivery on the main dispatch"
+        serde_json::json!({"text": "hi", "delivery": "steer"}),
+        "no files, no id"
     );
-}
-
-/// When the experimental wait route is absent (or failing), the blocking
-/// prompt falls back to polling `session.active` until the session has been
-/// absent for the confirmation window. Paused time keeps the poll cadence
-/// free.
-#[tokio::test(start_paused = true)]
-async fn prompt_falls_back_to_active_map_polling_when_wait_is_unavailable() {
-    let server = TestHttpServer::start().await;
-    server.route(
-        "POST",
-        "/api/session/ses_1/prompt",
-        200,
-        admitted_body("msg_cola_1"),
-    );
-    server.route(
-        "POST",
-        "/api/experimental/session/ses_1/wait",
-        404,
-        r#"{"message":"no such route"}"#,
-    );
-    server.route_sequence(
-        "GET",
-        "/api/session/active",
-        vec![
-            MockResponse::json(serde_json::json!({"data": {"ses_1": {"type": "running"}}}).to_string()),
-            MockResponse::json(serde_json::json!({"data": {}}).to_string()),
-            MockResponse::json(serde_json::json!({"data": {}}).to_string()),
-            MockResponse::json(serde_json::json!({"data": {}}).to_string()),
-        ],
-    );
-    server.route(
-        "GET",
-        "/api/session/ses_1/message",
-        200,
-        prompt_transcript("msg_cola_1", None),
-    );
-    let client = v2_wire_client(&server);
-
-    let response = client
-        .prompt("ses_1", "hi", &[], None, None, None, Some("msg_cola_1"))
-        .await
-        .unwrap();
-
-    assert_eq!(response.id, "msg_a1");
-    assert_eq!(
-        server.request_count(),
-        7,
-        "admit + wait + four active reads (running then three absences) + transcript"
-    );
-    for index in 2..6 {
-        assert_eq!(request_at(&server, index).path, "/api/session/active");
-    }
-    assert_eq!(request_at(&server, 6).path, "/api/session/ses_1/message");
-}
-
-/// A single absent read is not trusted: the prompt admit only schedules
-/// execution, so the poll fallback confirms absence across a bounded window. A
-/// run that registers right after the first (pre-registration) read must be
-/// followed to its reply, not mistaken for an already-idle session and
-/// degraded to the empty admitted response.
-#[tokio::test(start_paused = true)]
-async fn poll_fallback_confirms_absence_and_never_mistakes_a_registration_race_for_idle() {
-    let server = TestHttpServer::start().await;
-    server.route(
-        "POST",
-        "/api/session/ses_1/prompt",
-        200,
-        admitted_body("msg_cola_1"),
-    );
-    server.route(
-        "POST",
-        "/api/experimental/session/ses_1/wait",
-        404,
-        r#"{"message":"no such route"}"#,
-    );
-    // The first read races ahead of the run's registration, then the run
-    // appears and finishes; absence must then be confirmed three times.
-    server.route_sequence(
-        "GET",
-        "/api/session/active",
-        vec![
-            MockResponse::json(serde_json::json!({"data": {}}).to_string()),
-            MockResponse::json(serde_json::json!({"data": {"ses_1": {"type": "running"}}}).to_string()),
-            MockResponse::json(serde_json::json!({"data": {}}).to_string()),
-            MockResponse::json(serde_json::json!({"data": {}}).to_string()),
-            MockResponse::json(serde_json::json!({"data": {}}).to_string()),
-        ],
-    );
-    server.route(
-        "GET",
-        "/api/session/ses_1/message",
-        200,
-        prompt_transcript("msg_cola_1", None),
-    );
-    let client = v2_wire_client(&server);
-
-    let response = client
-        .prompt("ses_1", "hi", &[], None, None, None, Some("msg_cola_1"))
-        .await
-        .unwrap();
-
-    assert_eq!(
-        response.id, "msg_a1",
-        "the fallback must not degrade to the empty admitted response on a registration race"
-    );
-    assert!(
-        !response.parts.is_empty(),
-        "the followed turn's reply must be in the response: {response:#?}"
-    );
-    assert_eq!(
-        server.request_count(),
-        8,
-        "admit + wait + five active reads (absence, running, then three absences) + transcript"
-    );
-    for index in 2..7 {
-        assert_eq!(request_at(&server, index).path, "/api/session/active");
-    }
-}
-
-/// The poll fallback is bounded: a server that never reports the session idle
-/// stops the fallback at its timeout with a warning instead of hanging the
-/// blocking prompt (and the Turn) forever. The production timeout is an hour;
-/// the test drives the same loop with a short one so it stops within one poll
-/// interval of the bound (real time — paused time would let HTTP-client timers
-/// jump the clock past the deadline).
-#[tokio::test]
-async fn poll_fallback_stops_with_a_warning_at_its_timeout() {
-    let server = TestHttpServer::start().await;
-    server.route(
-        "GET",
-        "/api/session/active",
-        200,
-        serde_json::json!({"data": {"ses_1": {"type": "running"}}}).to_string(),
-    );
-    let http = Transport::new(Some("opencode"), Some("secret"), server.base_url());
-    http.disable_env_proxy(Some("opencode"), Some("secret"));
-
-    let (result, logs) = crate::bridge::test_support::capture_logs(async {
-        V2Strategy
-            .poll_until_idle(&http, "ses_1", std::time::Duration::from_millis(300))
-            .await
-    })
-    .await;
-
-    assert!(
-        result.is_ok(),
-        "a timeout is a degradation, not an error: {result:?}"
-    );
-    assert!(
-        (1..=2).contains(&server.request_count()),
-        "the loop must stop within one poll interval of the bound, not keep polling: {}",
-        server.request_count()
-    );
-    let warning = crate::bridge::test_support::assert_line_level(&logs, "still active after", "WARN");
-    assert!(
-        warning.contains("ses_1"),
-        "the warning names the session: {warning}"
-    );
-    assert!(
-        !logs.contains("idle not confirmed"),
-        "the last read was active, so the expiry must not claim an unconfirmed absence: {logs}"
-    );
-}
-
-/// The expiry WARN tells the truth about which state it gave up on: a server
-/// whose last reads were absent-but-unconfirmed (fewer than the confirmation
-/// window) must not be reported as "still active".
-#[tokio::test]
-async fn poll_fallback_timeout_warning_reports_an_unconfirmed_absence() {
-    let server = TestHttpServer::start().await;
-    server.route(
-        "GET",
-        "/api/session/active",
-        200,
-        serde_json::json!({"data": {}}).to_string(),
-    );
-    let http = Transport::new(Some("opencode"), Some("secret"), server.base_url());
-    http.disable_env_proxy(Some("opencode"), Some("secret"));
-
-    let (result, logs) = crate::bridge::test_support::capture_logs(async {
-        V2Strategy
-            .poll_until_idle(&http, "ses_1", std::time::Duration::from_millis(300))
-            .await
-    })
-    .await;
-
-    assert!(result.is_ok(), "{result:?}");
-    let warning = crate::bridge::test_support::assert_line_level(&logs, "idle not confirmed", "WARN");
-    assert!(
-        warning.contains("ses_1") && warning.contains("confirmation window"),
-        "the warning explains the unconfirmed absence and names the session: {warning}"
-    );
-    assert!(
-        !logs.contains("still active"),
-        "the last read was absent, so the expiry must not claim an active session: {logs}"
-    );
-}
-
-/// A failed status read inside the poll fallback is surfaced WITH its body:
-/// the error leaves `prompt` and is the caller's only diagnostic, so a bare
-/// status code is not enough. The shared `read_failure` (error without body)
-/// serves the list reads whose callers only log it; this one site uses the
-/// detailed variant.
-#[tokio::test]
-async fn poll_fallback_status_failure_surfaces_the_body() {
-    let server = TestHttpServer::start().await;
-    server.route("GET", "/api/session/active", 500, r#"{"message":"boom"}"#);
-    let http = Transport::new(Some("opencode"), Some("secret"), server.base_url());
-    http.disable_env_proxy(Some("opencode"), Some("secret"));
-
-    let error = V2Strategy
-        .poll_until_idle(&http, "ses_1", std::time::Duration::from_millis(300))
-        .await
-        .unwrap_err();
-    let message = error.to_string();
-    assert!(
-        message.contains("session status failed") && message.contains("500") && message.contains("boom"),
-        "the poll fallback's status failure must keep its body preview: {message}"
-    );
-}
-
-/// The settled turn's failure is surfaced: the assistant message's `error`
-/// rides the prompt response as V1's `info.error` does.
-#[tokio::test]
-async fn prompt_surfaces_the_turns_model_error() {
-    let server = TestHttpServer::start().await;
-    server.route(
-        "POST",
-        "/api/session/ses_1/prompt",
-        200,
-        admitted_body("msg_cola_1"),
-    );
-    server.route("POST", "/api/experimental/session/ses_1/wait", 204, "");
-    server.route(
-        "GET",
-        "/api/session/ses_1/message",
-        200,
-        prompt_transcript("msg_cola_1", Some("provider 503")),
-    );
-    let client = v2_wire_client(&server);
-
-    let response = client
-        .prompt("ses_1", "hi", &[], None, None, None, Some("msg_cola_1"))
-        .await
-        .unwrap();
-
-    assert_eq!(response.error.as_deref(), Some("provider 503"));
 }
 
 /// A 404 is the bridge's recreate-the-mapping signal only when its `_tag` says
-/// the session is missing: an untagged proxy 404 stays a plain failure, and a
-/// tagged 404 while waiting surfaces the same SessionNotFound.
+/// the session is missing: an untagged proxy 404 stays a plain failure.
 #[tokio::test]
 async fn prompt_maps_only_a_tagged_session_not_found() {
     let tagged = TestHttpServer::start().await;
@@ -982,80 +668,6 @@ async fn prompt_maps_only_a_tagged_session_not_found() {
     assert!(
         matches!(error, BridgeError::OpenCode(_)),
         "an untagged 404 must not trigger the recreate heal: {error:?}"
-    );
-
-    // The wait's tagged 404 (the session vanished mid-turn) surfaces too.
-    let wait_gone = TestHttpServer::start().await;
-    wait_gone.route(
-        "POST",
-        "/api/session/ses_1/prompt",
-        200,
-        admitted_body("msg_cola_1"),
-    );
-    wait_gone.route(
-        "POST",
-        "/api/experimental/session/ses_1/wait",
-        404,
-        r#"{"_tag":"SessionNotFoundError","message":"gone"}"#,
-    );
-    let client = v2_wire_client(&wait_gone);
-    let error = client
-        .prompt("ses_1", "hi", &[], None, None, None, Some("msg_cola_1"))
-        .await
-        .unwrap_err();
-    assert!(matches!(error, BridgeError::SessionNotFound(_)), "{error:?}");
-}
-
-/// A transcript read that fails after a successful wait is a downgrade, never a
-/// failed turn: the response is Ok with the admitted id and no parts, so the
-/// Bridge's own final read decides the render.
-#[tokio::test]
-async fn prompt_degrades_when_the_reply_read_fails() {
-    let server = TestHttpServer::start().await;
-    server.route(
-        "POST",
-        "/api/session/ses_1/prompt",
-        200,
-        admitted_body("msg_cola_1"),
-    );
-    server.route("POST", "/api/experimental/session/ses_1/wait", 204, "");
-    server.route("GET", "/api/session/ses_1/message", 500, r#"{"message":"boom"}"#);
-    let client = v2_wire_client(&server);
-
-    let response = client
-        .prompt("ses_1", "hi", &[], None, None, None, Some("msg_cola_1"))
-        .await
-        .unwrap();
-
-    assert_eq!(response.id, "msg_cola_1");
-    assert_eq!(response.parent_id.as_deref(), Some("msg_cola_1"));
-    assert!(response.error.is_none());
-    assert!(response.parts.is_empty());
-}
-
-/// The supplement path: `prompt_async` admits with `delivery: "steer"` so the
-/// item merges into the running turn, and returns without waiting (no wait, no
-/// transcript read — the bridge keeps its card live through the render poll).
-#[tokio::test]
-async fn prompt_async_admits_with_steer_delivery_and_does_not_wait() {
-    let server = TestHttpServer::start().await;
-    server.route(
-        "POST",
-        "/api/session/ses_1/prompt",
-        200,
-        admitted_body("msg_cola_2"),
-    );
-    let client = v2_wire_client(&server);
-
-    client
-        .prompt_async("ses_1", "更多", &[], None, None, None, Some("msg_cola_2"))
-        .await
-        .unwrap();
-
-    assert_eq!(server.request_count(), 1, "no wait and no transcript read");
-    assert_eq!(
-        body_json(&last_request(&server)),
-        serde_json::json!({"id": "msg_cola_2", "text": "更多", "delivery": "steer"})
     );
 }
 

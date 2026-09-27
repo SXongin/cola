@@ -26,8 +26,8 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 use crate::opencode::types::{
-    AgentInfo, CreateSessionInput, FormAnswer, ImageInput, ModelInfo, PermissionRequest, PromptResponse,
-    ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
+    AgentInfo, CreateSessionInput, FormAnswer, ImageInput, ModelInfo, PermissionRequest, ProviderModels,
+    QuestionRequest, Session, SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
 };
 
 /// A directory-scoped handle to the backend. Instance routing lives here: the
@@ -124,6 +124,16 @@ pub trait Backend: Send + Sync {
     #[allow(dead_code)] // no bridge caller yet; the generation wire tests drive it
     async fn delete_session(&self, session_id: &str) -> Result<()>;
 
+    /// Submit one prompt: the message is persisted and a run is scheduled,
+    /// then the call returns — it does NOT block until the turn finishes. How
+    /// a generation sends a prompt does not change the contract: V1 uses the
+    /// native fire-and-forget route, V2 its admit-then-return prompt.
+    ///
+    /// The Turn observes the submitted turn's completion from the transcript
+    /// and the run state ([`Self::transcript`] + [`Self::session_status`]);
+    /// a failure that cannot be observed there (a rejected submit, a transport
+    /// error) surfaces as the call's `Err`.
+    ///
     /// `model` is the per-session `/model` override (parsed "provider/model");
     /// None → the configured default applies, and if that's also unset the
     /// server uses its own default model.
@@ -141,26 +151,8 @@ pub trait Backend: Send + Sync {
     /// create (ADR-0026: `msg_cola_` self-identifies cola-authored messages;
     /// the server persists it, and reusing it on a retry is idempotent). None
     /// falls back to a server-generated id.
-    ///
-    /// The blocking contract is generation-blind: V1 blocks natively, V2
-    /// polyfills the block with `session.wait` plus a poll fallback (ADR-0056).
     #[allow(clippy::too_many_arguments)] // prompt axes: session/text/images + model/variant/agent/message-id
     async fn prompt(
-        &self,
-        session_id: &str,
-        text: &str,
-        images: &[ImageInput],
-        model: Option<&ModelInfo>,
-        variant: Option<&str>,
-        agent: Option<&str>,
-        message_id: Option<&str>,
-    ) -> Result<PromptResponse>;
-
-    /// Fire-and-forget prompt (OpenCode `prompt_async`): message persisted and
-    /// a run forked, returns immediately. Used by the supplement path so a
-    /// message sent mid-turn doesn't block. Same `images` semantics as `prompt`.
-    #[allow(clippy::too_many_arguments)] // same prompt axes as `prompt`
-    async fn prompt_async(
         &self,
         session_id: &str,
         text: &str,

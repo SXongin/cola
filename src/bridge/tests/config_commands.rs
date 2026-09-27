@@ -1442,15 +1442,15 @@ async fn model_command_rejects_malformed_value() {
 }
 
 /// The `/model` override also flows through the supplement (in-flight)
-/// prompt_async path, not just the synchronous prompt.
+/// submit path, not just a fresh Turn's prompt.
 #[tokio::test]
 async fn model_override_flows_through_supplement_path() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let backend = MockBackend::new(realistic_parts());
-    let async_models = backend.prompt_async_models.clone();
-    let async_calls = backend.prompt_async_calls.clone();
+    let async_models = backend.prompt_models.clone();
+    let async_calls = backend.prompt_calls.clone();
     let (app, _platform) = build_app(cfg, backend).await;
     seed_entry(
         &app,
@@ -1488,10 +1488,7 @@ async fn model_override_flows_through_supplement_path() {
     ))
     .await;
 
-    assert_eq!(
-        async_calls.lock().await.as_slice(),
-        &["ses_test:补充内容".to_string()]
-    );
+    assert_eq!(async_calls.lock().await.as_slice(), &["补充内容".to_string()]);
     assert_eq!(
         async_models.lock().await.as_slice(),
         &[Some("opencode-go/deepseek-v4-flash".to_string())]
@@ -1552,15 +1549,15 @@ async fn agent_command_records_override_used_on_next_prompt() {
 }
 
 /// The `/agent` override also flows through the supplement (in-flight)
-/// prompt_async path, not just the synchronous prompt.
+/// submit path, not just a fresh Turn's prompt.
 #[tokio::test]
 async fn agent_override_flows_through_supplement_path() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let backend = MockBackend::new(realistic_parts());
-    let async_agents = backend.prompt_async_agents.clone();
-    let async_calls = backend.prompt_async_calls.clone();
+    let async_agents = backend.prompt_agents.clone();
+    let async_calls = backend.prompt_calls.clone();
     let (app, _platform) = build_app(cfg, backend).await;
     seed_entry(
         &app,
@@ -1589,10 +1586,7 @@ async fn agent_override_flows_through_supplement_path() {
     ))
     .await;
 
-    assert_eq!(
-        async_calls.lock().await.as_slice(),
-        &["ses_test:补充内容".to_string()]
-    );
+    assert_eq!(async_calls.lock().await.as_slice(), &["补充内容".to_string()]);
     assert_eq!(
         async_agents.lock().await.as_slice(),
         &[Some("primary".to_string())]

@@ -564,8 +564,8 @@ impl App {
 
         // Supplement path: if this session already has a turn in flight, don't
         // start a competing run_prompt (it would overwrite the running turn's
-        // accumulator and race on the same card). Instead send the message
-        // fire-and-forget via prompt_async — OpenCode persists it and the
+        // accumulator and race on the same card). Instead submit the message to
+        // the backend without starting a Turn — OpenCode persists it and the
         // running loop picks it up at the next tool boundary, merging it into
         // the current turn (original message preserved; model sees full
         // history). This is what lets the user append context mid-turn without
@@ -582,7 +582,7 @@ impl App {
                 let cola_msg_id = crate::opencode::parsing::cola_message_id();
                 match self
                     .opencode
-                    .prompt_async(
+                    .prompt(
                         &session_id,
                         &text,
                         &image_inputs,
@@ -600,7 +600,7 @@ impl App {
                         );
                     }
                     Err(e) => {
-                        tracing::warn!("supplement: prompt_async failed: {}", e);
+                        tracing::warn!("supplement: prompt failed: {}", e);
                         // The failure notice is sent first, then the split
                         // still happens below — the live card must remain the
                         // newest message, not the notice.

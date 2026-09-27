@@ -557,40 +557,8 @@ pub(super) fn decode_messages(data: &[Value]) -> SessionTranscript {
     SessionTranscript::new(data.iter().map(decode_message).collect())
 }
 
-/// The failure the turn anchored at `anchor_ms` recorded, if any: the newest
-/// assistant message belonging to that turn whose `error` field is set. A final
-/// model failure settles the session idle with its error on the assistant
-/// message, and the blocking prompt contract has to surface it — the neutral
-/// transcript deliberately carries no error field (it is a prompt-response
-/// fact). An older turn's error can never leak into a newer turn's response:
-/// membership mirrors the transcript's own rule (still in flight → belongs;
-/// completed → only when created within the turn or still producing as the
-/// turn began).
-pub(super) fn turn_error(data: &[Value], anchor_ms: i64) -> Option<String> {
-    data.iter()
-        .filter(|message| message.get("type").and_then(Value::as_str) == Some("assistant"))
-        .filter(|message| assistant_in_turn(message, anchor_ms))
-        .filter_map(|message| message.get("error"))
-        .rfind(|error| !error.is_null())
-        .and_then(decode_error)
-}
-
-/// Whether a projected assistant message belongs to the turn anchored at
-/// `anchor_ms` — the raw mirror of the neutral transcript's membership rule
-/// ([`crate::backend::SessionTranscript::turn_for_user`]). A message without a
-/// server time cannot be placed and stays out.
-fn assistant_in_turn(message: &Value, anchor_ms: i64) -> bool {
-    let Some(created) = message.pointer("/time/created").and_then(Value::as_i64) else {
-        return false;
-    };
-    match message.pointer("/time/completed").and_then(Value::as_i64) {
-        None => true,
-        Some(completed) => created >= anchor_ms || completed >= anchor_ms,
-    }
-}
-
-/// Decode one projected message. Its identity, role and server time are the
-/// neutral facts; the body depends on the message type.
+/// Decode one projected message. Its identity, role, server time and recorded
+/// failure are the neutral facts; the body depends on the message type.
 fn decode_message(message: &Value) -> TranscriptMessage {
     let kind = message.get("type").and_then(Value::as_str);
     let (role, parts) = decode_body(kind, message);
@@ -606,6 +574,7 @@ fn decode_message(message: &Value) -> TranscriptMessage {
         time: decode_time(message),
         model: decode_model(message.get("model")),
         tokens: decode_tokens(message.get("tokens")),
+        error: message.get("error").and_then(decode_error),
         parts,
     }
 }
@@ -1296,69 +1265,37 @@ mod tests {
         assert_eq!(admitted.id, "msg_cola_1");
     }
 
-    /// The turn's error is the newest assistant error *within* the turn: an
-    /// older turn's failure never leaks into a newer response, a still-in-flight
-    /// step created before the anchor belongs (the streaming rule), and an
-    /// unreadable error shape reads as no error.
+    /// A projected message's `error` field lands on the neutral message — the
+    /// async-native Turn derives a settled turn's failure from it (the
+    /// turn-level membership/newest rule is the neutral transcript's).
     #[test]
-    fn turn_error_reads_the_newest_error_inside_the_turn_only() {
-        let old_failure = serde_json::json!({
-            "id": "msg_old", "type": "assistant",
-            "time": {"created": 10, "completed": 20},
-            "error": {"type": "ProviderError", "message": "old boom"},
-        });
-        let in_flight_failure = serde_json::json!({
-            "id": "msg_inflight", "type": "assistant",
-            "time": {"created": 5},
-            "error": {"message": "still running"},
-        });
-        let new_success = serde_json::json!({
-            "id": "msg_new", "type": "assistant",
-            "time": {"created": 110, "completed": 120},
-            "error": null,
-        });
-        let new_failure = serde_json::json!({
-            "id": "msg_new", "type": "assistant",
-            "time": {"created": 110, "completed": 120},
-            "error": {"type": "ProviderError", "message": "new boom"},
-        });
-
+    fn message_errors_decode_onto_the_neutral_message() {
+        let transcript = decode_messages(&[
+            serde_json::json!({
+                "id": "msg_new", "type": "assistant",
+                "time": {"created": 110, "completed": 120},
+                "error": {"type": "ProviderError", "message": "new boom"},
+            }),
+            serde_json::json!({
+                "id": "msg_null", "type": "assistant",
+                "time": {"created": 130, "completed": 140},
+                "error": null,
+            }),
+            serde_json::json!({
+                "id": "msg_str", "type": "assistant",
+                "time": {"created": 150, "completed": 160},
+                "error": "just a string",
+            }),
+        ]);
         assert_eq!(
-            turn_error(&[old_failure.clone(), new_success.clone()], 100),
-            None,
-            "an older turn's error must not leak into a newer response"
+            transcript.messages[0].error.as_deref(),
+            Some("new boom"),
+            "an object error normalizes to its message"
         );
-        assert_eq!(
-            turn_error(&[old_failure.clone(), new_failure.clone()], 100).as_deref(),
-            Some("new boom")
+        assert!(
+            transcript.messages[1].error.is_none(),
+            "an explicit null is no error"
         );
-        assert_eq!(
-            turn_error(&[old_failure.clone(), in_flight_failure], 100).as_deref(),
-            Some("still running"),
-            "a still-in-flight step belongs to the current turn"
-        );
-        assert_eq!(
-            turn_error(
-                &[
-                    old_failure,
-                    serde_json::json!({"id": "msg_ts", "type": "assistant", "error": {"message": "x"}})
-                ],
-                100
-            ),
-            None,
-            "a message without a server time cannot be placed"
-        );
-        assert_eq!(
-            turn_error(
-                &[serde_json::json!({
-                    "id": "msg_str", "type": "assistant",
-                    "time": {"created": 110, "completed": 120},
-                    "error": "just a string"
-                })],
-                100
-            )
-            .as_deref(),
-            Some("just a string")
-        );
+        assert_eq!(transcript.messages[2].error.as_deref(), Some("just a string"));
     }
 }

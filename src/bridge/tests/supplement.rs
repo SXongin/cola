@@ -418,7 +418,7 @@ async fn supplement_during_the_loading_card_round_trip_still_splits() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let backend = MockBackend::new(realistic_parts());
-    let async_calls = backend.prompt_async_calls.clone();
+    let async_calls = backend.prompt_calls.clone();
     let (app, platform) = build_app(cfg, backend).await;
 
     // Park the loading card's reply: the turn holds the inflight guard and its
@@ -527,7 +527,7 @@ async fn supplements_queued_in_the_startup_window_share_one_continuation() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let backend = MockBackend::new(realistic_parts());
-    let async_calls = backend.prompt_async_calls.clone();
+    let async_calls = backend.prompt_calls.clone();
     let (app, platform) = build_app(cfg, backend).await;
 
     // Park the loading card's reply: the turn holds the inflight guard and its
@@ -748,7 +748,7 @@ async fn failed_supplement_send_splits_after_the_failure_notice() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.fail_supplement("provider 503");
+    backend.fail_prompts(1, "provider 503");
     let (app, platform) = build_app(cfg, backend).await;
     seed_session(&app, "ses_test", "/work").await;
     seed_live_turn(&app, "ses_test", "第一段进度。").await;

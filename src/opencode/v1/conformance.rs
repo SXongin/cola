@@ -14,7 +14,7 @@ use crate::test_http::{MockResponse, TestHttpServer};
 
 /// The V1 conformance case: the unprefixed routes, with V1's response shapes
 /// (a bare list array + a header cursor, a bare session object, a status map,
-/// the blocking prompt response).
+/// and the fire-and-forget prompt submit).
 pub(crate) fn case() -> SessionCase {
     SessionCase {
         generation: Generation::V1,
@@ -181,29 +181,45 @@ fn mount_recorded_transcript(server: &TestHttpServer, session_id: &str, body: &s
     server.route("GET", &format!("/session/{session_id}/message"), 200, body);
 }
 
-/// Mount the V1 blocking prompt: `POST /session/{id}/message` answers the
-/// assistant message inline (`{info, parts}`), exactly as the live server does
-/// when the turn finishes. The answer's `parts` carry the same neutral values
-/// the shared [`PromptFixture`] names.
+/// Mount the V1 prompt submit: `POST /session/{id}/prompt_async` answers 204
+/// (the native fire-and-forget route), and the transcript read serves the turn
+/// it scheduled — the observation source the async-native Turn drives
+/// completion from. The answer's parts carry the same neutral values the
+/// shared [`PromptFixture`] names.
 fn mount_prompt(server: &TestHttpServer, fixture: &PromptFixture) {
     server.route(
         "POST",
+        &format!("/session/{}/prompt_async", fixture.session),
+        204,
+        "",
+    );
+    server.route(
+        "GET",
         &format!("/session/{}/message", fixture.session),
         200,
-        json!({
-            "info": {
-                "id": fixture.answer_id,
-                "parentID": fixture.message_id,
-                "role": "assistant",
-                "time": {"created": 1010, "completed": 1100},
-                "providerID": "opencode-go",
-                "modelID": "deepseek-v4-flash",
+        json!([
+            {
+                "info": {
+                    "id": fixture.message_id,
+                    "role": "user",
+                    "time": {"created": 1000},
+                },
+                "parts": [{"type": "text", "text": fixture.text}],
             },
-            "parts": [
-                {"type": "text", "text": fixture.answer_text},
-                {"type": "step-finish", "reason": "stop"},
-            ],
-        })
+            {
+                "info": {
+                    "id": fixture.answer_id,
+                    "role": "assistant",
+                    "time": {"created": 1010, "completed": 1100},
+                    "providerID": "opencode-go",
+                    "modelID": "deepseek-v4-flash",
+                },
+                "parts": [
+                    {"type": "text", "text": fixture.answer_text},
+                    {"type": "step-finish", "reason": "stop"},
+                ],
+            },
+        ])
         .to_string(),
     );
 }

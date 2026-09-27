@@ -35,8 +35,10 @@ Tool-payload knowledge stays Platform contract, not protocol coupling
   V1 retirement is a deletion.
 - Discovery gains a probe step, and V2 credentials come from the service
   registration file (plain `serve` stays on `/proc`).
-- The experimental `wait` endpoint is a temporary, recorded dependency until
-  the async-native Turn slice (ADR-0056).
+- ~~The experimental `wait` endpoint is a temporary, recorded dependency until
+  the async-native Turn slice (ADR-0056).~~ **Removed 2026-09-27**: the
+  async-native Turn slice (spec #364 S8) deleted the polyfill, so cola no
+  longer depends on any experimental endpoint (ADR-0056 amendment).
 
 The effort, its detection/override rules and its slicing are spec #364
 (OpenCode V2 dual-generation support).

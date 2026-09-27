@@ -20,8 +20,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::backend::Part;
-
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionResponse {
     pub data: Session,
@@ -216,21 +214,6 @@ pub struct Location {
 pub struct ImageInput {
     pub mime: String,
     pub data_base64: String,
-}
-
-#[derive(Debug)]
-pub struct PromptResponse {
-    pub id: String,
-    pub session_id: Option<String>,
-    pub admitted_seq: Option<i64>,
-    /// The user message this turn answers (from `info.parentID`).
-    pub parent_id: Option<String>,
-    /// Error on the assistant message (e.g. provider 503), from `info.error`.
-    pub error: Option<String>,
-    /// Parts of the assistant response, decoded into the neutral read model by
-    /// the adapter's wire decoder — the same seam a polled message goes
-    /// through (ADR-0053).
-    pub parts: Vec<Part>,
 }
 
 /// The typed kind of a form field (V2 `Form.Field`). V1 questions map onto

@@ -6,10 +6,10 @@
 //! (`live_v1_scripted_capability_chain`: prompt → streamed reasoning → tool
 //! call → permission round-trip → final text) and the **V2** chains — the
 //! transcript read with the production prompt (`live_v2_scripted_transcript_read`:
-//! the blocking prompt runs while the turn streams, then the decoded transcript
-//! and its projections are asserted), the write surface
-//! (`live_v2_scripted_write_chain`: supplement steering, retry idempotency,
-//! interrupt, compact and title rename), the permission round-trip
+//! the admit-then-return submit comes back while the turn streams, and the
+//! decoded transcript and its projections are asserted at rest), the write
+//! surface (`live_v2_scripted_write_chain`: supplement steering, retry
+//! idempotency, interrupt, compact and title rename), the permission round-trip
 //! (`live_v2_scripted_permission_chain`: a gated shell tool answered through the
 //! session-scoped decision), the form round-trip
 //! (`live_v2_scripted_form_chain`: a typed question form answered with a keyed
@@ -37,8 +37,9 @@
 //!
 //! The assertion is structural: ids and timestamps vary run to run; membership,
 //! order and content are asserted. Both V2 chains drive the production adapter:
-//! the prompt goes through the strategy's blocking polyfill (`session.wait`
-//! plus the poll fallback), never a raw protocol admit.
+//! the prompt goes through the strategy's native admit-then-return submit and
+//! completion is observed from the transcript + run state, never a raw protocol
+//! read the Bridge would not perform (ADR-0056).
 //!
 //! ## Re-recording the fixture corpus
 //!
@@ -121,30 +122,28 @@ async fn live_v1_scripted_capability_chain() {
         .unwrap_or_else(|error| panic!("create session failed: {error}\n{}", server.stderr()));
 
     let message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
-    // The V1 prompt is synchronous and blocks inside the permission ask, so
-    // the permission poll and the prompt run concurrently — exactly the shape
-    // the Bridge's Turn is built around.
+    // The V1 submit is the native fire-and-forget prompt: it returns once the
+    // message is durable and a run is forked, so the permission poll below runs
+    // concurrently with the live turn — exactly the shape the Bridge's Turn is
+    // built around (ADR-0056).
     let prompt = backend.prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id));
     let answer = answer_permission(&backend, &work_dir, &session.id, &server);
 
     let (prompt_result, permission) = tokio::join!(prompt, answer);
-    let response =
-        prompt_result.unwrap_or_else(|error| panic!("prompt failed: {error}\n{}", server.stderr()));
-    assert!(
-        response.error.is_none(),
-        "the prompt must not report a model error: {:?}",
-        response.error
-    );
+    prompt_result.unwrap_or_else(|error| panic!("prompt submit failed: {error}\n{}", server.stderr()));
     assert_eq!(
         permission.session_id.as_deref(),
         Some(session.id.as_str()),
         "the ask must belong to the prompted session"
     );
 
-    let transcript = backend
-        .transcript(&session.id)
-        .await
-        .unwrap_or_else(|error| panic!("transcript read failed: {error}\n{}", server.stderr()));
+    // The submitted turn settles through transcript + run-state observation.
+    let transcript = wait_for_turn(&backend, &session.id, &message_id, &server).await;
+    assert!(
+        turn_error(&transcript, &message_id).is_none(),
+        "the submitted turn must not record a model error: {:?}",
+        turn_error(&transcript, &message_id)
+    );
 
     assert_user_anchor(&transcript, &message_id);
     assert_tool_call(&transcript, provider::Tool::Bash, provider::ToolCommand::Fast);
@@ -172,8 +171,8 @@ async fn live_v1_scripted_capability_chain() {
 }
 
 /// The V2 read chain against the pinned V2 server: prompt through the
-/// production adapter (the blocking polyfill holds while the turn streams),
-/// watch the transcript mid-turn and at rest, and assert the neutral
+/// production adapter (the admit-then-return submit comes back while the turn
+/// streams), watch the transcript mid-turn and at rest, and assert the neutral
 /// projections the Session Snapshot tail, the external-message sync and the
 /// follow renderers consume — no duplicated text, correct turn anchoring.
 #[tokio::test]
@@ -207,25 +206,12 @@ async fn live_v2_scripted_transcript_read() {
         .unwrap_or_else(|error| panic!("create session failed: {error}\n{}", server.stderr()));
 
     let message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
-    // The V2 prompt is admit-then-wait, and the polyfill blocks until the run is
-    // idle, so the prompt runs concurrently with the in-flight read below —
-    // exactly the shape the Bridge's Turn is built around.
-    let prompt_backend = backend.clone();
-    let prompt_session = session.id.clone();
-    let prompt_message_id = message_id.clone();
-    let prompt = tokio::spawn(async move {
-        prompt_backend
-            .prompt(
-                &prompt_session,
-                PROMPT_TEXT,
-                &[],
-                None,
-                None,
-                None,
-                Some(&prompt_message_id),
-            )
-            .await
-    });
+    // The V2 submit is admit-then-return: it comes back as soon as the message
+    // is durable, so the in-flight read below sees the live turn (ADR-0056).
+    backend
+        .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
+        .await
+        .unwrap_or_else(|error| panic!("prompt submit failed: {error}\n{}", server.stderr()));
 
     // Mid-turn: the projected assistant message is one row that carries its
     // content while it streams, so the first read that sees a live tool captures
@@ -268,49 +254,14 @@ async fn live_v2_scripted_transcript_read() {
     )
     .await;
 
-    // The production prompt's blocking wait returns with the turn's reply: the
-    // polyfill's decoded parts carry the closing text exactly once.
-    let response = prompt
-        .await
-        .expect("the prompt task must not panic")
-        .unwrap_or_else(|error| panic!("prompt failed: {error}\n{}", server.stderr()));
+    // At rest: the submitted turn settles and its closing text appears exactly
+    // once — the same turn the old blocking response carried inline.
+    let transcript = wait_for_turn(&backend, &session.id, &message_id, &server).await;
     assert!(
-        response.error.is_none(),
-        "the prompt must not report a model error: {:?}",
-        response.error
+        turn_error(&transcript, &message_id).is_none(),
+        "the submitted turn must not record a model error: {:?}",
+        turn_error(&transcript, &message_id)
     );
-    assert_eq!(
-        response.parent_id.as_deref(),
-        Some(message_id.as_str()),
-        "the polyfilled response answers the admitted message"
-    );
-    assert_eq!(
-        response
-            .parts
-            .iter()
-            .filter(|part| matches!(part, Part::Text(text) if text.text == provider::FINAL_TEXT))
-            .count(),
-        1,
-        "the closing deltas assemble into exactly one part on the response: {:#?}",
-        response.parts
-    );
-
-    // At rest: the terminal finish ends the turn and every marker is present
-    // exactly once.
-    let transcript = poll_until(
-        "the live V2 turn to complete",
-        POLL_TIMEOUT,
-        || async {
-            let transcript = backend.transcript(&session.id).await?;
-            let Some(anchor) = transcript.newest_user().and_then(|message| message.anchor()) else {
-                return Ok(None);
-            };
-            let complete = transcript.turn_for_user(&anchor).complete;
-            Ok(complete.then_some(transcript))
-        },
-        || server.stderr(),
-    )
-    .await;
 
     assert_user_anchor(&transcript, &message_id);
     assert_tool_call(&transcript, provider::Tool::Shell, provider::ToolCommand::Slow);
@@ -380,9 +331,9 @@ async fn live_v2_scripted_transcript_read() {
 }
 
 /// The V2 write surface against the pinned V2 server: the production prompt
-/// (blocking polyfill) with a mid-turn Supplement steered into the running
-/// turn, the cola-chosen id persisted and retry-idempotent, then interrupt,
-/// compact and the title rename.
+/// with a mid-turn Supplement steered into the running turn, the cola-chosen
+/// id persisted and retry-idempotent, then interrupt, compact and the title
+/// rename.
 #[tokio::test]
 #[ignore = "live: needs a V2 binary (see the module docs)"]
 async fn live_v2_scripted_write_chain() {
@@ -411,26 +362,15 @@ async fn live_v2_scripted_write_chain() {
         .await
         .unwrap_or_else(|error| panic!("create session failed: {error}\n{}", server.stderr()));
 
-    // The prompt blocks inside the polyfill; the supplement is steered in while
-    // the scripted slow tool runs, so the running turn must merge it.
+    // The submit returns as soon as the message is durable; the supplement is
+    // steered in while the scripted slow tool runs, so the running turn must
+    // merge it (ADR-0056).
     let message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
     let supplement_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
-    let prompt_backend = backend.clone();
-    let prompt_session = session.id.clone();
-    let prompt_message_id = message_id.clone();
-    let prompt = tokio::spawn(async move {
-        prompt_backend
-            .prompt(
-                &prompt_session,
-                PROMPT_TEXT,
-                &[],
-                None,
-                None,
-                None,
-                Some(&prompt_message_id),
-            )
-            .await
-    });
+    backend
+        .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
+        .await
+        .unwrap_or_else(|error| panic!("prompt submit failed: {error}\n{}", server.stderr()));
     poll_until(
         "the live tool so the supplement can steer mid-turn",
         POLL_TIMEOUT,
@@ -442,7 +382,7 @@ async fn live_v2_scripted_write_chain() {
     )
     .await;
     backend
-        .prompt_async(
+        .prompt(
             &session.id,
             SUPPLEMENT_TEXT,
             &[],
@@ -454,37 +394,16 @@ async fn live_v2_scripted_write_chain() {
         .await
         .unwrap_or_else(|error| panic!("supplement admit failed: {error}\n{}", server.stderr()));
 
-    let response = prompt
-        .await
-        .expect("the prompt task must not panic")
-        .unwrap_or_else(|error| panic!("prompt failed: {error}\n{}", server.stderr()));
-    assert!(
-        response.error.is_none(),
-        "the supplemented turn must not report a model error: {:?}",
-        response.error
-    );
-
-    let transcript = poll_until(
-        "the supplemented V2 turn to complete",
-        POLL_TIMEOUT,
-        || async {
-            let transcript = backend.transcript(&session.id).await?;
-            let Some(anchor) = transcript
-                .messages
-                .iter()
-                .find(|message| message.id.as_str() == message_id)
-                .and_then(|message| message.anchor())
-            else {
-                return Ok(None);
-            };
-            Ok(transcript.turn_for_user(&anchor).complete.then_some(transcript))
-        },
-        || server.stderr(),
-    )
-    .await;
+    let transcript = wait_for_turn(&backend, &session.id, &message_id, &server).await;
 
     // The supplement merged into the same turn: both user messages carry their
-    // cola ids, and the turn closed on the scripted final text.
+    // cola ids, and the turn closed on the scripted final text — with no
+    // recorded failure.
+    assert!(
+        turn_error(&transcript, &message_id).is_none(),
+        "the supplemented turn must not record a model error: {:?}",
+        turn_error(&transcript, &message_id)
+    );
     assert_user_anchor(&transcript, &message_id);
     let supplement = transcript
         .messages
@@ -540,11 +459,13 @@ async fn live_v2_scripted_write_chain() {
         .filter(|message| message.role == MessageRole::Assistant)
         .count();
     let completions_before = provider_completions(&provider);
-    let retry = backend
+    backend
         .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
         .await
         .unwrap_or_else(|error| panic!("retry failed: {error}\n{}", server.stderr()));
-    assert!(retry.error.is_none());
+    // Let the reconcile settle before counting, as the retired blocking retry
+    // did: a deduplicated id schedules nothing.
+    wait_for_idle(&backend, &session.id, &work_dir, &server).await;
     let transcript = backend
         .transcript(&session.id)
         .await
@@ -583,31 +504,27 @@ async fn live_v2_scripted_write_chain() {
     );
     wait_for_idle(&backend, &session.id, &work_dir, &server).await;
 
-    // Interrupt: a fresh slow turn is stopped mid-flight; the blocking prompt
-    // unblocks, the interrupt answers as an accepted op, and the session idles.
-    // A fresh session keeps the scripted provider's first call a tool call (the
+    // Interrupt: a fresh slow turn is stopped mid-flight; the interrupt answers
+    // as an accepted op, the live tool settles, and the session idles. A fresh
+    // session keeps the scripted provider's first call a tool call (the
     // transcript above already carries a tool result).
     let interrupt_session = backend
         .create_session(&backend.new_session_input(Some(&work_dir)))
         .await
         .unwrap_or_else(|error| panic!("create interrupt session failed: {error}\n{}", server.stderr()));
     let interrupt_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
-    let prompt_backend = backend.clone();
-    let prompt_session = interrupt_session.id.clone();
-    let interrupt_message_id = interrupt_id.clone();
-    let interrupted = tokio::spawn(async move {
-        prompt_backend
-            .prompt(
-                &prompt_session,
-                PROMPT_TEXT,
-                &[],
-                None,
-                None,
-                None,
-                Some(&interrupt_message_id),
-            )
-            .await
-    });
+    backend
+        .prompt(
+            &interrupt_session.id,
+            PROMPT_TEXT,
+            &[],
+            None,
+            None,
+            None,
+            Some(&interrupt_id),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("interrupt submit failed: {error}\n{}", server.stderr()));
     poll_until(
         "the interrupt turn's live tool",
         POLL_TIMEOUT,
@@ -622,15 +539,15 @@ async fn live_v2_scripted_write_chain() {
         .interrupt(&interrupt_session.id)
         .await
         .unwrap_or_else(|error| panic!("interrupt failed: {error}\n{}", server.stderr()));
-    let interrupted = tokio::time::timeout(POLL_TIMEOUT, interrupted)
-        .await
-        .unwrap_or_else(|_| panic!("the interrupted prompt must return\n{}", server.stderr()))
-        .expect("the prompt task must not panic");
-    assert!(
-        interrupted.is_ok(),
-        "the interrupted prompt must complete, not fail: {interrupted:?}"
-    );
     wait_for_idle(&backend, &interrupt_session.id, &work_dir, &server).await;
+    let interrupted = backend
+        .transcript(&interrupt_session.id)
+        .await
+        .unwrap_or_else(|error| panic!("interrupt transcript read failed: {error}\n{}", server.stderr()));
+    assert!(
+        !has_live_tool(&interrupted),
+        "the interrupt must settle the live tool: {interrupted:#?}"
+    );
 
     // Compact and the title rename: V2's compact needs its empty payload, and
     // the 204 title patch must persist for the session surfaces.
@@ -744,20 +661,16 @@ async fn live_v2_scripted_selection_chain() {
     // `None` (the V2 strategy would drop them anyway — the wire has no such
     // fields — so this is what "the session's selection applies" means).
     let message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
-    let response = backend
+    backend
         .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
         .await
-        .unwrap_or_else(|error| panic!("prompt failed: {error}\n{}", server.stderr()));
+        .unwrap_or_else(|error| panic!("prompt submit failed: {error}\n{}", server.stderr()));
+    let transcript = wait_for_turn(&backend, &session.id, &message_id, &server).await;
     assert!(
-        response.error.is_none(),
+        turn_error(&transcript, &message_id).is_none(),
         "the switched selection must run cleanly: {:?}",
-        response.error
+        turn_error(&transcript, &message_id)
     );
-
-    let transcript = backend
-        .transcript(&session.id)
-        .await
-        .unwrap_or_else(|error| panic!("transcript read failed: {error}\n{}", server.stderr()));
     assert_user_anchor(&transcript, &message_id);
     assert_turn_complete(&transcript, &message_id);
     let answer = transcript
@@ -947,25 +860,13 @@ async fn live_v2_scripted_permission_chain() {
         .unwrap_or_else(|error| panic!("create session failed: {error}\n{}", server.stderr()));
 
     let message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
-    let prompt_backend = backend.clone();
-    let prompt_session = session.id.clone();
-    let prompt_message_id = message_id.clone();
-    let prompt = tokio::spawn(async move {
-        prompt_backend
-            .prompt(
-                &prompt_session,
-                PROMPT_TEXT,
-                &[],
-                None,
-                None,
-                None,
-                Some(&prompt_message_id),
-            )
-            .await
-    });
-
-    // The turn blocks on the shell ask; the location-scoped pending list must
-    // surface it (one call per directory, never per session).
+    // The admit-then-return submit schedules the turn; it blocks on the shell
+    // ask, which the location-scoped pending list must surface (one call per
+    // directory, never per session).
+    backend
+        .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
+        .await
+        .unwrap_or_else(|error| panic!("prompt submit failed: {error}\n{}", server.stderr()));
     let permission = poll_until(
         &format!("a V2 permission ask for session {}", session.id),
         POLL_TIMEOUT,
@@ -995,15 +896,6 @@ async fn live_v2_scripted_permission_chain() {
         .await
         .unwrap_or_else(|error| panic!("permission reply failed: {error}\n{}", server.stderr()));
 
-    let response = prompt
-        .await
-        .expect("the prompt task must not panic")
-        .unwrap_or_else(|error| panic!("prompt failed: {error}\n{}", server.stderr()));
-    assert!(
-        response.error.is_none(),
-        "the answered turn must not report a model error: {:?}",
-        response.error
-    );
     assert!(
         backend
             .list_permissions(Some(&work_dir))
@@ -1013,10 +905,12 @@ async fn live_v2_scripted_permission_chain() {
         "the replied request must leave the pending list"
     );
 
-    let transcript = backend
-        .transcript(&session.id)
-        .await
-        .unwrap_or_else(|error| panic!("transcript read failed: {error}\n{}", server.stderr()));
+    let transcript = wait_for_turn(&backend, &session.id, &message_id, &server).await;
+    assert!(
+        turn_error(&transcript, &message_id).is_none(),
+        "the answered turn must not record a model error: {:?}",
+        turn_error(&transcript, &message_id)
+    );
     assert_user_anchor(&transcript, &message_id);
     assert_tool_call(&transcript, provider::Tool::Shell, provider::ToolCommand::Fast);
     assert_streamed_reasoning(&transcript);
@@ -1036,22 +930,10 @@ async fn live_v2_scripted_permission_chain() {
                 panic!("{decision}: create session failed: {error}\n{}", server.stderr())
             });
         let message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
-        let prompt_backend = backend.clone();
-        let prompt_session = session.id.clone();
-        let prompt_message_id = message_id.clone();
-        let prompt = tokio::spawn(async move {
-            prompt_backend
-                .prompt(
-                    &prompt_session,
-                    PROMPT_TEXT,
-                    &[],
-                    None,
-                    None,
-                    None,
-                    Some(&prompt_message_id),
-                )
-                .await
-        });
+        backend
+            .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
+            .await
+            .unwrap_or_else(|error| panic!("{decision}: prompt submit failed: {error}\n{}", server.stderr()));
         let permission = poll_until(
             &format!("a V2 permission ask ({decision})"),
             POLL_TIMEOUT,
@@ -1089,18 +971,13 @@ async fn live_v2_scripted_permission_chain() {
             || server.stderr(),
         )
         .await;
-        let result = tokio::time::timeout(POLL_TIMEOUT, prompt)
-            .await
-            .unwrap_or_else(|_| panic!("{decision}: the prompt must return\n{}", server.stderr()))
-            .expect("the prompt task must not panic");
         if decision == "always" {
-            let response = result.unwrap_or_else(|error| {
-                panic!(
-                    "always: the approved turn must complete: {error}\n{}",
-                    server.stderr()
-                )
-            });
-            assert!(response.error.is_none(), "always: {response:?}");
+            let transcript = wait_for_turn(&backend, &session.id, &message_id, &server).await;
+            assert!(
+                turn_error(&transcript, &message_id).is_none(),
+                "always: the approved turn must settle cleanly: {:?}",
+                turn_error(&transcript, &message_id)
+            );
         }
         // `reject` deliberately declines the tool (a defect tunnel upstream), so
         // only the run settling is asserted — never a specific turn outcome.
@@ -1143,22 +1020,12 @@ async fn live_v2_scripted_form_chain() {
         .unwrap_or_else(|error| panic!("create session failed: {error}\n{}", server.stderr()));
 
     let message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
-    let prompt_backend = backend.clone();
-    let prompt_session = session.id.clone();
-    let prompt_message_id = message_id.clone();
-    let prompt = tokio::spawn(async move {
-        prompt_backend
-            .prompt(
-                &prompt_session,
-                PROMPT_TEXT,
-                &[],
-                None,
-                None,
-                None,
-                Some(&prompt_message_id),
-            )
-            .await
-    });
+    // The admit-then-return submit schedules the turn; it blocks on the typed
+    // form the location-scoped list must surface.
+    backend
+        .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
+        .await
+        .unwrap_or_else(|error| panic!("prompt submit failed: {error}\n{}", server.stderr()));
 
     let form = poll_until(
         &format!("a V2 form for session {}", session.id),
@@ -1196,15 +1063,6 @@ async fn live_v2_scripted_form_chain() {
         .await
         .unwrap_or_else(|error| panic!("form reply failed: {error}\n{}", server.stderr()));
 
-    let response = prompt
-        .await
-        .expect("the prompt task must not panic")
-        .unwrap_or_else(|error| panic!("prompt failed: {error}\n{}", server.stderr()));
-    assert!(
-        response.error.is_none(),
-        "the answered turn must not report a model error: {:?}",
-        response.error
-    );
     assert_eq!(
         backend
             .list_questions(Some(&work_dir))
@@ -1215,10 +1073,12 @@ async fn live_v2_scripted_form_chain() {
         "the answered form must leave the pending list"
     );
 
-    let transcript = backend
-        .transcript(&session.id)
-        .await
-        .unwrap_or_else(|error| panic!("transcript read failed: {error}\n{}", server.stderr()));
+    let transcript = wait_for_turn(&backend, &session.id, &message_id, &server).await;
+    assert!(
+        turn_error(&transcript, &message_id).is_none(),
+        "the answered turn must not record a model error: {:?}",
+        turn_error(&transcript, &message_id)
+    );
     assert_user_anchor(&transcript, &message_id);
     assert_question_tool_call(&transcript);
     assert_final_text(&transcript);
@@ -1232,22 +1092,19 @@ async fn live_v2_scripted_form_chain() {
         .create_session(&backend.new_session_input(Some(&work_dir)))
         .await
         .unwrap_or_else(|error| panic!("create cancel session failed: {error}\n{}", server.stderr()));
-    let cancel_backend = backend.clone();
-    let cancel_session_id = cancel_session.id.clone();
     let cancel_message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
-    let cancelled = tokio::spawn(async move {
-        cancel_backend
-            .prompt(
-                &cancel_session_id,
-                PROMPT_TEXT,
-                &[],
-                None,
-                None,
-                None,
-                Some(&cancel_message_id),
-            )
-            .await
-    });
+    backend
+        .prompt(
+            &cancel_session.id,
+            PROMPT_TEXT,
+            &[],
+            None,
+            None,
+            None,
+            Some(&cancel_message_id),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("cancel submit failed: {error}\n{}", server.stderr()));
     let cancelled_form = poll_until(
         "the second V2 form",
         POLL_TIMEOUT,
@@ -1277,9 +1134,9 @@ async fn live_v2_scripted_form_chain() {
         || server.stderr(),
     )
     .await;
-    // The cancelled turn may settle with a tool failure; drain it so the
-    // server is not left with a blocked run.
-    let _ = tokio::time::timeout(IDLE_TIMEOUT, cancelled).await;
+    // The cancelled turn may settle with a tool failure; let the run reach its
+    // end so the server is not left with a blocked run.
+    wait_for_idle(&backend, &cancel_session.id, &work_dir, &server).await;
 }
 
 /// Whether any decoded part of the transcript is a still-live tool call.
@@ -1425,7 +1282,7 @@ async fn answer_permission(
 }
 
 /// Wait until the server reports the session idle — the run state may clear a
-/// beat after the synchronous prompt response.
+/// beat after the turn's transcript settles.
 async fn wait_for_idle(backend: &OpenCodeBackend, session_id: &str, directory: &str, server: &LiveServer) {
     poll_until(
         "the session to read idle",
@@ -1439,6 +1296,50 @@ async fn wait_for_idle(backend: &OpenCodeBackend, session_id: &str, directory: &
         || server.stderr(),
     )
     .await;
+}
+
+/// Wait for the turn anchored at `message_id` to settle — a terminal step or a
+/// recorded failure — and return the transcript that observed it. This is the
+/// observation the async-native Turn performs from the transcript + run state
+/// (ADR-0056); the retired blocking prompt used to hand the finished turn back
+/// inline. Verification is the caller's: a clean turn asserts no error, an
+/// aborted one does not.
+async fn wait_for_turn(
+    backend: &OpenCodeBackend,
+    session_id: &str,
+    message_id: &str,
+    server: &LiveServer,
+) -> crate::backend::SessionTranscript {
+    poll_until(
+        "the submitted turn to settle",
+        POLL_TIMEOUT,
+        || async {
+            let transcript = backend.transcript(session_id).await?;
+            let Some(anchor) = transcript
+                .messages
+                .iter()
+                .find(|message| message.id.as_str() == message_id)
+                .and_then(|message| message.anchor())
+            else {
+                return Ok(None);
+            };
+            let turn = transcript.turn_for_user(&anchor);
+            Ok((turn.complete || turn.error.is_some()).then_some(transcript))
+        },
+        || server.stderr(),
+    )
+    .await
+}
+
+/// The failure the turn anchored at `message_id` recorded, if any — the
+/// neutral projection the Turn reads (ADR-0056).
+fn turn_error(transcript: &crate::backend::SessionTranscript, message_id: &str) -> Option<String> {
+    let anchor = transcript
+        .messages
+        .iter()
+        .find(|message| message.id.as_str() == message_id)
+        .and_then(|message| message.anchor())?;
+    transcript.turn_for_user(&anchor).error
 }
 
 /// The user message is present, under the cola-chosen id (ADR-0026), with the

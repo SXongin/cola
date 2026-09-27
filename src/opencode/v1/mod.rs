@@ -28,8 +28,8 @@ use super::strategy::GenerationStrategy;
 use super::transport::{REPLY_TIMEOUT, Transport, read_failure};
 use super::types::{
     AgentInfo, FormAnswer, FormFieldKind, ImageInput, ModelInfo, ModelOption, PermissionRequest,
-    PromptResponse, ProviderModels, QuestionInfo, QuestionOption, QuestionRequest, SessionInfo,
-    SessionListInfo, SessionSelection, SessionStatus,
+    ProviderModels, QuestionInfo, QuestionOption, QuestionRequest, SessionInfo, SessionListInfo,
+    SessionSelection, SessionStatus,
 };
 
 /// Hard stop for the `x-next-cursor` follow in [`V1Strategy::list_sessions`]: a
@@ -150,9 +150,14 @@ impl GenerationStrategy for V1Strategy {
         Ok(())
     }
 
-    /// Send a prompt to a session using the canonical OpenCode API:
-    /// `POST /session/{id}/message` with `parts`. This is the same protocol
-    /// OpenChamber/TUI use, so messages land in the shared message store.
+    /// Submit a prompt: `POST /session/{id}/prompt_async`. OpenCode immediately
+    /// persists the user message (`createUserMessage`) and forks a run
+    /// (`Effect.forkIn`), returning 204 — the caller doesn't block until the
+    /// turn finishes (ADR-0056's submit+observe end state). Both the main
+    /// dispatch and a mid-turn Supplement go through here: while a turn is in
+    /// flight the running loop picks the message up at the next tool boundary
+    /// (merged into the current turn), without a second submit blocking the WS
+    /// read loop.
     ///
     /// `model` is the effective model (the per-session override or the
     /// configured default, already resolved by the adapter); when None the
@@ -182,114 +187,6 @@ impl GenerationStrategy for V1Strategy {
         variant: Option<&str>,
         agent: Option<&str>,
         message_id: Option<&str>,
-    ) -> Result<PromptResponse> {
-        let mut body = serde_json::json!({
-            "parts": build_parts(text, images),
-        });
-        inject_message_id(&mut body, message_id);
-        inject_model(&mut body, model, variant);
-        inject_agent(&mut body, agent);
-        let resp = http
-            .client()
-            .post(http.url(&format!("{SESSION}/{session_id}/message")))
-            .json(&body)
-            .send()
-            .await?;
-        if resp.status().is_success() {
-            let text_body = resp.text().await?;
-            // ADR-0048: the prompt-response body is a full payload dump — DEBUG
-            // only. The Turn's own lines are what an INFO trace reads for.
-            tracing::debug!("prompt response: {}", &text_body[..text_body.len().min(500)]);
-            let parsed: serde_json::Value = serde_json::from_str(&text_body).map_err(|e| {
-                crate::error::BridgeError::OpenCode(format!(
-                    "prompt decode: {e} — body: {}",
-                    &text_body[..text_body.len().min(300)]
-                ))
-            })?;
-            let message_id = parsed
-                .get("info")
-                .and_then(|i| i.get("id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let parent_id = parsed
-                .get("info")
-                .and_then(|i| i.get("parentID"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let error = parsed
-                .get("info")
-                .and_then(|i| i.get("error"))
-                .and_then(|e| e.get("data"))
-                .and_then(|d| d.get("message"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .or_else(|| {
-                    parsed
-                        .get("info")
-                        .and_then(|i| i.get("error"))
-                        .and_then(|e| e.get("message"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                });
-            return Ok(PromptResponse {
-                id: message_id.clone(),
-                session_id: Some(session_id.to_string()),
-                admitted_seq: None,
-                parent_id,
-                error,
-                // The response's parts decode through the same wire seam as a
-                // polled message, so no raw protocol shape reaches the Bridge.
-                parts: wire::decode_parts(
-                    parsed
-                        .get("parts")
-                        .unwrap_or(&serde_json::Value::Array(Vec::new())),
-                ),
-            });
-        }
-
-        // Canonical 404: the session doesn't exist on this server (e.g. it was
-        // created before a server restart/replacement, or another client removed
-        // it). Report SessionNotFound so the bridge recreates the session —
-        // falling back to the legacy path here would surface a confusing 502 and
-        // the recreate never fires (see AGENTS.md pitfall #1).
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(crate::error::BridgeError::SessionNotFound(session_id.to_string()));
-        }
-        let status = resp.status();
-
-        // Any other failure (5xx, network drop) surfaces as a prompt error —
-        // the error card's retry re-submits with the SAME message_id, which the
-        // server deduplicates. There is deliberately NO legacy `/api/.../prompt`
-        // fallback: it cannot carry `message_id`, appends a fresh user message,
-        // and re-runs the model, so retrying through it would duplicate the
-        // message + double-run (ADR-0026).
-        let text_body = resp.text().await?;
-        Err(crate::error::BridgeError::OpenCode(format!(
-            "prompt {session_id} failed: HTTP {} — {}",
-            status,
-            &text_body[..text_body.len().min(300)]
-        )))
-    }
-
-    /// Fire-and-forget prompt: `POST /session/{id}/prompt_async`. OpenCode
-    /// immediately persists the user message (`createUserMessage`) and forks a
-    /// run (`Effect.forkIn`), returning 204 — the caller doesn't block until the
-    /// turn finishes. Used by the supplement path: while a turn is in flight we
-    /// send the new message here so it lands in the DB and the running loop
-    /// picks it up at the next tool boundary (merged into the current turn),
-    /// without a second synchronous prompt blocking the WS read loop.
-    #[allow(clippy::too_many_arguments)] // same prompt axes as `prompt`
-    async fn prompt_async(
-        &self,
-        http: &Transport,
-        session_id: &str,
-        text: &str,
-        images: &[ImageInput],
-        model: Option<&ModelInfo>,
-        variant: Option<&str>,
-        agent: Option<&str>,
-        message_id: Option<&str>,
     ) -> Result<()> {
         let mut body = serde_json::json!({
             "parts": build_parts(text, images),
@@ -303,22 +200,23 @@ impl GenerationStrategy for V1Strategy {
             .json(&body)
             .send()
             .await?;
-        // Same canonical 404 meaning as `prompt`: the session does not exist on
-        // this server. Keep the taxonomy aligned (`is_session_not_found`) even
-        // though today's only caller replies the same way for every error —
-        // the wire client reports what the server said, the bridge decides.
+        // Canonical 404: the session doesn't exist on this server (e.g. it was
+        // created before a server restart/replacement, or another client removed
+        // it). Report SessionNotFound so the bridge recreates the session —
+        // falling back to the legacy path here would surface a confusing 502 and
+        // the recreate never fires (see AGENTS.md pitfall #1).
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(crate::error::BridgeError::SessionNotFound(session_id.to_string()));
         }
         if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await?;
             return Err(crate::error::BridgeError::OpenCode(format!(
-                "prompt_async {}: {} {}",
-                session_id,
-                resp.status(),
-                resp.text().await.unwrap_or_default()
+                "prompt {session_id} failed: HTTP {status} — {}",
+                &body[..body.len().min(300)]
             )));
         }
-        tracing::info!("prompt_async sent to session {}", session_id);
+        tracing::info!("prompt sent to session {session_id} (V1 prompt_async)");
         Ok(())
     }
 
@@ -644,8 +542,8 @@ impl GenerationStrategy for V1Strategy {
     /// Compact a session's context (`POST /api/session/{id}/compact`, the
     /// `/api` surface both generations serve). V1 sends no body and answers
     /// **204 No Content**; V2's payload/response shape lives in its own
-    /// strategy. Unlike V2, V1's failure taxonomy is status-based (its prompt,
-    /// prompt_async and reply endpoints all read a 404 that way), so the
+    /// strategy. Unlike V2, V1's failure taxonomy is status-based (its prompt
+    /// and reply endpoints all read a 404 that way), so the
     /// default `error_for_status` already yields a 404
     /// `BridgeError::Http` that `is_session_not_found()` recognises — no
     /// tag-aware mapping is missing here.
@@ -761,8 +659,7 @@ impl WireQuestion {
 
 /// The prompt `parts` array: a text part followed by one data-URL `file` part
 /// per image. OpenCode decodes the data URL and normalizes the image before
-/// handing it to a vision-capable model (FilePartInput). Shared by `prompt`
-/// and `prompt_async`.
+/// handing it to a vision-capable model (FilePartInput). Used by `prompt`.
 fn build_parts(text: &str, images: &[ImageInput]) -> Vec<serde_json::Value> {
     let mut parts = vec![serde_json::json!({ "type": "text", "text": text })];
     for img in images {
@@ -778,8 +675,8 @@ fn build_parts(text: &str, images: &[ImageInput]) -> Vec<serde_json::Value> {
 /// Attach the effective model to a prompt body. The adapter already resolved
 /// the per-session override and the configured default; when neither is set
 /// the server uses its own default. `variant` is independent — it is written
-/// whenever set, applying to whatever model the server runs this turn. Shared
-/// by `prompt` and `prompt_async`.
+/// whenever set, applying to whatever model the server runs this turn. Used
+/// by `prompt`.
 fn inject_model(body: &mut serde_json::Value, model: Option<&ModelInfo>, variant: Option<&str>) {
     if let Some(model) = model {
         body["model"] = serde_json::json!({
@@ -793,8 +690,7 @@ fn inject_model(body: &mut serde_json::Value, model: Option<&ModelInfo>, variant
 }
 
 /// Attach the per-session agent override to a prompt body. When unset the
-/// server uses the session's own/default agent. Shared by `prompt` and
-/// `prompt_async`.
+/// server uses the session's own/default agent. Used by `prompt`.
 fn inject_agent(body: &mut serde_json::Value, agent: Option<&str>) {
     if let Some(a) = agent {
         body["agent"] = serde_json::json!(a);
@@ -803,7 +699,7 @@ fn inject_agent(body: &mut serde_json::Value, agent: Option<&str>) {
 
 /// Attach the cola-chosen user-message id to a prompt body (`msg_cola_…`,
 /// ADR-0026). When set the server persists that id (idempotent on retries);
-/// when None it generates one. Shared by `prompt` and `prompt_async`.
+/// when None it generates one. Used by `prompt`.
 fn inject_message_id(body: &mut serde_json::Value, message_id: Option<&str>) {
     if let Some(mid) = message_id {
         body["messageID"] = serde_json::json!(mid);

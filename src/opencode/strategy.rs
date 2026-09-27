@@ -23,8 +23,8 @@ use crate::error::Result;
 
 use super::transport::Transport;
 use super::types::{
-    AgentInfo, FormAnswer, ImageInput, ModelInfo, PermissionRequest, PromptResponse, ProviderModels,
-    QuestionRequest, SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
+    AgentInfo, FormAnswer, ImageInput, ModelInfo, PermissionRequest, ProviderModels, QuestionRequest,
+    SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
 };
 
 /// One protocol generation's wire contract.
@@ -48,29 +48,14 @@ pub(crate) trait GenerationStrategy: Send + Sync {
     #[allow(dead_code)] // no bridge caller yet; the generation wire tests drive it
     async fn delete_session(&self, http: &Transport, session_id: &str) -> Result<()>;
 
-    /// A synchronous prompt: the call returns only when the turn is done, with
-    /// the assistant response inline. `model` is already the effective model
-    /// (the adapter resolved the configured default before dispatch). V1 blocks
-    /// natively; V2 has no synchronous prompt and polyfills the block with the
-    /// experimental `session.wait` endpoint plus a poll fallback (ADR-0056), so
-    /// the trait's contract is the same on both generations.
+    /// Submit a prompt: the message is persisted and a run is scheduled, then
+    /// the call returns without waiting for the turn. V1 posts its native
+    /// `prompt_async`; V2 durably admits through its native prompt and returns.
+    /// The Turn observes completion from the transcript and run state
+    /// (ADR-0056's submit+observe end state); `model` is already the effective
+    /// model (the adapter resolved the configured default before dispatch).
     #[allow(clippy::too_many_arguments)] // prompt axes: session/text/images + model/variant/agent/message-id
     async fn prompt(
-        &self,
-        http: &Transport,
-        session_id: &str,
-        text: &str,
-        images: &[ImageInput],
-        model: Option<&ModelInfo>,
-        variant: Option<&str>,
-        agent: Option<&str>,
-        message_id: Option<&str>,
-    ) -> Result<PromptResponse>;
-
-    /// A fire-and-forget prompt (message persisted, a run forked, returns
-    /// immediately).
-    #[allow(clippy::too_many_arguments)] // same prompt axes as `prompt`
-    async fn prompt_async(
         &self,
         http: &Transport,
         session_id: &str,

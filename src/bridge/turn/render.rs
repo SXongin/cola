@@ -203,8 +203,9 @@ fn render_part(acc: &mut StreamAccumulator, part: &Part) -> bool {
 
 /// Render a batch of typed parts into the accumulator, skipping anything
 /// already rendered (same dedup as the poll loop). Returns true if anything
-/// new was rendered. Used as the final fallback when the incremental poll
-/// missed parts.
+/// new was rendered. Test-only since the async-native Turn reconciles from the
+/// settled transcript instead of a prompt response's inline parts (ADR-0056).
+#[cfg(test)]
 pub(super) fn render_parts(acc: &mut StreamAccumulator, parts: &[Part]) -> bool {
     let mut rendered_any = false;
     for part in parts {
@@ -484,11 +485,12 @@ async fn refresh_task_liveness(
     changed
 }
 
-/// Incremental renderer: while the synchronous prompt is in flight, poll the
-/// session's transcript and flush the card as parts complete (reasoning, tools,
-/// text). `done` stops the loop once the prompt returns. `poll_ms` is the
-/// injected cadence (`TurnConfig::turn_render_poll_ms`), so tests never wait
-/// on the production 1.5 s.
+/// Incremental renderer: while the submitted prompt is being admitted, poll
+/// the session's transcript and flush the card as parts complete (reasoning,
+/// tools, text). `done` stops the loop once the submit returns; the
+/// post-prompt drain then owns the observation. `poll_ms` is the injected
+/// cadence (`TurnConfig::turn_render_poll_ms`), so tests never wait on the
+/// production 1.5 s.
 async fn render_poll_loop(
     cards: &CardsHandle,
     sessions: &SessionsHandle,
@@ -601,6 +603,7 @@ mod tests {
             time: Some(MessageTime { created, completed }),
             model: None,
             tokens: None,
+            error: None,
             parts,
         }
     }
@@ -725,6 +728,7 @@ mod tests {
                 variant: None,
             }),
             tokens: Some(tokens),
+            error: None,
             parts: Vec::new(),
         };
         let mut acc = StreamAccumulator::new("test");
@@ -974,6 +978,7 @@ Index: /x/src/main.rs
                 }),
                 model: None,
                 tokens: None,
+                error: None,
                 parts: vec![text_part("我的问题你回答了吗")],
             },
             // The previous run's step, still in flight (no completion stamp),

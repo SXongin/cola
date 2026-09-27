@@ -270,10 +270,11 @@ fn mount_recorded_transcript(server: &TestHttpServer, session_id: &str, body: &s
     );
 }
 
-/// Mount V2's write path with one scripted turn: the durable admit, the
-/// experimental wait (204), and the transcript read the synchronous polyfill
-/// performs to rebuild the reply. The shared [`PromptFixture`] names the
-/// values; only V2's spellings live here.
+/// Mount V2's prompt submit: the durable admit (`POST
+/// /api/session/{id}/prompt`, 200 `{data: Session.Inbox.User}`) and the
+/// transcript read serving the turn it scheduled — the observation source the
+/// async-native Turn drives completion from. The shared [`PromptFixture`] names
+/// the values; only V2's spellings live here.
 fn mount_prompt(server: &TestHttpServer, fixture: &PromptFixture) {
     server.route(
         "POST",
@@ -290,12 +291,6 @@ fn mount_prompt(server: &TestHttpServer, fixture: &PromptFixture) {
             },
         })
         .to_string(),
-    );
-    server.route(
-        "POST",
-        &format!("/api/experimental/session/{}/wait", fixture.session),
-        204,
-        "",
     );
     server.route(
         "GET",

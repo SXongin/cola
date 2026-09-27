@@ -12,8 +12,11 @@
 //! state (`session.active`) with the retry status derived from the newest
 //! assistant message's `retry` field. S4b is the transcript decode proper,
 //! behind [`V2Strategy::transcript`] and the private [`wire`] module. S5 is
-//! the write surface: prompt dispatch (admit + `session.wait`/poll polyfill),
-//! the steer supplement, interrupt and compact. S6 is permissions and forms:
+//! the write surface: the native admit-then-return prompt, interrupt and
+//! compact. S8 removed the temporary synchronous polyfill (the experimental
+//! `session.wait` endpoint plus its `session.active` poll fallback, ADR-0056):
+//! the Turn submits through the native prompt here and observes the turn's
+//! completion from the transcript + run state. S6 is permissions and forms:
 //! the location-scoped pending lists, the session-scoped decision/keyed-answer
 //! replies, and the cancel-by-delete path. S7 is the session-scoped selection:
 //! `/model`, `/think` and `/agent` become durable switches
@@ -38,18 +41,19 @@ use crate::backend::SessionTranscript;
 use crate::error::Result;
 
 use super::strategy::GenerationStrategy;
-use super::transport::{Transport, body_preview, read_failure, read_failure_detailed};
+use super::transport::{Transport, body_preview, read_failure};
 use super::types::{
-    AgentInfo, FormAnswer, FormValue, ImageInput, ModelInfo, PermissionRequest, PromptResponse,
-    ProviderModels, QuestionRequest, SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
+    AgentInfo, FormAnswer, FormValue, ImageInput, ModelInfo, PermissionRequest, ProviderModels,
+    QuestionRequest, SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
 };
 
 /// The session root: list, get, update (PATCH), delete, and the per-session
 /// sub-routes. Unlike V1's unprefixed surface, every V2 route lives under
 /// `/api`.
 const SESSION: &str = "/api/session";
-/// The durable prompt admit (`POST /api/session/{id}/prompt`) — V2's only
-/// prompt route, shared by the blocking dispatch and the supplement/steer path.
+/// The durable prompt admit (`POST /api/session/{id}/prompt`) — V2's native
+/// admit-then-return prompt, used for both the main dispatch and a mid-turn
+/// supplement (the server's default delivery is `steer`).
 const SESSION_PROMPT_SUFFIX: &str = "/prompt";
 /// The interrupt endpoint (`POST /api/session/{id}/interrupt`).
 const SESSION_INTERRUPT_SUFFIX: &str = "/interrupt";
@@ -57,11 +61,6 @@ const SESSION_INTERRUPT_SUFFIX: &str = "/interrupt";
 const SESSION_MODEL_SUFFIX: &str = "/model";
 /// The durable agent switch (`POST /api/session/{id}/agent`, 204).
 const SESSION_AGENT_SUFFIX: &str = "/agent";
-/// The experimental "wait for the agent loop to become idle" endpoint
-/// (`POST /api/experimental/session/{id}/wait`, 204) — ADR-0056's recorded
-/// dependency, deleted by the async-native Turn slice (S8). The poll fallback
-/// in [`V2Strategy::wait_until_idle`] is its mandatory degradation path.
-const SESSION_WAIT: &str = "/api/experimental/session";
 /// The active-session run-state map (`{data: Record<SessionID, {type:"running"}>}`).
 const SESSION_ACTIVE: &str = "/api/session/active";
 /// The per-session projected-message read: the S4b transcript decode and, for
@@ -78,30 +77,6 @@ const AGENT: &str = "/api/agent";
 /// context-window lookup read. It serves the enabled models only, so the
 /// picker needs no credential/`connected` filter like V1's `GET /provider`.
 const MODEL: &str = "/api/model";
-
-/// How long the poll fallback waits between `session.active` reads. The wait
-/// endpoint resolves as soon as the drain settles; the fallback matches that
-/// latency closely enough for a card that renders on its own poll anyway.
-const IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-
-/// How many consecutive absent reads the fallback requires before it trusts
-/// "idle". A single absence cannot distinguish "the run finished before the
-/// first read" from "the server has not registered the run yet": the prompt
-/// admit only *schedules* execution, so absence is confirmed across a bounded
-/// window ([`IDLE_CONFIRMATIONS`] × [`IDLE_POLL_INTERVAL`]) instead of being
-/// believed once. v2.0.18 registers the execution synchronously inside the
-/// prompt handler, but the fallback must stay correct for a server that
-/// schedules asynchronously.
-const IDLE_CONFIRMATIONS: usize = 3;
-
-/// The poll fallback's overall backstop: how long it follows `session.active`
-/// before giving up. This is not a turn limit — V1's blocking prompt has no
-/// client deadline at all and real turns run long — so it is sized past any
-/// plausible turn. On expiry the fallback stops observing with a WARN and the
-/// prompt returns the turn as read so far; the Bridge's own drain and status
-/// read then decide completion (a still-running turn is followed, never
-/// falsely finalized).
-const IDLE_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// Hard stop for the body-cursor follow in [`V2Strategy::list_sessions`]: a
 /// misbehaving server must not spin the client forever. The server's default
@@ -201,30 +176,6 @@ async fn write_failure(
     ))
 }
 
-/// The response for an admitted prompt whose reply could not be assembled
-/// (transcript read failed, or the admitted message is not in the read): the
-/// neutral response with no parts and no error, so a completed turn is never
-/// painted as failed by a read hiccup. `wait` already observed the run settle,
-/// and the Bridge's own final read is the primary render source.
-fn admitted_response(session_id: &str, admitted_id: &str) -> PromptResponse {
-    PromptResponse {
-        id: admitted_id.to_string(),
-        session_id: Some(session_id.to_string()),
-        admitted_seq: None,
-        parent_id: Some(admitted_id.to_string()),
-        error: None,
-        parts: Vec::new(),
-    }
-}
-
-/// Why [`V2Strategy::wait_for_idle`] could not observe the idle transition:
-/// the session is gone (surface it — the bridge recreates the mapping), or the
-/// wait endpoint is unusable (fall back to polling `session.active`).
-enum WaitFailure {
-    SessionNotFound,
-    Unavailable(String),
-}
-
 #[async_trait]
 impl GenerationStrategy for V2Strategy {
     /// List sessions across the shared store, most recently active first.
@@ -290,16 +241,17 @@ impl GenerationStrategy for V2Strategy {
         Ok(())
     }
 
-    /// The blocking prompt contract, polyfilled for V2 (ADR-0056).
+    /// Submit a prompt through V2's native admit-then-return route.
     ///
-    /// V2's prompt is admit-then-return: `POST /api/session/{id}/prompt`
-    /// durably admits the message (under cola's `msg_cola_…` id, which the
-    /// server persists and reconciles a retry onto) and returns immediately.
-    /// The synchronous shape is then reconstructed in two steps: wait for the
-    /// agent loop to become idle through the experimental `session.wait`
-    /// endpoint (with the `session.active` poll fallback), then read the
-    /// transcript the turn produced through the same V2 decode the read
-    /// strategy uses.
+    /// `POST /api/session/{id}/prompt` durably admits the message (under
+    /// cola's `msg_cola_…` id, which the server persists and reconciles a
+    /// retry onto) and returns immediately — there is no synchronous V2
+    /// prompt. The Turn observes the submitted turn's completion from the
+    /// transcript + run state (ADR-0056's submit+observe end state). Delivery
+    /// is explicit `steer` (the server's own default): when the session is
+    /// idle it starts the run, and while a turn is in flight it merges into it
+    /// at the next step boundary — the same call serves the main dispatch and
+    /// a mid-turn Supplement.
     ///
     /// V2 has no per-prompt `model`/`variant`/`agent`: those are session-scoped
     /// and durable (S7), applied through `POST /api/session/{id}/model|agent`
@@ -317,41 +269,15 @@ impl GenerationStrategy for V2Strategy {
         variant: Option<&str>,
         agent: Option<&str>,
         message_id: Option<&str>,
-    ) -> Result<PromptResponse> {
+    ) -> Result<()> {
         if model.is_some() || variant.is_some() || agent.is_some() {
             tracing::debug!(
                 "session {session_id}: V2 uses the session's durable selection, \
                  not the per-prompt model/variant/agent"
             );
         }
-        let admitted = self
-            .dispatch(http, session_id, text, images, message_id, None)
-            .await?;
-        self.wait_until_idle(http, session_id).await?;
-        self.completed_turn(http, session_id, &admitted).await
-    }
-
-    /// Fire-and-forget prompt: the supplement path. V2 admits the message with
-    /// `delivery: "steer"`, so a message sent while a turn is in flight merges
-    /// into the running turn at its next step boundary — the same behaviour as
-    /// V1's `prompt_async` (ADR-0043) — and returns as soon as the admit is
-    /// durable. No wait is taken: the caller (the bridge) keeps its card live
-    /// through the render poll.
-    #[allow(clippy::too_many_arguments)] // matches the trait's prompt axes
-    async fn prompt_async(
-        &self,
-        http: &Transport,
-        session_id: &str,
-        text: &str,
-        images: &[ImageInput],
-        _model: Option<&ModelInfo>,
-        _variant: Option<&str>,
-        _agent: Option<&str>,
-        message_id: Option<&str>,
-    ) -> Result<()> {
-        self.dispatch(http, session_id, text, images, message_id, Some("steer"))
-            .await?;
-        tracing::info!("prompt_async sent to session {session_id} (V2 delivery=steer)");
+        let admitted = self.dispatch(http, session_id, text, images, message_id).await?;
+        tracing::info!("prompt sent to session {session_id} (V2 admitted {admitted})");
         Ok(())
     }
 
@@ -729,10 +655,12 @@ impl GenerationStrategy for V2Strategy {
 }
 
 impl V2Strategy {
-    /// Durably admit one prompt (`POST /api/session/{id}/prompt`). `delivery`
-    /// is `Some("steer")` for the supplement path and `None` for the main
-    /// dispatch (the server default is steer as well). Returns the admitted
-    /// user-message id: the caller's `message_id` when set, else the server's.
+    /// Durably admit one prompt (`POST /api/session/{id}/prompt`) with
+    /// `delivery: "steer"` — the server's own default, sent explicitly: while
+    /// the session is idle it starts the run, and while a turn is in flight it
+    /// merges in at the next step boundary (the main dispatch and a mid-turn
+    /// Supplement are the same call). Returns the admitted user-message id: the
+    /// caller's `message_id` when set, else the server's.
     ///
     /// A 404 is mapped to [`crate::error::BridgeError::SessionNotFound`] only
     /// when its `_tag` says so — the bridge's recreate-and-retry heal reads
@@ -744,7 +672,6 @@ impl V2Strategy {
         text: &str,
         images: &[ImageInput],
         message_id: Option<&str>,
-        delivery: Option<&str>,
     ) -> Result<String> {
         let mut body = serde_json::json!({ "text": text });
         if !images.is_empty() {
@@ -765,9 +692,7 @@ impl V2Strategy {
         if let Some(message_id) = message_id {
             body["id"] = serde_json::json!(message_id);
         }
-        if let Some(delivery) = delivery {
-            body["delivery"] = serde_json::json!(delivery);
-        }
+        body["delivery"] = serde_json::json!("steer");
         let response = http
             .client()
             .post(http.url(&format!("{SESSION}/{session_id}{SESSION_PROMPT_SUFFIX}")))
@@ -786,193 +711,6 @@ impl V2Strategy {
                 ))
             })?;
         Ok(admitted.data.id)
-    }
-
-    /// Wait until the session's agent loop is idle: the experimental `wait`
-    /// endpoint first (ADR-0056), the `session.active` poll as its mandatory
-    /// degradation path when the route is absent or failing. A missing session
-    /// is surfaced either way.
-    async fn wait_until_idle(&self, http: &Transport, session_id: &str) -> Result<()> {
-        match self.wait_for_idle(http, session_id).await {
-            Ok(()) => Ok(()),
-            Err(WaitFailure::SessionNotFound) => {
-                Err(crate::error::BridgeError::SessionNotFound(session_id.to_string()))
-            }
-            Err(WaitFailure::Unavailable(reason)) => {
-                tracing::warn!(
-                    "session {session_id}: wait endpoint unavailable ({reason}); \
-                     falling back to session.active polling"
-                );
-                self.poll_until_idle(http, session_id, IDLE_POLL_TIMEOUT).await
-            }
-        }
-    }
-
-    /// One `POST /api/experimental/session/{id}/wait` (204 = the agent loop is
-    /// idle). A 404 is only "the session is gone" when its `_tag` says so;
-    /// every other failure (an absent route, a 503 during migration, a
-    /// transport error) degrades to the poll fallback.
-    async fn wait_for_idle(
-        &self,
-        http: &Transport,
-        session_id: &str,
-    ) -> std::result::Result<(), WaitFailure> {
-        let response = http
-            .client()
-            .post(http.url(&format!("{SESSION_WAIT}/{session_id}/wait")))
-            .send()
-            .await
-            .map_err(|error| WaitFailure::Unavailable(format!("request failed: {error}")))?;
-        let status = response.status();
-        if status.is_success() {
-            return Ok(());
-        }
-        let text = response.text().await.unwrap_or_default();
-        if status == reqwest::StatusCode::NOT_FOUND && is_session_not_found(&text) {
-            return Err(WaitFailure::SessionNotFound);
-        }
-        Err(WaitFailure::Unavailable(format!(
-            "HTTP {status} — {}",
-            body_preview(&text)
-        )))
-    }
-
-    /// Poll `GET /api/session/active` until the session has been absent for
-    /// [`IDLE_CONFIRMATIONS`] consecutive reads — the same event the `wait`
-    /// endpoint resolves on (an execution owns the session until its last
-    /// successor settles). An entry with a type this build does not recognise
-    /// still counts as active: only confirmed absence means idle, never a guess.
-    ///
-    /// Absence is confirmed rather than believed once: the prompt admit only
-    /// schedules execution, so a first read can precede the run's registration
-    /// on a server that schedules asynchronously (v2.0.18 registers
-    /// synchronously, but the fallback must not depend on that), and believing
-    /// it would return a live turn as an empty reply.
-    ///
-    /// `timeout` bounds the whole fallback (see [`IDLE_POLL_TIMEOUT`] for the
-    /// production value): when it passes, the loop warns and stops observing —
-    /// the caller returns the turn as read so far and the Bridge's own
-    /// drain/status read decides completion instead of this call hanging the
-    /// Turn forever. Returns `Err` only when a read itself fails; a garbled
-    /// active map is an error, never a silent idle.
-    async fn poll_until_idle(
-        &self,
-        http: &Transport,
-        session_id: &str,
-        timeout: std::time::Duration,
-    ) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        let mut absent_reads = 0usize;
-        // What the LAST read saw, so the expiry WARN describes the state the
-        // loop actually gave up on: an active session, or an absence it could
-        // not confirm inside the window. Assigned by every loop iteration
-        // before its first read.
-        let mut last_read_active;
-        loop {
-            let response = http.client().get(http.url(SESSION_ACTIVE)).send().await?;
-            if !response.status().is_success() {
-                // This error leaves `prompt` as the surfaced diagnostic, so it
-                // keeps the body preview the other status reads only log.
-                return Err(read_failure_detailed(response, "session status").await);
-            }
-            let text = response.text().await?;
-            let active: wire::ActiveSessions = serde_json::from_str(&text).map_err(|error| {
-                crate::error::BridgeError::OpenCode(format!(
-                    "session status parse: {error} — body: {}",
-                    body_preview(&text)
-                ))
-            })?;
-            last_read_active = active.state(session_id).is_some();
-            if last_read_active {
-                absent_reads = 0;
-            } else {
-                absent_reads += 1;
-                if absent_reads >= IDLE_CONFIRMATIONS {
-                    return Ok(());
-                }
-            }
-            if tokio::time::Instant::now() >= deadline {
-                if last_read_active {
-                    tracing::warn!(
-                        "session {session_id}: still active after {}s of session.active polling; \
-                         returning to the caller instead of polling forever",
-                        timeout.as_secs()
-                    );
-                } else {
-                    tracing::warn!(
-                        "session {session_id}: idle not confirmed after {}s of session.active \
-                         polling (the last read was absent, but the confirmation window did not \
-                         complete); returning to the caller instead of polling forever",
-                        timeout.as_secs()
-                    );
-                }
-                return Ok(());
-            }
-            tokio::time::sleep(IDLE_POLL_INTERVAL).await;
-        }
-    }
-
-    /// The prompt response for a turn that has settled: read the transcript,
-    /// anchor it at the admitted user message, and return the turn's assistant
-    /// parts plus any failure the turn recorded — the neutral contract V1's
-    /// blocking prompt answers inline.
-    ///
-    /// A read failure here is a downgrade, never a failed turn: `wait` already
-    /// observed the drain settle and the Bridge's own final read is the primary
-    /// render source, so an empty Ok response lets the turn complete there
-    /// instead of painting a finished turn as an error.
-    async fn completed_turn(
-        &self,
-        http: &Transport,
-        session_id: &str,
-        admitted_id: &str,
-    ) -> Result<PromptResponse> {
-        let raw = match self.read_messages(http, session_id).await {
-            Ok(raw) => raw,
-            Err(error) => {
-                tracing::warn!(
-                    "prompt {session_id}: transcript read failed after the wait ({error}); \
-                     returning the admitted id only"
-                );
-                return Ok(admitted_response(session_id, admitted_id));
-            }
-        };
-        let transcript = wire::decode_messages(&raw);
-        let anchor = transcript
-            .messages
-            .iter()
-            .find(|message| message.id.as_str() == admitted_id)
-            .and_then(|message| message.anchor());
-        let Some(anchor) = anchor else {
-            tracing::warn!(
-                "prompt {session_id}: admitted message {admitted_id} is not in the transcript; \
-                 returning the admitted id only"
-            );
-            return Ok(admitted_response(session_id, admitted_id));
-        };
-        let turn = transcript.turn_for_user(&anchor);
-        // The answer is the turn's newest assistant message; without one the
-        // admitted id is the only identity the response can carry.
-        let id = turn
-            .messages
-            .last()
-            .map(|message| message.id.as_str())
-            .unwrap_or(admitted_id)
-            .to_string();
-        Ok(PromptResponse {
-            id,
-            session_id: Some(session_id.to_string()),
-            admitted_seq: None,
-            // V1's `parent_id` is the user message the returned message
-            // answers; here the admitted message itself.
-            parent_id: Some(admitted_id.to_string()),
-            error: wire::turn_error(&raw, anchor.created_ms),
-            parts: turn
-                .messages
-                .iter()
-                .flat_map(|message| message.parts.iter().cloned())
-                .collect(),
-        })
     }
 
     /// Read the session's durable selection (`GET /api/session/{id}`, the same
@@ -995,7 +733,7 @@ impl V2Strategy {
 
     /// Read the session's projected messages, decoded-ready: the raw `data`
     /// arrays a `GET /api/session/{id}/message` read carries, in server order.
-    /// Shared by the transcript decode and the prompt response's turn read.
+    /// The transcript decode's raw input.
     async fn read_messages(&self, http: &Transport, session_id: &str) -> Result<Vec<serde_json::Value>> {
         let mut data: Vec<serde_json::Value> = Vec::new();
         let mut cursor: Option<String> = None;

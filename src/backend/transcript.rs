@@ -5,9 +5,9 @@
 //! identity and its server time travel together ([`TurnAnchor`]), so no caller
 //! reassembles an anchor from backend fields.
 //!
-//! A message carries no error field: the wire read never surfaced one, and a
-//! failed prompt's error is a prompt-response fact the adapters keep surfacing
-//! where they always have — it is not transcript content.
+//! A failed turn is transcript content: the server records the failure on its
+//! assistant message, and the async-native Turn derives the turn's error from
+//! that field ([`TurnView::error`]) instead of a blocking prompt response.
 
 use serde_json::Value;
 
@@ -47,7 +47,8 @@ impl SessionTranscript {
     ///
     /// The Turn is complete when an assistant message that started within it
     /// carries a terminal step-finish reason (every reason except a pause to
-    /// run tools).
+    /// run tools). `error` carries the failure recorded on the Turn's newest
+    /// assistant message, if any — a recovered earlier step is not a failure.
     pub fn turn_for_user(&self, anchor: &TurnAnchor) -> TurnView<'_> {
         let mut messages = Vec::new();
         let mut complete = false;
@@ -64,7 +65,16 @@ impl SessionTranscript {
             }
             messages.push(message);
         }
-        TurnView { messages, complete }
+        // The failure is the NEWEST assistant message's: a recovered step (an
+        // earlier error the turn went on from) must not fail a turn whose final
+        // state is clean, and a turn that failed leaves its error on the
+        // message it settled on.
+        let error = messages.last().and_then(|message| message.error.clone());
+        TurnView {
+            messages,
+            complete,
+            error,
+        }
     }
 
     /// The recent-conversation tail: the last (at most four) text-bearing
@@ -123,6 +133,10 @@ pub struct TranscriptMessage {
     pub model: Option<ModelIdentity>,
     /// Token usage the message reports, when it reports any.
     pub tokens: Option<TokenUsage>,
+    /// The failure the server recorded on this message, when it recorded one
+    /// (a model error, an abort, a context overflow). The async-native Turn
+    /// reads a turn's failure from here instead of a blocking prompt response.
+    pub error: Option<String>,
     pub parts: Vec<Part>,
 }
 
@@ -250,11 +264,14 @@ pub struct TurnAnchor {
 }
 
 /// One Turn as read from a transcript: the assistant messages that belong to
-/// it (in-flight ones included), and whether it has finished.
+/// it (in-flight ones included), whether it has finished, and its newest
+/// recorded failure.
 #[derive(Debug)]
 pub struct TurnView<'a> {
     pub messages: Vec<&'a TranscriptMessage>,
     pub complete: bool,
+    /// The Turn's newest assistant failure message, if any.
+    pub error: Option<String>,
 }
 
 /// One recent-conversation tail entry: a text-bearing user/assistant message's
@@ -433,6 +450,7 @@ mod tests {
             time,
             model: None,
             tokens: None,
+            error: None,
             parts,
         }
     }
@@ -605,6 +623,45 @@ mod tests {
         // A finish BEFORE the anchor belongs to the previous Turn.
         let transcript = SessionTranscript::new(vec![assistant("msg_old", 500, FinishReason::Stop)]);
         assert!(!transcript.turn_for_user(&anchor).complete);
+    }
+
+    /// A Turn's failure is its newest assistant message's: an error outside the
+    /// Turn (completed before the anchor) never leaks in, a recovered earlier
+    /// step does not fail a turn whose final message is clean, and a newer
+    /// failure supersedes an older one.
+    #[test]
+    fn turn_for_user_takes_the_newest_messages_error_only() {
+        let (_, anchor) = anchored("msg_u1", 1_000);
+        let assistant = |id: &str, created: i64, completed: i64, error: Option<&str>| {
+            let mut message = message(
+                id,
+                MessageRole::Assistant,
+                Some(MessageTime {
+                    created,
+                    completed: Some(completed),
+                }),
+                vec![text_part("回答")],
+            );
+            message.error = error.map(str::to_string);
+            message
+        };
+
+        // An error from the previous Turn (completed before the anchor) is out;
+        // a failed first step and a failed final step: the newest wins.
+        let previous = assistant("msg_old", 500, 800, Some("上一个回合的错误"));
+        let failed_step = assistant("msg_a1", 1_100, 1_200, Some("第一步失败但恢复了"));
+        let fatal = assistant("msg_a2", 1_300, 1_400, Some("最后失败"));
+        let transcript = SessionTranscript::new(vec![previous.clone(), failed_step.clone(), fatal]);
+        assert_eq!(
+            transcript.turn_for_user(&anchor).error.as_deref(),
+            Some("最后失败")
+        );
+
+        // A recovered earlier error with a clean final message is NOT a failure
+        // (the error-card retry's shape: the retried step succeeds).
+        let clean = assistant("msg_a2", 1_300, 1_400, None);
+        let transcript = SessionTranscript::new(vec![previous, failed_step, clean]);
+        assert!(transcript.turn_for_user(&anchor).error.is_none());
     }
 
     #[test]
