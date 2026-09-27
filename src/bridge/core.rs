@@ -128,13 +128,22 @@ pub struct SharedCore {
     /// before finalization (ADR-0043). Defaults to the external renderer's
     /// 10 min; tests store a small value to exercise the bound.
     pub turn_drain_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
-    /// Ceiling on the out-of-turn drain follow (ms, #284): after the drain
-    /// bound is reached with the session still running, the released turn hands
-    /// its card to a follow that keeps rendering until the session reports
-    /// non-busy. Bounds that follow so a hung Backend ends in Error instead of
-    /// an eternal spinner. Defaults to the drain's 10 min; tests store a small
-    /// value to exercise the ceiling.
-    pub turn_follow_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// The lost-contact / stuck-panel grace on the out-of-turn drain follow
+    /// (ms, #284/#386): after the drain bound is reached with the session still
+    /// running, the released turn hands its card to a follow that keeps
+    /// rendering. The follow has NO total budget — a readable run may take as
+    /// long as it takes, and a wait for the operator is unbounded. This grace
+    /// bounds only the failure modes where nobody can act: reads that stopped
+    /// returning (lost contact) and a live Tool Panel on an idle session that
+    /// never settles (a crash orphan). Defaults to the drain's 10 min; tests
+    /// store a small value to exercise the fallback.
+    pub turn_follow_grace_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// How long ONE follow read (transcript or status) may take before it is
+    /// abandoned (ms, #386). Bounds each call so a hung Backend cannot delay
+    /// the grace check by more than one read bound per tick; defaults to the
+    /// shared 30 s request bound. Tests store a small value so a wedged read
+    /// fails fast instead of eating the grace.
+    pub turn_follow_read_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
     /// session_id → the cover card's current title for topics created with a
     /// bot cover card as their root (ADR-0023). In-memory only: the post-turn
     /// hook compares the server title and patches the cover card in place when
@@ -229,7 +238,8 @@ impl SharedCore {
             stopped_sessions: Arc::new(Mutex::new(HashSet::new())),
             turn_render_poll_ms: Arc::new(std::sync::atomic::AtomicU64::new(1_500)),
             turn_drain_timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(600_000)),
-            turn_follow_timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(600_000)),
+            turn_follow_grace_ms: Arc::new(std::sync::atomic::AtomicU64::new(600_000)),
+            turn_follow_read_timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(30_000)),
             cover_titles: Arc::new(Mutex::new(HashMap::new())),
             work_dir: cfg
                 .bridge
@@ -375,7 +385,8 @@ impl SharedCore {
             Arc::clone(&self.long_task_notice_ms),
             Arc::clone(&self.turn_render_poll_ms),
             Arc::clone(&self.turn_drain_timeout_ms),
-            Arc::clone(&self.turn_follow_timeout_ms),
+            Arc::clone(&self.turn_follow_grace_ms),
+            Arc::clone(&self.turn_follow_read_timeout_ms),
             self.work_dir.clone(),
         )
     }

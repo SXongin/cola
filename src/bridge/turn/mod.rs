@@ -551,7 +551,8 @@ impl Turn {
         // marked Done from a snapshot that still shows running tools: it is
         // handed to the out-of-turn follow, which keeps rendering the SAME
         // accumulator and card chain until the session reports non-busy (or the
-        // follow's own ceiling ends it in Error). The anchor is the follow's
+        // follow's own fallback (lost contact / an unreconcilable panel) ends
+        // it in Error). The anchor is the follow's
         // identity: without one there is no card content to follow, so the
         // turn ends the normal way.
         let follow_anchor = if prompt_err.is_none() && drain_outcome == Some(DrainState::Running) {
@@ -1246,9 +1247,10 @@ impl Turn {
     }
 
     /// Finalize a followed card as Error: record `error`, mark it Error and
-    /// flush it. Used by the out-of-turn drain follow (#284) when its ceiling is
-    /// reached with the session still running — the card must never read Done
-    /// while a tool panel is still running.
+    /// flush it. Used by the out-of-turn drain follow (#284/#386) when its
+    /// fallback ends the card (lost contact, or a live panel that never
+    /// settles) — the card must never read Done while a tool panel is still
+    /// running.
     pub(crate) async fn finalize_error(cards: &CardsHandle, session_id: &str, error: &str) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
             card.acc.error = Some(error.to_string());
