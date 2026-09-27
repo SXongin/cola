@@ -87,6 +87,25 @@ fix(feishu): cap question form name under Feishu's 100-char limit
 docs(adr): turn footer shows work context
 ```
 
+### Agent attribution
+
+Commits created by an agent (opencode) end with one `Co-authored-by:` trailer
+that names the agent and the model that produced the commit:
+
+```
+Co-authored-by: opencode (<Model Display Name>) <noreply@opencode.ai>
+```
+
+For example:
+
+```
+Co-authored-by: opencode (DeepSeek V4.1 Flash) <noreply@opencode.ai>
+```
+
+The email is always the agent vendor's `noreply@` address, so the trailer never
+links to a personal account. Resolve the model name from the session — never
+hardcode it.
+
 ## Verification loop (must pass before pushing)
 
 Git hooks (lefthook) enforce the cheap ones automatically — `pre-commit` runs
