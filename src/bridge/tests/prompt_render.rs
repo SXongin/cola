@@ -263,6 +263,79 @@ async fn transcript_recorded_failure_renders_error_card() {
     );
 }
 
+/// The error-card retry's shape: a failed step followed by a clean one in the
+/// SAME turn (the server re-runs a failed retry as a new step under the same
+/// user anchor) must finish Done — the newest assistant message is
+/// authoritative, so a recovered earlier step is not a failure.
+#[tokio::test]
+async fn transcript_recovered_step_finishes_done() {
+    use crate::backend::{MessageRole, SessionTranscript};
+
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    let mut failed = typed_message(
+        "msg_failed",
+        MessageRole::Assistant,
+        Some(2_000),
+        vec![text_part("失败的一步")],
+    );
+    failed.error = Some("provider 503".into());
+    let recovered = typed_message(
+        "msg_recovered",
+        MessageRole::Assistant,
+        Some(3_000),
+        realistic_parts(),
+    );
+    backend.given_transcript(
+        "ses_test",
+        vec![SessionTranscript::new(vec![
+            typed_message(
+                "msg_cola_recovered",
+                MessageRole::User,
+                Some(1_000),
+                vec![text_part("hi")],
+            ),
+            failed,
+            recovered,
+        ])],
+    );
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+    app.turn_render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+
+    let context = crate::bridge::turn::PromptContext {
+        session_id: "ses_test".into(),
+        thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+        text: "hi".into(),
+        message_id: "msg_1".into(),
+        subtitle: "p2p".into(),
+        existing_card_id: None,
+        requester_open_id: None,
+        is_group: false,
+        cola_message_id: Some("msg_cola_recovered".into()),
+        images: Vec::new(),
+    };
+    crate::bridge::turn::Turn::run(&app.turn_handles(), context)
+        .await
+        .unwrap();
+
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    let text = final_card.to_string();
+    assert!(
+        text.contains("✅"),
+        "a recovered trailing step must finish Done: {text}"
+    );
+    assert!(
+        !text.contains("provider 503"),
+        "the recovered failure must not surface: {text}"
+    );
+}
+
 #[tokio::test]
 async fn error_card_retry_reuses_card_and_reruns_prompt() {
     let _wd = test_work_dir();

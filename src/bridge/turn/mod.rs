@@ -29,6 +29,14 @@ use crate::opencode::types::SessionStatus;
 /// deadline, and `/stop` must be observable within one bounded request.
 const DRAIN_REQUEST_TIMEOUT_MS: u64 = 30_000;
 
+/// How many consecutive drain reads must see no run before an unobserved
+/// submit is treated as never having registered. A prompt admit only
+/// *schedules* execution (ADR-0056), so a single non-busy read can precede the
+/// run's registration; the value is the retired V2 poll fallback's confirmation
+/// window, kept so the unstarted case is bounded by this window instead of the
+/// whole drain budget. A permanently failing status read takes the same path.
+const IDLE_CONFIRMATIONS: usize = 3;
+
 /// A p2p Turn that ran at least this long notifies on completion (ADR-0043
 /// amendment 2026-09-21): a long task's end is the one event worth a new
 /// message even when the user was around, because the card patch itself
@@ -118,18 +126,32 @@ pub(crate) struct Turn {
     /// Notice: a turn that ran past the threshold notifies on completion even
     /// in p2p (ADR-0043 amendment 2026-09-21).
     started_at: std::time::Instant,
-    /// Whether the drain has observed the submitted run start (a busy/retry
-    /// status, assistant content in the turn, or a recorded failure). The
-    /// prompt submit only *schedules* execution (ADR-0056), so before this
-    /// flips a non-busy status can just mean "not registered yet" — believing
-    /// it would finalize the card Done before a single token arrived.
+    /// Whether the drain has observed the submitted run START (a busy/retry
+    /// status, or a message the turn itself produced — a terminal finish, a
+    /// recorded failure, or a step created at/after the anchor). The prompt
+    /// submit only *schedules* execution (ADR-0056), so before this flips a
+    /// non-busy status can just mean "not registered yet" — believing it would
+    /// finalize the card Done before a single token arrived. A completed
+    /// straddling message from a prior turn is NOT a start signal (membership
+    /// already excludes it), so a stale step cannot flip this.
     drain_started: bool,
+    /// How many consecutive reads have seen no run yet. The admit only
+    /// *schedules* execution, and the old confirmed-absence window is kept:
+    /// after [`IDLE_CONFIRMATIONS`] unstarted reads the submit is treated as
+    /// never having registered (the pre-S8 behavior) instead of observing to
+    /// the drain bound. Reset by every start signal.
+    unstarted_reads: usize,
     /// Whether this turn's submit was REJECTED (the prompt call returned Err).
     /// A rejected submit may never have scheduled a run at all, so the drain
     /// must not mistake an idle status for a registration race and keep
     /// observing to its bound: the error is the outcome, and the drain settles
     /// on its first non-busy read.
     submit_failed: bool,
+    /// The failure the drain last observed in the turn, for the case where the
+    /// final reconcile's transcript read fails or has no anchor: the failure is
+    /// then taken from this snapshot instead of silently stamping Done. Only
+    /// ever a fallback — an authoritative final read (with the anchor) decides.
+    last_drain_error: Option<String>,
     /// The stopped-finalization line is logged once per Turn (ADR-0048): both
     /// the post-prompt drain and its pre-finalization re-check observe the
     /// same sticky `/stop` marker, so the second observation must stay silent.
@@ -344,7 +366,9 @@ impl Turn {
             turn_variant: None,
             started_at: std::time::Instant::now(),
             drain_started: false,
+            unstarted_reads: 0,
             submit_failed: false,
+            last_drain_error: None,
             stop_finalization_logged: false,
         }))
     }
@@ -482,13 +506,36 @@ impl Turn {
 
         // The turn's outcome is OBSERVED, not returned (ADR-0056): a rejected
         // submit is the call's Err, and a submitted run's failure is recorded
-        // on its assistant message — the blocking response used to carry it
-        // inline, and the transcript now does. One read serves both the error
-        // decision and the final reconcile below.
+        // on its newest assistant message — the blocking response used to carry
+        // it inline, and the transcript now does. One read serves both the
+        // error decision and the final reconcile below.
+        //
+        // A read that fails or has no anchor is NOT completion: the failure the
+        // drain last observed stands in, so a hiccup cannot stamp Done over a
+        // failed turn.
         let final_transcript = handles.backend.transcript(&self.session_id).await.ok();
         let prompt_err = match prompt_resp {
             Err(e) => Some(e.to_string()),
-            Ok(()) => self.turn_error(final_transcript.as_ref()),
+            Ok(()) => {
+                let observed = final_transcript
+                    .as_ref()
+                    .and_then(|transcript| self.turn_error(transcript));
+                if observed.is_some() {
+                    observed
+                } else if final_transcript
+                    .as_ref()
+                    .is_some_and(|transcript| transcript.anchor_of_user(&self.cola_message_id).is_some())
+                {
+                    // An authoritative final read (the anchor is present) says
+                    // the newest assistant message is clean: no failure.
+                    None
+                } else {
+                    // A failed read, or one that does not carry the anchor yet:
+                    // keep the failure the drain observed — never Done by a
+                    // hiccup.
+                    self.last_drain_error.clone()
+                }
+            }
         };
 
         // #284: a drain bound reached while the session is still running is NOT
@@ -838,13 +885,31 @@ impl Turn {
         // The submit only SCHEDULED the run (ADR-0056): before any sign of it
         // is observed, a non-busy status can just mean "not registered yet",
         // and settling on it would finalize the card Done before a token
-        // arrived. The signs ride the snapshot already read — assistant
-        // content in the turn (a recorded failure counts as content) — or the
-        // status read below. A REJECTED submit is the exception: no run was
-        // scheduled, so the error is the outcome and one idle read settles.
+        // arrived. The start signs are a Busy/Retry status, a terminal finish,
+        // a recorded failure, or a step CREATED at/after the anchor — never a
+        // completed straddling step from a prior turn (membership excludes it),
+        // so a stale step cannot flip this. The snapshot's failure is kept as
+        // the finalization fallback. A REJECTED submit is the exception: no run
+        // was scheduled, so the error is the outcome and one idle read settles.
         if let Some(anchor) = &anchor {
             let turn = transcript.turn_for_user(anchor);
-            self.drain_started |= turn.error.is_some() || !turn.messages.is_empty();
+            let produced_a_step = turn.messages.iter().any(|message| {
+                message
+                    .time
+                    .as_ref()
+                    .is_some_and(|time| time.created >= anchor.created_ms)
+            });
+            if turn.error.is_some() || turn.complete || produced_a_step {
+                self.drain_started = true;
+                self.unstarted_reads = 0;
+            }
+            // Only a read that actually carries the turn's user message is
+            // authoritative for the failure: an anchorless read (the message
+            // has not landed, or is already compacted away) leaves the last
+            // observed failure in place.
+            if transcript.anchor_of_user(&self.cola_message_id).is_some() {
+                self.last_drain_error = turn.error.clone();
+            }
         }
         let observed = self.drain_started || self.submit_failed;
         match crate::bridge::bounded_call(
@@ -859,42 +924,45 @@ impl Turn {
             // Alive: parts keep coming.
             Some(Ok(Some(SessionStatus::Busy | SessionStatus::Retry))) => {
                 self.drain_started = true;
+                self.unstarted_reads = 0;
                 DrainState::Running
             }
             // A non-busy status: completion once the run was observed, and
-            // continued observation before that.
-            Some(Ok(_)) if observed => DrainState::Settled,
-            Some(Ok(_)) => DrainState::Running,
+            // confirmed absence before that — a run that never registers stops
+            // after the window instead of observing to the drain bound.
+            Some(Ok(_)) => self.settle_or_confirm(observed),
             Some(Err(e)) => {
                 tracing::warn!("turn drain session status: {}", e);
-                if observed {
-                    DrainState::Settled
-                } else {
-                    DrainState::Running
-                }
+                self.settle_or_confirm(observed)
             }
             // The bounded status call timed out: same rule as a failed read.
-            None => {
-                if observed {
-                    DrainState::Settled
-                } else {
-                    DrainState::Running
-                }
-            }
+            None => self.settle_or_confirm(observed),
+        }
+    }
+
+    /// The non-busy (or unreadable) status rule: once the run was observed the
+    /// turn settles; before that, [`IDLE_CONFIRMATIONS`] consecutive reads are
+    /// required before the submit is treated as never registered. Shared by
+    /// the idle, failed and timed-out status paths so they cannot drift.
+    fn settle_or_confirm(&mut self, observed: bool) -> DrainState {
+        if observed {
+            return DrainState::Settled;
+        }
+        self.unstarted_reads += 1;
+        if self.unstarted_reads >= IDLE_CONFIRMATIONS {
+            DrainState::Settled
+        } else {
+            DrainState::Running
         }
     }
 
     /// The failure a submitted turn recorded, read from the settled transcript:
-    /// the assistant error inside the turn anchored at this Turn's
-    /// `msg_cola_` user message. `None` when the read has no such anchor or the
-    /// turn recorded no failure — a read hiccup never invents one.
-    fn turn_error(&self, transcript: Option<&SessionTranscript>) -> Option<String> {
-        let transcript = transcript?;
-        let anchor = transcript
-            .messages
-            .iter()
-            .find(|message| message.role == MessageRole::User && message.id.as_str() == self.cola_message_id)
-            .and_then(|message| message.anchor())?;
+    /// the newest assistant message's error inside the turn anchored at this
+    /// Turn's `msg_cola_` user message (a recovered earlier step is not a
+    /// failure). `None` when the read has no such anchor or the turn recorded
+    /// none — a read hiccup never invents one.
+    fn turn_error(&self, transcript: &SessionTranscript) -> Option<String> {
+        let anchor = transcript.anchor_of_user(&self.cola_message_id)?;
         transcript.turn_for_user(&anchor).error
     }
 

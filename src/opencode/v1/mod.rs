@@ -202,9 +202,9 @@ impl GenerationStrategy for V1Strategy {
             .await?;
         // Canonical 404: the session doesn't exist on this server (e.g. it was
         // created before a server restart/replacement, or another client removed
-        // it). Report SessionNotFound so the bridge recreates the session —
-        // falling back to the legacy path here would surface a confusing 502 and
-        // the recreate never fires (see AGENTS.md pitfall #1).
+        // it). Report SessionNotFound so the bridge recreates the session and
+        // retries once; any other failure stays a plain OpenCode error, which
+        // the error card offers to re-submit (see AGENTS.md pitfall #1).
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(crate::error::BridgeError::SessionNotFound(session_id.to_string()));
         }
