@@ -703,7 +703,8 @@ async fn live_v2_scripted_selection_chain() {
     );
 
     // `/model` + `/think`: switch to the variant-declaring model with the
-    // variant inside the ref; `/agent`: switch to the configured agent.
+    // variant inside the ref; `/agent`: switch to an agent other than the
+    // configured default (so the reset below has somewhere to land).
     backend
         .switch_session_model(
             &session.id,
@@ -716,7 +717,7 @@ async fn live_v2_scripted_selection_chain() {
         .await
         .unwrap_or_else(|error| panic!("model switch failed: {error}\n{}", server.stderr()));
     backend
-        .switch_session_agent(&session.id, provider::AGENT)
+        .switch_session_agent(&session.id, "build")
         .await
         .unwrap_or_else(|error| panic!("agent switch failed: {error}\n{}", server.stderr()));
 
@@ -734,12 +735,14 @@ async fn live_v2_scripted_selection_chain() {
     );
     assert_eq!(
         selection.agent.as_deref(),
-        Some(provider::AGENT),
+        Some("build"),
         "the agent switch persisted"
     );
 
-    // The next turn runs the switched selection with nothing re-sent per
-    // prompt (the prompt args are all `None`, exactly what V2 drops).
+    // The next turn runs the switched selection with NOTHING re-sent per
+    // prompt: every prompt axis beyond the text and the cola message id is
+    // `None` (the V2 strategy would drop them anyway — the wire has no such
+    // fields — so this is what "the session's selection applies" means).
     let message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
     let response = backend
         .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
@@ -831,6 +834,27 @@ async fn live_v2_scripted_selection_chain() {
         "the live session kept the variant"
     );
 
+    // The bridge's ladder reads the SESSION's selection live (not a mirror):
+    // the effective model and variant come from the server's own selection.
+    let settings = sessions
+        .session_settings(&key)
+        .await
+        .expect("the live mapping is the settings target");
+    let effective = sessions
+        .effective_selection(&pick_backend, &settings)
+        .await
+        .expect("the live durable selection resolves");
+    assert_eq!(effective.id, provider::MODEL_ALT);
+    assert_eq!(effective.variant.as_deref(), Some(provider::VARIANT));
+    assert_eq!(
+        sessions
+            .effective_variant(&pick_backend, &session.id, Some(&work_dir))
+            .await
+            .as_deref(),
+        Some(provider::VARIANT),
+        "the footer's variant source reads the live selection"
+    );
+
     let outcome = sessions
         .pick_model(&pick_backend, &key, provider::MODEL_REF)
         .await
@@ -852,6 +876,39 @@ async fn live_v2_scripted_selection_chain() {
     assert!(
         model.variant.is_none(),
         "the undeclared variant is gone from the live session ref"
+    );
+
+    // The `/agent --reset` default heuristic validated against the live
+    // server: the isolated config pins `default_agent` to the custom agent, so
+    // the server sorts it first in `GET /agent` and the heuristic must return
+    // exactly that (not the built-in `build` fallback).
+    let agents = backend.list_agents().await;
+    let default = crate::opencode::types::AgentInfo::default_agent(&agents);
+    assert_eq!(
+        default.as_deref(),
+        Some(provider::AGENT),
+        "the catalog's first primary visible agent is the configured default: {agents:?}"
+    );
+    let outcome = sessions
+        .pick_agent(&pick_backend, &key, None)
+        .await
+        .unwrap_or_else(|error| panic!("pick_agent failed: {error}\n{}", server.stderr()));
+    assert_eq!(
+        outcome,
+        PickOutcome::Applied {
+            cleared_variant: None
+        },
+        "the reset resolves a default and switches to it"
+    );
+    let selection = backend
+        .session_selection(&session.id, Some(&work_dir))
+        .await
+        .unwrap_or_else(|error| panic!("selection read failed: {error}\n{}", server.stderr()))
+        .expect("a selection");
+    assert_eq!(
+        selection.agent.as_deref(),
+        Some(provider::AGENT),
+        "the live session's agent is the resolved default"
     );
 }
 

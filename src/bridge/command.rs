@@ -443,7 +443,7 @@ pub fn command_help(name: &str) -> Option<String> {
 // text-command behavior (spec #298, ticket D).
 
 use crate::bridge::display::id_tail;
-use crate::bridge::handles::{CommandHandles, PickOutcome};
+use crate::bridge::handles::{CommandHandles, PickReply, classify_pick};
 use crate::config::{ConversationKind, SessionEntry, ThreadKey};
 use crate::feishu;
 use std::sync::Arc;
@@ -932,13 +932,17 @@ pub(crate) async fn handle_command(
             // `default`/`off`/`reset` is a normal pick, never a clear word.
             let cleared = is_reset_flag(&name);
             let agent = if cleared { None } else { Some(name.clone()) };
-            match handles
+            let outcome = handles
                 .flow
                 .sessions
                 .pick_agent(&handles.flow.backend, &thread_key, agent)
-                .await
-            {
-                Ok(PickOutcome::Applied { .. }) => {
+                .await;
+            match classify_pick(
+                outcome,
+                "Agent",
+                crate::bridge::display::feishu_side_label(&thread_key),
+            ) {
+                PickReply::Applied { .. } => {
                     let msg = if cleared {
                         "已清除 Agent（回到服务器默认）。".to_string()
                     } else {
@@ -946,42 +950,8 @@ pub(crate) async fn handle_command(
                     };
                     handles.flow.platform.reply_text(message_id, &msg).await?;
                 }
-                Ok(PickOutcome::NoTarget) => {
-                    handles
-                        .flow
-                        .platform
-                        .reply_text(
-                            message_id,
-                            &format!(
-                                "⚠️ {}还没有会话，先用 `/new` 或 `/dir` 创建。",
-                                crate::bridge::display::feishu_side_label(&thread_key)
-                            ),
-                        )
-                        .await?;
-                }
-                Ok(PickOutcome::NoDefaultAgent) => {
-                    handles
-                        .flow
-                        .platform
-                        .reply_text(
-                            message_id,
-                            "⚠️ 无法确定服务器默认 Agent；请用 `/agent <名字>` 从列表中选择。",
-                        )
-                        .await?;
-                }
-                Ok(_) => {
-                    handles
-                        .flow
-                        .platform
-                        .reply_text(message_id, "⚠️ 无法应用当前 Agent 选择。")
-                        .await?;
-                }
-                Err(e) => {
-                    handles
-                        .flow
-                        .platform
-                        .reply_text(message_id, &format!("⚠️ 切换 Agent 失败：{e}"))
-                        .await?;
+                PickReply::Failed(text) => {
+                    handles.flow.platform.reply_text(message_id, &text).await?;
                 }
             }
         }
@@ -1008,13 +978,17 @@ pub(crate) async fn handle_command(
                         .await?;
                 return Ok(());
             }
-            match handles
+            let outcome = handles
                 .flow
                 .sessions
                 .pick_model(&handles.flow.backend, &thread_key, &name)
-                .await
-            {
-                Ok(PickOutcome::Applied { cleared_variant }) => {
+                .await;
+            match classify_pick(
+                outcome,
+                "模型",
+                crate::bridge::display::feishu_side_label(&thread_key),
+            ) {
+                PickReply::Applied { cleared_variant } => {
                     let extra = cleared_variant
                         .map(|v| format!("（已清除思考等级 `{v}`：新模型不支持）"))
                         .unwrap_or_default();
@@ -1027,32 +1001,8 @@ pub(crate) async fn handle_command(
                         )
                         .await?;
                 }
-                Ok(PickOutcome::NoTarget) => {
-                    handles
-                        .flow
-                        .platform
-                        .reply_text(
-                            message_id,
-                            &format!(
-                                "⚠️ {}还没有会话，先用 `/new` 或 `/dir` 创建。",
-                                crate::bridge::display::feishu_side_label(&thread_key)
-                            ),
-                        )
-                        .await?;
-                }
-                Ok(_) => {
-                    handles
-                        .flow
-                        .platform
-                        .reply_text(message_id, "⚠️ 无法应用当前模型选择。")
-                        .await?;
-                }
-                Err(e) => {
-                    handles
-                        .flow
-                        .platform
-                        .reply_text(message_id, &format!("⚠️ 切换模型失败：{e}"))
-                        .await?;
+                PickReply::Failed(text) => {
+                    handles.flow.platform.reply_text(message_id, &text).await?;
                 }
             }
         }
@@ -1113,13 +1063,17 @@ pub(crate) async fn handle_command(
                 return Ok(());
             }
             let variant = if cleared { None } else { Some(name.clone()) };
-            match handles
+            let outcome = handles
                 .flow
                 .sessions
                 .pick_think(&handles.flow.backend, &thread_key, variant)
-                .await
-            {
-                Ok(PickOutcome::Applied { .. }) => {
+                .await;
+            match classify_pick(
+                outcome,
+                "思考等级",
+                crate::bridge::display::feishu_side_label(&thread_key),
+            ) {
+                PickReply::Applied { .. } => {
                     let msg = if cleared {
                         "已清除思考等级（回到模型默认）。".to_string()
                     } else {
@@ -1127,39 +1081,8 @@ pub(crate) async fn handle_command(
                     };
                     handles.flow.platform.reply_text(message_id, &msg).await?;
                 }
-                Ok(PickOutcome::NoTarget) => {
-                    handles
-                        .flow
-                        .platform
-                        .reply_text(
-                            message_id,
-                            &format!(
-                                "⚠️ {}还没有会话，先用 `/new` 或 `/dir` 创建。",
-                                crate::bridge::display::feishu_side_label(&thread_key)
-                            ),
-                        )
-                        .await?;
-                }
-                Ok(PickOutcome::NoModel) => {
-                    handles
-                        .flow
-                        .platform
-                        .reply_text(message_id, "⚠️ 无法确定当前模型，请先用 `/model` 选择模型。")
-                        .await?;
-                }
-                Ok(_) => {
-                    handles
-                        .flow
-                        .platform
-                        .reply_text(message_id, "⚠️ 无法应用当前思考等级。")
-                        .await?;
-                }
-                Err(e) => {
-                    handles
-                        .flow
-                        .platform
-                        .reply_text(message_id, &format!("⚠️ 设置思考等级失败：{e}"))
-                        .await?;
+                PickReply::Failed(text) => {
+                    handles.flow.platform.reply_text(message_id, &text).await?;
                 }
             }
         }

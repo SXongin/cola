@@ -88,6 +88,38 @@ pub(crate) enum PickOutcome {
     NoDefaultAgent,
 }
 
+/// A pick result turned into what a surface renders: the applied payload, or
+/// the one failure phrasing every surface shares (text reply and card toast).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PickReply {
+    Applied { cleared_variant: Option<String> },
+    Failed(String),
+}
+
+/// Classify a pick result for its surface. `noun` names the switched thing in
+/// the failure line ("模型" / "思考等级" / "Agent"), `thread_label` decorates
+/// the no-session case. All six pick sites (three text commands, three card
+/// actions) go through here, so their phrasing cannot drift.
+pub(crate) fn classify_pick(
+    result: crate::error::Result<PickOutcome>,
+    noun: &str,
+    thread_label: &str,
+) -> PickReply {
+    match result {
+        Ok(PickOutcome::Applied { cleared_variant }) => PickReply::Applied { cleared_variant },
+        Ok(PickOutcome::NoTarget) => PickReply::Failed(format!(
+            "⚠️ {thread_label}还没有会话，先用 `/new` 或 `/dir` 创建。"
+        )),
+        Ok(PickOutcome::NoModel) => {
+            PickReply::Failed("⚠️ 无法确定当前模型，请先用 `/model` 选择模型。".to_string())
+        }
+        Ok(PickOutcome::NoDefaultAgent) => {
+            PickReply::Failed("⚠️ 无法确定服务器默认 Agent；请用 `/agent <名字>` 从列表中选择。".to_string())
+        }
+        Err(error) => PickReply::Failed(format!("⚠️ 切换{noun}失败：{error}")),
+    }
+}
+
 impl SessionsHandle {
     pub(crate) fn new(store: Arc<Mutex<SessionStore>>, cache: Arc<Mutex<Option<SessionListCache>>>) -> Self {
         Self { store, cache }
@@ -286,36 +318,38 @@ impl SessionsHandle {
         Ok(sessions)
     }
 
-    /// The model the NEXT turn will actually run, resolved generation-natively:
+    /// The model the NEXT turn will actually run, resolved generation-natively.
     ///
-    /// 0. **the session's durable selection** (V2's `GET /api/session/{id}`):
-    ///    what the server will use — shared state another client may have
-    ///    changed — so it outranks cola's local mirror. V1 has no durable
-    ///    selection (its picks ride each prompt), so this rung only exists on
-    ///    V2;
-    /// 1. the `/model` mirror;
-    /// 2. the configured default (`[opencode] model`);
-    /// 3. what the server recorded for the session (V1's display fallback).
+    /// On a generation that keeps the selection server-side (V2), the session's
+    /// durable selection IS the answer — what the next prompt will use, shared
+    /// state another client may have changed. A failed read says "unknown", so
+    /// it yields `None`: cola's local mirror is never presented as if the
+    /// server had it (one rule for one fact, ADR-0055). When the server
+    /// recorded no model, the configured default (`[opencode] model`) is what
+    /// the server's own resolver would fall back to.
     ///
-    /// A Pending Session has no durable selection and no server-recorded rung
-    /// (nothing exists on the server yet, ADR-0041). Every remote rung is
-    /// bounded, so a hung server degrades the ladder (no current-model line /
-    /// a `/think` "pick a model" prompt), never the card send.
+    /// On V1 (and for a Pending Session, which has no server identity yet,
+    /// ADR-0041) the `/model` mirror is the selection cola sends per prompt,
+    /// so the ladder is mirror → configured default → server-recorded model.
+    /// Every remote rung is bounded: a hung server degrades the ladder (no
+    /// current-model line / a `/think` "pick a model" prompt), never the card
+    /// send.
     pub(crate) async fn effective_selection(
         &self,
         backend: &Arc<dyn crate::backend::Backend>,
         settings: &SessionSettings,
     ) -> Option<opencode::types::ModelInfo> {
-        let durable = match settings.session_id.as_deref() {
-            Some(session_id) => {
-                self.durable_selection(backend, session_id, Some(&settings.directory))
-                    .await
-            }
-            None => None,
-        };
-        let durable_model = durable.and_then(|selection| selection.model);
-        if let Some(model) = durable_model {
-            return Some(model);
+        if let Some(session_id) = settings.session_id.as_deref()
+            && backend.keeps_session_selection()
+        {
+            return match self
+                .durable_selection(backend, session_id, Some(&settings.directory))
+                .await
+            {
+                Ok(Some(selection)) => selection.model.or_else(|| backend.configured_default_model()),
+                // V2 always reports a selection; a failed read is unknown.
+                Ok(None) | Err(_) => None,
+            };
         }
         // The `/model` mirror. Its variant is the separate `/think` field on
         // the settings, so the model ref is assembled here.
@@ -361,46 +395,54 @@ impl SessionsHandle {
             .map(|model| (model.provider_id, model.id))
     }
 
-    /// The variant the next prompt will actually use: the session's durable
-    /// selection where the generation keeps one (V2 — possibly set by another
-    /// client), else the `/think` mirror (V1). `None` means the model runs at
-    /// its own default, so a stale mirror cannot tag a V2 footer.
+    /// The variant the next prompt will actually use. On a generation with a
+    /// durable selection (V2) it is the session's own — possibly set by another
+    /// client — and a failed read says unknown (`None`), never the mirror: the
+    /// footer then falls back to the transcript, which carries what ran. On V1
+    /// it is the `/think` mirror, which is what the next prompt sends.
     pub(crate) async fn effective_variant(
         &self,
         backend: &Arc<dyn crate::backend::Backend>,
         session_id: &str,
         directory: Option<&str>,
     ) -> Option<String> {
-        if let Some(selection) = self.durable_selection(backend, session_id, directory).await {
-            return selection.model.and_then(|model| model.variant);
+        if !backend.keeps_session_selection() {
+            return self.variant_override(session_id).await;
         }
-        self.variant_override(session_id).await
+        match self.durable_selection(backend, session_id, directory).await {
+            Ok(Some(selection)) => selection.model.and_then(|model| model.variant),
+            Ok(None) | Err(_) => None,
+        }
     }
 
-    /// Read the session's durable selection where the generation keeps one
-    /// (V2). `None` means either V1 (no durable selection; the local mirror is
-    /// authoritative) or a failed/unreachable read — both degrade the caller to
-    /// the mirror rather than failing the card.
+    /// Read the session's durable selection (V2). A failed or timed-out read is
+    /// an error the caller must decide about — never a silent `None` that reads
+    /// like "this generation has no selection". Every failure is logged at WARN
+    /// (the adapter's "errors are visible, never silent" rule).
     async fn durable_selection(
         &self,
         backend: &Arc<dyn crate::backend::Backend>,
         session_id: &str,
         directory: Option<&str>,
-    ) -> Option<opencode::types::SessionSelection> {
+    ) -> crate::error::Result<Option<opencode::types::SessionSelection>> {
         match tokio::time::timeout(
             SESSION_INFO_TIMEOUT,
             backend.session_selection(session_id, directory),
         )
         .await
         {
-            Ok(Ok(selection)) => selection,
-            Ok(Err(error)) => {
-                tracing::debug!("session {session_id}: durable selection read failed: {error}");
-                None
+            Ok(result) => {
+                if let Err(error) = &result {
+                    tracing::warn!("session {session_id}: durable selection read failed: {error}");
+                }
+                result
             }
             Err(_) => {
-                tracing::debug!("session {session_id}: durable selection read timed out");
-                None
+                let error = crate::error::BridgeError::OpenCode(format!(
+                    "session {session_id} selection read timed out"
+                ));
+                tracing::warn!("{error}");
+                Err(error)
             }
         }
     }
@@ -449,16 +491,46 @@ impl SessionsHandle {
         }
     }
 
+    /// Put a settled model selection onto a session: clear a variant the model
+    /// does not declare (ADR-0020), then switch the model ref (the variant
+    /// inside it). One implementation for the live picks and for a Pending
+    /// Session's materialisation, so the two cannot drift. Returns the cleared
+    /// variant. The caller owns the local write; V1's switch is a no-op and
+    /// only its clear applies.
+    pub(crate) async fn apply_model_selection(
+        &self,
+        backend: &Arc<dyn crate::backend::Backend>,
+        session_id: &str,
+        model_spec: &str,
+        variant: &mut Option<String>,
+    ) -> crate::error::Result<Option<String>> {
+        let cleared = self.clear_variant_for_model(backend, variant, model_spec).await;
+        let model = opencode::parsing::parse_model(model_spec).ok_or_else(|| {
+            crate::error::BridgeError::OpenCode(format!("invalid model reference `{model_spec}`"))
+        })?;
+        backend
+            .switch_session_model(
+                session_id,
+                &opencode::types::ModelInfo {
+                    id: model.id,
+                    provider_id: model.provider_id,
+                    variant: variant.clone(),
+                },
+            )
+            .await?;
+        Ok(cleared)
+    }
+
     /// Apply a `/model` pick (ADR-0020 and V2's durable switches): mirror the
     /// pick, carry or clear the variant, and switch the session's model where
     /// the generation keeps a durable selection. The switch happens BEFORE the
     /// local write, so a failed switch leaves the mirror untouched rather than
     /// claiming a pick that never landed.
     ///
-    /// The surviving variant is read from the session's own selection when one
-    /// exists (another client may have changed it), so "a model that does not
-    /// declare the current variant clears it" judges the real current variant,
-    /// not a stale mirror.
+    /// On a durable generation (V2) the surviving variant is the SESSION's own
+    /// (another client may have changed it); a failed selection read means
+    /// unknown, and since the switch replaces the whole ref, the variant is
+    /// dropped rather than revived from the mirror.
     pub(crate) async fn pick_model(
         &self,
         backend: &Arc<dyn crate::backend::Backend>,
@@ -468,29 +540,30 @@ impl SessionsHandle {
         let Some(mut settings) = self.session_settings(thread_key).await else {
             return Ok(PickOutcome::NoTarget);
         };
-        if let Some(session_id) = settings.session_id.clone()
-            && let Some(selection) = self
-                .durable_selection(backend, &session_id, Some(&settings.directory))
-                .await
-            && let Some(model) = selection.model
-        {
-            settings.variant = model.variant;
-        }
         settings.model = Some(model_spec.to_string());
-        let cleared_variant = self
-            .clear_variant_for_model(backend, &mut settings.variant, model_spec)
-            .await;
-        if let Some(session_id) = settings.session_id.as_deref() {
-            let model = opencode::parsing::parse_model(model_spec).ok_or_else(|| {
-                crate::error::BridgeError::OpenCode(format!("invalid model reference `{model_spec}`"))
-            })?;
-            let selection = opencode::types::ModelInfo {
-                id: model.id,
-                provider_id: model.provider_id,
-                variant: settings.variant.clone(),
-            };
-            backend.switch_session_model(session_id, &selection).await?;
-        }
+        let cleared_variant = match settings.session_id.clone() {
+            Some(session_id) => {
+                if backend.keeps_session_selection() {
+                    settings.variant = match self
+                        .durable_selection(backend, &session_id, Some(&settings.directory))
+                        .await
+                    {
+                        Ok(Some(selection)) => selection.model.and_then(|model| model.variant),
+                        // Unknown: the switch rewrites the ref wholesale, so
+                        // dropping it is the one honest outcome.
+                        Ok(None) | Err(_) => None,
+                    };
+                }
+                self.apply_model_selection(backend, &session_id, model_spec, &mut settings.variant)
+                    .await?
+            }
+            None => {
+                // A Pending Session has no session to switch yet; the clear
+                // rule is recorded and applied when the session materialises.
+                self.clear_variant_for_model(backend, &mut settings.variant, model_spec)
+                    .await
+            }
+        };
         if !self.set_session_settings(thread_key, settings).await? {
             return Ok(PickOutcome::NoTarget);
         }
@@ -500,8 +573,9 @@ impl SessionsHandle {
     /// Apply a `/think` pick: `variant: None` clears it (the model's own
     /// default). On a durable generation the variant is written into the
     /// session's model ref — the effective model is resolved first, so
-    /// [`PickOutcome::NoModel`] reports a session that cannot carry one — and
-    /// on V1 it stays the per-prompt mirror.
+    /// [`PickOutcome::NoModel`] reports a session that cannot carry one (never
+    /// a mirror-only write the server would ignore) — and on V1 it stays the
+    /// per-prompt mirror.
     pub(crate) async fn pick_think(
         &self,
         backend: &Arc<dyn crate::backend::Backend>,
@@ -512,21 +586,22 @@ impl SessionsHandle {
             return Ok(PickOutcome::NoTarget);
         };
         settings.variant = variant;
-        if let Some(session_id) = settings.session_id.clone() {
-            let durable = self
-                .durable_selection(backend, &session_id, Some(&settings.directory))
-                .await;
-            if durable.is_some() {
-                let Some(model) = self.effective_selection(backend, &settings).await else {
-                    return Ok(PickOutcome::NoModel);
-                };
-                let selection = opencode::types::ModelInfo {
-                    id: model.id,
-                    provider_id: model.provider_id,
-                    variant: settings.variant.clone(),
-                };
-                backend.switch_session_model(&session_id, &selection).await?;
-            }
+        if let Some(session_id) = settings.session_id.clone()
+            && backend.keeps_session_selection()
+        {
+            let Some(model) = self.effective_selection(backend, &settings).await else {
+                return Ok(PickOutcome::NoModel);
+            };
+            backend
+                .switch_session_model(
+                    &session_id,
+                    &opencode::types::ModelInfo {
+                        id: model.id,
+                        provider_id: model.provider_id,
+                        variant: settings.variant.clone(),
+                    },
+                )
+                .await?;
         }
         if !self.set_session_settings(thread_key, settings).await? {
             return Ok(PickOutcome::NoTarget);
@@ -537,10 +612,11 @@ impl SessionsHandle {
     }
 
     /// Apply an `/agent` pick: `agent: None` clears it (back to the server's
-    /// default). On a durable generation the default is resolved from the agent
-    /// catalog and switched explicitly — V2 has no "unset" arm, and its default
-    /// is the first primary, visible agent in `GET /agent` order. On V1
+    /// default). On a durable generation (V2) the selection is switched on the
+    /// session — a reset resolves the default from the agent catalog and
+    /// switches to that id explicitly, because V2 has no "unset" arm. On V1
     /// clearing is purely local: absence of the per-prompt agent is the clear.
+    /// The capability, never a selection read, decides which path applies.
     pub(crate) async fn pick_agent(
         &self,
         backend: &Arc<dyn crate::backend::Backend>,
@@ -550,14 +626,12 @@ impl SessionsHandle {
         let Some(mut settings) = self.session_settings(thread_key).await else {
             return Ok(PickOutcome::NoTarget);
         };
-        if let Some(session_id) = settings.session_id.clone() {
-            let durable = self
-                .durable_selection(backend, &session_id, Some(&settings.directory))
-                .await
-                .is_some();
+        if let Some(session_id) = settings.session_id.clone()
+            && backend.keeps_session_selection()
+        {
             match &agent {
                 Some(picked) => backend.switch_session_agent(&session_id, picked).await?,
-                None if durable => {
+                None => {
                     let Some(default) =
                         opencode::types::AgentInfo::default_agent(&backend.list_agents().await)
                     else {
@@ -565,7 +639,6 @@ impl SessionsHandle {
                     };
                     backend.switch_session_agent(&session_id, &default).await?;
                 }
-                None => {}
             }
         }
         settings.agent = agent;

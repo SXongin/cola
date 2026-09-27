@@ -86,8 +86,9 @@ impl AgentInfo {
     /// The server's default agent: the first primary, visible agent in
     /// `GET /agent` order. The server's own agent service sorts the configured
     /// default (or `build`) first, so this is its `defaultInfo` fallback
-    /// without a `/config` round trip. `None` when the server listed nothing
-    /// usable.
+    /// without a `/config` round trip — an ordering the live V2 selection
+    /// chain validates against a real server whose `default_agent` is a custom
+    /// agent. `None` when the server listed nothing usable.
     pub fn default_agent(agents: &[AgentInfo]) -> Option<String> {
         agents
             .iter()

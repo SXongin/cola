@@ -2125,3 +2125,264 @@ async fn the_ladder_reads_the_servers_selection_over_the_local_mirror() {
     assert_eq!(calls[0].1.id, "server-model");
     assert_eq!(calls[0].1.variant.as_deref(), Some("high"));
 }
+
+/// On a durable generation a failed selection read is NEVER a licence to
+/// confirm a mirror-only write: `/think` reports the unknown state, keeps the
+/// mirror, and touches no session.
+#[tokio::test]
+async fn a_failed_durable_read_never_confirms_a_think_pick() {
+    use crate::opencode::types::{ModelInfo, SessionSelection};
+
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_models(vec![crate::opencode::types::ProviderModels {
+        provider: "p".into(),
+        models: vec![model_option("server-model", &["high"])],
+    }]);
+    backend.with_session_selection(
+        "ses_test",
+        SessionSelection {
+            model: Some(ModelInfo {
+                id: "server-model".into(),
+                provider_id: "p".into(),
+                variant: None,
+            }),
+            agent: None,
+        },
+    );
+    backend.fail_session_selection("selection boom");
+    let switch_calls = backend.switch_model_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: key.clone(),
+            session_id: "ses_test".into(),
+            directory: "/tmp/aa".into(),
+            agent: None,
+            model: Some("p/server-model".into()),
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    let (_, logs) = capture_logs(async {
+        send_command_in(
+            &app,
+            "/think high",
+            key.clone(),
+            "msg_think",
+            crate::config::ConversationKind::P2p,
+        )
+        .await;
+    })
+    .await;
+
+    let text = platform.texts().await.join("\n");
+    assert!(
+        text.contains("无法确定当前模型"),
+        "the unknown state is reported: {text}"
+    );
+    assert!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key)
+            .and_then(|e| e.variant.clone())
+            .is_none(),
+        "the mirror must stay untouched"
+    );
+    assert!(
+        switch_calls.lock().await.is_empty(),
+        "nothing may be switched on an unreadable selection"
+    );
+    assert_line_level(&logs, "durable selection read failed", "WARN");
+}
+
+/// The same failed read must not present the local mirror as the session's
+/// selection: the `/model` card omits its current line, and a pick drops the
+/// unknown variant (the switch replaces the ref wholesale) instead of reviving
+/// the mirror's.
+#[tokio::test]
+async fn a_failed_durable_read_hides_the_mirror_and_drops_an_unknown_variant() {
+    use crate::opencode::types::{ModelInfo, SessionSelection};
+
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_models(vec![crate::opencode::types::ProviderModels {
+        provider: "p".into(),
+        models: vec![
+            model_option("new-model", &["high"]),
+            model_option("local-model", &["high"]),
+        ],
+    }]);
+    backend.with_session_selection(
+        "ses_test",
+        SessionSelection {
+            model: Some(ModelInfo {
+                id: "server-model".into(),
+                provider_id: "p".into(),
+                variant: Some("high".into()),
+            }),
+            agent: None,
+        },
+    );
+    backend.fail_session_selection("selection boom");
+    let switch_calls = backend.switch_model_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: key.clone(),
+            session_id: "ses_test".into(),
+            directory: "/tmp/aa".into(),
+            agent: None,
+            model: Some("p/local-model".into()),
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: Some("high".into()),
+        },
+    )
+    .await;
+
+    send_command_in(
+        &app,
+        "/model",
+        key.clone(),
+        "msg_model_card",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let card = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .find_map(|c| match c {
+            PlatformCall::ReplyCard { card, .. } => Some(card.to_string()),
+            _ => None,
+        })
+        .expect("a model card should be sent");
+    assert!(
+        !card.contains("p/local-model"),
+        "the mirror must not be shown as the session's selection: {card}"
+    );
+    assert!(!card.contains("当前模型"), "no current-model line: {card}");
+
+    // A pick still switches (the server accepts a new ref); the unknown
+    // variant is dropped rather than taken from the mirror.
+    send_command_in(
+        &app,
+        "/model p/new-model",
+        key.clone(),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let calls = switch_calls.lock().await.clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1.id, "new-model");
+    assert_eq!(
+        calls[0].1.variant, None,
+        "an unreadable selection means the variant is unknown, not the mirror's"
+    );
+    let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
+    assert_eq!(entry.model.as_deref(), Some("p/new-model"));
+    assert!(entry.variant.is_none());
+}
+
+/// The `/model` picker card's model button switches the session on a durable
+/// generation, carrying the session's surviving variant (here the selection's
+/// `high`), and the `/agent` picker's button switches the agent.
+#[tokio::test]
+async fn picker_buttons_switch_the_session_on_a_durable_generation() {
+    use crate::opencode::types::{AgentInfo, ModelInfo, SessionSelection};
+
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_models(vec![crate::opencode::types::ProviderModels {
+        provider: "p".into(),
+        models: vec![model_option("alt-model", &["low", "high"])],
+    }]);
+    backend.with_agents(vec![AgentInfo {
+        name: "build".into(),
+        description: None,
+        mode: Some("primary".into()),
+        hidden: Some(false),
+    }]);
+    backend.with_session_selection(
+        "ses_test",
+        SessionSelection {
+            model: Some(ModelInfo {
+                id: "server-model".into(),
+                provider_id: "p".into(),
+                variant: Some("high".into()),
+            }),
+            agent: None,
+        },
+    );
+    let model_calls = backend.switch_model_calls.clone();
+    let agent_calls = backend.switch_agent_calls.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: key.clone(),
+            session_id: "ses_test".into(),
+            directory: "/tmp/aa".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    let model = serde_json::json!({
+        "action": "model",
+        "level": "model",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "value": "p/alt-model",
+    });
+    app.host_action(model).await.expect("model card action");
+    let calls = model_calls.lock().await.clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "ses_test");
+    assert_eq!(
+        calls[0].1,
+        ModelInfo {
+            id: "alt-model".into(),
+            provider_id: "p".into(),
+            variant: Some("high".into()),
+        },
+        "the button pick carries the session's surviving variant"
+    );
+
+    let agent = serde_json::json!({
+        "action": "agent",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "value": "build",
+    });
+    app.host_action(agent).await.expect("agent card action");
+    assert_eq!(
+        agent_calls.lock().await.as_slice(),
+        &[("ses_test".to_string(), "build".to_string())]
+    );
+}

@@ -112,26 +112,25 @@ impl RawSessionInfo {
             id: self.id,
             parent_id: self.parent_id,
             title: self.title,
-            model: self
-                .model
-                .map(serde_json::from_value::<SessionModel>)
-                .transpose()?,
+            model: decode_model_ref(self.model)?.map(RawModelRef::into_session_model),
         })
     }
 
     /// The neutral durable-selection read: the session's model ref (variant
-    /// inside it) and agent. A malformed model is a decode error, like
-    /// [`Self::into_session_info`].
+    /// inside it) and agent. The same [`RawModelRef`] decode as
+    /// [`Self::into_session_info`] — one model decoder, so the two reads cannot
+    /// drift.
     pub(super) fn into_selection(self) -> serde_json::Result<SessionSelection> {
         Ok(SessionSelection {
-            model: self
-                .model
-                .map(serde_json::from_value::<RawModelRef>)
-                .transpose()?
-                .map(RawModelRef::into_model_info),
+            model: decode_model_ref(self.model)?.map(RawModelRef::into_model_info),
             agent: self.agent,
         })
     }
+}
+
+/// Decode `Session.Info.model` through one shared [`RawModelRef`] decoder.
+fn decode_model_ref(model: Option<Value>) -> serde_json::Result<Option<RawModelRef>> {
+    model.map(serde_json::from_value::<RawModelRef>).transpose()
 }
 
 /// `Session.Info.model` — the `Model.Ref` a durable selection carries. The
@@ -146,6 +145,16 @@ struct RawModelRef {
 }
 
 impl RawModelRef {
+    /// The neutral session-info model (the variant-blind DTO the parent-chain
+    /// and display readers consume).
+    fn into_session_model(self) -> SessionModel {
+        SessionModel {
+            provider_id: self.provider_id,
+            id: self.id,
+        }
+    }
+
+    /// The neutral model ref, variant included.
     fn into_model_info(self) -> ModelInfo {
         ModelInfo {
             id: self.id,

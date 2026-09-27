@@ -857,6 +857,14 @@ pub struct MockBackend {
     /// per-prompt selection until a scenario seeds one or a switch lands.
     pub session_selections:
         Arc<tokio::sync::Mutex<std::collections::HashMap<String, opencode::types::SessionSelection>>>,
+    /// Whether the mock speaks a generation with durable session selection
+    /// (V2): `session_selection` serves the map and `keeps_session_selection`
+    /// is true. Default false (V1: picks ride each prompt); a scenario that
+    /// seeds a selection switches it on.
+    pub durable_selection: bool,
+    /// When set, `session_selection` fails with this message (a transient V2
+    /// read failure) — the caller must not treat it as "no durable selection".
+    pub session_selection_error: Option<String>,
     /// Records `switch_session_model` calls: `(session_id, model)`.
     pub switch_model_calls: Arc<tokio::sync::Mutex<Vec<(String, opencode::types::ModelInfo)>>>,
     /// Records `switch_session_agent` calls: `(session_id, agent)`.
@@ -960,6 +968,8 @@ impl MockBackend {
             context_window_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_model: None,
             session_selections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            durable_selection: false,
+            session_selection_error: None,
             switch_model_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             switch_agent_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             switch_error: None,
@@ -1060,12 +1070,14 @@ impl MockBackend {
     }
 
     /// Scenario: the session has `selection` durably (V2's session-scoped
-    /// switches) — what `session_selection` serves before any pick.
+    /// switches) — what `session_selection` serves before any pick. Turns the
+    /// mock into the durable-selection generation (V2 semantics).
     pub(crate) fn with_session_selection(
         &mut self,
         session_id: &str,
         selection: opencode::types::SessionSelection,
     ) -> &mut Self {
+        self.durable_selection = true;
         self.session_selections
             .try_lock()
             .expect("with_session_selection before the app is built")
@@ -1077,6 +1089,14 @@ impl MockBackend {
     /// rejects the switch) — the pick must not be mirrored.
     pub(crate) fn fail_session_switch(&mut self, message: &str) -> &mut Self {
         self.switch_error = Some(message.to_string());
+        self
+    }
+
+    /// Scenario: the durable selection read fails with `message` (a transient
+    /// V2 failure) — a pick that needs the session's own selection must not
+    /// pretend the generation has none.
+    pub(crate) fn fail_session_selection(&mut self, message: &str) -> &mut Self {
+        self.session_selection_error = Some(message.to_string());
         self
     }
 
@@ -1814,7 +1834,17 @@ impl crate::backend::Backend for MockBackend {
         session_id: &str,
         _d: Option<&str>,
     ) -> crate::error::Result<Option<opencode::types::SessionSelection>> {
+        if let Some(error) = &self.session_selection_error {
+            return Err(crate::error::BridgeError::OpenCode(error.clone()));
+        }
+        if !self.durable_selection {
+            return Ok(None);
+        }
         Ok(self.session_selections.lock().await.get(session_id).cloned())
+    }
+
+    fn keeps_session_selection(&self) -> bool {
+        self.durable_selection
     }
 
     async fn switch_session_model(

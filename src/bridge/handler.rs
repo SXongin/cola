@@ -6,7 +6,7 @@ use tracing::Instrument;
 use crate::bridge::access::{Access, Decision, DenyReason};
 use crate::bridge::command;
 use crate::bridge::core::SharedCore;
-use crate::bridge::handles::PickOutcome;
+use crate::bridge::handles::{PickReply, classify_pick};
 use crate::bridge::session::PendingEntry;
 use crate::bridge::span;
 use crate::bridge::turn::PromptContext;
@@ -704,7 +704,7 @@ impl App {
     /// the pending intact, so the next message retries.
     async fn materialise_pending(
         &self,
-        pending: PendingEntry,
+        mut pending: PendingEntry,
         message_id: &str,
     ) -> crate::error::Result<String> {
         let session = self
@@ -712,12 +712,14 @@ impl App {
             .create_session(&self.opencode.new_session_input(Some(&pending.directory)))
             .await?;
         // ADR-0041 + V2's durable selection: the pending's picks become
-        // session switches now that a session exists, so the first prompt
-        // needs no per-prompt fields. On V1 these calls are no-ops and the
-        // first prompt carries the picks as before. Best-effort: a failed
-        // switch warns (and tells the user), but the created session is never
-        // orphaned.
-        self.apply_pending_picks(&session.id, &pending, message_id).await;
+        // session switches now that a session exists (and on V1 the same
+        // helper's switch is a no-op, leaving the first prompt to carry them).
+        // It also applies the shared ADR-0020 clear rule, so a pending pick
+        // that no longer matches the model cannot poison the first turn.
+        // Best-effort: a failed switch warns (and tells the user), but the
+        // created session is never orphaned.
+        self.apply_pending_picks(&session.id, &mut pending, message_id)
+            .await;
         // Creation title policy (ADR-0007): `/new <name>` PATCHes the title.
         // A failed PATCH must not orphan the created session (a retry would
         // create a second one), so it warns and keeps the server-generated
@@ -753,36 +755,44 @@ impl App {
         Ok(session.id)
     }
 
-    /// Apply a Pending Session's picks to the session it just created. The
-    /// model switch needs a full ref, so a variant-only pending (no `/model`
-    /// pick) resolves the model the create recorded; the agent switches by id.
-    /// V1's strategy no-ops both calls, so this is free there. Failures are
-    /// reported once, without orphaning the created session.
-    async fn apply_pending_picks(&self, session_id: &str, pending: &PendingEntry, message_id: &str) {
+    /// Apply a Pending Session's picks to the session it just created, through
+    /// the same rules as a live pick: [`SessionsHandle::apply_model_selection`]
+    /// clears a variant the model does not declare (ADR-0020) and switches the
+    /// ref, and the agent switches by id. The model switch needs a full ref, so
+    /// a variant-only pending (no `/model` pick) resolves the model the create
+    /// recorded — and reports a failed read rather than guessing. V1's switches
+    /// are no-ops; only the clear rule and the local mirror apply there.
+    /// Failures are reported once, without orphaning the created session.
+    async fn apply_pending_picks(&self, session_id: &str, pending: &mut PendingEntry, message_id: &str) {
         let mut failures: Vec<String> = Vec::new();
-        let mut model = pending
-            .model
-            .as_deref()
-            .and_then(crate::opencode::parsing::parse_model);
-        if model.is_none() && pending.variant.is_some() {
-            model = self
-                .opencode
-                .session_info(session_id, Some(&pending.directory))
-                .await
-                .ok()
-                .and_then(|info| info.model)
-                .map(|model| opencode::types::ModelInfo {
-                    id: model.id,
-                    provider_id: model.provider_id,
-                    variant: None,
-                });
-        }
-        if let Some(mut model) = model {
-            model.variant = pending.variant.clone();
-            if let Err(e) = self.opencode.switch_session_model(session_id, &model).await {
-                tracing::warn!("materialise: model switch failed for {session_id}: {e}");
-                failures.push(format!("模型/思考等级未生效（{e}）"));
+        let model_spec = match pending.model.clone() {
+            Some(spec) => Some(spec),
+            None if pending.variant.is_some() => {
+                match self
+                    .opencode
+                    .session_info(session_id, Some(&pending.directory))
+                    .await
+                {
+                    Ok(info) => info
+                        .model
+                        .map(|model| format!("{}/{}", model.provider_id, model.id)),
+                    Err(e) => {
+                        tracing::warn!("materialise: session model read failed for {session_id}: {e}");
+                        failures.push(format!("读取会话模型失败（{e}）"));
+                        None
+                    }
+                }
             }
+            None => None,
+        };
+        if let Some(model_spec) = model_spec
+            && let Err(e) = self
+                .sessions_handle()
+                .apply_model_selection(&self.opencode, session_id, &model_spec, &mut pending.variant)
+                .await
+        {
+            tracing::warn!("materialise: model switch failed for {session_id}: {e}");
+            failures.push(format!("模型/思考等级未生效（{e}）"));
         }
         if let Some(agent) = &pending.agent
             && let Err(e) = self.opencode.switch_session_agent(session_id, agent).await
@@ -1584,33 +1594,17 @@ impl App {
             .to_string();
         let thread_key = thread_key_from_value(value);
         let agent = if clear { None } else { Some(picked.clone()) };
-        match core.pick_agent(&thread_key, agent).await {
-            Ok(PickOutcome::Applied { .. }) => {}
-            Ok(PickOutcome::NoTarget) => {
+        let outcome = core.pick_agent(&thread_key, agent).await;
+        match classify_pick(
+            outcome,
+            "Agent",
+            crate::bridge::display::feishu_side_label(&thread_key),
+        ) {
+            PickReply::Applied { .. } => {}
+            PickReply::Failed(text) => {
                 return Some(CardActionResult {
                     card: None,
-                    toast: Some(format!(
-                        "{}还没有会话",
-                        crate::bridge::display::feishu_side_label(&thread_key)
-                    )),
-                });
-            }
-            Ok(PickOutcome::NoDefaultAgent) => {
-                return Some(CardActionResult {
-                    card: None,
-                    toast: Some("无法确定服务器默认 Agent".to_string()),
-                });
-            }
-            Ok(_) => {
-                return Some(CardActionResult {
-                    card: None,
-                    toast: Some("无法应用当前 Agent 选择".to_string()),
-                });
-            }
-            Err(e) => {
-                return Some(CardActionResult {
-                    card: None,
-                    toast: Some(format!("切换 Agent 失败：{e}")),
+                    toast: Some(text),
                 });
             }
         }
@@ -1676,27 +1670,16 @@ impl App {
                 toast: Some("模型格式应为 <provider>/<model>".to_string()),
             });
         }
-        let cleared_variant = match core.pick_model(&thread_key, &picked).await {
-            Ok(PickOutcome::Applied { cleared_variant }) => cleared_variant,
-            Ok(PickOutcome::NoTarget) => {
+        let cleared_variant = match classify_pick(
+            core.pick_model(&thread_key, &picked).await,
+            "模型",
+            crate::bridge::display::feishu_side_label(&thread_key),
+        ) {
+            PickReply::Applied { cleared_variant } => cleared_variant,
+            PickReply::Failed(text) => {
                 return Some(CardActionResult {
                     card: None,
-                    toast: Some(format!(
-                        "{}还没有会话",
-                        crate::bridge::display::feishu_side_label(&thread_key)
-                    )),
-                });
-            }
-            Ok(_) => {
-                return Some(CardActionResult {
-                    card: None,
-                    toast: Some("无法应用当前模型选择".to_string()),
-                });
-            }
-            Err(e) => {
-                return Some(CardActionResult {
-                    card: None,
-                    toast: Some(format!("切换模型失败：{e}")),
+                    toast: Some(text),
                 });
             }
         };
@@ -1749,36 +1732,17 @@ impl App {
                 toast: Some(format!("当前模型 `{provider}/{model}` 不支持思考等级 `{picked}`")),
             });
         }
-        match core
-            .pick_think(&thread_key, if clear { None } else { Some(picked.clone()) })
-            .await
-        {
-            Ok(PickOutcome::Applied { .. }) => {}
-            Ok(PickOutcome::NoTarget) => {
+        match classify_pick(
+            core.pick_think(&thread_key, if clear { None } else { Some(picked.clone()) })
+                .await,
+            "思考等级",
+            crate::bridge::display::feishu_side_label(&thread_key),
+        ) {
+            PickReply::Applied { .. } => {}
+            PickReply::Failed(text) => {
                 return Some(CardActionResult {
                     card: None,
-                    toast: Some(format!(
-                        "{}还没有会话",
-                        crate::bridge::display::feishu_side_label(&thread_key)
-                    )),
-                });
-            }
-            Ok(PickOutcome::NoModel) => {
-                return Some(CardActionResult {
-                    card: None,
-                    toast: Some("无法确定当前模型，请先用 /model 选择模型".to_string()),
-                });
-            }
-            Ok(_) => {
-                return Some(CardActionResult {
-                    card: None,
-                    toast: Some("无法应用当前思考等级".to_string()),
-                });
-            }
-            Err(e) => {
-                return Some(CardActionResult {
-                    card: None,
-                    toast: Some(format!("设置思考等级失败：{e}")),
+                    toast: Some(text),
                 });
             }
         }

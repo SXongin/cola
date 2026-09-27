@@ -547,21 +547,7 @@ impl Turn {
                             .iter()
                             .rfind(|message| message.role == MessageRole::Assistant);
                         if let Some(message) = latest_assistant {
-                            if let Some(model) = &message.model {
-                                acc.model_id = Some(model.model_id.clone());
-                                if !model.provider_id.is_empty() {
-                                    acc.provider_id = Some(model.provider_id.clone());
-                                }
-                                // A decoder that reports the variant (V2's
-                                // message model ref carries it) is
-                                // authoritative: the footer shows what
-                                // actually ran. V1's decoder deliberately
-                                // reports none, so its turn-time capture
-                                // (ADR-0019) stands.
-                                if let Some(variant) = &model.variant {
-                                    acc.variant = Some(variant.clone());
-                                }
-                            }
+                            render::capture_footer_model(acc, message);
                             if let Some(tokens) = &message.tokens {
                                 let used = tokens.context_used();
                                 if used > 0 {
@@ -1893,5 +1879,51 @@ mod tests {
             "the footer reads the transcript's variant"
         );
         assert_eq!(acc.acc.model_id.as_deref(), Some("deepseek-v4-flash"));
+    }
+
+    /// On a durable generation the turn's variant comes from the SESSION's
+    /// selection, never a stale `/think` mirror: the mirror's `high` must not
+    /// be sent (or tagged) when the session's model ref carries none.
+    #[tokio::test]
+    async fn turn_variant_ignores_the_mirror_on_a_durable_generation() {
+        use crate::opencode::types::{ModelInfo, SessionSelection};
+
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        let sent_variants = backend.prompt_variants.clone();
+        backend.with_session_selection(
+            "ses_a",
+            SessionSelection {
+                model: Some(ModelInfo {
+                    id: "m".into(),
+                    provider_id: "p".into(),
+                    variant: None,
+                }),
+                agent: None,
+            },
+        );
+        let (app, _platform) = build_app(cfg, backend).await;
+        let mut entry = crate::config::SessionEntry::new(
+            ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "ses_a",
+            "/tmp/a",
+        );
+        entry.variant = Some("high".into());
+        seed_entry(&app, entry).await;
+
+        Turn::run(&app.turn_handles(), ctx("ses_a", "hi")).await.unwrap();
+
+        assert_eq!(
+            sent_variants.lock().await.as_slice(),
+            &[None],
+            "the stale mirror's variant must not ride the prompt"
+        );
+        let cards = app.cards.lock().await;
+        assert!(
+            cards.get("ses_a").and_then(|c| c.acc.variant.clone()).is_none(),
+            "nor tag the footer"
+        );
     }
 }
