@@ -156,16 +156,33 @@ async fn run(
                     // Still running: keep rendering (the ceiling is the only
                     // way out while it stays busy).
                     Some(Ok(Some(SessionStatus::Busy | SessionStatus::Retry))) => {}
-                    // Non-busy: finalize Done — but never over a panel still
-                    // marked live (`⏳`). A crash-orphaned tool can leave one
-                    // behind on an idle session; it waits for the ceiling's
-                    // Error rather than a false `✅`.
+                    // Non-busy: finalize — but never over a panel still marked
+                    // live (`⏳`). A crash-orphaned tool can leave one behind on
+                    // an idle session; it waits for the ceiling's Error rather
+                    // than a false `✅`.
+                    //
+                    // The settled turn's own failure decides the ending
+                    // (ADR-0056): the failure lives on the newest assistant
+                    // message, so a long turn that ended in a provider failure
+                    // must finalize Error, not Done.
                     Some(Ok(_)) => {
                         let live_panels = Turn::has_live_tools(&handles.cards, &session_id).await;
                         if !live_panels {
-                            Turn::finalize_done(&handles.cards, &session_id).await;
-                            super::send_completion_notice(&handles, &session_id, started_at).await;
-                            tracing::info!("drain follow: session {} idle; finalized", session_id);
+                            match turn_failure(&transcript, &anchor) {
+                                Some(error) => {
+                                    Turn::finalize_error(&handles.cards, &session_id, &error).await;
+                                    super::send_completion_notice(&handles, &session_id, started_at).await;
+                                    tracing::info!(
+                                        "drain follow: session {} failed; finalized Error",
+                                        session_id
+                                    );
+                                }
+                                None => {
+                                    Turn::finalize_done(&handles.cards, &session_id).await;
+                                    super::send_completion_notice(&handles, &session_id, started_at).await;
+                                    tracing::info!("drain follow: session {} idle; finalized", session_id);
+                                }
+                            }
                             return;
                         }
                     }
@@ -182,6 +199,14 @@ async fn run(
             return;
         }
     }
+}
+
+/// The failure the followed turn recorded, read from its settled transcript
+/// through the same projection the Turn's own finalization uses
+/// ([`crate::backend::TurnView::error`]: the NEWEST assistant message's
+/// failure, so a recovered earlier step is not a failure).
+fn turn_failure(transcript: &crate::backend::SessionTranscript, anchor: &TurnAnchor) -> Option<String> {
+    transcript.turn_for_user(anchor).error
 }
 
 /// The ceiling exit: the session is still busy (or unreadable) at the follow's

@@ -663,6 +663,40 @@ async fn a_running_supplement_panel_rides_past_the_drain_bound_until_idle() {
     assert_no_further_rendering(&backend, &platform).await;
 }
 
+/// A followed long turn that ends in a provider failure must finalize Error,
+/// not Done: the failure lives on the transcript's newest assistant message,
+/// and the out-of-turn follow reads the same shared rule the Turn's own
+/// finalization uses (ADR-0056).
+#[tokio::test]
+async fn a_followed_failure_finalizes_error_not_done() {
+    let _wd = test_work_dir();
+    // A ceiling the test would never wait out: only the settled failure ends it.
+    let (_dir, app, backend, platform) = busy_supplement_app(60_000).await;
+
+    run_to_handoff(&app, &platform).await;
+
+    // The run settles: the tool completes and the server records the provider
+    // failure on the newest assistant message, with the session idle.
+    settle_tool(&backend, ToolStatus::Completed, "done").await;
+    {
+        let mut scripts = backend.transcript_scripts.lock().await;
+        let transcript = &mut scripts.get_mut("ses_test").unwrap()[0];
+        transcript.messages.last_mut().unwrap().error = Some("provider 503".into());
+    }
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+
+    wait_for_card_header(&platform, "出错").await;
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(card_header(&final_card).contains("出错"), "final card Error");
+    assert!(
+        card_text(&final_card).contains("provider 503"),
+        "the transcript's failure must reach the card: {final_card}"
+    );
+    assert_no_further_rendering(&backend, &platform).await;
+}
+
 /// `/stop` during the follow finalizes the card promptly — the same sticky
 /// stopped-session marker the drain observes — instead of waiting out the
 /// follow's ceiling.
