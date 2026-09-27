@@ -11,7 +11,7 @@ use crate::opencode::conformance::{
     PromptFixture, RequestFixture, SessionCase, SessionReadFixture, TranscriptFixture,
 };
 use crate::opencode::strategy::Generation;
-use crate::test_http::{MockResponse, TestHttpServer};
+use crate::test_http::{DynamicResponse, MockResponse, TestHttpServer};
 
 /// The V2 conformance case: the `/api` routes, with V2's response shapes
 /// (`{data}` envelopes, a body cursor, the active map, and the admit + wait +
@@ -19,12 +19,73 @@ use crate::test_http::{MockResponse, TestHttpServer};
 pub(crate) fn case() -> SessionCase {
     SessionCase {
         generation: Generation::V2,
+        keeps_session_selection: true,
         mount,
         mount_transcript,
         mount_recorded_transcript,
         mount_prompt,
         mount_requests,
+        mount_selection,
     }
+}
+
+/// Mount a stateful durable selection: `GET /api/session/{id}` serves the
+/// stored `Session.Info` and the two switch routes mutate it, so a switch is
+/// observable in the following selection read — V2's native semantics.
+fn mount_selection(server: &TestHttpServer, fixture: &SessionReadFixture) {
+    use std::sync::{Arc, Mutex};
+
+    let state = Arc::new(Mutex::new(json!({
+        "id": fixture.newest,
+        "agent": fixture.agent,
+        "model": {"id": fixture.model, "providerID": fixture.provider},
+        "location": {"directory": fixture.directory},
+        "time": {"created": 1, "updated": 2},
+    })));
+
+    let get_state = Arc::clone(&state);
+    server.route_dynamic(
+        "GET",
+        &format!("/api/session/{}", fixture.newest),
+        move |_request| {
+            let data = get_state.lock().expect("selection state lock").clone();
+            DynamicResponse::new(200, "application/json", json!({"data": data}).to_string())
+        },
+    );
+
+    let model_state = Arc::clone(&state);
+    server.route_dynamic(
+        "POST",
+        &format!("/api/session/{}/model", fixture.newest),
+        move |request| {
+            let body: serde_json::Value =
+                serde_json::from_str(&request.body).expect("a model switch body is JSON");
+            model_state
+                .lock()
+                .expect("selection state lock")
+                .as_object_mut()
+                .expect("session object")
+                .insert("model".into(), body["model"].clone());
+            DynamicResponse::new(204, "application/json", "")
+        },
+    );
+
+    let agent_state = Arc::clone(&state);
+    server.route_dynamic(
+        "POST",
+        &format!("/api/session/{}/agent", fixture.newest),
+        move |request| {
+            let body: serde_json::Value =
+                serde_json::from_str(&request.body).expect("an agent switch body is JSON");
+            agent_state
+                .lock()
+                .expect("selection state lock")
+                .as_object_mut()
+                .expect("session object")
+                .insert("agent".into(), body["agent"].clone());
+            DynamicResponse::new(204, "application/json", "")
+        },
+    );
 }
 
 fn mount(server: &TestHttpServer, fixture: &SessionReadFixture) {

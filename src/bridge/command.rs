@@ -443,7 +443,7 @@ pub fn command_help(name: &str) -> Option<String> {
 // text-command behavior (spec #298, ticket D).
 
 use crate::bridge::display::id_tail;
-use crate::bridge::handles::CommandHandles;
+use crate::bridge::handles::{CommandHandles, PickOutcome};
 use crate::config::{ConversationKind, SessionEntry, ThreadKey};
 use crate::feishu;
 use std::sync::Arc;
@@ -919,57 +919,84 @@ pub(crate) async fn handle_command(
             crate::feishu::card::command::send_agent_card(handles, &thread_key, message_id).await?;
         }
         Command::Agent(name) => {
-            // The OpenCode server has no agent-switch endpoint (the legacy
-            // `/api/session/{id}/agent` route 500s, same as `/model`'s dead
-            // route), so `/agent` records a per-session override here — persisted
-            // with the session mapping so it survives a restart — and cola sends
-            // it as a per-prompt agent on the next message (the server honors
-            // `PromptInput.agent`). On a Pending Session the override is
+            // `/agent` records the per-session override and — on a generation
+            // whose selection is durable (V2) — switches the session's agent,
+            // so the next turn uses it with nothing re-sent (the server honors
+            // a per-prompt `agent` on V1). On a Pending Session the override is
             // recorded on the pending and lands on the created session at
             // materialisation (ADR-0041). Unknown agent names surface as a
             // clear error on the next prompt's card. `--reset` clears the
-            // override (the server's default agent applies); an agent literally
-            // named `default`/`off`/`reset` is a normal pick, never a clear word.
-            let Some(mut settings) = handles.flow.sessions.session_settings(&thread_key).await else {
-                handles
-                    .flow
-                    .platform
-                    .reply_text(
-                        message_id,
-                        &format!(
-                            "⚠️ {}还没有会话，先用 `/new` 或 `/dir` 创建。",
-                            crate::bridge::display::feishu_side_label(&thread_key)
-                        ),
-                    )
-                    .await?;
-                return Ok(());
-            };
+            // override (the server's default agent applies — on V2 that means
+            // switching to the default agent id explicitly, because V2 has no
+            // "unset" arm); an agent literally named
+            // `default`/`off`/`reset` is a normal pick, never a clear word.
             let cleared = is_reset_flag(&name);
-            settings.agent = if cleared { None } else { Some(name.clone()) };
-            handles
+            let agent = if cleared { None } else { Some(name.clone()) };
+            match handles
                 .flow
                 .sessions
-                .set_session_settings(&thread_key, settings)
-                .await?;
-            let msg = if cleared {
-                "已清除 Agent（回到服务器默认）。".to_string()
-            } else {
-                format!("Agent: {}（下一条消息开始生效）", name)
-            };
-            handles.flow.platform.reply_text(message_id, &msg).await?;
+                .pick_agent(&handles.flow.backend, &thread_key, agent)
+                .await
+            {
+                Ok(PickOutcome::Applied { .. }) => {
+                    let msg = if cleared {
+                        "已清除 Agent（回到服务器默认）。".to_string()
+                    } else {
+                        format!("Agent: {}（下一条消息开始生效）", name)
+                    };
+                    handles.flow.platform.reply_text(message_id, &msg).await?;
+                }
+                Ok(PickOutcome::NoTarget) => {
+                    handles
+                        .flow
+                        .platform
+                        .reply_text(
+                            message_id,
+                            &format!(
+                                "⚠️ {}还没有会话，先用 `/new` 或 `/dir` 创建。",
+                                crate::bridge::display::feishu_side_label(&thread_key)
+                            ),
+                        )
+                        .await?;
+                }
+                Ok(PickOutcome::NoDefaultAgent) => {
+                    handles
+                        .flow
+                        .platform
+                        .reply_text(
+                            message_id,
+                            "⚠️ 无法确定服务器默认 Agent；请用 `/agent <名字>` 从列表中选择。",
+                        )
+                        .await?;
+                }
+                Ok(_) => {
+                    handles
+                        .flow
+                        .platform
+                        .reply_text(message_id, "⚠️ 无法应用当前 Agent 选择。")
+                        .await?;
+                }
+                Err(e) => {
+                    handles
+                        .flow
+                        .platform
+                        .reply_text(message_id, &format!("⚠️ 切换 Agent 失败：{e}"))
+                        .await?;
+                }
+            }
         }
         Command::ModelCard => {
             crate::feishu::card::command::send_model_card(handles, &thread_key, message_id).await?;
         }
         Command::Model(name) => {
-            // The OpenCode server has NO model-switch endpoint (the legacy
-            // `/api/session/{id}/model` route is gone), so `/model` records
-            // a per-session override here and cola sends it as a per-prompt
-            // model on the next message. Validate the shape up front so a
-            // typo gets immediate feedback instead of a silent no-op. On a
-            // Pending Session the override is recorded on the pending and
-            // lands on the created session at materialisation (ADR-0041).
-            let Some(_) = crate::opencode::parsing::parse_model(&name) else {
+            // `/model` records the per-session override and — on a generation
+            // whose selection is durable (V2) — switches the session's model,
+            // so the next turn uses it with nothing re-sent; V1 sends it as a
+            // per-prompt model. Validate the shape up front so a typo gets
+            // immediate feedback instead of a silent no-op. On a Pending
+            // Session the override is recorded on the pending and lands on the
+            // created session at materialisation (ADR-0041).
+            if crate::opencode::parsing::parse_model(&name).is_none() {
                 handles.flow.platform
                         .reply_text(
                             message_id,
@@ -980,59 +1007,68 @@ pub(crate) async fn handle_command(
                         )
                         .await?;
                 return Ok(());
-            };
-            let Some(mut settings) = handles.flow.sessions.session_settings(&thread_key).await else {
-                handles
-                    .flow
-                    .platform
-                    .reply_text(
-                        message_id,
-                        &format!(
-                            "⚠️ {}还没有会话，先用 `/new` 或 `/dir` 创建。",
-                            crate::bridge::display::feishu_side_label(&thread_key)
-                        ),
-                    )
-                    .await?;
-                return Ok(());
-            };
-            settings.model = Some(name.clone());
-            // Auto-clear the `/think` variant when the new model doesn't
-            // declare it (ADR-0020), shared with the `/model` picker card.
-            let cleared_variant = handles
+            }
+            match handles
                 .flow
                 .sessions
-                .clear_variant_for_model(&handles.flow.backend, &mut settings.variant, &name)
-                .await;
-            handles
-                .flow
-                .sessions
-                .set_session_settings(&thread_key, settings)
-                .await?;
-            let extra = cleared_variant
-                .map(|v| format!("（已清除思考等级 `{v}`：新模型不支持）"))
-                .unwrap_or_default();
-            handles
-                .flow
-                .platform
-                .reply_text(
-                    message_id,
-                    &format!("Model: {}（下一条消息开始生效）{}", name, extra),
-                )
-                .await?;
+                .pick_model(&handles.flow.backend, &thread_key, &name)
+                .await
+            {
+                Ok(PickOutcome::Applied { cleared_variant }) => {
+                    let extra = cleared_variant
+                        .map(|v| format!("（已清除思考等级 `{v}`：新模型不支持）"))
+                        .unwrap_or_default();
+                    handles
+                        .flow
+                        .platform
+                        .reply_text(
+                            message_id,
+                            &format!("Model: {}（下一条消息开始生效）{}", name, extra),
+                        )
+                        .await?;
+                }
+                Ok(PickOutcome::NoTarget) => {
+                    handles
+                        .flow
+                        .platform
+                        .reply_text(
+                            message_id,
+                            &format!(
+                                "⚠️ {}还没有会话，先用 `/new` 或 `/dir` 创建。",
+                                crate::bridge::display::feishu_side_label(&thread_key)
+                            ),
+                        )
+                        .await?;
+                }
+                Ok(_) => {
+                    handles
+                        .flow
+                        .platform
+                        .reply_text(message_id, "⚠️ 无法应用当前模型选择。")
+                        .await?;
+                }
+                Err(e) => {
+                    handles
+                        .flow
+                        .platform
+                        .reply_text(message_id, &format!("⚠️ 切换模型失败：{e}"))
+                        .await?;
+                }
+            }
         }
         Command::ThinkCard => {
             crate::feishu::card::command::send_think_card(handles, &thread_key, message_id).await?;
         }
         Command::Think(name) => {
-            // The OpenCode server has no thinking-level endpoint either —
-            // `/think` records a per-session variant override and cola sends it
-            // as a per-prompt `variant` on the next message. On a Pending
-            // Session the override is recorded on the pending and lands on the
-            // created session at materialisation (ADR-0041). `--reset` clears
-            // the override (the server's default for the model); a variant
-            // literally named `default`/`off`/`reset` is a normal pick, never
-            // a clear word.
-            let Some(mut settings) = handles.flow.sessions.session_settings(&thread_key).await else {
+            // `/think` records the per-session variant and — on a generation
+            // whose selection is durable (V2) — rewrites the session's model
+            // ref with the variant inside it; V1 sends it as a per-prompt
+            // `variant`. On a Pending Session the override is recorded on the
+            // pending and lands on the created session at materialisation
+            // (ADR-0041). `--reset` clears the override (the server's default
+            // for the model); a variant literally named
+            // `default`/`off`/`reset` is a normal pick, never a clear word.
+            let Some(settings) = handles.flow.sessions.session_settings(&thread_key).await else {
                 handles
                     .flow
                     .platform
@@ -1048,15 +1084,15 @@ pub(crate) async fn handle_command(
             };
             let cleared = is_reset_flag(&name);
             if !cleared
-                && let Some((provider, model)) = handles
+                && let Some(model) = handles
                     .flow
                     .sessions
-                    .effective_model(&handles.flow.backend, &settings)
+                    .effective_selection(&handles.flow.backend, &settings)
                     .await
                 && let Some(variants) = handles
                     .flow
                     .sessions
-                    .model_variants(&handles.flow.backend, &provider, &model)
+                    .model_variants(&handles.flow.backend, &model.provider_id, &model.id)
                     .await
                 && !variants.iter().any(|v| v == &name)
             {
@@ -1069,24 +1105,63 @@ pub(crate) async fn handle_command(
                     .reply_text(
                         message_id,
                         &format!(
-                            "⚠️ 当前模型 `{provider}/{model}` 不支持思考等级 `{name}`。可用：{available}。（清除请用 `/think --reset`）"
+                            "⚠️ 当前模型 `{}/{}` 不支持思考等级 `{name}`。可用：{available}。（清除请用 `/think --reset`）",
+                            model.provider_id, model.id
                         ),
                     )
                     .await?;
                 return Ok(());
             }
-            settings.variant = if cleared { None } else { Some(name.clone()) };
-            handles
+            let variant = if cleared { None } else { Some(name.clone()) };
+            match handles
                 .flow
                 .sessions
-                .set_session_settings(&thread_key, settings)
-                .await?;
-            let msg = if cleared {
-                "已清除思考等级（回到模型默认）。".to_string()
-            } else {
-                format!("Thinking: {}（下一条消息开始生效）", name)
-            };
-            handles.flow.platform.reply_text(message_id, &msg).await?;
+                .pick_think(&handles.flow.backend, &thread_key, variant)
+                .await
+            {
+                Ok(PickOutcome::Applied { .. }) => {
+                    let msg = if cleared {
+                        "已清除思考等级（回到模型默认）。".to_string()
+                    } else {
+                        format!("Thinking: {}（下一条消息开始生效）", name)
+                    };
+                    handles.flow.platform.reply_text(message_id, &msg).await?;
+                }
+                Ok(PickOutcome::NoTarget) => {
+                    handles
+                        .flow
+                        .platform
+                        .reply_text(
+                            message_id,
+                            &format!(
+                                "⚠️ {}还没有会话，先用 `/new` 或 `/dir` 创建。",
+                                crate::bridge::display::feishu_side_label(&thread_key)
+                            ),
+                        )
+                        .await?;
+                }
+                Ok(PickOutcome::NoModel) => {
+                    handles
+                        .flow
+                        .platform
+                        .reply_text(message_id, "⚠️ 无法确定当前模型，请先用 `/model` 选择模型。")
+                        .await?;
+                }
+                Ok(_) => {
+                    handles
+                        .flow
+                        .platform
+                        .reply_text(message_id, "⚠️ 无法应用当前思考等级。")
+                        .await?;
+                }
+                Err(e) => {
+                    handles
+                        .flow
+                        .platform
+                        .reply_text(message_id, &format!("⚠️ 设置思考等级失败：{e}"))
+                        .await?;
+                }
+            }
         }
         Command::Help(target) => {
             match target {

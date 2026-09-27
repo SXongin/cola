@@ -82,6 +82,20 @@ pub struct AgentInfo {
     pub hidden: Option<bool>,
 }
 
+impl AgentInfo {
+    /// The server's default agent: the first primary, visible agent in
+    /// `GET /agent` order. The server's own agent service sorts the configured
+    /// default (or `build`) first, so this is its `defaultInfo` fallback
+    /// without a `/config` round trip. `None` when the server listed nothing
+    /// usable.
+    pub fn default_agent(agents: &[AgentInfo]) -> Option<String> {
+        agents
+            .iter()
+            .find(|a| a.mode.as_deref() != Some("subagent") && a.hidden != Some(true))
+            .map(|a| a.name.clone())
+    }
+}
+
 /// A provider's available models (`GET /provider`), rendered as one `/model`
 /// card row per provider. Each model carries its declared variants (the
 /// thinking-level options `/think` surfaces).
@@ -140,6 +154,19 @@ pub struct SessionModel {
     pub id: String,
 }
 
+/// A session's durable model/agent selection — V2's session-scoped switches
+/// (`Session.Info.model` + `Session.Info.agent`). On a generation that keeps
+/// the selection server-side the next turn uses it with nothing re-sent, and
+/// every client sharing the store sees the same pick; a generation whose
+/// selection rides each prompt (V1) reports `None` instead.
+#[derive(Debug, Clone, Default)]
+pub struct SessionSelection {
+    /// The selected model ref (`Model.Ref`, variant inside it).
+    pub model: Option<ModelInfo>,
+    /// The selected agent id, when the session has one recorded.
+    pub agent: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionTime {
     pub created: i64,
@@ -167,7 +194,7 @@ pub struct CreateSessionInput {
     pub location: Option<Location>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModelInfo {
     pub id: String,
     #[serde(rename = "providerID")]

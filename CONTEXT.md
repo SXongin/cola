@@ -146,7 +146,7 @@ Directories of the most recently active sessions in the Shared Store, deduplicat
 _Avoid_: Recently opened folders, folder history, recent projects
 
 **Variant**:
-A model-declared reasoning-effort setting (e.g. "low"/"high"/"minimal"), selectable per session via the `/think` command and sent to the backend as `PromptInput.variant`. Each model declares its own variant set — there is no universal scale across models — and "unset" means the server's default for that model. Selecting a model that doesn't declare the current session's variant clears it. The user-facing label on cards is "思考等级"/thinking; "variant" is the backend protocol term, never a command name.
+A model-declared reasoning-effort setting (e.g. "low"/"high"/"minimal"), selectable per session via the `/think` command. Each model declares its own variant set — there is no universal scale across models — and "unset" means the server's default for that model. Selecting a model that doesn't declare the current session's variant clears it. How it reaches the backend is generation-specific: V1 sends `PromptInput.variant` per prompt, while V2 carries it inside the session's durable model ref (a session switch, not a prompt field). The user-facing label on cards is "思考等级"/thinking; "variant" is the backend protocol term, never a command name.
 _Avoid_: Thinking level as the domain term (it's the presentation label); calling the command `/variant`
 
 **Permission**:

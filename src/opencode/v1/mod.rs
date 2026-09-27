@@ -29,7 +29,7 @@ use super::transport::{REPLY_TIMEOUT, Transport, read_failure};
 use super::types::{
     AgentInfo, FormAnswer, FormFieldKind, ImageInput, ModelInfo, ModelOption, PermissionRequest,
     PromptResponse, ProviderModels, QuestionInfo, QuestionOption, QuestionRequest, SessionInfo,
-    SessionListInfo, SessionStatus,
+    SessionListInfo, SessionSelection, SessionStatus,
 };
 
 /// Hard stop for the `x-next-cursor` follow in [`V1Strategy::list_sessions`]: a
@@ -404,6 +404,36 @@ impl GenerationStrategy for V1Strategy {
             .error_for_status()?;
         let body: serde_json::Value = resp.json().await?;
         wire::decode_response(&body)
+    }
+
+    /// V1 has no session-scoped selection: `/model`, `/think` and `/agent`
+    /// ride each prompt (`PromptInput.model`/`variant`/`agent`, ADR-0020), and
+    /// the model the server records on a session is historical, not a
+    /// selection. Answering `None` (without a request) is what tells the
+    /// adapter's ladder to keep resolving from the caller's mirror.
+    async fn session_selection(
+        &self,
+        _http: &Transport,
+        _session_id: &str,
+        _directory: Option<&str>,
+    ) -> Result<Option<SessionSelection>> {
+        Ok(None)
+    }
+
+    /// V1's model selection is per prompt — deliberately a no-op, so the
+    /// generation-blind Bridge may call it unconditionally.
+    async fn switch_session_model(
+        &self,
+        _http: &Transport,
+        _session_id: &str,
+        _model: &ModelInfo,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// V1's agent selection is per prompt — deliberately a no-op.
+    async fn switch_session_agent(&self, _http: &Transport, _session_id: &str, _agent: &str) -> Result<()> {
+        Ok(())
     }
 
     /// The server's per-session run state for ONE session (canonical:

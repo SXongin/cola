@@ -24,7 +24,7 @@ use crate::error::Result;
 use super::transport::Transport;
 use super::types::{
     AgentInfo, FormAnswer, ImageInput, ModelInfo, PermissionRequest, PromptResponse, ProviderModels,
-    QuestionRequest, SessionInfo, SessionListInfo, SessionStatus,
+    QuestionRequest, SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
 };
 
 /// One protocol generation's wire contract.
@@ -126,6 +126,25 @@ pub(crate) trait GenerationStrategy: Send + Sync {
     ) -> Result<()>;
 
     async fn transcript(&self, http: &Transport, session_id: &str) -> Result<SessionTranscript>;
+
+    /// The session's durable model/agent selection (`GET /api/session/{id}` on
+    /// V2). V1 has no session-scoped selection — its picks ride each prompt —
+    /// so it always answers `None` without a request.
+    async fn session_selection(
+        &self,
+        http: &Transport,
+        session_id: &str,
+        directory: Option<&str>,
+    ) -> Result<Option<SessionSelection>>;
+
+    /// Switch the session's model (`POST /api/session/{id}/model`, 204); V1 is
+    /// a no-op because its model rides the next prompt.
+    async fn switch_session_model(&self, http: &Transport, session_id: &str, model: &ModelInfo)
+    -> Result<()>;
+
+    /// Switch the session's agent (`POST /api/session/{id}/agent`, 204); V1 is
+    /// a no-op because its agent rides the next prompt.
+    async fn switch_session_agent(&self, http: &Transport, session_id: &str, agent: &str) -> Result<()>;
 
     async fn session_status(
         &self,

@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use crate::error::Result;
 use crate::opencode::types::{
     AgentInfo, CreateSessionInput, FormAnswer, ImageInput, ModelInfo, PermissionRequest, PromptResponse,
-    ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionStatus,
+    ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
 };
 
 /// A directory-scoped handle to the backend. Instance routing lives here: the
@@ -170,6 +170,31 @@ pub trait Backend: Send + Sync {
         agent: Option<&str>,
         message_id: Option<&str>,
     ) -> Result<()>;
+
+    /// The session's durable model/agent selection, where the generation keeps
+    /// one server-side (V2's session-scoped switches). `None` on a generation
+    /// whose selection rides each prompt (V1: cola's own override is
+    /// authoritative, and the server-recorded model is only a display
+    /// fallback), and for a Pending Session (no server identity to read).
+    ///
+    /// This is what the next turn will actually run: shared session state that
+    /// another client may have changed, not cola's local mirror.
+    async fn session_selection(
+        &self,
+        session_id: &str,
+        directory: Option<&str>,
+    ) -> Result<Option<SessionSelection>>;
+
+    /// Make the session's model selection durable so subsequent turns use it
+    /// with nothing re-sent (V2's `POST /api/session/{id}/model`); the variant
+    /// rides inside `model`. A no-op on V1, where the selection rides each
+    /// prompt.
+    async fn switch_session_model(&self, session_id: &str, model: &ModelInfo) -> Result<()>;
+
+    /// Make the session's agent selection durable (V2's
+    /// `POST /api/session/{id}/agent`). A no-op on V1, where the selection
+    /// rides each prompt.
+    async fn switch_session_agent(&self, session_id: &str, agent: &str) -> Result<()>;
 
     /// Reply to a pending permission with a decision (`once` / `always` /
     /// `reject`). `session_id` is the requesting session (the child session for

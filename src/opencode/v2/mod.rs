@@ -2,12 +2,11 @@
 //!
 //! This module is where every V2 path, payload, decoder and semantic lands.
 //! Attach detection (slice S3, [`super::generation`]) can already select it,
-//! and its capabilities arrive slice by slice (S4a session reads, S4b
+//! and its capabilities arrived slice by slice (S4a session reads, S4b
 //! transcript, S5 writes, S6 permissions/forms, S7 session-scoped switches).
-//! Until a capability lands, its method fails with an explicit
-//! "not implemented yet" error naming the method — attaching to a V2 server is
-//! never silently broken, and the failing call is visible in the log and on the
-//! card.
+//! Until a capability lands its method fails with an explicit "not implemented
+//! yet" error naming the method — attaching to a V2 server is never silently
+//! broken, and the failing call is visible in the log and on the card.
 //!
 //! S4a is the session-level read surface: list/get/update/delete, and the run
 //! state (`session.active`) with the retry status derived from the newest
@@ -16,7 +15,10 @@
 //! the write surface: prompt dispatch (admit + `session.wait`/poll polyfill),
 //! the steer supplement, interrupt and compact. S6 is permissions and forms:
 //! the location-scoped pending lists, the session-scoped decision/keyed-answer
-//! replies, and the cancel-by-delete path.
+//! replies, and the cancel-by-delete path. S7 is the session-scoped selection:
+//! `/model`, `/think` and `/agent` become durable switches
+//! (`POST /api/session/{id}/model|agent`, the variant inside the model ref),
+//! plus the `/api/model` and `/api/agent` catalogs their cards read.
 //!
 //! Session creation (`POST /api/session`) is NOT here: both generations serve
 //! that request identically, so it lives on the generation-blind adapter
@@ -39,7 +41,7 @@ use super::strategy::GenerationStrategy;
 use super::transport::{Transport, body_preview, read_failure, read_failure_detailed};
 use super::types::{
     AgentInfo, FormAnswer, FormValue, ImageInput, ModelInfo, PermissionRequest, PromptResponse,
-    ProviderModels, QuestionRequest, SessionInfo, SessionListInfo, SessionStatus,
+    ProviderModels, QuestionRequest, SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
 };
 
 /// The session root: list, get, update (PATCH), delete, and the per-session
@@ -51,6 +53,10 @@ const SESSION: &str = "/api/session";
 const SESSION_PROMPT_SUFFIX: &str = "/prompt";
 /// The interrupt endpoint (`POST /api/session/{id}/interrupt`).
 const SESSION_INTERRUPT_SUFFIX: &str = "/interrupt";
+/// The durable model switch (`POST /api/session/{id}/model`, 204).
+const SESSION_MODEL_SUFFIX: &str = "/model";
+/// The durable agent switch (`POST /api/session/{id}/agent`, 204).
+const SESSION_AGENT_SUFFIX: &str = "/agent";
 /// The experimental "wait for the agent loop to become idle" endpoint
 /// (`POST /api/experimental/session/{id}/wait`, 204) — ADR-0056's recorded
 /// dependency, deleted by the async-native Turn slice (S8). The poll fallback
@@ -66,6 +72,12 @@ const SESSION_MESSAGES_SUFFIX: &str = "/message";
 const PERMISSION_REQUEST: &str = "/api/permission/request";
 /// The location-scoped pending-form list (`GET /api/form?location[directory]=…`).
 const FORM: &str = "/api/form";
+/// The agent catalog (`GET /api/agent`) the `/agent` picker reads.
+const AGENT: &str = "/api/agent";
+/// The model catalog (`GET /api/model`) the `/model` picker and the footer's
+/// context-window lookup read. It serves the enabled models only, so the
+/// picker needs no credential/`connected` filter like V1's `GET /provider`.
+const MODEL: &str = "/api/model";
 
 /// How long the poll fallback waits between `session.active` reads. The wait
 /// endpoint resolves as soon as the drain settles; the fallback matches that
@@ -108,18 +120,6 @@ const MESSAGE_PAGE_LIMIT: &str = "200";
 
 /// The strategy that speaks the V2 generation.
 pub(crate) struct V2Strategy;
-
-/// The visible failure text of a capability that has not landed yet: names the
-/// method and the generation, so an attached V2 server's missing surface is
-/// diagnosable from the log and the card (spec #364, S3 "errors are visible,
-/// never silent"). One message for both the `Result` methods and the two
-/// catalog warns.
-fn not_implemented(method: &str) -> String {
-    format!(
-        "OpenCode V2 strategy: {method} is not implemented yet (spec #364; a later slice); \
-         cola is attached to a V2 server"
-    )
-}
 
 /// The location-scoped list URL: V2 selects an instance/workspace with the
 /// deepObject query `location[directory]=…` (V1's flat `directory=`). Without a
@@ -302,10 +302,10 @@ impl GenerationStrategy for V2Strategy {
     /// strategy uses.
     ///
     /// V2 has no per-prompt `model`/`variant`/`agent`: those are session-scoped
-    /// and durable, and slice S7 lands them. The session's recorded model
-    /// applies (new sessions record the configured default at create time); a
-    /// caller-supplied override is dropped, never silently sent in a shape the
-    /// protocol cannot carry.
+    /// and durable (S7), applied through `POST /api/session/{id}/model|agent`
+    /// when the user picks them. A caller-supplied override is deliberately
+    /// dropped — the session's recorded selection is what runs, and re-sending
+    /// it per prompt is nothing the protocol can carry.
     #[allow(clippy::too_many_arguments)] // matches the trait's prompt axes
     async fn prompt(
         &self,
@@ -320,8 +320,8 @@ impl GenerationStrategy for V2Strategy {
     ) -> Result<PromptResponse> {
         if model.is_some() || variant.is_some() || agent.is_some() {
             tracing::debug!(
-                "session {session_id}: V2 ignores per-prompt model/variant/agent \
-                 (session-scoped semantics land in S7)"
+                "session {session_id}: V2 uses the session's durable selection, \
+                 not the per-prompt model/variant/agent"
             );
         }
         let admitted = self
@@ -547,25 +547,123 @@ impl GenerationStrategy for V2Strategy {
         })
     }
 
+    /// The session's durable selection (`GET /api/session/{id}`): the model
+    /// ref (variant inside it) and agent the server will use for the next
+    /// turn, visible to every client sharing the store. This is the read the
+    /// effective-model ladder prefers over cola's local mirror.
+    async fn session_selection(
+        &self,
+        http: &Transport,
+        session_id: &str,
+        _directory: Option<&str>,
+    ) -> Result<Option<SessionSelection>> {
+        Ok(Some(self.read_session_selection(http, session_id).await?))
+    }
+
+    /// Switch the session's model (`POST /api/session/{id}/model`, 204) so
+    /// subsequent turns use it with nothing re-sent. The variant rides inside
+    /// the `Model.Ref`; the server short-circuits an unchanged selection.
+    async fn switch_session_model(
+        &self,
+        http: &Transport,
+        session_id: &str,
+        model: &ModelInfo,
+    ) -> Result<()> {
+        let response = http
+            .client()
+            .post(http.url(&format!("{SESSION}/{session_id}{SESSION_MODEL_SUFFIX}")))
+            .json(&serde_json::json!({ "model": model }))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(write_failure(response, session_id, "model switch").await);
+        }
+        Ok(())
+    }
+
+    /// Switch the session's agent (`POST /api/session/{id}/agent`, 204). V2
+    /// has no "clear" arm — the server default is the agent the server itself
+    /// would select, so a reset switches to that id.
+    async fn switch_session_agent(&self, http: &Transport, session_id: &str, agent: &str) -> Result<()> {
+        let response = http
+            .client()
+            .post(http.url(&format!("{SESSION}/{session_id}{SESSION_AGENT_SUFFIX}")))
+            .json(&serde_json::json!({ "agent": agent }))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(write_failure(response, session_id, "agent switch").await);
+        }
+        Ok(())
+    }
+
+    /// The model's context-window size (tokens), from `GET /api/model`. Best
+    /// effort like V1's provider read: any failure returns Ok(None) so the
+    /// footer just omits the ratio.
     async fn model_context_window(
         &self,
-        _http: &Transport,
-        _provider: &str,
-        _model: &str,
+        http: &Transport,
+        provider: &str,
+        model: &str,
     ) -> Result<Option<i64>> {
-        Err(crate::error::BridgeError::OpenCode(not_implemented(
-            "model_context_window",
-        )))
+        let Ok(resp) = http.client().get(http.url(MODEL)).send().await else {
+            return Ok(None);
+        };
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+        let Ok(page) = resp.json::<wire::DataEnvelope<Vec<wire::RawModelInfo>>>().await else {
+            return Ok(None);
+        };
+        Ok(page
+            .data
+            .into_iter()
+            .find(|entry| entry.provider_id == provider && entry.id == model)
+            .and_then(|entry| entry.limit.and_then(|limit| limit.context)))
     }
 
-    async fn list_agents(&self, _http: &Transport) -> Vec<AgentInfo> {
-        tracing::warn!("{}", not_implemented("list_agents"));
-        Vec::new()
+    /// Available agents (`GET /api/agent`), each with its selectable identity.
+    /// Best-effort: an unreadable failure returns an empty list so the
+    /// `/agent` card can degrade to a plain text prompt.
+    async fn list_agents(&self, http: &Transport) -> Vec<AgentInfo> {
+        let Ok(resp) = http.client().get(http.url(AGENT)).send().await else {
+            return Vec::new();
+        };
+        let Ok(page) = resp.json::<wire::DataEnvelope<Vec<wire::RawAgentInfo>>>().await else {
+            return Vec::new();
+        };
+        page.data
+            .into_iter()
+            .map(wire::RawAgentInfo::into_neutral)
+            .collect()
     }
 
-    async fn list_models(&self, _http: &Transport) -> Vec<ProviderModels> {
-        tracing::warn!("{}", not_implemented("list_models"));
-        Vec::new()
+    /// Available models (`GET /api/model`), grouped as `provider → models`,
+    /// each with its declared variants. The endpoint serves the enabled set
+    /// already, so no `connected` filter is needed. Best-effort: an unreadable
+    /// failure returns an empty list so the `/model` card can degrade to a
+    /// plain text prompt.
+    async fn list_models(&self, http: &Transport) -> Vec<ProviderModels> {
+        let Ok(resp) = http.client().get(http.url(MODEL)).send().await else {
+            return Vec::new();
+        };
+        let Ok(page) = resp.json::<wire::DataEnvelope<Vec<wire::RawModelInfo>>>().await else {
+            return Vec::new();
+        };
+        let mut grouped: Vec<ProviderModels> = Vec::new();
+        for model in page.data {
+            match grouped
+                .iter_mut()
+                .find(|group| group.provider == model.provider_id)
+            {
+                Some(group) => group.models.push(model.into_option()),
+                None => grouped.push(ProviderModels {
+                    provider: model.provider_id.clone(),
+                    models: vec![model.into_option()],
+                }),
+            }
+        }
+        grouped
     }
 
     /// Fetch a session's info (`GET /api/session/{id}`), unwrapping the
@@ -872,6 +970,24 @@ impl V2Strategy {
                 .flat_map(|message| message.parts.iter().cloned())
                 .collect(),
         })
+    }
+
+    /// Read the session's durable selection (`GET /api/session/{id}`, the same
+    /// envelope `session_info` unwraps), decoding the `Model.Ref` with its
+    /// variant and the selected agent. A failed read names itself and carries
+    /// a body preview, like the module's other reads; the ladder treats a
+    /// failure as "nothing durably selected" and falls back to cola's mirror.
+    async fn read_session_selection(&self, http: &Transport, session_id: &str) -> Result<SessionSelection> {
+        let resp = http
+            .client()
+            .get(http.url(&format!("{SESSION}/{session_id}")))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(read_failure(resp, "session selection").await);
+        }
+        let body: wire::DataEnvelope<wire::RawSessionInfo> = resp.json().await?;
+        Ok(body.data.into_selection()?)
     }
 
     /// Read the session's projected messages, decoded-ready: the raw `data`

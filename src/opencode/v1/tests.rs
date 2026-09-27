@@ -1322,3 +1322,37 @@ async fn transcript_surfaces_a_failed_message_read() {
 
     assert!(client.transcript("ses_gone").await.is_err());
 }
+
+/// V1 has no session-scoped selection: the read answers `None` and both
+/// switches are no-ops with no request on the wire. That is the contract the
+/// generation-blind adapter relies on to call them unconditionally while V1
+/// keeps sending model/variant/agent per prompt.
+#[tokio::test]
+async fn session_selection_is_none_and_switches_are_no_ops_on_v1() {
+    use crate::opencode::types::ModelInfo;
+
+    let server = TestHttpServer::start().await;
+    let client = v1_wire_client(&server, None);
+
+    let selection = client.session_selection("ses_1", None).await.unwrap();
+    assert!(selection.is_none(), "V1 never exposes a durable selection");
+
+    client
+        .switch_session_model(
+            "ses_1",
+            &ModelInfo {
+                id: "deepseek-v4-flash".into(),
+                provider_id: "opencode-go".into(),
+                variant: Some("high".into()),
+            },
+        )
+        .await
+        .unwrap();
+    client.switch_session_agent("ses_1", "build").await.unwrap();
+
+    assert!(
+        server.requests().is_empty(),
+        "V1's switches must not reach the wire: {:?}",
+        server.requests()
+    );
+}

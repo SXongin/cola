@@ -84,6 +84,21 @@ pub const PROVIDER: &str = "scripted";
 pub const MODEL: &str = "scripted-model";
 /// The full `provider/model` reference cola prompts with.
 pub const MODEL_REF: &str = "scripted/scripted-model";
+/// The second model the isolated V2 config declares, with declared variants —
+/// what the S7 selection chain switches to and attaches a variant to. The
+/// scripted provider answers any requested model, so the switch's effect is
+/// read from the session's ref and the transcript, not from the endpoint.
+pub const MODEL_ALT: &str = "scripted-model-alt";
+/// The full `provider/model` reference for [`MODEL_ALT`].
+pub const MODEL_ALT_REF: &str = "scripted/scripted-model-alt";
+/// The thinking-level variants [`MODEL_ALT`] declares.
+pub const MODEL_ALT_VARIANTS: &[&str] = &["high", "low"];
+/// The variant the selection chain attaches to [`MODEL_ALT`]. [`MODEL`] does
+/// not declare it, which is what exercises ADR-0020's clear-on-switch rule.
+pub const VARIANT: &str = "high";
+/// The custom agent the isolated V2 config declares — the S7 agent switch's
+/// target (the built-ins alone could not prove a changed selection).
+pub const AGENT: &str = "live-agent";
 
 /// The reasoning deltas the tool-call script streams, in order. Assembled they
 /// must equal [`REASONING_TEXT`] (pinned by a unit test below).

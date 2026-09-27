@@ -308,16 +308,14 @@ pub(crate) async fn send_dir_card(
 }
 
 /// The first agent in `GET /agent` order that the server would actually run as
-/// its default: primary (not subagent) and visible (not hidden). Parity with
-/// opencode's `Agent.Service` `defaultInfo` fallback — `agent.list()` already
-/// sorts the configured default (or `build`) first, so the first primary
-/// visible agent in that order IS the server default; no `/config` round trip
-/// needed. Mirrors `defaultInfo`'s "first primary non-hidden agent".
+/// its default: primary (not subagent) and visible (not hidden). The server's
+/// own agent service sorts the configured default (or `build`) first, so the
+/// first primary visible agent in that order IS the server default — no
+/// `/config` round trip needed. A thin alias over
+/// [`AgentInfo::default_agent`](crate::opencode::types::AgentInfo::default_agent)
+/// so the card and V2's `/agent --reset` switch resolve one rule.
 fn server_default_agent(agents: &[crate::opencode::types::AgentInfo]) -> Option<String> {
-    agents
-        .iter()
-        .find(|a| a.mode.as_deref() != Some("subagent") && a.hidden != Some(true))
-        .map(|a| a.name.clone())
+    crate::opencode::types::AgentInfo::default_agent(agents)
 }
 
 /// Resolve what the `/agent` card should show for a thread's target session:
@@ -384,25 +382,26 @@ pub(crate) async fn send_model_card(
 }
 
 /// The current model label the `/model` picker renders: `provider/model` from
-/// the effective-model ladder (settings override → configured default →
-/// server-recorded), plus `@variant` when the target set a `/think` level. The
-/// target is the Pending Session when one exists, else the active SessionEntry
-/// (ADR-0041). `None` when the thread has no target or no rung resolves — the
-/// picker then omits its current-model line. Shared by the text send path and
-/// the card-ack rebuild so both show one source of truth.
+/// the effective-model ladder (the session's durable selection on V2, else the
+/// settings override → configured default → server-recorded), plus `@variant`
+/// from that same selection. The target is the Pending Session when one
+/// exists, else the active SessionEntry (ADR-0041). `None` when the thread has
+/// no target or no rung resolves — the picker then omits its current-model
+/// line. Shared by the text send path and the card-ack rebuild so both show one
+/// source of truth.
 pub(crate) async fn current_model_label(handles: &CommandHandles, thread_key: &ThreadKey) -> Option<String> {
     let settings = handles.flow.sessions.session_settings(thread_key).await?;
-    let (provider, model) = handles
+    let model = handles
         .flow
         .sessions
-        .effective_model(&handles.flow.backend, &settings)
+        .effective_selection(&handles.flow.backend, &settings)
         .await?;
-    let variant = settings
+    let variant = model
         .variant
         .as_deref()
         .map(|v| format!("@{v}"))
         .unwrap_or_default();
-    Some(format!("{provider}/{model}{variant}"))
+    Some(format!("{}/{}{}", model.provider_id, model.id, variant))
 }
 
 /// Resolve what the `/think` card should show for a thread's target session:
@@ -427,10 +426,10 @@ pub(crate) async fn think_card(
             )),
         );
     };
-    let Some((provider, model)) = handles
+    let Some(model) = handles
         .flow
         .sessions
-        .effective_model(&handles.flow.backend, &settings)
+        .effective_selection(&handles.flow.backend, &settings)
         .await
     else {
         return (
@@ -441,17 +440,25 @@ pub(crate) async fn think_card(
     let variants = handles
         .flow
         .sessions
-        .model_variants(&handles.flow.backend, &provider, &model)
+        .model_variants(&handles.flow.backend, &model.provider_id, &model.id)
         .await
         .unwrap_or_default();
     if variants.is_empty() {
         return (
             None,
-            Some(format!("当前模型 `{provider}/{model}` 没有思考等级可选。")),
+            Some(format!(
+                "当前模型 `{}/{}` 没有思考等级可选。",
+                model.provider_id, model.id
+            )),
         );
     }
-    let current = settings.variant.clone();
-    let card = super::picker::build_think_card(thread_key, &provider, &model, current.as_deref(), &variants);
+    let card = super::picker::build_think_card(
+        thread_key,
+        &model.provider_id,
+        &model.id,
+        model.variant.as_deref(),
+        &variants,
+    );
     (Some(card), None)
 }
 

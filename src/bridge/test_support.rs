@@ -852,6 +852,17 @@ pub struct MockBackend {
     /// The server-recorded session model served by `session_info` (the third
     /// rung of the `/think` effective-model resolution).
     pub session_model: Option<opencode::types::SessionModel>,
+    /// Per-session durable selections served by `session_selection` (V2's
+    /// session-scoped switches). Empty by default: the mock speaks V1's
+    /// per-prompt selection until a scenario seeds one or a switch lands.
+    pub session_selections:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, opencode::types::SessionSelection>>>,
+    /// Records `switch_session_model` calls: `(session_id, model)`.
+    pub switch_model_calls: Arc<tokio::sync::Mutex<Vec<(String, opencode::types::ModelInfo)>>>,
+    /// Records `switch_session_agent` calls: `(session_id, agent)`.
+    pub switch_agent_calls: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
+    /// When set, both `switch_session_*` calls fail with this message.
+    pub switch_error: Option<String>,
     /// Per-session server status served by `session_status` (session_id →
     /// status). A missing key means idle (matches the server: a finished run is
     /// removed from the status map). `Some(None)` inside simulates a session
@@ -948,6 +959,10 @@ impl MockBackend {
             context_window: Some(100_000),
             context_window_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_model: None,
+            session_selections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            switch_model_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            switch_agent_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            switch_error: None,
             session_statuses: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             session_status_reads: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             session_status_error: None,
@@ -1041,6 +1056,27 @@ impl MockBackend {
     /// Scenario: the server records `model` for the session (`session_info`).
     pub(crate) fn with_session_model(&mut self, model: opencode::types::SessionModel) -> &mut Self {
         self.session_model = Some(model);
+        self
+    }
+
+    /// Scenario: the session has `selection` durably (V2's session-scoped
+    /// switches) — what `session_selection` serves before any pick.
+    pub(crate) fn with_session_selection(
+        &mut self,
+        session_id: &str,
+        selection: opencode::types::SessionSelection,
+    ) -> &mut Self {
+        self.session_selections
+            .try_lock()
+            .expect("with_session_selection before the app is built")
+            .insert(session_id.to_string(), selection);
+        self
+    }
+
+    /// Scenario: both session switches fail with `message` (a V2 server that
+    /// rejects the switch) — the pick must not be mirrored.
+    pub(crate) fn fail_session_switch(&mut self, message: &str) -> &mut Self {
+        self.switch_error = Some(message.to_string());
         self
     }
 
@@ -1771,6 +1807,52 @@ impl crate::backend::Backend for MockBackend {
             title: self.session_titles.lock().unwrap().get(session_id).cloned(),
             model: self.session_model.clone(),
         })
+    }
+
+    async fn session_selection(
+        &self,
+        session_id: &str,
+        _d: Option<&str>,
+    ) -> crate::error::Result<Option<opencode::types::SessionSelection>> {
+        Ok(self.session_selections.lock().await.get(session_id).cloned())
+    }
+
+    async fn switch_session_model(
+        &self,
+        session_id: &str,
+        model: &opencode::types::ModelInfo,
+    ) -> crate::error::Result<()> {
+        if let Some(error) = &self.switch_error {
+            return Err(crate::error::BridgeError::OpenCode(error.clone()));
+        }
+        self.switch_model_calls
+            .lock()
+            .await
+            .push((session_id.to_string(), model.clone()));
+        self.session_selections
+            .lock()
+            .await
+            .entry(session_id.to_string())
+            .or_default()
+            .model = Some(model.clone());
+        Ok(())
+    }
+
+    async fn switch_session_agent(&self, session_id: &str, agent: &str) -> crate::error::Result<()> {
+        if let Some(error) = &self.switch_error {
+            return Err(crate::error::BridgeError::OpenCode(error.clone()));
+        }
+        self.switch_agent_calls
+            .lock()
+            .await
+            .push((session_id.to_string(), agent.to_string()));
+        self.session_selections
+            .lock()
+            .await
+            .entry(session_id.to_string())
+            .or_default()
+            .agent = Some(agent.to_string());
+        Ok(())
     }
 
     async fn session_status(

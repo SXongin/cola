@@ -9,7 +9,7 @@ use super::V2Strategy;
 use crate::backend::{FinishReason, Part, StepFinish, TextPart};
 use crate::error::BridgeError;
 use crate::opencode::client::OpenCodeBackend;
-use crate::opencode::strategy::{Generation, GenerationStrategy};
+use crate::opencode::strategy::Generation;
 use crate::opencode::transport::Transport;
 use crate::opencode::types::{ImageInput, SessionStatus};
 use crate::test_http::{MockResponse, RecordedRequest, TestHttpServer};
@@ -1130,24 +1130,283 @@ async fn interrupt_accepts_the_idle_no_op_and_compact_sends_an_empty_payload() {
     );
 }
 
-/// Attaching to V2 must never pretend a missing capability worked: a caller
-/// gets an error naming the method and the generation (spec #364, S3). S4a
-/// landed the session reads, S4b the transcript, S5 the writes and S6 the
-/// permissions/forms, so this pins the capabilities still waiting for their
-/// slices: the session-scoped model/agent catalogs (S7).
+/// The durable-selection read: `GET /api/session/{id}`'s `{data}` envelope
+/// carries the model ref (variant inside it) and the selected agent — the
+/// state the effective-model ladder and the footer read.
 #[tokio::test]
-async fn remaining_capabilities_fail_loudly_until_their_slice_lands() {
-    let strategy = V2Strategy;
-    let http = Transport::new(Some("opencode"), Some("pw"), "http://127.0.0.1:1");
-    let error = strategy.model_context_window(&http, "p", "m").await.unwrap_err();
-    let error = error.to_string();
-    assert!(error.contains("V2 strategy"), "unexpected: {error}");
-    assert!(error.contains("model_context_window"), "unexpected: {error}");
-    assert!(error.contains("not implemented"), "unexpected: {error}");
-    // The two catalog reads degrade to empty with a warning instead of an
-    // error (their card surfaces tolerate emptiness).
-    assert!(strategy.list_agents(&http).await.is_empty());
-    assert!(strategy.list_models(&http).await.is_empty());
+async fn session_selection_reads_the_model_ref_with_its_variant_and_the_agent() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "GET",
+        "/api/session/ses_1",
+        200,
+        serde_json::json!({
+            "data": {
+                "id": "ses_1",
+                "agent": "live-agent",
+                "model": {"id": "deepseek-v4-flash", "providerID": "opencode-go", "variant": "high"},
+                "location": {"directory": "/work/cola"},
+                "time": {"created": 1, "updated": 2},
+            },
+        })
+        .to_string(),
+    );
+    let client = v2_wire_client(&server);
+
+    let selection = client
+        .session_selection("ses_1", None)
+        .await
+        .unwrap()
+        .expect("a V2 session has a durable selection");
+    let model = selection.model.expect("the model ref survives");
+    assert_eq!(model.provider_id, "opencode-go");
+    assert_eq!(model.id, "deepseek-v4-flash");
+    assert_eq!(model.variant.as_deref(), Some("high"));
+    assert_eq!(selection.agent.as_deref(), Some("live-agent"));
+
+    // A selection without a model (a session the create left bare) still
+    // reports, so the caller can tell "durable, nothing selected" from V1.
+    server.route(
+        "GET",
+        "/api/session/ses_bare",
+        200,
+        serde_json::json!({"data": {"id": "ses_bare"}}).to_string(),
+    );
+    let bare = client.session_selection("ses_bare", None).await.unwrap().unwrap();
+    assert!(bare.model.is_none());
+    assert!(bare.agent.is_none());
+
+    // V2 spells "no variant" as the literal `"default"` on the session read;
+    // the neutral ref must not surface it as a real thinking level.
+    server.route(
+        "GET",
+        "/api/session/ses_default",
+        200,
+        serde_json::json!({
+            "data": {
+                "id": "ses_default",
+                "model": {"id": "deepseek-v4-flash", "providerID": "opencode-go", "variant": "default"},
+            },
+        })
+        .to_string(),
+    );
+    let defaulted = client
+        .session_selection("ses_default", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        defaulted.model.expect("a model").variant.is_none(),
+        "the reserved `default` spelling is no variant"
+    );
+}
+
+/// The session-scoped switches: V2's `POST /api/session/{id}/model` carries the
+/// whole `Model.Ref` (variant inside it) and `/agent` the agent id, both
+/// answering 204. A tagged 404 is session-not-found, not a bare proxy 404.
+#[tokio::test]
+async fn switch_model_and_agent_post_the_durable_selection_and_accept_204() {
+    use crate::opencode::types::ModelInfo;
+
+    let server = TestHttpServer::start().await;
+    server.route("POST", "/api/session/ses_1/model", 204, "");
+    server.route("POST", "/api/session/ses_1/agent", 204, "");
+    server.route(
+        "POST",
+        "/api/session/ses_gone/model",
+        404,
+        serde_json::json!({"_tag": "SessionNotFoundError", "message": "gone"}).to_string(),
+    );
+    let client = v2_wire_client(&server);
+
+    client
+        .switch_session_model(
+            "ses_1",
+            &ModelInfo {
+                id: "deepseek-v4-flash".into(),
+                provider_id: "opencode-go".into(),
+                variant: Some("high".into()),
+            },
+        )
+        .await
+        .unwrap();
+    let model = last_request(&server);
+    assert_eq!(model.method, "POST");
+    assert_eq!(model.path, "/api/session/ses_1/model");
+    assert_eq!(
+        body_json(&model),
+        serde_json::json!({
+            "model": {"id": "deepseek-v4-flash", "providerID": "opencode-go", "variant": "high"},
+        })
+    );
+
+    client.switch_session_agent("ses_1", "live-agent").await.unwrap();
+    let agent = last_request(&server);
+    assert_eq!(agent.path, "/api/session/ses_1/agent");
+    assert_eq!(body_json(&agent), serde_json::json!({"agent": "live-agent"}));
+
+    let error = client
+        .switch_session_model(
+            "ses_gone",
+            &ModelInfo {
+                id: "m".into(),
+                provider_id: "p".into(),
+                variant: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, BridgeError::SessionNotFound(ref id) if id == "ses_gone"),
+        "a tagged 404 is the bridge's session-gone taxonomy: {error:?}"
+    );
+}
+
+/// The agent catalog: `GET /api/agent`'s `{location, data}` envelope. The wire
+/// `id` is the selectable identity (what a switch takes); the display `name`
+/// is not cola's pick value, so the neutral view carries the id as its name.
+#[tokio::test]
+async fn list_agents_maps_the_wire_id_to_the_selectable_name() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "GET",
+        "/api/agent",
+        200,
+        serde_json::json!({
+            "location": {"directory": "/work/cola"},
+            "data": [
+                {
+                    "id": "build",
+                    "name": "Build",
+                    "description": "The default agent.",
+                    "mode": "primary",
+                    "hidden": false,
+                    "permissions": [],
+                },
+                {
+                    "id": "explore",
+                    "name": "Explore",
+                    "mode": "subagent",
+                    "hidden": false,
+                    "permissions": [],
+                },
+            ],
+        })
+        .to_string(),
+    );
+    let client = v2_wire_client(&server);
+
+    let agents = client.list_agents().await;
+    assert_eq!(agents.len(), 2);
+    assert_eq!(agents[0].name, "build", "the id is the selectable value");
+    assert_eq!(agents[0].description.as_deref(), Some("The default agent."));
+    assert_eq!(agents[0].mode.as_deref(), Some("primary"));
+    assert_eq!(agents[0].hidden, Some(false));
+    assert_eq!(agents[1].name, "explore");
+    assert_eq!(agents[1].mode.as_deref(), Some("subagent"));
+    assert_eq!(
+        crate::opencode::types::AgentInfo::default_agent(&agents).as_deref(),
+        Some("build"),
+        "the server's first primary visible agent is its default"
+    );
+}
+
+/// The model catalog: `GET /api/model`'s `{location, data}` envelope groups
+/// into the picker's `provider → models` view, with each model's declared
+/// variants; the same read answers the footer's context-window lookup.
+#[tokio::test]
+async fn list_models_groups_the_catalog_and_reports_variants_and_context_windows() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "GET",
+        "/api/model",
+        200,
+        serde_json::json!({
+            "location": {"directory": "/work/cola"},
+            "data": [
+                {
+                    "id": "deepseek-v4-flash",
+                    "providerID": "opencode-go",
+                    "name": "DeepSeek V4 Flash",
+                    "variants": [{"id": "low"}, {"id": "high"}],
+                    "limit": {"context": 128000, "output": 4096},
+                    "status": "active",
+                    "enabled": true,
+                    "capabilities": {"tools": true, "input": ["text"], "output": ["text"]},
+                    "cost": [],
+                    "time": {"released": 1},
+                },
+                {
+                    "id": "gpt-4o",
+                    "providerID": "opencode-go",
+                    "variants": [],
+                    "limit": {"context": 200000},
+                    "status": "active",
+                    "enabled": true,
+                    "capabilities": {"tools": true, "input": ["text"], "output": ["text"]},
+                    "cost": [],
+                    "time": {"released": 2},
+                },
+                {
+                    "id": "other-model",
+                    "providerID": "openrouter",
+                    "variants": [{"id": "medium"}],
+                    "status": "active",
+                    "enabled": true,
+                    "capabilities": {"tools": true, "input": ["text"], "output": ["text"]},
+                    "cost": [],
+                    "time": {"released": 3},
+                },
+            ],
+        })
+        .to_string(),
+    );
+    let client = v2_wire_client(&server);
+
+    let grouped = client.list_models().await;
+    assert_eq!(grouped.len(), 2, "one group per provider");
+    assert_eq!(grouped[0].provider, "opencode-go");
+    assert_eq!(
+        grouped[0]
+            .models
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        ["deepseek-v4-flash", "gpt-4o"]
+    );
+    assert_eq!(grouped[0].models[0].variants, ["low", "high"]);
+    assert!(grouped[0].models[1].variants.is_empty());
+    assert_eq!(grouped[1].provider, "openrouter");
+    assert_eq!(grouped[1].models[0].variants, ["medium"]);
+
+    assert_eq!(
+        client
+            .model_context_window("opencode-go", "deepseek-v4-flash")
+            .await
+            .unwrap(),
+        Some(128_000)
+    );
+    assert_eq!(
+        client
+            .model_context_window("opencode-go", "gpt-4o")
+            .await
+            .unwrap(),
+        Some(200_000)
+    );
+    // An unknown model, or a server without the route, degrades to None: the
+    // footer omits the ratio rather than failing the read.
+    assert_eq!(
+        client.model_context_window("opencode-go", "nope").await.unwrap(),
+        None
+    );
+    server.route("GET", "/api/model", 500, "boom");
+    assert_eq!(
+        client
+            .model_context_window("opencode-go", "gpt-4o")
+            .await
+            .unwrap(),
+        None
+    );
 }
 
 /// The location-scoped pending-permission read: `GET /api/permission/request`
