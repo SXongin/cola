@@ -1,5 +1,48 @@
 use crate::bridge::test_support::*;
 
+use crate::backend::{
+    MessageId, MessageRole, MessageTime, Part, SessionTranscript, ToolCall, ToolIdentity, ToolOutput,
+    ToolStatus, TranscriptMessage,
+};
+
+/// #378: the kill-shaped orphan — a run the server was killed in: no
+/// completion stamp, a `running` tool part whose newest activity long predates
+/// the Turn anchor (verified on 2.0.18: a restart settles neither), and the
+/// failure the server had recorded before it died.
+fn orphaned_in_flight_message(
+    created: i64,
+    tool_started: i64,
+    output: &str,
+    error: Option<&str>,
+) -> TranscriptMessage {
+    TranscriptMessage {
+        id: MessageId::new("msg_zombie"),
+        role: MessageRole::Assistant,
+        time: Some(MessageTime {
+            created,
+            completed: None,
+        }),
+        model: None,
+        tokens: None,
+        error: error.map(str::to_string),
+        parts: vec![Part::Tool(ToolCall {
+            identity: ToolIdentity {
+                name: "bash".into(),
+                call_id: "call_zombie".into(),
+            },
+            status: ToolStatus::Running,
+            started_at: Some(tool_started),
+            input: Some(serde_json::json!({ "command": "sleep 120" })),
+            metadata: None,
+            output: ToolOutput {
+                raw: Some(serde_json::json!(output)),
+                blocks: Vec::new(),
+                error: None,
+            },
+        })],
+    }
+}
+
 #[tokio::test]
 async fn handle_prompt_renders_reasoning_tools_and_text() {
     let _wd = test_work_dir();
@@ -1019,4 +1062,136 @@ async fn an_in_flight_step_before_the_anchor_renders_live() {
         "the final card keeps the content: {final_card}"
     );
     assert!(card_header(&final_card).contains("完成"), "final card Done");
+}
+
+/// #378: an orphaned in-flight message must not replay its tool panel into a
+/// later Turn's card — the new card renders its own content only.
+#[tokio::test]
+async fn an_orphaned_in_flight_message_does_not_render_on_a_later_turn() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use super::drain::{ctx, spawn_turn, user, wait_for_card_text};
+
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    // Park the prompt: the turn is still running while the test asserts.
+    let gate = backend.hold_prompts();
+    // The new Turn's own in-flight reply, created after the anchor.
+    let live = TranscriptMessage {
+        id: MessageId::new("msg_live"),
+        role: MessageRole::Assistant,
+        time: Some(MessageTime {
+            created: 2_000_500,
+            completed: None,
+        }),
+        model: None,
+        tokens: None,
+        error: None,
+        parts: vec![text_part("新回合的内容")],
+    };
+    backend.given_transcript(
+        "ses_test",
+        vec![SessionTranscript::new(vec![
+            user("msg_cola_anchor", 2_000_000, "新消息"),
+            // ~25 minutes of silence before the anchor: the killed run.
+            orphaned_in_flight_message(500_000, 510_000, "zombie panel output", Some("被杀死的运行")),
+            live,
+        ])],
+    );
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
+
+    let turn = spawn_turn(&app, ctx("ses_test", "新消息"));
+
+    // The new Turn's own content renders live …
+    wait_for_card_text(&platform, "新回合的内容").await;
+    // … and further poll ticks never replay the orphan.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    for card in platform.updated_cards().await {
+        let text = card_text(&card);
+        assert!(
+            !text.contains("sleep 120"),
+            "the orphan's panel must not render: {text}"
+        );
+        assert!(
+            !text.contains("zombie panel output"),
+            "the orphan's output must not render: {text}"
+        );
+    }
+
+    gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn must finish")
+        .unwrap()
+        .unwrap();
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&final_card);
+    assert!(
+        !text.contains("sleep 120"),
+        "the final card must not replay the orphan: {text}"
+    );
+    assert!(
+        text.contains("新回合的内容"),
+        "the new Turn's content must survive: {text}"
+    );
+    assert!(
+        card_header(&final_card).contains("完成"),
+        "the clean Turn finalizes Done: {text}"
+    );
+}
+
+/// #378: a later Turn whose only assistant message in the window would be the
+/// orphan finalizes clean — the dead run's recorded failure must not become
+/// this Turn's error.
+#[tokio::test]
+async fn a_later_turn_does_not_inherit_an_orphans_failure() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use super::drain::{ctx, spawn_turn, user};
+
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_transcript(
+        "ses_test",
+        vec![SessionTranscript::new(vec![
+            user("msg_cola_anchor", 2_000_000, "新消息"),
+            orphaned_in_flight_message(500_000, 510_000, "zombie panel output", Some("被杀死的运行")),
+        ])],
+    );
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
+
+    let turn = spawn_turn(&app, ctx("ses_test", "新消息"));
+    tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn must finish")
+        .unwrap()
+        .unwrap();
+
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&final_card);
+    assert!(!text.contains("sleep 120"), "the orphan must not render: {text}");
+    assert!(
+        !text.contains("执行失败"),
+        "the dead run's failure must not leak into this Turn: {text}"
+    );
+    assert!(
+        card_header(&final_card).contains("完成"),
+        "the later Turn must finalize Done: {text}"
+    );
 }
