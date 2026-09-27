@@ -67,3 +67,16 @@ in `src/opencode/generation.rs` (spec #364, slice S3) is:
   the probe cannot be trusted, with a WARN on a contradicting classified probe.
 
 Everything else in this ADR stands.
+
+## Amendment (2026-09-27): an Owned Server's generation is probed, never assumed
+
+The Decision's "Discovery gains a probe step" applies to every attachment, the
+server cola spawned itself included. `spawn_own_server` describes its child as a
+candidate and resolves it through the same probe + override path as a
+discovered one: the `opencode` binary on PATH may be either lineage (V1's
+`1.18.x` or V2's `2.0.x`), so the generation is never assumed from the command
+(#380). A just-spawned server is retried through its startup window — TCP up
+before HTTP answers, and V2 answers 503 while it migrates — within a bounded
+budget; a child that exited fails the spawn immediately. An inconclusive spawn
+leaves the live child recorded and cola serverless, exactly like an
+inconclusive attach: the reconnect loop attaches once the probe classifies.

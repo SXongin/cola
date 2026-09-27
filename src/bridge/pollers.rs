@@ -160,9 +160,10 @@ async fn reconcile(
         // is unavailable).
         let want_spawn = want_to_spawn(allow_spawn, heal_when_busy, busy(&handles.flow.waits).await);
         if want_spawn && handles.server.start_policy.spawns_when_needed() {
-            let spawned = discovery::spawn_own_server(handles.server.preferred_port)
-                .await
-                .map_err(|e| crate::error::BridgeError::OpenCode(format!("lazy start failed: {e}")))?;
+            let spawned =
+                discovery::spawn_own_server(handles.server.preferred_port, handles.server.generation)
+                    .await
+                    .map_err(|e| crate::error::BridgeError::OpenCode(format!("lazy start failed: {e}")))?;
             handles.flow.backend.reconnect(Some(&spawned)).await?;
             // The spawned server only serves requests after a short startup
             // window (requests landing in it are swallowed forever). Wait until

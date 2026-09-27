@@ -15,8 +15,10 @@
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
-use crate::config::port_from_url;
+use crate::bridge::attach;
+use crate::config::{GenerationOverride, port_from_url};
 use crate::opencode::strategy::Generation;
+use crate::opencode::transport::Transport;
 
 /// An `opencode serve` process discovered on the machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,23 +78,6 @@ pub struct ResolvedServer {
     /// `[opencode] generation` override applied (spec #364 §2). A property of
     /// the attachment — never guessed, never per-session (ADR-0055).
     pub(crate) generation: Generation,
-}
-
-impl ResolvedServer {
-    /// The attachment to a server cola started itself. [`spawn_self_server`]
-    /// runs the `opencode` binary (the V1 lineage), so the generation is known
-    /// from the command rather than probed — a probe would also race the
-    /// server's startup window (`wait_for_server_ready` exists for exactly
-    /// that swallowed-request hazard).
-    pub(crate) fn self_started(url: String, password: String, pid: i32) -> Self {
-        Self {
-            url,
-            username: DEFAULT_SERVER_USERNAME.to_string(),
-            password,
-            pid: Some(pid),
-            generation: Generation::V1,
-        }
-    }
 }
 
 /// The data directory OpenCode resolves as its default on every platform.
@@ -535,12 +520,25 @@ pub async fn wait_for_port(port: u16) -> anyhow::Result<()> {
     anyhow::bail!("OpenCode server did not start on port {}", port)
 }
 
+/// The startup budget for resolving a freshly spawned server's generation: it
+/// accepts TCP a beat before it answers HTTP, and V2 answers 503 while it
+/// migrates. Bounded like the Lazy Start readiness wait. On timeout a live
+/// child is left recorded (a later reconcile attaches to it by probing again);
+/// a child that exited is forgotten immediately and fails the spawn at once.
+const SELF_START_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Start cola's own `opencode serve` on the default store, skipping ports
-/// already held by a running server, and wait until it accepts connections.
-/// Used by Lazy Start (`auto`/`eager` policies) and `/restart-opencode`. The
-/// result is a [`ResolvedServer`] like any other — an Owned Server is just the
-/// endpoint cola attaches to (ADR-0013).
-pub async fn spawn_own_server(preferred_port: Option<u16>) -> anyhow::Result<ResolvedServer> {
+/// already held by a running server, wait until it accepts connections, and
+/// resolve its generation by probing — the `opencode` binary may be the V1 or
+/// the V2 lineage (spec #364 §2). Used at boot (`eager`) and by Lazy Start
+/// (`auto`); `/restart-opencode` re-raises through [`spawn_self_server`] and
+/// the reconnect loop's own re-probe. The result is a [`ResolvedServer`] like
+/// any other — an Owned Server is just the endpoint cola attaches to
+/// (ADR-0013).
+pub async fn spawn_own_server(
+    preferred_port: Option<u16>,
+    generation_override: GenerationOverride,
+) -> anyhow::Result<ResolvedServer> {
     let candidates = scan_processes();
     let mut port = preferred_port.unwrap_or(4096);
     // Skip ports already held by a custom-store server (someone else's data).
@@ -550,7 +548,60 @@ pub async fn spawn_own_server(preferred_port: Option<u16>) -> anyhow::Result<Res
     let password = "cola-secret".to_string();
     let pid = spawn_self_server(port, &password)?;
     wait_for_port(port).await?;
-    Ok(ResolvedServer::self_started(local_url(port), password, pid))
+    // The Owned Server is described as a candidate and resolved through the
+    // SAME attach path as any discovered server: the `opencode` binary's
+    // lineage is not fixed (#380), so the generation is probed, never assumed.
+    let candidate = ServerCandidate {
+        pid,
+        port,
+        password,
+        username: DEFAULT_SERVER_USERNAME.to_string(),
+        uses_default_store: true,
+    };
+    let transport = attach::candidate_transport(&candidate);
+    resolve_spawned_server_over(
+        &transport,
+        &candidate,
+        generation_override,
+        SELF_START_PROBE_TIMEOUT,
+    )
+    .await
+    .map_err(|evidence| {
+        anyhow::anyhow!("spawned OpenCode server's generation could not be resolved: {evidence}")
+    })
+}
+
+/// The retry loop around the attach decision for a just-spawned Owned Server:
+/// the startup window answers nothing, or answers unclassifiably (V2's
+/// 503-while-migrating), so inconclusive probes are retried until `timeout` or
+/// the child dies. The last probe evidence travels on failure; the credential
+/// never does (the attach path's promise).
+async fn resolve_spawned_server_over(
+    transport: &Transport,
+    candidate: &ServerCandidate,
+    generation_override: GenerationOverride,
+    timeout: std::time::Duration,
+) -> Result<ResolvedServer, String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match attach::resolve_candidate_over(transport, candidate, generation_override).await {
+            Ok(resolved) => return Ok(resolved),
+            Err(evidence) => {
+                if !process_alive(candidate.pid) {
+                    if self_spawned_pid() == Some(candidate.pid) {
+                        clear_self_spawned();
+                    }
+                    return Err(format!(
+                        "the spawned server exited before its generation resolved: {evidence}"
+                    ));
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(evidence);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    }
 }
 
 /// Outcome of `/restart-opencode`.
@@ -970,5 +1021,153 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("XDG_DATA_HOME", v) },
             None => unsafe { std::env::remove_var("XDG_DATA_HOME") },
         }
+    }
+
+    /// The retry loop around the spawned-server attach decision: the startup
+    /// window's unclassified answers (V2's 503-while-it-settles) are retried
+    /// until the info envelope resolves the server. Regression: #380.
+    #[tokio::test]
+    async fn a_spawned_server_retries_the_startup_window_and_resolves_v2() {
+        let server = crate::test_http::TestHttpServer::start().await;
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        server.route_dynamic("GET", "/api/info", {
+            let attempts = std::sync::Arc::clone(&attempts);
+            move |_| {
+                if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    crate::test_http::DynamicResponse::new(503, "text/plain", "migrating")
+                } else {
+                    crate::test_http::DynamicResponse::new(
+                        200,
+                        "application/json",
+                        r#"{"version":"2.0.18","pid":7494,"urls":["http://127.0.0.1:49374"]}"#,
+                    )
+                }
+            }
+        });
+        // A live stand-in for the spawned child: the test process itself.
+        let pid = std::process::id() as i32;
+        let candidate = cand(pid, spawn_test_port(&server), "cola-secret", true);
+        let transport = spawn_test_transport(&server, "cola-secret");
+
+        let resolved = resolve_spawned_server_over(
+            &transport,
+            &candidate,
+            GenerationOverride::Auto,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("the second, classified answer resolves");
+
+        assert_eq!(
+            resolved.generation,
+            Generation::V2,
+            "the spawned server's lineage is probed, not assumed"
+        );
+        assert_eq!(resolved.username, DEFAULT_SERVER_USERNAME);
+        assert_eq!(resolved.pid, Some(pid));
+        assert!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the 503 must have been retried"
+        );
+    }
+
+    /// A spawn whose server never classifies fails with the probe evidence, and
+    /// the evidence never carries the credential.
+    #[tokio::test]
+    async fn a_spawned_server_that_never_classifies_fails_with_evidence() {
+        let server = crate::test_http::TestHttpServer::start().await;
+        server.route_raw("GET", "/api/info", 503, "text/plain", "migrating");
+        let candidate = cand(
+            std::process::id() as i32,
+            spawn_test_port(&server),
+            "spawn-secret",
+            true,
+        );
+        let transport = spawn_test_transport(&server, "spawn-secret");
+
+        let error = resolve_spawned_server_over(
+            &transport,
+            &candidate,
+            GenerationOverride::Auto,
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .expect_err("an inconclusive spawn must not attach");
+
+        assert!(error.contains("503"), "evidence: {error}");
+        assert!(!error.contains("spawn-secret"), "the credential leaked: {error}");
+    }
+
+    /// The V1 leg of the spawn path: V1's 200-`text/html` catch-all resolves V1
+    /// through the same loop (the spawn must not assume V2 either).
+    #[tokio::test]
+    async fn a_spawned_v1_server_resolves_v1_through_the_spawn_path() {
+        let server = crate::test_http::TestHttpServer::start().await;
+        server.route_raw(
+            "GET",
+            "/api/info",
+            200,
+            "text/html",
+            "<!doctype html><title>OpenCode</title>",
+        );
+        let candidate = cand(
+            std::process::id() as i32,
+            spawn_test_port(&server),
+            "cola-secret",
+            true,
+        );
+        let transport = spawn_test_transport(&server, "cola-secret");
+
+        let resolved = resolve_spawned_server_over(
+            &transport,
+            &candidate,
+            GenerationOverride::Auto,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("the V1 catch-all resolves");
+
+        assert_eq!(resolved.generation, Generation::V1);
+        assert_eq!(resolved.username, DEFAULT_SERVER_USERNAME);
+    }
+
+    /// A child that exits during the startup window fails the spawn
+    /// immediately, without waiting out the budget.
+    #[tokio::test]
+    async fn a_spawned_server_that_exited_fails_immediately() {
+        let server = crate::test_http::TestHttpServer::start().await;
+        server.route_raw("GET", "/api/info", 503, "text/plain", "migrating");
+        // A far-out pid is dead everywhere (see `process_alive_detects_own_process`).
+        let candidate = cand(i32::MAX - 1, spawn_test_port(&server), "cola-secret", true);
+        let transport = spawn_test_transport(&server, "cola-secret");
+
+        let started = std::time::Instant::now();
+        let error = resolve_spawned_server_over(
+            &transport,
+            &candidate,
+            GenerationOverride::Auto,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect_err("a dead child cannot resolve");
+
+        assert!(error.contains("exited"), "evidence: {error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a dead child must not wait out the budget"
+        );
+    }
+
+    /// The fake server's listening port, as the spawn would pick it.
+    fn spawn_test_port(server: &crate::test_http::TestHttpServer) -> u16 {
+        port_from_url(&server.base_url()).expect("the fake server URL has a port")
+    }
+
+    /// A transport pointing at the fake server with the env proxy disabled, so
+    /// a developer shell's `http_proxy` cannot intercept loopback.
+    fn spawn_test_transport(server: &crate::test_http::TestHttpServer, password: &str) -> Transport {
+        let transport = Transport::new(Some(DEFAULT_SERVER_USERNAME), Some(password), server.base_url());
+        transport.disable_env_proxy(Some(DEFAULT_SERVER_USERNAME), Some(password));
+        transport
     }
 }

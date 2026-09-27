@@ -53,7 +53,7 @@ The default OpenCode data directory (`~/.local/share/opencode`; `$XDG_DATA_HOME`
 _Avoid_: Database, data dir, state directory
 
 **Owned Server**:
-An `opencode serve` process that cola itself spawned (pid recorded in `~/.cola/self-opencode.pid`). Only an Owned Server may be killed, restarted, or reaped by cola; everything else is someone else's process.
+An `opencode serve` process that cola itself spawned (pid recorded in `~/.cola/self-opencode.pid`). Only an Owned Server may be killed, restarted, or reaped by cola; everything else is someone else's process. Its protocol generation is probed like any other attachment's — the `opencode` binary on PATH may be either lineage (spec #364 §2).
 _Avoid_: Managed server, our server, private server
 
 **Coexistent Server**:
