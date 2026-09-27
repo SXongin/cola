@@ -521,9 +521,9 @@ async fn stale_topic_recreate_preserves_creation_messages() {
 
 /// When a turn is already in flight, a new message must NOT start a
 /// competing run_prompt (which would overwrite the running accumulator and
-/// race on the same card). It goes through the supplement path: the message
-/// is sent fire-and-forget via prompt_async (OpenCode merges it into the
-/// current turn) — no Loading card, no second accumulator, and no deleted
+/// race on the same card). It goes through the supplement path: the message is
+/// submitted to the Backend without starting a Turn (OpenCode merges it into
+/// the current turn) — no Loading card, no second accumulator, and no deleted
 /// text acknowledgement (ADR-0043).
 ///
 /// This seeds the turn's STARTUP WINDOW — the busy guard is held while the
@@ -537,8 +537,8 @@ async fn message_during_inflight_goes_to_supplement_path() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let backend = MockBackend::new(realistic_parts());
-    let sup_calls = backend.prompt_async_calls.clone();
-    let sup_ids = backend.prompt_async_message_ids.clone();
+    let sup_calls = backend.prompt_calls.clone();
+    let sup_ids = backend.prompt_message_ids.clone();
     let (app, platform) = build_app(cfg, backend).await;
     seed_entry(
         &app,
@@ -568,11 +568,11 @@ async fn message_during_inflight_goes_to_supplement_path() {
     ))
     .await;
 
-    // prompt_async was called with the supplement text.
+    // The prompt submit was called with the supplement text.
     let calls = sup_calls.lock().await.clone();
     assert!(
         calls.iter().any(|c| c.contains("补充一下，改用方案 B")),
-        "supplement text must be sent via prompt_async: {:?}",
+        "supplement text must be submitted on the supplement path: {:?}",
         calls
     );
     // The supplement is a cola-authored message: fresh `msg_cola_` id

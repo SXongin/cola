@@ -122,7 +122,7 @@ Cola's record of which Sessions a Chat or Topic has activated, and which one is 
 _Avoid_: Session list, session store, mapping table
 
 **Session Transcript**:
-The normalized read of one Session's messages and parts, produced by the Backend and consumed by the Bridge and the Platform: message identity, role, server time, model identity and token usage are typed, while tool payloads stay opaque content. One Transcript serves rendering, external-message sync and the Session Snapshot, and a message's identity and its server time travel together, so a Turn's anchor is one fact rather than two independently derived ones.
+The normalized read of one Session's messages and parts, produced by the Backend and consumed by the Bridge and the Platform: message identity, role, server time, model identity, token usage and a message's recorded failure are typed, while tool payloads stay opaque content. One Transcript serves rendering, external-message sync and the Session Snapshot, and a message's identity and its server time travel together, so a Turn's anchor is one fact rather than two independently derived ones. A Turn's failure is read from its assistant messages here (the Backend records it on the message), so completion observation is one read.
 _Avoid_: Message list, history, message log
 
 **Cola-Authored Message**:

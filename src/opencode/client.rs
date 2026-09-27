@@ -17,8 +17,8 @@ use super::strategy::{Generation, GenerationStrategy};
 use super::transport::Transport;
 use super::types::{
     AgentInfo, CreateSessionInput, CreateSessionResponse, FormAnswer, ImageInput, Location, ModelInfo,
-    PermissionRequest, PromptResponse, ProviderModels, QuestionRequest, Session, SessionInfo,
-    SessionListInfo, SessionSelection, SessionStatus,
+    PermissionRequest, ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo,
+    SessionSelection, SessionStatus,
 };
 
 /// Session creation, on the `/api` surface both generations serve. It is a
@@ -243,6 +243,9 @@ impl OpenCodeBackend {
         self.strategy().delete_session(&self.transport, session_id).await
     }
 
+    /// Submit a prompt through the attached generation's strategy (ADR-0056's
+    /// submit+observe contract: the call returns once the message is durable,
+    /// and the Turn observes completion from the transcript + run state).
     #[allow(clippy::too_many_arguments)] // prompt axes: session/text/images + model/variant/agent/message-id
     pub async fn prompt(
         &self,
@@ -253,39 +256,13 @@ impl OpenCodeBackend {
         variant: Option<&str>,
         agent: Option<&str>,
         message_id: Option<&str>,
-    ) -> crate::error::Result<PromptResponse> {
+    ) -> crate::error::Result<()> {
         // Resolve the effective model here (per-session override → configured
         // default): which model runs is cola policy, how it is spelled on the
         // wire is the strategy's business.
         let model = model.or(self.model.as_ref());
         self.strategy()
             .prompt(
-                &self.transport,
-                session_id,
-                text,
-                images,
-                model,
-                variant,
-                agent,
-                message_id,
-            )
-            .await
-    }
-
-    #[allow(clippy::too_many_arguments)] // same prompt axes as `prompt`
-    pub async fn prompt_async(
-        &self,
-        session_id: &str,
-        text: &str,
-        images: &[ImageInput],
-        model: Option<&ModelInfo>,
-        variant: Option<&str>,
-        agent: Option<&str>,
-        message_id: Option<&str>,
-    ) -> crate::error::Result<()> {
-        let model = model.or(self.model.as_ref());
-        self.strategy()
-            .prompt_async(
                 &self.transport,
                 session_id,
                 text,

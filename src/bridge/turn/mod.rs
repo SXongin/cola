@@ -118,6 +118,18 @@ pub(crate) struct Turn {
     /// Notice: a turn that ran past the threshold notifies on completion even
     /// in p2p (ADR-0043 amendment 2026-09-21).
     started_at: std::time::Instant,
+    /// Whether the drain has observed the submitted run start (a busy/retry
+    /// status, assistant content in the turn, or a recorded failure). The
+    /// prompt submit only *schedules* execution (ADR-0056), so before this
+    /// flips a non-busy status can just mean "not registered yet" — believing
+    /// it would finalize the card Done before a single token arrived.
+    drain_started: bool,
+    /// Whether this turn's submit was REJECTED (the prompt call returned Err).
+    /// A rejected submit may never have scheduled a run at all, so the drain
+    /// must not mistake an idle status for a registration race and keep
+    /// observing to its bound: the error is the outcome, and the drain settles
+    /// on its first non-busy read.
+    submit_failed: bool,
     /// The stopped-finalization line is logged once per Turn (ADR-0048): both
     /// the post-prompt drain and its pre-finalization re-check observe the
     /// same sticky `/stop` marker, so the second observation must stay silent.
@@ -331,17 +343,18 @@ impl Turn {
             directory: session_dir,
             turn_variant: None,
             started_at: std::time::Instant::now(),
+            drain_started: false,
+            submit_failed: false,
             stop_finalization_logged: false,
         }))
     }
 
     /// Send one attempt with the incremental renderer attached. The overrides
     /// are captured at send time (ADR-0019), and the renderer always stops
-    /// before the response is returned so a retry starts its own cleanly.
-    async fn attempt(
-        &mut self,
-        handles: &TurnHandles,
-    ) -> crate::error::Result<opencode::types::PromptResponse> {
+    /// before the submit returns so a retry starts its own cleanly. The
+    /// submit itself does not wait for the turn (ADR-0056's submit+observe):
+    /// the post-prompt drain observes the run it scheduled.
+    async fn attempt(&mut self, handles: &TurnHandles) -> crate::error::Result<()> {
         let render = render::RenderPoll::spawn(handles, &self.session_id, &self.thread_key);
         // Capture the variant actually sent this turn AT SEND TIME, not at
         // finalization: a `/think` issued mid-generation must not retro-tag the
@@ -372,10 +385,11 @@ impl Turn {
             )
             .await;
         render.stop().await;
-        // The poll runs only while the prompt call is in flight. Should the
-        // run have ended with a Supplement already queued — or a new Turn
-        // started by one — the post-prompt drain takes the polling over on the
-        // same injected cadence (ADR-0043).
+        // The poll runs only while the submit is in flight; the post-prompt
+        // drain observes the submitted run from here on (ADR-0056, ADR-0043).
+        // A rejected submit is recorded so the drain does not wait out its
+        // bound for a run that was never scheduled.
+        self.submit_failed = prompt_resp.is_err();
         prompt_resp
     }
 
@@ -459,20 +473,22 @@ impl Turn {
     /// that runs out its bound while the session is still running is NOT
     /// completion (#284): the guard is released, but the card is handed to the
     /// out-of-turn [`follow`], which finalizes it when the session goes idle.
-    async fn finish(
-        &mut self,
-        handles: &TurnHandles,
-        prompt_resp: &crate::error::Result<opencode::types::PromptResponse>,
-    ) {
+    async fn finish(&mut self, handles: &TurnHandles, prompt_resp: &crate::error::Result<()>) {
         // Post-prompt drain + the pre-finalization re-check: a Supplement
         // racing the drain's exit is drained here rather than dropped, and one
         // that lands after the release becomes a normal new Turn on the
         // handler's not-busy path.
         let drain_outcome = self.drain_after_prompt(handles).await;
 
+        // The turn's outcome is OBSERVED, not returned (ADR-0056): a rejected
+        // submit is the call's Err, and a submitted run's failure is recorded
+        // on its assistant message — the blocking response used to carry it
+        // inline, and the transcript now does. One read serves both the error
+        // decision and the final reconcile below.
+        let final_transcript = handles.backend.transcript(&self.session_id).await.ok();
         let prompt_err = match prompt_resp {
-            Ok(r) => r.error.clone(),
             Err(e) => Some(e.to_string()),
+            Ok(()) => self.turn_error(final_transcript.as_ref()),
         };
 
         // #284: a drain bound reached while the session is still running is NOT
@@ -523,22 +539,14 @@ impl Turn {
         // finalization refreshes the work context and flushes. Everything
         // below the guard is the normal end of a turn.
         if !follow {
-            // Reconcile: render any parts the incremental poll missed, then mark
-            // the card Done (or Error). Fall back to the prompt response's parts
-            // (already decoded through the same wire seam) if the fetch fails or
-            // shows nothing new.
-            let final_transcript = handles.backend.transcript(&self.session_id).await.ok();
+            // Reconcile: render any parts the incremental poll missed from the
+            // settled transcript read above, then mark the card Done (or
+            // Error).
             {
                 let mut cards = handles.cards.cards.lock().await;
                 if let Some(acc) = cards.get_mut(&self.session_id).map(|c| &mut c.acc) {
-                    if let Ok(resp) = prompt_resp {
-                        let mut rendered = false;
-                        if let Some(transcript) = &final_transcript {
-                            rendered = render::render_new_turn_parts(acc, transcript);
-                        }
-                        if !rendered {
-                            render::render_parts(acc, &resp.parts);
-                        }
+                    if let Some(transcript) = &final_transcript {
+                        render::render_new_turn_parts(acc, transcript);
                     }
                     // Capture the answering model + token usage from the LATEST
                     // assistant message unconditionally — the render dedup may have
@@ -657,7 +665,7 @@ impl Turn {
             );
         }
         // Permissions are handled by the independent poller spawned in App::run,
-        // so a prompt blocked on a permission still gets its card shown.
+        // so a run waiting on a permission still gets its card shown.
     }
 
     /// Release this turn's busy guard. Idempotent.
@@ -665,7 +673,7 @@ impl Turn {
         release_inflight(handles, &self.session_id).await;
     }
 
-    /// The post-prompt phase (ADR-0043): keep the renderer polling while the
+    /// The post-submit phase (ADR-0043): keep the renderer polling while the
     /// session is still running or an unanswered cola-authored Supplement is
     /// newer than this turn's anchor — a Supplement that missed the running
     /// run starts a new Turn on the Backend, and its reply must land on the
@@ -718,7 +726,7 @@ impl Turn {
         let mut last: Option<DrainState> = None;
         loop {
             // The first check runs before any sleep: a Supplement that missed
-            // the run is already on the Backend when the prompt returns.
+            // the run is already on the Backend when the submit returns.
             match self.drain_tick(handles, drain_request_timeout(deadline)).await {
                 Some(DrainState::Settled) => return None,
                 Some(state) => last = Some(state),
@@ -756,12 +764,13 @@ impl Turn {
         }
     }
 
-    /// What the drain must do next (ADR-0043): keep going while the session's
-    /// run is still alive, or while the Backend's newest user message is a
-    /// cola-authored Supplement newer than this turn's anchor with no
-    /// assistant reply after it. `transcript` is the snapshot the caller just
-    /// read. The Supplement is classified before the run state so the re-check
-    /// can tell the racing Supplement apart from a session that is merely busy.
+    /// What the drain must do next (ADR-0043, ADR-0056): keep going while the
+    /// session's run is still alive, while the submitted run has not been
+    /// observed yet, or while the Backend's newest user message is a
+    /// cola-authored Supplement newer than this turn's anchor with no assistant
+    /// reply after it. `transcript` is the snapshot the caller just read. The
+    /// Supplement is classified before the run state so the re-check can tell
+    /// the racing Supplement apart from a session that is merely busy.
     async fn drain_state(
         &mut self,
         handles: &TurnHandles,
@@ -804,7 +813,7 @@ impl Turn {
         // A Supplement the Backend has not answered yet. Its `msg_cola_` id is
         // authoritative (ADR-0026); the anchor is the server's own time for
         // this turn's user message (#190). Cola's clock never enters here.
-        if let Some(anchor) = anchor
+        if let Some(anchor) = anchor.as_ref()
             && let Some(newest_user) = transcript.newest_user()
             && let Some(created) = newest_user.time.map(|time| time.created)
             && crate::opencode::parsing::is_cola_message_id(newest_user.id.as_str())
@@ -826,7 +835,18 @@ impl Turn {
                 return DrainState::Supplement;
             }
         }
-        // The run is still alive: parts keep coming.
+        // The submit only SCHEDULED the run (ADR-0056): before any sign of it
+        // is observed, a non-busy status can just mean "not registered yet",
+        // and settling on it would finalize the card Done before a token
+        // arrived. The signs ride the snapshot already read — assistant
+        // content in the turn (a recorded failure counts as content) — or the
+        // status read below. A REJECTED submit is the exception: no run was
+        // scheduled, so the error is the outcome and one idle read settles.
+        if let Some(anchor) = &anchor {
+            let turn = transcript.turn_for_user(anchor);
+            self.drain_started |= turn.error.is_some() || !turn.messages.is_empty();
+        }
+        let observed = self.drain_started || self.submit_failed;
         match crate::bridge::bounded_call(
             "turn drain session status",
             timeout_ms,
@@ -836,13 +856,46 @@ impl Turn {
         )
         .await
         {
-            Some(Ok(Some(SessionStatus::Busy | SessionStatus::Retry))) => DrainState::Running,
-            Some(Ok(_)) | None => DrainState::Settled,
+            // Alive: parts keep coming.
+            Some(Ok(Some(SessionStatus::Busy | SessionStatus::Retry))) => {
+                self.drain_started = true;
+                DrainState::Running
+            }
+            // A non-busy status: completion once the run was observed, and
+            // continued observation before that.
+            Some(Ok(_)) if observed => DrainState::Settled,
+            Some(Ok(_)) => DrainState::Running,
             Some(Err(e)) => {
                 tracing::warn!("turn drain session status: {}", e);
-                DrainState::Settled
+                if observed {
+                    DrainState::Settled
+                } else {
+                    DrainState::Running
+                }
+            }
+            // The bounded status call timed out: same rule as a failed read.
+            None => {
+                if observed {
+                    DrainState::Settled
+                } else {
+                    DrainState::Running
+                }
             }
         }
+    }
+
+    /// The failure a submitted turn recorded, read from the settled transcript:
+    /// the assistant error inside the turn anchored at this Turn's
+    /// `msg_cola_` user message. `None` when the read has no such anchor or the
+    /// turn recorded no failure — a read hiccup never invents one.
+    fn turn_error(&self, transcript: Option<&SessionTranscript>) -> Option<String> {
+        let transcript = transcript?;
+        let anchor = transcript
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::User && message.id.as_str() == self.cola_message_id)
+            .and_then(|message| message.anchor())?;
+        transcript.turn_for_user(&anchor).error
     }
 
     /// The drain's Backend read, bounded by the caller's per-call timeout so a
@@ -1868,7 +1921,12 @@ mod tests {
         )
         .await;
 
-        Turn::run(&app.turn_handles(), ctx("ses_a", "hi")).await.unwrap();
+        // The scripted history's user message is the turn's anchor: the drain
+        // matches it by the cola-chosen id (ADR-0026), so the context must carry
+        // the same id.
+        let mut context = ctx("ses_a", "hi");
+        context.cola_message_id = Some("msg_u".into());
+        Turn::run(&app.turn_handles(), context).await.unwrap();
 
         assert_eq!(
             sent_variants.lock().await.as_slice(),

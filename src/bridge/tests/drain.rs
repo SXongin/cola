@@ -401,14 +401,9 @@ async fn a_message_during_the_drain_is_handled_as_a_supplement() {
     .await;
 
     assert!(
-        backend
-            .prompt_async_calls
-            .lock()
-            .await
-            .iter()
-            .any(|c| c == "ses_test:补充二"),
+        backend.prompt_calls.lock().await.iter().any(|c| c == "补充二"),
         "the message must queue as a supplement: {:?}",
-        backend.prompt_async_calls.lock().await
+        backend.prompt_calls.lock().await
     );
     assert!(
         !platform.texts().await.iter().any(|t| t.contains("还在处理中")),
@@ -768,11 +763,6 @@ async fn a_message_after_the_bound_handoff_starts_a_normal_new_turn() {
         backend.prompt_calls.lock().await
     );
     assert!(
-        backend.prompt_async_calls.lock().await.is_empty(),
-        "no supplement send after the hand-off: {:?}",
-        backend.prompt_async_calls.lock().await
-    );
-    assert!(
         !platform.texts().await.iter().any(|t| t.contains("还在处理中")),
         "the new turn is not throttled: {:?}",
         platform.calls.lock().await
@@ -805,15 +795,40 @@ async fn a_message_after_the_release_becomes_a_normal_new_turn() {
         "the guard is released"
     );
 
-    app.handle_message(incoming(
-        "msg_next".into(),
-        "chat_1".into(),
-        "p2p".into(),
-        None,
-        "接着问".into(),
-        None,
-    ))
-    .await;
+    // The released session starts a fresh Turn; run it on its own task so the
+    // test can serve the new turn's history once the handler has generated its
+    // `msg_cola_` id (the scripted timeline above belongs to the first turn).
+    let next_turn = {
+        let app = Arc::clone(&app);
+        tokio::spawn(async move {
+            app.handle_message(incoming(
+                "msg_next".into(),
+                "chat_1".into(),
+                "p2p".into(),
+                None,
+                "接着问".into(),
+                None,
+            ))
+            .await;
+        })
+    };
+    let next_id = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(Some(id)) = backend.prompt_message_ids.lock().await.last().cloned()
+                && backend
+                    .prompt_calls
+                    .lock()
+                    .await
+                    .last()
+                    .is_some_and(|text| text == "接着问")
+            {
+                return id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the new turn's prompt must be submitted");
 
     assert!(
         backend.prompt_calls.lock().await.iter().any(|t| t == "接着问"),
@@ -821,15 +836,26 @@ async fn a_message_after_the_release_becomes_a_normal_new_turn() {
         backend.prompt_calls.lock().await
     );
     assert!(
-        backend.prompt_async_calls.lock().await.is_empty(),
-        "no supplement send after the release: {:?}",
-        backend.prompt_async_calls.lock().await
-    );
-    assert!(
         !platform.texts().await.iter().any(|t| t.contains("还在处理中")),
         "the new turn is not throttled: {:?}",
         platform.calls.lock().await
     );
+
+    // The new turn's answer closes it, so the turn task returns.
+    *backend
+        .transcript_scripts
+        .lock()
+        .await
+        .get_mut("ses_test")
+        .unwrap() = vec![SessionTranscript::new(vec![
+        user(&next_id, 3_000, "接着问"),
+        assistant(4_000, "新一轮回答。"),
+    ])];
+    tokio::time::timeout(Duration::from_secs(5), next_turn)
+        .await
+        .expect("the new turn must finish")
+        .unwrap();
+
     assert!(!app.inflight.lock().await.contains("ses_test"));
 }
 
@@ -1078,6 +1104,106 @@ async fn a_supplement_landing_after_the_drain_exit_is_still_drained() {
     assert!(card_header(&final_card).contains("完成"), "final card Done");
     assert!(!app.inflight.lock().await.contains("ses_test"));
     assert_no_further_rendering(&backend, &platform).await;
+}
+
+/// A submitted run may not have registered yet when the drain's first read
+/// happens (a prompt admit only *schedules* execution, ADR-0056): an idle
+/// status with no assistant content visible yet must NOT settle the turn — the
+/// answer that lands moments later must still render and finalize the card.
+#[tokio::test]
+async fn an_unregistered_run_does_not_settle_the_drain() {
+    let _wd = test_work_dir();
+    // The first snapshot carries only the admitted user message: the run has
+    // produced nothing yet.
+    let admitted = vec![user("msg_cola_anchor", 1_000, "第一条消息")];
+    let answered = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一轮回答。"),
+    ];
+    let (_dir, app, backend, platform) =
+        scripted_app(vec![SessionTranscript::new(admitted)], Some(SessionStatus::Idle)).await;
+
+    let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+
+    // The idle status alone must not finalize: the guard stays held and the
+    // card is not Done while no assistant content is visible.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        app.inflight.lock().await.contains("ses_test"),
+        "an unregistered run must keep the turn open"
+    );
+    let state = Turn::card_state(&app.cards_handle(), "ses_test").await;
+    assert!(
+        !matches!(state, Some(CardState::Done | CardState::Error)),
+        "the card must not be finalized before the run is observed: {state:?}"
+    );
+
+    // The run's answer lands; the drain picks it up and finalizes Done.
+    *backend
+        .transcript_scripts
+        .lock()
+        .await
+        .get_mut("ses_test")
+        .unwrap() = vec![SessionTranscript::new(answered)];
+    let result = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn must finish once the answer lands")
+        .unwrap();
+    result.unwrap();
+
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&final_card).contains("第一轮回答。"),
+        "the late answer must render: {final_card}"
+    );
+    assert!(card_header(&final_card).contains("完成"), "final card Done");
+    assert!(
+        !app.inflight.lock().await.contains("ses_test"),
+        "the busy guard must be released"
+    );
+}
+
+/// A rejected submit schedules no run: when the transcript carries no admitted
+/// message (a real server's 500), the drain must settle on its first non-busy
+/// read — the submit's error is the outcome — instead of observing to its
+/// bound for a run that never registered.
+#[tokio::test]
+async fn a_rejected_submit_does_not_wait_out_the_drain_bound() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.fail_prompt("provider 503");
+    // A rejected submit leaves no message behind: the history stays empty.
+    backend.given_transcript("ses_test", vec![SessionTranscript::new(Vec::new())]);
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    // A bound the test would never wait out: only the submit-failure rule can
+    // end the drain promptly.
+    app.turn_drain_timeout_ms.store(60_000, Ordering::Relaxed);
+
+    let started = std::time::Instant::now();
+    Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
+        .await
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "a rejected submit must not be mistaken for a registration race"
+    );
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_header(&final_card).contains("出错"),
+        "a rejected submit ends Error: {}",
+        card_header(&final_card)
+    );
+    assert!(
+        card_text(&final_card).contains("provider 503"),
+        "the submit failure must reach the card: {final_card}"
+    );
+    assert!(!app.inflight.lock().await.contains("ses_test"));
 }
 
 /// Idle with nothing outstanding exits without waiting out the (60 s) bound:

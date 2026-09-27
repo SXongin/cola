@@ -40,13 +40,6 @@ pub(crate) fn decode_response(json: &Value) -> crate::error::Result<SessionTrans
     legacy::decode_response(json)
 }
 
-/// Decode one raw parts array — a prompt response's `parts` — through the same
-/// decoder as a polled message's, so the prompt-response fallback cannot
-/// smuggle raw protocol shapes back into the Bridge (spec #332).
-pub(crate) fn decode_parts(parts: &Value) -> Vec<Part> {
-    legacy::decode_parts(parts)
-}
-
 /// One `text` field as a text part: a string becomes [`Part::Text`]; a missing
 /// or non-string field is malformed and stays raw as the WHOLE payload, so a
 /// valid+malformed pair never joins an extra line and nothing is lost. An

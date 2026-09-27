@@ -194,6 +194,75 @@ async fn prompt_error_renders_error_card() {
     assert!(card.contains("503"), "error text missing: {}", card);
 }
 
+/// A failure the server recorded on the assistant message (V1's `info.error`,
+/// V2's message `error`) ends the submitted turn as an Error card: the
+/// async-native Turn reads the turn's failure from the transcript it observes,
+/// not from a blocking prompt response (ADR-0056).
+#[tokio::test]
+async fn transcript_recorded_failure_renders_error_card() {
+    use crate::backend::{MessageRole, SessionTranscript};
+
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    // The turn the server settled: the admitted user message plus an assistant
+    // message carrying the provider failure.
+    let mut failed = typed_message(
+        "msg_assist",
+        MessageRole::Assistant,
+        Some(2_000),
+        vec![text_part("部分回答")],
+    );
+    failed.error = Some("provider 503".into());
+    backend.given_transcript(
+        "ses_test",
+        vec![SessionTranscript::new(vec![
+            typed_message(
+                "msg_cola_failed",
+                MessageRole::User,
+                Some(1_000),
+                vec![text_part("hi")],
+            ),
+            failed,
+        ])],
+    );
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+    app.turn_render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+
+    let context = crate::bridge::turn::PromptContext {
+        session_id: "ses_test".into(),
+        thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+        text: "hi".into(),
+        message_id: "msg_1".into(),
+        subtitle: "p2p".into(),
+        existing_card_id: None,
+        requester_open_id: None,
+        is_group: false,
+        cola_message_id: Some("msg_cola_failed".into()),
+        images: Vec::new(),
+    };
+    crate::bridge::turn::Turn::run(&app.turn_handles(), context)
+        .await
+        .unwrap();
+
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    let text = final_card.to_string();
+    assert!(text.contains("❌"), "error card header missing: {text}");
+    assert!(
+        text.contains("provider 503"),
+        "the transcript's failure must reach the card: {text}"
+    );
+    assert!(
+        text.contains("部分回答"),
+        "content produced before the failure still renders: {text}"
+    );
+}
+
 #[tokio::test]
 async fn error_card_retry_reuses_card_and_reruns_prompt() {
     let _wd = test_work_dir();
@@ -724,6 +793,7 @@ async fn render_poll_shows_live_context_and_memoizes_the_window() {
                 total,
                 ..Default::default()
             }),
+            error: None,
             parts: vec![text_part("回答")],
         }])
     };
@@ -811,6 +881,7 @@ async fn an_in_flight_step_before_the_anchor_renders_live() {
         }),
         model: None,
         tokens: None,
+        error: None,
         parts: vec![
             Part::Reasoning(ReasoningPart {
                 text: "还在研究".into(),

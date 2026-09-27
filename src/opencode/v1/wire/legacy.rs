@@ -47,6 +47,11 @@ struct WireMessageInfo {
     provider_id: Option<String>,
     #[serde(default)]
     tokens: Option<WireMessageTokens>,
+    /// The assistant failure the message records (`AssistantError` on the V1
+    /// schema): a wrapped `{name, data:{message}}`, a plain `{message}`, or a
+    /// string. Kept raw here; [`decode_message_error`] normalizes it.
+    #[serde(default)]
+    error: Option<Value>,
 }
 
 /// Token usage carried on an assistant message's `info.tokens`.
@@ -91,8 +96,7 @@ fn decode(messages: &[WireSessionMessage]) -> SessionTranscript {
     SessionTranscript::new(messages.iter().map(decode_message).collect())
 }
 
-/// Decode one raw parts array — a message's `parts` or a prompt response's —
-/// through the same per-part decoder, so both reads cannot drift.
+/// Decode one raw `parts` array through the per-part decoder.
 pub(super) fn decode_parts(parts: &Value) -> Vec<Part> {
     parts
         .as_array()
@@ -117,8 +121,22 @@ fn decode_message(message: &WireSessionMessage) -> TranscriptMessage {
             variant: None,
         }),
         tokens: info.tokens.as_ref().map(decode_tokens),
+        error: info.error.as_ref().and_then(decode_message_error),
         parts: decode_parts(&message.parts),
     }
+}
+
+/// Normalize an assistant message's recorded failure to its message text. V1's
+/// `AssistantError` union serializes as `{name, data:{message, …}}` for most
+/// arms (`UnknownError`, `APIError`, …); a few shapes carry `message` at the
+/// top level. The wrapped form wins when both exist — the same precedence the
+/// retired blocking-prompt decoder used, so the error text cannot drift.
+fn decode_message_error(error: &Value) -> Option<String> {
+    error
+        .pointer("/data/message")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| decode_error(error))
 }
 
 fn decode_role(role: Option<&str>) -> MessageRole {
@@ -261,6 +279,7 @@ mod tests {
                 model_id: None,
                 provider_id: None,
                 tokens: None,
+                error: None,
             },
             parts: serde_json::json!([
                 {"type": "tool", "tool": "bash", "callID": "call_1", "state": state}
@@ -497,6 +516,7 @@ mod tests {
                 model_id: None,
                 provider_id: None,
                 tokens: None,
+                error: None,
             },
             parts,
         }]);
@@ -571,6 +591,53 @@ mod tests {
         assert_eq!(
             tool(serde_json::json!({"status": "weird"})).status,
             ToolStatus::Other("weird".into())
+        );
+    }
+
+    /// A message's recorded failure decodes onto the neutral message: the
+    /// wrapped `AssistantError` arm (`{name, data:{message}}`) and the bare
+    /// `message` shape both normalize, and a missing/null error stays `None`.
+    #[test]
+    fn message_errors_decode_onto_the_neutral_message() {
+        let decode_one = |error: Value| {
+            let mut info = serde_json::json!({
+                "id": "msg_a1",
+                "role": "assistant",
+                "time": {"created": 1_000, "completed": 1_000},
+            });
+            if !error.is_null() {
+                info["error"] = error;
+            }
+            decode_response(&serde_json::json!([{"info": info, "parts": []}]))
+                .expect("a valid payload decodes")
+                .messages
+                .remove(0)
+        };
+
+        assert_eq!(
+            decode_one(serde_json::json!({
+                "name": "UnknownError",
+                "data": {"message": "Provider is not available", "ref": "x"},
+            }))
+            .error
+            .as_deref(),
+            Some("Provider is not available"),
+            "the wrapped AssistantError arm normalizes"
+        );
+        assert_eq!(
+            decode_one(serde_json::json!({"message": "bare failure"}))
+                .error
+                .as_deref(),
+            Some("bare failure"),
+            "a top-level message normalizes"
+        );
+        assert_eq!(
+            decode_one(serde_json::json!("plain string")).error.as_deref(),
+            Some("plain string")
+        );
+        assert!(
+            decode_one(Value::Null).error.is_none(),
+            "a message without an error carries none"
         );
     }
 

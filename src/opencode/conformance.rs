@@ -39,11 +39,11 @@ pub(crate) struct SessionCase {
     /// follow-up cursor page with the empty end-of-list page, so a recorded
     /// body's real `cursor.next` is exercised rather than stripped out.
     pub(crate) mount_recorded_transcript: fn(&TestHttpServer, &str, &str),
-    /// Mount the generation's prompt dispatch with one scripted assistant
-    /// answer, publishing the shared [`PromptFixture`] values in that
-    /// generation's wire shape. V1 answers the blocking request inline; V2's
-    /// mount includes its wait endpoint and the follow-up transcript read the
-    /// synchronous polyfill performs.
+    /// Mount the generation's prompt submit with one scripted turn — V1's
+    /// native fire-and-forget route (204), V2's admit-then-return prompt
+    /// (`{data: Session.Inbox.User}`) — plus the transcript read serving the
+    /// turn it scheduled, which the neutral scenario observes completion
+    /// through. The shared [`PromptFixture`] names the values.
     pub(crate) mount_prompt: fn(&TestHttpServer, &PromptFixture),
     /// Mount the generation's permission/question-form routes for one pending
     /// request each, publishing the shared [`RequestFixture`] values in that
@@ -195,10 +195,10 @@ impl SessionCase {
     }
 }
 
-/// The neutral values both generations' prompt mounts publish. The prompt
-/// dispatch differs structurally — V1 answers the blocking request with the
-/// assistant message inline, V2 admits, waits and reads the transcript — but
-/// the neutral reply the Bridge consumes is the same.
+/// The neutral values both generations' prompt-submit mounts publish. The
+/// submit differs structurally — V1's fire-and-forget route vs V2's admit
+/// envelope — but both return as soon as the turn is scheduled, and the
+/// neutral observation (the transcript turn) is the same.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PromptFixture {
     pub(crate) session: &'static str,
@@ -609,14 +609,14 @@ async fn transcript_reads_the_same_neutral_view_on_every_generation() {
     }
 }
 
-/// The prompt dispatch has the same neutral outcome on both generations: the
-/// blocking call returns the answer the turn produced, answers the admitted
-/// user message, and surfaces no error. How the block is achieved (V1's native
-/// blocking prompt vs V2's admit + wait + transcript read) stays in the mounts.
+/// Submitting a prompt has the same neutral outcome on both generations: the
+/// call returns once the message is admitted (V1's native fire-and-forget
+/// prompt, V2's native admit-then-return prompt), and the turn it scheduled is
+/// observable through the neutral transcript read — the join the
+/// async-native Turn drives completion from (ADR-0056). The generation's own
+/// wire suite pins its route and payload shape.
 #[tokio::test]
-async fn prompt_returns_the_turn_reply_on_every_generation() {
-    use crate::backend::Part;
-
+async fn prompt_submits_and_the_turn_is_observable_on_every_generation() {
     for case in cases() {
         let generation = case.generation.as_str();
         let fixture = PromptFixture::default();
@@ -624,7 +624,7 @@ async fn prompt_returns_the_turn_reply_on_every_generation() {
         (case.mount_prompt)(&server, &fixture);
         let backend = case.backend(&server);
 
-        let response = backend
+        backend
             .prompt(
                 fixture.session,
                 fixture.text,
@@ -635,29 +635,38 @@ async fn prompt_returns_the_turn_reply_on_every_generation() {
                 Some(fixture.message_id),
             )
             .await
-            .unwrap_or_else(|e| panic!("{generation}: prompt failed: {e}"));
+            .unwrap_or_else(|e| panic!("{generation}: prompt submit failed: {e}"));
 
-        assert_eq!(response.id, fixture.answer_id, "{generation}: answer id");
-        assert_eq!(
-            response.session_id.as_deref(),
-            Some(fixture.session),
-            "{generation}: session"
-        );
-        assert_eq!(
-            response.parent_id.as_deref(),
-            Some(fixture.message_id),
-            "{generation}: the reply answers the admitted user message"
+        // The scheduled turn is observable: the anchor is the admitted user
+        // message and the turn completes with the scripted answer, no error.
+        let transcript = backend
+            .transcript(fixture.session)
+            .await
+            .unwrap_or_else(|e| panic!("{generation}: transcript read failed: {e}"));
+        let anchor = transcript
+            .messages
+            .iter()
+            .find(|message| message.id.as_str() == fixture.message_id)
+            .and_then(|message| message.anchor())
+            .unwrap_or_else(|| {
+                panic!("{generation}: the admitted message must anchor the turn: {transcript:#?}")
+            });
+        let turn = transcript.turn_for_user(&anchor);
+        assert!(
+            turn.complete,
+            "{generation}: the scripted turn must read complete: {turn:#?}"
         );
         assert!(
-            response.error.is_none(),
+            turn.error.is_none(),
             "{generation}: a clean turn reports no error: {:?}",
-            response.error
+            turn.error
         );
-        let texts: Vec<&str> = response
-            .parts
+        let texts: Vec<&str> = turn
+            .messages
             .iter()
+            .flat_map(|message| message.parts.iter())
             .filter_map(|part| match part {
-                Part::Text(text) => Some(text.text.as_str()),
+                crate::backend::Part::Text(text) => Some(text.text.as_str()),
                 _ => None,
             })
             .collect();
