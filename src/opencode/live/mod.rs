@@ -11,9 +11,12 @@
 //! (`live_v2_scripted_write_chain`: supplement steering, retry idempotency,
 //! interrupt, compact and title rename), the permission round-trip
 //! (`live_v2_scripted_permission_chain`: a gated shell tool answered through the
-//! session-scoped decision) and the form round-trip
+//! session-scoped decision), the form round-trip
 //! (`live_v2_scripted_form_chain`: a typed question form answered with a keyed
-//! value, plus a cancellation by delete). Each test spawns the binary of its own
+//! value, plus a cancellation by delete) and the session-scoped selection
+//! (`live_v2_scripted_selection_chain`: durable model/agent/variant switches,
+//! the next turn running them with nothing re-sent, and the coupling to the
+//! bridge's ADR-0020 clear rule). Each test spawns the binary of its own
 //! generation into its own temp store, so neither can touch the machine's
 //! default store, credentials or config; each refuses a binary of the other
 //! generation.
@@ -647,6 +650,208 @@ async fn live_v2_scripted_write_chain() {
         info.title.as_deref(),
         Some(RENAMED_TITLE),
         "V2's 204 title patch must persist"
+    );
+}
+
+/// The V2 session-scoped selection chain against the pinned V2 server:
+/// `switch_session_model` / `switch_session_agent` write durable session state
+/// (the variant inside the model ref), the next turn runs the switched
+/// selection with NOTHING re-sent per prompt, and the bridge's own ADR-0020
+/// clearing rule rewrites the live session's ref when the new model does not
+/// declare the variant.
+#[tokio::test]
+#[ignore = "live: needs a V2 binary (see the module docs)"]
+async fn live_v2_scripted_selection_chain() {
+    use crate::bridge::handles::{PickOutcome, SessionsHandle};
+    use crate::opencode::types::ModelInfo;
+
+    let binary = live_v2_binary();
+    let version = server::ensure_v2_binary(&binary).await;
+    eprintln!("live V2 binary: {binary} ({version})");
+
+    let provider = provider::start_with(provider::Tool::Shell, provider::ToolCommand::Fast).await;
+    let server = LiveServer::start_v2(&binary, &provider.base_url()).await;
+
+    let backend = OpenCodeBackend::with_generation(
+        Some(provider::MODEL_REF),
+        server.base_url(),
+        Some("opencode"),
+        Some(server::PASSWORD),
+        Generation::V2,
+        None,
+    );
+    backend.disable_env_proxy(Some("opencode"), Some(server::PASSWORD));
+
+    wait_for_ready(&backend, &server).await;
+
+    let work_dir = server.work_dir();
+    let session = backend
+        .create_session(&backend.new_session_input(Some(&work_dir)))
+        .await
+        .unwrap_or_else(|error| panic!("create session failed: {error}\n{}", server.stderr()));
+
+    // The create recorded cola's configured model as the session's selection.
+    let selection = backend
+        .session_selection(&session.id, Some(&work_dir))
+        .await
+        .unwrap_or_else(|error| panic!("selection read failed: {error}\n{}", server.stderr()))
+        .expect("a V2 session exposes its durable selection");
+    assert_eq!(
+        selection.model.as_ref().map(|model| model.id.as_str()),
+        Some(provider::MODEL),
+        "the create's configured model is the session's selection: {selection:?}"
+    );
+
+    // `/model` + `/think`: switch to the variant-declaring model with the
+    // variant inside the ref; `/agent`: switch to the configured agent.
+    backend
+        .switch_session_model(
+            &session.id,
+            &ModelInfo {
+                id: provider::MODEL_ALT.into(),
+                provider_id: provider::PROVIDER.into(),
+                variant: Some(provider::VARIANT.into()),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("model switch failed: {error}\n{}", server.stderr()));
+    backend
+        .switch_session_agent(&session.id, provider::AGENT)
+        .await
+        .unwrap_or_else(|error| panic!("agent switch failed: {error}\n{}", server.stderr()));
+
+    let selection = backend
+        .session_selection(&session.id, Some(&work_dir))
+        .await
+        .unwrap_or_else(|error| panic!("selection read failed: {error}\n{}", server.stderr()))
+        .expect("the switched session keeps a selection");
+    let model = selection.model.expect("the switched model survives");
+    assert_eq!(model.id, provider::MODEL_ALT, "the model switch persisted");
+    assert_eq!(
+        model.variant.as_deref(),
+        Some(provider::VARIANT),
+        "the variant rides inside the persisted model ref"
+    );
+    assert_eq!(
+        selection.agent.as_deref(),
+        Some(provider::AGENT),
+        "the agent switch persisted"
+    );
+
+    // The next turn runs the switched selection with nothing re-sent per
+    // prompt (the prompt args are all `None`, exactly what V2 drops).
+    let message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
+    let response = backend
+        .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
+        .await
+        .unwrap_or_else(|error| panic!("prompt failed: {error}\n{}", server.stderr()));
+    assert!(
+        response.error.is_none(),
+        "the switched selection must run cleanly: {:?}",
+        response.error
+    );
+
+    let transcript = backend
+        .transcript(&session.id)
+        .await
+        .unwrap_or_else(|error| panic!("transcript read failed: {error}\n{}", server.stderr()));
+    assert_user_anchor(&transcript, &message_id);
+    assert_turn_complete(&transcript, &message_id);
+    let answer = transcript
+        .messages
+        .iter()
+        .rev()
+        .find(|message| {
+            message.role == MessageRole::Assistant
+                && message.time.is_some_and(|time| time.completed.is_some())
+        })
+        .expect("a completed assistant message");
+    let identity = answer
+        .model
+        .as_ref()
+        .expect("the answering message names its model");
+    assert_eq!(
+        identity.model_id,
+        provider::MODEL_ALT,
+        "the turn ran the session's switched model: {identity:?}"
+    );
+    assert_eq!(
+        identity.variant.as_deref(),
+        Some(provider::VARIANT),
+        "the turn ran the switched ref's variant: {identity:?}"
+    );
+    wait_for_idle(&backend, &session.id, &work_dir, &server).await;
+
+    // The scripted provider was asked for the switched model — the server
+    // really resolved the session ref, not just persisted it.
+    assert!(
+        provider.requests().iter().any(|request| {
+            request.path == "/v1/chat/completions" && request.body.contains(provider::MODEL_ALT)
+        }),
+        "the provider must be asked for the switched model:\n{}",
+        server.stderr()
+    );
+
+    // The bridge's own pick path against the live server: a model that
+    // declares the variant keeps it; a model that does not clears it from the
+    // session's ref (ADR-0020), judged against the server's selection.
+    let store_dir = tempfile::tempdir().expect("a temp store for the live pick");
+    let mut store = crate::bridge::session::SessionStore::new(store_dir.path().join("sessions.json"))
+        .expect("a fresh session store");
+    let key = crate::config::ThreadKey::new("live_selection".into(), "live_selection".into());
+    let mut entry = crate::config::SessionEntry::new(key.clone(), session.id.clone(), work_dir.clone());
+    entry.model = Some(provider::MODEL_ALT_REF.into());
+    entry.variant = Some(provider::VARIANT.into());
+    store.activate(entry).expect("seed the live mapping");
+    let sessions = SessionsHandle::new(
+        std::sync::Arc::new(tokio::sync::Mutex::new(store)),
+        std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+    );
+    let pick_backend = std::sync::Arc::new(backend.clone()) as std::sync::Arc<dyn crate::backend::Backend>;
+
+    let outcome = sessions
+        .pick_model(&pick_backend, &key, provider::MODEL_ALT_REF)
+        .await
+        .unwrap_or_else(|error| panic!("pick_model failed: {error}\n{}", server.stderr()));
+    assert_eq!(
+        outcome,
+        PickOutcome::Applied {
+            cleared_variant: None
+        },
+        "a model that declares the variant keeps it"
+    );
+    let selection = backend
+        .session_selection(&session.id, Some(&work_dir))
+        .await
+        .unwrap_or_else(|error| panic!("selection read failed: {error}\n{}", server.stderr()))
+        .expect("a selection");
+    assert_eq!(
+        selection.model.expect("a model").variant.as_deref(),
+        Some(provider::VARIANT),
+        "the live session kept the variant"
+    );
+
+    let outcome = sessions
+        .pick_model(&pick_backend, &key, provider::MODEL_REF)
+        .await
+        .unwrap_or_else(|error| panic!("pick_model failed: {error}\n{}", server.stderr()));
+    assert_eq!(
+        outcome,
+        PickOutcome::Applied {
+            cleared_variant: Some(provider::VARIANT.to_string())
+        },
+        "a model that lacks the variant clears it"
+    );
+    let selection = backend
+        .session_selection(&session.id, Some(&work_dir))
+        .await
+        .unwrap_or_else(|error| panic!("selection read failed: {error}\n{}", server.stderr()))
+        .expect("a selection");
+    let model = selection.model.expect("the cleared model survives");
+    assert_eq!(model.id, provider::MODEL, "the ref points at the picked model");
+    assert!(
+        model.variant.is_none(),
+        "the undeclared variant is gone from the live session ref"
     );
 }
 

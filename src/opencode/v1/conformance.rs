@@ -18,13 +18,19 @@ use crate::test_http::{MockResponse, TestHttpServer};
 pub(crate) fn case() -> SessionCase {
     SessionCase {
         generation: Generation::V1,
+        keeps_session_selection: false,
         mount,
         mount_transcript,
         mount_recorded_transcript,
         mount_prompt,
         mount_requests,
+        mount_selection,
     }
 }
+
+/// V1 mounts nothing: it has no session switch routes, so the conformance
+/// scenario's switches are no-ops and must stay off the wire.
+fn mount_selection(_server: &TestHttpServer, _fixture: &SessionReadFixture) {}
 
 fn mount(server: &TestHttpServer, fixture: &SessionReadFixture) {
     // Two pages, most recently updated first, with the cursor in the header —

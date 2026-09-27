@@ -275,6 +275,12 @@ pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &Se
             if !model.provider_id.is_empty() {
                 acc.provider_id = Some(model.provider_id.clone());
             }
+            // A decoder that reports the variant (V2's message model ref
+            // carries it) is authoritative for the footer; V1's decoder
+            // deliberately reports none, keeping its turn-time capture.
+            if let Some(variant) = &model.variant {
+                acc.variant = Some(variant.clone());
+            }
         }
         // An in-flight step is its own assistant message and carries all-zero
         // usage until it finishes. Capturing that zero would wipe the last

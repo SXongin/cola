@@ -39,7 +39,7 @@ use async_trait::async_trait;
 use client::OpenCodeBackend;
 use types::{
     AgentInfo, CreateSessionInput, FormAnswer, ImageInput, ModelInfo, PermissionRequest, PromptResponse,
-    ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionStatus,
+    ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
 };
 
 #[async_trait]
@@ -129,6 +129,22 @@ impl Backend for OpenCodeBackend {
 
     async fn transcript(&self, session_id: &str) -> Result<SessionTranscript> {
         OpenCodeBackend::transcript(self, session_id).await
+    }
+
+    async fn session_selection(
+        &self,
+        session_id: &str,
+        directory: Option<&str>,
+    ) -> Result<Option<SessionSelection>> {
+        OpenCodeBackend::session_selection(self, session_id, directory).await
+    }
+
+    async fn switch_session_model(&self, session_id: &str, model: &ModelInfo) -> Result<()> {
+        OpenCodeBackend::switch_session_model(self, session_id, model).await
+    }
+
+    async fn switch_session_agent(&self, session_id: &str, agent: &str) -> Result<()> {
+        OpenCodeBackend::switch_session_agent(self, session_id, agent).await
     }
 
     async fn session_status(

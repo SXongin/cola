@@ -370,11 +370,18 @@ fn write_v1_config(config_home: &Path, provider_base_url: &str) {
 /// spec would send V2 to npm for the AI-SDK package it no longer resolves), and
 /// the V2 permissions list the chain needs. An unmatched action defaults to
 /// `ask`, so a chain that must not block (or must) declares its rule here.
+///
+/// The catalog carries a second model with declared variants and a custom
+/// agent: the S7 selection chain switches to them, so the switch's effect is
+/// observable without credentials or a real provider.
 fn write_v2_config(config_home: &Path, provider_base_url: &str, permissions: V2Permissions) {
     let config = json!({
         "$schema": "https://opencode.ai/config.json",
         "model": provider::MODEL_REF,
-        "agents": { "title": { "model": provider::MODEL_REF } },
+        "agents": {
+            "title": { "model": provider::MODEL_REF },
+            provider::AGENT: { "model": provider::MODEL_REF, "mode": "primary" },
+        },
         "autoupdate": false,
         "share": "disabled",
         "snapshot": false,
@@ -391,6 +398,18 @@ fn write_v2_config(config_home: &Path, provider_base_url: &str, permissions: V2P
                     provider::MODEL: {
                         "name": "Scripted Model",
                         "limit": { "context": 128_000, "output": 4_096 },
+                        // An explicit empty list opts out of V2's synthesized
+                        // provider-package variants: this model is the S7
+                        // clear-on-switch target.
+                        "variants": [],
+                    },
+                    provider::MODEL_ALT: {
+                        "name": "Scripted Model Alt",
+                        "limit": { "context": 128_000, "output": 4_096 },
+                        "variants": provider::MODEL_ALT_VARIANTS
+                            .iter()
+                            .map(|id| json!({ "id": id }))
+                            .collect::<Vec<_>>(),
                     },
                 },
             },
@@ -455,6 +474,16 @@ mod tests {
         assert!(config["provider"].is_null(), "no V1 provider shape");
         assert_eq!(config["model"], provider::MODEL_REF);
         assert_eq!(config["agents"]["title"]["model"], provider::MODEL_REF);
+        assert_eq!(
+            config["agents"][provider::AGENT]["mode"],
+            "primary",
+            "the selection chain's switch target agent is configured"
+        );
+        assert_eq!(
+            config["providers"][provider::PROVIDER]["models"][provider::MODEL_ALT]["variants"][0]["id"],
+            provider::VARIANT,
+            "the alt model declares the variant the chain attaches"
+        );
         assert_eq!(config["permissions"][0]["action"], "shell");
         assert_eq!(config["permissions"][0]["effect"], "allow");
         assert!(

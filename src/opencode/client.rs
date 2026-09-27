@@ -18,7 +18,7 @@ use super::transport::Transport;
 use super::types::{
     AgentInfo, CreateSessionInput, CreateSessionResponse, FormAnswer, ImageInput, Location, ModelInfo,
     PermissionRequest, PromptResponse, ProviderModels, QuestionRequest, Session, SessionInfo,
-    SessionListInfo, SessionStatus,
+    SessionListInfo, SessionSelection, SessionStatus,
 };
 
 /// Session creation, on the `/api` surface both generations serve. It is a
@@ -349,6 +349,36 @@ impl OpenCodeBackend {
 
     pub async fn transcript(&self, session_id: &str) -> crate::error::Result<SessionTranscript> {
         self.strategy().transcript(&self.transport, session_id).await
+    }
+
+    /// The session's durable model/agent selection where the generation keeps
+    /// one server-side (V2); `None` on V1 (its picks ride each prompt).
+    pub async fn session_selection(
+        &self,
+        session_id: &str,
+        directory: Option<&str>,
+    ) -> crate::error::Result<Option<SessionSelection>> {
+        self.strategy()
+            .session_selection(&self.transport, session_id, directory)
+            .await
+    }
+
+    /// Make the session's model selection durable (V2); a no-op on V1.
+    pub async fn switch_session_model(
+        &self,
+        session_id: &str,
+        model: &ModelInfo,
+    ) -> crate::error::Result<()> {
+        self.strategy()
+            .switch_session_model(&self.transport, session_id, model)
+            .await
+    }
+
+    /// Make the session's agent selection durable (V2); a no-op on V1.
+    pub async fn switch_session_agent(&self, session_id: &str, agent: &str) -> crate::error::Result<()> {
+        self.strategy()
+            .switch_session_agent(&self.transport, session_id, agent)
+            .await
     }
 
     pub async fn session_status(

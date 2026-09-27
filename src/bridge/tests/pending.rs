@@ -1140,3 +1140,58 @@ async fn switch_forget_clears_the_pending_too() {
     assert!(store.pending_for(&key()).is_none(), "the pending is forgotten");
     assert!(store.list_thread(&key()).is_empty(), "the mappings are forgotten");
 }
+
+/// A Pending Session's picks become session switches at materialisation: the
+/// session that is created gets the model ref (variant inside it) and the
+/// agent written to it, so a durable generation's first prompt needs no
+/// per-prompt fields (V1's switches are no-ops; its prompt still carries them).
+#[tokio::test]
+async fn pending_picks_are_switched_when_the_session_materialises() {
+    use crate::opencode::types::ModelInfo;
+
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let switch_models = backend.switch_model_calls.clone();
+    let switch_agents = backend.switch_agent_calls.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let mut pending = PendingEntry::new(key(), "/work/proj");
+    pending.model = Some("p/test".into());
+    pending.variant = Some("high".into());
+    pending.agent = Some("build".into());
+    seed_pending(&app, pending).await;
+
+    app.handle_message(incoming(
+        "msg_prompt".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+
+    assert_eq!(
+        switch_models.lock().await.as_slice(),
+        &[(
+            "ses_test".to_string(),
+            ModelInfo {
+                id: "test".into(),
+                provider_id: "p".into(),
+                variant: Some("high".into()),
+            }
+        )],
+        "the created session gets the pending's model ref"
+    );
+    assert_eq!(
+        switch_agents.lock().await.as_slice(),
+        &[("ses_test".to_string(), "build".to_string())],
+        "the created session gets the pending's agent"
+    );
+    // The materialised entry still carries the picks for V1's per-prompt path.
+    let entry = app.sessions.lock().await.get_active(&key()).cloned().unwrap();
+    assert_eq!(entry.model.as_deref(), Some("p/test"));
+    assert_eq!(entry.variant.as_deref(), Some("high"));
+    assert_eq!(entry.agent.as_deref(), Some("build"));
+}

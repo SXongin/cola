@@ -23,6 +23,10 @@ use crate::test_http::TestHttpServer;
 /// shared fixture values into the generation's own wire shapes.
 pub(crate) struct SessionCase {
     pub(crate) generation: Generation,
+    /// Whether this generation keeps the model/agent selection server-side
+    /// (`true` on V2's session switches, `false` on V1, whose picks ride each
+    /// prompt). Drives the session-selection conformance scenario.
+    pub(crate) keeps_session_selection: bool,
     /// Mount the generation's fake session-read routes (a two-page list, one
     /// session get, the run-state reads), publishing the shared
     /// [`SessionReadFixture`] values in that generation's envelope shapes.
@@ -45,6 +49,11 @@ pub(crate) struct SessionCase {
     /// request each, publishing the shared [`RequestFixture`] values in that
     /// generation's shape (V1's positional questions, V2's typed forms).
     pub(crate) mount_requests: fn(&TestHttpServer, &RequestFixture),
+    /// Mount the generation's model/agent switch routes, where it has any: V2
+    /// mounts a stateful `GET /api/session/{id}` + `POST .../model|agent` so a
+    /// switch is observable in the following read; V1 mounts nothing (its
+    /// switches are no-ops).
+    pub(crate) mount_selection: fn(&TestHttpServer, &SessionReadFixture),
 }
 
 /// The neutral values both generations' session-read payloads publish. One
@@ -776,5 +785,71 @@ async fn form_cancel_round_trips_on_every_generation() {
             .reject_question(fixture.session, fixture.form_id, Some(fixture.directory))
             .await
             .unwrap_or_else(|e| panic!("{generation}: reject_question failed: {e}"));
+    }
+}
+
+/// The session-scoped selection is generation-dependent by design: a
+/// generation with durable switches (V2) round-trips the model ref — variant
+/// inside it — and the agent, while a generation whose picks ride each prompt
+/// (V1) reports no durable selection and its switches are no-ops. The neutral
+/// caller sees one shape either way: [`SessionSelection`].
+#[tokio::test]
+async fn session_switches_round_trip_only_where_the_generation_keeps_them() {
+    use crate::opencode::types::ModelInfo;
+
+    for case in cases() {
+        let generation = case.generation.as_str();
+        let fixture = SessionReadFixture::default();
+        let server = TestHttpServer::start().await;
+        (case.mount_selection)(&server, &fixture);
+        let backend = case.backend(&server);
+
+        backend
+            .switch_session_model(
+                fixture.newest,
+                &ModelInfo {
+                    id: fixture.model.into(),
+                    provider_id: fixture.provider.into(),
+                    variant: Some("high".into()),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{generation}: model switch failed: {e}"));
+        backend
+            .switch_session_agent(fixture.newest, fixture.agent)
+            .await
+            .unwrap_or_else(|e| panic!("{generation}: agent switch failed: {e}"));
+
+        let selection = backend
+            .session_selection(fixture.newest, Some(fixture.directory))
+            .await
+            .unwrap_or_else(|e| panic!("{generation}: selection read failed: {e}"));
+
+        if case.keeps_session_selection {
+            let selection = selection.unwrap_or_else(|| panic!("{generation}: a durable selection"));
+            let model = selection.model.expect("the switched model survives");
+            assert_eq!(model.provider_id, fixture.provider, "{generation}: provider");
+            assert_eq!(model.id, fixture.model, "{generation}: model id");
+            assert_eq!(
+                model.variant.as_deref(),
+                Some("high"),
+                "{generation}: the variant rides the model ref"
+            );
+            assert_eq!(
+                selection.agent.as_deref(),
+                Some(fixture.agent),
+                "{generation}: agent"
+            );
+        } else {
+            assert!(
+                selection.is_none(),
+                "{generation}: a per-prompt generation keeps no durable selection"
+            );
+            assert!(
+                server.requests().is_empty(),
+                "{generation}: its switches must not reach the wire: {:?}",
+                server.requests()
+            );
+        }
     }
 }

@@ -34,8 +34,8 @@ use crate::backend::{
     ToolStatus, TranscriptMessage,
 };
 use crate::opencode::types::{
-    FormFieldKind, PermissionRequest, QuestionInfo, QuestionOption, QuestionRequest, SessionInfo,
-    SessionListInfo, SessionModel, SessionTime,
+    AgentInfo, FormFieldKind, ModelInfo, ModelOption, PermissionRequest, QuestionInfo, QuestionOption,
+    QuestionRequest, SessionInfo, SessionListInfo, SessionModel, SessionSelection, SessionTime,
 };
 
 /// `{data: T}` — the envelope most V2 reads share (R2's "unwrap per route —
@@ -118,6 +118,107 @@ impl RawSessionInfo {
                 .transpose()?,
         })
     }
+
+    /// The neutral durable-selection read: the session's model ref (variant
+    /// inside it) and agent. A malformed model is a decode error, like
+    /// [`Self::into_session_info`].
+    pub(super) fn into_selection(self) -> serde_json::Result<SessionSelection> {
+        Ok(SessionSelection {
+            model: self
+                .model
+                .map(serde_json::from_value::<RawModelRef>)
+                .transpose()?
+                .map(RawModelRef::into_model_info),
+            agent: self.agent,
+        })
+    }
+}
+
+/// `Session.Info.model` — the `Model.Ref` a durable selection carries. The
+/// variant is part of the ref (V2's `/think` semantics).
+#[derive(Debug, Deserialize)]
+struct RawModelRef {
+    #[serde(rename = "providerID")]
+    provider_id: String,
+    id: String,
+    #[serde(default)]
+    variant: Option<String>,
+}
+
+impl RawModelRef {
+    fn into_model_info(self) -> ModelInfo {
+        ModelInfo {
+            id: self.id,
+            provider_id: self.provider_id,
+            // V2 serializes "no variant" as the literal `"default"` on the
+            // session read (`Session.Info` normalizes an absent variant to it)
+            // and treats that spelling as unset everywhere else, so the
+            // neutral ref must not carry it as a real variant.
+            variant: self.variant.filter(|variant| variant != "default"),
+        }
+    }
+}
+
+/// `GET /api/agent` — one `Agent.Info`. `id` is the wire identity a session
+/// switch takes; the neutral view carries it as the agent's selectable name
+/// (V1's agent name IS its id). `name` is the display name, which only the
+/// server-side catalog knows and cola does not show on the picker today.
+#[derive(Debug, Deserialize)]
+pub(super) struct RawAgentInfo {
+    pub(super) id: String,
+    #[serde(default)]
+    pub(super) description: Option<String>,
+    #[serde(default)]
+    pub(super) mode: Option<String>,
+    #[serde(default)]
+    pub(super) hidden: Option<bool>,
+}
+
+impl RawAgentInfo {
+    pub(super) fn into_neutral(self) -> AgentInfo {
+        AgentInfo {
+            name: self.id,
+            description: self.description,
+            mode: self.mode,
+            hidden: self.hidden,
+        }
+    }
+}
+
+/// `GET /api/model` — one `Model.Info`. Only the catalog fields the `/model`
+/// picker and the context-window footer read; `GET /api/model` already serves
+/// the enabled set, so no `enabled`/`status` filter is applied here.
+#[derive(Debug, Deserialize)]
+pub(super) struct RawModelInfo {
+    pub(super) id: String,
+    #[serde(rename = "providerID")]
+    pub(super) provider_id: String,
+    #[serde(default)]
+    pub(super) variants: Vec<RawModelVariant>,
+    #[serde(default)]
+    pub(super) limit: Option<RawModelLimit>,
+}
+
+impl RawModelInfo {
+    pub(super) fn into_option(self) -> ModelOption {
+        ModelOption {
+            id: self.id,
+            variants: self.variants.into_iter().map(|variant| variant.id).collect(),
+        }
+    }
+}
+
+/// One declared thinking-level variant (`Model.Variant`).
+#[derive(Debug, Deserialize)]
+pub(super) struct RawModelVariant {
+    pub(super) id: String,
+}
+
+/// The model's declared limits; only the context window is read.
+#[derive(Debug, Deserialize)]
+pub(super) struct RawModelLimit {
+    #[serde(default)]
+    pub(super) context: Option<i64>,
 }
 
 /// `POST /api/session/{id}/prompt` — `{data: SessionInbox.User}`. The admitted

@@ -6,6 +6,7 @@ use tracing::Instrument;
 use crate::bridge::access::{Access, Decision, DenyReason};
 use crate::bridge::command;
 use crate::bridge::core::SharedCore;
+use crate::bridge::handles::PickOutcome;
 use crate::bridge::session::PendingEntry;
 use crate::bridge::span;
 use crate::bridge::turn::PromptContext;
@@ -710,6 +711,13 @@ impl App {
             .opencode
             .create_session(&self.opencode.new_session_input(Some(&pending.directory)))
             .await?;
+        // ADR-0041 + V2's durable selection: the pending's picks become
+        // session switches now that a session exists, so the first prompt
+        // needs no per-prompt fields. On V1 these calls are no-ops and the
+        // first prompt carries the picks as before. Best-effort: a failed
+        // switch warns (and tells the user), but the created session is never
+        // orphaned.
+        self.apply_pending_picks(&session.id, &pending, message_id).await;
         // Creation title policy (ADR-0007): `/new <name>` PATCHes the title.
         // A failed PATCH must not orphan the created session (a retry would
         // create a second one), so it warns and keeps the server-generated
@@ -743,6 +751,57 @@ impl App {
         // card. No-op for lobby pendings and fallback-rooted topics.
         crate::bridge::topic::claim_pending_cover(&self.topic_handles(), &thread_key, &session.id).await;
         Ok(session.id)
+    }
+
+    /// Apply a Pending Session's picks to the session it just created. The
+    /// model switch needs a full ref, so a variant-only pending (no `/model`
+    /// pick) resolves the model the create recorded; the agent switches by id.
+    /// V1's strategy no-ops both calls, so this is free there. Failures are
+    /// reported once, without orphaning the created session.
+    async fn apply_pending_picks(&self, session_id: &str, pending: &PendingEntry, message_id: &str) {
+        let mut failures: Vec<String> = Vec::new();
+        let mut model = pending
+            .model
+            .as_deref()
+            .and_then(crate::opencode::parsing::parse_model);
+        if model.is_none() && pending.variant.is_some() {
+            model = self
+                .opencode
+                .session_info(session_id, Some(&pending.directory))
+                .await
+                .ok()
+                .and_then(|info| info.model)
+                .map(|model| opencode::types::ModelInfo {
+                    id: model.id,
+                    provider_id: model.provider_id,
+                    variant: None,
+                });
+        }
+        if let Some(mut model) = model {
+            model.variant = pending.variant.clone();
+            if let Err(e) = self.opencode.switch_session_model(session_id, &model).await {
+                tracing::warn!("materialise: model switch failed for {session_id}: {e}");
+                failures.push(format!("模型/思考等级未生效（{e}）"));
+            }
+        }
+        if let Some(agent) = &pending.agent
+            && let Err(e) = self.opencode.switch_session_agent(session_id, agent).await
+        {
+            tracing::warn!("materialise: agent switch failed for {session_id}: {e}");
+            failures.push(format!("Agent 未生效（{e}）"));
+        }
+        if !failures.is_empty() {
+            let _ = self
+                .feishu
+                .reply_text(
+                    message_id,
+                    &format!(
+                        "⚠️ 会话已创建，但{}；可用 `/model`、`/think`、`/agent` 重试。",
+                        failures.join("；")
+                    ),
+                )
+                .await;
+        }
     }
 
     /// Create a brand-new session on the current server and make it the active
@@ -1506,11 +1565,12 @@ impl App {
     }
 
     /// Handle an `/agent` picker-card button: record the per-session override
-    /// (action `agent`), or clear it via the dedicated `agent_clear` button.
-    /// Clearing is carried by the ACTION tag, never a value word — an agent
-    /// literally named like a clear verb stays selectable (ADR-0020), so
-    /// `clear` is a dispatch flag, not a value predicate. Refreshes the card so
-    /// the current agent updates.
+    /// (action `agent`) — and on a durable generation (V2) switch the session's
+    /// agent — or clear it via the dedicated `agent_clear` button (which on V2
+    /// switches to the server's default agent id). Clearing is carried by the
+    /// ACTION tag, never a value word — an agent literally named like a clear
+    /// verb stays selectable (ADR-0020), so `clear` is a dispatch flag, not a
+    /// value predicate. Refreshes the card so the current agent updates.
     async fn handle_agent_card_action(
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
@@ -1523,18 +1583,36 @@ impl App {
             .unwrap_or("")
             .to_string();
         let thread_key = thread_key_from_value(value);
-        let Some(mut settings) = core.session_settings(&thread_key).await else {
-            return Some(CardActionResult {
-                card: None,
-                toast: Some(format!(
-                    "{}还没有会话",
-                    crate::bridge::display::feishu_side_label(&thread_key)
-                )),
-            });
-        };
-        settings.agent = if clear { None } else { Some(picked.clone()) };
-        if let Err(e) = core.set_session_settings(&thread_key, settings).await {
-            tracing::warn!("agent card: persist failed: {}", e);
+        let agent = if clear { None } else { Some(picked.clone()) };
+        match core.pick_agent(&thread_key, agent).await {
+            Ok(PickOutcome::Applied { .. }) => {}
+            Ok(PickOutcome::NoTarget) => {
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some(format!(
+                        "{}还没有会话",
+                        crate::bridge::display::feishu_side_label(&thread_key)
+                    )),
+                });
+            }
+            Ok(PickOutcome::NoDefaultAgent) => {
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some("无法确定服务器默认 Agent".to_string()),
+                });
+            }
+            Ok(_) => {
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some("无法应用当前 Agent 选择".to_string()),
+                });
+            }
+            Err(e) => {
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some(format!("切换 Agent 失败：{e}")),
+                });
+            }
         }
         let (card, _error) =
             crate::feishu::card::command::agent_card(&core.command_handles(), &thread_key).await;
@@ -1589,29 +1667,39 @@ impl App {
             return Some(Self::picker_pages_result(core, &thread_key, cards).await);
         }
 
-        // Level 2: a concrete model — record the override.
+        // Level 2: a concrete model — record the override (and on a durable
+        // generation switch the session's model), carrying or clearing the
+        // `/think` variant (ADR-0020), same as the `/model` text form.
         if crate::opencode::parsing::parse_model(&picked).is_none() {
             return Some(CardActionResult {
                 card: None,
                 toast: Some("模型格式应为 <provider>/<model>".to_string()),
             });
         }
-        let Some(mut settings) = core.session_settings(&thread_key).await else {
-            return Some(CardActionResult {
-                card: None,
-                toast: Some(format!(
-                    "{}还没有会话",
-                    crate::bridge::display::feishu_side_label(&thread_key)
-                )),
-            });
+        let cleared_variant = match core.pick_model(&thread_key, &picked).await {
+            Ok(PickOutcome::Applied { cleared_variant }) => cleared_variant,
+            Ok(PickOutcome::NoTarget) => {
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some(format!(
+                        "{}还没有会话",
+                        crate::bridge::display::feishu_side_label(&thread_key)
+                    )),
+                });
+            }
+            Ok(_) => {
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some("无法应用当前模型选择".to_string()),
+                });
+            }
+            Err(e) => {
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some(format!("切换模型失败：{e}")),
+                });
+            }
         };
-        settings.model = Some(picked.clone());
-        // Auto-clear the `/think` variant when the new model doesn't declare
-        // it (ADR-0020), same as the `/model` text form.
-        let cleared_variant = core.clear_variant_for_model(&mut settings.variant, &picked).await;
-        if let Err(e) = core.set_session_settings(&thread_key, settings).await {
-            tracing::warn!("model card: persist failed: {}", e);
-        }
         let extra = cleared_variant
             .map(|v| format!("（已清除思考等级 `{v}`：新模型不支持）"))
             .unwrap_or_default();
@@ -1642,7 +1730,7 @@ impl App {
             .unwrap_or("")
             .to_string();
         let thread_key = thread_key_from_value(value);
-        let Some(mut settings) = core.session_settings(&thread_key).await else {
+        let Some(settings) = core.session_settings(&thread_key).await else {
             return Some(CardActionResult {
                 card: None,
                 toast: Some(format!(
@@ -1661,9 +1749,38 @@ impl App {
                 toast: Some(format!("当前模型 `{provider}/{model}` 不支持思考等级 `{picked}`")),
             });
         }
-        settings.variant = if clear { None } else { Some(picked.clone()) };
-        if let Err(e) = core.set_session_settings(&thread_key, settings).await {
-            tracing::warn!("think card: persist failed: {}", e);
+        match core
+            .pick_think(&thread_key, if clear { None } else { Some(picked.clone()) })
+            .await
+        {
+            Ok(PickOutcome::Applied { .. }) => {}
+            Ok(PickOutcome::NoTarget) => {
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some(format!(
+                        "{}还没有会话",
+                        crate::bridge::display::feishu_side_label(&thread_key)
+                    )),
+                });
+            }
+            Ok(PickOutcome::NoModel) => {
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some("无法确定当前模型，请先用 /model 选择模型".to_string()),
+                });
+            }
+            Ok(_) => {
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some("无法应用当前思考等级".to_string()),
+                });
+            }
+            Err(e) => {
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some(format!("设置思考等级失败：{e}")),
+                });
+            }
         }
         let (card, _error) =
             crate::feishu::card::command::think_card(&core.command_handles(), &thread_key).await;

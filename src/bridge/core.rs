@@ -408,16 +408,51 @@ impl SharedCore {
         self.sessions_handle().variant_override(session_id).await
     }
 
-    /// The model the NEXT turn will actually run, resolved settings override →
-    /// configured default → server-recorded session model (`GET /session/{id}`).
-    /// `None` only when every rung fails (no override, no config, server
-    /// unreachable) — the `/think` card then tells the user to `/model` first,
-    /// and the `/model` picker omits its current-model line. Returns
-    /// `(provider, model)`. A Pending Session has no server-recorded rung
-    /// (nothing exists on the server yet, ADR-0041).
+    /// The model the NEXT turn will actually run, resolved generation-natively:
+    /// the session's durable selection where the generation keeps one (V2),
+    /// else settings override → configured default → server-recorded session
+    /// model (`GET /session/{id}`). `None` only when every rung fails (no
+    /// durable selection, no override, no config, server unreachable) — the
+    /// `/think` card then tells the user to `/model` first, and the `/model`
+    /// picker omits its current-model line. Returns `(provider, model)`. A
+    /// Pending Session has no server-recorded rung (nothing exists on the
+    /// server yet, ADR-0041).
     pub async fn effective_model(&self, settings: &SessionSettings) -> Option<(String, String)> {
         self.sessions_handle()
             .effective_model(&self.opencode, settings)
+            .await
+    }
+
+    /// Apply a `/model` pick (ADR-0020 + V2's durable switch).
+    pub async fn pick_model(
+        &self,
+        thread_key: &ThreadKey,
+        model_spec: &str,
+    ) -> crate::error::Result<crate::bridge::handles::PickOutcome> {
+        self.sessions_handle()
+            .pick_model(&self.opencode, thread_key, model_spec)
+            .await
+    }
+
+    /// Apply a `/think` pick (`variant: None` clears).
+    pub async fn pick_think(
+        &self,
+        thread_key: &ThreadKey,
+        variant: Option<String>,
+    ) -> crate::error::Result<crate::bridge::handles::PickOutcome> {
+        self.sessions_handle()
+            .pick_think(&self.opencode, thread_key, variant)
+            .await
+    }
+
+    /// Apply an `/agent` pick (`agent: None` resets to the server default).
+    pub async fn pick_agent(
+        &self,
+        thread_key: &ThreadKey,
+        agent: Option<String>,
+    ) -> crate::error::Result<crate::bridge::handles::PickOutcome> {
+        self.sessions_handle()
+            .pick_agent(&self.opencode, thread_key, agent)
             .await
     }
 
@@ -428,24 +463,6 @@ impl SharedCore {
     pub async fn model_variants(&self, provider: &str, model: &str) -> Option<Vec<String>> {
         self.sessions_handle()
             .model_variants(&self.opencode, provider, model)
-            .await
-    }
-
-    /// Auto-clear a `/think` variant when switching to a model that doesn't
-    /// declare it (ADR-0020): a leftover variant would make every prompt fail
-    /// with a server `VariantUnavailableError`. Works on the variant field of
-    /// either a real session or a Pending Session — the settings commands
-    /// choose the target, this owns the rule. Returns the cleared variant name,
-    /// or `None` when the variant survives. Best-effort: a model not found in
-    /// the advertised catalog is left alone (can't be judged, so it is not
-    /// destroyed — the server error is the fallback).
-    pub async fn clear_variant_for_model(
-        &self,
-        variant: &mut Option<String>,
-        model_spec: &str,
-    ) -> Option<String> {
-        self.sessions_handle()
-            .clear_variant_for_model(&self.opencode, variant, model_spec)
             .await
     }
 

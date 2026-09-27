@@ -346,8 +346,13 @@ impl Turn {
         // Capture the variant actually sent this turn AT SEND TIME, not at
         // finalization: a `/think` issued mid-generation must not retro-tag the
         // card of a turn that was sent without it (same "capture at turn start"
-        // rule as the work-context 📁 half, ADR-0019).
-        self.turn_variant = handles.sessions.variant_override(&self.session_id).await;
+        // rule as the work-context 📁 half, ADR-0019). On a durable generation
+        // (V2) the session's own selection is the source of truth — another
+        // client may have changed it — so a stale mirror cannot tag the turn.
+        self.turn_variant = handles
+            .sessions
+            .effective_variant(&handles.backend, &self.session_id, Some(&self.directory))
+            .await;
         let model = handles.sessions.model_override(&self.session_id).await;
         let agent = handles.sessions.agent_override(&self.session_id).await;
         let prompt_resp = handles
@@ -546,6 +551,15 @@ impl Turn {
                                 acc.model_id = Some(model.model_id.clone());
                                 if !model.provider_id.is_empty() {
                                     acc.provider_id = Some(model.provider_id.clone());
+                                }
+                                // A decoder that reports the variant (V2's
+                                // message model ref carries it) is
+                                // authoritative: the footer shows what
+                                // actually ran. V1's decoder deliberately
+                                // reports none, so its turn-time capture
+                                // (ADR-0019) stands.
+                                if let Some(variant) = &model.variant {
+                                    acc.variant = Some(variant.clone());
                                 }
                             }
                             if let Some(tokens) = &message.tokens {
@@ -1820,5 +1834,64 @@ mod tests {
         let cards = app.cards.lock().await;
         let footer_variant = cards.get("ses_a").and_then(|c| c.acc.variant.clone());
         assert_eq!(footer_variant.as_deref(), Some("high"));
+    }
+
+    /// A decoder that reports the model's variant (V2's message model ref
+    /// carries it) is what the footer shows — the server's truthful selection
+    /// even when cola's local mirror has none, and nothing is sent per prompt.
+    #[tokio::test]
+    async fn footer_reads_the_variant_the_transcript_reports() {
+        use crate::backend::{MessageRole, ModelIdentity, SessionTranscript};
+
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        let sent_variants = backend.prompt_variants.clone();
+        let now = chrono::Utc::now().timestamp_millis();
+        let user = crate::bridge::test_support::typed_message(
+            "msg_u",
+            MessageRole::User,
+            Some(now),
+            vec![crate::bridge::test_support::text_part("hi")],
+        );
+        let mut assistant = crate::bridge::test_support::typed_message(
+            "msg_a",
+            MessageRole::Assistant,
+            Some(now + 1_000),
+            realistic_parts(),
+        );
+        assistant.model = Some(ModelIdentity {
+            provider_id: "opencode-go".into(),
+            model_id: "deepseek-v4-flash".into(),
+            variant: Some("high".into()),
+        });
+        backend.given_transcript("ses_a", vec![SessionTranscript::new(vec![user, assistant])]);
+        let (app, _platform) = build_app(cfg, backend).await;
+        seed_entry(
+            &app,
+            crate::config::SessionEntry::new(
+                ThreadKey::new("chat_1".into(), "chat_1".into()),
+                "ses_a",
+                "/tmp/a",
+            ),
+        )
+        .await;
+
+        Turn::run(&app.turn_handles(), ctx("ses_a", "hi")).await.unwrap();
+
+        assert_eq!(
+            sent_variants.lock().await.as_slice(),
+            &[None],
+            "the durable generation sends no per-prompt variant"
+        );
+        let cards = app.cards.lock().await;
+        let acc = cards.get("ses_a").expect("the turn's card");
+        assert_eq!(
+            acc.acc.variant.as_deref(),
+            Some("high"),
+            "the footer reads the transcript's variant"
+        );
+        assert_eq!(acc.acc.model_id.as_deref(), Some("deepseek-v4-flash"));
     }
 }
