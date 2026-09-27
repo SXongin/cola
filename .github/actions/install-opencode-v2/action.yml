@@ -1,4 +1,4 @@
-# The pinned OpenCode **V2** install, in one place: the advisory `Live V2` job
+# The pinned OpenCode **V2** install, in one place: the `Live V2` job
 # runs exactly this fingerprint. V2 ships as npm packages (`@opencode/cli` plus
 # a platform binary package), so unlike V1 there is no tarball URL; the version
 # lives once, in the `version` input default, and the cache key derives from it.

@@ -131,20 +131,22 @@ newly published RUSTSEC advisories surface even when nothing is pushed.
    and explicit go-ahead before merging (see *Branch workflow*; the release cut
    is the ADR-0033 exception).
 
-The `main: CI` ruleset requires exactly those five checks — judge merge-readiness
-with `gh pr checks <branch> --required`, not by eyeballing every check. CodeQL
-also runs on PRs, but it is advisory: it is not a required check, so a slow or
-red CodeQL result never blocks a normal merge. The release cut is the one flow
-that makes it required (its watch covers every check).
+The `main: CI` ruleset requires seven checks: `Format`, `Check`,
+`Test (macos-latest)`, `Test (windows-latest)`, `Live V1`, `Live V2` and
+`Dependency audit` — judge merge-readiness with `gh pr checks <branch>
+--required`, not by eyeballing every check. CodeQL also runs on PRs, but it is
+advisory: it is not a required check, so a slow or red CodeQL result never
+blocks a normal merge. The release cut is the one flow that makes it required
+(its watch covers every check).
 
 Release PRs (`release/*`) and docs-only PRs skip the code-dependent work
-(Format, Check, Coverage, and the Test steps): a skipped job or step reports
-success, so the required checks still satisfy the `main: CI` ruleset and the PR
-stays mergeable without running the code-dependent gates. The Test job itself
-still dispatches on both platforms (idling for a few seconds) — a job-level
-skip leaves its matrix unexpanded and the two required `Test (…)` checks never
-report, so only its steps are gated. `Dependency audit` always runs, and the
-release cut keeps its CodeQL gate.
+(Format, Check, Coverage, the live suites, and the Test steps): a skipped job
+or step reports success, so the required checks still satisfy the `main: CI`
+ruleset and the PR stays mergeable without running the code-dependent gates.
+The Test matrix and the two live jobs still dispatch (idling for a few
+seconds) — a job-level skip leaves the matrix unexpanded or the required
+`Live V1`/`Live V2` checks unreported, so only their steps are gated.
+`Dependency audit` always runs, and the release cut keeps its CodeQL gate.
 
 Description template:
 
