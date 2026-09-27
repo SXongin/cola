@@ -1,9 +1,10 @@
 //! The V2 suite: wire tests driving the real adapter (with the V2 strategy
 //! selected) against a local fake server, asserting both sides of every
 //! exchange — the recorded request (method / path / query / body) and what the
-//! client parsed back (ADR-0031). These pin the V2 read contract: the `{data}`
-//! envelopes, the body cursor, the transcript decode and its pagination, the
-//! 204 mutations, and the run-state derivation.
+//! client parsed back (ADR-0031). These pin the V2 wire contract: the `{data}`
+//! envelopes and body cursor, the transcript decode and its pagination, the
+//! 204 mutations, the run-state derivation, the admit-then-return prompt, the
+//! session-scoped switches, and the permission/form surface.
 
 use crate::error::BridgeError;
 use crate::opencode::client::OpenCodeBackend;

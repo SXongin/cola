@@ -2,8 +2,8 @@
 //! wire tests driving the real adapter (which defaults to the V1 strategy)
 //! against a local fake server, asserting both sides of every exchange — the
 //! recorded request (method / path / query / headers / body) and what the
-//! client parsed back (ADR-0031). These pin the V1 wire contract; V2 grows the
-//! same suite shape beside its strategy.
+//! client parsed back (ADR-0031). These pin the V1 wire contract; V2's suite
+//! beside its strategy has the same shape.
 
 use super::*;
 use crate::error::BridgeError;

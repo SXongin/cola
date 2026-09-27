@@ -9,9 +9,8 @@
 //! see the machine's default store, credentials or config (the spec's "never
 //! point a test server at the default store").
 //!
-//! The harness also refuses a binary of the wrong generation: running the live
-//! V1 contract on V2 (or the V2 read chain on V1) would assert the wrong
-//! protocol.
+//! The harness also refuses a binary of the wrong generation: running a live
+//! V1 chain on V2 (or a V2 chain on V1) would assert the wrong protocol.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -250,8 +249,6 @@ impl Drop for LiveServer {
     }
 }
 
-/// Fail fast unless `binary` is a V1 binary, and return the version it
-/// reported. The live suite asserts V1's wire contract; a V2 binary would
 /// The env var that points a live test at its generation's binary.
 fn live_binary_env(generation: Generation) -> &'static str {
     match generation {
@@ -288,7 +285,7 @@ pub async fn ensure_v1_binary(binary: &str) -> String {
 }
 
 /// Fail fast unless `binary` is a V2 binary, and return the version it
-/// reported. The mirror of [`ensure_v1_binary`]: the V2 read slice must run
+/// reported. The mirror of [`ensure_v1_binary`]: the live V2 suite must run
 /// against V2's `/api` surface, never against the V1 compatibility surface.
 pub async fn ensure_v2_binary(binary: &str) -> String {
     let stdout = binary_version(binary).await;
