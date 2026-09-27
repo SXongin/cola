@@ -90,6 +90,7 @@ Set `COLA_LIVE_CAPTURE_DIR=<dir>` on either run to re-record the raw transcript 
 - **PR rules**: `CONTRIBUTING.md` — commit conventions, the pre-PR verification loop, and the PR description checklist. Follow it when creating commits or PRs.
 - **Coding standards**: `CODING_STANDARDS.md` — the source the `/code-review` skill's Standards axis reads (together with `CONTRIBUTING.md`).
 - **Releases**: cut with `cargo xtask release <version>` (ADR-0033) — it bumps the manifest, merges through the CI-gated PR, and tags the merged commit. Never hand-edit the version or tag a branch commit; only pass `--yes` after a human confirmed the smoke test.
+- **Commit attribution (agents)**: every commit an agent creates ends with one `Co-authored-by:` trailer naming the agent and the model — `Co-authored-by: opencode (<Model Display Name>) <noreply@opencode.ai>`, e.g. `Co-authored-by: opencode (DeepSeek V4.1 Flash) <noreply@opencode.ai>`. Resolve the model name from the session; never hardcode it. See `CONTRIBUTING.md` ("Agent attribution").
 
 ## Handoff
 
