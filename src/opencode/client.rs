@@ -236,9 +236,7 @@ impl OpenCodeBackend {
     }
 
     /// Delete a session server-side (V2 answers 204 and cascades to children;
-    /// V1 answers a boolean body). No bridge command calls it yet; the
-    /// generation wire tests pin it (spec #364, S4a).
-    #[allow(dead_code)] // no bridge caller yet; the generation wire tests drive it
+    /// V1 answers a boolean body).
     pub async fn delete_session(&self, session_id: &str) -> crate::error::Result<()> {
         self.strategy().delete_session(&self.transport, session_id).await
     }

@@ -36,7 +36,7 @@
 //! the harness needs (and is what keeps the default store untouched).
 //!
 //! The assertion is structural: ids and timestamps vary run to run; membership,
-//! order and content are asserted. Both V2 chains drive the production adapter:
+//! order and content are asserted. Every V2 chain drives the production adapter:
 //! the prompt goes through the strategy's native admit-then-return submit and
 //! completion is observed from the transcript + run state, never a raw protocol
 //! read the Bridge would not perform (ADR-0056).

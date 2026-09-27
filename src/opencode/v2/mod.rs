@@ -1,12 +1,11 @@
 //! The V2 generation strategy (ADR-0055): OpenCode 2.0.x's `/api`-only surface.
 //!
-//! This module is where every V2 path, payload, decoder and semantic lands.
-//! Attach detection (slice S3, [`super::generation`]) can already select it,
-//! and its capabilities arrived slice by slice (S4a session reads, S4b
+//! This module is where every V2 path, payload, decoder and semantic lives.
+//! Attach detection (slice S3, [`super::generation`]) selects it for a `/api`
+//! server, and the capabilities landed slice by slice (S4a session reads, S4b
 //! transcript, S5 writes, S6 permissions/forms, S7 session-scoped switches).
-//! Until a capability lands its method fails with an explicit "not implemented
-//! yet" error naming the method — attaching to a V2 server is never silently
-//! broken, and the failing call is visible in the log and on the card.
+//! Every strategy method is implemented here — no "not implemented yet" arm
+//! remains.
 //!
 //! S4a is the session-level read surface: list/get/update/delete, and the run
 //! state (`session.active`) with the retry status derived from the newest

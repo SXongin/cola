@@ -1,13 +1,16 @@
 //! Private protocol decoder for the unprefixed message/transcript read
 //! (ADR-0053).
 //!
-//! cola deliberately stays on the unprefixed routes for the conversation
-//! (prompts, permissions, questions, the transcript read): that is the store
-//! cola's own prompts and the other mounted clients append to, and the
-//! message stores do not project into each other. The `/api` generation's
-//! transcript decoder was removed with the same decision (see the closed
-//! `refactor/drop-v2-read` work); session creation alone still uses
-//! `POST /api/session`, where `location.directory` lives.
+//! cola follows the attached generation for the conversation: V1's routes are
+//! unprefixed (prompts, permissions, questions, the transcript read), V2's are
+//! under `/api`. This module decodes the unprefixed message/transcript read
+//! for V1; V2's decoder is its sibling inside the V2 strategy
+//! ([`crate::opencode::v2`]), because the two generations' message shapes
+//! share no wire spellings. The current-generation calls both generations
+//! serve live on the generation-blind adapter ([`crate::opencode::client`]):
+//! session creation posts `POST /api/session` there, and compaction rides
+//! `/api/session/{id}/compact` through each strategy (the path is shared, the
+//! body/response contract is not).
 //!
 //! Backend protocol field names for the message/transcript read live ONLY
 //! here: from outside the adapter only the decode functions are callable, so

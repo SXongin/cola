@@ -11,8 +11,8 @@
 //! detection ([`super::generation`], spec #364 §2): every attach/reconnect
 //! probes `GET /api/info` and selects the generation the server reported (or
 //! the `[opencode] generation` override forces). Deleting [`super::v1`] is V1
-//! retirement; [`super::v2`] is the V2 strategy, whose capabilities land slice
-//! by slice.
+//! retirement; [`super::v2`] is the V2 strategy, whose capabilities have all
+//! landed.
 
 use std::sync::Arc;
 
@@ -42,10 +42,7 @@ pub(crate) trait GenerationStrategy: Send + Sync {
 
     /// Delete a session server-side. V2 cascades to the session's child
     /// sessions and answers 204; V1 deletes the one session and answers a
-    /// boolean body. Un-mapping a chat is a separate, local act. No Bridge
-    /// command calls it yet; the generation wire tests pin the route and the
-    /// 204 handling (spec #364, S4a).
-    #[allow(dead_code)] // no bridge caller yet; the generation wire tests drive it
+    /// boolean body. Un-mapping a chat is a separate, local act.
     async fn delete_session(&self, http: &Transport, session_id: &str) -> Result<()>;
 
     /// Submit a prompt: the message is persisted and a run is scheduled, then

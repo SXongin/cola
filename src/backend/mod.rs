@@ -121,7 +121,10 @@ pub trait Backend: Send + Sync {
     /// No Bridge command deletes a session yet (`/switch forget` deliberately
     /// keeps the server session); the capability completes the session surface
     /// across generations (spec #364, S4a) and is pinned by the wire tests.
-    #[allow(dead_code)] // no bridge caller yet; the generation wire tests drive it
+    /// This is the capability's only `#[allow(dead_code)]`: the allow keeps
+    /// this trait method live, and the adapter and strategy methods are
+    /// reachable through it.
+    #[allow(dead_code)]
     async fn delete_session(&self, session_id: &str) -> Result<()>;
 
     /// Submit one prompt: the message is persisted and a run is scheduled,

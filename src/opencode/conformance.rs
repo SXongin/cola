@@ -19,8 +19,9 @@ use crate::test_http::TestHttpServer;
 
 /// One generation's conformance case: which strategy to speak, and how to
 /// mount that generation's fake routes. The suite grows a scenario per neutral
-/// capability (reads today, writes as they land); each mount translates the
-/// shared fixture values into the generation's own wire shapes.
+/// capability (session/transcript reads, prompt submit, permissions/forms,
+/// session selection); each mount translates the shared fixture values into the
+/// generation's own wire shapes.
 pub(crate) struct SessionCase {
     pub(crate) generation: Generation,
     /// Whether this generation keeps the model/agent selection server-side
