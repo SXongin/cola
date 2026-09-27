@@ -117,48 +117,77 @@ jobs:
   live-v1:
     # The live V1 contract suite (ADR-0057): the real pinned 1.18.31 binary
     # runs its agent loop against an in-process scripted provider, in an
-    # isolated store. Advisory: the job is not in the `main: CI` ruleset, so a
-    # red run is loud evidence but never blocks a merge. The suite is
+    # isolated store. Required by the `main: CI` ruleset (#376). The suite is
     # `#[ignore]`-gated, so no hermetic job ever runs it.
+    #
+    # The docs-only and release/* skips gate the STEPS, not the job: a
+    # job-level skip would leave the required `Live V1` check unreported and
+    # block the PR. A dispatched job with skipped steps reports success under
+    # the required name instead (the same shape as the Test matrix).
     name: Live V1
     needs: classify
-    if: >-
-      always() &&
-      needs.classify.outputs.heavy != 'false' &&
-      !startsWith(github.head_ref || '', 'release/')
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - if: >-
+          needs.classify.outputs.heavy != 'false' &&
+          !startsWith(github.head_ref || '', 'release/')
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - if: >-
+          needs.classify.outputs.heavy != 'false' &&
+          !startsWith(github.head_ref || '', 'release/')
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - uses: ./.github/actions/install-opencode-v1
-      - name: Live V1 suite
+      - if: >-
+          needs.classify.outputs.heavy != 'false' &&
+          !startsWith(github.head_ref || '', 'release/')
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - if: >-
+          needs.classify.outputs.heavy != 'false' &&
+          !startsWith(github.head_ref || '', 'release/')
+        uses: ./.github/actions/install-opencode-v1
+      - if: >-
+          needs.classify.outputs.heavy != 'false' &&
+          !startsWith(github.head_ref || '', 'release/')
+        name: Live V1 suite
         run: cargo test --locked -- --ignored live_v1
 
   live-v2:
     # The live V2 contract suite (ADR-0057): the real pinned 2.0.18 binary runs
     # its agent loop against an in-process scripted provider, in an isolated
-    # store. Advisory like Live V1: the job is not in the `main: CI` ruleset,
-    # so a red run is loud evidence but never blocks a merge.
+    # store. Required by the `main: CI` ruleset (#376), same step-gating shape
+    # as Live V1: only the steps are skipped for docs-only and release/* PRs,
+    # so the required `Live V2` check still reports.
     name: Live V2
     needs: classify
-    if: >-
-      always() &&
-      needs.classify.outputs.heavy != 'false' &&
-      !startsWith(github.head_ref || '', 'release/')
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - if: >-
+          needs.classify.outputs.heavy != 'false' &&
+          !startsWith(github.head_ref || '', 'release/')
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - if: >-
+          needs.classify.outputs.heavy != 'false' &&
+          !startsWith(github.head_ref || '', 'release/')
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - uses: ./.github/actions/install-opencode-v2
-      - name: Live V2 suite
+      - if: >-
+          needs.classify.outputs.heavy != 'false' &&
+          !startsWith(github.head_ref || '', 'release/')
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - if: >-
+          needs.classify.outputs.heavy != 'false' &&
+          !startsWith(github.head_ref || '', 'release/')
+        uses: ./.github/actions/install-opencode-v2
+      - if: >-
+          needs.classify.outputs.heavy != 'false' &&
+          !startsWith(github.head_ref || '', 'release/')
+        name: Live V2 suite
         run: cargo test --locked -- --ignored live_v2
 
   test:
