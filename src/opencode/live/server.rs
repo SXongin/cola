@@ -119,7 +119,7 @@ impl LiveServer {
             Generation::V2 => write_v2_config(&dirs("config"), provider_base_url, v2_permissions),
         }
 
-        let mut command = tokio::process::Command::new(binary);
+        let mut command = tokio::process::Command::new(resolve_binary(binary));
         command
             .arg("serve")
             .arg("--hostname")
@@ -257,6 +257,29 @@ fn live_binary_env(generation: Generation) -> &'static str {
     }
 }
 
+/// Resolve a bare binary name through the parent's `PATH`.
+///
+/// The child server is spawned with a cleared environment and a minimal
+/// `PATH`, so `Command`'s own lookup would search *that* list and miss a
+/// binary the caller exposed on PATH (CI installs the pin and appends its
+/// directory to `$GITHUB_PATH`). Resolving here keeps a bare `opencode` /
+/// `opencode2` working and hands the spawn an absolute path.
+fn resolve_binary(binary: &str) -> PathBuf {
+    let path = Path::new(binary);
+    if path.is_absolute() || path.components().count() > 1 {
+        return path.to_path_buf();
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join(binary);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    path.to_path_buf()
+}
+
 /// The URL inside a server's listening line. V1 prefixes it with the artifact
 /// name (`opencode server listening on …`); V2 prints it bare
 /// (`server listening on …`), so the marker is matched without its prefix.
@@ -300,7 +323,7 @@ pub async fn ensure_v2_binary(binary: &str) -> String {
 
 /// `binary --version`, trimmed — the artifact's own report.
 async fn binary_version(binary: &str) -> String {
-    let output = tokio::process::Command::new(binary)
+    let output = tokio::process::Command::new(resolve_binary(binary))
         .arg("--version")
         .output()
         .await
