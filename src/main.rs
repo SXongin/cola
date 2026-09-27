@@ -19,7 +19,7 @@ mod version;
 use clap::Parser;
 use std::io::IsTerminal;
 use std::sync::Arc;
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{EnvFilter, util::SubscriberInitExt};
 
 #[derive(Parser)]
 #[command(name = "cola", about = "Bridge bot connecting OpenCode to Feishu")]
@@ -588,26 +588,22 @@ async fn main() -> anyhow::Result<()> {
     // content moves to cola-YYYY-MM-DD.log, older files are swept after
     // `log_days`. When stdout is a real terminal it mirrors the logs too (with
     // ANSI); a redirected stdout gets no cola logs, so the redirect target
-    // stays clean and the file is authoritative.
+    // stays clean and the file is authoritative. `logging` owns the wiring —
+    // including the mirror layer's own field formatter, which keeps its
+    // span-fields extension private (see `logging::subscriber`).
     let log_path = cli.log_file.clone().unwrap_or_else(default_log_path);
     let daily = logging::DailyLog::new(log_path.clone(), cfg.bridge.log_days)?;
-    // Stamp every line in the machine's local time, with the offset spelled out.
-    // Without an explicit timer tracing prints UTC, so the line clock would
-    // disagree with both the card clocks (also `chrono::Local`) and the daily
-    // rotation date — the log file's day would start at 08:00 Beijing.
-    let timer = tracing_subscriber::fmt::time::ChronoLocal::rfc_3339();
-    let file_layer = tracing_subscriber::fmt::layer()
-        .with_writer(daily)
-        .with_ansi(false)
-        .with_timer(timer.clone());
-    let stdout_layer = std::io::stdout()
+    // The mirror layer's default writer is the `fn() -> Stdout` maker, which
+    // is what implements `MakeWriter` (a bare `Stdout` does not).
+    let mirror = std::io::stdout()
         .is_terminal()
-        .then(|| tracing_subscriber::fmt::layer().with_ansi(true).with_timer(timer));
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "cola=info".into()))
-        .with(file_layer)
-        .with(stdout_layer)
-        .init();
+        .then_some(std::io::stdout as fn() -> std::io::Stdout);
+    logging::subscriber(
+        daily,
+        mirror,
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| "cola=info".into()),
+    )
+    .init();
     tracing::info!("logging to {}", log_path.display());
     // Every boot records the exact build in the log so a report can be traced
     // back to a release or a dev build (ADR-0027).

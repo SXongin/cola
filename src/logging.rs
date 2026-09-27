@@ -10,6 +10,9 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use tracing_subscriber::field::MakeVisitor;
+use tracing_subscriber::layer::SubscriberExt;
+
 /// Implements `tracing_subscriber::fmt::MakeWriter`: each write goes to the
 /// day's `cola.log`, rotating (and sweeping) when the date changes.
 pub struct DailyLog {
@@ -146,6 +149,63 @@ impl Write for LogWriterGuard<'_> {
     }
 }
 
+/// A field formatter that renders exactly like the default one but is its own
+/// type.
+///
+/// `tracing-subscriber` keys a span's formatted-field extension on
+/// `FormattedFields<N>` — the FIELD formatter type, not the layer. Two `fmt`
+/// layers that both use the default formatter share one extension, so every
+/// `Span::record` (the `session`/`chat`/`topic` fills in `bridge::span`) is
+/// appended once per layer and each line's prefix prints its fields twice:
+/// `turn{session=ses_x session=ses_x chat=oc_x chat=oc_x}`. The mirror layer
+/// wraps its formatter in this newtype so each layer owns its extension;
+/// `tests::a_mirror_layer_does_not_double_the_span_fields` pins it.
+#[derive(Debug, Default)]
+struct MirrorFields(tracing_subscriber::fmt::format::DefaultFields);
+
+impl<'a> MakeVisitor<tracing_subscriber::fmt::format::Writer<'a>> for MirrorFields {
+    type Visitor = tracing_subscriber::fmt::format::DefaultVisitor<'a>;
+
+    fn make_visitor(&self, target: tracing_subscriber::fmt::format::Writer<'a>) -> Self::Visitor {
+        self.0.make_visitor(target)
+    }
+}
+
+/// The two-layer subscriber cola installs (ADR-0048): the plain daily file
+/// plus, for a real terminal, the ANSI mirror, under the level `filter`.
+/// `main` passes `EnvFilter::try_from_default_env()` with cola's `cola=info`
+/// default; the tests install the same wiring over in-memory writers.
+pub(crate) fn subscriber<W, M>(
+    file: W,
+    mirror: Option<M>,
+    filter: tracing_subscriber::EnvFilter,
+) -> impl tracing::Subscriber + Send + Sync + 'static
+where
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+    M: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
+    // Stamp every line in the machine's local time, with the offset spelled
+    // out. Without an explicit timer tracing prints UTC, so the line clock
+    // would disagree with both the card clocks (also `chrono::Local`) and the
+    // daily rotation date — the log file's day would start at 08:00 Beijing.
+    let timer = tracing_subscriber::fmt::time::ChronoLocal::rfc_3339();
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(file)
+        .with_ansi(false)
+        .with_timer(timer.clone());
+    let mirror_layer = mirror.map(|writer| {
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer)
+            .with_ansi(true)
+            .with_timer(timer)
+            .fmt_fields(MirrorFields::default())
+    });
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(file_layer)
+        .with(mirror_layer)
+}
+
 /// `YYYY-MM-DD` for the local timezone, as chrono is already a dependency.
 fn today_str() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
@@ -188,6 +248,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("cola.log");
         (dir, base)
+    }
+
+    /// An in-memory [`MakeWriter`] shared by the two layers of the
+    /// span-field regression test.
+    #[derive(Clone, Default)]
+    struct TestBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for TestBuffer {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestBuffer {
+        type Writer = TestBuffer;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
 
     #[test]
@@ -276,5 +360,67 @@ mod tests {
         log.sweep();
         assert!(!old.exists(), "old dated file swept");
         assert!(recent.exists(), "recent file kept");
+    }
+
+    /// Two `fmt` layers must not share their span-fields extension.
+    ///
+    /// `tracing-subscriber` stores a span's formatted prefix in a span
+    /// extension keyed by `FormattedFields<N>` — the FIELD formatter type, not
+    /// the layer. Two layers that format fields with the same type share one
+    /// extension, so every `Span::record` (the `session`/`chat`/`topic` fills
+    /// in `bridge::span`) is appended once per layer and each line's prefix
+    /// prints its fields twice:
+    /// `turn{session=ses_x session=ses_x chat=oc_x chat=oc_x}`. Single-layer
+    /// tests never see it; it fires exactly when stdout is a real terminal,
+    /// because only then does the mirror layer exist.
+    #[test]
+    fn a_mirror_layer_does_not_double_the_span_fields() {
+        // A second, never-installed dispatcher keeps the callsite interest
+        // cache from short-circuiting (the capture harness documents the same
+        // trap).
+        let _interest_keepalive = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(io::sink)
+                .finish(),
+        );
+        let file = TestBuffer::default();
+        let mirror = TestBuffer::default();
+        let subscriber = subscriber(
+            file.clone(),
+            Some(mirror.clone()),
+            tracing_subscriber::EnvFilter::new("info"),
+        );
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let span = tracing::info_span!(
+            "turn",
+            session = tracing::field::Empty,
+            chat = tracing::field::Empty,
+            topic = tracing::field::Empty,
+        );
+        span.record("session", tracing::field::display("ses_x"));
+        span.record("chat", tracing::field::display("oc_x"));
+        span.record("topic", tracing::field::display("omt_x"));
+        let _entered = span.enter();
+        tracing::info!("span-fields probe");
+
+        for (name, buffer) in [("file", &file), ("mirror", &mirror)] {
+            let text = String::from_utf8(buffer.0.lock().unwrap().clone())
+                .expect("the fmt layer writes valid UTF-8");
+            let line = text
+                .lines()
+                .find(|line| line.contains("span-fields probe"))
+                .unwrap_or_else(|| panic!("the {name} layer must render the probe event: {text:?}"));
+            // Counted, not matched as one substring: the mirror layer renders
+            // ANSI, so its prefix is styled (the file layer is plain).
+            for value in ["ses_x", "oc_x", "omt_x"] {
+                assert_eq!(
+                    line.matches(value).count(),
+                    1,
+                    "the {name} layer must print {value} exactly once: {line}"
+                );
+            }
+        }
     }
 }
