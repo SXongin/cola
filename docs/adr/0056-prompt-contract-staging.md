@@ -39,20 +39,28 @@ landed as follows:
   and treats a settled run's failure as a fact of the transcript (both
   decoders now carry the assistant message's `error` on the neutral read, and
   the newest assistant message's error decides — a recovered earlier step is
-  not a failure).
+  not a failure). The out-of-turn follow reads the same rule: a followed long
+  turn that ended in a provider failure finalizes Error, never Done.
 - **The drain's settle rule is explicit.** A non-busy status settles the turn
   only once the run was observed to start: a Busy/Retry status, a terminal
   finish, a recorded failure, or a step *created at/after the anchor* (a
-  completed straddling step from a prior turn is not a start signal, so a
-  stale step cannot flip it). Before that, the retired poll fallback's
-  confirmed-absence window applies: after three consecutive non-busy (or
-  failed/timed-out) status reads the submit is treated as never registered and
-  the turn finalizes, so a permanently failing read cannot burn the drain
-  budget plus the follow ceiling. A rejected submit settles on the first
-  non-busy read (no run was scheduled). The failure the drain last observed is
-  kept as the finalization fallback: if the final reconcile's transcript read
-  fails or carries no anchor, that observed failure stands instead of a Done
-  card.
+  completed straddling step from a prior turn is not a start signal — the
+  transcript's membership rule includes a straddler still producing when this
+  turn began, so only the created-at/after filter keeps a stale step from
+  flipping it). Before that, the retired poll fallback's confirmed-absence
+  window applies: after three consecutive non-busy **status** reads the submit
+  is treated as never registered and the turn finalizes. At the default 1.5 s
+  render cadence that is ~4.5 s, and a reply that arrives after that window is
+  deliberately not followed or rendered — the same accepted degradation the
+  retired polyfill had. A failing or timing-out **status** read takes the same
+  window (so it cannot burn the drain budget plus the follow ceiling). A
+  failing **transcript** read is different: before any pending state was
+  observed it ends the drain at once (there is no snapshot to act on, so the
+  turn finalizes from what it has), and once something was observed it is
+  retried to the drain bound. A rejected submit settles on the first non-busy
+  read (no run was scheduled). The failure the drain last observed is kept as
+  the finalization fallback: if the final reconcile's transcript read fails or
+  carries no anchor, that observed failure stands instead of a Done card.
 - **The polyfill and its `wait` dependency are deleted.** The experimental
   `POST /api/experimental/session/{id}/wait` call, its confirmed
   `session.active` poll fallback, and the V2 blocking-response assembly are

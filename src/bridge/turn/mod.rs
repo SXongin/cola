@@ -34,7 +34,11 @@ const DRAIN_REQUEST_TIMEOUT_MS: u64 = 30_000;
 /// *schedules* execution (ADR-0056), so a single non-busy read can precede the
 /// run's registration; the value is the retired V2 poll fallback's confirmation
 /// window, kept so the unstarted case is bounded by this window instead of the
-/// whole drain budget. A permanently failing status read takes the same path.
+/// whole drain budget. After it the turn finalizes from what it has — a reply
+/// arriving later is deliberately not followed (the retired fallback's accepted
+/// degradation). A failing or timing-out STATUS read takes the same window; a
+/// failing TRANSCRIPT read is the drain's own rule (first-tick failure before
+/// anything was observed ends the drain, later ones are retried).
 const IDLE_CONFIRMATIONS: usize = 3;
 
 /// A p2p Turn that ran at least this long notifies on completion (ADR-0043
@@ -126,20 +130,23 @@ pub(crate) struct Turn {
     /// Notice: a turn that ran past the threshold notifies on completion even
     /// in p2p (ADR-0043 amendment 2026-09-21).
     started_at: std::time::Instant,
-    /// Whether the drain has observed the submitted run START (a busy/retry
+    /// Whether the drain has observed the submitted run START (a Busy/Retry
     /// status, or a message the turn itself produced — a terminal finish, a
     /// recorded failure, or a step created at/after the anchor). The prompt
     /// submit only *schedules* execution (ADR-0056), so before this flips a
     /// non-busy status can just mean "not registered yet" — believing it would
     /// finalize the card Done before a single token arrived. A completed
-    /// straddling message from a prior turn is NOT a start signal (membership
-    /// already excludes it), so a stale step cannot flip this.
+    /// straddling step from a prior turn does NOT count: the transcript's
+    /// membership rule includes a straddler that was still producing when this
+    /// turn began, so `produced_a_step` filters it out by requiring a step
+    /// CREATED at/after the anchor — without that filter a stale step could
+    /// flip this.
     drain_started: bool,
     /// How many consecutive reads have seen no run yet. The admit only
     /// *schedules* execution, and the old confirmed-absence window is kept:
     /// after [`IDLE_CONFIRMATIONS`] unstarted reads the submit is treated as
     /// never having registered (the pre-S8 behavior) instead of observing to
-    /// the drain bound. Reset by every start signal.
+    /// the drain bound. Only consulted while `drain_started` is false.
     unstarted_reads: usize,
     /// Whether this turn's submit was REJECTED (the prompt call returned Err).
     /// A rejected submit may never have scheduled a run at all, so the drain
@@ -887,10 +894,12 @@ impl Turn {
         // and settling on it would finalize the card Done before a token
         // arrived. The start signs are a Busy/Retry status, a terminal finish,
         // a recorded failure, or a step CREATED at/after the anchor — never a
-        // completed straddling step from a prior turn (membership excludes it),
-        // so a stale step cannot flip this. The snapshot's failure is kept as
-        // the finalization fallback. A REJECTED submit is the exception: no run
-        // was scheduled, so the error is the outcome and one idle read settles.
+        // completed straddling step from a prior turn (the transcript's
+        // membership includes such a straddler, so only the created-at/after
+        // filter keeps it from flipping this). The snapshot's failure is kept
+        // as the finalization fallback. A REJECTED submit is the exception: no
+        // run was scheduled, so the error is the outcome and one idle read
+        // settles.
         if let Some(anchor) = &anchor {
             let turn = transcript.turn_for_user(anchor);
             let produced_a_step = turn.messages.iter().any(|message| {
@@ -901,7 +910,6 @@ impl Turn {
             });
             if turn.error.is_some() || turn.complete || produced_a_step {
                 self.drain_started = true;
-                self.unstarted_reads = 0;
             }
             // Only a read that actually carries the turn's user message is
             // authoritative for the failure: an anchorless read (the message
@@ -924,7 +932,6 @@ impl Turn {
             // Alive: parts keep coming.
             Some(Ok(Some(SessionStatus::Busy | SessionStatus::Retry))) => {
                 self.drain_started = true;
-                self.unstarted_reads = 0;
                 DrainState::Running
             }
             // A non-busy status: completion once the run was observed, and
