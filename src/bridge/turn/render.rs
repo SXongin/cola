@@ -268,10 +268,13 @@ pub(super) fn capture_footer_model(acc: &mut StreamAccumulator, message: &crate:
 /// Until the anchor is observed nothing renders: with two skewed clocks there
 /// is no threshold that tells the two turns apart.
 ///
-/// A message still in flight (no server completion stamp) is always rendered,
-/// whatever its created time: the previous run may still be streaming when this
-/// turn's user message lands, and that tail is live content the card must show
-/// (#310). A completed message belongs to this turn when it finished at/after
+/// A message still in flight (no server completion stamp) is rendered while
+/// it can still be producing: one created within the turn always is, and one
+/// the previous run left streaming when this turn began stays live content
+/// while its newest activity is recent (#310) — an orphan the server was
+/// killed in goes quiet past the transcript's staleness window and stops
+/// belonging, so it cannot replay its parts into every later turn (#378).
+/// A completed message belongs to this turn when it finished at/after
 /// the anchor — either created within the turn or still being produced as the
 /// turn began — while one that finished before the anchor stays the previous
 /// turn's and never bleeds in (#190).
@@ -405,8 +408,7 @@ fn child_liveness(transcript: &SessionTranscript) -> Option<TaskLiveness> {
                         }
                     }
                 }
-                Part::Text(text) => observe(text.started_at),
-                Part::Reasoning(reasoning) => observe(reasoning.started_at),
+                Part::Text(_) | Part::Reasoning(_) => observe(part.started_at()),
                 Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::Other(_) => {}
             }
         }

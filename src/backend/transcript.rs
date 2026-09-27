@@ -51,12 +51,15 @@ impl SessionTranscript {
     /// messages that belong to it, in transcript order, plus whether it has
     /// finished.
     ///
-    /// Membership follows the streaming rule: a message still in flight (no
-    /// completion stamp) always belongs — the previous run may still be
-    /// streaming when this Turn's user message lands — while a completed
-    /// message belongs only when it was created within the Turn or was still
-    /// being produced as the Turn began. A message with no server time at all
-    /// cannot be placed and stays out.
+    /// Membership follows the streaming rule: a message created within the
+    /// Turn always belongs; a message still in flight (no completion stamp)
+    /// that predates the anchor belongs while it is recent — the previous run
+    /// may still be streaming as this Turn begins — but an orphaned one (no
+    /// server activity for [`IN_FLIGHT_STALE_AFTER_MS`]) stops belonging, so a
+    /// run the server was killed in cannot replay its parts into every later
+    /// Turn. A completed message belongs only when it was created within the
+    /// Turn or was still being produced as the Turn began. A message with no
+    /// server time at all cannot be placed and stays out.
     ///
     /// The Turn is complete when an assistant message that started within it
     /// carries a terminal step-finish reason (every reason except a pause to
@@ -70,7 +73,7 @@ impl SessionTranscript {
                 continue;
             }
             let Some(time) = &message.time else { continue };
-            if !belongs_to_turn(time, anchor.created_ms) {
+            if !belongs_to_turn(message, anchor.created_ms) {
                 continue;
             }
             if time.created >= anchor.created_ms && message.finishes_turn() {
@@ -123,14 +126,35 @@ impl SessionTranscript {
 }
 
 /// Whether an assistant message belongs to the Turn anchored at `anchor_ms`.
-/// Still in flight (no completion stamp): always. Completed: only when it was
-/// created within the Turn or was still being produced as the Turn began.
-fn belongs_to_turn(time: &MessageTime, anchor_ms: i64) -> bool {
+/// A message still in flight (no completion stamp) belongs when it was created
+/// within the Turn, or while its newest server activity is recent enough — the
+/// previous run may still be streaming when this Turn's user message lands —
+/// while an orphaned one (no activity for [`IN_FLIGHT_STALE_AFTER_MS`]) stops
+/// belonging, so a run the server was killed in cannot replay its parts into
+/// every later Turn. A completed message belongs only when it was created
+/// within the Turn or was still being produced as the Turn began.
+fn belongs_to_turn(message: &TranscriptMessage, anchor_ms: i64) -> bool {
+    let Some(time) = message.time else { return false };
     match time.completed {
-        None => true,
+        None => {
+            time.created >= anchor_ms
+                || anchor_ms.saturating_sub(message.newest_activity_ms(time.created))
+                    <= IN_FLIGHT_STALE_AFTER_MS
+        }
         Some(completed) => time.created >= anchor_ms || completed >= anchor_ms,
     }
 }
+
+/// How long a message created before a Turn's anchor may go without a
+/// completion stamp and still belong to the Turn. An in-flight message's
+/// newest server activity is its creation time or its latest part start; once
+/// the anchor is this far past it, the message cannot be producing anymore —
+/// the server was killed mid-run and no later read settles the orphan
+/// (verified: a restart leaves the message and its `running` tool part as they
+/// were), so rendering it would replay its parts on every later Turn. Ten
+/// minutes matches the bridge's default turn drain/follow bound; retune the
+/// two together.
+const IN_FLIGHT_STALE_AFTER_MS: i64 = 10 * 60 * 1000;
 
 /// One message of a [`SessionTranscript`]: identity, role, server time, model
 /// identity and token usage are typed; the body is typed parts.
@@ -174,6 +198,17 @@ impl TranscriptMessage {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The newest server activity this message reports: its creation time and
+    /// the latest part start it carries. The neutral read carries no part end
+    /// time, so a part contributes its start only; boundary kinds contribute
+    /// nothing.
+    fn newest_activity_ms(&self, created: i64) -> i64 {
+        self.parts
+            .iter()
+            .filter_map(Part::started_at)
+            .fold(created, i64::max)
     }
 
     /// Whether one of this message's parts finished its Turn (a terminal
@@ -309,6 +344,21 @@ pub enum Part {
     Patch(Patch),
     /// A part kind this build does not model, kept raw.
     Other(OtherPart),
+}
+
+impl Part {
+    /// The server time the part started producing, when it reports one: text,
+    /// reasoning and tool parts carry a start; boundary kinds carry none. The
+    /// one place the part-kind-to-time mapping lives, so liveness reads cannot
+    /// drift.
+    pub fn started_at(&self) -> Option<i64> {
+        match self {
+            Part::Text(text) => text.started_at,
+            Part::Reasoning(reasoning) => reasoning.started_at,
+            Part::Tool(call) => call.started_at,
+            Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::Other(_) => None,
+        }
+    }
 }
 
 /// An assistant's (or user's) text part.
@@ -480,6 +530,21 @@ mod tests {
         Part::StepFinish(StepFinish { reason })
     }
 
+    /// One tool part with the given server start time and lifecycle status.
+    fn tool(name: &str, started_at: Option<i64>, status: ToolStatus) -> Part {
+        Part::Tool(ToolCall {
+            identity: ToolIdentity {
+                name: name.into(),
+                call_id: name.into(),
+            },
+            status,
+            started_at,
+            input: None,
+            metadata: None,
+            output: ToolOutput::default(),
+        })
+    }
+
     fn anchored(id: &str, created_ms: i64) -> (TranscriptMessage, TurnAnchor) {
         let message = message(
             id,
@@ -556,7 +621,7 @@ mod tests {
                 }),
                 vec![text_part("接着上一个回合")],
             ),
-            // In flight: no completion stamp → always this Turn's.
+            // In flight but created within the Turn: always this Turn's.
             message(
                 "msg_inflight",
                 MessageRole::Assistant,
@@ -594,6 +659,133 @@ mod tests {
         let ids: Vec<_> = turn.messages.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["msg_straddle", "msg_inflight", "msg_new"]);
         assert!(!turn.complete, "an in-flight tail is not a completed Turn");
+    }
+
+    /// #378: the server can be killed mid-run, leaving an assistant message
+    /// without a completion stamp that no later read settles (verified on
+    /// 2.0.18: a restart leaves the message and its `running` tool part as
+    /// they were). Once its newest server activity is older than the
+    /// staleness window it cannot be producing anymore, so it stops belonging
+    /// — otherwise its parts (e.g. a stuck or errored tool panel) re-render on
+    /// every later Turn.
+    #[test]
+    fn an_orphaned_in_flight_message_stops_belonging() {
+        let (_, anchor) = anchored("msg_u1", 10_000_000);
+        let mut zombie = message(
+            "msg_zombie",
+            MessageRole::Assistant,
+            Some(MessageTime {
+                created: anchor.created_ms - 1_500_000,
+                completed: None,
+            }),
+            vec![tool(
+                "bash",
+                Some(anchor.created_ms - 1_490_000),
+                ToolStatus::Running,
+            )],
+        );
+        zombie.error = Some("被杀的运行".into());
+
+        let transcript = SessionTranscript::new(vec![zombie]);
+        let turn = transcript.turn_for_user(&anchor);
+        assert!(
+            turn.messages.is_empty(),
+            "an orphan with 24 minutes of silence must not belong: {:?}",
+            turn.messages
+        );
+        assert!(
+            turn.error.is_none(),
+            "an orphan's recorded error must not leak into the Turn"
+        );
+    }
+
+    /// A pre-anchor in-flight message whose newest activity is inside the
+    /// window is the legitimate straddle (#310: the previous run was still
+    /// streaming as this Turn began) and keeps belonging.
+    #[test]
+    fn a_recent_pre_anchor_in_flight_message_belongs() {
+        let (_, anchor) = anchored("msg_u1", 10_000_000);
+        // Created just under 9 minutes before the anchor, last part a minute
+        // later: inside the 10-minute window.
+        let transcript = SessionTranscript::new(vec![message(
+            "msg_straddle",
+            MessageRole::Assistant,
+            Some(MessageTime {
+                created: anchor.created_ms - 540_000,
+                completed: None,
+            }),
+            vec![tool(
+                "task",
+                Some(anchor.created_ms - 480_000),
+                ToolStatus::Running,
+            )],
+        )]);
+
+        let turn = transcript.turn_for_user(&anchor);
+        let ids: Vec<_> = turn.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["msg_straddle"]);
+    }
+
+    /// A part that started at/after the anchor is activity within this Turn,
+    /// so the message keeps belonging even when its creation is old.
+    #[test]
+    fn a_pre_anchor_in_flight_message_with_activity_after_the_anchor_belongs() {
+        let (_, anchor) = anchored("msg_u1", 10_000_000);
+        let transcript = SessionTranscript::new(vec![message(
+            "msg_straddle",
+            MessageRole::Assistant,
+            Some(MessageTime {
+                created: anchor.created_ms - 1_500_000,
+                completed: None,
+            }),
+            vec![tool("task", Some(anchor.created_ms + 500), ToolStatus::Running)],
+        )]);
+
+        let turn = transcript.turn_for_user(&anchor);
+        let ids: Vec<_> = turn.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["msg_straddle"]);
+    }
+
+    /// A message created within the Turn always belongs — a live Turn sitting
+    /// on a settled errored tool while the model continues must keep
+    /// rendering.
+    #[test]
+    fn an_in_turn_in_flight_message_belongs_however_settled() {
+        let (_, anchor) = anchored("msg_u1", 10_000_000);
+        let transcript = SessionTranscript::new(vec![message(
+            "msg_live",
+            MessageRole::Assistant,
+            Some(MessageTime {
+                created: anchor.created_ms + 100,
+                completed: None,
+            }),
+            vec![tool("bash", Some(anchor.created_ms + 200), ToolStatus::Error)],
+        )]);
+
+        let turn = transcript.turn_for_user(&anchor);
+        let ids: Vec<_> = turn.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["msg_live"]);
+    }
+
+    /// The completed-message rule is untouched by the staleness window: a
+    /// message created long before the anchor but completed at/after it was
+    /// still being produced as this Turn began and belongs (#190/#310).
+    #[test]
+    fn a_completed_straddler_belongs_however_old() {
+        let (_, anchor) = anchored("msg_u1", 10_000_000);
+        let transcript = SessionTranscript::new(vec![message(
+            "msg_straddle",
+            MessageRole::Assistant,
+            Some(MessageTime {
+                created: anchor.created_ms - 3_600_000,
+                completed: Some(anchor.created_ms + 100),
+            }),
+            vec![text_part("接着上一个回合")],
+        )]);
+
+        let turn = transcript.turn_for_user(&anchor);
+        let ids: Vec<_> = turn.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["msg_straddle"]);
     }
 
     #[test]
