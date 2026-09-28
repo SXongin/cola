@@ -1348,6 +1348,18 @@ async fn a_message_after_a_reattach_starts_a_normal_new_turn() {
         followed,
         "the new Turn must replace the accumulator the follow watched"
     );
+
+    // The replaced follow exits silently: after the new Turn settled nothing
+    // reads the transcript again (`turn_render_poll_ms` is 5 ms, so a live
+    // follow would keep adding reads every tick).
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let reads = backend.transcript_calls.lock().await.len();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        backend.transcript_calls.lock().await.len(),
+        reads,
+        "the replaced follow must exit without touching the new turn"
+    );
 }
 
 /// The long-task notice's start is the re-attach, not the original turn (spec

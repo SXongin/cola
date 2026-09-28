@@ -302,6 +302,36 @@ impl CardSession {
         // The fresh snapshot is this chain's newest, growing card.
         self.card_is_live = true;
     }
+
+    /// Give an unused retry claim back (spec #391): a click that neither
+    /// submitted nor re-attached leaves the Error card retryable.
+    pub(super) fn release_retry_claim(&mut self) {
+        self.acc.retry_claimed = false;
+    }
+
+    /// Re-attach this card to a run that is still alive (spec #391, ticket
+    /// #393): the coordinated Error → live transition. `None` — nothing
+    /// changed — when the card is not in `Error` (a new Turn may have replaced
+    /// it since the retry claim) or the accumulator carries no anchor to
+    /// follow (nothing the failed submission stored can be ordered against a
+    /// run). On success the Error is cleared with the content untouched, the
+    /// claim goes back (a real failure must keep a working retry), a live
+    /// header state is restored, and the follow's fixture — the anchor it
+    /// watches and the directory its status reads route under — is returned.
+    pub(super) fn reattach(&mut self, directory: Option<String>) -> Option<(TurnAnchor, String)> {
+        if self.acc.card_state != CardState::Error {
+            return None;
+        }
+        let anchor = self.acc.turn_anchor.clone()?;
+        self.acc.error = None;
+        self.release_retry_claim();
+        self.acc.restore_live_state();
+        let directory = directory
+            .filter(|directory| !directory.is_empty())
+            .or_else(|| self.acc.directory.clone())
+            .unwrap_or_default();
+        Some((anchor, directory))
+    }
 }
 
 /// The header phase driving the live progress timer. Distinct from
@@ -582,6 +612,14 @@ impl StreamAccumulator {
         }
     }
 
+    /// Whether any tool panel of this turn is still running: a timeline tool
+    /// or the todo tail. Shared by the header phase and the live-state resume
+    /// so the rule (including `todowrite`'s tail-panel status) lives once.
+    fn has_running_tool(&self) -> bool {
+        self.tools.values().any(ToolPanel::is_running)
+            || self.todo_panel.as_ref().is_some_and(ToolPanel::is_running)
+    }
+
     /// The header phase for the current state: None when the turn finished or
     /// errored (no timer shown).
     pub(super) fn active_phase(&self) -> Option<HeaderPhase> {
@@ -592,9 +630,7 @@ impl StreamAccumulator {
                 // A running todowrite is a tail panel, not a timeline tool, but
                 // it is still a running tool: ADR-0014 gives it the Tool phase
                 // (and the timer reset that comes with it), like any other.
-                let running = self.tools.values().any(|t| t.is_running())
-                    || self.todo_panel.as_ref().is_some_and(|t| t.is_running());
-                if running {
+                if self.has_running_tool() {
                     Some(HeaderPhase::Tool)
                 } else {
                     Some(HeaderPhase::Streaming)
@@ -615,22 +651,13 @@ impl StreamAccumulator {
     }
 
     /// Restore a live card after its Error was cleared (spec #391, ticket
-    /// #393): the phase the card's existing content implies — Streaming when
+    /// #393): the state the card's existing content implies — Streaming when
     /// text or a running tool is on it, Reasoning when only reasoning has
     /// streamed, Loading otherwise — and a fresh phase timer, because the card
     /// was frozen in Error while the run continued (the elapsed time it held
     /// measured nothing of this activity).
-    pub(super) fn resume_live(&mut self) {
-        self.card_state = if !self.text.is_empty()
-            || self
-                .tools
-                .values()
-                .any(crate::feishu::card::tool_render::ToolPanel::is_running)
-            || self
-                .todo_panel
-                .as_ref()
-                .is_some_and(crate::feishu::card::tool_render::ToolPanel::is_running)
-        {
+    pub(super) fn restore_live_state(&mut self) {
+        self.card_state = if !self.text.is_empty() || self.has_running_tool() {
             CardState::Streaming
         } else if !self.reasoning.is_empty() {
             CardState::Reasoning
