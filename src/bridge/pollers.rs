@@ -13,9 +13,12 @@ use crate::config::ServerStartPolicy;
 /// server (the same cadence the old reconnect loop used).
 const RECONNECT_POLL_INTERVAL_SECS: u64 = 5;
 
-/// Whether any session has a prompt in flight (a turn is streaming). The yield
-/// is deferred while busy so killing an Owned Server never truncates a
-/// mid-stream generation (ADR-0013).
+/// Whether any session has a prompt in flight (a turn is streaming), or an
+/// out-of-turn follow still rendering it (ADR-0059: the follow inherits the
+/// inflight guard for its window). The yield is deferred while busy so killing
+/// an Owned Server never truncates a mid-stream generation (ADR-0013) — and
+/// since the follow holds the guard, a followed Session is never read as idle
+/// here.
 async fn busy(waits: &WaitsHandle) -> bool {
     !waits.inflight.lock().await.is_empty()
 }

@@ -1292,20 +1292,18 @@ async fn stop_after_a_reattach_ends_the_card_promptly() {
     );
 }
 
-/// A message arriving after a re-attach is a normal new Turn — the guard
-/// stayed free, exactly as at the drain hand-off — and it replaces the
-/// accumulator the follow watched, so the follow exits on its next tick
-/// (spec #391, ticket #393).
+/// ADR-0059's routing key on the re-attach path: the re-attached follow holds
+/// the Session's guard for its window too (spec #391, ticket #393), so a
+/// message arriving during it is a Supplement — the chain splits at the
+/// message and the follow keeps rendering on the continuation, never a
+/// competing Turn replacing the accumulator. When the run then truly ends, the
+/// continuation finalizes Done.
 #[tokio::test]
-async fn a_message_after_a_reattach_starts_a_normal_new_turn() {
+async fn a_message_during_a_reattach_follow_splits_the_live_chain() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let (app, backend, platform) = error_card_app(cfg, false, None).await;
-    // Tiny drain bound: the new Turn hands off quickly even while the scripted
-    // session stays Busy.
-    app.turn_drain_timeout_ms
-        .store(30, std::sync::atomic::Ordering::Relaxed);
 
     backend
         .set_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Busy))
@@ -1323,6 +1321,10 @@ async fn a_message_after_a_reattach_starts_a_normal_new_turn() {
     .await;
     let followed = crate::bridge::turn::Turn::armed_turn_anchor(&app.cards_handle(), "ses_test").await;
     assert!(followed.is_some(), "the re-attach watches the turn anchor");
+    assert!(
+        app.inflight.lock().await.contains("ses_test"),
+        "the re-attached follow must hold the guard"
+    );
 
     app.handle_message(incoming(
         "msg_next".into(),
@@ -1334,6 +1336,8 @@ async fn a_message_after_a_reattach_starts_a_normal_new_turn() {
     ))
     .await;
 
+    // The message merged as a Supplement: submitted to the Backend, no busy
+    // notice, and the follow's accumulator survives (no competing Turn).
     assert!(
         backend
             .prompt_calls
@@ -1341,7 +1345,7 @@ async fn a_message_after_a_reattach_starts_a_normal_new_turn() {
             .await
             .iter()
             .any(|text| text == "接着问"),
-        "the released session must take the normal prompt path: {:?}",
+        "the Supplement must be submitted to the Backend: {:?}",
         backend.prompt_calls.lock().await
     );
     assert!(
@@ -1350,25 +1354,70 @@ async fn a_message_after_a_reattach_starts_a_normal_new_turn() {
             .await
             .iter()
             .any(|text| text.contains("还在处理中")),
-        "the new turn is not throttled: {:?}",
+        "a follow-window message is never answered busy: {:?}",
         platform.calls.lock().await
     );
-    assert_ne!(
+    assert_eq!(
         crate::bridge::turn::Turn::armed_turn_anchor(&app.cards_handle(), "ses_test").await,
         followed,
-        "the new Turn must replace the accumulator the follow watched"
+        "no competing Turn: the follow's accumulator survives"
     );
 
-    // The replaced follow exits silently: after the new Turn settled nothing
-    // reads the transcript again (`turn_render_poll_ms` is 5 ms, so a live
-    // follow would keep adding reads every tick).
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    let reads = backend.transcript_calls.lock().await.len();
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Exactly one card replies to the message — the split continuation, with
+    // the Supplement receipt.
+    let continuation = {
+        let calls = platform.calls.lock().await;
+        let mut replies = calls.iter().filter_map(|c| match c {
+            PlatformCall::ReplyCard { reply_to, card } if reply_to == "msg_next" => Some(card),
+            _ => None,
+        });
+        let card = replies.next().expect("the split continuation must reply").clone();
+        assert!(replies.next().is_none(), "exactly one card may reply: {calls:?}");
+        card
+    };
+    assert!(
+        card_text(&continuation).contains("📨 已收到补充"),
+        "the continuation carries the Supplement receipt: {continuation}"
+    );
+
+    // The run ends clean: the follow finalizes the continuation Done from the
+    // transcript, carrying the new content.
+    *backend
+        .transcript_scripts
+        .lock()
+        .await
+        .get_mut("ses_test")
+        .unwrap() = vec![window_with(
+        REATTACH_ANCHOR,
+        vec![typed_message(
+            "msg_clean_end",
+            MessageRole::Assistant,
+            Some(3_000),
+            vec![text_part("重接后的干净收尾 CLEAN_END")],
+        )],
+    )];
+    backend
+        .set_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Idle))
+        .await;
+    wait_for_card_update(
+        &platform,
+        "the continuation's Done card",
+        CardUpdates::Latest,
+        |card| card_header(card) == "✅ 完成" && card_text(card).contains("CLEAN_END"),
+    )
+    .await;
+
+    // The re-attach submitted nothing itself; the only extra prompt is the
+    // Supplement.
     assert_eq!(
-        backend.transcript_calls.lock().await.len(),
-        reads,
-        "the replaced follow must exit without touching the new turn"
+        backend.prompt_calls.lock().await.len(),
+        2,
+        "the re-attach must never submit a prompt: {:?}",
+        backend.prompt_calls.lock().await
+    );
+    assert!(
+        !app.inflight.lock().await.contains("ses_test"),
+        "the follow releases the guard at its ending"
     );
 }
 
