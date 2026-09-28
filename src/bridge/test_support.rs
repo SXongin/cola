@@ -881,6 +881,12 @@ pub struct MockBackend {
     /// When set, `session_selection` fails with this message (a transient V2
     /// read failure) — the caller must not treat it as "no durable selection".
     pub session_selection_error: Option<String>,
+    /// Whether the mock speaks a generation where a same-id re-post of an
+    /// ADMITTED user message can continue the turn (V1's upsert-continue) —
+    /// what [`crate::backend::Backend::reuse_continues_an_admitted_turn`]
+    /// answers. Default true (V1); a V2 scenario sets it false, where admission
+    /// makes the re-post a no-op.
+    pub reuse_continues_an_admitted_turn: bool,
     /// Records `switch_session_model` calls: `(session_id, model)`.
     pub switch_model_calls: Arc<tokio::sync::Mutex<Vec<(String, opencode::types::ModelInfo)>>>,
     /// Records `switch_session_agent` calls: `(session_id, agent)`.
@@ -993,6 +999,7 @@ impl MockBackend {
             session_selections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             durable_selection: false,
             session_selection_error: None,
+            reuse_continues_an_admitted_turn: true,
             switch_model_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             switch_agent_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             switch_error: None,
@@ -1101,6 +1108,14 @@ impl MockBackend {
     /// Scenario: the server records `model` for the session (`session_info`).
     pub(crate) fn with_session_model(&mut self, model: opencode::types::SessionModel) -> &mut Self {
         self.session_model = Some(model);
+        self
+    }
+
+    /// Scenario: the mock speaks a generation where a same-id re-post of an
+    /// admitted turn can continue it (V1) or is a no-op (V2, `false`). Drives
+    /// [`crate::backend::Backend::reuse_continues_an_admitted_turn`].
+    pub(crate) fn with_reuse_continuation(&mut self, reuse_continues: bool) -> &mut Self {
+        self.reuse_continues_an_admitted_turn = reuse_continues;
         self
     }
 
@@ -1864,6 +1879,10 @@ impl crate::backend::Backend for MockBackend {
 
     fn keeps_session_selection(&self) -> bool {
         self.durable_selection
+    }
+
+    fn reuse_continues_an_admitted_turn(&self) -> bool {
+        self.reuse_continues_an_admitted_turn
     }
 
     async fn switch_session_model(

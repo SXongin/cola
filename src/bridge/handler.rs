@@ -1905,12 +1905,14 @@ impl App {
     /// One bounded read pair — session status + session transcript, each with
     /// the follow's per-read timeout — then the matrix (spec #391): a live run
     /// is re-attached and submits nothing; a settled turn takes a fresh
-    /// `msg_cola_` id; an unpersisted or unfinished turn reuses the failed
-    /// attempt's id; a read that failed or timed out is unknown and submits a
-    /// fresh id, so a transient hiccup never recreates the "click does
-    /// nothing" bug. The submit branches hand off to `Turn::start`, which marks
-    /// the failed card `Retried` once it holds the session's inflight guard and
-    /// replies the attempt's new card.
+    /// `msg_cola_` id; a never-admitted id reuses the failed attempt's id on
+    /// either generation, while an admitted-but-unfinished turn reuses it only
+    /// where the generation's re-post still runs (V1 — on V2 the same re-post
+    /// would be a silent no-op, so it takes a fresh id); a read that failed or
+    /// timed out is unknown and submits a fresh id, so a transient hiccup
+    /// never recreates the "click does nothing" bug. The submit branches hand
+    /// off to `Turn::start`, which marks the failed card `Retried` once it
+    /// holds the session's inflight guard and replies the attempt's new card.
     async fn run_retry(
         self: Arc<Self>,
         handles: crate::bridge::handles::TurnHandles,
@@ -1963,6 +1965,7 @@ impl App {
             status,
             transcript.as_ref(),
             retry.cola_message_id.as_deref(),
+            handles.backend.reuse_continues_an_admitted_turn(),
         );
         let cola_message_id = match decision {
             crate::bridge::turn::RetryDecision::Busy => {

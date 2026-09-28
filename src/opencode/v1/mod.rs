@@ -340,6 +340,12 @@ impl GenerationStrategy for V1Strategy {
         false
     }
 
+    /// V1's `prompt_async` upserts by `messageID`: a same-id re-post of an
+    /// admitted, unfinished turn continues it with a new step.
+    fn reuse_continues_an_admitted_turn(&self) -> bool {
+        true
+    }
+
     /// The server's per-session run state for ONE session (canonical:
     /// `GET /session/status`, which returns `Record<sessionID, SessionStatus>`).
     ///

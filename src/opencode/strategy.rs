@@ -135,6 +135,12 @@ pub(crate) trait GenerationStrategy: Send + Sync {
     /// failed".
     fn keeps_session_selection(&self) -> bool;
 
+    /// Whether a same-id re-post of an admitted user message can still
+    /// continue that turn on this generation (V1's upsert-continue) or is a
+    /// no-op (V2's admission key). See
+    /// [`crate::backend::Backend::reuse_continues_an_admitted_turn`].
+    fn reuse_continues_an_admitted_turn(&self) -> bool;
+
     async fn session_status(
         &self,
         http: &Transport,

@@ -151,9 +151,11 @@ pub trait Backend: Send + Sync {
     /// model (unsupported models surface an error).
     ///
     /// `message_id` is the id cola chose for the user message this prompt will
-    /// create (ADR-0026: `msg_cola_` self-identifies cola-authored messages;
-    /// the server persists it, and reusing it on a retry is idempotent). None
-    /// falls back to a server-generated id.
+    /// create (ADR-0026: `msg_cola_` self-identifies cola-authored messages).
+    /// A re-post is idempotent either way, but only on a generation where
+    /// [`Self::reuse_continues_an_admitted_turn`] is true does it continue the
+    /// admitted turn (V1); on V2 the admitted id makes the re-post a no-op.
+    /// None falls back to a server-generated id.
     #[allow(clippy::too_many_arguments)] // prompt axes: session/text/images + model/variant/agent/message-id
     async fn prompt(
         &self,
@@ -197,6 +199,16 @@ pub trait Backend: Send + Sync {
     /// pick to take effect; it must never infer it from a failed selection
     /// read (which only says "unknown").
     fn keeps_session_selection(&self) -> bool;
+
+    /// Whether a same-id re-post of a user message this server has ALREADY
+    /// admitted can still continue that turn. True on V1, where re-posting an
+    /// admitted, unfinished (failed, no terminal finish) `msg_cola_` id upserts
+    /// the one user message and runs a new step; false on V2, where the id is
+    /// an admission key: once admitted, a same-id re-post returns without
+    /// running (only a never-admitted id runs). The retry matrix reads this to
+    /// choose id reuse vs a fresh id; it states the server contract, never a
+    /// policy.
+    fn reuse_continues_an_admitted_turn(&self) -> bool;
 
     /// Reply to a pending permission with a decision (`once` / `always` /
     /// `reject`). `session_id` is the requesting session (the child session for
