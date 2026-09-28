@@ -494,6 +494,28 @@ impl GenerationStrategy for V2Strategy {
         ))
     }
 
+    /// The model the session last actually ran with: the newest assistant
+    /// message's ref (`type=assistant&order=desc&limit=1`). The session read
+    /// carries a model only after an explicit switch, so this is the public
+    /// record of what a session started from the server default is running —
+    /// the effective-model ladder's last rung.
+    async fn session_last_run_model(
+        &self,
+        http: &Transport,
+        session_id: &str,
+        _directory: Option<&str>,
+    ) -> Result<Option<ModelInfo>> {
+        let page = self
+            .message_page(
+                http,
+                session_id,
+                "last-run model",
+                &[("type", "assistant"), ("order", "desc"), ("limit", "1")],
+            )
+            .await?;
+        Ok(page.newest_assistant().and_then(wire::decode_message_model))
+    }
+
     /// Switch the session's model (`POST /api/session/{id}/model`, 204) so
     /// subsequent turns use it with nothing re-sent. The variant rides inside
     /// the `Model.Ref`; the server short-circuits an unchanged selection.
@@ -791,34 +813,59 @@ impl V2Strategy {
         Ok(data)
     }
 
+    /// Fetch ONE page of a session's projected messages with `query` pairs —
+    /// the shared transport/parse half of the minimal message reads
+    /// (`type=assistant&order=desc&limit=1`). `read` names the failure, so a
+    /// caller's errors stay distinguishable in logs.
+    async fn message_page(
+        &self,
+        http: &Transport,
+        session_id: &str,
+        read: &str,
+        query: &[(&str, &str)],
+    ) -> Result<wire::MessagesPage> {
+        let mut url =
+            reqwest::Url::parse(&http.url(&format!("{SESSION}/{session_id}{SESSION_MESSAGES_SUFFIX}")))?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            for (key, value) in query {
+                pairs.append_pair(key, value);
+            }
+        }
+        let resp = http.client().get(url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            // A body-read failure degrades to an empty preview rather than
+            // replacing the status-named error with a transport one.
+            let text = resp.text().await.unwrap_or_default();
+            return Err(crate::error::BridgeError::OpenCode(format!(
+                "session {read} read failed: {status} — body: {}",
+                body_preview(&text)
+            )));
+        }
+        let text = resp.text().await?;
+        serde_json::from_str(&text).map_err(|e| {
+            crate::error::BridgeError::OpenCode(format!(
+                "session {read} read parse: {e} — body: {}",
+                body_preview(&text)
+            ))
+        })
+    }
+
     /// Whether the newest assistant message of `session_id` carries a scheduled
     /// `retry`. Reads ONE projected message (`type=assistant&order=desc&
     /// limit=1`) — the minimal wire read that answers the run-state question
     /// without decoding the whole transcript. Failures name the retry read, so
     /// a caller can tell them apart from the active-map read.
     async fn newest_assistant_retrying(&self, http: &Transport, session_id: &str) -> Result<bool> {
-        let mut url =
-            reqwest::Url::parse(&http.url(&format!("{SESSION}/{session_id}{SESSION_MESSAGES_SUFFIX}")))?;
-        url.query_pairs_mut()
-            .append_pair("type", "assistant")
-            .append_pair("order", "desc")
-            .append_pair("limit", "1");
-        let resp = http.client().get(url).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(crate::error::BridgeError::OpenCode(format!(
-                "session retry read failed: {status} — body: {}",
-                body_preview(&text)
-            )));
-        }
-        let text = resp.text().await?;
-        let page: wire::MessagesPage = serde_json::from_str(&text).map_err(|e| {
-            crate::error::BridgeError::OpenCode(format!(
-                "session retry read parse: {e} — body: {}",
-                body_preview(&text)
-            ))
-        })?;
+        let page = self
+            .message_page(
+                http,
+                session_id,
+                "retry",
+                &[("type", "assistant"), ("order", "desc"), ("limit", "1")],
+            )
+            .await?;
         Ok(page.newest_assistant_retrying())
     }
 }

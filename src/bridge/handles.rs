@@ -326,7 +326,9 @@ impl SessionsHandle {
     /// it yields `None`: cola's local mirror is never presented as if the
     /// server had it (one rule for one fact, ADR-0055). When the server
     /// recorded no model, the configured default (`[opencode] model`) is what
-    /// the server's own resolver would fall back to.
+    /// the server's own resolver would fall back to — and when even that is
+    /// unset, the model the session last ran with (the newest assistant
+    /// message) names its effective model.
     ///
     /// On V1 (and for a Pending Session, which has no server identity yet,
     /// ADR-0041) the `/model` mirror is the selection cola sends per prompt,
@@ -346,7 +348,20 @@ impl SessionsHandle {
                 .durable_selection(backend, session_id, Some(&settings.directory))
                 .await
             {
-                Ok(Some(selection)) => selection.model.or_else(|| backend.configured_default_model()),
+                Ok(Some(selection)) => match selection.model.or_else(|| backend.configured_default_model()) {
+                    Some(model) => Some(model),
+                    // A durable session records a model only after an explicit
+                    // switch, so a session started from the server default has
+                    // no selection to show — but it names the model it ran in
+                    // the message history. Fall back to that (what the
+                    // server's own next-turn resolution keeps using) instead
+                    // of asking for `/model` on a working session; V1 parity:
+                    // its ladder's last rung is the server-recorded model.
+                    None => {
+                        self.last_run_model(backend, session_id, &settings.directory)
+                            .await
+                    }
+                },
                 // V2 always reports a selection; a failed read is unknown.
                 Ok(None) | Err(_) => None,
             };
@@ -443,6 +458,35 @@ impl SessionsHandle {
                 ));
                 tracing::warn!("{error}");
                 Err(error)
+            }
+        }
+    }
+
+    /// The durable-generation ladder's last rung: the model the session last
+    /// actually ran with (its newest assistant message). Bounded like every
+    /// other remote rung — a hung or failing server degrades the ladder to "no
+    /// current model", never the card send — with every failure logged at WARN
+    /// (the adapter's "errors are visible, never silent" rule).
+    async fn last_run_model(
+        &self,
+        backend: &Arc<dyn crate::backend::Backend>,
+        session_id: &str,
+        directory: &str,
+    ) -> Option<opencode::types::ModelInfo> {
+        match tokio::time::timeout(
+            SESSION_INFO_TIMEOUT,
+            backend.session_last_run_model(session_id, Some(directory)),
+        )
+        .await
+        {
+            Ok(Ok(model)) => model,
+            Ok(Err(error)) => {
+                tracing::warn!("session {session_id}: last-run model read failed: {error}");
+                None
+            }
+            Err(_) => {
+                tracing::warn!("session {session_id}: last-run model read timed out");
+                None
             }
         }
     }

@@ -182,6 +182,20 @@ pub trait Backend: Send + Sync {
         directory: Option<&str>,
     ) -> Result<Option<SessionSelection>>;
 
+    /// The model the session last actually ran with — the newest assistant
+    /// message's model ref (variant inside it). A durable generation records a
+    /// model on the session only after an explicit switch, so for a session
+    /// started from the server's own default this message ref is the public
+    /// record of what is running; the effective-model ladder reads it as the
+    /// last rung before giving up. `None` on V1, whose ladder already reads
+    /// the server-recorded session model through `session_info`, and for a
+    /// session with no assistant message yet.
+    async fn session_last_run_model(
+        &self,
+        session_id: &str,
+        directory: Option<&str>,
+    ) -> Result<Option<ModelInfo>>;
+
     /// Make the session's model selection durable so subsequent turns use it
     /// with nothing re-sent (V2's `POST /api/session/{id}/model`); the variant
     /// rides inside `model`. A no-op on V1, where the selection rides each

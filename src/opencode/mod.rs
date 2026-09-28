@@ -126,6 +126,14 @@ impl Backend for OpenCodeBackend {
         OpenCodeBackend::session_selection(self, session_id, directory).await
     }
 
+    async fn session_last_run_model(
+        &self,
+        session_id: &str,
+        directory: Option<&str>,
+    ) -> Result<Option<ModelInfo>> {
+        OpenCodeBackend::session_last_run_model(self, session_id, directory).await
+    }
+
     async fn switch_session_model(&self, session_id: &str, model: &ModelInfo) -> Result<()> {
         OpenCodeBackend::switch_session_model(self, session_id, model).await
     }

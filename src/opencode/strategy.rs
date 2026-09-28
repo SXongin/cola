@@ -119,6 +119,18 @@ pub(crate) trait GenerationStrategy: Send + Sync {
         directory: Option<&str>,
     ) -> Result<Option<SessionSelection>>;
 
+    /// The model the session last actually ran with (V2: the newest assistant
+    /// message's model ref, `type=assistant&order=desc&limit=1`). V1 answers
+    /// `None` without a request — its effective-model ladder already reads the
+    /// server-recorded session model through
+    /// [`Self::session_info`](Self::session_info).
+    async fn session_last_run_model(
+        &self,
+        http: &Transport,
+        session_id: &str,
+        directory: Option<&str>,
+    ) -> Result<Option<ModelInfo>>;
+
     /// Switch the session's model (`POST /api/session/{id}/model`, 204); V1 is
     /// a no-op because its model rides the next prompt.
     async fn switch_session_model(&self, http: &Transport, session_id: &str, model: &ModelInfo)

@@ -868,6 +868,13 @@ pub struct MockBackend {
     /// The server-recorded session model served by `session_info` (the third
     /// rung of the `/think` effective-model resolution).
     pub session_model: Option<opencode::types::SessionModel>,
+    /// Per-session last-run models served by `session_last_run_model` (the
+    /// model of the newest assistant message — the durable ladder's last rung
+    /// when the session has no selection and no configured default).
+    pub session_last_run_models: std::collections::HashMap<String, opencode::types::ModelInfo>,
+    /// When set, `session_last_run_model` fails with this message (the ladder
+    /// must degrade to "no current model", never hang or guess).
+    pub session_last_run_model_error: Option<String>,
     /// Per-session durable selections served by `session_selection` (V2's
     /// session-scoped switches). Empty by default: the mock speaks V1's
     /// per-prompt selection until a scenario seeds one or a switch lands.
@@ -996,6 +1003,8 @@ impl MockBackend {
             context_window: Some(100_000),
             context_window_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_model: None,
+            session_last_run_models: std::collections::HashMap::new(),
+            session_last_run_model_error: None,
             session_selections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             durable_selection: false,
             session_selection_error: None,
@@ -1108,6 +1117,26 @@ impl MockBackend {
     /// Scenario: the server records `model` for the session (`session_info`).
     pub(crate) fn with_session_model(&mut self, model: opencode::types::SessionModel) -> &mut Self {
         self.session_model = Some(model);
+        self
+    }
+
+    /// Scenario: the newest assistant message of `session_id` ran `model`
+    /// (`session_last_run_model`). Turns the mock into the durable-selection
+    /// generation (V2 semantics): only a durable ladder reads this rung.
+    pub(crate) fn with_session_last_run_model(
+        &mut self,
+        session_id: &str,
+        model: opencode::types::ModelInfo,
+    ) -> &mut Self {
+        self.durable_selection = true;
+        self.session_last_run_models.insert(session_id.to_string(), model);
+        self
+    }
+
+    /// Scenario: the last-run model read fails with `message` (a transient V2
+    /// failure) — the ladder must degrade to "no current model", never guess.
+    pub(crate) fn fail_session_last_run_model(&mut self, message: &str) -> &mut Self {
+        self.session_last_run_model_error = Some(message.to_string());
         self
     }
 
@@ -1875,6 +1904,17 @@ impl crate::backend::Backend for MockBackend {
             return Ok(None);
         }
         Ok(self.session_selections.lock().await.get(session_id).cloned())
+    }
+
+    async fn session_last_run_model(
+        &self,
+        session_id: &str,
+        _d: Option<&str>,
+    ) -> crate::error::Result<Option<opencode::types::ModelInfo>> {
+        if let Some(error) = &self.session_last_run_model_error {
+            return Err(crate::error::BridgeError::OpenCode(error.clone()));
+        }
+        Ok(self.session_last_run_models.get(session_id).cloned())
     }
 
     fn keeps_session_selection(&self) -> bool {
