@@ -12,6 +12,17 @@ keeps the render loop alive across a supplement that starts a new Turn (today
 that reply is rendered nowhere), and adds Feishu's **Instant Reminder** to pin
 the conversation while a Turn needs attention.
 
+> **Amended by ADR-0059**: the inflight guard now covers the out-of-turn
+> follow — a message arriving during a follow is a Supplement that continues
+> the chain, not a normal new Turn. This supersedes the 2026-09-24 amendment's
+> "the inflight guard is released, so the next message is a normal new Turn"
+> and its rejected alternative "not releasing the guard while busy": that
+> rejection assumed the 10-minute bound owned the turn's ending, but with no
+> total budget the follow owns it, and holding the guard is what keeps a long
+> run one coherent story (ADR-0059). ADR-0059 also gives a Turn whose
+> Background Tasks are live the waiting disposition (等待后台任务) and renders
+> Wakes as continuation cards.
+
 ## Context
 
 - **Updates don't move, sends do.** The only way to put the live card back at
@@ -405,7 +416,9 @@ whose `task` subagents outlived the budget by 1.6 s).
 
 - **A bound reached with the session still running is not completion.** The
   turn ends exactly as before — the inflight guard is released, so the next
-  message is a normal new Turn — but the card is not finalized. It is handed to
+  message is a normal new Turn **(superseded by ADR-0059: the guard now covers
+  the follow window; a message during a follow is a Supplement)** — but the
+  card is not finalized. It is handed to
   an out-of-turn follow that keeps the SAME accumulator and Card Chain, renders
   on the same injected poll cadence, and finalizes Done only when the session
   reports a non-busy status.
@@ -435,7 +448,8 @@ whose `task` subagents outlived the budget by 1.6 s).
 
 Rejected: raising the bound (moves the threshold, same failure mode one budget
 later); not releasing the guard while busy (the bound exists precisely so a
-merely-busy session cannot hold the guard).
+merely-busy session cannot hold the guard) — **(superseded by ADR-0059: the
+guard now covers the follow; the follow, not a timer, owns the ending)**.
 
 Source: #284.
 
