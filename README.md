@@ -37,6 +37,9 @@ tap-to-answer cards.
   store as OpenChamber and the CLI, so sessions started anywhere can be adopted
   (`/switch`, with a snapshot of what's pending) and messages sent from another
   client are surfaced back into Feishu.
+- **OpenCode 1 and 2.** cola attaches to either generation — 1.18.x (V1) or
+  2.0.x (V2) — detects which protocol the server speaks at attach, and records
+  the evidence in the log; there is nothing to configure.
 - **A topic per task.** `/topic <dir>` opens a Feishu topic whose first message
   creates the session in that project, with a cover card that keeps the title,
   project, branch and model visible and up to date.
@@ -83,8 +86,10 @@ Or build from source (same prerequisites as `cargo install`):
 `cargo build --release`. The [user guide](docs/user-guide.md#install) explains
 each choice in detail.
 
-You also need an `opencode` binary on `PATH` (see <https://opencode.ai>); cola
-starts and manages its own server, but the binary must be runnable.
+You also need an `opencode` binary on `PATH` (see <https://opencode.ai>) —
+OpenCode **1.18.x (V1) and 2.0.x (V2) both work**; cola starts and manages its
+own server and detects which protocol the attached server speaks (the log
+records the choice).
 
 ### 2. Create a Feishu app
 

@@ -84,8 +84,11 @@ above): `cargo build --release`; `cargo install --path .` also places the
 binary in a user-writable directory.
 
 Also make sure an `opencode` binary is on `PATH` — cola discovers and spawns it.
-The autostart launcher snapshots your `PATH` at `cola autostart enable` time, so
-install both **before** enabling autostart.
+OpenCode **1.18.x (V1) and 2.0.x (V2) are both supported**: cola probes the
+attached server's protocol at every attach/reconnect and logs the result (the
+`generation` setting below is the rare override). The autostart launcher
+snapshots your `PATH` at `cola autostart enable` time, so install both **before**
+enabling autostart.
 
 ## Feishu app setup
 
@@ -167,13 +170,15 @@ app_secret = "your-app-secret"
 [opencode]
 url = "http://localhost:4096"    # preferred/fallback port (default 4096)
 start_server = "auto"            # auto (default) | never | eager
+# generation = "auto"            # auto (default) | v1 | v2
 # model = "opencode/deepseek-v4-flash"
 ```
 
 - **`url`** — only a *preferred* port. cola attaches to whatever `opencode
   serve` is already running on the **shared store** automatically (username and
-  password are read from the server's environment, so nothing to configure), so
-  `url` is a tiebreaker among several servers of the same kind — and the fallback
+  password are read from the running server itself — its environment, or a V2
+  managed service's registration file — so nothing to configure), so `url` is a
+  tiebreaker among several servers of the same kind — and the fallback
   port when cola starts its own server. A server cola did **not** start
   (OpenChamber's, a manual one) always wins over cola's own.
 - **`start_server`** — when cola may start its own `opencode serve`:
@@ -182,8 +187,16 @@ start_server = "auto"            # auto (default) | never | eager
   - `never` — attach-only; cola replies that OpenCode is unavailable when no
     server exists.
   - `eager` — the old behavior: spawn an own server at boot when none is running.
+- **`generation`** — which OpenCode protocol cola speaks: `auto` (the default) or
+  the forced `v1` / `v2`. On `auto`, cola probes the attached server at every
+  attach/reconnect and logs the evidence (see
+  [FAQ](#faq--troubleshooting) for the line to look for). Both OpenCode 1.18.x
+  (V1) and 2.0.x (V2) are supported; forcing a generation exists only for a
+  proxy or an unusual build the probe cannot classify, and a contradicting probe
+  still logs a warning with its evidence. On `auto`, a server that cannot be
+  classified leaves cola serverless rather than guessing.
 - **`model`** — the default model for new sessions (`provider/model`). Unset
-  (recommended on most setups) → cola sends no model and the OpenCode server
+  (recommended on most setups) → cola pins no model and the OpenCode server
   uses **its own** default. If set, the model must exist on the server cola
   attaches to (usually `opencode/...`). Per-session overrides are set with
   `/model`.
@@ -431,15 +444,19 @@ Notes:
   therefore means what cola knows, not what still exists on the server: a
   directory whose sessions were cleaned up can reappear. `/switch forget` and
   removing the thread are what drop a mapped directory.
-- `/agent`, `/model`, `/think`, `/autoaccept` are **per-session** overrides sent
-  with the next message and persisted across restarts. On a session that is still
-  pending (`/new`, `/dir` or `/topic` before its first message — including its
-  card forms), the override is recorded on the pending and applies to the session
-  the first message creates. `/model`'s value must exist on the server cola
-  attaches to. Bare `/model` opens the provider → model picker, whose intro shows
-  the model the next message will actually run (session override, else
-  `[opencode] model`, else what the server recorded). `/compact` and `/stop` need
-  a real session and keep their "还没有会话" replies on a pending.
+- `/agent`, `/model`, `/think`, `/autoaccept` are **per-session** and apply from
+  the next message, persisting across restarts. On OpenCode 2 the first three are
+  durable session state — the pick is written to the session itself (`POST
+  /api/session/{id}/model|agent`, the thinking level inside the model ref), so it
+  persists with nothing re-sent and other clients on the shared store see it. On
+  a session that is still pending (`/new`, `/dir` or `/topic` before its first
+  message — including its card forms), the override is recorded on the pending
+  and applies to the session the first message creates. `/model`'s value must
+  exist on the server cola attaches to. Bare `/model` opens the provider → model
+  picker, whose intro shows the model the next message will actually run (the
+  session's own selection, else `[opencode] model`, else what the server
+  recorded). `/compact` and `/stop` need a real session and keep their
+  "还没有会话" replies on a pending.
 - `/restart-opencode` leaves a server launched by another tool alone — it only
   restarts a server cola started itself.
 - Topic rule: inside a topic already bound to a session, `/switch`, `/new`,
@@ -481,6 +498,19 @@ directory (e.g. `/usr/local/bin`). Reinstall into `~/.local/bin` (see
 OpenCode server cola attaches to (usually the `opencode/...` provider on the
 shared server). When in doubt, remove `[opencode] model` from the config and let
 the server use its own default.
+
+**Does cola work with OpenCode 2?** Yes — OpenCode 1.18.x (V1) and 2.0.x (V2) are
+both supported, and cola picks the generation automatically: nothing needs
+configuring, and upgrading OpenCode in place needs no cola change. Every
+attach/reconnect logs the choice and its probe evidence:
+
+    Attached to OpenCode server at http://localhost:4096 — generation=v2 (probe: GET http://localhost:4096/api/info -> 200 application/json (V2 info envelope, version 2.0.18))
+
+If the probe cannot classify a server (a proxy or an unusual build), force the
+generation with `[opencode] generation = "v1"` or `"v2"`. The store is shared,
+and V2 migrates it in place on first boot, so the upgrade affects every client
+using that store; session ids are preserved, so the chat↔session mappings
+survive.
 
 **I moved the cola binary and now autostart is broken.** Re-run
 `cola autostart enable` — the launcher snapshots the binary path at enable time.
