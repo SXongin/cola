@@ -40,7 +40,7 @@ use crate::bridge::reminder::ReminderState;
 use crate::bridge::request::flow::RequestFlow;
 use crate::bridge::session::{PendingEntry, SessionSettings, SessionStore};
 use crate::bridge::snapshot_claims::{ClaimKind, SnapshotClaims};
-use crate::bridge::turn::CardSession;
+use crate::bridge::turn::{CardSession, CollectReason, Turn};
 use crate::config::{ServerStartPolicy, SessionEntry, ThreadKey};
 use crate::{feishu, opencode};
 
@@ -260,7 +260,13 @@ impl SessionsHandle {
     /// cache: creating or adopting a session changes what `/switch`
     /// should offer. The cache is dropped even when the save fails, because the
     /// in-memory mapping already changed.
-    pub(crate) async fn activate(&self, entry: SessionEntry) -> crate::error::Result<()> {
+    ///
+    /// **Raw mutator — module-private on purpose.** Every activation a caller
+    /// outside this module performs goes through [`FlowHandles::activate`],
+    /// which collects the displaced Session's waiting card first (ADR-0059,
+    /// spec #405); keeping this private is what makes that collect an
+    /// invariant instead of a rule each call site must remember.
+    pub(in crate::bridge::handles) async fn activate(&self, entry: SessionEntry) -> crate::error::Result<()> {
         let result = self.store.lock().await.activate(entry);
         *self.cache.lock().await = None;
         result
@@ -268,7 +274,11 @@ impl SessionsHandle {
 
     /// Remove a mapping and persist, dropping the session-list cache (the
     /// `/switch` view may no longer mention it).
-    pub(crate) async fn remove_session(
+    ///
+    /// **Raw mutator — module-private on purpose.** Callers outside this module
+    /// use [`FlowHandles::unmap`] / [`FlowHandles::unmap_thread`], which collect
+    /// the removed Session's waiting card (ADR-0059, spec #405).
+    pub(in crate::bridge::handles) async fn remove_session(
         &self,
         session_id: &str,
     ) -> crate::error::Result<Option<SessionEntry>> {
@@ -279,13 +289,29 @@ impl SessionsHandle {
 
     /// Remove every mapping of a thread and persist, dropping the session-list
     /// cache (`/switch forget`).
-    pub(crate) async fn remove_thread_sessions(
+    ///
+    /// **Raw mutator — module-private on purpose.** See [`Self::remove_session`].
+    pub(in crate::bridge::handles) async fn remove_thread_sessions(
         &self,
         key: &ThreadKey,
     ) -> crate::error::Result<Vec<SessionEntry>> {
         let result = self.store.lock().await.remove_thread_persist(key);
         *self.cache.lock().await = None;
         result
+    }
+
+    /// The session ids mapped to `thread_key`, in the store's order (the active
+    /// entry first) — the Turn's supersede collect reads every mapped session,
+    /// so no waiting card a new Turn displaces is left behind (ADR-0059, spec
+    /// #405).
+    pub(crate) async fn session_ids_for_thread(&self, thread_key: &ThreadKey) -> Vec<String> {
+        self.store
+            .lock()
+            .await
+            .list_thread(thread_key)
+            .into_iter()
+            .map(|entry| entry.session_id.clone())
+            .collect()
     }
 
     /// Drop the session-list cache. Called whenever cola creates, adopts, forgets or
@@ -694,30 +720,6 @@ impl SessionsHandle {
         })
     }
 
-    /// Create a brand-new session on the current server and make it the active
-    /// one for the thread. Used when a mapped session no longer exists (404).
-    /// The per-session overrides reset to defaults, but the topic's creation
-    /// messages (`topic_anchor`/`topic_root`, ADR-0023) are Feishu message ids —
-    /// not session state — and survive so the quote-injection guard keeps
-    /// working after the recreate.
-    pub(crate) async fn create_fresh_session(
-        &self,
-        backend: &Arc<dyn crate::backend::Backend>,
-        thread_key: &ThreadKey,
-        directory: String,
-        topic_anchor: Option<String>,
-        topic_root: Option<String>,
-    ) -> crate::error::Result<String> {
-        let session = backend
-            .create_session(&backend.new_session_input(Some(&directory)))
-            .await?;
-        let mut entry = SessionEntry::new(thread_key.clone(), session.id.clone(), directory);
-        entry.topic_anchor = topic_anchor;
-        entry.topic_root = topic_root;
-        self.activate(entry).await?;
-        Ok(session.id)
-    }
-
     /// Whether `candidate` is `root` or a sub-task child reachable by walking
     /// up its parent chain (sub-task child sessions carry their own sessionID).
     /// Shared with the turn-end leftover rejection (#187), which filters the
@@ -1063,15 +1065,81 @@ pub(crate) struct FlowHandles {
 
 impl FlowHandles {
     /// Promote `entry` as its thread's Active Session, collecting the displaced
-    /// Session's waiting card first (ADR-0059, spec #405): the one write path
-    /// every switch/adopt surface shares, so no activation can leave a card on
-    /// 「⏳ 等待后台任务」 behind. See
-    /// [`Turn::activate_collecting`](crate::bridge::turn::Turn::activate_collecting).
-    pub(crate) async fn activate_collecting(
+    /// Session's waiting card first (ADR-0059, spec #405): the displaced
+    /// Session can no longer be continued by a message in this thread, so a
+    /// card it left on 「⏳ 等待后台任务」 is collected as
+    /// 「⏳ 已切换会话 · 后台任务仍在运行」 and stops updating, while its
+    /// background work runs on. The collect runs BEFORE the activation, so a
+    /// polling Wake cannot resume a chain the switch is leaving behind.
+    /// Re-activating the already-active session collects nothing.
+    ///
+    /// This and the other operations below are the ONLY way to change a
+    /// thread's Active Session mapping outside [`SessionsHandle`]: the raw
+    /// mutators are module-private, so no switch/adopt/steal path can forget
+    /// the collect. A **Pending Session** declaration deliberately does not
+    /// collect: the superseded session stays mapped and switchable, and the
+    /// next Turn in the thread collects its card — the Turn's supersede collect
+    /// reads every mapped session.
+    pub(crate) async fn activate(&self, entry: SessionEntry) -> crate::error::Result<()> {
+        if let Some(previous) = self.sessions.active_entry(&entry.thread_key).await
+            && previous.session_id != entry.session_id
+        {
+            Turn::collect_waiting(&self.cards, &previous.session_id, CollectReason::SwitchedAway).await;
+        }
+        self.sessions.activate(entry).await
+    }
+
+    /// Unmap `session_id` — a `--force` steal by another thread, or a dead
+    /// mapping being replaced — collecting the waiting card it leaves behind
+    /// first (ADR-0059, spec #405): the Session stops being any thread's Active
+    /// Session, so its card must not keep sitting on 「⏳ 等待后台任务」. The
+    /// returned entry is the removed mapping, `None` when nothing was mapped
+    /// (and then nothing is collected).
+    pub(crate) async fn unmap(&self, session_id: &str) -> crate::error::Result<Option<SessionEntry>> {
+        let removed = self.sessions.remove_session(session_id).await?;
+        if removed.is_some() {
+            Turn::collect_waiting(&self.cards, session_id, CollectReason::SwitchedAway).await;
+        }
+        Ok(removed)
+    }
+
+    /// Unmap every mapping of `thread_key` (`/switch forget`), collecting each
+    /// removed Session's waiting card (ADR-0059, spec #405).
+    pub(crate) async fn unmap_thread(
         &self,
-        entry: crate::config::SessionEntry,
-    ) -> crate::error::Result<()> {
-        crate::bridge::turn::Turn::activate_collecting(&self.sessions, &self.cards, entry).await
+        thread_key: &ThreadKey,
+    ) -> crate::error::Result<Vec<SessionEntry>> {
+        let removed = self.sessions.remove_thread_sessions(thread_key).await?;
+        for entry in &removed {
+            Turn::collect_waiting(&self.cards, &entry.session_id, CollectReason::SwitchedAway).await;
+        }
+        Ok(removed)
+    }
+
+    /// Create a brand-new session on the current server and make it the
+    /// thread's Active Session through [`Self::activate`] (so a session it
+    /// displaces is collected: a 404 recreate can leave another mapped session
+    /// active until this activation takes over). The per-session overrides
+    /// reset to defaults, but the topic's creation messages
+    /// (`topic_anchor`/`topic_root`, ADR-0023) are Feishu message ids — not
+    /// session state — and survive so the quote-injection guard keeps working
+    /// after the recreate.
+    pub(crate) async fn create_fresh_session(
+        &self,
+        thread_key: &ThreadKey,
+        directory: String,
+        topic_anchor: Option<String>,
+        topic_root: Option<String>,
+    ) -> crate::error::Result<String> {
+        let session = self
+            .backend
+            .create_session(&self.backend.new_session_input(Some(&directory)))
+            .await?;
+        let mut entry = SessionEntry::new(thread_key.clone(), session.id.clone(), directory);
+        entry.topic_anchor = topic_anchor;
+        entry.topic_root = topic_root;
+        self.activate(entry).await?;
+        Ok(session.id)
     }
 }
 

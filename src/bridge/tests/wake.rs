@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use super::drain::{
-    assistant, ctx, script_transcript, scripted_app, spawn_turn, user, wait_for_card_header,
+    assistant, ctx, script_transcript, scripted_app, spawn_sync, spawn_turn, user, wait_for_card_header,
     wait_for_card_text,
 };
 use crate::backend::{
@@ -61,18 +61,6 @@ fn another_background_shell(started_at: i64) -> BackgroundTask {
         child_id: None,
         started_at: Some(started_at),
     }
-}
-
-/// Start Session Sync's poll loop with tiny injected cadences: the sync tick,
-/// the continuation render tick and every read bound.
-fn spawn_sync(app: &Arc<App>) {
-    app.external.poll_interval_ms.store(20, Ordering::Relaxed);
-    app.external.render_poll_ms.store(5, Ordering::Relaxed);
-    app.external.request_timeout_ms.store(50, Ordering::Relaxed);
-    let app = app.clone();
-    tokio::spawn(async move {
-        let _ = app.external.poll_loop(&app.flow_handles()).await;
-    });
 }
 
 /// The 承接 receipt line a Wake continuation opens with — the one user-facing

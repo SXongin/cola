@@ -894,8 +894,8 @@ impl App {
         topic_anchor: Option<String>,
         topic_root: Option<String>,
     ) -> crate::error::Result<String> {
-        self.sessions_handle()
-            .create_fresh_session(&self.opencode, thread_key, directory, topic_anchor, topic_root)
+        self.flow_handles()
+            .create_fresh_session(thread_key, directory, topic_anchor, topic_root)
             .await
     }
 
