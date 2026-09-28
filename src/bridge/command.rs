@@ -851,12 +851,24 @@ pub(crate) async fn handle_command(
         }
         Command::Stop => {
             if let Some(id) = handles.flow.sessions.get_session_id(&thread_key).await {
-                handles.flow.backend.interrupt(&id).await?;
-                // Mark the session stopped so a running post-prompt drain
-                // (ADR-0043) finalizes promptly instead of waiting out its
-                // bound on a Supplement the abort left unanswered. The next
+                // Mark the session stopped BEFORE the interrupt round-trip: the
+                // abort settles the run server-side, and a drain/follow tick
+                // that observes that settled run can beat the marker back and
+                // finalize Done/Error instead of the stop terminal (#394). The
+                // marker is rolled back if the interrupt itself fails, so a
+                // failed stop never leaves a card claiming 已停止. The next
                 // Turn clears the marker when it starts.
-                handles.flow.waits.stopped_sessions.lock().await.insert(id);
+                handles
+                    .flow
+                    .waits
+                    .stopped_sessions
+                    .lock()
+                    .await
+                    .insert(id.clone());
+                if let Err(e) = handles.flow.backend.interrupt(&id).await {
+                    handles.flow.waits.stopped_sessions.lock().await.remove(&id);
+                    return Err(e);
+                }
                 handles
                     .flow
                     .platform

@@ -55,6 +55,54 @@ async fn card_command_after_the_turn_finished_replies_a_notice() {
     assert!(platform.replied_cards().await.is_empty(), "no card created");
 }
 
+/// A stopped Turn's card session also stays in `cards` (#394): `/card` must
+/// treat it as not running exactly like a Done one — the pull probe reads the
+/// terminal set, so Stopped can never be pulled or finalized again.
+#[tokio::test]
+async fn card_command_after_a_stopped_turn_replies_a_notice() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    seed_session(&app, "ses_test", "/work").await;
+    seed_live_card(&app, "ses_test", "被停止的回合。").await;
+    Turn::set_card_state(&app.cards_handle(), "ses_test", CardState::Stopped).await;
+    assert!(
+        !Turn::is_running(&app.cards_handle(), "ses_test").await,
+        "a stopped card must not count as running for the pull probe"
+    );
+
+    app.handle_message(incoming(
+        "msg_card".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+
+    let texts = platform.texts().await;
+    assert_eq!(
+        texts.len(),
+        1,
+        "a stopped Turn has no live card to pull: {texts:?}"
+    );
+    assert!(
+        texts[0].contains("当前没有正在运行的实时卡片"),
+        "the notice must say there is nothing to pull: {texts:?}"
+    );
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        !calls.iter().any(|c| matches!(
+            c,
+            PlatformCall::UpdateMessage { message_id, .. } if message_id == "om_live"
+        )),
+        "the stopped card must not be finalized again: {calls:?}"
+    );
+    assert!(platform.replied_cards().await.is_empty(), "no card created");
+}
+
 /// `/card` with nothing to pull — no session at all, or a session whose Turn
 /// is not rendering — replies one text line and creates no card.
 #[tokio::test]
