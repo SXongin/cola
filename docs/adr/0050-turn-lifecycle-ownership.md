@@ -33,14 +33,14 @@ companion narrow-handles decision is ADR-0049 and is not re-litigated here.
   interaction registration and settlement (`add_permission`, `add_question`,
   `update_question_state`, `resolve_interactions`,
   `resolve_vanished_permissions`/`_questions`, `ack_card`), external-follow
-  arming and finalization (`arm_external_render`, `finalize_done`,
+  arming and finalization (`arm_external_render`, `finalize_done`/`finalize_stopped`,
   `repoint_card`, `reattach_run` — the retry re-attach: clears the card's
   Error, restores its live header state and hands it to the out-of-turn
   follow), and the read probes a flow decides on (`has_card`, `is_running`,
   `card_message_id`, `reply_target`, `armed_turn_anchor`,
-  `has_rendered_content`, `pin_source`, `claim_retry`, `flush_owned_blocks`,
-  `has_interaction`/`has_interaction_in`). Any card delivery those operations
-  trigger still lands on the four calls above.
+  `has_rendered_content`, `pin_source`, `claim_retry`/`release_retry_claim`,
+  `flush_owned_blocks`, `has_interaction`/`has_interaction_in`). Any card
+  delivery those operations trigger still lands on the four calls above.
 - **The Turn receives narrow handles (`TurnHandles`), never `SharedCore`**
   (ADR-0049).
 
