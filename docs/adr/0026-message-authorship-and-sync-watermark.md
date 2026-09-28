@@ -17,23 +17,26 @@ itself and give the poller sole ownership of the sync state.
 
 > **Corrected 2026-09-28 (spec #391, ADR-0058)**: decision 1's "a retry reuses
 > the same id" and decision 3's "the user's retry reuses the same `messageID`"
-> apply to two shapes only: an id the server never admitted (no anchor for it —
-> both generations still create and run it) and V1's admitted-but-unfinished
-> continuation (its upsert re-post runs a new step). A settled turn, an unknown
-> status or transcript read, and every admitted turn on V2 take a FRESH
-> `msg_cola_` id — on V2 the id is an admission key, so a same-id re-post of an
-> admitted turn is a `200` no-op.
+> apply to two shapes only: an id the read carries no anchor for — in practice
+> the server never admitted it, and both generations still create and run it —
+> and V1's admitted-but-unfinished continuation (its upsert re-post runs a new
+> step). A settled turn, an unknown status or transcript read, and a turn the
+> read does anchor on V2 take a FRESH `msg_cola_` id — on V2 the id is an
+> admission key, so a same-id re-post of an admitted, anchorable turn is a `200`
+> no-op. An admitted id the read cannot anchor stays in the reuse shape above:
+> the same V2 no-op risk, accepted because the read cannot tell it apart from a
+> never-admitted id.
 >
-> Two statements below narrow accordingly rather than being silently rewritten:
-> the Verification bullet "Re-posting the same `messageID` does not duplicate
-> the user message (single row kept) — retries are idempotent server-side" now
-> means no SECOND RUN of an admitted submission, not that a same-id re-post is
-> always the right retry (ADR-0058's live chains pin each generation's shape);
-> and the Consequences bullet "Retries can no longer duplicate user-message
-> rows" narrows to *of the same submission* — a settled fresh-id retry
-> deliberately adds one new user row ("asked again"). What survives unchanged
-> is no duplicate run of one submission and no duplicate notification of it.
-> ADR-0058 holds the state → action matrix.
+> Two statements below narrow accordingly rather than being silently
+> rewritten: the Verification bullet "Re-posting the same `messageID` does not
+> duplicate the user message (single row kept) — retries are idempotent
+> server-side" now means a re-post never re-runs an admitted submission, not
+> that a same-id re-post is always the right retry (ADR-0058's live chains pin
+> each generation's shape); and the Consequences bullet's residual gap now
+> reads as the accepted fresh-id "asked again" shape rather than a duplicate of
+> one submission. What survives unchanged is no duplicate run of one submission
+> and no duplicate notification of it. ADR-0058 holds the state → action
+> matrix.
 
 ## Decision
 
@@ -87,8 +90,11 @@ itself and give the poller sole ownership of the sync state.
 
 - `msg_cola_` is reserved on the Shared Store; any client that fabricated that
   prefix would be misread as cola (accepted — only cola uses it).
-- Retries can no longer duplicate user-message rows. Residual accepted gap: a
-  cola restart between a committed send and a manual retry loses the in-memory
-  id, so one manual retry after such a restart can add a duplicate user message.
+- Retries cannot duplicate one submission's user-message row, and cannot
+  re-notify an existing message: a same-id re-post is idempotent, while a
+  fresh-id retry is a new submission. Residual accepted shape: a cola restart
+  between a committed send and a manual retry loses the in-memory id, so that
+  retry "asks again" under a fresh id — one extra user row by design, never a
+  second run of the original submission.
 - Interrupted turns are still recovered by the user clicking 重试 on the error
   card; automatic resume after healing is a separate, deferred decision.
