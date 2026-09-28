@@ -111,12 +111,21 @@ the live incident (#387) the rebuilt card had replayed the whole old attempt
 The carry site is the **explicit retry signal** on the Turn, not a reused card
 id (spec #391). A retry now replies a NEW card below the failed one (which the
 handler marks 「↩️ 已重试」), instead of resetting the failed card in place. The
-baseline is load-bearing on the **reused-id branch** alone: there the retry
-re-submits the failed turn's `msg_cola_` user message (ADR-0026), so the failed
-attempt's messages are still in the new card's turn window. On the new-id
-branch (a settled failure) the same baseline rides along under a fresh anchor,
-where it is inert — the new attempt's messages carry new server ids. The union
-chains across repeated retries, and a fresh prompt starts clean.
+baseline is load-bearing wherever the old attempt's messages can still read as
+belonging to the retry's own turn:
+
+- the **reused-id branch** — V1's same-id re-post of an admitted, unfinished
+  turn (ADR-0026), whose failed attempt's messages sit in the same turn window.
+  On V2 an admitted id is an admission key, so the retry takes a fresh id
+  instead (the generation-aware correction, ticket #392);
+- the **fresh-id orphan branch** — V2's killed-run shape: an admitted,
+  unfinished assistant message with no completion stamp can still fall inside
+  the fresh anchor's in-flight window, so only the baseline keeps it from
+  replaying.
+
+On the settled new-id branch the same baseline rides along inert: the fresh
+anchor's window holds the new attempt's own ids and no straddling message. The
+union chains across repeated retries, and a fresh prompt starts clean.
 
 Fold state is unaffected as a mechanism — `seq` still restarts with the fresh
 accumulator, and the todo tail still starts folded — but the rationale changes:
