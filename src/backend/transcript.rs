@@ -504,6 +504,16 @@ pub struct Wake {
 }
 
 impl Wake {
+    /// This Wake as a Turn anchor: the message's identity together with its
+    /// server time, one fact. `None` when the payload carried no usable time —
+    /// the Wake cannot be ordered, so no scope can be built from it.
+    pub fn anchor(&self) -> Option<TurnAnchor> {
+        Some(TurnAnchor {
+            message_id: self.id.clone(),
+            created_ms: self.created_ms?,
+        })
+    }
+
     /// Whether this Wake retires `task` — the backend's own completion
     /// correlation: a shell Wake names the task's shell id or the tool call
     /// that started it, and a subagent Wake names the task's child session. A

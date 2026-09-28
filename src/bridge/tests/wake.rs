@@ -45,6 +45,17 @@ fn spawn_sync(app: &Arc<App>) {
 /// marker that tells a continuation card apart from a fresh turn's card.
 const LEAD: &str = "已恢复执行";
 
+/// The card a platform call carried, whatever kind of call it was (a sent,
+/// replied or updated card) — the one match the helpers below share.
+fn call_card(call: &PlatformCall) -> Option<&serde_json::Value> {
+    match call {
+        PlatformCall::ReplyCard { card, .. }
+        | PlatformCall::SendCard { card, .. }
+        | PlatformCall::UpdateMessage { card, .. } => Some(card),
+        _ => None,
+    }
+}
+
 /// Whether `card` is a Wake continuation card (it carries the 承接 line).
 fn is_continuation(card: &serde_json::Value) -> bool {
     card_text(card).contains(LEAD)
@@ -57,13 +68,9 @@ async fn continuation_cards(platform: &RecordingPlatform) -> Vec<serde_json::Val
         .lock()
         .await
         .iter()
-        .filter_map(|call| match call {
-            PlatformCall::ReplyCard { card, .. }
-            | PlatformCall::SendCard { card, .. }
-            | PlatformCall::UpdateMessage { card, .. } => Some(card.clone()),
-            _ => None,
-        })
-        .filter(is_continuation)
+        .filter_map(call_card)
+        .filter(|card| is_continuation(card))
+        .cloned()
         .collect()
 }
 
@@ -75,12 +82,10 @@ async fn wait_for_any_card(platform: &RecordingPlatform, needle: &str) {
         loop {
             let found = {
                 let calls = platform.calls.lock().await;
-                calls.iter().any(|call| match call {
-                    PlatformCall::ReplyCard { card, .. }
-                    | PlatformCall::SendCard { card, .. }
-                    | PlatformCall::UpdateMessage { card, .. } => card_text(card).contains(needle),
-                    _ => false,
-                })
+                calls
+                    .iter()
+                    .filter_map(call_card)
+                    .any(|card| card_text(card).contains(needle))
             };
             if found {
                 return;

@@ -53,11 +53,13 @@ impl CardState {
 
     /// Whether a live renderer still owns the card's chain: the card is
     /// neither ended nor yielded to its Background Tasks. `Waiting` is NOT
-    /// live in this sense — the Turn that owned it yielded and the next Wake
+    /// owned in this sense — the Turn that owned it yielded and the next Wake
     /// continues the chain on a new card (ADR-0059) — and neither is a
     /// terminal card. Session Sync's Wake step reads this to decide whether
-    /// the chain can be handed over without double-rendering.
-    pub(crate) fn is_live(&self) -> bool {
+    /// the chain can be handed over without double-rendering. Distinct from
+    /// `CardSession::card_is_live` (the last send reached Feishu) and
+    /// `CardSession::is_running` (non-terminal, `Waiting` included).
+    pub(crate) fn is_render_owned(&self) -> bool {
         !self.is_terminal() && !matches!(self, Self::Waiting)
     }
 

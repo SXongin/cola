@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::Instrument;
 
-use crate::backend::{Part, SessionTranscript, ToolStatus};
+use crate::backend::{Part, SessionTranscript, ToolStatus, TurnAnchor};
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
 use crate::bridge::handles::{CardsHandle, RequestsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
@@ -118,38 +118,27 @@ async fn refresh_session_title(
     true
 }
 
-/// Render one typed part into the accumulator, applying the dedup rules: text
-/// and reasoning are tracked by their content (OpenCode part payloads carry NO
-/// `id`, AGENTS.md #9), and a tool call re-renders exactly when its typed panel
-/// revision changed. Returns true when the part rendered (not skipped as
-/// duplicate/empty).
-fn render_part(acc: &mut StreamAccumulator, part: &Part) -> bool {
+/// Whether `part` would render into `acc`: the dedup half of [`render_part`],
+/// so the content-diff probe (Session Sync's "did the chain miss anything")
+/// reads exactly the rule the rendering applies — without rendering, and
+/// without cloning the accumulator. The apply half re-checks nothing and
+/// assumes this returned true.
+fn renders_part(acc: &StreamAccumulator, part: &Part) -> bool {
     match part {
         // Reasoning/text parts are written with empty text first, then updated
         // with the full content. Only render once they have content, otherwise
         // we'd freeze the placeholder version.
         Part::Text(text) => {
-            if text.text.is_empty() {
-                return false;
-            }
-            if !acc.rendered_parts.insert(RenderedPart::Text(text.text.clone())) {
-                return false;
-            }
-            acc.push_text_at(text.started_at, &text.text);
-            acc.card_state = crate::feishu::card::CardState::Streaming;
+            !text.text.is_empty()
+                && !acc
+                    .rendered_parts
+                    .contains(&RenderedPart::Text(text.text.clone()))
         }
         Part::Reasoning(reasoning) => {
-            if reasoning.text.is_empty() {
-                return false;
-            }
-            if !acc
-                .rendered_parts
-                .insert(RenderedPart::Reasoning(reasoning.text.clone()))
-            {
-                return false;
-            }
-            acc.push_reasoning_at(reasoning.started_at, &reasoning.text);
-            acc.card_state = crate::feishu::card::CardState::Reasoning;
+            !reasoning.text.is_empty()
+                && !acc
+                    .rendered_parts
+                    .contains(&RenderedPart::Reasoning(reasoning.text.clone()))
         }
         Part::Tool(call) => {
             // The current panel IS the call's rendered revision: an update
@@ -162,17 +151,43 @@ fn render_part(acc: &mut StreamAccumulator, part: &Part) -> bool {
             // The comparison is against the typed call BEFORE the panel is
             // built: an unchanged poll (the common case) must not deep-copy
             // the call's raw payloads into a panel only to drop it.
-            let already_rendered = if call.identity.name == "todowrite" {
-                acc.todo_panel.as_ref().is_some_and(|panel| panel.call() == call)
-                    && acc.todo_shown_at == call.started_at
+            if call.identity.name == "todowrite" {
+                !(acc.todo_panel.as_ref().is_some_and(|panel| panel.call() == call)
+                    && acc.todo_shown_at == call.started_at)
             } else {
-                acc.tools
+                !acc.tools
                     .get(&call.identity.call_id)
                     .is_some_and(|panel| panel.call() == call)
-            };
-            if already_rendered {
-                return false;
             }
+        }
+        // Step boundaries, patches and part kinds this build does not model
+        // render nothing — there is no content to add or dedupe.
+        Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::Other(_) => false,
+    }
+}
+
+/// Render one typed part into the accumulator, applying the dedup rules
+/// ([`renders_part`]): text and reasoning are tracked by their content
+/// (OpenCode part payloads carry NO `id`, AGENTS.md #9), and a tool call
+/// re-renders exactly when its typed panel revision changed. Returns true when
+/// the part rendered (not skipped as duplicate/empty).
+fn render_part(acc: &mut StreamAccumulator, part: &Part) -> bool {
+    if !renders_part(acc, part) {
+        return false;
+    }
+    match part {
+        Part::Text(text) => {
+            acc.rendered_parts.insert(RenderedPart::Text(text.text.clone()));
+            acc.push_text_at(text.started_at, &text.text);
+            acc.card_state = crate::feishu::card::CardState::Streaming;
+        }
+        Part::Reasoning(reasoning) => {
+            acc.rendered_parts
+                .insert(RenderedPart::Reasoning(reasoning.text.clone()));
+            acc.push_reasoning_at(reasoning.started_at, &reasoning.text);
+            acc.card_state = crate::feishu::card::CardState::Reasoning;
+        }
+        Part::Tool(call) => {
             // The panel is a view over the typed call; the Platform assembles
             // the output text and status icon from it (ADR-0042, ADR-0053).
             let panel = crate::feishu::card::tool_render::ToolPanel::new(call.clone());
@@ -192,8 +207,6 @@ fn render_part(acc: &mut StreamAccumulator, part: &Part) -> bool {
                 acc.card_state = crate::feishu::card::CardState::Streaming;
             }
         }
-        // Step boundaries, patches and part kinds this build does not model
-        // render nothing — there is no content to add or dedupe.
         Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::Other(_) => return false,
     }
     // card_state / running-tool changes reset the header phase timer.
@@ -311,6 +324,29 @@ pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &Se
         }
     }
     rendered_any
+}
+
+/// Whether rendering `transcript` scoped at `anchor` would add ANY part to
+/// `acc` — the content diff Session Sync's Wake step decides on (ADR-0059):
+/// the chain has missed something iff this is true. Reads the accumulator's
+/// dedup state through the one renderability rule ([`renders_part`]); never
+/// mutates it, so the caller does not build a throwaway clone of the card's
+/// accumulator on every poll.
+///
+/// "Any part renders" is equivalent to running the real render: a part that
+/// the real pass skips can only have been deduped by an EARLIER part with the
+/// same content or revision, and that earlier part was itself renderable — so
+/// the first renderable part this scan finds is exactly where a real render
+/// would produce something.
+pub(super) fn renders_new_content(
+    acc: &StreamAccumulator,
+    transcript: &SessionTranscript,
+    anchor: &TurnAnchor,
+) -> bool {
+    transcript.turn_for_user(anchor).messages.iter().any(|message| {
+        !acc.baseline.suppressed.contains(message.id.as_str())
+            && message.parts.iter().any(|part| renders_part(acc, part))
+    })
 }
 
 /// Render the session's transcript into the streaming card and flush it when

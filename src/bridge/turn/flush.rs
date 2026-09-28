@@ -11,22 +11,6 @@ use super::MAX_CARD_CHAIN;
 use crate::bridge::card_handles::RenderedBlock;
 use crate::bridge::handles::CardsHandle;
 
-/// The one-line receipt a supplement leaves on its continuation card (ADR-0043)
-/// — the same visual form as an Interaction Receipt, keyed in timeline order.
-const SUPPLEMENT_RECEIPT: &str = "📨 已收到补充";
-
-/// The status line `/card` leaves on its continuation card (ADR-0043,
-/// 2026-09-22 amendment) — the pull's acknowledgement, same visual form as an
-/// Interaction Receipt.
-const PULL_RECEIPT: &str = "⏬ 实时卡片已移到底部";
-
-/// The 承接 line a Wake continuation opens with (ADR-0059): the new card is
-/// itself the notification, and this line says why it appeared — the Turn was
-/// resumed by the Backend after going idle. Source-neutral on purpose: a Wake
-/// can be a finished background task, a subagent, an interruption or a server
-/// restart, and cola never claims more than "the work resumed".
-pub(super) const WAKE_RECEIPT: &str = "🔔 已恢复执行，继续处理…";
-
 /// Whether `e` is Feishu's deterministic card-content rejection (`230099`).
 /// The same card JSON fails on every retry, so the flush degrades instead.
 fn is_card_content_rejected(e: &crate::error::BridgeError) -> bool {
@@ -196,9 +180,9 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str) {
             // renders NO tail — its live Interaction Blocks migrate to the
             // continuation (ADR-0038), so the old card's controls are settled
             // rather than left dead.
-            let wake_split = pending_split
+            let continues_an_ended_card = pending_split
                 .iter()
-                .any(|split| split.kind == crate::bridge::turn::SplitKind::Wake);
+                .any(|split| split.kind.continues_an_ended_card());
             let (finalized, restamp) = if supplement_split_requested && !built.full {
                 // The live slice still fits, but a supplement forces the split
                 // anyway: finalize the slice here and HAND IT OFF — the
@@ -208,15 +192,14 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str) {
                 let Some(card) = cards.get_mut(session_id) else {
                     return;
                 };
-                // A Wake split continues a card that has already ENDED (the
-                // 等待后台任务 yield, a settled failure, a stop): the handoff
-                // advances the render boundary either way, but only a waiting
-                // card takes the standard 「部分完成，继续中…」 header — a
-                // terminal card keeps the ending it recorded. Every other
-                // split kind (a Supplement, `/card`) re-stamps the tracked
-                // card unconditionally: its slice may not have reached Feishu
-                // yet (the loading-card window's deferred split).
-                let restamp = !wake_split || !card.acc.card_state.is_terminal();
+                // A cause that continues an ENDED card (a Wake) advances the
+                // render boundary either way, but only a waiting card takes
+                // the standard 「部分完成，继续中…」 header — a terminal card
+                // keeps the ending it recorded. Every other cause splits a
+                // live card and re-stamps unconditionally: its slice may not
+                // have reached Feishu yet (the loading-card window's deferred
+                // split).
+                let restamp = !continues_an_ended_card || !card.acc.card_state.is_terminal();
                 (card.acc.build_finalized_handoff(), restamp)
             } else {
                 (built.card, true)
@@ -228,7 +211,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str) {
                 let mut cards = cards.cards.lock().await;
                 if let Some(card) = cards.get_mut(session_id) {
                     card.card_is_live = false;
-                    if wake_split {
+                    if continues_an_ended_card {
                         // The continuation card is a fresh live card: the
                         // ended attempt's display facts stay with the card the
                         // handoff just finalized (ADR-0059).
@@ -383,11 +366,7 @@ async fn push_queued_receipts(cards: &CardsHandle, session_id: &str) {
         if card.pending_split[i].receipt_pushed {
             continue;
         }
-        let receipt = match card.pending_split[i].kind {
-            crate::bridge::turn::SplitKind::Supplement => SUPPLEMENT_RECEIPT,
-            crate::bridge::turn::SplitKind::Pull => PULL_RECEIPT,
-            crate::bridge::turn::SplitKind::Wake => WAKE_RECEIPT,
-        };
+        let receipt = card.pending_split[i].kind.receipt();
         card.acc.push_receipt(receipt);
         card.pending_split[i].receipt_pushed = true;
     }
