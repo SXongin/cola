@@ -123,7 +123,16 @@ async fn aborted_turn_rejects_its_pending_permission() {
         replied.lock().await.contains("per_1"),
         "the server must no longer list the rejected request"
     );
-    let card = final_card(&platform).await.to_string();
+    let card_json = final_card(&platform).await;
+    let card = card_json.to_string();
+    assert!(
+        card_header(&card_json).contains("已停止"),
+        "the stopped turn finalizes Stopped, not Error: {card}"
+    );
+    assert!(
+        !card.contains("Aborted"),
+        "the abort error is not a failure and must not reach the card: {card}"
+    );
     assert!(
         card.contains("🚫 已拒绝：⚡ 执行 Shell 命令 `ls -la`"),
         "the block must settle into a denial receipt: {card}"
