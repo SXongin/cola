@@ -1015,6 +1015,13 @@ async fn a_message_in_the_waiting_window_starts_a_new_turn() {
     assert!(waiting_anchor.is_some(), "the waiting card keeps its accumulator");
 
     // The next message arrives in the waiting window: idle, so a new Turn.
+    // Hold its prompt: the first prompt's permit was returned when it
+    // completed, so take it here — the new Turn's submit stays in flight
+    // (holding the guard) while the assertions below observe it.
+    let _held = Arc::clone(&gate)
+        .acquire_owned()
+        .await
+        .expect("the prompt gate is open");
     let second = {
         let app = Arc::clone(&app);
         tokio::spawn(async move {
@@ -1046,11 +1053,19 @@ async fn a_message_in_the_waiting_window_starts_a_new_turn() {
     .await
     .expect("the new Turn must reply its own card to the message");
 
-    assert!(
-        backend.prompt_calls.lock().await.iter().any(|t| t == "新问题"),
-        "the new Turn's prompt must be submitted: {:?}",
-        backend.prompt_calls.lock().await
-    );
+    // The submit is recorded before the prompt gate, so wait for it instead of
+    // racing the Turn's work-context read that sits between the card and the
+    // prompt (the held permit keeps the Turn in flight from here on).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if backend.prompt_calls.lock().await.iter().any(|t| t == "新问题") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the new Turn's submit must be recorded");
     assert!(
         app.inflight.lock().await.contains("ses_test"),
         "the new Turn holds the guard while its prompt is in flight"
