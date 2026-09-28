@@ -1479,7 +1479,7 @@ impl Turn {
     /// finding a dead button.
     pub(crate) async fn release_retry_claim(cards: &CardsHandle, session_id: &str) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.acc.retry_claimed = false;
+            card.release_retry_claim();
         }
     }
 
@@ -1509,29 +1509,11 @@ impl Turn {
         thread_key: &ThreadKey,
         directory: Option<String>,
     ) -> bool {
-        let (anchor, directory) = {
+        let Some((anchor, directory)) = ({
             let mut live = handles.cards.cards.lock().await;
-            let Some(card) = live.get_mut(session_id) else {
-                return false;
-            };
-            if card.acc.card_state != crate::feishu::card::CardState::Error {
-                return false;
-            }
-            // The follow's identity and turn filter: without an anchor there
-            // is no turn to follow, so the Error card stays retryable.
-            let Some(anchor) = card.acc.turn_anchor.clone() else {
-                return false;
-            };
-            card.acc.error = None;
-            // The claim goes back with the Error state: the run may fail for
-            // real, and that Error's retry must be claimable.
-            card.acc.retry_claimed = false;
-            card.acc.resume_live();
-            let resolved_directory = directory
-                .filter(|directory| !directory.is_empty())
-                .or_else(|| card.acc.directory.clone())
-                .unwrap_or_default();
-            (anchor, resolved_directory)
+            live.get_mut(session_id).and_then(|card| card.reattach(directory))
+        }) else {
+            return false;
         };
         // The operator just clicked: the card must leave Error now, not after
         // the follow's first sleep.
