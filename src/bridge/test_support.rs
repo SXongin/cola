@@ -1114,7 +1114,7 @@ impl MockBackend {
     /// Scenario: the mock speaks a generation where a same-id re-post of an
     /// admitted turn can continue it (V1) or is a no-op (V2, `false`). Drives
     /// [`crate::backend::Backend::reuse_continues_an_admitted_turn`].
-    pub(crate) fn with_reuse_continuation(&mut self, reuse_continues: bool) -> &mut Self {
+    pub(crate) fn with_reuse_continues_an_admitted_turn(&mut self, reuse_continues: bool) -> &mut Self {
         self.reuse_continues_an_admitted_turn = reuse_continues;
         self
     }
