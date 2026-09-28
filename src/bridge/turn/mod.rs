@@ -543,6 +543,19 @@ impl Turn {
         // handler's not-busy path.
         let drain_outcome = self.drain_after_prompt(handles).await;
 
+        // A deliberate `/stop` owns this turn's ending (#394): the abort the
+        // server recorded is NOT a failure, its text must never reach the
+        // card, and the card finalizes `Stopped` — here, or by the follow's own
+        // stop branch if the drain had already handed the card off. The marker
+        // is sticky until the next Turn's `start` clears it, so reading it once
+        // here is authoritative for this finalization.
+        let stopped = handles
+            .waits
+            .stopped_sessions
+            .lock()
+            .await
+            .contains(&self.session_id);
+
         // The turn's outcome is OBSERVED, not returned (ADR-0056): a rejected
         // submit is the call's Err, and a submitted run's failure is recorded
         // on its newest assistant message — the blocking response used to carry
@@ -586,8 +599,10 @@ impl Turn {
         // follow's own fallback (lost contact / an unreconcilable panel) ends
         // it in Error). The anchor is the follow's
         // identity: without one there is no card content to follow, so the
-        // turn ends the normal way.
-        let follow_anchor = if prompt_err.is_none() && drain_outcome == Some(DrainState::Running) {
+        // turn ends the normal way. A stopped turn never hands off: the stop
+        // is its ending, so it finalizes right here (#394).
+        let follow_anchor = if !stopped && prompt_err.is_none() && drain_outcome == Some(DrainState::Running)
+        {
             Turn::armed_turn_anchor(&handles.cards, &self.session_id).await
         } else {
             None
@@ -600,8 +615,10 @@ impl Turn {
         // receipts on the card instead of ghosting onto the next turn (#177).
         // Only an unfinished turn does this: a completed one has nothing
         // pending, and a request that outlived a healthy turn (external or
-        // concurrent work) is not this turn's to deny.
-        if prompt_err.is_some() {
+        // concurrent work) is not this turn's to deny. A stopped turn is
+        // unfinished in exactly this sense — its abort strands whatever was
+        // pending — even when the stop left no error text (#394).
+        if stopped || prompt_err.is_some() {
             crate::bridge::request::flow::reject_leftovers_for_turn(
                 &handles.requests,
                 &handles.cards,
@@ -627,8 +644,8 @@ impl Turn {
         // below the guard is the normal end of a turn.
         if !follow {
             // Reconcile: render any parts the incremental poll missed from the
-            // settled transcript read above, then mark the card Done (or
-            // Error).
+            // settled transcript read above, then mark the card Stopped, Done
+            // or Error.
             {
                 let mut cards = handles.cards.cards.lock().await;
                 if let Some(acc) = cards.get_mut(&self.session_id).map(|c| &mut c.acc) {
@@ -655,7 +672,14 @@ impl Turn {
                             }
                         }
                     }
-                    if let Some(err) = &prompt_err {
+                    if stopped {
+                        // `/stop` is the operator's decision, not a failure:
+                        // discard the abort's error text (if the transcript
+                        // recorded one) and end the card in its own terminal
+                        // (#394). The content the turn produced stays.
+                        acc.error = None;
+                        acc.card_state = crate::feishu::card::CardState::Stopped;
+                    } else if let Some(err) = &prompt_err {
                         acc.error = Some(err.clone());
                         acc.card_state = crate::feishu::card::CardState::Error;
                     } else {
@@ -1264,9 +1288,9 @@ impl Turn {
         cards.cards.lock().await.contains_key(session_id)
     }
 
-    /// Whether the session's card is still running (not Done/Error). The map's
-    /// key alone does not mean a live card — a completed turn stays until the
-    /// next Turn replaces it.
+    /// Whether the session's card is still running (not terminal: Done, Error,
+    /// Retried or Stopped). The map's key alone does not mean a live card — a
+    /// completed/stopped turn stays until the next Turn replaces it.
     pub(crate) async fn is_running(cards: &CardsHandle, session_id: &str) -> bool {
         cards
             .cards
@@ -1364,6 +1388,20 @@ impl Turn {
     pub(crate) async fn finalize_done(cards: &CardsHandle, session_id: &str) {
         Self::refresh_work_context(cards, session_id).await;
         Self::mark_done(cards, session_id).await;
+        Self::flush_card(cards, session_id).await;
+    }
+
+    /// Finalize a followed card as `Stopped` (#394): a deliberate `/stop` is
+    /// not a failure, so any recorded error text is discarded, the state is
+    /// marked Stopped and the card flushed. The content stays, the header
+    /// reads 「⏹ 已停止」 and no retry button is rendered. Used by the
+    /// out-of-turn follow's stop branch.
+    pub(crate) async fn finalize_stopped(cards: &CardsHandle, session_id: &str) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.error = None;
+            card.acc.card_state = crate::feishu::card::CardState::Stopped;
+        }
+        Self::refresh_work_context(cards, session_id).await;
         Self::flush_card(cards, session_id).await;
     }
 
@@ -1762,7 +1800,8 @@ async fn release_inflight(handles: &TurnHandles, session_id: &str) {
 /// it inherited actually ends. A drain hand-off keeps the ORIGINAL turn's
 /// start, so the long-task threshold measures the whole run; a retry re-attach
 /// (#393) arms the follow with "now" instead, because the original turn's
-/// start is no longer known there.
+/// start is no longer known there. The copy follows the card's real terminal
+/// (#394): 完成, 出错, or 已停止 for a deliberate `/stop`.
 async fn send_completion_notice(handles: &TurnHandles, session_id: &str, started_at: std::time::Instant) {
     if !(handles.config.group_completion_notice || handles.config.long_task_notice) {
         return;
@@ -1779,19 +1818,16 @@ async fn send_completion_notice(handles: &TurnHandles, session_id: &str, started
             {
                 return None;
             }
-            Some((
-                reply_to,
-                requester,
-                a.is_group,
-                a.card_state == crate::feishu::card::CardState::Error,
-            ))
+            Some((reply_to, requester, a.is_group, a.card_state.clone()))
         })
     };
-    if let Some((reply_to, requester, is_group, is_error)) = notice {
-        let text = if is_error {
-            "❌ 上一条请求处理出错了，可点击卡片上的「重试」。"
-        } else {
-            "✅ 已完成。"
+    if let Some((reply_to, requester, is_group, state)) = notice {
+        // The card's real terminal decides the copy (#394): a deliberate stop
+        // is announced as 已停止, never as 完成 or 出错.
+        let text = match state {
+            crate::feishu::card::CardState::Stopped => "⏹ 已停止。",
+            crate::feishu::card::CardState::Error => "❌ 上一条请求处理出错了，可点击卡片上的「重试」。",
+            _ => "✅ 已完成。",
         };
         // Best-effort @-mention: the display name needs the contact API
         // (permission granted). On any lookup failure cola falls back to a

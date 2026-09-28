@@ -434,7 +434,7 @@ async fn a_message_during_the_drain_is_handled_as_a_supplement() {
 /// `/stop` ends the drain promptly: the interrupt stops the session, the stop
 /// marker makes the next drain tick finalize even though the aborted new Turn
 /// left the supplement unanswered, and no rendering continues — the 60 s bound
-/// is never reached.
+/// is never reached. The card finalizes `Stopped` (#394).
 #[tokio::test]
 async fn stop_ends_the_drain_promptly() {
     let _wd = test_work_dir();
@@ -480,9 +480,118 @@ async fn stop_ends_the_drain_promptly() {
         platform.calls.lock().await
     );
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
-    assert!(card_header(&final_card).contains("完成"), "final card Done");
+    assert!(
+        card_header(&final_card).contains("已停止"),
+        "a deliberate /stop finalizes Stopped, not Done: {final_card}"
+    );
+    assert!(
+        card_buttons(&final_card).is_empty(),
+        "a stopped card must not offer a retry: {final_card}"
+    );
     assert!(!app.inflight.lock().await.contains("ses_test"));
     assert_no_further_rendering(&backend, &platform).await;
+}
+
+/// A deliberate `/stop` is not a failure (#394): the abort the server records
+/// on the transcript must not reach the card, and the card finalizes Stopped —
+/// not Error — with no retry button.
+#[tokio::test]
+async fn a_stopped_turn_discards_the_abort_error() {
+    let _wd = test_work_dir();
+    let mut aborted = assistant(2_000, "");
+    aborted.error = Some("Aborted".into());
+    let timeline = vec![user("msg_cola_anchor", 1_000, "第一条消息"), aborted];
+    // Busy keeps the drain polling until the stop marker ends it, so the stop
+    // lands before finalization.
+    let (_dir, app, backend, platform) =
+        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
+
+    let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
+    wait_for_card_header(&platform, "思考中").await;
+    app.handle_message(incoming(
+        "msg_stop".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/stop".into(),
+        None,
+    ))
+    .await;
+
+    let result = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the drain must end on the stop, not the 60 s bound")
+        .unwrap();
+    result.unwrap();
+
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_header(&final_card).contains("已停止"),
+        "a stopped turn finalizes Stopped: {final_card}"
+    );
+    assert!(
+        !card_text(&final_card).contains("Aborted") && !card_text(&final_card).contains("出错"),
+        "the transcript's abort error is not a failure and must not reach the card: {final_card}"
+    );
+    assert!(
+        card_buttons(&final_card).is_empty(),
+        "a stopped card must not offer a retry: {final_card}"
+    );
+    assert_no_further_rendering(&backend, &platform).await;
+}
+
+/// A deliberate stop's completion notice says 已停止 (#394): never 完成, never
+/// 出错.
+#[tokio::test]
+async fn a_stopped_group_turn_notices_stopped() {
+    let _wd = test_work_dir();
+    let timeline = vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一轮回答。"),
+        user("msg_cola_supp", 3_000, "补充一下"),
+    ];
+    let (_dir, app, _backend, platform) =
+        scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Idle)).await;
+
+    let mut context = ctx("ses_test", "第一条消息");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+    let turn = spawn_turn(&app, context);
+    wait_for_card_text(&platform, "第一轮回答。").await;
+
+    app.handle_message(incoming(
+        "msg_stop".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/stop".into(),
+        None,
+    ))
+    .await;
+    let result = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the drain must end on the stop, not the 60 s bound")
+        .unwrap();
+    result.unwrap();
+
+    let calls = platform.calls.lock().await.clone();
+    let notices: Vec<&str> = calls
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::CompletionNotice { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        notices.contains(&"⏹ 已停止。"),
+        "the stopped notice must be used: {notices:?}"
+    );
+    assert!(
+        !notices
+            .iter()
+            .any(|text| text.contains("已完成") || text.contains("出错")),
+        "a stop is never announced as 完成 or 出错: {notices:?}"
+    );
 }
 
 /// ADR-0048: the stopped-finalization is one state transition per Turn. The
@@ -729,10 +838,15 @@ async fn stop_during_the_follow_finalizes_promptly() {
         "/stop must interrupt the session"
     );
 
-    wait_for_card_header(&platform, "完成").await;
+    wait_for_card_header(&platform, "已停止").await;
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "the follow must end on the stop, not the 60 s grace"
+    );
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_buttons(&final_card).is_empty(),
+        "a stopped card must not offer a retry: {final_card}"
     );
     assert!(
         platform.texts().await.iter().any(|t| t.contains("Interrupted")),

@@ -27,7 +27,8 @@
 //! message arriving meanwhile starts a normal new Turn, which replaces the
 //! accumulator and ends the follow on its next tick (the same replacement
 //! guard the external render loop uses). `/stop` still ends it promptly via
-//! the sticky stopped-session marker.
+//! the sticky stopped-session marker, and finalizes `Stopped` — the stop
+//! terminal, never Done or Error (#394).
 
 use std::time::Duration;
 
@@ -125,7 +126,9 @@ async fn run(
         // `/stop` aborted this session's run: no answer is coming, so finalize
         // promptly instead of waiting out the grace (the drain's own stop
         // rule). One last render reconciles the abort's tool states before the
-        // card goes Done, exactly as `finish` does on its stop path.
+        // card goes Stopped — a deliberate stop is not a failure and its
+        // abort's error text never reaches the card (#394) — exactly as
+        // `finish` does on its stop path.
         if handles.waits.stopped_sessions.lock().await.contains(&session_id) {
             if let Some(Ok(transcript)) = crate::bridge::bounded_call(
                 "drain follow transcript",
@@ -144,9 +147,7 @@ async fn run(
                 )
                 .await;
             }
-            Turn::finalize_done(&handles.cards, &session_id).await;
-            super::send_completion_notice(&handles, &session_id, started_at).await;
-            tracing::info!("drain follow: session {} stopped; finalized", session_id);
+            finalize_stop(&handles, &session_id, started_at).await;
             return;
         }
         // The reads. BOTH must answer for the tick to count as contact: a
@@ -226,6 +227,17 @@ async fn run(
                 let live_panels = Turn::has_live_tools(&handles.cards, &session_id).await;
                 match transcript.as_ref() {
                     Some(transcript) if !live_panels => {
+                        // `/stop` may have landed after this tick's top marker
+                        // check (the command marks the session before it
+                        // interrupts, but a tick already past that check can
+                        // still be classifying the settled run): a deliberate
+                        // stop is the ending, never the settled Done/Error
+                        // below (#394). The tick already rendered the abort's
+                        // settled tool states above.
+                        if handles.waits.stopped_sessions.lock().await.contains(&session_id) {
+                            finalize_stop(&handles, &session_id, started_at).await;
+                            return;
+                        }
                         match turn_failure(transcript, &anchor) {
                             Some(error) => {
                                 Turn::finalize_error(&handles.cards, &session_id, &error).await;
@@ -275,6 +287,15 @@ async fn run(
 /// failure, so a recovered earlier step is not a failure).
 fn turn_failure(transcript: &SessionTranscript, anchor: &TurnAnchor) -> Option<String> {
     transcript.turn_for_user(anchor).error
+}
+
+/// The stop ending (#394): the session carries the `/stop` marker, so the card
+/// finalizes `Stopped` — never Done or Error — and the completion notice
+/// follows it. The caller owns any reconcile render; this only finalizes.
+async fn finalize_stop(handles: &TurnHandles, session_id: &str, started_at: std::time::Instant) {
+    Turn::finalize_stopped(&handles.cards, session_id).await;
+    super::send_completion_notice(handles, session_id, started_at).await;
+    tracing::info!("drain follow: session {} stopped; finalized Stopped", session_id);
 }
 
 /// A grace exit: the run is either unreadable or carries a panel that will

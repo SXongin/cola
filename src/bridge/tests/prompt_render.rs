@@ -1274,12 +1274,21 @@ async fn stop_after_a_reattach_ends_the_card_promptly() {
     let state = tokio::time::timeout(std::time::Duration::from_secs(3), wait)
         .await
         .expect("the follow must end on the stop, not the 60 s grace");
-    assert_ne!(
+    assert_eq!(
         state,
-        crate::feishu::card::CardState::Error,
-        "a deliberate stop must not be an Error"
+        crate::feishu::card::CardState::Stopped,
+        "a deliberate stop finalizes Stopped, not Error or Done"
     );
     assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_header(&final_card).contains("已停止"),
+        "the re-attached card's stop must render the stop header: {final_card}"
+    );
+    assert!(
+        card_buttons(&final_card).is_empty(),
+        "a re-attached card finalized by a stop must offer no retry: {final_card}"
+    );
 }
 
 /// A message arriving after a re-attach is a normal new Turn — the guard
