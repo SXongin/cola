@@ -977,11 +977,58 @@ async fn retry_on_a_live_card_submits_nothing() {
     assert_eq!(ids.len(), 1, "no retry prompt may be submitted: {ids:?}");
 }
 
-/// The busy cell of the matrix belongs to the re-attach ticket (#393): this
-/// ticket only guarantees the decision reads the status first and submits
-/// NOTHING while the run is alive.
+/// The re-attach fixture's turn anchor: the user message the failed turn
+/// answers. Later scripted windows keep it, so the follow keeps reading the
+/// same turn (ticket #393).
+const REATTACH_ANCHOR: &str = "msg_cola_reattach";
+
+/// The re-attach fixture (spec #391, ticket #393): a `ses_test` app whose
+/// first prompt failed. The scripted transcript carries the failed attempt —
+/// the anchor user message plus a failed assistant reply — so the Error card
+/// keeps the accumulator's anchor and prompt that a busy click re-attaches to.
+/// The session is left idle; the caller scripts the click-time status.
+async fn error_card_app(
+    cfg: crate::config::Config,
+    is_group: bool,
+    requester: Option<String>,
+) -> (Arc<App>, Arc<MockBackend>, Arc<RecordingPlatform>) {
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.fail_prompts(1, "Simulated provider failure");
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+    app.turn_render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    // A tiny per-read bound: a hung follow read must fail fast.
+    app.turn_follow_read_timeout_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
+    *backend
+        .transcript_scripts
+        .lock()
+        .await
+        .entry("ses_test".into())
+        .or_default() = vec![failed_attempt_window(REATTACH_ANCHOR)];
+
+    let mut context = retry_ctx("ses_test", "hi", REATTACH_ANCHOR);
+    context.is_group = is_group;
+    context.requester_open_id = requester;
+    crate::bridge::turn::Turn::run(&app.turn_handles(), context)
+        .await
+        .unwrap();
+    wait_for_card_update(&platform, "the Error card", CardUpdates::Latest, |card| {
+        card_header(card) == "❌ 出错"
+    })
+    .await;
+    (app, backend, platform)
+}
+
+/// The busy fallback (spec #391, ticket #393): a failed submission that
+/// persisted nothing leaves the accumulator without an anchor, so there is no
+/// run to follow. The click submits nothing and marks nothing, the card stays
+/// Error, and the claim goes back so the retry is still clickable.
 #[tokio::test]
-async fn busy_status_retry_submits_nothing() {
+async fn busy_retry_without_an_anchor_leaves_the_card_retryable() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -1012,10 +1059,427 @@ async fn busy_status_retry_submits_nothing() {
         .await;
     assert!(retry.is_some(), "the busy click still acks");
 
-    // Let the spawned decision run; it must not submit.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Let the spawned decision run: it must not submit, and it must give the
+    // claim back (the no-anchor fallback leaves the button usable).
+    let retryable = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if crate::bridge::turn::Turn::claim_retry(&app.cards_handle(), "ses_test")
+                .await
+                .is_some()
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(retryable.is_ok(), "the fallback must release the claim");
+    assert_eq!(
+        crate::bridge::turn::Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(crate::feishu::card::CardState::Error),
+        "without an anchor the card stays a retryable Error"
+    );
     let ids = prompt_ids.lock().await.clone();
     assert_eq!(ids.len(), 1, "a busy run must not be re-prompted: {ids:?}");
+}
+
+/// The busy cell of the retry matrix (spec #391, ticket #393): a click on a
+/// still-alive run submits NO prompt — the card is re-attached instead. It
+/// leaves Error immediately (live header, failed content preserved), and when
+/// the scripted run ends clean the follow finalizes Done from the transcript.
+#[tokio::test]
+async fn busy_retry_reattaches_and_finalizes_done_from_the_transcript() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, backend, platform) = error_card_app(cfg, false, None).await;
+
+    backend
+        .set_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Busy))
+        .await;
+    let retry = app
+        .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
+        .await;
+    assert_retry_ack(retry);
+
+    // The re-attach's own flush leaves Error before the follow's first tick:
+    // live header, the failed attempt's content intact.
+    wait_for_card_update(
+        &platform,
+        "the re-attached live card",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("回复中") && card_text(card).contains("OLD_TEXT"),
+    )
+    .await;
+    let ids = backend.prompt_message_ids.lock().await.clone();
+    assert_eq!(ids.len(), 1, "a live run must not be re-prompted: {ids:?}");
+
+    // The scripted run ends clean: the follow finalizes Done from it.
+    *backend
+        .transcript_scripts
+        .lock()
+        .await
+        .get_mut("ses_test")
+        .unwrap() = vec![window_with(
+        REATTACH_ANCHOR,
+        vec![typed_message(
+            "msg_clean_end",
+            MessageRole::Assistant,
+            Some(3_000),
+            vec![text_part("重接后的干净收尾 CLEAN_END")],
+        )],
+    )];
+    backend
+        .set_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Idle))
+        .await;
+    wait_for_card_update(
+        &platform,
+        "the re-attached Done card",
+        CardUpdates::Latest,
+        |card| card_header(card) == "✅ 完成" && card_text(card).contains("CLEAN_END"),
+    )
+    .await;
+    assert_eq!(
+        backend.prompt_calls.lock().await.len(),
+        1,
+        "the re-attach must never submit a prompt"
+    );
+}
+
+/// A re-attached run that ends in failure finalizes Error with a WORKING
+/// retry (spec #391, ticket #393): the claim was released with the re-attach,
+/// so the new Error's click can act again.
+#[tokio::test]
+async fn busy_retry_reattach_finalizes_error_with_a_working_retry() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, backend, platform) = error_card_app(cfg, false, None).await;
+
+    // `Retry` is the matrix's other live status: it must re-attach too.
+    backend
+        .set_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Retry))
+        .await;
+    let retry = app
+        .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
+        .await;
+    assert_retry_ack(retry);
+    wait_for_card_update(
+        &platform,
+        "the re-attached live card",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("回复中"),
+    )
+    .await;
+
+    // The run ends for real: the newest assistant message records a failure.
+    let mut failed = typed_message(
+        "msg_reattach_failure",
+        MessageRole::Assistant,
+        Some(3_000),
+        vec![text_part("重接后的真实失败 REAL_FAILURE")],
+    );
+    failed.error = Some("真实运行失败".into());
+    *backend
+        .transcript_scripts
+        .lock()
+        .await
+        .get_mut("ses_test")
+        .unwrap() = vec![window_with(REATTACH_ANCHOR, vec![failed])];
+    backend
+        .set_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Idle))
+        .await;
+    wait_for_card_update(
+        &platform,
+        "the re-attached Error card",
+        CardUpdates::Latest,
+        |card| card_header(card) == "❌ 出错" && card_text(card).contains("REAL_FAILURE"),
+    )
+    .await;
+
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_buttons(&final_card).iter().any(|button| {
+            button["value"].get("action").and_then(|action| action.as_str()) == Some("retry")
+        }),
+        "the re-attached failure must offer a retry: {final_card}"
+    );
+    assert!(
+        crate::bridge::turn::Turn::claim_retry(&app.cards_handle(), "ses_test")
+            .await
+            .is_some(),
+        "the re-attach must release the claim so the new Error is retryable"
+    );
+    assert_eq!(
+        backend.prompt_calls.lock().await.len(),
+        1,
+        "the re-attach must never submit a prompt"
+    );
+}
+
+/// The re-attached card is an ordinary follow: `/stop` still ends it promptly
+/// through the sticky stopped-session marker — re-attach adds no loop, so the
+/// follow's stop handling is untouched (spec #391, ticket #393).
+#[tokio::test]
+async fn stop_after_a_reattach_ends_the_card_promptly() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, backend, platform) = error_card_app(cfg, false, None).await;
+    // A ceiling the test would never wait out: only the stop can end it.
+    app.turn_follow_grace_ms
+        .store(60_000, std::sync::atomic::Ordering::Relaxed);
+
+    backend
+        .set_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Busy))
+        .await;
+    let retry = app
+        .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
+        .await;
+    assert_retry_ack(retry);
+    wait_for_card_update(
+        &platform,
+        "the re-attached live card",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("回复中"),
+    )
+    .await;
+
+    let started = std::time::Instant::now();
+    app.handle_message(incoming(
+        "msg_stop".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/stop".into(),
+        None,
+    ))
+    .await;
+    assert_eq!(
+        backend.interrupt_calls.lock().await.as_slice(),
+        &["ses_test".to_string()],
+        "/stop must interrupt the re-attached session"
+    );
+
+    let wait = async {
+        loop {
+            if let Some(state) = crate::bridge::turn::Turn::card_state(&app.cards_handle(), "ses_test").await
+                && state.is_terminal()
+            {
+                return state;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    };
+    let state = tokio::time::timeout(std::time::Duration::from_secs(3), wait)
+        .await
+        .expect("the follow must end on the stop, not the 60 s grace");
+    assert_ne!(
+        state,
+        crate::feishu::card::CardState::Error,
+        "a deliberate stop must not be an Error"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+}
+
+/// A message arriving after a re-attach is a normal new Turn — the guard
+/// stayed free, exactly as at the drain hand-off — and it replaces the
+/// accumulator the follow watched, so the follow exits on its next tick
+/// (spec #391, ticket #393).
+#[tokio::test]
+async fn a_message_after_a_reattach_starts_a_normal_new_turn() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, backend, platform) = error_card_app(cfg, false, None).await;
+    // Tiny drain bound: the new Turn hands off quickly even while the scripted
+    // session stays Busy.
+    app.turn_drain_timeout_ms
+        .store(30, std::sync::atomic::Ordering::Relaxed);
+
+    backend
+        .set_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Busy))
+        .await;
+    let retry = app
+        .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
+        .await;
+    assert_retry_ack(retry);
+    wait_for_card_update(
+        &platform,
+        "the re-attached live card",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("回复中"),
+    )
+    .await;
+    let followed = crate::bridge::turn::Turn::armed_turn_anchor(&app.cards_handle(), "ses_test").await;
+    assert!(followed.is_some(), "the re-attach watches the turn anchor");
+
+    app.handle_message(incoming(
+        "msg_next".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "接着问".into(),
+        None,
+    ))
+    .await;
+
+    assert!(
+        backend
+            .prompt_calls
+            .lock()
+            .await
+            .iter()
+            .any(|text| text == "接着问"),
+        "the released session must take the normal prompt path: {:?}",
+        backend.prompt_calls.lock().await
+    );
+    assert!(
+        !platform
+            .texts()
+            .await
+            .iter()
+            .any(|text| text.contains("还在处理中")),
+        "the new turn is not throttled: {:?}",
+        platform.calls.lock().await
+    );
+    assert_ne!(
+        crate::bridge::turn::Turn::armed_turn_anchor(&app.cards_handle(), "ses_test").await,
+        followed,
+        "the new Turn must replace the accumulator the follow watched"
+    );
+}
+
+/// The long-task notice's start is the re-attach, not the original turn (spec
+/// #391, ticket #393): the original start is no longer known. The failed turn
+/// began well past the threshold ago; the re-attached run ends quickly, so the
+/// notice must stay silent — a notice would mean the stale start leaked in.
+#[tokio::test]
+async fn a_quick_reattached_end_does_not_measure_the_original_turn() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(&dir.path().join("sessions.json"));
+    cfg.bridge.long_task_notice = true;
+    let (app, backend, platform) = error_card_app(cfg, false, Some(TEST_HOST.to_string())).await;
+    app.long_task_notice_ms
+        .store(300, std::sync::atomic::Ordering::Relaxed);
+
+    // The original turn is older than the threshold now. Its own fast finish
+    // sent nothing (the threshold was the default then), so the notice list
+    // starts empty.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(
+        platform.completion_notices().await.is_empty(),
+        "the failed turn was short: {:?}",
+        platform.calls.lock().await
+    );
+
+    backend
+        .set_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Busy))
+        .await;
+    let retry = app
+        .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
+        .await;
+    assert_retry_ack(retry);
+    wait_for_card_update(
+        &platform,
+        "the re-attached live card",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("回复中"),
+    )
+    .await;
+
+    // A clean end within the threshold of the re-attach.
+    *backend
+        .transcript_scripts
+        .lock()
+        .await
+        .get_mut("ses_test")
+        .unwrap() = vec![window_with(
+        REATTACH_ANCHOR,
+        vec![typed_message(
+            "msg_quick_end",
+            MessageRole::Assistant,
+            Some(3_000),
+            vec![text_part("快速收尾 QUICK_END")],
+        )],
+    )];
+    backend
+        .set_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Idle))
+        .await;
+    wait_for_card_update(
+        &platform,
+        "the quickly re-attached Done card",
+        CardUpdates::Latest,
+        |card| card_header(card) == "✅ 完成" && card_text(card).contains("QUICK_END"),
+    )
+    .await;
+    assert!(
+        platform.completion_notices().await.is_empty(),
+        "the notice must measure from the re-attach, not the original turn: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// The other side of the same rule: a re-attached stretch that itself
+/// outlives the threshold still notifies on the real end (the follow carries
+/// the re-attach's own start).
+#[tokio::test]
+async fn a_long_reattached_run_still_sends_the_notice() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(&dir.path().join("sessions.json"));
+    cfg.bridge.long_task_notice = true;
+    let (app, backend, platform) = error_card_app(cfg, false, Some(TEST_HOST.to_string())).await;
+    app.long_task_notice_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
+
+    backend
+        .set_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Busy))
+        .await;
+    let retry = app
+        .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
+        .await;
+    assert_retry_ack(retry);
+    wait_for_card_update(
+        &platform,
+        "the re-attached live card",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("回复中"),
+    )
+    .await;
+
+    // The re-attached stretch outlives the threshold on its own.
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    *backend
+        .transcript_scripts
+        .lock()
+        .await
+        .get_mut("ses_test")
+        .unwrap() = vec![window_with(
+        REATTACH_ANCHOR,
+        vec![typed_message(
+            "msg_long_end",
+            MessageRole::Assistant,
+            Some(4_000),
+            vec![text_part("长任务收尾 LONG_END")],
+        )],
+    )];
+    backend
+        .set_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Idle))
+        .await;
+    wait_for_card_update(
+        &platform,
+        "the long re-attached Done card",
+        CardUpdates::Latest,
+        |card| card_header(card) == "✅ 完成" && card_text(card).contains("LONG_END"),
+    )
+    .await;
+    let notices = platform.completion_notices().await;
+    assert!(
+        notices.iter().any(|(_, _, _, text)| text.contains("已完成")),
+        "a long re-attached run must notify: {notices:?}"
+    );
 }
 
 /// One failed attempt's assistant message: distinctive text plus a completed
