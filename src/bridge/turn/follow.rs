@@ -31,28 +31,47 @@ use crate::config::ThreadKey;
 
 use super::{SettleTiming, settle};
 
+/// The fixture a follow inherits from the Turn it continues: whose card it
+/// watches, where its reads route, and when the run started (the long-task
+/// notice's clock). Grouped so [`spawn`]/[`run`] carry one fact bundle instead
+/// of five positional arguments.
+pub(super) struct FollowFacts {
+    pub(super) session_id: String,
+    pub(super) thread_key: ThreadKey,
+    /// The session's working directory, for the settle loop's status reads.
+    pub(super) directory: String,
+    /// The original Turn's start; the retry re-attach passes "now" (the
+    /// original start is no longer known there), so the long-task notice
+    /// measures the stretch the follow actually covers.
+    pub(super) started_at: std::time::Instant,
+    /// The accumulator's identity — the message id together with its server
+    /// time, one fact: the loop's ownership guard and the settle decision's
+    /// scope.
+    pub(super) anchor: TurnAnchor,
+}
+
+/// Take the Session's inflight guard for a follow window (ADR-0059).
+/// Idempotent by design: the drain hand-off's Turn deliberately did not
+/// release, so its call finds the guard already held, while the retry
+/// re-attach acquires it here — either way the hand-off has no guard-free gap.
+/// [`run`] hands the guard back when the loop ends.
+pub(super) async fn inherit_guard(handles: &TurnHandles, session_id: &str) {
+    handles.waits.inflight.lock().await.insert(session_id.to_string());
+}
+
 /// Spawn the out-of-turn follow for a turn whose drain bound was reached with
-/// the session still running. `anchor` is the accumulator's identity (the
-/// message id together with its server time — one fact) and `started_at` the
-/// original turn's start, so the follow's completion notice keeps the
-/// long-task threshold measuring the whole run.
+/// the session still running.
 ///
-/// The follow inherits the Session's inflight guard (ADR-0059): the drain
-/// hand-off still holds it (its Turn deliberately did not release), and the
-/// retry re-attach acquires it here — the insert is idempotent either way, so
-/// the hand-off has no guard-free gap. The guard covers the whole follow
-/// window: a message arriving meanwhile is a Supplement merging into the
-/// still-live chain, and the server-yield's busy read never sees a followed
-/// Session as idle. [`run`] releases it when the window closes.
-pub(super) async fn spawn(
-    handles: &TurnHandles,
-    session_id: String,
-    thread_key: ThreadKey,
-    directory: String,
-    started_at: std::time::Instant,
-    anchor: TurnAnchor,
-) {
-    handles.waits.inflight.lock().await.insert(session_id.clone());
+/// **Guard hand-off (ADR-0059):** the follow takes the Session's inflight
+/// guard via [`inherit_guard`] BEFORE its task is spawned, so a caller must
+/// never release between handing the card over and this call — the drain
+/// hand-off's Turn deliberately does not release, and the retry re-attach has
+/// no guard to release. The guard then covers the whole follow window: a
+/// message arriving meanwhile is a Supplement merging into the still-live
+/// chain, and the server-yield's busy read never sees a followed Session as
+/// idle. [`run`] releases it when the window closes.
+pub(super) async fn spawn(handles: &TurnHandles, facts: FollowFacts) {
+    inherit_guard(handles, &facts.session_id).await;
     let handles = handles.clone();
     let timing = SettleTiming {
         poll_ms: handles.config.render_poll_ms(),
@@ -61,10 +80,10 @@ pub(super) async fn spawn(
     };
     // A spawn inherits no span: instrument the follow with the session's own
     // `turn` span (ADR-0048), rooted like the render poll's.
-    let span = span::turn(&session_id, &thread_key, None);
+    let span = span::turn(&facts.session_id, &facts.thread_key, None);
     tokio::spawn(
         async move {
-            run(handles, session_id, directory, started_at, anchor, timing).await;
+            run(handles, facts, timing).await;
         }
         .instrument(span),
     );
@@ -84,14 +103,14 @@ pub(super) async fn spawn(
 /// only a chain it still owns — a new Turn that slipped into the released
 /// moment replaced the accumulator, and stamping its live card with the old
 /// ending would be a lie.
-async fn run(
-    handles: TurnHandles,
-    session_id: String,
-    directory: String,
-    started_at: std::time::Instant,
-    anchor: TurnAnchor,
-    timing: SettleTiming,
-) {
+async fn run(handles: TurnHandles, facts: FollowFacts, timing: SettleTiming) {
+    let FollowFacts {
+        session_id,
+        thread_key: _,
+        directory,
+        started_at,
+        anchor,
+    } = facts;
     let flow = handles.flow();
     let owns = settle::Ownership::TurnAnchor(anchor);
     let ending = settle::run(&flow, &session_id, &directory, timing, &owns).await;

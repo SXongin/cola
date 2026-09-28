@@ -15,12 +15,6 @@ use crate::feishu;
 use crate::opencode;
 use crate::opencode::types::SessionStatus;
 
-/// Bound on the admission liveness read (`session_status`, ADR-0059): the
-/// routing key must not stall a user message behind a wedged server. Matches
-/// the prompt subtitle's own single-field read bound; a read that times out is
-/// unknown and never counts as liveness.
-const LIVENESS_READ_TIMEOUT_MS: u64 = 3_000;
-
 /// Shown once when the first top-level message in a group auto-creates the
 /// group's lobby session.
 const GROUP_LOBBY_GUIDANCE: &str = "\
@@ -49,6 +43,40 @@ pub(crate) fn image_inputs(
             data_base64: base64::engine::general_purpose::STANDARD.encode(&img.data),
         })
         .collect()
+}
+
+/// One bounded `session_status` read for the prompt path — the admission
+/// liveness check (ADR-0059's routing key) and the retry matrix read through
+/// it, so the two can never drift in bound or failure policy. `what` labels
+/// the read in the bounded-call timeout log; both callers pass the same
+/// injected per-read bound (`TurnConfig::follow_read_timeout_ms`).
+///
+/// `None` is UNKNOWN: a failed call, a timed-out call, or an unrecognised
+/// status kind (each warned once here). A successful read always yields a
+/// status — absence from the server's map means idle. The callers own the
+/// direction: admission reads unknown as NOT live (a new Turn is the safe
+/// shape; the read may never invent a live Execution), while the retry matrix
+/// submits a fresh id (the click must always have an effect).
+async fn read_session_status(
+    what: &str,
+    timeout_ms: u64,
+    backend: &Arc<dyn crate::backend::Backend>,
+    session_id: &str,
+    directory: Option<&str>,
+) -> Option<SessionStatus> {
+    match crate::bridge::bounded_call(what, timeout_ms, backend.session_status(session_id, directory)).await {
+        Some(Ok(Some(status))) => Some(status),
+        Some(Ok(None)) => {
+            tracing::warn!("{what}: unrecognised status kind; reading as unknown");
+            None
+        }
+        Some(Err(e)) => {
+            tracing::warn!("{what}: {e}");
+            None
+        }
+        // `bounded_call` already logged the timeout.
+        None => None,
+    }
 }
 
 /// The bridge coordinator. Owns the state shared by every flow ([`SharedCore`])
@@ -467,24 +495,26 @@ impl App {
     /// cola's inflight guard answers first: a running Turn holds it, and the
     /// out-of-turn follow inherits it for its whole window, so a followed
     /// Session is live without touching the wire. A free guard falls back to
-    /// the Backend's own status read — `Busy`/`Retry` is a live run, `Idle`
-    /// and an unrecognised kind are not, and a failed or timed-out read is
-    /// unknown and reads as NOT live: the read may never invent a run (the
-    /// message would be swallowed into a Supplement with no card to continue),
-    /// while the new Turn it starts instead is safe either way — a V2 prompt
-    /// carries the merge delivery, and a V1 runner absorbs a mid-run message.
+    /// the Backend's own status read through [`read_session_status`] — a live
+    /// status is a running Execution, and an unknown read (failed, timed out,
+    /// unrecognised) reads as NOT live: it may never invent a run (the message
+    /// would be swallowed into a Supplement with no card to continue), while
+    /// the new Turn it starts instead is safe either way — a V2 prompt carries
+    /// the merge delivery, and a V1 runner absorbs a mid-run message.
     async fn session_has_live_execution(&self, session_id: &str) -> bool {
         if self.inflight.lock().await.contains(session_id) {
             return true;
         }
         let directory = self.sessions.lock().await.directory_for_session(session_id);
-        let status = crate::bridge::bounded_call(
-            "prompt liveness session status",
-            LIVENESS_READ_TIMEOUT_MS,
-            self.opencode.session_status(session_id, directory.as_deref()),
+        read_session_status(
+            "prompt live execution status",
+            self.turn_config().follow_read_timeout_ms(),
+            &self.opencode,
+            session_id,
+            directory.as_deref(),
         )
-        .await;
-        matches!(status, Some(Ok(Some(SessionStatus::Busy | SessionStatus::Retry))))
+        .await
+        .is_some_and(SessionStatus::is_live)
     }
 
     pub(crate) async fn handle_prompt(
@@ -1958,31 +1988,16 @@ impl App {
     ) {
         let read_timeout_ms = handles.config.follow_read_timeout_ms();
         // Each read is bounded on its own: a hung status must not swallow the
-        // transcript read, and vice versa.
-        let status = match crate::bridge::bounded_call(
+        // transcript read, and vice versa. A failed, timed-out or unrecognised
+        // status read is UNKNOWN (`None`) — the matrix then submits a fresh id.
+        let status = read_session_status(
             "retry session status",
             read_timeout_ms,
-            handles
-                .backend
-                .session_status(&retry.session_id, directory.as_deref()),
+            &handles.backend,
+            &retry.session_id,
+            directory.as_deref(),
         )
-        .await
-        {
-            Some(Ok(Some(status))) => Some(status),
-            Some(Ok(None)) => {
-                tracing::warn!(
-                    "retry: session {} status unreadable; deciding as unknown",
-                    retry.session_id
-                );
-                None
-            }
-            Some(Err(e)) => {
-                tracing::warn!("retry session status: {}", e);
-                None
-            }
-            // `bounded_call` already logged the timeout.
-            None => None,
-        };
+        .await;
         let transcript = match crate::bridge::bounded_call(
             "retry transcript",
             read_timeout_ms,

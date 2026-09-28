@@ -476,11 +476,15 @@ pub const CHILD_IDLE: &str = "✅ 空闲";
 
 /// The run-state label for one child's status read; `None` = no report.
 fn child_state_label(status: Option<crate::opencode::types::SessionStatus>) -> Option<&'static str> {
-    use crate::opencode::types::SessionStatus;
     match status {
-        Some(SessionStatus::Busy | SessionStatus::Retry) => Some(CHILD_RUNNING),
-        Some(SessionStatus::Idle) => Some(CHILD_IDLE),
         None => None,
+        // Anything but Idle is a child still doing work: `is_live` is Busy
+        // (running) and Retry (the next attempt is scheduled).
+        Some(status) => Some(if status.is_live() {
+            CHILD_RUNNING
+        } else {
+            CHILD_IDLE
+        }),
     }
 }
 

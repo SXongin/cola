@@ -522,6 +522,62 @@ async fn busy_adopt_streams_turn_into_snapshot() {
     );
 }
 
+/// The external follow terminates on completion: once the followed turn reads
+/// complete, the renderer finalizes the card Done and stops reading the
+/// transcript — no eternal poll over a finished run.
+#[tokio::test]
+async fn a_completed_external_follow_stops_reading() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
+    backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
+    backend.external_message_for("ses_alpha01", "帮我重构这个模块");
+    let reply_ready = backend.external_reply(realistic_parts());
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    app.core
+        .external
+        .render_poll_ms
+        .store(20, std::sync::atomic::Ordering::Relaxed);
+
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    assert!(
+        Turn::armed_turn_anchor(&app.core.cards_handle(), "ses_alpha01")
+            .await
+            .is_some(),
+        "the busy adopt must arm the external follow"
+    );
+
+    // The model answers: the follow finalizes the card Done and exits.
+    reply_ready.store(true, std::sync::atomic::Ordering::SeqCst);
+    wait_for_card_update(
+        &platform,
+        "the external follow's Done card",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅"),
+    )
+    .await;
+
+    // The exit is silent: after the completion PATCH lands, no tick reads the
+    // transcript again (the poll cadence is 20 ms).
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let reads = backend.transcript_calls.lock().await.len();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        backend.transcript_calls.lock().await.len(),
+        reads,
+        "a completed external follow must stop reading"
+    );
+}
+
 /// An external run BLOCKED on a permission resumes from the snapshot: the
 /// adopt-time block rides as an inline section on the follow card, the
 /// approval takes the normal inline path, and the turn completes inside
@@ -853,18 +909,8 @@ async fn user_prompt_during_follow_merges_as_a_supplement() {
 
     // The chain split at the message: a continuation replies to it with the
     // Supplement receipt, and the followed card is finalized.
+    supplement_continuation(&platform, "msg_prompt").await;
     let calls = platform.calls.lock().await.clone();
-    let continuation = calls
-        .iter()
-        .find_map(|c| match c {
-            PlatformCall::ReplyCard { reply_to, card } if reply_to == "msg_prompt" => Some(card.clone()),
-            _ => None,
-        })
-        .expect("the split continuation must reply to the message");
-    assert!(
-        card_text(&continuation).contains("📨 已收到补充"),
-        "the continuation carries the Supplement receipt: {continuation}"
-    );
     assert!(
         calls.iter().any(|c| matches!(
             c,

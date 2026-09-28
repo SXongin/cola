@@ -2461,6 +2461,34 @@ pub(crate) async fn latest_card(platform: &RecordingPlatform) -> serde_json::Val
         .expect("a card must have been sent")
 }
 
+/// The Supplement split's continuation: the ONE card the platform replied to
+/// the supplement message, carrying the receipt line (ADR-0043). Panics when
+/// the reply is missing or duplicated — a split sends exactly one
+/// continuation, and a competing Turn would reply its own Loading card to the
+/// same message. Analyzed under one lock on the recorded calls.
+pub(crate) async fn supplement_continuation(
+    platform: &RecordingPlatform,
+    reply_to: &str,
+) -> serde_json::Value {
+    let calls = platform.calls.lock().await;
+    let mut replies = calls.iter().filter_map(|c| match c {
+        PlatformCall::ReplyCard { reply_to: mid, card } if mid == reply_to => Some(card.clone()),
+        _ => None,
+    });
+    let card = replies
+        .next()
+        .unwrap_or_else(|| panic!("no Supplement continuation replied to {reply_to}: {calls:?}"));
+    assert!(
+        replies.next().is_none(),
+        "exactly one card may reply to {reply_to} (a competing Turn would): {calls:?}"
+    );
+    assert!(
+        card_text(&card).contains("📨 已收到补充"),
+        "the continuation must carry the Supplement receipt: {card}"
+    );
+    card
+}
+
 /// Map `entry` as its thread's active session and persist the store — the
 /// setup tests need instead of reaching into `app.sessions` directly.
 pub(crate) async fn seed_entry(app: &Arc<App>, entry: crate::config::SessionEntry) {

@@ -455,6 +455,17 @@ pub enum SessionStatus {
     Retry,
 }
 
+impl SessionStatus {
+    /// Whether the server reports a LIVE run for the session: `Busy` (a turn
+    /// is running) or `Retry` (the last turn failed and is scheduled to run
+    /// again) — `Idle` is the only non-live status. This is ADR-0059's "live
+    /// Execution" fact, and every busy read in the Bridge and the cards goes
+    /// through it, so the predicate is spelled once.
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::Busy | Self::Retry)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PermissionRequest {
     #[serde(rename = "id")]
@@ -474,6 +485,15 @@ pub struct PermissionRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one liveness predicate (ADR-0059's "live Execution"): Idle is the
+    /// only status that is not a live run; Busy and Retry are.
+    #[test]
+    fn session_status_is_live_is_busy_or_retry() {
+        assert!(!SessionStatus::Idle.is_live());
+        assert!(SessionStatus::Busy.is_live());
+        assert!(SessionStatus::Retry.is_live());
+    }
 
     #[test]
     fn parses_session_list_info_camelcase_fixture() {
