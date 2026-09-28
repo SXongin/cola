@@ -218,7 +218,11 @@ async fn open_topic_inner(
             entry.agent = parts.agent;
             entry.topic_anchor = Some(anchor.clone());
             entry.topic_root = Some(topic_root);
-            handles.flow.sessions.activate(entry).await?;
+            // Through the collecting activation: adopting into a brand-new
+            // topic has no prior mapping there, so the collect is normally a
+            // no-op, but the operation stays the one way to change a thread's
+            // Active Session (ADR-0059, spec #405).
+            handles.flow.activate(entry).await?;
             record_cover_title(
                 &handles.flow.cards,
                 &session_id,

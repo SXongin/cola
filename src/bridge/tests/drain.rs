@@ -1850,14 +1850,28 @@ pub(crate) async fn script_transcript(backend: &Arc<MockBackend>, snapshots: Vec
         .expect("a scripted session") = snapshots;
 }
 
-/// Whether the platform sent any Completion Notice.
-async fn noticed(platform: &RecordingPlatform) -> bool {
+/// Whether the platform sent any Completion Notice — shared by the drain's
+/// settle tests and the collect tests (spec #405).
+pub(crate) async fn noticed(platform: &RecordingPlatform) -> bool {
     platform
         .calls
         .lock()
         .await
         .iter()
         .any(|call| matches!(call, PlatformCall::CompletionNotice { .. }))
+}
+
+/// Start Session Sync's poll loop with tiny injected cadences (the sync tick,
+/// the continuation render tick and every read bound) — shared by the Wake
+/// continuation tests and the collect tests.
+pub(crate) fn spawn_sync(app: &Arc<App>) {
+    app.external.poll_interval_ms.store(20, Ordering::Relaxed);
+    app.external.render_poll_ms.store(5, Ordering::Relaxed);
+    app.external.request_timeout_ms.store(50, Ordering::Relaxed);
+    let app = app.clone();
+    tokio::spawn(async move {
+        let _ = app.external.poll_loop(&app.flow_handles()).await;
+    });
 }
 
 /// A V2 group turn whose Execution idles with a live Background Task yields

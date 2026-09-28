@@ -500,12 +500,12 @@ impl SharedCore {
     /// Persist `entry` as its thread's active session and drop the session-list
     /// cache: creating or adopting a session changes what `/switch`
     /// should offer. The cache is dropped even when the save fails, because the
-    /// in-memory mapping already changed. A waiting card of the Session this
-    /// activation displaces is collected first (ADR-0059, spec #405), so a
-    /// switch away never leaves a card on 「⏳ 等待后台任务」.
+    /// in-memory mapping already changed. Goes through the collecting
+    /// activation, so a waiting card of the Session this activation displaces
+    /// is collected first (ADR-0059, spec #405) and a switch away never leaves
+    /// a card on 「⏳ 等待后台任务」.
     pub(crate) async fn activate_session(&self, entry: SessionEntry) -> crate::error::Result<()> {
-        crate::bridge::turn::Turn::activate_collecting(&self.sessions_handle(), &self.cards_handle(), entry)
-            .await
+        self.flow_handles().activate(entry).await
     }
 
     /// Declare (or replace) a Pending Session rooted at an explicit
@@ -626,13 +626,7 @@ mod tests {
             "update keeps the cache"
         );
 
-        assert!(
-            app.sessions_handle()
-                .remove_session("ses_x")
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(app.flow_handles().unmap("ses_x").await.unwrap().is_some());
         app.cached_session_list().await.unwrap();
         assert_eq!(sessions_fetches.load(Ordering::SeqCst), 3, "remove invalidates");
     }

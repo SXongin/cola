@@ -11,13 +11,13 @@
 //! through the ADR-0028 snapshot.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use super::drain::{assistant, ctx, script_transcript, scripted_app, user};
+use super::drain::{assistant, ctx, noticed, script_transcript, scripted_app, spawn_sync, user};
 use crate::backend::SessionTranscript;
 use crate::bridge::test_support::*;
 use crate::bridge::turn::Turn;
+use crate::config::{ConversationKind, ThreadKey};
 use crate::feishu::card::CardState;
 use crate::opencode::types::SessionStatus;
 
@@ -91,16 +91,6 @@ async fn patches_to(platform: &RecordingPlatform, message_id: &str) -> Vec<serde
         .collect()
 }
 
-/// Whether any Completion Notice was sent.
-async fn noticed(platform: &RecordingPlatform) -> bool {
-    platform
-        .calls
-        .lock()
-        .await
-        .iter()
-        .any(|call| matches!(call, PlatformCall::CompletionNotice { .. }))
-}
-
 /// The first card the platform replied to `reply_to` satisfying `check`, or
 /// `None` — the recorded calls under one lock.
 async fn replied_card_where(
@@ -137,17 +127,6 @@ async fn wait_for_replied_card(
         .unwrap_or_else(|_| panic!("no card replied to {reply_to:?} reached {label}"))
 }
 
-/// Start Session Sync's poll loop with tiny injected cadences.
-fn spawn_sync(app: &Arc<App>) {
-    app.external.poll_interval_ms.store(20, Ordering::Relaxed);
-    app.external.render_poll_ms.store(5, Ordering::Relaxed);
-    app.external.request_timeout_ms.store(50, Ordering::Relaxed);
-    let app = app.clone();
-    tokio::spawn(async move {
-        let _ = app.external.poll_loop(&app.flow_handles()).await;
-    });
-}
-
 /// Seed a card that has already yielded 「⏳ 等待后台任务」 for an active,
 /// mapped session — with an explicit message id, so the collect's PATCH is
 /// distinguishable from every later card (the recording platform serves one id
@@ -156,6 +135,13 @@ fn spawn_sync(app: &Arc<App>) {
 async fn seed_waiting_card(app: &Arc<App>, session_id: &str, card_message_id: &str) {
     Turn::seed_card(&app.cards_handle(), session_id, Some(card_message_id)).await;
     Turn::set_card_state(&app.cards_handle(), session_id, CardState::Waiting).await;
+}
+
+/// Give `session_id`'s tracked card the explicit message id `card_message_id`:
+/// the harness replies every card with `msg_reply`, so a test that must count
+/// PATCHes per chain has to name the collected card's message itself.
+async fn name_card(app: &Arc<App>, session_id: &str, card_message_id: &str) {
+    Turn::set_card_message_id(&app.cards_handle(), session_id, card_message_id).await;
 }
 
 /// An app whose chat_1 thread has `ses_test` mapped + active and `ses_other`
@@ -206,6 +192,9 @@ async fn a_new_turn_collects_the_waiting_card() {
     );
     let waiting_chain = Turn::chain_id(&app.cards_handle(), "ses_test").await;
     assert!(!noticed(&platform).await, "the waiting yield sends no notice");
+    // The harness serves one id for every sent card; name the waiting card so
+    // its PATCHes can be told apart from the new Turn's card below.
+    name_card(&app, "ses_test", "om_waiting").await;
 
     // The user posts a new message in the same thread: the new Turn collects
     // the waiting card before it starts.
@@ -217,30 +206,26 @@ async fn a_new_turn_collects_the_waiting_card() {
     second.requester_open_id = Some(TEST_HOST.to_string());
     Turn::run(&app.turn_handles(), second).await.unwrap();
 
-    let updates = platform.updated_cards().await;
-    let collected = updates
-        .iter()
-        .find(|card| card_header(card).contains(SUPERSEDED))
-        .cloned()
-        .unwrap_or_else(|| panic!("the waiting card must be collected: {updates:?}"));
-    assert!(
-        !card_header(&collected).contains("等待后台任务"),
-        "the collected card no longer yields: {collected}"
-    );
-    assert!(
-        card_text(&collected).contains("已经交给后台了。"),
-        "the collect keeps the content the turn produced: {collected}"
-    );
+    let patches = patches_to(&platform, "om_waiting").await;
     assert_eq!(
-        platform
-            .updated_cards()
-            .await
-            .iter()
-            .filter(|card| card_header(card).contains(SUPERSEDED))
-            .count(),
+        patches.len(),
         1,
-        "the wait is collected exactly once: {:?}",
-        platform.updated_cards().await
+        "the collect is the collected card's last PATCH: {patches:?}"
+    );
+    assert!(
+        card_header(&patches[0]).contains(SUPERSEDED),
+        "the collect names the takeover: {}",
+        patches[0]
+    );
+    assert!(
+        !card_header(&patches[0]).contains("等待后台任务"),
+        "the collected card no longer yields: {}",
+        patches[0]
+    );
+    assert!(
+        card_text(&patches[0]).contains("已经交给后台了。"),
+        "the collect keeps the content the turn produced: {}",
+        patches[0]
     );
     assert_ne!(
         Turn::chain_id(&app.cards_handle(), "ses_test").await,
@@ -263,16 +248,13 @@ async fn a_new_turn_collects_the_waiting_card() {
     })
     .await;
 
-    let continuation = wait_for_replied_card(&platform, "msg_next", "the Wake continuation", |card| {
+    // The continuation is replied to the second message (the wait panics if it
+    // never is); the settle loop renders the resumed work INTO that same card
+    // and ends it ✅, while the collected card's content never replays.
+    wait_for_replied_card(&platform, "msg_next", "the Wake continuation", |card| {
         card_text(card).contains(WAKE_LEAD)
     })
     .await;
-    assert!(
-        card_text(&continuation).contains(WAKE_LEAD),
-        "the continuation opens with the 承接 line: {continuation}"
-    );
-    // The settle loop renders the resumed work INTO that same continuation
-    // card and ends it ✅; the collected card's content never replays.
     let rendered = latest_card(&platform).await;
     assert!(
         card_header(&rendered).contains("✅"),
@@ -285,6 +267,11 @@ async fn a_new_turn_collects_the_waiting_card() {
     assert!(
         !card_text(&rendered).contains("已经交给后台了。"),
         "the continuation renders only the Wake's own work: {rendered}"
+    );
+    assert_eq!(
+        patches_to(&platform, "om_waiting").await.len(),
+        1,
+        "the collected card stops updating with the collect"
     );
     assert!(
         !noticed(&platform).await,
@@ -324,6 +311,89 @@ async fn switching_away_collects_the_waiting_card() {
         Turn::card_state(&app.cards_handle(), "ses_test").await,
         Some(CardState::SwitchedAway),
         "the collected card is terminal"
+    );
+    assert!(
+        !noticed(&platform).await,
+        "the collect sends no Completion Notice: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// The transition and the collect together: a REAL Turn runs to its waiting
+/// yield and `/switch`ing away collects that card. The seeded-card tests above
+/// pin the triggers in isolation; this one pins the pair on the
+/// #407/#408 waiting fixture.
+#[tokio::test]
+async fn switching_away_collects_a_card_that_really_yielded() {
+    let _wd = test_work_dir();
+    let (_dir, app, _backend, platform) = switch_fixture().await;
+
+    let mut context = ctx("ses_test", "跑一下 CI");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+    Turn::run(&app.turn_handles(), context).await.unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "the turn must really yield before the switch"
+    );
+    name_card(&app, "ses_test", "om_yielded").await;
+    assert!(!noticed(&platform).await, "the waiting yield sends no notice");
+
+    send_command(&app, "/switch 另一个会话", "msg_switch").await;
+
+    let patches = patches_to(&platform, "om_yielded").await;
+    assert_eq!(
+        patches.len(),
+        1,
+        "the switch collects the yielded card and nothing else: {patches:?}"
+    );
+    assert!(
+        card_header(&patches[0]).contains(SWITCHED),
+        "the collect names the switch: {}",
+        patches[0]
+    );
+    assert!(
+        card_text(&patches[0]).contains("已经交给后台了。"),
+        "the collect keeps the turn's content: {}",
+        patches[0]
+    );
+    assert!(
+        !noticed(&platform).await,
+        "the collect sends no Completion Notice: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// A `--force` steal unmaps the session from its owning thread; that unmapping
+/// is the same collecting operation `/switch forget` uses, so the stolen
+/// Session's waiting card is collected too — the defect this ticket removes.
+#[tokio::test]
+async fn a_forced_steal_collects_the_stolen_sessions_waiting_card() {
+    let _wd = test_work_dir();
+    let (_dir, app, _backend, platform) = switch_fixture().await;
+    seed_waiting_card(&app, "ses_test", "om_waiting").await;
+
+    // Another chat force-takes the mapped session into its own thread.
+    send_command_in(
+        &app,
+        "/switch ses_test --force",
+        ThreadKey::new("chat_2".into(), "chat_2".into()),
+        "msg_steal",
+        ConversationKind::P2p,
+    )
+    .await;
+
+    let patches = patches_to(&platform, "om_waiting").await;
+    assert_eq!(
+        patches.len(),
+        1,
+        "the steal collects the stolen session's wait: {patches:?}"
+    );
+    assert!(
+        card_header(&patches[0]).contains(SWITCHED),
+        "the collect names the switch: {}",
+        patches[0]
     );
     assert!(
         !noticed(&platform).await,
@@ -401,14 +471,10 @@ async fn a_collected_chain_still_takes_a_wake_after_switching_back() {
     })
     .await;
 
-    let continuation = wait_for_replied_card(&platform, "msg_1", "the Wake continuation", |card| {
+    wait_for_replied_card(&platform, "msg_1", "the Wake continuation", |card| {
         card_text(card).contains(WAKE_LEAD)
     })
     .await;
-    assert!(
-        card_text(&continuation).contains(WAKE_LEAD),
-        "the continuation opens with the 承接 line: {continuation}"
-    );
     let rendered = latest_card(&platform).await;
     assert!(
         card_text(&rendered).contains("CI 通过了。"),
