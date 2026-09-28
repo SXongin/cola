@@ -45,8 +45,10 @@ pub(super) enum Ownership {
 }
 
 impl Ownership {
-    /// Whether the loop still owns the card.
-    async fn held(&self, cards: &CardsHandle, session_id: &str) -> bool {
+    /// Whether the loop still owns the card. `pub(super)` for the follow's
+    /// exit: after it hands the guard back, it must not stamp a card a new
+    /// Turn has taken over in the released moment.
+    pub(super) async fn held(&self, cards: &CardsHandle, session_id: &str) -> bool {
         match self {
             Self::TurnAnchor(anchor) => {
                 Turn::armed_turn_anchor(cards, session_id).await.as_ref() == Some(anchor)

@@ -149,8 +149,9 @@ async fn busy_supplement_app(
 }
 
 /// Run the #284 scenario turn to its drain-bound hand-off: the running panel
-/// is on the card, and `Turn::run` returning IS the hand-off (the bound was
-/// reached and the guard released inside it).
+/// is on the card, and `Turn::run` returning IS the hand-off. The guard is NOT
+/// released at the bound any more — the follow inherits it (ADR-0059) and
+/// covers the whole follow window with it.
 async fn run_to_handoff(app: &Arc<App>, platform: &RecordingPlatform) {
     let turn = spawn_turn(app, ctx("ses_test", "第一条消息"));
     wait_for_card_text(platform, "⏳ bash").await;
@@ -160,8 +161,8 @@ async fn run_to_handoff(app: &Arc<App>, platform: &RecordingPlatform) {
         .unwrap();
     result.unwrap();
     assert!(
-        !app.inflight.lock().await.contains("ses_test"),
-        "the guard must be released at the bound"
+        app.inflight.lock().await.contains("ses_test"),
+        "the follow must inherit the guard at the bound"
     );
 }
 
@@ -639,9 +640,10 @@ async fn a_stopped_turn_logs_finalizing_once_per_turn() {
     );
 }
 
-/// A session that stays busy runs the drain to its bound. The TURN ends there
-/// (the guard is released, so the next message is a normal new Turn), but the
-/// CARD does not: it is handed to the out-of-turn follow. The follow has no
+/// A session that stays busy runs the drain to its bound. The TURN ends there,
+/// but the CARD does not: it is handed to the out-of-turn follow together with
+/// the guard (ADR-0059), which keeps the card live and never reads the
+/// followed Session as idle to the server-yield path. The follow has no
 /// total budget (#386) — a readable run stays live for as long as it runs —
 /// so only the session going idle finalizes it, and only then Done (#284).
 #[tokio::test]
@@ -664,11 +666,11 @@ async fn the_drain_bound_exits_cleanly_and_finishes_the_turn() {
 
     Turn::run(&app.turn_handles(), context).await.unwrap();
 
-    // The turn released the guard at the bound: a message arriving now is a
-    // normal new Turn, exactly as before the follow existed.
+    // The turn handed the card to the follow; the follow inherited the guard
+    // (ADR-0059) and keeps it while the run stays live.
     assert!(
-        !app.inflight.lock().await.contains("ses_test"),
-        "the guard must be released at the bound"
+        app.inflight.lock().await.contains("ses_test"),
+        "the follow must hold the guard at the bound"
     );
     assert!(
         backend.transcript_calls.lock().await.len() > 1,
@@ -1167,11 +1169,14 @@ async fn a_pending_wait_with_lost_contact_still_ends_in_error() {
     assert_no_further_rendering(&backend, &platform).await;
 }
 
-/// The follow never holds the session: the guard was released at the bound, so
-/// a message arriving after the hand-off is a normal new Turn (not a
-/// supplement), and it replaces the accumulator the follow was watching.
+/// ADR-0059's routing key, follow-window half: a run that outlived the drain
+/// bound keeps its guard, so a message arriving during the follow is a
+/// Supplement. It merges into the still-live chain — the Card Chain splits at
+/// the message and the follow keeps rendering on the continuation — instead of
+/// freezing the old card and starting an overlapping Turn. The accumulator is
+/// never replaced and the follow's guard is never read as idle.
 #[tokio::test]
-async fn a_message_after_the_bound_handoff_starts_a_normal_new_turn() {
+async fn a_message_during_the_follow_window_splits_the_live_chain() {
     let _wd = test_work_dir();
     let (_dir, app, backend, platform) = busy_supplement_app(60_000).await;
     run_to_handoff(&app, &platform).await;
@@ -1193,21 +1198,121 @@ async fn a_message_after_the_bound_handoff_starts_a_normal_new_turn() {
     ))
     .await;
 
+    // The message was submitted to merge into the live run — the follow's
+    // guard made it a Supplement, not a busy answer and not a new Turn.
     assert!(
         backend.prompt_calls.lock().await.iter().any(|t| t == "接着问"),
-        "the released session must take the normal prompt path: {:?}",
+        "the supplement must reach the Backend: {:?}",
         backend.prompt_calls.lock().await
     );
     assert!(
         !platform.texts().await.iter().any(|t| t.contains("还在处理中")),
-        "the new turn is not throttled: {:?}",
+        "a follow-window message is never answered busy: {:?}",
         platform.calls.lock().await
     );
-    assert_ne!(
+    assert_eq!(
         Turn::armed_turn_anchor(&app.cards_handle(), "ses_test").await,
         followed_anchor,
-        "the new Turn must replace the accumulator the follow watched"
+        "no competing Turn: the follow's accumulator survives"
     );
+    assert!(
+        app.inflight.lock().await.contains("ses_test"),
+        "the follow still owns the session's guard"
+    );
+
+    // Exactly ONE card replies to the message — the split continuation, with
+    // the receipt. A new Turn would have replied a Loading card to it. The old
+    // card is NOT frozen: the split finalizes it with everything before it,
+    // the live running panel rides the continuation (ADR-0045), and the receipt
+    // belongs to the continuation only. (Analyzed under one lock on the
+    // recorded calls, then dropped.)
+    {
+        let calls = platform.calls.lock().await;
+        let replies_to_next: Vec<&serde_json::Value> = calls
+            .iter()
+            .filter_map(|c| match c {
+                PlatformCall::ReplyCard { reply_to, card } if reply_to == "msg_next" => Some(card),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            replies_to_next.len(),
+            1,
+            "no overlapping Turn may reply a card to the message: {calls:?}"
+        );
+        let continuation = replies_to_next[0].clone();
+        assert!(
+            card_text(&continuation).contains("📨 已收到补充"),
+            "the continuation carries the Supplement receipt: {continuation}"
+        );
+        let reply_idx = calls
+            .iter()
+            .position(|c| matches!(c, PlatformCall::ReplyCard { reply_to, .. } if reply_to == "msg_next"))
+            .expect("the continuation reply");
+        let finalized = calls[..reply_idx]
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                PlatformCall::UpdateMessage { card, .. } => Some(card.clone()),
+                _ => None,
+            })
+            .expect("the split must finalize the old card before replying");
+        assert!(
+            card_header(&finalized).contains("部分完成"),
+            "the old card takes the standard split header: {finalized}"
+        );
+        assert!(
+            card_text(&finalized).contains("第一轮回答。"),
+            "the finalized card keeps everything before the split: {finalized}"
+        );
+        assert!(
+            !card_text(&finalized).contains("📨 已收到补充"),
+            "the receipt records the Supplement on the continuation only: {finalized}"
+        );
+        assert!(
+            card_text(&continuation).contains("⏳ bash"),
+            "the running panel rides the live continuation (ADR-0045): {continuation}"
+        );
+    }
+
+    // The run goes on: the follow keeps rendering into the continuation. The
+    // tool settles and the answer lands — on the split continuation.
+    settle_tool(&backend, ToolStatus::Completed, "构建完成").await;
+    backend
+        .transcript_scripts
+        .lock()
+        .await
+        .get_mut("ses_test")
+        .unwrap()[0]
+        .messages
+        .push(assistant(5_000, "接着问的回答。"));
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+
+    wait_for_card_update(
+        &platform,
+        "the continuation's Done card",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("完成") && card_text(card).contains("接着问的回答。"),
+    )
+    .await;
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&final_card).contains("📨 已收到补充"),
+        "the continuation keeps the receipt: {final_card}"
+    );
+    assert!(
+        !card_text(&final_card).contains("第一轮回答。"),
+        "the continuation is a delta, never a replay: {final_card}"
+    );
+
+    // The follow window closed: the guard went back with the ending.
+    assert!(
+        !app.inflight.lock().await.contains("ses_test"),
+        "the follow must release the guard when it ends"
+    );
+    assert_no_further_rendering(&backend, &platform).await;
 }
 
 /// The other half of the racing-supplement guarantee: once the turn released
@@ -2031,7 +2136,10 @@ async fn a_task_retiring_while_the_follow_renders_ends_the_turn_normally() {
         .expect("the turn must hand off at the drain bound")
         .unwrap();
     result.unwrap();
-    assert!(!app.inflight.lock().await.contains("ses_test"));
+    assert!(
+        app.inflight.lock().await.contains("ses_test"),
+        "the follow covers the bound window with the guard"
+    );
 
     // The task retires while the follow renders, and its Execution ends: the
     // true end, on the followed card.

@@ -14,11 +14,13 @@
 //! Completion Notice; the notice itself declines a card that is not at an
 //! ending, so the waiting yield stays silent (ADR-0059).
 //!
-//! The follow runs out of turn: the inflight guard is already released, so a
-//! message arriving meanwhile starts a normal new Turn, which replaces the
-//! accumulator and ends the follow on its next tick (the loop's ownership
-//! guard). `/stop` still ends it promptly in the stop terminal, never Done or
-//! Error (#394).
+//! The follow runs out of turn but holds the Session's inflight guard for its
+//! whole window (ADR-0059): a message arriving meanwhile is a Supplement that
+//! merges into the still-live chain (the Card Chain splits below it), and the
+//! server-yield's busy read never sees a followed Session as idle. The guard
+//! is released when the loop ends — before the ending is stamped — so the next
+//! message is a normal new Turn. `/stop` still ends it promptly in the stop
+//! terminal, never Done or Error (#394).
 
 use tracing::Instrument;
 
@@ -30,12 +32,19 @@ use crate::config::ThreadKey;
 use super::{SettleTiming, settle};
 
 /// Spawn the out-of-turn follow for a turn whose drain bound was reached with
-/// the session still running. The caller has already released the inflight
-/// guard; `anchor` is the accumulator's identity (the message id together
-/// with its server time — one fact) and `started_at` the original turn's
-/// start, so the follow's completion notice keeps the long-task threshold
-/// measuring the whole run.
-pub(super) fn spawn(
+/// the session still running. `anchor` is the accumulator's identity (the
+/// message id together with its server time — one fact) and `started_at` the
+/// original turn's start, so the follow's completion notice keeps the
+/// long-task threshold measuring the whole run.
+///
+/// The follow inherits the Session's inflight guard (ADR-0059): the drain
+/// hand-off still holds it (its Turn deliberately did not release), and the
+/// retry re-attach acquires it here — the insert is idempotent either way, so
+/// the hand-off has no guard-free gap. The guard covers the whole follow
+/// window: a message arriving meanwhile is a Supplement merging into the
+/// still-live chain, and the server-yield's busy read never sees a followed
+/// Session as idle. [`run`] releases it when the window closes.
+pub(super) async fn spawn(
     handles: &TurnHandles,
     session_id: String,
     thread_key: ThreadKey,
@@ -43,6 +52,7 @@ pub(super) fn spawn(
     started_at: std::time::Instant,
     anchor: TurnAnchor,
 ) {
+    handles.waits.inflight.lock().await.insert(session_id.clone());
     let handles = handles.clone();
     let timing = SettleTiming {
         poll_ms: handles.config.render_poll_ms(),
@@ -65,6 +75,15 @@ pub(super) fn spawn(
 /// sent for every ending (the helper itself declines a card that is not at an
 /// ending, so a waiting yield stays silent) and reads the card's real terminal
 /// for its copy (#394).
+///
+/// The loop owns the Session's guard for the whole run and hands it back as
+/// soon as the loop ends — BEFORE the ending is stamped. A message arriving at
+/// the end boundary must be a normal new Turn (the waiting window is exactly
+/// that state), never a Supplement racing a card that is about to be
+/// finalized. By then the run is over, so nothing is lost: the loop stamps
+/// only a chain it still owns — a new Turn that slipped into the released
+/// moment replaced the accumulator, and stamping its live card with the old
+/// ending would be a lie.
 async fn run(
     handles: TurnHandles,
     session_id: String,
@@ -75,9 +94,14 @@ async fn run(
 ) {
     let flow = handles.flow();
     let owns = settle::Ownership::TurnAnchor(anchor);
-    let Some(ending) = settle::run(&flow, &session_id, &directory, timing, &owns).await else {
+    let ending = settle::run(&flow, &session_id, &directory, timing, &owns).await;
+    super::release_inflight(&handles, &session_id).await;
+    let Some(ending) = ending else {
         return;
     };
+    if !owns.held(&flow.cards, &session_id).await {
+        return;
+    }
     settle::stamp(&flow.cards, &session_id, &ending).await;
     super::send_completion_notice(&handles, &session_id, started_at).await;
 }

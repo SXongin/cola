@@ -827,10 +827,13 @@ impl Turn {
             send_completion_notice(handles, &self.session_id, self.started_at).await;
         }
 
-        self.release(handles).await;
-        // The guard is released before the follow arms, exactly as the old
-        // finalization released it: a message arriving now is a normal new Turn
-        // (which replaces the accumulator and ends the follow on its next tick).
+        // The guard is released here for every end except a follow hand-off:
+        // the follow inherits it (ADR-0059) and hands it back when its own loop
+        // ends, so the follow window has no guard-free gap and `busy()` (the
+        // server-yield read) never sees a followed Session as idle.
+        if follow_anchor.is_none() {
+            self.release(handles).await;
+        }
         if let Some(anchor) = follow_anchor {
             tracing::info!(
                 "turn drain: bound with session {} running; handing off to the follow",
@@ -843,7 +846,8 @@ impl Turn {
                 self.directory.clone(),
                 self.started_at,
                 anchor,
-            );
+            )
+            .await;
         }
         // Permissions are handled by the independent poller spawned in App::run,
         // so a run waiting on a permission still gets its card shown.
@@ -1773,9 +1777,11 @@ impl Turn {
     /// live header state is restored, the unused retry claim goes back (the
     /// follow may fail the card again, and that retry must be claimable), and
     /// the out-of-turn [`follow`] is spawned on the accumulator's own anchor to
-    /// keep rendering until the run truly ends. Re-attach adds no loop: the
-    /// follow already owns Busy→non-busy finalization, `/stop`, the graces and
-    /// the silent exit when a new Turn replaces the accumulator.
+    /// keep rendering until the run truly ends — holding the Session's guard
+    /// for its window, exactly like the drain hand-off (ADR-0059). Re-attach
+    /// adds no loop: the follow already owns Busy→non-busy finalization,
+    /// `/stop`, the graces and the silent exit when a new Turn replaces the
+    /// accumulator.
     ///
     /// `directory` routes the follow's status reads (the handler's session
     /// mapping first, the accumulator's work context as the fallback). The
@@ -1809,7 +1815,8 @@ impl Turn {
             directory,
             std::time::Instant::now(),
             anchor,
-        );
+        )
+        .await;
         true
     }
 
