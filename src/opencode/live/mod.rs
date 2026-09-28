@@ -47,8 +47,10 @@
 //! chain pins the row SHAPES the retry id policy rests on — an aborted
 //! `finish`/`error`, a tool still `running`, the appended idle event, and the
 //! byte-identical row a same-id re-post must leave behind — and the neutral
-//! transcript folds those fields away. Those reads are observations only; the
-//! submits under test still go through the production adapter.
+//! transcript folds those fields away. It also issues one same-id re-post raw,
+//! to pin the contract's exact `200 OK` and the admitted id echoed back
+//! alongside the production adapter's own submit. Both are pins of the server
+//! contract; every other chain drives the adapter only.
 //!
 //! ## Re-recording the fixture corpus
 //!
@@ -130,7 +132,7 @@ async fn live_v1_scripted_capability_chain() {
         .await
         .unwrap_or_else(|error| panic!("create session failed: {error}\n{}", server.stderr()));
 
-    let message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
+    let message_id = cola_message_id();
     // The V1 submit is the native fire-and-forget prompt: it returns once the
     // message is durable and a run is forked, so the permission poll below runs
     // concurrently with the live turn — exactly the shape the Bridge's Turn is
@@ -254,7 +256,7 @@ async fn live_v1_scripted_failure_and_retry_chain() {
         .await
         .unwrap_or_else(|error| panic!("create session failed: {error}\n{}", server.stderr()));
 
-    let message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
+    let message_id = cola_message_id();
     backend
         .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
         .await
@@ -366,7 +368,7 @@ async fn live_v2_scripted_transcript_read() {
         .await
         .unwrap_or_else(|error| panic!("create session failed: {error}\n{}", server.stderr()));
 
-    let message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
+    let message_id = cola_message_id();
     // The V2 submit is admit-then-return: it comes back as soon as the message
     // is durable, so the in-flight read below sees the live turn (ADR-0056).
     backend
@@ -377,11 +379,7 @@ async fn live_v2_scripted_transcript_read() {
     // Mid-turn: the projected assistant message is one row that carries its
     // content while it streams, so the first read that sees a live tool captures
     // V2's in-flight shape (no completion stamp, a running tool) for real.
-    let url = format!(
-        "{}/api/session/{}/message?order=asc&limit=200",
-        server.base_url(),
-        session.id
-    );
+    let url = transcript_read_url(&server, &session.id);
     let inflight = poll_until(
         "the live V2 turn's in-flight transcript",
         POLL_TIMEOUT,
@@ -518,8 +516,8 @@ async fn live_v2_scripted_write_chain() {
     // The submit returns as soon as the message is durable; the supplement is
     // steered in while the scripted slow tool runs, so the running turn must
     // merge it (ADR-0056).
-    let message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
-    let supplement_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
+    let message_id = cola_message_id();
+    let supplement_id = cola_message_id();
     backend
         .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
         .await
@@ -665,7 +663,7 @@ async fn live_v2_scripted_write_chain() {
         .create_session(&backend.new_session_input(Some(&work_dir)))
         .await
         .unwrap_or_else(|error| panic!("create interrupt session failed: {error}\n{}", server.stderr()));
-    let interrupt_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
+    let interrupt_id = cola_message_id();
     backend
         .prompt(
             &interrupt_session.id,
@@ -805,7 +803,7 @@ async fn live_v2_scripted_selection_chain() {
     // prompt: every prompt axis beyond the text and the cola message id is
     // `None` (the V2 strategy would drop them anyway — the wire has no such
     // fields — so this is what "the session's selection applies" means).
-    let message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
+    let message_id = cola_message_id();
     backend
         .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
         .await
@@ -996,7 +994,7 @@ async fn live_v2_scripted_permission_chain() {
         .await
         .unwrap_or_else(|error| panic!("create session failed: {error}\n{}", server.stderr()));
 
-    let message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
+    let message_id = cola_message_id();
     // The admit-then-return submit schedules the turn; it blocks on the shell
     // ask, which the location-scoped pending list must surface (one call per
     // directory, never per session).
@@ -1066,7 +1064,7 @@ async fn live_v2_scripted_permission_chain() {
             .unwrap_or_else(|error| {
                 panic!("{decision}: create session failed: {error}\n{}", server.stderr())
             });
-        let message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
+        let message_id = cola_message_id();
         backend
             .prompt(&session.id, PROMPT_TEXT, &[], None, None, None, Some(&message_id))
             .await
@@ -1148,7 +1146,7 @@ async fn live_v2_scripted_form_chain() {
         .await
         .unwrap_or_else(|error| panic!("create session failed: {error}\n{}", server.stderr()));
 
-    let message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
+    let message_id = cola_message_id();
     // The admit-then-return submit schedules the turn; it blocks on the typed
     // form the location-scoped list must surface.
     backend
@@ -1221,7 +1219,7 @@ async fn live_v2_scripted_form_chain() {
         .create_session(&backend.new_session_input(Some(&work_dir)))
         .await
         .unwrap_or_else(|error| panic!("create cancel session failed: {error}\n{}", server.stderr()));
-    let cancel_message_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
+    let cancel_message_id = cola_message_id();
     backend
         .prompt(
             &cancel_session.id,
@@ -1334,6 +1332,11 @@ async fn live_v2_scripted_retry_id_chain() {
     let completions_before = provider_turn_completions(&provider);
     let fresh_id = start_turn(&backend, &server, &settled.id).await;
     let fresh = wait_for_turn(&backend, &settled.id, &fresh_id, &server).await;
+    assert!(
+        turn_error(&fresh, &fresh_id).is_none(),
+        "the new-id turn must not record a model error: {:?}",
+        turn_error(&fresh, &fresh_id)
+    );
     assert_user_anchor(&fresh, &fresh_id);
     assert_turn_complete(&fresh, &fresh_id);
     assert!(
@@ -1531,7 +1534,8 @@ async fn assert_retry_id_no_op(
     // The wire answer: exactly 200, with the admitted message echoed back (the
     // re-post reconciles onto the existing admission, never a new id). The
     // adapter maps any non-2xx to `Err`, so this raw submit is what pins the
-    // exact status the contract names.
+    // exact status the contract names. Its own effect is asserted before the
+    // next call, so neither submit can hide behind the other's rows.
     let (status, body) = raw_prompt(server, session_id, message_id, PROMPT_TEXT).await;
     assert_eq!(
         status,
@@ -1544,29 +1548,23 @@ async fn assert_retry_id_no_op(
         Some(message_id),
         "{what}: the re-post must reconcile onto the admitted id: {body:#?}"
     );
+    let after_raw = wait_for_one_idle_event(server, session_id, &rows_before, what, "the raw re-post").await;
 
     // …and the production submit path accepts it too (the adapter's `Ok` is
-    // its 2xx mapping).
+    // its 2xx mapping), with its own single idle event.
     submit_prompt(backend, server, session_id, message_id).await;
-
-    let rows_after = poll_until(
-        &format!("{what}: the same-id re-posts' idle events"),
-        POLL_TIMEOUT,
-        || async {
-            let read = raw_read(server, session_id).await;
-            Ok((raw_rows(&read).len() >= rows_before.len() + 2).then_some(raw_rows(&read)))
-        },
-        || server.stderr(),
+    let after_adapter = wait_for_one_idle_event(
+        server,
+        session_id,
+        &raw_rows(&after_raw),
+        what,
+        "the adapter re-post",
     )
     .await;
 
-    for (id, row) in &rows_before {
-        assert_eq!(
-            rows_after.get(id),
-            Some(row),
-            "{what}: the {id} row must be unchanged by a same-id re-post"
-        );
-    }
+    // Together the two re-posts appended exactly two idle rows and nothing
+    // else: no new assistant step, no model call.
+    let rows_after = raw_rows(&after_adapter);
     let appended: Vec<&Value> = rows_after
         .iter()
         .filter(|(id, _)| !rows_before.contains_key(*id))
@@ -1575,14 +1573,14 @@ async fn assert_retry_id_no_op(
     assert_eq!(
         appended.len(),
         2,
-        "{what}: each same-id re-post appends only its idle event: {appended:#?}"
+        "{what}: the two same-id re-posts append only their idle events: {appended:#?}"
     );
     assert!(
         appended.iter().all(|row| row["type"].as_str() == Some("idle")),
         "{what}: the only effect of a same-id re-post is an idle event: {appended:#?}"
     );
     assert_eq!(
-        raw_assistant_count(&raw_read(server, session_id).await),
+        raw_assistant_count(&after_adapter),
         assistants_before,
         "{what}: a same-id re-post runs no new step:\n{}",
         server.stderr()
@@ -1594,7 +1592,55 @@ async fn assert_retry_id_no_op(
     );
 }
 
-/// A fresh cola-chosen message id — the admission key the retry policy uses.
+/// Poll until the read gains exactly one row over `previous`, assert that row
+/// is an idle event (a same-id re-post's only effect) and that every row of
+/// `previous` survived byte-identical; return the grown read. `what`/`step`
+/// name the scenario and the call in failures.
+async fn wait_for_one_idle_event(
+    server: &LiveServer,
+    session_id: &str,
+    previous: &std::collections::BTreeMap<String, Value>,
+    what: &str,
+    step: &str,
+) -> Value {
+    let read = poll_until(
+        &format!("{what}: {step}'s idle event"),
+        POLL_TIMEOUT,
+        || async {
+            let read = raw_read(server, session_id).await;
+            Ok((raw_rows(&read).len() > previous.len()).then_some(read))
+        },
+        || server.stderr(),
+    )
+    .await;
+    let rows = raw_rows(&read);
+    let appended: Vec<&Value> = rows
+        .iter()
+        .filter(|(id, _)| !previous.contains_key(*id))
+        .map(|(_, row)| row)
+        .collect();
+    assert_eq!(
+        appended.len(),
+        1,
+        "{what}: {step} appends exactly its own idle event: {appended:#?}\n{}",
+        server.stderr()
+    );
+    assert_eq!(
+        appended[0]["type"], "idle",
+        "{what}: {step}'s only effect is an idle event: {appended:#?}"
+    );
+    for (id, row) in previous {
+        assert_eq!(
+            rows.get(id),
+            Some(row),
+            "{what}: {step} must leave the {id} row unchanged"
+        );
+    }
+    read
+}
+
+/// A fresh cola-chosen message id — the admission key the retry policy uses
+/// (and the id shape ADR-0026's `is_cola_message_id` recognises).
 fn cola_message_id() -> String {
     format!("msg_cola_{}", uuid::Uuid::new_v4().simple())
 }
@@ -1633,8 +1679,8 @@ async fn submit_prompt(backend: &OpenCodeBackend, server: &LiveServer, session_i
 }
 
 /// Submit `message_id` raw, with the wire body the V2 strategy sends (`text`,
-/// `id`, `delivery: "steer"`), returning the status and body — the exact-code
-/// answer the adapter's `Ok`/`Err` cannot express.
+/// `id`, `delivery`), returning the status and body — the exact-code answer the
+/// adapter's `Ok`/`Err` cannot express.
 async fn raw_prompt(
     server: &LiveServer,
     session_id: &str,
@@ -1644,7 +1690,11 @@ async fn raw_prompt(
     let response = crate::test_http::no_proxy_transport()
         .post(format!("{}/api/session/{}/prompt", server.base_url(), session_id))
         .basic_auth("opencode", Some(server::PASSWORD))
-        .json(&serde_json::json!({ "text": text, "id": message_id, "delivery": "steer" }))
+        .json(&serde_json::json!({
+            "text": text,
+            "id": message_id,
+            "delivery": super::v2::PROMPT_DELIVERY,
+        }))
         .send()
         .await
         .unwrap_or_else(|error| panic!("raw prompt submit failed: {error}\n{}", server.stderr()));
