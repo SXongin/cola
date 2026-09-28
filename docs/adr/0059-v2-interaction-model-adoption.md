@@ -11,9 +11,12 @@ busy period and defines the turn as everything since the previous marker,
 including prompts steered in while busy; continuations are first-class
 `synthetic` messages that can wake a session with no user message; and
 still-running backgrounded work stays readable on the assistant tool part
-(`background=true`, `state.metadata.status=running`, retired by its synthetic
-completion) — the exact predicate the official app (v2.0.18) uses to show "N
-tasks running".
+(`state.metadata.status=running` on a completed `shell`/`subagent` call,
+retired by its synthetic completion) — the exact predicate the official app
+(v2.0.18) uses to show "N tasks running". The tool input's request-time
+`background=true` flag is not part of that predicate: a foreground run the user
+moves to the background (`POST /api/session/:sessionID/background`) returns the
+same handle without one.
 
 cola kept the V1 shape: a Turn is anchored on a user message, `idle` and
 `synthetic` are dropped by the read model (`synthetic` decodes to
@@ -34,9 +37,12 @@ onto the V1-shaped one.**
   `idle` message (a shutdown writes none — absence is tolerated); a **Wake**
   from `synthetic`, carrying its source (`shell`, `subagent`, `restart`,
   `interrupt`) and correlation keys (`shellID`/`jobID`/`childID`); and
-  **Background Tasks** derived from assistant tool parts (`background=true` and
-  `metadata.status=running`) and retired by their Wake. V1 has none of these
-  types: the new fields are empty there and behavior degrades to today's.
+  **Background Tasks** derived from assistant tool parts (`state.status=completed`
+  with `state.metadata.status=running`, the official app's derivation; the
+  request-time `background=true` input flag is not required, since a run moved
+  to the background mid-flight carries none) and retired by their Wake. V1 has
+  none of these types: the new fields are empty there and behavior degrades to
+  today's.
 
 - **A Turn spans Executions and is not complete while Background Tasks are
   live.** At an Execution's idle with background work still pending, the Turn's
