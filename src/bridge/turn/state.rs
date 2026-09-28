@@ -372,14 +372,16 @@ impl CardFallback {
     }
 }
 
-/// A retry's render baseline (#387, restated by spec #391). The retry's
-/// reused-id branch reuses the failed attempt's `msg_cola_` user message
-/// (ADR-0026), so the failed attempt's messages are still in the fresh card's
-/// turn window; the baseline keeps them out of it. The new-id branch carries
-/// the same baseline under a fresh anchor, where it is inert (the new attempt's
-/// messages carry new server ids). It travels as one fact: `suppressed` is the
-/// carried frontier (written once at retry time), `observed` is what this
-/// attempt has examined (the next retry unions it in).
+/// A retry's render baseline (#387, restated by spec #391 and the
+/// generation-aware correction). It keeps the failed attempt's messages out of
+/// the fresh card's turn window, and is load-bearing wherever those messages
+/// can still read as belonging to it: the reused-id branch (V1 only — V2's
+/// admission key takes a fresh id there) and the fresh-id branch's V2
+/// killed-run case, where an admitted, unfinished message with no completion
+/// stamp can still fall inside the fresh anchor's in-flight window. On the
+/// settled fresh-id case it rides along inert. It travels as one fact:
+/// `suppressed` is the carried frontier (written once at retry time),
+/// `observed` is what this attempt has examined (the next retry unions it in).
 #[derive(Default, Clone)]
 pub(super) struct AttemptBaseline {
     /// Assistant message ids from EARLIER attempts: never rendered, their

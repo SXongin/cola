@@ -1523,11 +1523,18 @@ fn failed_attempt_message() -> TranscriptMessage {
     )
 }
 
-/// One attempt's scripted turn window: the admitted user message plus the
-/// assistant message that attempt left behind.
-fn attempt_window(anchor: &str, assistant: TranscriptMessage) -> SessionTranscript {
+/// One attempt's scripted turn window: the admitted user message (`anchor`,
+/// with server time `anchor_created`) plus the assistant message that attempt
+/// left behind. A retry window uses a later `anchor_created`, so the earlier
+/// attempts fall outside its membership.
+fn attempt_window(anchor: &str, anchor_created: i64, assistant: TranscriptMessage) -> SessionTranscript {
     SessionTranscript::new(vec![
-        typed_message(anchor, MessageRole::User, Some(1_000), vec![text_part("hi")]),
+        typed_message(
+            anchor,
+            MessageRole::User,
+            Some(anchor_created),
+            vec![text_part("hi")],
+        ),
         assistant,
     ])
 }
@@ -1535,7 +1542,7 @@ fn attempt_window(anchor: &str, assistant: TranscriptMessage) -> SessionTranscri
 /// The failed attempt's scripted turn window, anchored on the user message the
 /// retry reuses.
 fn failed_attempt_window(anchor: &str) -> SessionTranscript {
-    attempt_window(anchor, failed_attempt_message())
+    attempt_window(anchor, 1_000, failed_attempt_message())
 }
 
 /// [`failed_attempt_window`] plus `extra`'s messages, newest last — an
@@ -1844,18 +1851,7 @@ fn orphaned_attempt_message() -> TranscriptMessage {
 /// The V2 kill-shaped turn window: the admitted user message plus the orphaned
 /// assistant message, so the turn never reads complete.
 fn orphaned_attempt_window(anchor: &str) -> SessionTranscript {
-    attempt_window(anchor, orphaned_attempt_message())
-}
-
-/// A retry attempt's window on V2, starting afresh: the fresh attempt's own
-/// user message plus its assistant reply. Used where the earlier attempts are
-/// already excluded from the new anchor's membership (their messages completed
-/// before it), so the window need not carry them.
-fn fresh_attempt_window(user_id: &str, created: i64, assistant: TranscriptMessage) -> SessionTranscript {
-    SessionTranscript::new(vec![
-        typed_message(user_id, MessageRole::User, Some(created), vec![text_part("hi")]),
-        assistant,
-    ])
+    attempt_window(anchor, 1_000, orphaned_attempt_message())
 }
 
 /// Spec #391's generation split, V2 side: the `msg_cola_` id is an admission
@@ -2038,7 +2034,7 @@ async fn v2_retries_chain_under_fresh_ids() {
         .lock()
         .await
         .get_mut("ses_test")
-        .unwrap() = vec![fresh_attempt_window(
+        .unwrap() = vec![attempt_window(
         retry1.as_str(),
         RETRY1_CREATED - 1_000,
         retry1_failed,
@@ -2064,7 +2060,7 @@ async fn v2_retries_chain_under_fresh_ids() {
         .lock()
         .await
         .get_mut("ses_test")
-        .unwrap() = vec![fresh_attempt_window(
+        .unwrap() = vec![attempt_window(
         retry2.as_str(),
         RETRY2_CREATED - 1_000,
         typed_message(

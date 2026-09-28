@@ -313,11 +313,11 @@ impl Turn {
         acc.requester_open_id = requester_open_id.clone();
         acc.is_group = is_group;
         // An explicit retry carries the failed attempt's render baseline
-        // (#387, spec #391): the reused-id branch renders the same
-        // `msg_cola_` user message (ADR-0026), so the failed attempt's
-        // messages are still in the new card's turn window — the baseline
-        // keeps them from replaying. The new-id branch carries it inertly
-        // under a fresh anchor. A fresh prompt starts clean.
+        // (#387, spec #391; ADR-0040's amendment): load-bearing on V1's
+        // reused-id branch and on V2's fresh-id killed-run case (an admitted,
+        // unfinished message can still fall inside the fresh anchor's in-flight
+        // window); inert on the settled fresh-id case. A fresh prompt starts
+        // clean.
         if is_retry {
             let live = handles.cards.cards.lock().await;
             if let Some(previous) = live.get(&session_id) {
