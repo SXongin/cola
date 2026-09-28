@@ -682,10 +682,12 @@ fn decode_background_tasks(data: &[Value], wakes: &[Wake]) -> Vec<BackgroundTask
 /// which identity the task carries: a `shell` reports its shell id, a
 /// `subagent` the child session it runs in — the names and metadata keys of
 /// OpenCode 2.0.x's own plugins (`packages/core/src/tool/plugin/{shell,
-/// subagent}.ts`); OpenCode 1's `task` tool belongs to the V1 generation and is
-/// never decoded here. A part still streaming or running has not returned a
-/// background handle yet, and any other tool never backgrounds through this
-/// shape.
+/// subagent}.ts`). OpenCode 1's `task` tool is a different generation: its
+/// foreground parts do appear in shared-store reads, but they carry no
+/// background marker and their completions never produce a V2 Wake, so they
+/// are never a Background Task here. A part still streaming or running has not
+/// returned a background handle yet, and any other tool never backgrounds
+/// through this shape.
 fn decode_background_task(item: &Value) -> Option<BackgroundTask> {
     let name = item.get("name").and_then(Value::as_str)?;
     let state = non_null(item.get("state"))?;
@@ -1910,6 +1912,38 @@ mod tests {
         let mut moved = background_shell_part("call_moved", "sh_moved");
         moved["state"]["input"] = serde_json::json!({"command": "sleep 2"});
         assert_eq!(read_with(moved, Vec::new()).background_tasks.len(), 1);
+    }
+
+    /// OpenCode 1's `task` tool parts appear in shared-store reads (the live
+    /// 2.0.18 store holds both generations' rows), but they are not V2
+    /// Background Tasks: their metadata carries no run status or background
+    /// marker (`metadata.sessionId`, camelCase), and the V1 line's completion
+    /// never produces a V2 Wake — counting one would leave a phantom task live
+    /// forever.
+    #[test]
+    fn a_v1_task_tool_part_is_not_a_background_task() {
+        let task = serde_json::json!({
+            "type": "tool",
+            "id": "call_task",
+            "name": "task",
+            "state": {
+                "status": "completed",
+                "input": {"description": "review", "prompt": "…", "subagent_type": "general"},
+                "content": [{"type": "text", "text": "…"}],
+                "metadata": {
+                    "parentSessionId": "ses_parent",
+                    "sessionId": "ses_child",
+                    "truncated": false,
+                },
+            },
+            "time": {"created": 1000},
+        });
+        let transcript = read_with(task, Vec::new());
+        assert!(
+            transcript.background_tasks.is_empty(),
+            "the V1 task shape is never a V2 Background Task: {:#?}",
+            transcript.background_tasks
+        );
     }
 
     /// A Wake's source decodes from the marker the backend wrote: the shell and
