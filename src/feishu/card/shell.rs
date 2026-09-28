@@ -330,7 +330,7 @@ pub(crate) fn header_title_and_template(
     running_tool: Option<&ToolPanel>,
     progress: &HeaderProgress,
 ) -> (String, &'static str) {
-    if !matches!(state, CardState::Done | CardState::Error | CardState::Retried)
+    if !state.is_terminal()
         && let Some(title) = progress.awaiting.title()
     {
         return (title.to_string(), "orange");

@@ -27,6 +27,17 @@ pub enum CardState {
     Retried,
 }
 
+impl CardState {
+    /// Whether this state ends the card's lifecycle: no more content arrives,
+    /// the header timer stops, and the only action left is the Error card's
+    /// retry. `Continued` is NOT terminal — the chain continues on a new card.
+    /// One definition, so a new terminal state (#394's `Stopped`) cannot leave
+    /// a probe reading the set differently.
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(self, Self::Done | Self::Error | Self::Retried)
+    }
+}
+
 /// How much text ONE card carries before it is finalized and the rest continues
 /// on the next card. Kept below Feishu's card limits so a card full of text
 /// never overflows; long answers flow across continuation cards instead of a

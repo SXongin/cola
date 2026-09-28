@@ -258,9 +258,14 @@ impl Turn {
             let mut inflight = handles.waits.inflight.lock().await;
             if inflight.contains(&session_id) {
                 drop(inflight);
-                // A retry is silent when it loses the guard: its user message
-                // is the failed turn's, and the new prompt already answered it.
-                if !is_retry {
+                if is_retry {
+                    // The retry lost the guard: nothing was submitted, so
+                    // nothing may be marked. Its user message is the failed
+                    // turn's and the running prompt already answered it; give
+                    // the claim back so the still-Error card keeps a working
+                    // retry button (spec #391).
+                    Self::release_retry_claim(&handles.cards, &session_id).await;
+                } else {
                     let _ = handles
                         .platform
                         .reply_text(&message_id, "⏳ 上一条消息还在处理中，请稍等它完成后重发。")
@@ -274,6 +279,17 @@ impl Turn {
         // marker (ADR-0043) is per-session and sticky until the next turn, so
         // clearing it here keeps a past stop from silencing this turn's drain.
         handles.waits.stopped_sessions.lock().await.remove(&session_id);
+
+        // A retry marks its failed card `Retried` before the fresh attempt
+        // exists (spec #391): the card records that it was retried while the
+        // new attempt lives on its own card below. Done only HERE — the
+        // inflight guard is already held, so a retry that lost it can never
+        // stamp 已重试 without submitting (the lost-guard path above released
+        // the claim instead). The flush is best-effort: a failed marker PATCH
+        // only warns, the retry proceeds.
+        if is_retry {
+            Self::mark_retried(&handles.cards, &session_id).await;
+        }
 
         // Fresh accumulator per prompt: reuse leaks stale text/tools from the
         // previous turn into the next card. The card's IDENTITY (the message
@@ -1138,6 +1154,31 @@ pub(crate) struct TurnRetry {
     pub(crate) cola_message_id: Option<String>,
 }
 
+impl TurnRetry {
+    /// This retry as the new attempt's [`PromptContext`]: the same facts under
+    /// the context's names, with the id policy the decision chose (`None` = a
+    /// fresh `msg_cola_` id, `Some` = the failed attempt's). Images are not
+    /// re-sent on a retry (#391, out of scope).
+    pub(crate) fn into_context(
+        self,
+        thread_key: ThreadKey,
+        cola_message_id: Option<String>,
+    ) -> PromptContext {
+        PromptContext {
+            session_id: self.session_id,
+            thread_key,
+            text: self.prompt,
+            message_id: self.reply_to,
+            subtitle: self.subtitle,
+            is_retry: true,
+            requester_open_id: self.requester_open_id,
+            is_group: self.is_group,
+            cola_message_id,
+            images: Vec::new(),
+        }
+    }
+}
+
 /// What a retry click decided to do, from the bounded status + transcript read
 /// pair (spec #391). The matrix is evaluated in order: a live run first, then
 /// the failed turn's transcript.
@@ -1145,9 +1186,10 @@ pub(crate) enum RetryDecision {
     /// The run is still alive (Busy/Retry): no prompt is submitted. Ticket
     /// #393's re-attach cell slots in here.
     Busy,
-    /// Submit under a fresh `msg_cola_` id: the failed turn settled (its newest
-    /// assistant reply carries a terminal finish), the decision read was
-    /// unknown, or no id exists to reuse.
+    /// Submit under a fresh `msg_cola_` id: the failed turn reads settled
+    /// through the finalization's completion projection (`TurnView::complete` —
+    /// a terminal finish on an assistant message within the turn), the decision
+    /// read was unknown, or no id exists to reuse.
     NewId,
     /// Submit reusing the failed attempt's id: nothing of the submission was
     /// stored, or its reply never finished — the server creates or continues
@@ -1161,9 +1203,10 @@ pub(crate) enum RetryDecision {
 /// - status Busy/Retry → [`RetryDecision::Busy`] (no submit);
 /// - a status read that failed, timed out or reported an unreadable kind is
 ///   unknown → a fresh id: the click must always have an effect;
-/// - idle + the failed turn reads complete through the finalization's own
-///   neutral projection (`turn_for_user`) → a fresh id (a same-id re-post
-///   against a settled turn is a server no-op);
+/// - idle + the failed turn reads settled through the finalization's own neutral
+///   projection (`turn_for_user(..).complete`, i.e. a terminal finish on an
+///   assistant message within the turn) → a fresh id (a same-id re-post against
+///   a settled turn is a server no-op);
 /// - idle + no assistant reply, an anchorless read, or an unfinished reply →
 ///   reuse the failed attempt's id (idempotent; the server creates or
 ///   continues the turn), or a fresh id when there is no id to reuse.
@@ -1440,9 +1483,12 @@ impl Turn {
 
     /// Mark the session's failed card `Retried` and flush it (spec #391):
     /// header 「↩️ 已重试」, retry button suppressed, the marker line appended,
-    /// all failed content preserved. A failed PATCH only warns inside the
-    /// flush — the retry proceeds on its new card regardless.
-    pub(crate) async fn mark_retried(cards: &CardsHandle, session_id: &str) {
+    /// all failed content preserved. Called by `Turn::start`'s retry path once
+    /// the inflight guard is held — never before, so a retry that loses the
+    /// guard cannot leave the card marked without a new attempt. A failed
+    /// PATCH only warns inside the flush — the retry proceeds on its new card
+    /// regardless.
+    async fn mark_retried(cards: &CardsHandle, session_id: &str) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
             card.acc.card_state = crate::feishu::card::CardState::Retried;
         }

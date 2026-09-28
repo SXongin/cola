@@ -45,6 +45,33 @@ async fn wait_for_prompt_ids(
     }
 }
 
+/// Assert the retry click's immediate ack (spec #391): the generic toast, and
+/// no card replacement — the failed card must never be overwritten.
+fn assert_retry_ack(result: Option<crate::bridge::handler::CardActionResult>) {
+    let ack = result.expect("retry ack expected");
+    assert_eq!(ack.toast.as_deref(), Some("正在重试..."));
+    assert!(
+        ack.card.is_none(),
+        "the retry ack must not overwrite the failed card"
+    );
+}
+
+/// The `↩️ 已重试` marked card among the recorded platform calls.
+async fn marked_card(platform: &RecordingPlatform) -> serde_json::Value {
+    platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .find_map(|c| match c {
+            PlatformCall::UpdateMessage { card, .. } if card_header(card) == "↩️ 已重试" => {
+                Some(card.clone())
+            }
+            _ => None,
+        })
+        .expect("the failed card must be marked Retried")
+}
+
 /// #378: the kill-shaped orphan — a run the server was killed in: no
 /// completion stamp, a `running` tool part whose newest activity long predates
 /// the Turn anchor (verified on 2.0.18: a restart settles neither), and the
@@ -473,13 +500,7 @@ async fn error_card_retry_reuses_the_unstored_id_and_replies_a_new_card() {
     let retry = app
         .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
         .await;
-    assert!(retry.is_some(), "retry ack expected");
-    let retry_ack = retry.unwrap();
-    assert_eq!(retry_ack.toast.as_deref(), Some("正在重试..."));
-    assert!(
-        retry_ack.card.is_none(),
-        "the retry ack must not overwrite the failed card"
-    );
+    assert_retry_ack(retry);
 
     // The retry's attempt renders on a NEW card; the failed card is marked
     // Retried first, keeping all its content.
@@ -502,15 +523,7 @@ async fn error_card_retry_reuses_the_unstored_id_and_replies_a_new_card() {
         "the retry must reply a new card below the failed one: {calls:?}"
     );
 
-    let marked = calls
-        .iter()
-        .find_map(|c| match c {
-            PlatformCall::UpdateMessage { card, .. } if card_header(card) == "↩️ 已重试" => {
-                Some(card.clone())
-            }
-            _ => None,
-        })
-        .expect("the failed card must be marked Retried");
+    let marked = marked_card(&platform).await;
     let marked_text = card_text(&marked);
     assert!(
         marked_text.contains("Simulated provider failure"),
@@ -621,13 +634,7 @@ async fn settled_failure_retry_submits_a_new_id_on_a_new_card() {
     let retry = app
         .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
         .await;
-    assert!(retry.is_some(), "retry ack expected");
-    let retry_ack = retry.unwrap();
-    assert_eq!(retry_ack.toast.as_deref(), Some("正在重试..."));
-    assert!(
-        retry_ack.card.is_none(),
-        "the retry ack must not overwrite the failed card"
-    );
+    assert_retry_ack(retry);
 
     // The retry's prompt blocks on the gate with its fresh id already
     // recorded: the decision read has happened (it saw the settled window) and
@@ -658,15 +665,7 @@ async fn settled_failure_retry_submits_a_new_id_on_a_new_card() {
         replies, 2,
         "the retry must reply a new card below the failed one: {calls:?}"
     );
-    let marked = calls
-        .iter()
-        .find_map(|c| match c {
-            PlatformCall::UpdateMessage { card, .. } if card_header(card) == "↩️ 已重试" => {
-                Some(card.clone())
-            }
-            _ => None,
-        })
-        .expect("the failed card must be marked Retried");
+    let marked = marked_card(&platform).await;
     let marked_text = card_text(&marked);
     assert!(
         marked_text.contains("OLD_TEXT") && marked_text.contains("provider 503"),
@@ -881,6 +880,70 @@ async fn double_clicked_retry_submits_only_once() {
     .await;
     let ids = prompt_ids.lock().await.clone();
     assert_eq!(ids.len(), 2, "exactly one retry submit: {ids:?}");
+}
+
+/// A retry that loses the inflight guard must mark NOTHING (spec #391): the
+/// mark lives inside `Turn::start`, after the guard, so the failed card stays
+/// `Error` with a working retry button and the claim is released for a later
+/// click. This is the window between the handler's guard check and the submit.
+#[tokio::test]
+async fn retry_losing_the_inflight_guard_marks_nothing_and_releases_the_claim() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.fail_prompts(1, "Simulated provider failure");
+    let prompt_ids = mock.prompt_message_ids.clone();
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+
+    crate::bridge::turn::Turn::run(&app.turn_handles(), retry_ctx("ses_test", "hi", ""))
+        .await
+        .unwrap();
+    wait_for_card_update(&platform, "the Error card", CardUpdates::Latest, |card| {
+        card_header(card) == "❌ 出错"
+    })
+    .await;
+
+    // The click claims the retry (the handler's gate)...
+    let retry = crate::bridge::turn::Turn::claim_retry(&app.cards_handle(), "ses_test").await;
+    assert!(retry.is_some(), "the Error card must be retryable");
+    // ...then another prompt takes the session's guard before this retry's
+    // `Turn::start` runs.
+    app.inflight.lock().await.insert("ses_test".to_string());
+
+    let mut ctx = retry_ctx("ses_test", "hi", "msg_cola_lost");
+    ctx.is_retry = true;
+    crate::bridge::turn::Turn::run(&app.turn_handles(), ctx)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        crate::bridge::turn::Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(crate::feishu::card::CardState::Error),
+        "a retry that never submitted must leave the card Error"
+    );
+    assert!(
+        !platform
+            .updated_cards()
+            .await
+            .iter()
+            .any(|card| card_header(card) == "↩️ 已重试"),
+        "no Retried mark may reach Feishu"
+    );
+    assert_eq!(
+        prompt_ids.lock().await.len(),
+        1,
+        "no retry prompt may be submitted"
+    );
+    assert!(
+        crate::bridge::turn::Turn::claim_retry(&app.cards_handle(), "ses_test")
+            .await
+            .is_some(),
+        "the lost guard must release the claim for a later click"
+    );
 }
 
 /// The double-click guard's other face: a card that is no longer `Error` (a
