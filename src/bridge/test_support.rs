@@ -173,6 +173,10 @@ pub struct RecordingPlatform {
     /// (`230099`, what Feishu returns for a card whose markdown it refuses):
     /// the flush must degrade the card and retry instead of resending it.
     pub fail_update_card_content_count: std::sync::atomic::AtomicUsize,
+    /// The next N `update_message` calls fail with a plain Feishu error: the
+    /// caller must only warn (the retry's `Retried` marker PATCH must never
+    /// block the retry itself, spec #391).
+    pub fail_update_count: std::sync::atomic::AtomicUsize,
     /// The next N `reply_card` calls fail with the same typed rejection, for
     /// the continuation-send recovery path.
     pub fail_reply_card_content_count: std::sync::atomic::AtomicUsize,
@@ -208,6 +212,7 @@ impl RecordingPlatform {
             fail_reply_card: false,
             fail_reply_card_count: std::sync::atomic::AtomicUsize::new(0),
             fail_update_card_content_count: std::sync::atomic::AtomicUsize::new(0),
+            fail_update_count: std::sync::atomic::AtomicUsize::new(0),
             fail_reply_card_content_count: std::sync::atomic::AtomicUsize::new(0),
             fail_instant_reminder: std::sync::atomic::AtomicBool::new(false),
             fail_pin: std::sync::atomic::AtomicBool::new(false),
@@ -472,6 +477,11 @@ impl feishu::Platform for RecordingPlatform {
             self.fail_update_card_content_count
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
+        let failed = self.fail_update_count.load(std::sync::atomic::Ordering::SeqCst) > 0;
+        if failed {
+            self.fail_update_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
         if let Some(gate) = self.take_gate("update", message_id) {
             wait_gate(gate).await;
         }
@@ -484,6 +494,11 @@ impl feishu::Platform for RecordingPlatform {
                 code: 230099,
                 detail: "simulated card content rejection".into(),
             });
+        }
+        if failed {
+            return Err(crate::error::BridgeError::Feishu(
+                "simulated card update failure".into(),
+            ));
         }
         Ok(())
     }
@@ -870,6 +885,11 @@ pub struct MockBackend {
     /// When set, `session_status` fails with this message (simulates a read
     /// failure — the caller must not guess a status).
     pub session_status_error: Option<String>,
+    /// When true, `session_status` fails from that moment on — the post-build
+    /// toggle for a decision/observation read that must degrade to "unknown"
+    /// (the retry's status leg, spec #391). Separate from
+    /// [`Self::session_status_error`], which is fixed at construction.
+    pub session_status_fails: Arc<std::sync::atomic::AtomicBool>,
     /// Scripts the ADR-0028 busy→idle race: the first `session_status` read
     /// returns Busy (and clears the flag), later reads serve the map.
     pub status_busy_once: std::sync::atomic::AtomicBool,
@@ -959,6 +979,7 @@ impl MockBackend {
             session_statuses: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             session_status_reads: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             session_status_error: None,
+            session_status_fails: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             status_busy_once: std::sync::atomic::AtomicBool::new(false),
             prompt_scripts: Vec::new(),
             last_prompt_parts: std::sync::Mutex::new(None),
@@ -1844,6 +1865,14 @@ impl crate::backend::Backend for MockBackend {
             .push(session_id.to_string());
         if let Some(err) = &self.session_status_error {
             return Err(crate::error::BridgeError::OpenCode(err.clone()));
+        }
+        if self
+            .session_status_fails
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(crate::error::BridgeError::OpenCode(
+                "simulated session_status failure".into(),
+            ));
         }
         // Scripts the ADR-0028 busy→idle race: the FIRST read reports Busy
         // (the snapshot gather sees a mid-flight turn), later reads serve the

@@ -420,7 +420,7 @@ fn turn_ctx(session_id: &str) -> PromptContext {
         text: "hi".into(),
         message_id: "msg_1".into(),
         subtitle: "p2p".into(),
-        existing_card_id: None,
+        is_retry: false,
         requester_open_id: Some(TEST_HOST.into()),
         is_group: false,
         cola_message_id: None,

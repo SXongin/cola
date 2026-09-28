@@ -83,20 +83,21 @@ fn drain_deadline(handles: &TurnHandles) -> tokio::time::Instant {
 }
 
 /// Everything [`Turn::run`] needs for one turn. Built by `handle_prompt` for a
-/// fresh message and by the error-card "retry" action (which reuses the
-/// existing card id + stored prompt).
+/// fresh message and by the error-card "retry" action (which re-submits the
+/// original prompt under either the failed attempt's id or a fresh one, and
+/// replies a NEW card — spec #391).
 pub(crate) struct PromptContext {
     pub(crate) session_id: String,
     pub(crate) thread_key: ThreadKey,
     pub(crate) text: String,
     pub(crate) message_id: String,
     pub(crate) subtitle: String,
-    /// The live card a retry resets in place (the error-card retry); None
-    /// means a fresh message, which replies a new card. Its presence is also
-    /// the retry signal: `Turn::start` carries the failed attempt's render
-    /// baseline across so the rebuilt card renders only the new attempt
-    /// (#387).
-    pub(crate) existing_card_id: Option<String>,
+    /// The explicit error-card retry signal (spec #391): this run re-submits a
+    /// failed turn and replies a NEW card below the failed one (which the
+    /// handler marks `Retried`). `Turn::start` then carries the failed
+    /// attempt's render baseline across so the fresh card renders only the new
+    /// attempt (#387). False for a fresh message.
+    pub(crate) is_retry: bool,
     pub(crate) requester_open_id: Option<String>,
     pub(crate) is_group: bool,
     /// The id cola assigned to this turn's user message (`msg_cola_…`,
@@ -229,9 +230,10 @@ impl Turn {
         Ok(())
     }
 
-    /// The busy guard, the Loading card (fresh reply or a reset of the retry's
-    /// existing card) and the fresh accumulator this turn streams into.
-    /// `Ok(None)` means another prompt holds the session — already answered.
+    /// The busy guard, the Loading card (a fresh reply below the user's
+    /// message — including a retry, which replies a new card) and the fresh
+    /// accumulator this turn streams into. `Ok(None)` means another prompt
+    /// holds the session — already answered.
     async fn start(handles: &TurnHandles, ctx: PromptContext) -> crate::error::Result<Option<Turn>> {
         let PromptContext {
             session_id,
@@ -239,7 +241,7 @@ impl Turn {
             text,
             message_id,
             subtitle,
-            existing_card_id,
+            is_retry,
             requester_open_id,
             is_group,
             cola_message_id,
@@ -256,7 +258,9 @@ impl Turn {
             let mut inflight = handles.waits.inflight.lock().await;
             if inflight.contains(&session_id) {
                 drop(inflight);
-                if existing_card_id.is_none() {
+                // A retry is silent when it loses the guard: its user message
+                // is the failed turn's, and the new prompt already answered it.
+                if !is_retry {
                     let _ = handles
                         .platform
                         .reply_text(&message_id, "⏳ 上一条消息还在处理中，请稍等它完成后重发。")
@@ -292,12 +296,13 @@ impl Turn {
         acc.prompt = Some(text.clone());
         acc.requester_open_id = requester_open_id.clone();
         acc.is_group = is_group;
-        // An error-card retry carries the failed attempt's render baseline
-        // (#387): the retry reuses the same `msg_cola_` user message
-        // (ADR-0026), so the failed attempt's messages are still in the turn
-        // window — the baseline keeps them from replaying into the rebuilt
-        // card. A fresh prompt starts clean.
-        if existing_card_id.is_some() {
+        // An explicit retry carries the failed attempt's render baseline
+        // (#387, spec #391): the reused-id branch renders the same
+        // `msg_cola_` user message (ADR-0026), so the failed attempt's
+        // messages are still in the new card's turn window — the baseline
+        // keeps them from replaying. The new-id branch carries it inertly
+        // under a fresh anchor. A fresh prompt starts clean.
+        if is_retry {
             let live = handles.cards.cards.lock().await;
             if let Some(previous) = live.get(&session_id) {
                 acc.carry_attempt_baseline(&previous.acc);
@@ -331,31 +336,26 @@ impl Turn {
             .with_state(crate::feishu::card::CardState::Loading)
             .with_subtitle(&subtitle)
             .build();
-        let new_card_id = match existing_card_id {
-            Some(cid) => {
-                // Retry: reset the SAME card to Loading instead of replying a new one.
-                if let Err(e) = handles.cards.feishu.update_message(&cid, &loading).await {
-                    tracing::warn!("retry: reset card failed: {}", e);
-                }
-                Some(cid)
+        // Every attempt gets its own card, a retry included: the failed card
+        // stays below the new one, marked `Retried` by the retry handler before
+        // this submit (spec #391). The reply target is the failed turn's own
+        // user message, so the new card lands directly below the failure.
+        let new_card_id = match handles.cards.feishu.reply_card(&message_id, &loading).await {
+            Ok(id) => id,
+            Err(e) => {
+                // The turn never started: drop the just-inserted card
+                // session and release the guard, so nothing leaks and the
+                // session does not look busy until a restart.
+                handles.cards.cards.lock().await.remove(&session_id);
+                release_inflight(handles, &session_id).await;
+                return Err(e);
             }
-            None => match handles.cards.feishu.reply_card(&message_id, &loading).await {
-                Ok(id) => Some(id),
-                Err(e) => {
-                    // The turn never started: drop the just-inserted card
-                    // session and release the guard, so nothing leaks and the
-                    // session does not look busy until a restart.
-                    handles.cards.cards.lock().await.remove(&session_id);
-                    release_inflight(handles, &session_id).await;
-                    return Err(e);
-                }
-            },
         };
 
-        if let Some(cid) = new_card_id {
+        {
             let mut cards = handles.cards.cards.lock().await;
             if let Some(card) = cards.get_mut(&session_id) {
-                card.card_message_id = Some(cid);
+                card.card_message_id = Some(new_card_id);
             }
         }
 
@@ -1128,13 +1128,75 @@ pub(crate) struct TurnPinSource {
 /// The error-card retry fixture a failed turn's card carries: the original
 /// prompt, its reply target, and the identity/thread facts a retry reuses.
 pub(crate) struct TurnRetry {
+    /// The failed turn's session.
+    pub(crate) session_id: String,
     pub(crate) prompt: String,
     pub(crate) reply_to: String,
     pub(crate) subtitle: String,
     pub(crate) requester_open_id: Option<String>,
     pub(crate) is_group: bool,
     pub(crate) cola_message_id: Option<String>,
-    pub(crate) card_message_id: Option<String>,
+}
+
+/// What a retry click decided to do, from the bounded status + transcript read
+/// pair (spec #391). The matrix is evaluated in order: a live run first, then
+/// the failed turn's transcript.
+pub(crate) enum RetryDecision {
+    /// The run is still alive (Busy/Retry): no prompt is submitted. Ticket
+    /// #393's re-attach cell slots in here.
+    Busy,
+    /// Submit under a fresh `msg_cola_` id: the failed turn settled (its newest
+    /// assistant reply carries a terminal finish), the decision read was
+    /// unknown, or no id exists to reuse.
+    NewId,
+    /// Submit reusing the failed attempt's id: nothing of the submission was
+    /// stored, or its reply never finished — the server creates or continues
+    /// the turn.
+    Reuse(String),
+}
+
+/// The retry decision (spec #391's matrix), a pure function over the bounded
+/// read pair so the cells are testable without a backend:
+///
+/// - status Busy/Retry → [`RetryDecision::Busy`] (no submit);
+/// - a status read that failed, timed out or reported an unreadable kind is
+///   unknown → a fresh id: the click must always have an effect;
+/// - idle + the failed turn reads complete through the finalization's own
+///   neutral projection (`turn_for_user`) → a fresh id (a same-id re-post
+///   against a settled turn is a server no-op);
+/// - idle + no assistant reply, an anchorless read, or an unfinished reply →
+///   reuse the failed attempt's id (idempotent; the server creates or
+///   continues the turn), or a fresh id when there is no id to reuse.
+pub(crate) fn retry_decision(
+    status: Option<SessionStatus>,
+    transcript: Option<&SessionTranscript>,
+    cola_message_id: Option<&str>,
+) -> RetryDecision {
+    match status {
+        Some(SessionStatus::Busy | SessionStatus::Retry) => RetryDecision::Busy,
+        // Unknown status: submit a fresh attempt rather than risk a no-op.
+        None => RetryDecision::NewId,
+        Some(SessionStatus::Idle) => {
+            let Some(id) = cola_message_id else {
+                return RetryDecision::NewId;
+            };
+            // An unreadable transcript is unknown too.
+            let Some(transcript) = transcript else {
+                return RetryDecision::NewId;
+            };
+            // No anchor means the failed submission stored no user message (or
+            // one that cannot be ordered): nothing settled, so the idempotent
+            // reuse is the safe submit.
+            let settled = transcript
+                .anchor_of_user(id)
+                .is_some_and(|anchor| transcript.turn_for_user(&anchor).complete);
+            if settled {
+                RetryDecision::NewId
+            } else {
+                RetryDecision::Reuse(id.to_string())
+            }
+        }
+    }
 }
 
 /// How a resolution leaves its residue on the card's timeline (ADR-0038,
@@ -1333,21 +1395,58 @@ impl Turn {
         })
     }
 
-    /// The error-card retry fixture a session's card carries: the original
-    /// prompt, its reply target, subtitle, requester/chat facts and the card id
-    /// to reset. `None` when the session has no card.
-    pub(crate) async fn retry_request(cards: &CardsHandle, session_id: &str) -> Option<TurnRetry> {
-        let live = cards.cards.lock().await;
-        let card = live.get(session_id)?;
+    /// Claim the session's error-card retry (spec #391): returns the failed
+    /// turn's retry fixture exactly once while the card is still in the `Error`
+    /// state and no earlier click holds the claim. `None` when the card is not
+    /// failed (already marked `Retried` or live), a retry is already claimed,
+    /// no card exists, or no prompt was stored to re-submit (an
+    /// externally-rendered error card). This atomic claim is what makes the
+    /// callback safe to double-click: the click is acked immediately, so a
+    /// second click can arrive before the retry's own Error→`Retried` marking
+    /// lands.
+    pub(crate) async fn claim_retry(cards: &CardsHandle, session_id: &str) -> Option<TurnRetry> {
+        let mut live = cards.cards.lock().await;
+        let card = live.get_mut(session_id)?;
+        if card.acc.card_state != crate::feishu::card::CardState::Error || card.acc.retry_claimed {
+            return None;
+        }
+        // A card that was never sent cannot be marked; an Error card always
+        // has one (`Turn::start` drops the session when the Loading reply
+        // fails).
+        card.card_message_id.as_ref()?;
+        // An external turn's failure has no prompt to re-submit; the button
+        // must not claim (there is nothing to retry).
+        let prompt = card.acc.prompt.clone().filter(|prompt| !prompt.is_empty())?;
+        card.acc.retry_claimed = true;
         Some(TurnRetry {
-            prompt: card.acc.prompt.clone().unwrap_or_default(),
+            session_id: session_id.to_string(),
+            prompt,
             reply_to: card.acc.reply_to_message_id.clone().unwrap_or_default(),
             subtitle: card.acc.title.clone(),
             requester_open_id: card.acc.requester_open_id.clone(),
             is_group: card.acc.is_group,
             cola_message_id: card.acc.cola_message_id.clone(),
-            card_message_id: card.card_message_id.clone(),
         })
+    }
+
+    /// Release an unused retry claim. The `Busy` decision submits nothing
+    /// (ticket #393 re-attaches there), so the claim goes back: a later click
+    /// can retry once the run has ended instead of finding a dead button.
+    pub(crate) async fn release_retry_claim(cards: &CardsHandle, session_id: &str) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.retry_claimed = false;
+        }
+    }
+
+    /// Mark the session's failed card `Retried` and flush it (spec #391):
+    /// header 「↩️ 已重试」, retry button suppressed, the marker line appended,
+    /// all failed content preserved. A failed PATCH only warns inside the
+    /// flush — the retry proceeds on its new card regardless.
+    pub(crate) async fn mark_retried(cards: &CardsHandle, session_id: &str) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.card_state = crate::feishu::card::CardState::Retried;
+        }
+        Self::flush_card(cards, session_id).await;
     }
 
     /// Add a permission's inline block to `session_id`'s card. Returns false
@@ -1891,7 +1990,7 @@ mod tests {
             text: text.into(),
             message_id: "msg_1".into(),
             subtitle: "p2p".into(),
-            existing_card_id: None,
+            is_retry: false,
             requester_open_id: None,
             is_group: false,
             cola_message_id: None,
@@ -2080,5 +2179,85 @@ mod tests {
             cards.get("ses_a").and_then(|c| c.acc.variant.clone()).is_none(),
             "nor tag the footer"
         );
+    }
+
+    /// The retry matrix (spec #391) as a pure decision: a live run never gets a
+    /// prompt; a settled turn takes a fresh id; an unpersisted or unfinished
+    /// turn reuses the failed id; anything unknown takes a fresh id so the
+    /// click always has an effect.
+    #[test]
+    fn retry_decision_reads_the_matrix() {
+        use crate::backend::{FinishReason, MessageRole, Part, StepFinish};
+        use crate::bridge::test_support::{text_part, typed_message};
+
+        let window = |complete: bool| {
+            let mut assistant = typed_message(
+                "msg_a",
+                MessageRole::Assistant,
+                Some(2_000),
+                vec![text_part("回答")],
+            );
+            if complete {
+                assistant.parts.push(Part::StepFinish(StepFinish {
+                    reason: FinishReason::Stop,
+                }));
+            }
+            SessionTranscript::new(vec![
+                typed_message(
+                    "msg_cola_x",
+                    MessageRole::User,
+                    Some(1_000),
+                    vec![text_part("hi")],
+                ),
+                assistant,
+            ])
+        };
+        let unfinished = window(false);
+        let settled = window(true);
+        let id = Some("msg_cola_x");
+
+        // A live run is never re-prompted (ticket #393 owns the re-attach).
+        for status in [SessionStatus::Busy, SessionStatus::Retry] {
+            assert!(
+                matches!(
+                    retry_decision(Some(status), Some(&settled), id),
+                    RetryDecision::Busy
+                ),
+                "{status:?} must not submit"
+            );
+        }
+        // Unknown (status read failed/timed out, unreadable kind) → fresh id.
+        assert!(matches!(
+            retry_decision(None, Some(&settled), id),
+            RetryDecision::NewId
+        ));
+        assert!(matches!(retry_decision(None, None, id), RetryDecision::NewId));
+        // No id to reuse, or no transcript to read → fresh id.
+        assert!(matches!(
+            retry_decision(Some(SessionStatus::Idle), Some(&settled), None),
+            RetryDecision::NewId
+        ));
+        assert!(matches!(
+            retry_decision(Some(SessionStatus::Idle), None, id),
+            RetryDecision::NewId
+        ));
+        // Settled → fresh id (a same-id re-post would be a server no-op).
+        assert!(matches!(
+            retry_decision(Some(SessionStatus::Idle), Some(&settled), id),
+            RetryDecision::NewId
+        ));
+        // Unfinished, or no assistant reply/anchor at all → reuse.
+        assert!(matches!(
+            retry_decision(Some(SessionStatus::Idle), Some(&unfinished), id),
+            RetryDecision::Reuse(reused) if reused == "msg_cola_x"
+        ));
+        assert!(matches!(
+            retry_decision(
+                Some(SessionStatus::Idle),
+                Some(&SessionTranscript::new(vec![])),
+                id
+            ),
+            RetryDecision::Reuse(reused) if reused == "msg_cola_x"
+        ));
     }
 }

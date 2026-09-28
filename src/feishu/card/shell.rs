@@ -330,7 +330,7 @@ pub(crate) fn header_title_and_template(
     running_tool: Option<&ToolPanel>,
     progress: &HeaderProgress,
 ) -> (String, &'static str) {
-    if !matches!(state, CardState::Done | CardState::Error)
+    if !matches!(state, CardState::Done | CardState::Error | CardState::Retried)
         && let Some(title) = progress.awaiting.title()
     {
         return (title.to_string(), "orange");
@@ -351,6 +351,7 @@ pub(crate) fn header_title_and_template(
         CardState::Continued => ("⏳ 部分完成，继续中…".to_string(), "blue"),
         CardState::Done => ("✅ 完成".to_string(), "green"),
         CardState::Error => ("❌ 出错".to_string(), "red"),
+        CardState::Retried => ("↩️ 已重试".to_string(), "grey"),
     };
     let mut title = label;
     match state {
@@ -751,6 +752,50 @@ mod tests {
                 .unwrap()
                 .contains("503")
         );
+    }
+
+    /// The retry marker (spec #391): a Retried card is grey-titled 「↩️ 已重试」,
+    /// keeps the failed content and renders NO retry button — only the Error
+    /// state offers the action.
+    #[test]
+    fn retried_card_is_grey_and_offers_no_retry_button() {
+        let card = CardBuilder::new()
+            .with_state(CardState::Retried)
+            .with_text("**错误**: 503 request queue full")
+            .with_error_buttons(vec![CardActionButton {
+                text: "🔄 重试".to_string(),
+                kind: "primary",
+                value: serde_json::json!({ "action": "retry" }),
+            }])
+            .build();
+        assert_eq!(card["header"]["template"].as_str().unwrap(), "grey");
+        assert_eq!(card["header"]["title"]["content"].as_str().unwrap(), "↩️ 已重试");
+        assert!(
+            card.to_string().contains("503"),
+            "the failed content stays on the card: {card}"
+        );
+        assert!(
+            card["body"]["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|element| element["tag"] != "button"),
+            "a Retried card must not render the retry button: {card}"
+        );
+    }
+
+    /// The awaiting override is for live states only: a Retried card is
+    /// terminal, so a still-pending interaction block must not restyle its
+    /// header as "waiting for your authorization" (#386's rule, extended).
+    #[test]
+    fn awaiting_override_does_not_touch_a_retried_card() {
+        let progress = HeaderProgress {
+            awaiting: AwaitingAction::Permission,
+            ..Default::default()
+        };
+        let (title, template) = header_title_and_template(&CardState::Retried, None, &progress);
+        assert_eq!(title, "↩️ 已重试");
+        assert_eq!(template, "grey");
     }
 
     #[test]

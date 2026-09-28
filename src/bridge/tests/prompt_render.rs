@@ -5,6 +5,46 @@ use crate::backend::{
     ToolStatus, TranscriptMessage,
 };
 
+/// A direct Turn context for the retry tests: the handler path is exercised by
+/// `host_action`, this seeds the failed attempt. An empty `cola_message_id`
+/// means "generate a fresh one".
+fn retry_ctx(session_id: &str, text: &str, cola_message_id: &str) -> crate::bridge::turn::PromptContext {
+    crate::bridge::turn::PromptContext {
+        session_id: session_id.into(),
+        thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+        text: text.into(),
+        message_id: "msg_1".into(),
+        subtitle: "p2p".into(),
+        is_retry: false,
+        requester_open_id: None,
+        is_group: false,
+        cola_message_id: (!cola_message_id.is_empty()).then(|| cola_message_id.to_string()),
+        images: Vec::new(),
+    }
+}
+
+/// Await at least `len` recorded prompt message ids, or panic after 5 s. The
+/// retry's id is recorded at prompt entry, before any gate the test installed,
+/// so this stays deterministic when the prompt is held.
+async fn wait_for_prompt_ids(
+    ids: &Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
+    len: usize,
+) -> Vec<Option<String>> {
+    let wait = async {
+        loop {
+            let current = ids.lock().await.clone();
+            if current.len() >= len {
+                return current;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(5), wait).await {
+        Ok(ids) => ids,
+        Err(_) => panic!("the retry prompt was never recorded (wanted {len} ids)"),
+    }
+}
+
 /// #378: the kill-shaped orphan — a run the server was killed in: no
 /// completion stamp, a `running` tool part whose newest activity long predates
 /// the Turn anchor (verified on 2.0.18: a restart settles neither), and the
@@ -283,7 +323,7 @@ async fn transcript_recorded_failure_renders_error_card() {
         text: "hi".into(),
         message_id: "msg_1".into(),
         subtitle: "p2p".into(),
-        existing_card_id: None,
+        is_retry: false,
         requester_open_id: None,
         is_group: false,
         cola_message_id: Some("msg_cola_failed".into()),
@@ -357,7 +397,7 @@ async fn transcript_recovered_step_finishes_done() {
         text: "hi".into(),
         message_id: "msg_1".into(),
         subtitle: "p2p".into(),
-        existing_card_id: None,
+        is_retry: false,
         requester_open_id: None,
         is_group: false,
         cola_message_id: Some("msg_cola_recovered".into()),
@@ -379,8 +419,13 @@ async fn transcript_recovered_step_finishes_done() {
     );
 }
 
+/// The unstored-submission cell of the retry matrix (spec #391): the first
+/// submit was rejected, so nothing persisted and there is no reply to settle.
+/// The retry reuses the failed attempt's id (idempotent — the server may
+/// create it) and, per the new contract, replies a NEW card below the failed
+/// one instead of overwriting the failure.
 #[tokio::test]
-async fn error_card_retry_reuses_card_and_reruns_prompt() {
+async fn error_card_retry_reuses_the_unstored_id_and_replies_a_new_card() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -417,7 +462,7 @@ async fn error_card_retry_reuses_card_and_reruns_prompt() {
     assert!(err_text.contains("❌"), "error card missing: {}", err_text);
     assert!(err_text.contains("重试"), "retry button missing: {}", err_text);
 
-    // The card the retry will reuse: the loading reply card id.
+    // The card the first attempt used: the loading reply card id.
     let card_id = match calls.first().unwrap() {
         PlatformCall::ReplyCard { card, .. } if card_text(card).contains("思考中") => "msg_reply",
         _ => panic!("expected a loading reply card first: {:?}", calls),
@@ -428,43 +473,72 @@ async fn error_card_retry_reuses_card_and_reruns_prompt() {
     let retry = app
         .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
         .await;
-    assert!(retry.is_some(), "retry ack card expected");
-    assert_eq!(retry.unwrap().toast.as_deref(), Some("正在重试..."));
+    assert!(retry.is_some(), "retry ack expected");
+    let retry_ack = retry.unwrap();
+    assert_eq!(retry_ack.toast.as_deref(), Some("正在重试..."));
+    assert!(
+        retry_ack.card.is_none(),
+        "the retry ack must not overwrite the failed card"
+    );
 
-    // The spawned retry re-runs the prompt on the SAME card, not a new reply.
-    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    // The retry's attempt renders on a NEW card; the failed card is marked
+    // Retried first, keeping all its content.
+    wait_for_card_update(&platform, "the retried Done card", CardUpdates::Latest, |card| {
+        card_header(card) == "✅ 完成" && card_text(card).contains("当前目录有 src/ 和 Cargo.toml。")
+    })
+    .await;
 
     let calls = platform.calls.lock().await.clone();
-    let updates: Vec<_> = calls
+    let replies: Vec<_> = calls
         .iter()
         .filter_map(|c| match c {
-            PlatformCall::UpdateMessage { message_id, card } => Some((message_id.clone(), card.clone())),
+            PlatformCall::ReplyCard { card, .. } => Some(card.clone()),
             _ => None,
         })
         .collect();
     assert_eq!(
-        updates.last().unwrap().0,
-        "msg_reply",
-        "retry must update the original card, not send a new one: {:?}",
-        calls
+        replies.len(),
+        2,
+        "the retry must reply a new card below the failed one: {calls:?}"
     );
-    let final_card = updates.last().unwrap().1.to_string();
+
+    let marked = calls
+        .iter()
+        .find_map(|c| match c {
+            PlatformCall::UpdateMessage { card, .. } if card_header(card) == "↩️ 已重试" => {
+                Some(card.clone())
+            }
+            _ => None,
+        })
+        .expect("the failed card must be marked Retried");
+    let marked_text = card_text(&marked);
     assert!(
-        final_card.contains("✅"),
-        "retry should finish Done: {}",
-        final_card
+        marked_text.contains("Simulated provider failure"),
+        "the failed content must stay readable: {marked_text}"
     );
     assert!(
-        final_card.contains("当前目录有 src/ 和 Cargo.toml。"),
-        "retried answer missing: {}",
-        final_card
+        marked_text.contains("已重试，见下方新卡片"),
+        "the marker line is missing: {marked_text}"
+    );
+    assert!(
+        card_buttons(&marked)
+            .iter()
+            .all(|b| { b["value"].get("action").and_then(|a| a.as_str()) != Some("retry") }),
+        "a Retried card must not offer another retry: {marked}"
+    );
+
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert_eq!(card_header(&final_card), "✅ 完成");
+    assert!(
+        card_text(&final_card).contains("当前目录有 src/ 和 Cargo.toml。"),
+        "the new card must render the retry's answer: {final_card}"
     );
 
     let backend_calls = prompt_calls.lock().await.clone();
     assert_eq!(backend_calls, vec!["hi".to_string(), "hi".to_string()]);
     // Both attempts are the SAME logical user message: a fresh `msg_cola_`
-    // id on the first send, REUSED by the retry (ADR-0026) so the server
-    // deduplicates instead of appending a second user message.
+    // id on the first send, REUSED by the retry (ADR-0026) because nothing of
+    // the first submission persisted — the server creates it now.
     let message_ids = prompt_ids.lock().await.clone();
     assert_eq!(message_ids.len(), 2, "two prompt attempts expected");
     let first = message_ids[0].clone().expect("prompt must carry a message id");
@@ -476,8 +550,409 @@ async fn error_card_retry_reuses_card_and_reruns_prompt() {
     assert_eq!(
         message_ids[1].as_deref(),
         Some(first.as_str()),
-        "retry must reuse the failed attempt's message id"
+        "an unstored submission must reuse the failed attempt's message id"
     );
+}
+
+/// The settled-failure cell of the retry matrix (spec #391): the failed turn's
+/// newest assistant reply carries a terminal finish, so a same-id re-post
+/// would be a server no-op. The retry takes a FRESH `msg_cola_` id, marks the
+/// failed card `Retried` and replies a new card that renders only the new
+/// attempt.
+#[tokio::test]
+async fn settled_failure_retry_submits_a_new_id_on_a_new_card() {
+    use crate::backend::{FinishReason, StepFinish};
+
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    const ANCHOR: &str = "msg_cola_settled";
+    let mut mock = MockBackend::new(realistic_parts());
+    // The retry's prompt is held after its id is recorded, so the test can
+    // swap the transcript script between the decision read and the retry's
+    // own render.
+    let gate = mock.hold_prompts();
+    let prompt_ids = mock.prompt_message_ids.clone();
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+
+    // The turn as the server settled it: the admitted user message plus an
+    // assistant message carrying the provider failure and a terminal finish.
+    let mut failed = typed_message(
+        "msg_a_err",
+        MessageRole::Assistant,
+        Some(2_000),
+        vec![
+            text_part("失败尝试：OLD_TEXT"),
+            Part::StepFinish(StepFinish {
+                reason: FinishReason::Error,
+            }),
+        ],
+    );
+    failed.error = Some("provider 503".into());
+    *backend
+        .transcript_scripts
+        .lock()
+        .await
+        .entry("ses_test".into())
+        .or_default() = vec![SessionTranscript::new(vec![
+        typed_message(ANCHOR, MessageRole::User, Some(1_000), vec![text_part("hi")]),
+        failed,
+    ])];
+
+    // Attempt 1 (the settled failure): the transcript above ends it Error.
+    gate.add_permits(1);
+    crate::bridge::turn::Turn::run(&app.turn_handles(), retry_ctx("ses_test", "hi", ANCHOR))
+        .await
+        .unwrap();
+    wait_for_card_update(
+        &platform,
+        "the settled failure's Error card",
+        CardUpdates::Latest,
+        |card| {
+            let text = card_text(card);
+            text.contains("❌") && text.contains("OLD_TEXT")
+        },
+    )
+    .await;
+
+    let retry = app
+        .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
+        .await;
+    assert!(retry.is_some(), "retry ack expected");
+    let retry_ack = retry.unwrap();
+    assert_eq!(retry_ack.toast.as_deref(), Some("正在重试..."));
+    assert!(
+        retry_ack.card.is_none(),
+        "the retry ack must not overwrite the failed card"
+    );
+
+    // The retry's prompt blocks on the gate with its fresh id already
+    // recorded: the decision read has happened (it saw the settled window) and
+    // the failed card has been marked. Drop the script so the retry's own
+    // render reads the mock's default transcript, which carries that fresh id.
+    let ids = wait_for_prompt_ids(&prompt_ids, 2).await;
+    backend.transcript_scripts.lock().await.remove("ses_test");
+    gate.add_permits(1);
+
+    let new_id = ids[1].clone().expect("the retry prompt carries an id");
+    assert_ne!(
+        ANCHOR,
+        new_id.as_str(),
+        "a settled failure must retry under a NEW msg_cola_ id"
+    );
+
+    wait_for_card_update(&platform, "the retry's Done card", CardUpdates::Latest, |card| {
+        card_header(card) == "✅ 完成" && card_text(card).contains("当前目录有 src/ 和 Cargo.toml。")
+    })
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    let replies = calls
+        .iter()
+        .filter(|call| matches!(call, PlatformCall::ReplyCard { .. }))
+        .count();
+    assert_eq!(
+        replies, 2,
+        "the retry must reply a new card below the failed one: {calls:?}"
+    );
+    let marked = calls
+        .iter()
+        .find_map(|c| match c {
+            PlatformCall::UpdateMessage { card, .. } if card_header(card) == "↩️ 已重试" => {
+                Some(card.clone())
+            }
+            _ => None,
+        })
+        .expect("the failed card must be marked Retried");
+    let marked_text = card_text(&marked);
+    assert!(
+        marked_text.contains("OLD_TEXT") && marked_text.contains("provider 503"),
+        "all failed content must stay on the marked card: {marked_text}"
+    );
+    assert!(
+        marked_text.contains("已重试，见下方新卡片"),
+        "the marker line is missing: {marked_text}"
+    );
+    assert!(
+        card_buttons(&marked)
+            .iter()
+            .all(|b| { b["value"].get("action").and_then(|a| a.as_str()) != Some("retry") }),
+        "a Retried card must not offer another retry: {marked}"
+    );
+
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    let final_text = card_text(&final_card);
+    assert_eq!(card_header(&final_card), "✅ 完成");
+    assert!(
+        final_text.contains("当前目录有 src/ 和 Cargo.toml。"),
+        "the new attempt must render on the new card: {final_text}"
+    );
+    assert!(
+        !final_text.contains("OLD_TEXT"),
+        "the failed attempt must not replay onto the new card: {final_text}"
+    );
+}
+
+/// The unknown cell (spec #391): a failed status read is not guessed — the
+/// click still has an effect, submitting a fresh attempt under a new id.
+#[tokio::test]
+async fn retry_after_a_failed_status_read_submits_a_new_id() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.fail_prompts(1, "Simulated provider failure");
+    let prompt_ids = mock.prompt_message_ids.clone();
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+
+    crate::bridge::turn::Turn::run(&app.turn_handles(), retry_ctx("ses_test", "hi", ""))
+        .await
+        .unwrap();
+    wait_for_card_update(&platform, "the Error card", CardUpdates::Latest, |card| {
+        card_header(card) == "❌ 出错"
+    })
+    .await;
+
+    // From now on the status read fails: the decision is unknown.
+    backend
+        .session_status_fails
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let retry = app
+        .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
+        .await;
+    assert!(retry.is_some(), "retry ack expected");
+
+    let ids = wait_for_prompt_ids(&prompt_ids, 2).await;
+    assert_ne!(
+        ids[0], ids[1],
+        "an unknown decision must submit a fresh id (click must have an effect)"
+    );
+
+    wait_for_card_update(&platform, "the retried Done card", CardUpdates::Latest, |card| {
+        card_header(card) == "✅ 完成" && card_text(card).contains("当前目录有 src/ 和 Cargo.toml。")
+    })
+    .await;
+}
+
+/// The unknown cell's timeout arm: a hung decision transcript read is bounded
+/// (the follow's per-read timeout) and degrades to a fresh-id submit, so the
+/// click can never silently do nothing.
+#[tokio::test]
+async fn retry_after_a_timed_out_transcript_read_submits_a_new_id() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.fail_prompts(1, "Simulated provider failure");
+    let prompt_ids = mock.prompt_message_ids.clone();
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+
+    crate::bridge::turn::Turn::run(&app.turn_handles(), retry_ctx("ses_test", "hi", ""))
+        .await
+        .unwrap();
+    wait_for_card_update(&platform, "the Error card", CardUpdates::Latest, |card| {
+        card_header(card) == "❌ 出错"
+    })
+    .await;
+
+    // The decision's transcript read hangs; bound it tightly so the test stays
+    // fast (the render/drain reads later consume no hang).
+    app.turn_follow_read_timeout_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
+    backend
+        .hang_transcript
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let retry = app
+        .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
+        .await;
+    assert!(retry.is_some(), "retry ack expected");
+
+    let ids = wait_for_prompt_ids(&prompt_ids, 2).await;
+    assert_ne!(
+        ids[0], ids[1],
+        "a timed-out decision must submit a fresh id (click must have an effect)"
+    );
+
+    wait_for_card_update(&platform, "the retried Done card", CardUpdates::Latest, |card| {
+        card_header(card) == "✅ 完成" && card_text(card).contains("当前目录有 src/ 和 Cargo.toml。")
+    })
+    .await;
+}
+
+/// A failed marker PATCH only warns (spec #391): the retry still submits onto
+/// its new card, so a Feishu hiccup on the old card never blocks the retry.
+#[tokio::test]
+async fn a_failed_retried_marker_patch_does_not_block_the_retry() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.fail_prompts(1, "Simulated provider failure");
+    let prompt_ids = mock.prompt_message_ids.clone();
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+
+    crate::bridge::turn::Turn::run(&app.turn_handles(), retry_ctx("ses_test", "hi", ""))
+        .await
+        .unwrap();
+    wait_for_card_update(&platform, "the Error card", CardUpdates::Latest, |card| {
+        card_header(card) == "❌ 出错"
+    })
+    .await;
+
+    // The mark's PATCH fails (one plain platform error); the retry must still
+    // go ahead.
+    platform
+        .fail_update_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let retry = app
+        .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
+        .await;
+    assert!(retry.is_some(), "retry ack expected");
+
+    wait_for_card_update(&platform, "the retried Done card", CardUpdates::Latest, |card| {
+        card_header(card) == "✅ 完成" && card_text(card).contains("当前目录有 src/ 和 Cargo.toml。")
+    })
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        calls.iter().any(|call| matches!(
+            call,
+            PlatformCall::UpdateMessage { card, .. } if card_header(card) == "↩️ 已重试"
+        )),
+        "the marker PATCH must have been attempted: {calls:?}"
+    );
+    let ids = prompt_ids.lock().await.clone();
+    assert_eq!(
+        ids.len(),
+        2,
+        "the retry must submit despite the failed mark: {ids:?}"
+    );
+}
+
+/// Double-click safety (spec #391): the first click claims the retry; a second
+/// click finds the claim taken (or the card no longer Error) and submits
+/// nothing.
+#[tokio::test]
+async fn double_clicked_retry_submits_only_once() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.fail_prompts(1, "Simulated provider failure");
+    let prompt_ids = mock.prompt_message_ids.clone();
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+
+    crate::bridge::turn::Turn::run(&app.turn_handles(), retry_ctx("ses_test", "hi", ""))
+        .await
+        .unwrap();
+    wait_for_card_update(&platform, "the Error card", CardUpdates::Latest, |card| {
+        card_header(card) == "❌ 出错"
+    })
+    .await;
+
+    let first = app
+        .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
+        .await;
+    let second = app
+        .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
+        .await;
+    assert!(first.is_some(), "the first click must claim the retry");
+    assert!(second.is_none(), "the second click must be refused");
+
+    wait_for_card_update(&platform, "the retried Done card", CardUpdates::Latest, |card| {
+        card_header(card) == "✅ 完成"
+    })
+    .await;
+    let ids = prompt_ids.lock().await.clone();
+    assert_eq!(ids.len(), 2, "exactly one retry submit: {ids:?}");
+}
+
+/// The double-click guard's other face: a card that is no longer `Error` (a
+/// live or Done turn) offers no retry — the click claims nothing and submits
+/// nothing.
+#[tokio::test]
+async fn retry_on_a_live_card_submits_nothing() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mock = MockBackend::new(realistic_parts());
+    let prompt_ids = mock.prompt_message_ids.clone();
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+
+    crate::bridge::turn::Turn::run(&app.turn_handles(), retry_ctx("ses_test", "hi", ""))
+        .await
+        .unwrap();
+    wait_for_card_update(&platform, "the Done card", CardUpdates::Latest, |card| {
+        card_header(card) == "✅ 完成"
+    })
+    .await;
+
+    let retry = app
+        .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
+        .await;
+    assert!(retry.is_none(), "a live card must not claim a retry");
+    let ids = prompt_ids.lock().await.clone();
+    assert_eq!(ids.len(), 1, "no retry prompt may be submitted: {ids:?}");
+}
+
+/// The busy cell of the matrix belongs to the re-attach ticket (#393): this
+/// ticket only guarantees the decision reads the status first and submits
+/// NOTHING while the run is alive.
+#[tokio::test]
+async fn busy_status_retry_submits_nothing() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.fail_prompts(1, "Simulated provider failure");
+    let prompt_ids = mock.prompt_message_ids.clone();
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+
+    crate::bridge::turn::Turn::run(&app.turn_handles(), retry_ctx("ses_test", "hi", ""))
+        .await
+        .unwrap();
+    wait_for_card_update(&platform, "the Error card", CardUpdates::Latest, |card| {
+        card_header(card) == "❌ 出错"
+    })
+    .await;
+
+    *backend
+        .session_statuses
+        .lock()
+        .await
+        .entry("ses_test".into())
+        .or_default() = Some(crate::opencode::types::SessionStatus::Busy);
+    let retry = app
+        .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
+        .await;
+    assert!(retry.is_some(), "the busy click still acks");
+
+    // Let the spawned decision run; it must not submit.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let ids = prompt_ids.lock().await.clone();
+    assert_eq!(ids.len(), 1, "a busy run must not be re-prompted: {ids:?}");
 }
 
 /// One failed attempt's assistant message: distinctive text plus a completed
@@ -566,7 +1041,7 @@ async fn error_card_retry_does_not_replay_the_failed_attempt() {
             text: "hi".into(),
             message_id: "msg_1".into(),
             subtitle: "p2p".into(),
-            existing_card_id: None,
+            is_retry: false,
             requester_open_id: None,
             is_group: false,
             cola_message_id: Some(ANCHOR.into()),
@@ -671,7 +1146,7 @@ async fn retrying_again_suppresses_every_earlier_attempt() {
             text: "hi".into(),
             message_id: "msg_1".into(),
             subtitle: "p2p".into(),
-            existing_card_id: None,
+            is_retry: false,
             requester_open_id: None,
             is_group: false,
             cola_message_id: Some(ANCHOR.into()),
