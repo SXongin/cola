@@ -1261,25 +1261,26 @@ async fn stop_after_a_reattach_ends_the_card_promptly() {
         "/stop must interrupt the re-attached session"
     );
 
-    let wait = async {
-        loop {
-            if let Some(state) = crate::bridge::turn::Turn::card_state(&app.cards_handle(), "ses_test").await
-                && state.is_terminal()
-            {
-                return state;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    };
-    let state = tokio::time::timeout(std::time::Duration::from_secs(3), wait)
-        .await
-        .expect("the follow must end on the stop, not the 60 s grace");
+    // The final PATCH is the observation point: `finalize_stopped` sets the
+    // state before it refreshes the work context and flushes, so waiting on
+    // the internal state alone would read the stale live card. The sibling
+    // drain test waits on the card the same way.
+    wait_for_card_update(
+        &platform,
+        "the re-attached card's stop header",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("已停止"),
+    )
+    .await;
     assert_eq!(
-        state,
-        crate::feishu::card::CardState::Stopped,
+        crate::bridge::turn::Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(crate::feishu::card::CardState::Stopped),
         "a deliberate stop finalizes Stopped, not Error or Done"
     );
-    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "the follow must end on the stop, not the 60 s grace"
+    );
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
         card_header(&final_card).contains("已停止"),
