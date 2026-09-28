@@ -612,12 +612,12 @@ impl StreamAccumulator {
         }
     }
 
-    /// Whether any tool panel of this turn is still running: a timeline tool
-    /// or the todo tail. Shared by the header phase and the live-state resume
-    /// so the rule (including `todowrite`'s tail-panel status) lives once.
+    /// Whether any tool panel of this turn is still running — the header
+    /// phase and the live-state resume both read it. Delegates to
+    /// [`Self::running_tool`], so the selection rule (a timeline tool first,
+    /// then the `todowrite` tail) lives in exactly one place.
     fn has_running_tool(&self) -> bool {
-        self.tools.values().any(ToolPanel::is_running)
-            || self.todo_panel.as_ref().is_some_and(ToolPanel::is_running)
+        self.running_tool().is_some()
     }
 
     /// The header phase for the current state: None when the turn finished or
