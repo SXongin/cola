@@ -484,3 +484,28 @@ stale pending record must never suspend the fallback).
 
 Source: #386.
 
+## Amendment (2026-09-28): `/stop` finalizes `Stopped`, not Done
+
+The #386 amendment above kept the stop rule it inherited from the 2026-09-24
+amendment: 「`/stop` — prompt Done」 — the follow's stop branch finalized Done
+after one last reconcile render. That line is superseded by the stop terminal
+(#394): a deliberate stop is a third ending, neither 完成 nor 出错.
+
+- **`CardState::Stopped`** (header 「⏹ 已停止」, grey) is the deliberate
+  stop's own terminal. It is terminal for every running/probe check
+  (`is_running`, the `/card` pull, the header phase timer), so a stopped card
+  is never treated as live; it is excluded from the awaiting override (a
+  still-pending block cannot restyle it) and renders no retry button.
+- **The abort is not a failure.** The server records the interrupt as an error
+  on the turn's transcript; a turn whose session carries the stopped marker
+  (`waits.stopped_sessions`) is classified `Stopped` and that error text is
+  never written to the card. The turn's other cleanup (rejecting the pending
+  Permission/Question the abort strands, ADR-0038 rule 7) is unchanged.
+- **Both finalization paths classify by the marker**: `finish` for the in-turn
+  path — which also never hands a stopped card to the follow — and the
+  out-of-turn follow's stop branch, which finalized Done before.
+- **The completion notice follows the card's real terminal**: 「⏹ 已停止。」,
+  never 完成 or 出错.
+
+Source: #394 (spec #391).
+
