@@ -839,13 +839,18 @@ impl Turn {
                 "turn drain: bound with session {} running; handing off to the follow",
                 self.session_id
             );
+            // No release happened above: the follow inherits the guard this
+            // Turn is still holding (ADR-0059) and hands it back when its loop
+            // ends.
             follow::spawn(
                 handles,
-                self.session_id.clone(),
-                self.thread_key.clone(),
-                self.directory.clone(),
-                self.started_at,
-                anchor,
+                follow::FollowFacts {
+                    session_id: self.session_id.clone(),
+                    thread_key: self.thread_key.clone(),
+                    directory: self.directory.clone(),
+                    started_at: self.started_at,
+                    anchor,
+                },
             )
             .await;
         }
@@ -1072,8 +1077,9 @@ impl Turn {
         )
         .await
         {
-            // Alive: parts keep coming.
-            Some(Ok(Some(SessionStatus::Busy | SessionStatus::Retry))) => {
+            // Alive: parts keep coming. `is_live` is Busy or Retry — a Retry
+            // schedules the next attempt, so the run is still cola's to watch.
+            Some(Ok(Some(status))) if status.is_live() => {
                 self.drain_started = true;
                 DrainState::Running
             }
@@ -1442,7 +1448,8 @@ pub(crate) enum RetryDecision {
 /// a same-id re-post of an admitted, unfinished turn still runs (V1), false
 /// where admission makes it a no-op (V2).
 ///
-/// - status Busy/Retry → [`RetryDecision::Busy`] (re-attach; no submit);
+/// - a live status (`SessionStatus::is_live`: Busy, or Retry's scheduled next
+///   attempt) → [`RetryDecision::Busy`] (re-attach; no submit);
 /// - a status read that failed, timed out or reported an unreadable kind is
 ///   unknown → a fresh id: the click must always have an effect;
 /// - idle + no anchor for the id (nothing was admitted) → reuse (both
@@ -1463,10 +1470,15 @@ pub(crate) fn retry_decision(
     reuse_continues_an_admitted_turn: bool,
 ) -> RetryDecision {
     match status {
-        Some(SessionStatus::Busy | SessionStatus::Retry) => RetryDecision::Busy,
         // Unknown status: submit a fresh attempt rather than risk a no-op.
         None => RetryDecision::NewId,
-        Some(SessionStatus::Idle) => {
+        Some(status) => {
+            // A live run (`is_live`: Busy, or Retry's scheduled next attempt)
+            // is re-attached, never re-prompted.
+            if status.is_live() {
+                return RetryDecision::Busy;
+            }
+            // Idle: the failed turn's transcript decides the id policy.
             let Some(id) = cola_message_id else {
                 return RetryDecision::NewId;
             };
@@ -1808,13 +1820,17 @@ impl Turn {
         // The operator just clicked: the card must leave Error now, not after
         // the follow's first sleep.
         Self::flush_card(&handles.cards, session_id).await;
+        // The re-attached follow inherits the guard here (this path had none);
+        // `spawn` guarantees it before the task starts (ADR-0059).
         follow::spawn(
             handles,
-            session_id.to_string(),
-            thread_key.clone(),
-            directory,
-            std::time::Instant::now(),
-            anchor,
+            follow::FollowFacts {
+                session_id: session_id.to_string(),
+                thread_key: thread_key.clone(),
+                directory,
+                started_at: std::time::Instant::now(),
+                anchor,
+            },
         )
         .await;
         true

@@ -47,7 +47,9 @@ pub(super) enum Ownership {
 impl Ownership {
     /// Whether the loop still owns the card. `pub(super)` for the follow's
     /// exit: after it hands the guard back, it must not stamp a card a new
-    /// Turn has taken over in the released moment.
+    /// Turn has taken over in the released moment. The probe stays here (the
+    /// one place the ownership predicate is spelled) rather than being
+    /// duplicated in `follow.rs`.
     pub(super) async fn held(&self, cards: &CardsHandle, session_id: &str) -> bool {
         match self {
             Self::TurnAnchor(anchor) => {
@@ -248,7 +250,7 @@ pub(super) async fn run(
         }
         // Still running: keep rendering. There is no total budget; the graces
         // above and below only watch the states nobody can act on.
-        if matches!(status, Some(Some(SessionStatus::Busy | SessionStatus::Retry))) {
+        if status.is_some_and(|status| status.is_some_and(SessionStatus::is_live)) {
             stuck_since = None;
             continue;
         }

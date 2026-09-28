@@ -1224,56 +1224,39 @@ async fn a_message_during_the_follow_window_splits_the_live_chain() {
     // the receipt. A new Turn would have replied a Loading card to it. The old
     // card is NOT frozen: the split finalizes it with everything before it,
     // the live running panel rides the continuation (ADR-0045), and the receipt
-    // belongs to the continuation only. (Analyzed under one lock on the
-    // recorded calls, then dropped.)
-    {
+    // belongs to the continuation only.
+    let continuation = supplement_continuation(&platform, "msg_next").await;
+    let finalized = {
         let calls = platform.calls.lock().await;
-        let replies_to_next: Vec<&serde_json::Value> = calls
-            .iter()
-            .filter_map(|c| match c {
-                PlatformCall::ReplyCard { reply_to, card } if reply_to == "msg_next" => Some(card),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            replies_to_next.len(),
-            1,
-            "no overlapping Turn may reply a card to the message: {calls:?}"
-        );
-        let continuation = replies_to_next[0].clone();
-        assert!(
-            card_text(&continuation).contains("📨 已收到补充"),
-            "the continuation carries the Supplement receipt: {continuation}"
-        );
         let reply_idx = calls
             .iter()
             .position(|c| matches!(c, PlatformCall::ReplyCard { reply_to, .. } if reply_to == "msg_next"))
             .expect("the continuation reply");
-        let finalized = calls[..reply_idx]
+        calls[..reply_idx]
             .iter()
             .rev()
             .find_map(|c| match c {
                 PlatformCall::UpdateMessage { card, .. } => Some(card.clone()),
                 _ => None,
             })
-            .expect("the split must finalize the old card before replying");
-        assert!(
-            card_header(&finalized).contains("部分完成"),
-            "the old card takes the standard split header: {finalized}"
-        );
-        assert!(
-            card_text(&finalized).contains("第一轮回答。"),
-            "the finalized card keeps everything before the split: {finalized}"
-        );
-        assert!(
-            !card_text(&finalized).contains("📨 已收到补充"),
-            "the receipt records the Supplement on the continuation only: {finalized}"
-        );
-        assert!(
-            card_text(&continuation).contains("⏳ bash"),
-            "the running panel rides the live continuation (ADR-0045): {continuation}"
-        );
-    }
+            .expect("the split must finalize the old card before replying")
+    };
+    assert!(
+        card_header(&finalized).contains("部分完成"),
+        "the old card takes the standard split header: {finalized}"
+    );
+    assert!(
+        card_text(&finalized).contains("第一轮回答。"),
+        "the finalized card keeps everything before the split: {finalized}"
+    );
+    assert!(
+        !card_text(&finalized).contains("📨 已收到补充"),
+        "the receipt records the Supplement on the continuation only: {finalized}"
+    );
+    assert!(
+        card_text(&continuation).contains("⏳ bash"),
+        "the running panel rides the live continuation (ADR-0045): {continuation}"
+    );
 
     // The run goes on: the follow keeps rendering into the continuation. The
     // tool settles and the answer lands — on the split continuation.

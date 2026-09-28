@@ -303,24 +303,7 @@ async fn a_message_while_the_backend_reports_a_live_run_splits_the_chain() {
 
     // The chain split at the message: exactly one card replies to it, the
     // continuation, carrying the receipt.
-    let calls = platform.calls.lock().await.clone();
-    let replies: Vec<&serde_json::Value> = calls
-        .iter()
-        .filter_map(|c| match c {
-            PlatformCall::ReplyCard { reply_to, card } if reply_to == "msg_sup" => Some(card),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        replies.len(),
-        1,
-        "no competing Turn may reply a card to the message: {calls:?}"
-    );
-    assert!(
-        has(replies[0], "📨 已收到补充"),
-        "the continuation carries the receipt: {}",
-        replies[0]
-    );
+    supplement_continuation(&platform, "msg_sup").await;
 }
 
 /// A split while a tool is running: the panel is live tail content (ADR-0045),

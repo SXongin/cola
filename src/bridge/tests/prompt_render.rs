@@ -1364,21 +1364,8 @@ async fn a_message_during_a_reattach_follow_splits_the_live_chain() {
     );
 
     // Exactly one card replies to the message — the split continuation, with
-    // the Supplement receipt.
-    let continuation = {
-        let calls = platform.calls.lock().await;
-        let mut replies = calls.iter().filter_map(|c| match c {
-            PlatformCall::ReplyCard { reply_to, card } if reply_to == "msg_next" => Some(card),
-            _ => None,
-        });
-        let card = replies.next().expect("the split continuation must reply").clone();
-        assert!(replies.next().is_none(), "exactly one card may reply: {calls:?}");
-        card
-    };
-    assert!(
-        card_text(&continuation).contains("📨 已收到补充"),
-        "the continuation carries the Supplement receipt: {continuation}"
-    );
+    // the Supplement receipt (the helper asserts both).
+    supplement_continuation(&platform, "msg_next").await;
 
     // The run ends clean: the follow finalizes the continuation Done from the
     // transcript, carrying the new content.
