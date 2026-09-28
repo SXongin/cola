@@ -15,10 +15,10 @@
 //!
 //! Re-record with the live harness's `COLA_LIVE_CAPTURE_DIR` hook (see
 //! `crate::opencode::live`), sanitize ids/times/cursors by hand, and commit.
-//! The background-wake and interruption-continuation fixtures are the one
-//! manual exception: they are unfiltered message reads of a real session from
-//! #403 (`?type=idle` is not a legal message filter), and their stamp records
-//! the read command instead of a live test.
+//! The interaction-fact fixtures are the one manual exception: they are
+//! sanitized excerpts of unfiltered message reads of real sessions
+//! (`?type=idle` is not a legal message filter), so their command records the
+//! read and their stamp's `note` records the excerpt and the sanitization.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -41,6 +41,12 @@ pub(crate) struct CaptureStamp {
     pub(crate) command: String,
     /// The UTC date of the capture.
     pub(crate) captured_at: String,
+    /// How a recording was derived when the command alone cannot reproduce the
+    /// file — the sanitized excerpts taken from a live read, and the
+    /// anonymization applied. The live-harness fixtures omit it: their command
+    /// re-records them byte-for-byte.
+    #[serde(default)]
+    pub(crate) note: Option<String>,
 }
 
 impl RecordedResponse {
@@ -75,7 +81,8 @@ pub(crate) fn v2_transcript_inflight() -> RecordedResponse {
 /// part, the shell Wake that retired it, and a later backgrounded run whose
 /// Wake had not arrived when the read was taken — one unfiltered transcript
 /// read (`?type=idle` is not a legal message filter, so the durable idle
-/// boundary rides along), sanitized to neutral ids, times and text.
+/// boundary rides along), sanitized to neutral ids, times and text (the
+/// stamp's `note` records the excerpt and the sanitization).
 pub(crate) fn v2_background_wake() -> RecordedResponse {
     RecordedResponse::parse(include_str!("fixtures/v2/background_wake.json"))
 }
@@ -85,6 +92,14 @@ pub(crate) fn v2_background_wake() -> RecordedResponse {
 /// steps, and the idle boundary — recorded in the same unfiltered read.
 pub(crate) fn v2_interrupt_continuation() -> RecordedResponse {
     RecordedResponse::parse(include_str!("fixtures/v2/interrupt_continuation.json"))
+}
+
+/// A real 2.0.18 background-subagent cycle: two `subagent` tool parts that
+/// returned their background handles while their runs kept going, the first
+/// child's completion Wake (`metadata.source=subagent`, `childID`), and the
+/// idle boundaries around them — sanitized like the #403 excerpts.
+pub(crate) fn v2_subagent_wake() -> RecordedResponse {
+    RecordedResponse::parse(include_str!("fixtures/v2/subagent_wake.json"))
 }
 
 #[cfg(test)]

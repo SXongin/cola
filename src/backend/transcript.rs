@@ -46,7 +46,9 @@ impl SessionTranscript {
         }
     }
 
-    /// Attach the Execution boundaries the backend recorded.
+    /// Attach the Execution boundaries the backend recorded. The V2 decoder
+    /// builds a read through these, and a scripted bridge test sets the facts
+    /// directly (the transcript is the one seam every flow consumes).
     pub fn with_executions(mut self, executions: Vec<Execution>) -> Self {
         self.executions = executions;
         self
@@ -365,14 +367,17 @@ pub struct TurnView<'a> {
 }
 
 /// One Execution boundary, as the backend records it: the durable marker that
-/// a busy period ended, its server time, and the outcome it recorded. A
-/// shutdown records none, so absence is a normal read — never invented.
+/// a busy period ended, its server time when one was recorded, and the outcome
+/// it recorded. A shutdown records none, so absence is a normal read — never
+/// invented.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Execution {
     /// The marker message's identity.
     pub id: MessageId,
-    /// When the Execution ended (the marker's server time).
-    pub ended_ms: i64,
+    /// When the Execution ended (the marker's server time). `None` when the
+    /// payload carried no usable time: the outcome is still a fact, it just
+    /// cannot be placed in time.
+    pub ended_ms: Option<i64>,
     pub outcome: ExecutionOutcome,
 }
 
@@ -415,8 +420,12 @@ impl Wake {
     /// Whether this Wake retires `task` — the backend's own completion
     /// correlation: a shell Wake names the task's shell id or the tool call
     /// that started it, and a subagent Wake names the task's child session. A
-    /// Wake that names nothing retires nothing.
+    /// Wake that names nothing retires nothing, and a Wake written before the
+    /// task started cannot have completed it.
     pub fn retires(&self, task: &BackgroundTask) -> bool {
+        if task.started_at.is_some_and(|started| self.created_ms < started) {
+            return false;
+        }
         let names_shell_or_call = |id: &str| task.shell_id.as_deref() == Some(id) || task.tool.call_id == id;
         self.shell_id.as_deref().is_some_and(names_shell_or_call)
             || self.job_id.as_deref().is_some_and(names_shell_or_call)

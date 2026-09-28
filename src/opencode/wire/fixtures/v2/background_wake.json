@@ -3,6 +3,7 @@
     "captured_at": "2026-09-29",
     "command": "curl -u \"$OPENCODE_SERVER_USERNAME:$OPENCODE_SERVER_PASSWORD\" \"$OPENCODE_URL/api/session/<session>/message?order=asc&limit=200\"",
     "generation": "v2",
+    "note": "Hand-sanitized excerpt (10 contiguous rows) of an unfiltered GET /api/session/{id}/message read of the #403 session on opencode 2.0.18: the shell-wake cycle. Message/tool/shell ids, times and free text are anonymized fixture values; wire field names, metadata keys and statuses are verbatim.",
     "source": "opencode v2.0.18"
   },
   "response": {

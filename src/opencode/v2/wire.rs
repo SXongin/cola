@@ -582,15 +582,15 @@ pub(super) fn decode_messages(data: &[Value]) -> SessionTranscript {
 }
 
 /// Decode one durable `idle` marker into an Execution boundary. A marker
-/// without a server time cannot be placed in the transcript and is ignored —
-/// the boundary is only ever what the backend recorded, never invented.
+/// without a server time is still a boundary fact — the outcome is never
+/// dropped — it just cannot be placed in time (`ended_ms` stays `None`).
 fn decode_execution(message: &Value) -> Option<Execution> {
     if message.get("type").and_then(Value::as_str) != Some("idle") {
         return None;
     }
     Some(Execution {
         id: message_id(message),
-        ended_ms: message.pointer("/time/created").and_then(Value::as_i64)?,
+        ended_ms: message.pointer("/time/created").and_then(Value::as_i64),
         outcome: decode_execution_outcome(message.get("outcome").and_then(Value::as_str)),
     })
 }
@@ -617,20 +617,14 @@ fn decode_wake(message: &Value) -> Option<Wake> {
         return None;
     }
     let metadata = non_null(message.get("metadata"));
-    let key = |field: &str| {
-        metadata
-            .and_then(|metadata| metadata.get(field))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    };
     Some(Wake {
         id: message_id(message),
         created_ms: message.pointer("/time/created").and_then(Value::as_i64)?,
         source: decode_wake_source(metadata),
-        shell_id: key("shellID"),
-        job_id: key("jobID"),
-        child_id: key("childID"),
-        state: key("state"),
+        shell_id: string_field(metadata, "shellID"),
+        job_id: string_field(metadata, "jobID"),
+        child_id: string_field(metadata, "childID"),
+        state: string_field(metadata, "state"),
     })
 }
 
@@ -652,13 +646,16 @@ fn decode_wake_source(metadata: Option<&Value>) -> WakeSource {
 }
 
 /// The Background Tasks a read leaves live: every assistant tool part that
-/// recorded a backgrounded run, minus the ones a Wake already retired. The
-/// predicate is the backend's own (the official app's derivation): a `shell`
-/// or `subagent` tool part whose call has completed — it returned the
-/// background handle — while its metadata still says the run is `running`. A
-/// settled tool's metadata says `completed`, so it is not live; the input's
-/// `background: true` flag is not required, because a foreground run the user
-/// moved to the background never had one.
+/// recorded a backgrounded run, minus the ones a Wake retired. The predicate
+/// is the backend's own — the exact derivation the official 2.0.x app uses
+/// (`packages/app/src/session/requests/background.ts`): a `shell` or
+/// `subagent` tool part whose call has completed (it returned the background
+/// handle) while its metadata still says the run is `running`. The input's
+/// `background: true` flag is deliberately NOT required: a foreground run the
+/// user moved to the background (`POST /api/session/:sessionID/background` →
+/// the shell tool's `jobs.block` returns `backgrounded` and it returns the
+/// background handle) carries no request-time flag, and the app counts it.
+/// A settled tool's metadata says `completed`, so it is not live.
 fn decode_background_tasks(data: &[Value], wakes: &[Wake]) -> Vec<BackgroundTask> {
     let mut tasks = Vec::new();
     for message in data {
@@ -682,10 +679,13 @@ fn decode_background_tasks(data: &[Value], wakes: &[Wake]) -> Vec<BackgroundTask
 }
 
 /// One backgrounded run as its tool part recorded it. The part's name decides
-/// which identity the task carries: a shell reports its shell id, a subagent
-/// the child session it runs in; any other tool never backgrounds through this
-/// shape, and a part still streaming or running has not returned a background
-/// handle yet.
+/// which identity the task carries: a `shell` reports its shell id, a
+/// `subagent` the child session it runs in — the names and metadata keys of
+/// OpenCode 2.0.x's own plugins (`packages/core/src/tool/plugin/{shell,
+/// subagent}.ts`); OpenCode 1's `task` tool belongs to the V1 generation and is
+/// never decoded here. A part still streaming or running has not returned a
+/// background handle yet, and any other tool never backgrounds through this
+/// shape.
 fn decode_background_task(item: &Value) -> Option<BackgroundTask> {
     let name = item.get("name").and_then(Value::as_str)?;
     let state = non_null(item.get("state"))?;
@@ -696,10 +696,9 @@ fn decode_background_task(item: &Value) -> Option<BackgroundTask> {
     if metadata.get("status").and_then(Value::as_str) != Some("running") {
         return None;
     }
-    let key = |field: &str| metadata.get(field).and_then(Value::as_str).map(str::to_string);
     let (shell_id, child_id) = match name {
-        "shell" => (key("shellID"), None),
-        "subagent" => (None, key("sessionID")),
+        "shell" => (string_field(Some(metadata), "shellID"), None),
+        "subagent" => (None, string_field(Some(metadata), "sessionID")),
         _ => return None,
     };
     Some(BackgroundTask {
@@ -1042,6 +1041,16 @@ fn decode_error(error: &Value) -> Option<String> {
 /// read as "not there".
 fn non_null(value: Option<&Value>) -> Option<&Value> {
     value.filter(|value| !value.is_null())
+}
+
+/// One string field of a JSON object, when the payload carries it as a string.
+/// The one read every metadata key (`shellID`, `sessionID`, a Wake's keys)
+/// goes through, so their tolerance cannot drift.
+fn string_field(value: Option<&Value>, field: &str) -> Option<String> {
+    value
+        .and_then(|value| value.get(field))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// Whether a payload field carries anything: an empty array or object is the
@@ -1545,8 +1554,9 @@ mod tests {
         })
     }
 
-    /// A `subagent` tool part that returned its background handle: the child
-    /// session rides in the metadata.
+    /// A `subagent` tool part that returned its background handle, mirroring
+    /// the real shape the corpus records (`v2_subagent_wake`): the child
+    /// session rides in the metadata and the run is still `running`.
     fn background_subagent_part(call_id: &str, child_id: &str) -> Value {
         serde_json::json!({
             "type": "tool",
@@ -1603,7 +1613,7 @@ mod tests {
         let execution = &transcript.executions[0];
         assert_eq!(execution.id.as_str(), "msg_idle");
         assert_eq!(execution.outcome, ExecutionOutcome::Succeeded);
-        assert!(execution.ended_ms > 0);
+        assert!(execution.ended_ms.is_some_and(|ms| ms > 0));
 
         // The Wake: source and correlation keys survive.
         assert_eq!(transcript.wakes.len(), 1, "{:#?}", transcript.wakes);
@@ -1721,6 +1731,61 @@ mod tests {
         );
     }
 
+    /// The real 2.0.18 background-subagent read: two `subagent` parts returned
+    /// their background handles, the first child's completion Wake retires it
+    /// by `childID`, and the second child's run is still live.
+    #[test]
+    fn the_recorded_subagent_read_retires_by_child_id() {
+        let recorded = crate::opencode::wire::v2_subagent_wake();
+        assert_eq!(recorded.capture.generation, "v2");
+        assert_eq!(recorded.capture.source, "opencode v2.0.18");
+        let data = fixture_data(&recorded);
+        let transcript = decode_messages(&data);
+
+        assert_eq!(
+            transcript
+                .background_tasks
+                .iter()
+                .map(|task| (task.tool.name.as_str(), task.child_id.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![("subagent", Some("ses_fixture_child_b"))],
+            "the Wake retires the child it names; the other stays live: {:#?}",
+            transcript.background_tasks
+        );
+
+        assert_eq!(transcript.wakes.len(), 1, "{:#?}", transcript.wakes);
+        let wake = &transcript.wakes[0];
+        assert_eq!(wake.id.as_str(), "msg_wake_subagent_a");
+        assert_eq!(wake.source, WakeSource::Subagent);
+        assert_eq!(wake.child_id.as_deref(), Some("ses_fixture_child_a"));
+        assert_eq!(wake.state.as_deref(), Some("completed"));
+        assert!(wake.shell_id.is_none() && wake.job_id.is_none());
+
+        assert_eq!(transcript.executions.len(), 2, "{:#?}", transcript.executions);
+        assert!(
+            transcript
+                .executions
+                .iter()
+                .all(|execution| execution.outcome == ExecutionOutcome::Succeeded),
+            "{:#?}",
+            transcript.executions
+        );
+
+        // The recorded Wake retires the recorded retired child, and not the
+        // still-running one.
+        let retired = data
+            .iter()
+            .filter(|message| message.get("type").and_then(Value::as_str) == Some("assistant"))
+            .filter_map(|message| message.get("content").and_then(Value::as_array))
+            .flatten()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some("call_subagent_a"))
+            .and_then(decode_background_task)
+            .expect("the retired subagent part decodes");
+        let live = &transcript.background_tasks[0];
+        assert!(wake.retires(&retired), "the recorded Wake must retire its child");
+        assert!(!wake.retires(live), "and must not retire the live child");
+    }
+
     /// A backgrounded run is retired by its Wake under every correlation key
     /// the backend writes — the shell id, the job id, or the tool part's own id
     /// (the official app's predicate) — while a Wake that names nothing of the
@@ -1749,7 +1814,7 @@ mod tests {
             2000,
             serde_json::json!({"source": "shell", "shellID": "sh_other", "jobID": "job_other", "state": "completed"}),
         );
-        let transcript = read_with(part, vec![unrelated]);
+        let transcript = read_with(part.clone(), vec![unrelated]);
         assert_eq!(
             transcript
                 .background_tasks
@@ -1758,6 +1823,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["call_bg"],
             "an unrelated Wake retires nothing"
+        );
+
+        // A Wake written before the task started cannot have completed it, even
+        // when it names the task's own keys (the read is authoritative, but its
+        // rows can be replayed in any order).
+        let predating = synthetic_wake(
+            "msg_w",
+            500,
+            serde_json::json!({"source": "shell", "shellID": "sh_bg", "state": "completed"}),
+        );
+        let transcript = read_with(part, vec![predating]);
+        assert_eq!(
+            transcript.background_tasks.len(),
+            1,
+            "a Wake predating the task retires nothing: {:#?}",
+            transcript.background_tasks
         );
     }
 
@@ -1847,7 +1928,10 @@ mod tests {
             source_of(sources(serde_json::json!({"source": "subagent"}))),
             WakeSource::Subagent
         );
-        // 2.0.18's restart notice spells its marker as `notice`.
+        // 2.0.18's restart notice spells its marker as `notice`
+        // (`packages/core/src/session/execution/restart.ts`, `metadata: {notice:
+        // "restart"}`); it has no recorded occurrence in this store's sessions,
+        // so this is the upstream shape, constructed here.
         assert_eq!(
             source_of(sources(serde_json::json!({"notice": "restart"}))),
             WakeSource::Restart
@@ -1871,10 +1955,11 @@ mod tests {
 
     /// A shutdown writes no `idle` marker: the Execution boundary is absent —
     /// never invented — and a Wake in the same read still decodes. A marker
-    /// without a server time cannot be placed and is ignored like any other
-    /// timeless message.
+    /// whose payload carries no usable time is still a boundary fact: its
+    /// outcome survives with no `ended_ms`, never erased and never placed at
+    /// epoch 0.
     #[test]
-    fn a_shutdown_leaves_no_execution_boundary() {
+    fn a_shutdown_leaves_no_execution_boundary_and_a_timeless_marker_keeps_its_outcome() {
         let transcript = decode_messages(&[synthetic_wake(
             "msg_w",
             2000,
@@ -1884,12 +1969,15 @@ mod tests {
         assert_eq!(transcript.wakes.len(), 1);
 
         let timeless = decode_messages(&[serde_json::json!({
-            "id": "msg_i", "type": "idle", "outcome": "succeeded"
+            "id": "msg_i", "type": "idle", "outcome": "failed"
         })]);
-        assert!(
-            timeless.executions.is_empty(),
-            "a timeless boundary cannot be placed: {:#?}",
-            timeless.executions
+        assert_eq!(timeless.executions.len(), 1, "{:#?}", timeless.executions);
+        let boundary = &timeless.executions[0];
+        assert_eq!(boundary.id.as_str(), "msg_i");
+        assert_eq!(boundary.outcome, ExecutionOutcome::Failed);
+        assert_eq!(
+            boundary.ended_ms, None,
+            "a boundary with no recorded time is still a boundary, just unplaceable"
         );
     }
 

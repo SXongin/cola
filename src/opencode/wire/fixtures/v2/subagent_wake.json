@@ -1,0 +1,256 @@
+{
+  "capture": {
+    "captured_at": "2026-09-29",
+    "command": "curl -u \"$OPENCODE_SERVER_USERNAME:$OPENCODE_SERVER_PASSWORD\" \"$OPENCODE_URL/api/session/<session>/message?order=asc&limit=200\"",
+    "generation": "v2",
+    "note": "Hand-sanitized excerpt (6 contiguous rows) of an unfiltered GET /api/session/{id}/message read of a real opencode 2.0.18 session: the background-subagent cycle (two `subagent` parts returned while their runs were running, the first child's completion Wake, the resumed steps). Message/tool/child-session ids, times, prompts and free text are anonymized fixture values; wire field names, metadata keys and statuses are verbatim.",
+    "source": "opencode v2.0.18"
+  },
+  "response": {
+    "cursor": {
+      "next": "cursor_next_fixture"
+    },
+    "data": [
+      {
+        "id": "msg_background_subagents",
+        "time": {
+          "created": 1700000000000,
+          "streamed": 1700000017745,
+          "completed": 1700000017872
+        },
+        "type": "assistant",
+        "agent": "build",
+        "model": {
+          "id": "scripted-model",
+          "providerID": "scripted",
+          "variant": "default"
+        },
+        "content": [
+          {
+            "type": "reasoning",
+            "text": "live-harness-reasoning",
+            "state": {
+              "reasoningField": "reasoning_content"
+            },
+            "time": {
+              "created": 1700000008049,
+              "completed": 1700000017731
+            }
+          },
+          {
+            "type": "text",
+            "text": "live-harness-text"
+          },
+          {
+            "type": "tool",
+            "id": "call_subagent_a",
+            "name": "subagent",
+            "executed": false,
+            "state": {
+              "status": "completed",
+              "input": {
+                "agent": "general",
+                "description": "live-harness-task-a",
+                "background": true,
+                "prompt": "live-harness-prompt"
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "The subagent is working in the background (sessionID: ses_fixture_child_a)."
+                }
+              ],
+              "metadata": {
+                "sessionID": "ses_fixture_child_a",
+                "status": "running",
+                "truncated": false
+              }
+            },
+            "time": {
+              "created": 1700000014159,
+              "ran": 1700000017735,
+              "completed": 1700000017773
+            }
+          },
+          {
+            "type": "tool",
+            "id": "call_subagent_b",
+            "name": "subagent",
+            "executed": false,
+            "state": {
+              "status": "completed",
+              "input": {
+                "agent": "general",
+                "description": "live-harness-task-b",
+                "background": true,
+                "prompt": "live-harness-prompt"
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "The subagent is working in the background (sessionID: ses_fixture_child_b)."
+                }
+              ],
+              "metadata": {
+                "sessionID": "ses_fixture_child_b",
+                "status": "running",
+                "truncated": false
+              }
+            },
+            "time": {
+              "created": 1700000016272,
+              "ran": 1700000017740,
+              "completed": 1700000017817
+            }
+          }
+        ],
+        "snapshot": {
+          "start": "snapshot_fixture_start",
+          "end": "snapshot_fixture_end",
+          "files": []
+        },
+        "finish": "tool-calls",
+        "rawFinish": "tool_calls",
+        "cost": 0,
+        "tokens": {
+          "input": 389,
+          "output": 774,
+          "reasoning": 706,
+          "cache": {
+            "read": 220928,
+            "write": 0
+          }
+        }
+      },
+      {
+        "id": "msg_launch_answer",
+        "time": {
+          "created": 1700000017934,
+          "streamed": 1700000033799,
+          "completed": 1700000033830
+        },
+        "type": "assistant",
+        "agent": "build",
+        "model": {
+          "id": "scripted-model",
+          "providerID": "scripted",
+          "variant": "default"
+        },
+        "content": [
+          {
+            "type": "reasoning",
+            "text": "live-harness-reasoning",
+            "state": {
+              "reasoningField": "reasoning_content"
+            },
+            "time": {
+              "created": 1700000026196,
+              "completed": 1700000033793
+            }
+          },
+          {
+            "type": "text",
+            "text": "live-harness-answer"
+          }
+        ],
+        "snapshot": {
+          "start": "snapshot_fixture_start",
+          "end": "snapshot_fixture_end",
+          "files": []
+        },
+        "finish": "stop",
+        "rawFinish": "stop",
+        "cost": 0,
+        "tokens": {
+          "input": 1694,
+          "output": 516,
+          "reasoning": 453,
+          "cache": {
+            "read": 221312,
+            "write": 0
+          }
+        }
+      },
+      {
+        "id": "msg_idle_after_background",
+        "time": {
+          "created": 1700000033834
+        },
+        "type": "idle",
+        "outcome": "succeeded"
+      },
+      {
+        "id": "msg_wake_subagent_a",
+        "metadata": {
+          "source": "subagent",
+          "childID": "ses_fixture_child_a",
+          "agent": "General",
+          "state": "completed"
+        },
+        "time": {
+          "created": 1700000098618
+        },
+        "text": "<subagent sessionID=\"ses_fixture_child_a\" state=\"completed\" description=\"live-harness-task-a\">\nlive-harness-task-output\n</subagent>",
+        "description": "live-harness-wake",
+        "type": "synthetic"
+      },
+      {
+        "id": "msg_wake_continuation",
+        "time": {
+          "created": 1700000098668,
+          "streamed": 1700000128905,
+          "completed": 1700000128921
+        },
+        "type": "assistant",
+        "agent": "build",
+        "model": {
+          "id": "scripted-model",
+          "providerID": "scripted",
+          "variant": "default"
+        },
+        "content": [
+          {
+            "type": "reasoning",
+            "text": "live-harness-reasoning",
+            "state": {
+              "reasoningField": "reasoning_content"
+            },
+            "time": {
+              "created": 1700000106237,
+              "completed": 1700000128899
+            }
+          },
+          {
+            "type": "text",
+            "text": "live-harness-continuation"
+          }
+        ],
+        "snapshot": {
+          "start": "snapshot_fixture_start",
+          "end": "snapshot_fixture_end",
+          "files": []
+        },
+        "finish": "stop",
+        "rawFinish": "stop",
+        "cost": 0,
+        "tokens": {
+          "input": 1886,
+          "output": 182,
+          "reasoning": 2688,
+          "cache": {
+            "read": 222976,
+            "write": 0
+          }
+        }
+      },
+      {
+        "id": "msg_idle_after_wake",
+        "time": {
+          "created": 1700000128925
+        },
+        "type": "idle",
+        "outcome": "succeeded"
+      }
+    ]
+  }
+}

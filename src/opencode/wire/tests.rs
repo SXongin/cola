@@ -11,7 +11,7 @@ use crate::opencode::strategy::Generation;
 use crate::test_http::TestHttpServer;
 
 use super::{
-    RecordedResponse, v1_transcript_turn, v2_background_wake, v2_interrupt_continuation,
+    RecordedResponse, v1_transcript_turn, v2_background_wake, v2_interrupt_continuation, v2_subagent_wake,
     v2_transcript_inflight, v2_transcript_turn,
 };
 
@@ -286,4 +286,50 @@ async fn recorded_v2_background_facts_decode_through_the_adapter() {
     );
     assert_eq!(transcript.executions.len(), 1, "{:#?}", transcript.executions);
     assert!(transcript.background_tasks.is_empty());
+
+    let transcript = decode_recorded(&case, &v2_subagent_wake()).await;
+    assert_eq!(transcript.wakes.len(), 1, "{:#?}", transcript.wakes);
+    assert_eq!(transcript.wakes[0].source, WakeSource::Subagent);
+    assert_eq!(
+        transcript.wakes[0].child_id.as_deref(),
+        Some("ses_fixture_child_a")
+    );
+    assert_eq!(
+        transcript
+            .background_tasks
+            .iter()
+            .map(|task| task.child_id.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("ses_fixture_child_b")],
+        "the recorded Wake retires its child, the other stays live: {:#?}",
+        transcript.background_tasks
+    );
+}
+
+/// A recording the live harness cannot re-run carries its provenance in the
+/// stamp: the excerpt it was taken from and the sanitization applied. The
+/// live-harness fixtures say so through their re-recording command instead.
+#[test]
+fn sanitized_excerpts_stamp_their_provenance() {
+    for recorded in [
+        v2_background_wake(),
+        v2_interrupt_continuation(),
+        v2_subagent_wake(),
+    ] {
+        assert!(
+            recorded.capture.command.contains("/api/session/")
+                && recorded.capture.command.contains("order=asc"),
+            "a manual recording stamps the unfiltered read that produced it: {:?}",
+            recorded.capture.command
+        );
+        let note = recorded
+            .capture
+            .note
+            .as_deref()
+            .unwrap_or_else(|| panic!("a sanitized excerpt must carry its provenance note"));
+        assert!(
+            note.contains("sanitized excerpt") && note.contains("2.0.18"),
+            "the note names the sanitization and the server: {note:?}"
+        );
+    }
 }
