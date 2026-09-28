@@ -63,7 +63,13 @@ onto the V1-shaped one.**
   cover the follow window, so a message during a follow merges into the
   rendering chain instead of starting a second Turn — and `busy()` no longer
   reads a followed session as idle (previously the server-yield path could reap
-  the Owned Server out from under a run cola was still rendering).
+  the Owned Server out from under a run cola was still rendering). **This
+  supersedes ADR-0043's 2026-09-24 guard-release rule** — its "the inflight
+  guard is released, so the next message is a normal new Turn" and the
+  rejected alternative "not releasing the guard while busy": that rejection
+  assumed the 10-minute bound owned the ending, while with no total budget the
+  follow owns it. ADR-0043 carries the amendment banner; its split and receipt
+  machinery stands unchanged and is reused below.
 
 - **One Session Sync pass.** The external-message flow becomes Session Sync:
   the existing per-thread pass over the Active Session keeps notifying External
@@ -99,8 +105,16 @@ onto the V1-shaped one.**
 - ADR-0017's scope is unchanged; its flow grows into Session Sync. ADR-0026's
   watermark stays user-message-scoped — a Wake never moves it.
 - ADR-0043's supplement split and receipt machinery is reused for Wake
-  continuations, anchored on the user message when no Supplement exists.
-- ADR-0050's Turn gains the waiting disposition; the follow extends the guard.
+  continuations, anchored on the user message when no Supplement exists; its
+  guard-release rule is superseded, and ADR-0043 carries the amendment banner.
+- ADR-0058's retry matrix is unchanged in mechanism: its settled/unfinished
+  read stays the transcript projection of whether the submission was answered
+  (`turn_for_user(..).complete`), and this ADR does not alter that projection.
+  The waiting disposition is not an Error card and never offers Retry, and a
+  settled failure or a sticky stop dominates the ending — a failed or stopped
+  Turn never yields waiting even with live Background Tasks; a later Wake then
+  continues on a new card.
+- ADR-0050's Turn gains the waiting disposition; the follow holds the guard.
 - The read model's time-window turn membership (`turn_for_user`) now has the
   Backend's own boundary to lean on; a Turn's `✅` is decided from "idle with no
   live Background Task", not from "any terminal step since the anchor".
@@ -109,4 +123,4 @@ onto the V1-shaped one.**
   boundary is only visible in an unfiltered read.
 
 Related: #403 (the bug this subsumes), ADR-0017, ADR-0026, ADR-0028, ADR-0043,
-ADR-0050, ADR-0053, ADR-0055.
+ADR-0050, ADR-0053, ADR-0055, ADR-0058.
