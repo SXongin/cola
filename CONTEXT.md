@@ -103,22 +103,34 @@ The bot's confirmation card inside a topic, placed by `/topic` / `/topic --adopt
 _Avoid_: Root, seed message, confirmation card
 
 **Turn**:
-A single user→assistant exchange inside a Session (one prompt plus its streamed card response). cola's internal vocabulary is the English word "turn" (Turn Footer, ADR-0019); there is deliberately NO user-facing Chinese noun for it — the UI never labels individual turns. If one is ever needed, use 轮次/本轮.
+A single user→assistant exchange inside a Session (one prompt plus its streamed card response) — spanning every **Execution** that belongs to it, including ones a **Wake** opened after the Backend went idle. cola's internal vocabulary is the English word "turn" (Turn Footer, ADR-0019); there is deliberately NO user-facing Chinese noun for it — the UI never labels individual turns. If one is ever needed, use 轮次/本轮. A Turn is not complete while the **Background Tasks** it left running are still live: its card yields 等待后台任务 and the next Wake continues the chain on a new card (ADR-0059).
 _Avoid_: 对话 as a user-facing term for this (overloads "conversation"); 消息 (a single message, not a full exchange).
+
+**Execution** (执行):
+The Backend's own unit of running work: one busy period of a Session, opened by an admitted input after idle and closed by the Backend's next idle boundary (ADR-0059). cola reads Executions; it never owns them — a **Turn** may span several, and a **Wake** opens one with no user message.
+_Avoid_: run (cola's render/follow loops are also "runs"), turn (the card-level unit)
 
 **Retry** (重试):
 The action an Error **Card** offers for a failed **Turn**: run that turn's question again on the same **Session**. A Retry never oversubmits — if the run is still alive (cola may merely have lost sight of it), the card is re-attached to it instead of asking again — and it never overwrites the failed attempt: the failed card is marked 「↩️ 已重试」 and the new attempt renders on a new card below it, so the failure stays readable and a stale click cannot retry a newer turn (ADR-0058). A deliberate stop is not a failure and offers no Retry.
 _Avoid_: Resend, re-ask (both imply an unconditional second submission)
 
 **Supplement** (补充消息):
-A user message sent while its **Session** has a **Turn** in flight. cola does not start a competing Turn: it submits the message to the Backend's running loop, which merges it into that Turn when the loop is still alive, or starts a new Turn when it has already exited. Either way the message lands below the live card, so it splits the **Card Chain** — the continuation card is its reply and carries a receipt line; there is no separate text acknowledgement. A command reply is NOT a Supplement: cola deliberately leaves it as the newest message — unless the user runs `/card`, which explicitly pulls the live card back down.
+A user message sent while its **Session** has a live **Execution** — the routing key is the Backend's running work, never cola's own bookkeeping. cola does not start a competing Turn: it submits the message to the Backend, which merges it into the live Execution when one is still running, or starts a new Execution when it has already ended. Either way the message lands below the live card, so it splits the **Card Chain** — the continuation card is its reply and carries a receipt line; there is no separate text acknowledgement. A message arriving while the session is idle — including a **Turn** waiting on **Background Tasks** — is not a Supplement: it starts a new Turn (ADR-0059). A command reply is NOT a Supplement either: cola deliberately leaves it as the newest message — unless the user runs `/card`, which explicitly pulls the live card back down.
 _Avoid_: Follow-up, addition, queued message
+
+**Background Task** (后台任务):
+Work the agent left running in the background — a backgrounded shell command, a subagent — that will **Wake** the Session when it finishes. Durable and pollable: the tool part records it as background and running, and its Wake retires it (ADR-0059). It belongs to the Session, not to the Turn that started it: while one is live its Turn is not complete, and a completion arriving after the user moved on renders on the newest card chain.
+_Avoid_: Job, task (the task tool call is the call, not the work), pending work
+
+**Wake** (唤醒):
+A Backend-generated message (V2 `synthetic`) that resumes a Session with no user message: a **Background Task** finishing, a subagent completing, the server continuing after an interruption or restart. cola renders a Wake as a **Card Chain** continuation — a new card below the user's message, which is also the notification — but only while the Session's newest user message is a **Cola-Authored Message** (ADR-0059).
+_Avoid_: Notification, callback (both mean other things here), resume
 
 **Thread** (legacy name for Topic):
 A Feishu topic, identified by `thread_id` (`omt_...`). Retained in code as `ThreadKey { chat_id, thread_id }`; the glossary now calls the Feishu side Chat/Topic, and 话题 for topics in the UI. See Topic.
 
 **Active Session**:
-The single session of a chat/topic that messages route to and that external-message sync follows. At most one per ThreadKey at a time (the SessionStore's first entry); `/switch` promotes a session to active, and so does a **Pending Session**'s materialisation. A conversation with a Pending Session has NO Active Session until that first prompt materialises it.
+The single session of a chat/topic that messages route to and that Session Sync follows. At most one per ThreadKey at a time (the SessionStore's first entry); `/switch` promotes a session to active, and so does a **Pending Session**'s materialisation. A conversation with a Pending Session has NO Active Session until that first prompt materialises it.
 _Avoid_: Current session, latest session, selected session
 
 **Session Mapping**:
@@ -126,7 +138,7 @@ Cola's record of which Sessions a Chat or Topic has activated, and which one is 
 _Avoid_: Session list, session store, mapping table
 
 **Session Transcript**:
-The normalized read of one Session's messages and parts, produced by the Backend and consumed by the Bridge and the Platform: message identity, role, server time, model identity, token usage and a message's recorded failure are typed, while tool payloads stay opaque content. One Transcript serves rendering, external-message sync and the Session Snapshot, and a message's identity and its server time travel together, so a Turn's anchor is one fact rather than two independently derived ones. A Turn's failure is read from its assistant messages here (the Backend records it on the message), so completion observation is one read.
+The normalized read of one Session's messages and parts, produced by the Backend and consumed by the Bridge and the Platform: message identity, role, server time, model identity, token usage and a message's recorded failure are typed, while tool payloads stay opaque content. One Transcript serves rendering, Session Sync and the Session Snapshot, and a message's identity and its server time travel together, so a Turn's anchor is one fact rather than two independently derived ones. An Execution's idle boundary and a Wake are typed facts here too, so the Bridge never re-derives them from timestamps (ADR-0059). A Turn's failure is read from its assistant messages here (the Backend records it on the message), so completion observation is one read.
 _Avoid_: Message list, history, message log
 
 **Cola-Authored Message**:
@@ -134,12 +146,16 @@ A user message cola itself submitted to the Backend on behalf of a Feishu Chat/T
 _Avoid_: Outbound message, own prompt (a prompt is the send action, not the stored message)
 
 **External Message**:
-A user message in a Session that cola did NOT author — someone posted it from another Shared Store client (OpenChamber, the CLI). Surfaced to Feishu by the external-message sync, which follows only the Active Session (ADR-0017). The opposite of a Cola-Authored Message.
+A user message in a Session that cola did NOT author — someone posted it from another Shared Store client (OpenChamber, the CLI). Surfaced to Feishu by **Session Sync**, which follows only the Active Session (ADR-0017). The opposite of a Cola-Authored Message.
 _Avoid_: Foreign message, out-of-band message
 
 **Sync Watermark**:
-The external-message poller's per-session record of the newest user message it has already accounted for: anything newer that is not a Cola-Authored Message is an External Message and triggers a notification. Advances past both cola-authored and external messages; cleared when a session stops being the Active Session so a later `/switch` back re-baselines silently. Owned by the poller alone — the prompt path no longer records it (formerly called the "baseline").
+Session Sync's per-session record of the newest user message it has already accounted for: anything newer that is not a Cola-Authored Message is an External Message and triggers a notification. Advances past both cola-authored and external messages; cleared when a session stops being the Active Session so a later `/switch` back re-baselines silently. Owned by Session Sync alone — the prompt path no longer records it (formerly called the "baseline"). A **Wake** never moves it: it accounts user messages only.
 _Avoid_: Baseline (the old name; it implied the prompt path owned it)
+
+**Session Sync** (会话同步):
+The Bridge flow that keeps a thread's **Active Session**'s card chain current without a user message: it notifies **External Messages**, renders **Wakes** as continuation cards, and catches content its card missed (ADR-0059). The successor of the external-message sync; still scoped to the thread's active Session (ADR-0017).
+_Avoid_: External poller (the old name), background watcher
 
 **Project**:
 A working directory on the filesystem where OpenCode operates. A property of a session, not of the bot. A conversation's current project is the directory of its Pending Session when it has one, otherwise of its active session (derived, never stored separately); `/new` and the bare `/topic` form inherit it and fall back to the default directory only when the conversation has neither. Sessions created outside a conversation still carry their own directory.
@@ -181,12 +197,16 @@ The one read-only card a Chat/Topic receives when it activates a Session it was 
 _Avoid_: Briefing, takeover summary, handoff card
 
 **Card**:
-A Feishu interactive message card. It evolves through live states (loading → reasoning → streaming, including a running-tool phase) and ends in one of four terminals — 「✅ 完成」, 「❌ 出错」, 「⏹ 已停止」 for a deliberate stop, or 「↩️ 已重试」 once its retry was submitted; a filled card hands over to its chain's continuation with a 「⏳ 部分完成，继续中…」 pause. It uses collapsible panels for secondary content and shows progress in its header (phase timer, silence, reasoning length) so a slow turn is distinguishable from a dead one — including a "等待你的授权"/"等待你的回答" state that names whichever pending request blocks the turn (both at once reads "等待你的授权/回答").
+A Feishu interactive message card. It evolves through live states (loading → reasoning → streaming, including a running-tool phase) and ends in one of four terminals — 「✅ 完成」, 「❌ 出错」, 「⏹ 已停止」 for a deliberate stop, or 「↩️ 已重试」 once its retry was submitted — or, while its Turn's **Background Tasks** are still live, yields with 「⏳ 等待后台任务」 (not a terminal: the Turn continues on the next **Wake**'s card, ADR-0059); a filled card hands over to its chain's continuation with a 「⏳ 部分完成，继续中…」 pause. It uses collapsible panels for secondary content and shows progress in its header (phase timer, silence, reasoning length) so a slow turn is distinguishable from a dead one — including a "等待你的授权"/"等待你的回答" state that names whichever pending request blocks the turn (both at once reads "等待你的授权/回答").
 _Avoid_: Widget, component, bubble
 
 **Card Chain**:
-The one or more **Card**s a single **Turn** renders into when its content exceeds what one Feishu card may hold, when a **Supplement** lands below the live card and the chain must continue there to stay the newest message, or when the user explicitly pulls the live card down with `/card`: the filled card is finalized with a 部分完成，继续中 header and a continuation card takes over, replied to the user message it continues from. Only the newest card of the chain keeps receiving updates; an **Interaction Block** rides that newest card; a command reply does not split the chain by itself — `/card` is the user-invoked exception.
+The one or more **Card**s a single **Turn** renders into when its content exceeds what one Feishu card may hold, when a **Supplement** lands below the live card and the chain must continue there to stay the newest message, when a **Wake** resumes the Turn after its card yielded 等待后台任务, or when the user explicitly pulls the live card down with `/card`: the filled card is finalized with a 部分完成，继续中 header and a continuation card takes over, replied to the user message it continues from. Only the newest card of the chain keeps receiving updates; an **Interaction Block** rides that newest card; a command reply does not split the chain by itself — `/card` is the user-invoked exception.
 _Avoid_: Split card, multi-card turn, card pagination
+
+**Waiting on Background Work** (等待后台任务):
+The disposition a **Card** takes when its **Execution** ended but the **Turn**'s **Background Tasks** are still live: the card stops updating, is neither a terminal nor ✅, and the next **Wake** continues the chain on a new card (ADR-0059). Distinct from the live 「等待你的授权/回答」 state: the turn is not blocked on the user, and it resumes without one. A waiting card that is superseded collects as 「⏳ 部分完成 · 已由新消息接管」; one whose Session stops being the Active Session collects as 「⏳ 已切换会话 · 后台任务仍在运行」.
+_Avoid_: Paused, suspended, 等待中
 
 **Instant Reminder** (即时提醒):
 Feishu's `time_sensitive` capability (opt-in via `[bridge] instant_reminder`): temporarily pinning a conversation at the top of a **Principal**'s message list. cola enables it while a **Permission** or **Question** is pending, and it clears when the wait resolves. It is a **state**, not an event: it stays until the user acts, so it cannot be missed the way a message can; a long task's end is announced by a **Completion Notice** instead. A Chat/Topic has one reminder with one deterministic owner: the newest pending wins, and when the owning wait resolves the next pending takes the pin immediately. Every pin carries its **Turn**'s generation, so a stale clear can never unpin a newer turn's pin. Because the Feishu client offers the user no way to cancel an app's reminder, cola persists its live pins and clears the orphaned ones at startup, retrying any clear that failed; a pin lost to a permanently dead cola stays until the user marks the conversation 完成. The pin carries no reason text; the card title in the conversation preview does, and a pending wait's card also carries a **Message Pin** so opening the chat leads to it. Feishu addresses only a Chat (or the bot conversation), never a Topic: a Topic has no feed-card id, so the reminder lands on the Chat's row in the message list and only the **Message Pin** reaches into the Topic. Distinct from an app feed card, which is a separate list entry cola does not create (neither feed-card mode can address a specific message).
@@ -199,7 +219,7 @@ _UI label_: 消息置顶 — one message, one pin; several pinned messages simpl
 _Avoid_: Pin module, 置顶 conversation, feed card, 「pin 多条」
 
 **Completion Notice** (完成通知):
-The reply cola sends to a **Turn**'s prompt message when the turn ends, so Feishu pushes a notification: the streaming card is patched in place, which neither notifies nor bumps the conversation. Groups notify on every turn (opt-in `[bridge] group_completion_notice`) and @-mention the requester; p2p notifies only when the turn ran past the long-task threshold (5 minutes, opt-in `[bridge] long_task_notice`) and sends a plain reply — the new message itself is the notification. It is an **event** (one message), not a state: a wait's persistence is the **Instant Reminder**'s job. Distinct from the **Interaction Receipt**, which records a resolution inside the card, and from the **Topic Cover Card**, which is a topic's root.
+The reply cola sends to a **Turn**'s prompt message when the turn ends — its true end, after any 等待后台任务 yields (ADR-0059) — so Feishu pushes a notification: the streaming card is patched in place, which neither notifies nor bumps the conversation. Groups notify on every turn (opt-in `[bridge] group_completion_notice`) and @-mention the requester; p2p notifies only when the turn ran past the long-task threshold (5 minutes, opt-in `[bridge] long_task_notice`) and sends a plain reply — the new message itself is the notification. It is an **event** (one message), not a state: a wait's persistence is the **Instant Reminder**'s job. Distinct from the **Interaction Receipt**, which records a resolution inside the card, and from the **Topic Cover Card**, which is a topic's root.
 _Avoid_: Done ping, completion message, notification card
 
 **Todo Panel** (待办面板):
@@ -299,18 +319,19 @@ _Avoid_: Notification, message, signal
 - A **Chat** contains many **Topics**; a **Chat** may hold several **Sessions** directly (lobby), while a **Topic** holds exactly one **Session** (or one **Pending Session** until its first prompt)
 - A **Chat** or **Topic** has one **Session Mapping**: the set of **Session**s it has activated, with at most one of them its **Active Session**, plus at most one **Pending Session** that materialises at the conversation's first prompt
 - A **Topic** is created around its **Topic Root** and, when cola opens it, is anchored on its **Topic Anchor**; a cola-created **Topic Root** is a **Topic Cover Card**
-- A **Session** contains many **Turns** and has one **Project** and one optional **Agent**
-- A **Session** is read through one **Session Transcript**, whose projections serve rendering, **External Message** sync and the **Session Snapshot**
+- A **Session** contains many **Turns** and has one **Project** and one optional **Agent**; a **Turn** spans one or more **Executions**, and an **Execution** ends at the Backend's idle boundary, which a **Wake** may follow with another Execution (ADR-0059)
+- A **Session** is read through one **Session Transcript**, whose projections serve rendering, **Session Sync** and the **Session Snapshot**
 - A **Turn** renders into a **Card Chain**; a pending **Permission**/**Question** rides its newest card as an **Interaction Block**, and resolving one leaves an **Interaction Receipt**
 - A **Supplement** splits its **Turn**'s **Card Chain** so the continuation card is the newest message; the render loop stays alive across a Supplement that starts a new **Turn**; a **Command** reply does not split the chain by itself — `/card` pulls the live card down on explicit request
-- An **Instant Reminder** pins the conversation while a **Permission**/**Question** is pending, and clears when the wait resolves; a **Completion Notice** announces a long p2p **Turn**'s end (a new message, not a pin)
+- A **Turn** with live **Background Tasks** yields its card as 等待后台任务; the next **Wake** continues the chain on a new card, and a **Turn** superseded while waiting collects as 已由新消息接管 (ADR-0059)
+- An **Instant Reminder** pins the conversation while a **Permission**/**Question** is pending, and clears when the wait resolves; a **Completion Notice** announces a long p2p **Turn**'s end — after any 等待后台任务 yields (a new message, not a pin)
 - A **Turn** renders one **Tool Panel** per tool call; an unfinished panel rides the newest card of its **Card Chain** as a tail section and joins the card timeline when the tool settles; only **Built-in Tool**s (and tools cola itself injects) may get tailored rendering — every other tool's payload stays opaque
 - A **Session** receives many **Permissions** and **Questions**
 - A **Session Snapshot** reports the state of one **Session** (its last **Turn**'s completion, pending **Permissions**/**Questions**, recent messages) to the **Chat**/**Topic** that activated it
 - The **Bridge** reads the **Session Transcript** from a **Backend** and renders **Card** updates on the **Platform**
 - A prompt's **Quoted Context** and **Image Attachment**s enrich the **Session** the reply belongs to
 - A **Command** is parsed by the **Bridge** from message text before routing to the **Backend**
-- Every **Cola-Authored Message** carries a `msg_cola_` id chosen by the **Bridge**; external-message sync treats only user messages newer than the **Sync Watermark** that are NOT **Cola-Authored Message**s as **External Message**s
+- Every **Cola-Authored Message** carries a `msg_cola_` id chosen by the **Bridge**; Session Sync treats only user messages newer than the **Sync Watermark** that are NOT **Cola-Authored Message**s as **External Message**s
 - A **Distribution Channel** publishes builds; a machine's **Install Channel** records which one it got them from
 - A **Cargo Receipt** for the running binary flips its **Update Channel** from GitHub Releases to crates.io; the **Install Channel** decides, never the other way around (ADR-0030)
 
