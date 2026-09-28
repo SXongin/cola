@@ -322,9 +322,10 @@ impl CardBuilder {
 /// Active states append the progress signals passed in from the accumulator;
 /// `progress.awaiting` (a pending permission and/or question) overrides the
 /// phase label entirely, naming whichever kind is pending. The override is for
-/// ACTIVE states only: a terminal card (Done/Error) is no longer waiting for
-/// anyone, and its state must win — or a fallback Error under a still-pending
-/// block would read as "waiting for your authorization" forever (#386).
+/// ACTIVE states only: a terminal card (Done/Error/Retried/Stopped) is no
+/// longer waiting for anyone, and its state must win — or a fallback Error
+/// under a still-pending block would read as "waiting for your authorization"
+/// forever (#386).
 pub(crate) fn header_title_and_template(
     state: &CardState,
     running_tool: Option<&ToolPanel>,
@@ -352,6 +353,7 @@ pub(crate) fn header_title_and_template(
         CardState::Done => ("✅ 完成".to_string(), "green"),
         CardState::Error => ("❌ 出错".to_string(), "red"),
         CardState::Retried => ("↩️ 已重试".to_string(), "grey"),
+        CardState::Stopped => ("⏹ 已停止".to_string(), "grey"),
     };
     let mut title = label;
     match state {
@@ -798,6 +800,51 @@ mod tests {
         assert_eq!(template, "grey");
     }
 
+    /// The stop terminal (#394): a Stopped card is grey-titled 「⏹ 已停止」,
+    /// keeps whatever content the turn rendered and renders NO retry button —
+    /// a deliberate stop is not a failure and must not invite a re-run.
+    #[test]
+    fn stopped_card_is_grey_and_offers_no_retry_button() {
+        let card = CardBuilder::new()
+            .with_state(CardState::Stopped)
+            .with_text("正在分析…")
+            .with_error_buttons(vec![CardActionButton {
+                text: "🔄 重试".to_string(),
+                kind: "primary",
+                value: serde_json::json!({ "action": "retry" }),
+            }])
+            .build();
+        assert_eq!(card["header"]["template"].as_str().unwrap(), "grey");
+        assert_eq!(card["header"]["title"]["content"].as_str().unwrap(), "⏹ 已停止");
+        assert!(
+            card.to_string().contains("正在分析…"),
+            "the stopped content stays on the card: {card}"
+        );
+        assert!(
+            card["body"]["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|element| element["tag"] != "button"),
+            "a Stopped card must not render the retry button: {card}"
+        );
+    }
+
+    /// The awaiting override is for live states only: a Stopped card is
+    /// terminal, so a still-pending interaction block must not restyle its
+    /// header as "waiting for your authorization" (#386's rule, extended to
+    /// the stop terminal).
+    #[test]
+    fn awaiting_override_does_not_touch_a_stopped_card() {
+        let progress = HeaderProgress {
+            awaiting: AwaitingAction::Both,
+            ..Default::default()
+        };
+        let (title, template) = header_title_and_template(&CardState::Stopped, None, &progress);
+        assert_eq!(title, "⏹ 已停止");
+        assert_eq!(template, "grey");
+    }
+
     #[test]
     fn fmt_elapsed_formats_durations() {
         assert_eq!(fmt_elapsed(0), "0s");
@@ -885,9 +932,14 @@ mod tests {
 
     #[test]
     fn a_terminal_state_wins_over_a_pending_wait() {
-        // A fallback Error (or a Done) with a still-pending block must show its
-        // own header: the card is no longer waiting for anyone (#386).
-        for (state, title) in [(CardState::Error, "❌ 出错"), (CardState::Done, "✅ 完成")] {
+        // A fallback Error (or a Done/Stopped) with a still-pending block must
+        // show its own header: the card is no longer waiting for anyone (#386,
+        // #394).
+        for (state, title) in [
+            (CardState::Error, "❌ 出错"),
+            (CardState::Done, "✅ 完成"),
+            (CardState::Stopped, "⏹ 已停止"),
+        ] {
             let card = CardBuilder::new()
                 .with_state(state.clone())
                 .with_progress(HeaderProgress {

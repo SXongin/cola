@@ -25,6 +25,12 @@ pub enum CardState {
     /// retried attempt renders on a NEW card below it, so the record of the
     /// failure stays readable and cannot be retried again by mistake.
     Retried,
+    /// A card whose run the operator deliberately stopped with `/stop`
+    /// (#394): terminal, header 「⏹ 已停止」, grey, no retry button. The abort
+    /// the server recorded on the transcript is NOT a failure and its text is
+    /// never written to the card. The next Turn clears the session's stopped
+    /// marker and replaces this card.
+    Stopped,
 }
 
 impl CardState {
@@ -34,7 +40,7 @@ impl CardState {
     /// One definition, so a new terminal state (#394's `Stopped`) cannot leave
     /// a probe reading the set differently.
     pub(crate) fn is_terminal(&self) -> bool {
-        matches!(self, Self::Done | Self::Error | Self::Retried)
+        matches!(self, Self::Done | Self::Error | Self::Retried | Self::Stopped)
     }
 }
 
