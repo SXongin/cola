@@ -304,13 +304,14 @@ impl CardSession {
     }
 
     /// True while this card belongs to a Turn that has not finished: the pull
-    /// condition for `/card` (ADR-0043, 2026-09-22 amendment). A terminal
-    /// (Done/Error/Retried/Stopped) card session stays in the cards handle's
-    /// map until the next Turn replaces it, so the map's key alone does not
-    /// mean a live card. A `Waiting` card reads as running here (it is not
-    /// terminal) — it is still the chain's newest card; Session Sync's Wake
-    /// step asks [`super::Turn::card_is_owned`] instead, which excludes the
-    /// waiting yield because the next Wake continues that chain (ADR-0059).
+    /// condition for `/card` (ADR-0043, 2026-09-22 amendment). A terminal card
+    /// (Done/Error/Retried/Stopped and the collected waiting states
+    /// `Superseded`/`SwitchedAway`) stays in the cards handle's map until the
+    /// next Turn replaces it, so the map's key alone does not mean a live card.
+    /// A `Waiting` card reads as running here (it is not terminal) — it is
+    /// still the chain's newest card; Session Sync's Wake step asks
+    /// [`super::Turn::card_is_owned`] instead, which excludes the waiting yield
+    /// because the next Wake continues that chain (ADR-0059).
     pub(super) fn is_running(&self) -> bool {
         !self.acc.card_state.is_terminal()
     }
@@ -719,6 +720,21 @@ impl StreamAccumulator {
     pub(super) fn set_waiting(&mut self) {
         self.card_state = CardState::Waiting;
         self.refresh_phase();
+    }
+
+    /// A waiting card's collect (ADR-0059, spec #405): the card yielded
+    /// 「⏳ 等待后台任务」 and then its wait was taken over — a new Turn in the
+    /// thread superseded it, or the Session stopped being the thread's Active
+    /// Session. Only a card still in `Waiting` is collected: a live card is
+    /// somebody else's to finish and an ended card keeps the ending it
+    /// recorded. Returns whether this call collected the card, so the caller
+    /// flushes only a real transition.
+    pub(super) fn collect_waiting(&mut self, collected: CardState) -> bool {
+        if self.card_state != CardState::Waiting {
+            return false;
+        }
+        self.card_state = collected;
+        true
     }
 
     /// Start a Wake continuation on a NEW card from this accumulator

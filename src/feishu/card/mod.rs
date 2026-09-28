@@ -37,6 +37,18 @@ pub enum CardState {
     /// chain on a new continuation card; a later Turn supersedes this one or a
     /// switch-away collects it (spec #405).
     Waiting,
+    /// A waiting card collected because a new Turn in the thread superseded it
+    /// (ADR-0059, spec #405): header 「⏳ 部分完成 · 已由新消息接管」. Terminal —
+    /// the card stops updating — and no Completion Notice follows (the notice
+    /// belongs to a true end). The background work is unaffected: a later Wake
+    /// continues the newest chain.
+    Superseded,
+    /// A waiting card collected because its Session stopped being the thread's
+    /// Active Session — `/switch` away, `/switch forget` (ADR-0059, spec
+    /// #405): header 「⏳ 已切换会话 · 后台任务仍在运行」. Terminal, no
+    /// Completion Notice; switching back reports the Session through the
+    /// ADR-0028 snapshot, and the background work runs on.
+    SwitchedAway,
 }
 
 impl CardState {
@@ -44,11 +56,17 @@ impl CardState {
     /// the header timer stops, and the only action left is the Error card's
     /// retry. `Continued` is NOT terminal — the chain continues on a new card —
     /// and neither is `Waiting`: the Turn's Background Tasks are still live and
-    /// a Wake will continue its chain on a new card (ADR-0059).
+    /// a Wake will continue its chain on a new card (ADR-0059). The collected
+    /// waiting states (`Superseded`, `SwitchedAway`) ARE terminal: the wait is
+    /// over even though its background work is not, so the card stops updating
+    /// (ADR-0059).
     /// One definition, so a new terminal state (#394's `Stopped`) cannot leave
     /// a probe reading the set differently.
     pub(crate) fn is_terminal(&self) -> bool {
-        matches!(self, Self::Done | Self::Error | Self::Retried | Self::Stopped)
+        matches!(
+            self,
+            Self::Done | Self::Error | Self::Retried | Self::Stopped | Self::Superseded | Self::SwitchedAway
+        )
     }
 
     /// Whether a live renderer still owns the card's chain: the card is
@@ -313,8 +331,25 @@ mod tests {
             CardState::Retried,
             CardState::Stopped,
             CardState::Waiting,
+            CardState::Superseded,
+            CardState::SwitchedAway,
         ] {
             assert!(state.overrides_awaiting(), "{state:?} has its own ending to show");
+        }
+    }
+
+    /// The collected waiting states (ADR-0059) are terminal — the card stops
+    /// updating — and never render-owned: a later Wake continues a collected
+    /// chain, so Session Sync reading `is_render_owned` must not treat the
+    /// collected card as a live renderer's card.
+    #[test]
+    fn collected_waiting_states_are_terminal_and_not_render_owned() {
+        for state in [CardState::Superseded, CardState::SwitchedAway] {
+            assert!(state.is_terminal(), "{state:?} collected a finished wait");
+            assert!(
+                !state.is_render_owned(),
+                "{state:?} must not block a Wake continuation"
+            );
         }
     }
 

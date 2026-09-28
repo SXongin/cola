@@ -317,6 +317,14 @@ impl Turn {
         // clearing it here keeps a past stop from silencing this turn's drain.
         handles.waits.stopped_sessions.lock().await.remove(&session_id);
 
+        // A new Turn in the thread supersedes every waiting card it displaces
+        // (ADR-0059, spec #405): a card sitting on 「⏳ 等待后台任务」 is
+        // collected as 「⏳ 部分完成 · 已由新消息接管」 — terminal, no Completion
+        // Notice — so no waiting card hangs forever while its background work
+        // runs on. Runs before the new accumulator replaces the session's own
+        // card (and under the inflight guard, so no Wake can race the collect).
+        Self::collect_thread_waiting(&handles.cards, &handles.sessions, &thread_key).await;
+
         // A retry marks its failed card `Retried` before the fresh attempt
         // exists (spec #391): the card records that it was retried while the
         // new attempt lives on its own card below. Done only HERE — the
@@ -1250,6 +1258,26 @@ impl SplitKind {
     }
 }
 
+/// Why a waiting card was collected (ADR-0059, spec #405): the reason owns the
+/// collected card's header, so a collect site cannot restamp the wrong copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CollectReason {
+    /// A new Turn in the thread superseded the wait.
+    Superseded,
+    /// The Session stopped being the thread's Active Session.
+    SwitchedAway,
+}
+
+impl CollectReason {
+    /// The state a collected waiting card records for this reason.
+    fn collected(self) -> crate::feishu::card::CardState {
+        match self {
+            Self::Superseded => crate::feishu::card::CardState::Superseded,
+            Self::SwitchedAway => crate::feishu::card::CardState::SwitchedAway,
+        }
+    }
+}
+
 /// The Turn's card-delivery interface (spec #298, A2a): the operations sibling
 /// flows invoke when they own the trigger moment — the render poll, the
 /// request poller surfacing an inline block, the external renderer finalizing
@@ -1532,8 +1560,9 @@ impl Turn {
     }
 
     /// Whether the session's card is still running (not terminal: Done, Error,
-    /// Retried or Stopped). The map's key alone does not mean a live card — a
-    /// completed/stopped turn stays until the next Turn replaces it.
+    /// Retried, Stopped, or a collected waiting card). The map's key alone
+    /// does not mean a live card — a completed/stopped/collected turn stays
+    /// until the next Turn replaces it.
     pub(crate) async fn is_running(cards: &CardsHandle, session_id: &str) -> bool {
         cards
             .cards
@@ -1660,6 +1689,79 @@ impl Turn {
         }
         Self::refresh_work_context(cards, session_id).await;
         Self::flush_card(cards, session_id).await;
+    }
+
+    /// Collect a waiting card as 「⏳ 已切换会话 · 后台任务仍在运行」 (ADR-0059,
+    /// spec #405): its Session stopped being the thread's Active Session — a
+    /// switch away, or a `/switch forget` — so a message in that thread can
+    /// never continue the chain again. Returns whether this call collected a
+    /// card (false: no card, or the card was not waiting). Used by the
+    /// activation wrapper ([`Self::activate_collecting`]) and by `/switch
+    /// forget`, which unmaps the session without an activation.
+    pub(crate) async fn collect_switched_away(cards: &CardsHandle, session_id: &str) -> bool {
+        Self::collect_waiting(cards, session_id, CollectReason::SwitchedAway).await
+    }
+
+    /// Collect `session_id`'s card if it yielded 「⏳ 等待后台任务」 (ADR-0059,
+    /// spec #405): restamp it with the reason's collected header, refresh the
+    /// work context and flush once. No-op — nothing flushed — when the session
+    /// has no card or the card is not waiting. Neither collect sends a
+    /// Completion Notice (the notice belongs to a true end), and the
+    /// background work behind the wait is unaffected: a later Wake still
+    /// continues the chain on a new card.
+    async fn collect_waiting(cards: &CardsHandle, session_id: &str, reason: CollectReason) -> bool {
+        let collected = {
+            let mut live = cards.cards.lock().await;
+            live.get_mut(session_id)
+                .is_some_and(|card| card.acc.collect_waiting(reason.collected()))
+        };
+        if !collected {
+            return false;
+        }
+        tracing::info!("card collect: session {session_id} collected ({reason:?})");
+        Self::refresh_work_context(cards, session_id).await;
+        Self::flush_card(cards, session_id).await;
+        true
+    }
+
+    /// Collect every Waiting card of `thread_key`'s mapped sessions because a
+    /// new Turn in the thread superseded them (ADR-0059, spec #405): the new
+    /// message is the thread's newest word, so no waiting card it displaces may
+    /// keep sitting on 「⏳ 等待后台任务」. The Turn being started is included —
+    /// its own accumulator is replaced right after this runs.
+    async fn collect_thread_waiting(cards: &CardsHandle, sessions: &SessionsHandle, thread_key: &ThreadKey) {
+        let mapped: Vec<String> = {
+            let store = sessions.store.lock().await;
+            store
+                .list_thread(thread_key)
+                .into_iter()
+                .map(|entry| entry.session_id.clone())
+                .collect()
+        };
+        for session_id in mapped {
+            Self::collect_waiting(cards, &session_id, CollectReason::Superseded).await;
+        }
+    }
+
+    /// Promote `entry` as its thread's Active Session, collecting the displaced
+    /// Session's waiting card first (ADR-0059, spec #405): the Session stops
+    /// being the thread's Active Session, so a message in that thread can no
+    /// longer continue its chain — the card is collected as
+    /// 「⏳ 已切换会话 · 后台任务仍在运行」 and stops updating, while its
+    /// background work runs on. The collect runs BEFORE the activation, so a
+    /// polling Wake cannot resume a chain this switch is leaving behind.
+    /// Re-activating the already-active session collects nothing.
+    pub(crate) async fn activate_collecting(
+        sessions: &SessionsHandle,
+        cards: &CardsHandle,
+        entry: crate::config::SessionEntry,
+    ) -> crate::error::Result<()> {
+        if let Some(previous) = sessions.active_entry(&entry.thread_key).await
+            && previous.session_id != entry.session_id
+        {
+            Self::collect_switched_away(cards, &previous.session_id).await;
+        }
+        sessions.activate(entry).await
     }
 
     /// Finalize a followed card as Error: record `error`, mark it Error and
@@ -2290,7 +2392,8 @@ async fn send_completion_notice(handles: &TurnHandles, session_id: &str, started
         // stop is announced as 已停止, never as 完成 or 出错. A card that is
         // NOT at an ending declines here — a Waiting card has not reached its
         // true end (the notice belongs to the true end, and the next Wake
-        // continues the chain, ADR-0059); a Retried card's failure was already
+        // continues the chain, ADR-0059), nor has a collected waiting card
+        // (`Superseded`/`SwitchedAway`) — a Retried card's failure was already
         // announced when it failed; and a live/split card (Loading…Continued)
         // is no ending at all. The refusal lives HERE, not only at the call
         // sites, so a caller that forgets to guard cannot announce one as
