@@ -1759,8 +1759,10 @@ async fn release_inflight(handles: &TurnHandles, session_id: &str) {
 ///
 /// A free function because both ends of a turn call it: `finish` for a turn
 /// that ended normally, and the out-of-turn drain follow (#284) when the turn
-/// it inherited actually ends — `started_at` stays the ORIGINAL turn's start,
-/// so the long-task threshold measures the whole run.
+/// it inherited actually ends. A drain hand-off keeps the ORIGINAL turn's
+/// start, so the long-task threshold measures the whole run; a retry re-attach
+/// (#393) arms the follow with "now" instead, because the original turn's
+/// start is no longer known there.
 async fn send_completion_notice(handles: &TurnHandles, session_id: &str, started_at: std::time::Instant) {
     if !(handles.config.group_completion_notice || handles.config.long_task_notice) {
         return;
