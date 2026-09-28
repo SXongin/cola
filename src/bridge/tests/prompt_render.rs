@@ -1523,13 +1523,19 @@ fn failed_attempt_message() -> TranscriptMessage {
     )
 }
 
+/// One attempt's scripted turn window: the admitted user message plus the
+/// assistant message that attempt left behind.
+fn attempt_window(anchor: &str, assistant: TranscriptMessage) -> SessionTranscript {
+    SessionTranscript::new(vec![
+        typed_message(anchor, MessageRole::User, Some(1_000), vec![text_part("hi")]),
+        assistant,
+    ])
+}
+
 /// The failed attempt's scripted turn window, anchored on the user message the
 /// retry reuses.
 fn failed_attempt_window(anchor: &str) -> SessionTranscript {
-    SessionTranscript::new(vec![
-        typed_message(anchor, MessageRole::User, Some(1_000), vec![text_part("hi")]),
-        failed_attempt_message(),
-    ])
+    attempt_window(anchor, failed_attempt_message())
 }
 
 /// [`failed_attempt_window`] plus `extra`'s messages, newest last — an
@@ -1540,17 +1546,19 @@ fn window_with(anchor: &str, extra: Vec<TranscriptMessage>) -> SessionTranscript
     window
 }
 
+/// An assistant message that failed without a terminal finish: the retry's
+/// decision must read its turn as unfinished (V1 continues it; V2 takes a
+/// fresh id).
+fn failed_assistant_message(id: &str, created: i64, text: &str) -> TranscriptMessage {
+    let mut message = typed_message(id, MessageRole::Assistant, Some(created), vec![text_part(text)]);
+    message.error = Some("provider 503".into());
+    message
+}
+
 /// The first retry's own message; its recorded failure makes retry 1 end
 /// Error again, so the chain can be retried once more.
 fn first_retry_message() -> TranscriptMessage {
-    let mut message = typed_message(
-        "msg_new_1",
-        MessageRole::Assistant,
-        Some(3_000),
-        vec![text_part("第一次重试：RETRY1_TEXT")],
-    );
-    message.error = Some("provider 503".into());
-    message
+    failed_assistant_message("msg_new_1", 3_000, "第一次重试：RETRY1_TEXT")
 }
 
 /// #387, V1's reuse contract (spec #391 correction): the same-id re-post
@@ -1568,7 +1576,7 @@ async fn error_card_retry_does_not_replay_the_failed_attempt() {
     let mut mock = MockBackend::new(realistic_parts());
     mock.fail_prompts(1, "Simulated provider failure");
     // V1's server contract: a same-id re-post continues the admitted turn.
-    mock.with_reuse_continuation(true);
+    mock.with_reuse_continues_an_admitted_turn(true);
     let prompt_ids = mock.prompt_message_ids.clone();
     let backend = Arc::new(mock);
     let platform = Arc::new(RecordingPlatform::new());
@@ -1678,7 +1686,8 @@ async fn retrying_again_suppresses_every_earlier_attempt() {
     let mut mock = MockBackend::new(realistic_parts());
     mock.fail_prompts(1, "Simulated provider failure");
     // V1's server contract: a same-id re-post continues the admitted turn.
-    mock.with_reuse_continuation(true);
+    mock.with_reuse_continues_an_admitted_turn(true);
+    let prompt_ids = mock.prompt_message_ids.clone();
     let backend = Arc::new(mock);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -1794,12 +1803,24 @@ async fn retrying_again_suppresses_every_earlier_attempt() {
         !text.contains("OLD_TOOL_OUTPUT"),
         "the original failed attempt's Tool Panel must not replay: {text}"
     );
+
+    // V1's id contract: the initial attempt and BOTH retries are the same
+    // logical user message — every submit carries the one `msg_cola_` id.
+    let ids = prompt_ids.lock().await.clone();
+    assert_eq!(
+        ids,
+        vec![
+            Some(ANCHOR.to_string()),
+            Some(ANCHOR.to_string()),
+            Some(ANCHOR.to_string())
+        ],
+        "every V1 retry must re-submit the failed attempt's msg_cola_ id"
+    );
 }
 
-/// The V2 kill-shaped turn: the admitted user message plus an assistant
-/// message a killed run left unfinished — no completion stamp, a stuck running
-/// tool, the recorded failure — so the turn never reads complete.
-fn orphaned_attempt_window(anchor: &str) -> SessionTranscript {
+/// The assistant message a killed run leaves behind: no completion stamp, a
+/// stuck running tool, the recorded failure — the turn never reads complete.
+fn orphaned_attempt_message() -> TranscriptMessage {
     let mut orphan = typed_message(
         "msg_orphan",
         MessageRole::Assistant,
@@ -1817,15 +1838,19 @@ fn orphaned_attempt_window(anchor: &str) -> SessionTranscript {
     );
     orphan.time.as_mut().unwrap().completed = None;
     orphan.error = Some("运行被中断".into());
-    SessionTranscript::new(vec![
-        typed_message(anchor, MessageRole::User, Some(1_000), vec![text_part("hi")]),
-        orphan,
-    ])
+    orphan
 }
 
-/// A retry attempt's window on V2: the fresh attempt's own user message plus
-/// its assistant reply. `created` is far enough after the orphaned attempt's
-/// times that the orphan falls outside the new anchor's staleness window.
+/// The V2 kill-shaped turn window: the admitted user message plus the orphaned
+/// assistant message, so the turn never reads complete.
+fn orphaned_attempt_window(anchor: &str) -> SessionTranscript {
+    attempt_window(anchor, orphaned_attempt_message())
+}
+
+/// A retry attempt's window on V2, starting afresh: the fresh attempt's own
+/// user message plus its assistant reply. Used where the earlier attempts are
+/// already excluded from the new anchor's membership (their messages completed
+/// before it), so the window need not carry them.
 fn fresh_attempt_window(user_id: &str, created: i64, assistant: TranscriptMessage) -> SessionTranscript {
     SessionTranscript::new(vec![
         typed_message(user_id, MessageRole::User, Some(created), vec![text_part("hi")]),
@@ -1837,17 +1862,22 @@ fn fresh_attempt_window(user_id: &str, created: i64, assistant: TranscriptMessag
 /// key, so a same-id re-post of an ADMITTED, unfinished (orphaned) turn would
 /// be a silent no-op. The retry takes a FRESH id — pinned here over the V2
 /// orphan shape (no completion stamp, stuck tool, recorded failure) — and the
-/// orphan does not replay onto the new card.
+/// orphan does not replay onto the new card. The fresh anchor is only 5 minutes
+/// after the orphan's newest activity, inside the transcript's in-flight
+/// window, so the orphan would read as belonging to the new turn: the render
+/// baseline is exactly what keeps it off the new card.
 #[tokio::test]
 async fn v2_unfinished_retry_submits_a_new_id_and_never_replays_the_orphan() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     const ANCHOR: &str = "msg_cola_orphan";
-    const FRESH_CREATED: i64 = 2_000_000;
+    // 2_000 (the orphan's activity) + 300_000 = inside the 10-minute in-flight
+    // window, so `turn_for_user` includes the orphan in the fresh turn.
+    const FRESH_CREATED: i64 = 302_000;
     let mut mock = MockBackend::new(realistic_parts());
     // V2's server contract: admission makes a same-id re-post a no-op.
-    mock.with_reuse_continuation(false);
+    mock.with_reuse_continues_an_admitted_turn(false);
     // The retry's prompt is held after its id is recorded, so the test can
     // swap the transcript script between the decision read and the retry's
     // own render.
@@ -1887,7 +1917,9 @@ async fn v2_unfinished_retry_submits_a_new_id_and_never_replays_the_orphan() {
     assert_retry_ack(retry);
 
     // V2 must not re-post the admitted id: the retry's prompt carries a fresh
-    // one. Swap in the fresh attempt's window before releasing it.
+    // one. Swap in the full window before releasing it — the orphan stays in
+    // it, still inside the fresh anchor's in-flight window, so only the render
+    // baseline can keep it off the new card.
     let ids = wait_for_prompt_ids(&prompt_ids, 2).await;
     let new_id = ids[1].clone().expect("the retry prompt carries an id");
     assert_ne!(
@@ -1895,30 +1927,34 @@ async fn v2_unfinished_retry_submits_a_new_id_and_never_replays_the_orphan() {
         new_id.as_str(),
         "V2 must not re-post an id the server already admitted"
     );
+    let mut window = orphaned_attempt_window(ANCHOR);
+    window.messages.push(typed_message(
+        new_id.as_str(),
+        MessageRole::User,
+        Some(FRESH_CREATED),
+        vec![text_part("hi")],
+    ));
+    window.messages.push(typed_message(
+        "msg_fresh",
+        MessageRole::Assistant,
+        Some(FRESH_CREATED + 1_000),
+        vec![
+            text_part("新尝试的结论：NEW_TEXT"),
+            tool_part(
+                "bash",
+                "call_fresh",
+                ToolStatus::Completed,
+                serde_json::json!({ "command": "ls-fresh" }),
+                "NEW_TOOL_OUTPUT",
+            ),
+        ],
+    ));
     *backend
         .transcript_scripts
         .lock()
         .await
         .get_mut("ses_test")
-        .unwrap() = vec![fresh_attempt_window(
-        new_id.as_str(),
-        FRESH_CREATED,
-        typed_message(
-            "msg_fresh",
-            MessageRole::Assistant,
-            Some(FRESH_CREATED + 1_000),
-            vec![
-                text_part("新尝试的结论：NEW_TEXT"),
-                tool_part(
-                    "bash",
-                    "call_fresh",
-                    ToolStatus::Completed,
-                    serde_json::json!({ "command": "ls-fresh" }),
-                    "NEW_TOOL_OUTPUT",
-                ),
-            ],
-        ),
-    )];
+        .unwrap() = vec![window];
     gate.add_permits(1);
 
     wait_for_card_update(&platform, "the retry's Done card", CardUpdates::Latest, |card| {
@@ -1960,7 +1996,7 @@ async fn v2_retries_chain_under_fresh_ids() {
     const RETRY2_CREATED: i64 = 6_000_000;
     let mut mock = MockBackend::new(realistic_parts());
     // V2's server contract: admission makes a same-id re-post a no-op.
-    mock.with_reuse_continuation(false);
+    mock.with_reuse_continues_an_admitted_turn(false);
     let gate = mock.hold_prompts();
     let prompt_ids = mock.prompt_message_ids.clone();
     let backend = Arc::new(mock);
@@ -1996,13 +2032,7 @@ async fn v2_retries_chain_under_fresh_ids() {
     let ids = wait_for_prompt_ids(&prompt_ids, 2).await;
     let retry1 = ids[1].clone().expect("retry 1's id");
     assert_ne!(ANCHOR, retry1.as_str(), "retry 1 must take a fresh id");
-    let mut retry1_failed = typed_message(
-        "msg_v2_retry1",
-        MessageRole::Assistant,
-        Some(RETRY1_CREATED),
-        vec![text_part("第一次重试：RETRY1_TEXT")],
-    );
-    retry1_failed.error = Some("provider 503".into());
+    let retry1_failed = failed_assistant_message("msg_v2_retry1", RETRY1_CREATED, "第一次重试：RETRY1_TEXT");
     *backend
         .transcript_scripts
         .lock()
