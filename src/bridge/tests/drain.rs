@@ -856,6 +856,77 @@ async fn stop_during_the_follow_finalizes_promptly() {
     assert_no_further_rendering(&backend, &platform).await;
 }
 
+/// The follow's mid-tick stop re-check (#394): a stop landing AFTER a tick's
+/// top marker check — while its transcript read is already in flight — must
+/// still finalize `Stopped`, not the settled run's Done. The gate parks the
+/// follow's read (the only transcript reader after the hand-off), so the
+/// `/stop` deterministically lands inside the tick.
+#[tokio::test]
+async fn a_stop_landing_mid_tick_finalizes_stopped_not_done() {
+    let _wd = test_work_dir();
+    // A ceiling the test would never wait out: only the stop can end it.
+    let (_dir, app, backend, platform) = busy_supplement_app(60_000).await;
+    // The parked read must stay parked until the test releases it: the
+    // follow's default per-read bound would cancel it first.
+    app.turn_follow_read_timeout_ms.store(60_000, Ordering::Relaxed);
+    run_to_handoff(&app, &platform).await;
+
+    // Park the follow's next read. It has already passed the tick's top
+    // marker check (no marker is set yet), so only the mid-tick re-check can
+    // see the stop that lands below.
+    let gate = backend.hold_transcripts();
+    let entered = backend
+        .transcript_gate_entered
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let wait_parked = async {
+        while backend
+            .transcript_gate_entered
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == entered
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(3), wait_parked)
+        .await
+        .expect("the follow's read must reach the gate");
+
+    // The run settles while the tick is parked: without the re-check the
+    // tick would classify it Done.
+    settle_tool(&backend, ToolStatus::Completed, "done").await;
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    app.handle_message(incoming(
+        "msg_stop".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/stop".into(),
+        None,
+    ))
+    .await;
+    assert_eq!(
+        backend.interrupt_calls.lock().await.as_slice(),
+        &["ses_test".to_string()],
+        "/stop must interrupt the session"
+    );
+
+    gate.add_permits(1);
+    wait_for_card_header(&platform, "已停止").await;
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Stopped),
+        "the mid-tick stop must finalize Stopped, not the settled run's Done"
+    );
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_buttons(&final_card).is_empty(),
+        "a stopped card must not offer a retry: {final_card}"
+    );
+    assert_no_further_rendering(&backend, &platform).await;
+}
+
 /// A follow whose Backend reads hang ends in the lost-contact Error: the card
 /// never sits on an eternal "streaming" state over a run cola cannot see
 /// (#284/#386).

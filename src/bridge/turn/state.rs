@@ -671,6 +671,15 @@ impl StreamAccumulator {
         self.refresh_phase();
     }
 
+    /// The stop terminal (#394): a deliberate `/stop` is not a failure, so the
+    /// transition to `Stopped` discards any recorded error text — the
+    /// invariant (`Stopped` implies `error == None`) holds wherever the state
+    /// is set, by construction.
+    pub(super) fn set_stopped(&mut self) {
+        self.error = None;
+        self.card_state = CardState::Stopped;
+    }
+
     /// Add an interaction block to the card unless a block for the same
     /// request is already present (the poll loop and the adopt-time snapshot
     /// both feed blocks in). Live blocks render in the card's tail; resolving

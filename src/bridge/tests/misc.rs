@@ -25,6 +25,41 @@ async fn session_commands_reply_hint_without_mapped_session() {
     assert!(text.contains("还没有会话"), "every command must hint: {text}");
 }
 
+/// The `/stop` marker's rollback (#394): a failed interrupt rolls back only a
+/// marker THIS call inserted. A stop whose abort failed must not leave a
+/// paused card claiming 已停止; a failed second `/stop` must not wipe the
+/// marker an earlier successful stop left for the still-draining turn.
+#[tokio::test]
+async fn a_failed_stop_rolls_back_only_its_own_marker() {
+    for (preset, expected) in [(false, false), (true, true)] {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.fail_interrupts(1, "abort endpoint down");
+        let (app, _platform) = build_app(cfg, backend).await;
+        seed_session(&app, "ses_test", "/work").await;
+        if preset {
+            app.stopped_sessions.lock().await.insert("ses_test".to_string());
+        }
+
+        send_command_in(
+            &app,
+            "/stop",
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "msg_stop",
+            crate::config::ConversationKind::P2p,
+        )
+        .await;
+
+        assert_eq!(
+            app.stopped_sessions.lock().await.contains("ses_test"),
+            expected,
+            "preset={preset}: a failed stop must roll back only the marker it inserted"
+        );
+    }
+}
+
 /// A reply injects its parent's text as Quoted Context, prefixed ahead of
 /// the user's own message so the model sees what the reply answers.
 #[tokio::test]

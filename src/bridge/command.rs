@@ -855,18 +855,16 @@ pub(crate) async fn handle_command(
                 // abort settles the run server-side, and a drain/follow tick
                 // that observes that settled run can beat the marker back and
                 // finalize Done/Error instead of the stop terminal (#394). The
-                // marker is rolled back if the interrupt itself fails, so a
-                // failed stop never leaves a card claiming 已停止. The next
-                // Turn clears the marker when it starts.
-                handles
-                    .flow
-                    .waits
-                    .stopped_sessions
-                    .lock()
-                    .await
-                    .insert(id.clone());
+                // next Turn clears the marker when it starts.
+                let waits = &handles.flow.waits;
+                let inserted = waits.stopped_sessions.lock().await.insert(id.clone());
                 if let Err(e) = handles.flow.backend.interrupt(&id).await {
-                    handles.flow.waits.stopped_sessions.lock().await.remove(&id);
+                    // Roll back only a marker THIS call inserted: a failed
+                    // second `/stop` must not wipe the marker an earlier
+                    // successful stop left for the still-draining turn.
+                    if inserted {
+                        waits.stopped_sessions.lock().await.remove(&id);
+                    }
                     return Err(e);
                 }
                 handles

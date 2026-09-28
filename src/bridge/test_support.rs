@@ -786,6 +786,12 @@ pub struct MockBackend {
     pub prompt_error: Option<String>,
     /// Number of initial `prompt` calls to fail (for testing retry-after-error).
     pub fail_prompt_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Number of initial `interrupt` calls to fail with a genuine error (the
+    /// `/stop` abort's failure path); 0 succeeds like the real server.
+    pub fail_interrupt_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// The message counted `interrupt` failures report; `None` keeps the
+    /// generic one.
+    pub fail_interrupt_message: Option<String>,
     /// Records every `prompt` call's text (the main dispatch and a Supplement
     /// go through the same submit, ADR-0056).
     pub prompt_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
@@ -810,6 +816,16 @@ pub struct MockBackend {
     /// only afterwards let it finish — the mid-turn ordering the turn-end
     /// leftover rejection (#187) acts on.
     pub prompt_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// When set, every `transcript` read waits on this gate before serving —
+    /// armable mid-life (`hold_transcripts`, same `&self` as the trait) so a
+    /// test can park the ONE reader it owns (the out-of-turn follow, once the
+    /// drain handed off) after it passed a tick's own marker check, inject a
+    /// `/stop`, then release it — the mid-tick stop re-check (#394).
+    /// [`Self::transcript_gate_entered`] counts reads that reached the gate.
+    pub transcript_gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Counts `transcript` reads that reached [`Self::transcript_gate`] — the
+    /// test's "the reader is now parked" signal.
+    pub transcript_gate_entered: Arc<std::sync::atomic::AtomicUsize>,
     /// The session id `create_session` returns.
     pub session_id: String,
     /// Every `create_session` call's requested directory (ADR-0041: asserts
@@ -947,6 +963,8 @@ impl MockBackend {
             replied_questions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             prompt_error: None,
             fail_prompt_count: std::sync::atomic::AtomicUsize::new(0).into(),
+            fail_interrupt_count: std::sync::atomic::AtomicUsize::new(0).into(),
+            fail_interrupt_message: None,
             prompt_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_images: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             prompt_models: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -955,6 +973,8 @@ impl MockBackend {
             prompt_message_ids: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             on_prompt: None,
             prompt_gate: None,
+            transcript_gate: std::sync::Mutex::new(None),
+            transcript_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_id: "ses_test".into(),
             created_session_dirs: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             fail_create_session_count: std::sync::atomic::AtomicUsize::new(0).into(),
@@ -1040,6 +1060,16 @@ impl MockBackend {
         self.fail_prompt_count
             .store(count, std::sync::atomic::Ordering::SeqCst);
         self.fail_prompt_message = Some(message.to_string());
+        self
+    }
+
+    /// Scenario: the next `count` `interrupt` calls fail with `message`; the
+    /// scripted failure is consumed, so a later `/stop` succeeds (the `/stop`
+    /// rollback path, #394).
+    pub(crate) fn fail_interrupts(&mut self, count: usize, message: &str) -> &mut Self {
+        self.fail_interrupt_count
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+        self.fail_interrupt_message = Some(message.to_string());
         self
     }
 
@@ -1132,6 +1162,18 @@ impl MockBackend {
     pub(crate) fn hold_prompts(&mut self) -> Arc<tokio::sync::Semaphore> {
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         self.prompt_gate = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// Scenario: hold every `transcript` read until the returned semaphore is
+    /// released, counting reads that reached the gate in
+    /// [`Self::transcript_gate_entered`]. Armable through `&self` after the
+    /// app is built, so a test can park the follow's next read (already past
+    /// its tick's marker check) and inject a `/stop` before releasing it
+    /// (#394).
+    pub(crate) fn hold_transcripts(&self) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.transcript_gate.lock().unwrap() = Some(Arc::clone(&gate));
         gate
     }
 
@@ -1646,6 +1688,14 @@ impl crate::backend::Backend for MockBackend {
     /// wins; otherwise the scenario's default typed shape is served (spec
     /// #332, #334–#339).
     async fn transcript(&self, session_id: &str) -> crate::error::Result<SessionTranscript> {
+        // A test may hold the read in flight — after the reader's own marker
+        // check — and inject state before releasing it (#394).
+        let gate = self.transcript_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            self.transcript_gate_entered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _permit = gate.acquire().await;
+        }
         hang_if_scripted(&self.hang_transcript).await;
         let scripted = {
             let mut scripts = self.transcript_scripts.lock().await;
@@ -1891,8 +1941,21 @@ impl crate::backend::Backend for MockBackend {
         })
     }
 
-    async fn interrupt(&self, _s: &str) -> crate::error::Result<()> {
-        self.interrupt_calls.lock().await.push(_s.to_string());
+    async fn interrupt(&self, session_id: &str) -> crate::error::Result<()> {
+        self.interrupt_calls.lock().await.push(session_id.to_string());
+        if self
+            .fail_interrupt_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            self.fail_interrupt_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(crate::error::BridgeError::OpenCode(
+                self.fail_interrupt_message
+                    .clone()
+                    .unwrap_or_else(|| "Simulated interrupt failure".into()),
+            ));
+        }
         Ok(())
     }
     async fn compact(&self, _s: &str) -> crate::error::Result<()> {

@@ -129,7 +129,7 @@ async fn run(
         // card goes Stopped — a deliberate stop is not a failure and its
         // abort's error text never reaches the card (#394) — exactly as
         // `finish` does on its stop path.
-        if handles.waits.stopped_sessions.lock().await.contains(&session_id) {
+        if handles.waits.is_stopped(&session_id).await {
             if let Some(Ok(transcript)) = crate::bridge::bounded_call(
                 "drain follow transcript",
                 timing.read_timeout_ms,
@@ -234,7 +234,7 @@ async fn run(
                         // stop is the ending, never the settled Done/Error
                         // below (#394). The tick already rendered the abort's
                         // settled tool states above.
-                        if handles.waits.stopped_sessions.lock().await.contains(&session_id) {
+                        if handles.waits.is_stopped(&session_id).await {
                             finalize_stop(&handles, &session_id, started_at).await;
                             return;
                         }
