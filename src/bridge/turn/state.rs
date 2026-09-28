@@ -286,9 +286,9 @@ impl CardSession {
 
     /// True while this card belongs to a Turn that has not finished: the pull
     /// condition for `/card` (ADR-0043, 2026-09-22 amendment). A terminal
-    /// (Done/Error/Retried) card session stays in the cards handle's map until
-    /// the next Turn replaces it, so the map's key alone does not mean a live
-    /// card.
+    /// (Done/Error/Retried/Stopped) card session stays in the cards handle's
+    /// map until the next Turn replaces it, so the map's key alone does not
+    /// mean a live card.
     pub(super) fn is_running(&self) -> bool {
         !self.acc.card_state.is_terminal()
     }
@@ -620,8 +620,8 @@ impl StreamAccumulator {
         self.running_tool().is_some()
     }
 
-    /// The header phase for the current state: None when the turn finished or
-    /// errored (no timer shown).
+    /// The header phase for the current state: None when the turn finished,
+    /// was stopped or errored (no timer shown).
     pub(super) fn active_phase(&self) -> Option<HeaderPhase> {
         match self.card_state {
             CardState::Loading => Some(HeaderPhase::Loading),
@@ -2431,6 +2431,12 @@ mod tests {
         acc.card_state = CardState::Done;
         acc.refresh_phase();
         assert_eq!(acc.active_phase(), None);
+        // A stopped turn is terminal too: the stop terminal carries no timer
+        // (#394).
+        acc.card_state = CardState::Stopped;
+        acc.refresh_phase();
+        assert_eq!(acc.active_phase(), None);
+        assert_eq!(acc.current_phase, None);
     }
 
     /// The header signature carries the phase label, and flips to a title
