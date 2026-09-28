@@ -535,6 +535,12 @@ pub(super) struct StreamAccumulator {
     /// two sets are seeded and consumed together, and only this type's docs
     /// carry the invariant.
     pub(super) baseline: AttemptBaseline,
+    /// Whether this card continues its Turn after a Wake (ADR-0059): the
+    /// chain moved on a new card after the previous one yielded or ended, so
+    /// this card carries no question to re-ask — an Error ending never offers
+    /// Retry, whatever the previous attempt's facts were. Set by
+    /// [`Self::continue_on_new_card`] and by a fresh (restart) arm.
+    pub(super) wake_continuation: bool,
     /// The Turn's anchor, captured as one fact: the identity of the user
     /// message this turn answers together with that message's server time. An
     /// external render arms with the external message's anchor directly; a
@@ -718,16 +724,16 @@ impl StreamAccumulator {
     /// Start a Wake continuation on a NEW card from this accumulator
     /// (ADR-0059): the previous card's slice was already finalized with the
     /// facts it had, so the chain's newest card begins a fresh live phase —
-    /// Loading, with the ended attempt's failure display facts cleared (a
-    /// continuation carries no question to re-ask, so it never re-shows the
-    /// failure nor offers Retry). The rendered content, the timeline boundary
-    /// the handoff advanced and the interaction blocks stay: the continuation
-    /// renders only what arrives after the split and keeps the live controls
-    /// (ADR-0038).
+    /// Loading, marked [`Self::wake_continuation`] (it carries no question to
+    /// re-ask, so it never re-shows the ended attempt's failure nor offers
+    /// Retry). The rendered content, the timeline boundary the handoff
+    /// advanced and the interaction blocks stay: the continuation renders only
+    /// what arrives after the split and keeps the live controls (ADR-0038).
     pub(super) fn continue_on_new_card(&mut self) {
         self.error = None;
         self.prompt = None;
         self.retry_claimed = false;
+        self.wake_continuation = true;
         self.card_fallback = CardFallback::None;
         self.card_state = CardState::Loading;
         // The previous phase ended with the card; `refresh_phase` only resets
@@ -1556,12 +1562,11 @@ impl StreamAccumulator {
 
             // Error card: offer a retry that re-submits the original prompt
             // (spec #391), so the user doesn't have to retype it. Only Error
-            // offers the button — a Retried or live card must not — and only a
-            // card that actually carries a question to re-ask: a Wake
-            // continuation deliberately has none (ADR-0059), and neither does
-            // an externally-rendered card.
+            // offers the button — a Retried or live card must not — and a Wake
+            // continuation never does: it carries no question to re-ask
+            // (ADR-0059), so its Error ending is informational only.
             if self.card_state == CardState::Error
-                && self.prompt.is_some()
+                && !self.wake_continuation
                 && let Some(sid) = &self.session_id
             {
                 builder = builder.with_error_buttons(vec![crate::feishu::card::CardActionButton {
@@ -2577,6 +2582,29 @@ mod tests {
             acc.header_sig().contains("推理中"),
             "awaiting title must lift back to the phase label: {}",
             acc.header_sig()
+        );
+    }
+
+    /// The Error card's Retry button (spec #391) is gated by the card's KIND,
+    /// not by what an attempt happens to have stored: an Error card offers it
+    /// as before (the external/snapshot renderers included), while a Wake
+    /// continuation never does — it carries no question to re-ask (ADR-0059).
+    #[test]
+    fn a_wake_continuation_never_offers_retry() {
+        let error_card = |wake_continuation: bool| {
+            let mut acc = StreamAccumulator::new("test");
+            acc.card_state = CardState::Error;
+            acc.session_id = Some("ses_1".into());
+            acc.wake_continuation = wake_continuation;
+            acc.build_card().to_string()
+        };
+        assert!(
+            error_card(false).contains("重试"),
+            "an Error card offers Retry exactly as before"
+        );
+        assert!(
+            !error_card(true).contains("重试"),
+            "a Wake continuation never offers Retry"
         );
     }
 }

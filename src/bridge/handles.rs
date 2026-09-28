@@ -1029,6 +1029,22 @@ pub(crate) struct TurnHandles {
     pub(crate) config: TurnConfig,
 }
 
+impl TurnHandles {
+    /// The same handles as the flow bundle — every concern but the turn
+    /// config — for the flows that run under a Turn (the shared out-of-turn
+    /// settle loop the follow and the Wake continuation both run takes this).
+    pub(crate) fn flow(&self) -> FlowHandles {
+        FlowHandles {
+            sessions: self.sessions.clone(),
+            cards: self.cards.clone(),
+            requests: self.requests.clone(),
+            waits: self.waits.clone(),
+            backend: Arc::clone(&self.backend),
+            platform: Arc::clone(&self.platform),
+        }
+    }
+}
+
 /// The bundle every flow runs on (spec #298, B): the four per-concern handles
 /// plus the two adapters. The request flow and the external-message flow use it
 /// whole; the command, topic and poll bundles embed it and add their own state.

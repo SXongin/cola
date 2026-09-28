@@ -1,12 +1,8 @@
 mod flush;
 mod follow;
 mod render;
+mod settle;
 mod state;
-
-/// The two unobservable endings the out-of-turn follow and the Wake
-/// continuation's loop share, re-exported so their user-facing copy cannot
-/// drift (ADR-0059).
-pub(crate) use follow::{LOST_CONTACT_ERROR, STUCK_PANEL_ERROR};
 
 /// The one card-session type the coordinator's map holds. Its accumulator and
 /// identity chain stay private to the Turn module: every read/write goes
@@ -20,7 +16,7 @@ use tracing::Instrument;
 
 use crate::backend::{MessageRole, SessionTranscript, TurnAnchor, TurnSettle};
 use crate::bridge::handler::image_inputs;
-use crate::bridge::handles::{CardsHandle, RequestsHandle, SessionsHandle, TurnHandles};
+use crate::bridge::handles::{CardsHandle, FlowHandles, RequestsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
 use crate::bridge::turn::state::StreamAccumulator;
 use crate::config::ThreadKey;
@@ -1183,8 +1179,20 @@ impl Turn {
 /// split gets one slot past the bound, so a Supplement is never refused by it.
 pub(crate) const MAX_CARD_CHAIN: usize = 8;
 
-/// Why a Card Chain split was requested: each cause writes its own receipt
-/// line on the continuation (ADR-0043).
+/// The injectable timings of the out-of-turn settle loop the follow and the
+/// Wake continuation share ([`settle`]): the render poll cadence, the
+/// per-read bound, and the lost-contact / stuck-panel grace. Built by each
+/// caller from its own injected atomics (the follow's `TurnConfig`, the
+/// external flow's cadences), so the loop never reads a global.
+#[derive(Clone, Copy)]
+pub(crate) struct SettleTiming {
+    pub(crate) poll_ms: u64,
+    pub(crate) read_timeout_ms: u64,
+    pub(crate) grace_ms: u64,
+}
+
+/// Why a Card Chain split was requested: the cause owns both its receipt line
+/// and its handoff rule, so the flush never re-lists the causes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SplitKind {
     /// A Supplement landed below the live card (ADR-0043).
@@ -1196,6 +1204,40 @@ pub(crate) enum SplitKind {
     /// (ADR-0059): the chain continues on a new card below the user's
     /// message, and that new message is the notification.
     Wake,
+}
+
+/// The receipt line a Supplement's continuation carries (ADR-0043).
+const SUPPLEMENT_RECEIPT: &str = "📨 已收到补充";
+
+/// The `/card` pull's continuation line (ADR-0043, 2026-09-22 amendment).
+const PULL_RECEIPT: &str = "⏬ 实时卡片已移到底部";
+
+/// The 承接 line a Wake continuation opens with (ADR-0059): the new card is
+/// itself the notification, and this line says why it appeared — the Turn was
+/// resumed by the Backend after going idle. Source-neutral on purpose: a Wake
+/// can be a finished background task, a subagent, an interruption or a server
+/// restart, and cola never claims more than "the work resumed".
+const WAKE_RECEIPT: &str = "🔔 已恢复执行，继续处理…";
+
+impl SplitKind {
+    /// The one receipt line this cause's continuation carries: every queued
+    /// split gets exactly one, in arrival order.
+    pub(crate) fn receipt(self) -> &'static str {
+        match self {
+            Self::Supplement => SUPPLEMENT_RECEIPT,
+            Self::Pull => PULL_RECEIPT,
+            Self::Wake => WAKE_RECEIPT,
+        }
+    }
+
+    /// Whether this cause continues a card that has already ENDED: a Wake
+    /// arrives after the Turn yielded 等待后台任务 or its card ended, so the
+    /// handoff must not restamp a terminal card's ending, and the continuation
+    /// starts a fresh live phase (the ended attempt's display facts stay
+    /// behind). Every other cause splits a card that is still live.
+    pub(crate) fn continues_an_ended_card(self) -> bool {
+        matches!(self, Self::Wake)
+    }
 }
 
 /// The Turn's card-delivery interface (spec #298, A2a): the operations sibling
@@ -1273,7 +1315,7 @@ impl Turn {
             let Some(card) = live.get_mut(session_id) else {
                 return false;
             };
-            if card.acc.card_state.is_live() {
+            if card.acc.card_state.is_render_owned() {
                 return false;
             }
             card.pending_split.push(state::PendingSplit {
@@ -1687,7 +1729,12 @@ impl Turn {
     pub(crate) async fn claim_retry(cards: &CardsHandle, session_id: &str) -> Option<TurnRetry> {
         let mut live = cards.cards.lock().await;
         let card = live.get_mut(session_id)?;
-        if card.acc.card_state != crate::feishu::card::CardState::Error || card.acc.retry_claimed {
+        if card.acc.card_state != crate::feishu::card::CardState::Error
+            || card.acc.retry_claimed
+            // A Wake continuation carries no question to re-ask (ADR-0059):
+            // its card never offers Retry, so no click may claim one either.
+            || card.acc.wake_continuation
+        {
             return None;
         }
         // A card that was never sent cannot be marked; an Error card always
@@ -1979,42 +2026,45 @@ impl Turn {
     }
 }
 
-/// The fixture Session Sync arms a Wake continuation with (ADR-0059): which
-/// Wake resumed the Turn, when the continuation answers one. A chain that
-/// exists is continued by a split of its own accumulator, whose anchor already
-/// scopes the settle decision; a fresh (restart) continuation is scoped at the
-/// Wake's own anchor.
-pub(crate) struct WakeContinuation {
-    /// The newest placeable Wake that resumed the Turn. `None` marks a pure
-    /// content diff — no Wake, just content the card chain missed.
-    wake: Option<crate::backend::Wake>,
+/// What Session Sync owes for one read (ADR-0059): the decision carries
+/// everything the caller needs to act on it, so the same lock acquisition
+/// that found the chain also says which handoff to use — nothing is
+/// re-derived under a second look.
+pub(crate) enum WakeContinuation {
+    /// A card chain exists: continue it by split. Only the content the chain
+    /// has not rendered lands on the continuation, and the accumulator's own
+    /// anchor scopes the settle decision.
+    ContinueChain,
+    /// No chain (a cola restart): arm a fresh card, scoped at the newest
+    /// Wake's own anchor so the lost card's content is never replayed.
+    Fresh { anchor: TurnAnchor },
 }
 
-impl WakeContinuation {
-    /// The scope a FRESH continuation (no card chain — a cola restart) renders
-    /// and settles from: only the newest Wake's own work, never the whole Turn
-    /// the lost card already showed. `None` when there is no placeable Wake to
-    /// scope it to — a pure content diff cannot be re-rendered after a
-    /// restart, and the Session Snapshot owns re-adoption.
-    pub(crate) fn fresh_anchor(&self) -> Option<TurnAnchor> {
-        let wake = self.wake.as_ref()?;
-        Some(TurnAnchor {
-            message_id: wake.id.clone(),
-            created_ms: wake.created_ms?,
-        })
-    }
+/// The destination and identity a Wake continuation card is armed with:
+/// where it replies, its subtitle, the session's work directory (the Turn
+/// Footer) and the `/think` variant captured at arm time (ADR-0019). Grouped
+/// so the arming call stays readable.
+pub(crate) struct ContinuationFacts<'a> {
+    /// The Feishu message the card replies to. `None` lets the caller send at
+    /// the chat top level (a restart leaves no reply target to recover); the
+    /// split path needs one and resolves it before choosing that branch.
+    pub(crate) reply_to: Option<&'a str>,
+    pub(crate) subtitle: &'a str,
+    pub(crate) directory: &'a str,
+    pub(crate) variant: Option<String>,
 }
 
 /// The Wake-continuation interface (ADR-0059): the decision Session Sync asks,
-/// and the card operations it arms the continuation with. The accumulator and
-/// the chain's identity stay private to the Turn module; Session Sync only
-/// learns whether a continuation is owed and which anchor scopes it.
+/// the card operations it arms the continuation with, and the out-of-turn loop
+/// its ending runs through. The accumulator and the chain's identity stay
+/// private to the Turn module; Session Sync only learns what is owed and which
+/// anchor scopes it.
 impl Turn {
-    /// Whether Session Sync owes a Wake continuation for this read, and the
-    /// fixture to arm it with. The caller owns the scope predicates: the
-    /// Session must be the thread's Active Session, its newest user message
-    /// must be a Cola-Authored Message, and no live Turn/follow/renderer may
-    /// own the card ([`Self::card_is_owned`]).
+    /// What Session Sync owes for this read: `None` when the chain has
+    /// nothing unrendered, `Some([`WakeContinuation`])` otherwise. The caller
+    /// owns the scope predicates: the Session must be the thread's Active
+    /// Session, its newest user message must be a Cola-Authored Message, and
+    /// no live Turn/follow/renderer may own the card ([`Self::card_is_owned`]).
     ///
     /// The decision is a content diff over the Session Transcript (ADR-0059),
     /// never a terminal step:
@@ -2026,9 +2076,9 @@ impl Turn {
     ///   finalized. Nothing new renders -> nothing is owed, which is also what
     ///   keeps a rendered Wake from being re-posted on every poll.
     /// - **No chain (a cola restart).** Nothing durable says what the lost
-    ///   card showed, so only the newest Wake's own work may be rendered,
-    ///   scoped at the Wake's anchor — the whole Turn is never replayed. A
-    ///   Wake-less read owes nothing.
+    ///   card showed, so only the newest placeable Wake's own work may be
+    ///   rendered, scoped at the Wake's anchor — the whole Turn is never
+    ///   replayed. A Wake-less read owes nothing.
     pub(crate) async fn wake_continuation(
         cards: &CardsHandle,
         session_id: &str,
@@ -2042,22 +2092,12 @@ impl Turn {
             .filter(|wake| wake.created_ms.is_some())
             .max_by_key(|wake| wake.created_ms);
         if let Some(card) = chain {
-            let mut probe = card.acc.clone();
-            probe.turn_anchor = Some(turn_anchor.clone());
-            return render::render_new_turn_parts(&mut probe, transcript).then(|| WakeContinuation {
-                wake: newest_wake.cloned(),
-            });
+            return render::renders_new_content(&card.acc, transcript, turn_anchor)
+                .then_some(WakeContinuation::ContinueChain);
         }
-        let wake = newest_wake?;
-        let anchor = TurnAnchor {
-            message_id: wake.id.clone(),
-            created_ms: wake.created_ms?,
-        };
-        let mut probe = StreamAccumulator::new("");
-        probe.turn_anchor = Some(anchor);
-        render::render_new_turn_parts(&mut probe, transcript).then(|| WakeContinuation {
-            wake: Some(wake.clone()),
-        })
+        let anchor = newest_wake?.anchor()?;
+        let probe = StreamAccumulator::new("");
+        render::renders_new_content(&probe, transcript, &anchor).then_some(WakeContinuation::Fresh { anchor })
     }
 
     /// Whether `session_id`'s card chain is owned by a live renderer — a Turn
@@ -2071,13 +2111,13 @@ impl Turn {
             .lock()
             .await
             .get(session_id)
-            .is_some_and(|card| card.acc.card_state.is_live())
+            .is_some_and(|card| card.acc.card_state.is_render_owned())
     }
 
     /// `session_id`'s chain identity, when it has a card session — the Wake
-    /// continuation render loop's replacement guard. A Wake continues the SAME
-    /// Turn, so its accumulator's anchor cannot tell its loop apart from a new
-    /// Turn's; the chain identity can (a replacement session gets a new one).
+    /// continuation loop's ownership guard. A Wake continues the SAME Turn, so
+    /// its accumulator's anchor cannot tell its loop apart from a new Turn's;
+    /// the chain identity can (a replacement session gets a new one).
     pub(crate) async fn chain_id(cards: &CardsHandle, session_id: &str) -> Option<u64> {
         cards
             .cards
@@ -2090,39 +2130,34 @@ impl Turn {
     /// Arm a FRESH Wake continuation card: the no-chain path (a cola restart
     /// happened while the Wake was pending), so there is nothing to hand over.
     /// The new accumulator renders only the Wake's own work — scoped at
-    /// `anchor` — opens with the 承接 line, carries the session's work context
-    /// and answers to `reply_to`. Returns the card to send; the caller attaches
-    /// its id with [`Self::set_card_message_id`]. `None` when a live
-    /// Turn/renderer has taken the session over meanwhile — the caller must
-    /// then send nothing.
-    #[allow(clippy::too_many_arguments)] // the continuation card's whole arming fixture
+    /// `anchor` — opens with the 承接 line, carries the session's work context,
+    /// answers to `facts.reply_to` and is marked a continuation (it offers no
+    /// Retry). Returns the card to send; the caller attaches its id with
+    /// [`Self::set_card_message_id`]. `None` when the session has a card after
+    /// all — the decision saw none, so a chain appeared meanwhile and owns the
+    /// session now; the caller must send nothing and the next poll re-decides.
     pub(crate) async fn arm_wake_continuation(
         cards: &CardsHandle,
         session_id: &str,
         anchor: &TurnAnchor,
-        reply_to: Option<&str>,
-        subtitle: &str,
-        session_dir: &str,
-        variant: Option<String>,
+        facts: ContinuationFacts<'_>,
     ) -> Option<serde_json::Value> {
-        let work_context = StreamAccumulator::capture_work_context(session_dir).await;
+        let work_context = StreamAccumulator::capture_work_context(facts.directory).await;
         let mut live = cards.cards.lock().await;
-        if live
-            .get(session_id)
-            .is_some_and(|card| card.acc.card_state.is_live())
-        {
+        if live.contains_key(session_id) {
             return None;
         }
-        let mut acc = StreamAccumulator::new(subtitle);
+        let mut acc = StreamAccumulator::new(facts.subtitle);
         acc.turn_anchor = Some(anchor.clone());
         acc.session_id = Some(session_id.to_string());
-        acc.reply_to_message_id = reply_to.map(str::to_string);
-        acc.variant = variant;
+        acc.reply_to_message_id = facts.reply_to.map(str::to_string);
+        acc.variant = facts.variant;
+        acc.wake_continuation = true;
         acc.apply_work_context(work_context);
         // The 承接 line is keyed just before the Wake's own work so the
         // resumed parts — whose server times are at or after the anchor —
         // always insert below it.
-        acc.push_text_at(Some(anchor.created_ms.saturating_sub(1)), flush::WAKE_RECEIPT);
+        acc.push_text_at(Some(anchor.created_ms.saturating_sub(1)), WAKE_RECEIPT);
         let card = {
             // The initial send is a probe: building it must not advance the
             // live card's render boundary.
@@ -2131,6 +2166,30 @@ impl Turn {
         };
         live.insert(session_id.to_string(), state::CardSession::new(acc, None));
         Some(card)
+    }
+
+    /// Run the Wake continuation's out-of-turn settle loop (ADR-0059) on the
+    /// caller's own task: the shared out-of-turn loop under the
+    /// continuation's chain identity, then its ending stamped on the card. No
+    /// Completion Notice follows — the continuation card is itself the
+    /// notification.
+    pub(crate) async fn wake_settle_loop(
+        flow: &FlowHandles,
+        session_id: &str,
+        directory: &str,
+        anchor: &TurnAnchor,
+        chain: u64,
+        timing: SettleTiming,
+    ) {
+        let owns = settle::Ownership::Chain {
+            chain,
+            anchor: anchor.clone(),
+        };
+        let Some(ending) = settle::run(flow, session_id, directory, timing, &owns, "wake continuation").await
+        else {
+            return;
+        };
+        settle::stamp(&flow.cards, session_id, &ending).await;
     }
 
     /// Attach the sent card's identity to an armed-but-idless continuation
