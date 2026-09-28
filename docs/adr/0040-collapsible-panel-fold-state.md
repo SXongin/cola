@@ -39,6 +39,9 @@ keeps the plan size and status counts readable.
   card-update mechanism.
 - **Retry reuses a card.** A retry re-renders the same message from a fresh
   `StreamAccumulator` (`src/bridge/turn/state.rs:342`), so `seq` restarts on it.
+  *(Superseded by the 2026-09-28 amendment, spec #391: a retry now replies a NEW
+  card below the marked failed one — but its accumulator is still fresh, so
+  `seq` still restarts on it.)*
 
 ## Decision
 
@@ -62,7 +65,9 @@ timeline entry it renders.**
   a panel can come back wearing the state its id held in the failed attempt
   (`todo` does so by design). Accepted: a retry is a fresh read, and a
   globally-seeded counter would only make the tail and the timeline panels
-  disagree about it.
+  disagree about it. *(Superseded by the 2026-09-28 amendment, spec #391: a
+  retry replies a NEW card, so no panel of the failed card's message is
+  re-rendered — the new card starts with no inherited fold state.)*
 
 ## Why
 
