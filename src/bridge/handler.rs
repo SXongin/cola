@@ -1845,11 +1845,13 @@ impl App {
     /// retry (the atomic double-click guard behind the Turn interface), spawns
     /// the decision pipeline and returns a "retrying" toast immediately; the
     /// pipeline then reads the session's status and transcript once, decides,
-    /// marks the failed card `Retried` and submits the prompt onto a NEW card
-    /// below it.
+    /// and either re-attaches the card to a run that is still alive, or marks
+    /// the failed card `Retried` and submits the prompt onto a NEW card below
+    /// it.
     ///
-    /// The claim is released when nothing is submitted (a busy run, or a
-    /// session/thread that vanished), so a later click can try again.
+    /// The claim is released when nothing is submitted and nothing is
+    /// re-attached (a session/thread that vanished, or a busy run with no
+    /// anchor to follow), so a later click can try again.
     async fn handle_retry_action(self: &Arc<Self>, value: &serde_json::Value) -> Option<CardActionResult> {
         let sid = value
             .get("session_id")
@@ -1898,17 +1900,17 @@ impl App {
         })
     }
 
-    /// The retry's read → decide → submit pipeline, off the ack path.
+    /// The retry's read → decide → act pipeline, off the ack path.
     ///
     /// One bounded read pair — session status + session transcript, each with
     /// the follow's per-read timeout — then the matrix (spec #391): a live run
-    /// submits nothing; a settled turn takes a fresh `msg_cola_` id; an
-    /// unpersisted or unfinished turn reuses the failed attempt's id; a read
-    /// that failed or timed out is unknown and submits a fresh id, so a
-    /// transient hiccup never recreates the "click does nothing" bug. The
-    /// submit branches hand off to `Turn::start`, which marks the failed card
-    /// `Retried` once it holds the session's inflight guard and replies the
-    /// attempt's new card.
+    /// is re-attached and submits nothing; a settled turn takes a fresh
+    /// `msg_cola_` id; an unpersisted or unfinished turn reuses the failed
+    /// attempt's id; a read that failed or timed out is unknown and submits a
+    /// fresh id, so a transient hiccup never recreates the "click does
+    /// nothing" bug. The submit branches hand off to `Turn::start`, which marks
+    /// the failed card `Retried` once it holds the session's inflight guard and
+    /// replies the attempt's new card.
     async fn run_retry(
         self: Arc<Self>,
         handles: crate::bridge::handles::TurnHandles,
@@ -1964,13 +1966,26 @@ impl App {
         );
         let cola_message_id = match decision {
             crate::bridge::turn::RetryDecision::Busy => {
-                // The run is alive: no prompt. The re-attach cell is ticket
-                // #393; until then the claim goes back so the button still
-                // works once the run ends.
-                crate::bridge::turn::Turn::release_retry_claim(&handles.cards, &retry.session_id).await;
+                // The run is alive: no prompt. Re-attach the card to it — the
+                // Error is cleared, a live header state is restored, and the
+                // out-of-turn follow keeps rendering on the accumulator's own
+                // anchor until the run really ends (spec #391, ticket #393).
+                let attached = crate::bridge::turn::Turn::reattach_run(
+                    &handles,
+                    &retry.session_id,
+                    &thread_key,
+                    directory,
+                )
+                .await;
+                if !attached {
+                    // No live card, or no anchor to follow: give the claim
+                    // back so the Error card's retry still works.
+                    crate::bridge::turn::Turn::release_retry_claim(&handles.cards, &retry.session_id).await;
+                }
                 tracing::info!(
-                    "retry: session {} still busy; nothing submitted",
-                    retry.session_id
+                    "retry: session {} still busy; re-attached={}",
+                    retry.session_id,
+                    attached
                 );
                 return;
             }

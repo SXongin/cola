@@ -614,6 +614,36 @@ impl StreamAccumulator {
         }
     }
 
+    /// Restore a live card after its Error was cleared (spec #391, ticket
+    /// #393): the phase the card's existing content implies — Streaming when
+    /// text or a running tool is on it, Reasoning when only reasoning has
+    /// streamed, Loading otherwise — and a fresh phase timer, because the card
+    /// was frozen in Error while the run continued (the elapsed time it held
+    /// measured nothing of this activity).
+    pub(super) fn resume_live(&mut self) {
+        self.card_state = if !self.text.is_empty()
+            || self
+                .tools
+                .values()
+                .any(crate::feishu::card::tool_render::ToolPanel::is_running)
+            || self
+                .todo_panel
+                .as_ref()
+                .is_some_and(crate::feishu::card::tool_render::ToolPanel::is_running)
+        {
+            CardState::Streaming
+        } else if !self.reasoning.is_empty() {
+            CardState::Reasoning
+        } else {
+            CardState::Loading
+        };
+        // The Error state held the active phase at None, but the phase could
+        // still be Some from before the failure: clear first so the timer is
+        // always restarted (`refresh_phase` only resets on a change).
+        self.current_phase = None;
+        self.refresh_phase();
+    }
+
     /// Add an interaction block to the card unless a block for the same
     /// request is already present (the poll loop and the adopt-time snapshot
     /// both feed blocks in). Live blocks render in the card's tail; resolving

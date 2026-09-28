@@ -1183,8 +1183,8 @@ impl TurnRetry {
 /// pair (spec #391). The matrix is evaluated in order: a live run first, then
 /// the failed turn's transcript.
 pub(crate) enum RetryDecision {
-    /// The run is still alive (Busy/Retry): no prompt is submitted. Ticket
-    /// #393's re-attach cell slots in here.
+    /// The run is still alive (Busy/Retry): no prompt is submitted — the card
+    /// is re-attached to the running run instead (ticket #393).
     Busy,
     /// Submit under a fresh `msg_cola_` id: the failed turn reads settled
     /// through the finalization's completion projection (`TurnView::complete` —
@@ -1200,7 +1200,7 @@ pub(crate) enum RetryDecision {
 /// The retry decision (spec #391's matrix), a pure function over the bounded
 /// read pair so the cells are testable without a backend:
 ///
-/// - status Busy/Retry → [`RetryDecision::Busy`] (no submit);
+/// - status Busy/Retry → [`RetryDecision::Busy`] (re-attach; no submit);
 /// - a status read that failed, timed out or reported an unreadable kind is
 ///   unknown → a fresh id: the click must always have an effect;
 /// - idle + the failed turn reads settled through the finalization's own neutral
@@ -1472,13 +1472,79 @@ impl Turn {
         })
     }
 
-    /// Release an unused retry claim. The `Busy` decision submits nothing
-    /// (ticket #393 re-attaches there), so the claim goes back: a later click
-    /// can retry once the run has ended instead of finding a dead button.
+    /// Release an unused retry claim. A click that neither submits nor
+    /// re-attaches (the `Busy` decision with no anchor to follow, a retry that
+    /// lost the inflight guard, or a vanished session/thread) gives the claim
+    /// back, so a later click can retry once the run has ended instead of
+    /// finding a dead button.
     pub(crate) async fn release_retry_claim(cards: &CardsHandle, session_id: &str) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
             card.acc.retry_claimed = false;
         }
+    }
+
+    /// Re-attach a still-running run to its live card (spec #391, ticket #393):
+    /// the retry click's decision read found the run alive, so nothing is
+    /// submitted. The card's Error is cleared — its content is untouched — a
+    /// live header state is restored, the unused retry claim goes back (the
+    /// follow may fail the card again, and that retry must be claimable), and
+    /// the out-of-turn [`follow`] is spawned on the accumulator's own anchor to
+    /// keep rendering until the run truly ends. Re-attach adds no loop: the
+    /// follow already owns Busy→non-busy finalization, `/stop`, the graces and
+    /// the silent exit when a new Turn replaces the accumulator.
+    ///
+    /// `directory` routes the follow's status reads (the handler's session
+    /// mapping first, the accumulator's work context as the fallback). The
+    /// follow's start time is "now": the original turn's start is no longer
+    /// known here, so the long-task notice measures the re-attached stretch.
+    ///
+    /// Returns false when there is no card, the card is not in `Error` (a new
+    /// Turn may have replaced the accumulator since the claim), or the
+    /// accumulator carries no anchor to follow (nothing the failed submission
+    /// stored can be ordered against a run) — the caller then releases the
+    /// claim and the Error card keeps a working retry.
+    pub(crate) async fn reattach_run(
+        handles: &TurnHandles,
+        session_id: &str,
+        thread_key: &ThreadKey,
+        directory: Option<String>,
+    ) -> bool {
+        let (anchor, directory) = {
+            let mut live = handles.cards.cards.lock().await;
+            let Some(card) = live.get_mut(session_id) else {
+                return false;
+            };
+            if card.acc.card_state != crate::feishu::card::CardState::Error {
+                return false;
+            }
+            // The follow's identity and turn filter: without an anchor there
+            // is no turn to follow, so the Error card stays retryable.
+            let Some(anchor) = card.acc.turn_anchor.clone() else {
+                return false;
+            };
+            card.acc.error = None;
+            // The claim goes back with the Error state: the run may fail for
+            // real, and that Error's retry must be claimable.
+            card.acc.retry_claimed = false;
+            card.acc.resume_live();
+            let resolved_directory = directory
+                .filter(|directory| !directory.is_empty())
+                .or_else(|| card.acc.directory.clone())
+                .unwrap_or_default();
+            (anchor, resolved_directory)
+        };
+        // The operator just clicked: the card must leave Error now, not after
+        // the follow's first sleep.
+        Self::flush_card(&handles.cards, session_id).await;
+        follow::spawn(
+            handles,
+            session_id.to_string(),
+            thread_key.clone(),
+            directory,
+            std::time::Instant::now(),
+            anchor,
+        );
+        true
     }
 
     /// Mark the session's failed card `Retried` and flush it (spec #391):
@@ -2262,7 +2328,8 @@ mod tests {
         let settled = window(true);
         let id = Some("msg_cola_x");
 
-        // A live run is never re-prompted (ticket #393 owns the re-attach).
+        // A live run is never re-prompted: the click re-attaches instead
+        // (ticket #393).
         for status in [SessionStatus::Busy, SessionStatus::Retry] {
             assert!(
                 matches!(
