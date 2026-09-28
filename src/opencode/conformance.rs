@@ -28,6 +28,11 @@ pub(crate) struct SessionCase {
     /// (`true` on V2's session switches, `false` on V1, whose picks ride each
     /// prompt). Drives the session-selection conformance scenario.
     pub(crate) keeps_session_selection: bool,
+    /// Whether a same-id re-post of an ADMITTED user message can still continue
+    /// the turn on this generation (`true` on V1's upsert-continue, `false` on
+    /// V2, whose admission makes the re-post a no-op). Drives the retry-id
+    /// conformance scenario.
+    pub(crate) reuse_continues_an_admitted_turn: bool,
     /// Mount the generation's fake session-read routes (a two-page list, one
     /// session get, the run-state reads), publishing the shared
     /// [`SessionReadFixture`] values in that generation's envelope shapes.
@@ -861,5 +866,28 @@ async fn session_switches_round_trip_only_where_the_generation_keeps_them() {
                 server.requests()
             );
         }
+    }
+}
+
+/// The retry-id contract is generation-dependent: V1's same-id re-post can
+/// continue an admitted, unfinished turn (upsert-continue); V2's id is an
+/// admission key, so the same re-post returns without running. The bridge's
+/// retry matrix reads exactly this capability instead of guessing.
+#[tokio::test]
+async fn retry_reuse_continuation_matches_the_generation() {
+    for case in cases() {
+        let generation = case.generation.as_str();
+        let server = TestHttpServer::start().await;
+        let backend = case.backend(&server);
+        assert_eq!(
+            backend.reuse_continues_an_admitted_turn(),
+            case.reuse_continues_an_admitted_turn,
+            "{generation}: the retry-reuse contract must match the generation"
+        );
+        assert!(
+            server.requests().is_empty(),
+            "{generation}: the capability must answer without a wire read: {:?}",
+            server.requests()
+        );
     }
 }

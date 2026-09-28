@@ -1203,39 +1203,53 @@ impl TurnRetry {
 
 /// What a retry click decided to do, from the bounded status + transcript read
 /// pair (spec #391). The matrix is evaluated in order: a live run first, then
-/// the failed turn's transcript.
+/// the failed turn's transcript. The submit cells are generation-aware: id
+/// reuse is only safe where the server contract says a same-id re-post of an
+/// admitted turn still runs.
 pub(crate) enum RetryDecision {
     /// The run is still alive (Busy/Retry): no prompt is submitted — the card
     /// is re-attached to the running run instead (ticket #393).
     Busy,
     /// Submit under a fresh `msg_cola_` id: the failed turn reads settled
     /// through the finalization's completion projection (`TurnView::complete` —
-    /// a terminal finish on an assistant message within the turn), the decision
-    /// read was unknown, or no id exists to reuse.
+    /// a terminal finish on an assistant message within the turn), the
+    /// submission was admitted but unfinished on a generation whose re-post is
+    /// a no-op (V2), the decision read was unknown, or no id exists to reuse.
     NewId,
-    /// Submit reusing the failed attempt's id: nothing of the submission was
-    /// stored, or its reply never finished — the server creates or continues
-    /// the turn.
+    /// Submit reusing the failed attempt's id. Two shapes only: nothing of the
+    /// submission was stored (no anchor — both generations create and run it),
+    /// or the id was admitted with an unfinished turn on a generation whose
+    /// re-post continues it (V1's upsert). A same-id re-post of a SETTLED turn
+    /// is always a fresh-id decision instead.
     Reuse(String),
 }
 
 /// The retry decision (spec #391's matrix), a pure function over the bounded
-/// read pair so the cells are testable without a backend:
+/// read pair so the cells are testable without a backend.
+/// `reuse_continues_an_admitted_turn` is the server-contract capability
+/// ([`crate::backend::Backend::reuse_continues_an_admitted_turn`]): true where
+/// a same-id re-post of an admitted, unfinished turn still runs (V1), false
+/// where admission makes it a no-op (V2).
 ///
 /// - status Busy/Retry → [`RetryDecision::Busy`] (re-attach; no submit);
 /// - a status read that failed, timed out or reported an unreadable kind is
 ///   unknown → a fresh id: the click must always have an effect;
-/// - idle + the failed turn reads settled through the finalization's own neutral
-///   projection (`turn_for_user(..).complete`, i.e. a terminal finish on an
-///   assistant message within the turn) → a fresh id (a same-id re-post against
-///   a settled turn is a server no-op);
-/// - idle + no assistant reply, an anchorless read, or an unfinished reply →
-///   reuse the failed attempt's id (idempotent; the server creates or
-///   continues the turn), or a fresh id when there is no id to reuse.
+/// - idle + no anchor for the id (nothing was admitted) → reuse (both
+///   generations create and run it);
+/// - idle + the failed turn reads settled through the finalization's own
+///   neutral projection (`turn_for_user(..).complete`, i.e. a terminal finish
+///   on an assistant message within the turn) → a fresh id (a same-id re-post
+///   against a settled turn runs nothing, and the new attempt is the honest
+///   history);
+/// - idle + the id admitted but its turn unfinished (a failed step, or an
+///   orphaned run): reuse where the capability is true (V1's upsert-continue),
+///   a fresh id where it is false (V2's admission no-op);
+/// - no id to reuse, or no transcript to read → a fresh id.
 pub(crate) fn retry_decision(
     status: Option<SessionStatus>,
     transcript: Option<&SessionTranscript>,
     cola_message_id: Option<&str>,
+    reuse_continues_an_admitted_turn: bool,
 ) -> RetryDecision {
     match status {
         Some(SessionStatus::Busy | SessionStatus::Retry) => RetryDecision::Busy,
@@ -1249,16 +1263,24 @@ pub(crate) fn retry_decision(
             let Some(transcript) = transcript else {
                 return RetryDecision::NewId;
             };
-            // No anchor means the failed submission stored no user message (or
-            // one that cannot be ordered): nothing settled, so the idempotent
-            // reuse is the safe submit.
-            let settled = transcript
-                .anchor_of_user(id)
-                .is_some_and(|anchor| transcript.turn_for_user(&anchor).complete);
+            let Some(anchor) = transcript.anchor_of_user(id) else {
+                // The submission stored no user message (or one that cannot be
+                // ordered): nothing was admitted, so the idempotent reuse is
+                // the safe submit on either generation.
+                return RetryDecision::Reuse(id.to_string());
+            };
+            let settled = transcript.turn_for_user(&anchor).complete;
             if settled {
+                // A same-id re-post against a settled turn runs nothing (V2)
+                // or re-authors nothing useful (V1): take a fresh attempt.
                 RetryDecision::NewId
-            } else {
+            } else if reuse_continues_an_admitted_turn {
+                // V1's upsert: the re-post continues the admitted turn.
                 RetryDecision::Reuse(id.to_string())
+            } else {
+                // V2's admission key: the re-post would be a silent no-op, so
+                // the retry must be a new attempt.
+                RetryDecision::NewId
             }
         }
     }
@@ -2344,13 +2366,17 @@ mod tests {
         let unfinished = window(false);
         let settled = window(true);
         let id = Some("msg_cola_x");
+        // The server-contract capability: V1 continues an admitted unfinished
+        // turn on a same-id re-post, V2's admission makes it a no-op.
+        let v1 = true;
+        let v2 = false;
 
         // A live run is never re-prompted: the click re-attaches instead
         // (ticket #393).
         for status in [SessionStatus::Busy, SessionStatus::Retry] {
             assert!(
                 matches!(
-                    retry_decision(Some(status), Some(&settled), id),
+                    retry_decision(Some(status), Some(&settled), id, v1),
                     RetryDecision::Busy
                 ),
                 "{status:?} must not submit"
@@ -2358,36 +2384,49 @@ mod tests {
         }
         // Unknown (status read failed/timed out, unreadable kind) → fresh id.
         assert!(matches!(
-            retry_decision(None, Some(&settled), id),
+            retry_decision(None, Some(&settled), id, v1),
             RetryDecision::NewId
         ));
-        assert!(matches!(retry_decision(None, None, id), RetryDecision::NewId));
+        assert!(matches!(retry_decision(None, None, id, v2), RetryDecision::NewId));
         // No id to reuse, or no transcript to read → fresh id.
         assert!(matches!(
-            retry_decision(Some(SessionStatus::Idle), Some(&settled), None),
+            retry_decision(Some(SessionStatus::Idle), Some(&settled), None, v1),
             RetryDecision::NewId
         ));
         assert!(matches!(
-            retry_decision(Some(SessionStatus::Idle), None, id),
+            retry_decision(Some(SessionStatus::Idle), None, id, v2),
             RetryDecision::NewId
         ));
-        // Settled → fresh id (a same-id re-post would be a server no-op).
+        // Settled → fresh id on BOTH generations (a same-id re-post against a
+        // settled turn runs nothing on V2 and is not the honest history on V1).
+        for reuse_continues in [v1, v2] {
+            assert!(matches!(
+                retry_decision(Some(SessionStatus::Idle), Some(&settled), id, reuse_continues),
+                RetryDecision::NewId
+            ));
+        }
+        // Admitted + unfinished: V1's upsert-continue → reuse; V2's admission
+        // key would no-op the re-post → fresh id.
         assert!(matches!(
-            retry_decision(Some(SessionStatus::Idle), Some(&settled), id),
-            RetryDecision::NewId
-        ));
-        // Unfinished, or no assistant reply/anchor at all → reuse.
-        assert!(matches!(
-            retry_decision(Some(SessionStatus::Idle), Some(&unfinished), id),
+            retry_decision(Some(SessionStatus::Idle), Some(&unfinished), id, v1),
             RetryDecision::Reuse(reused) if reused == "msg_cola_x"
         ));
         assert!(matches!(
-            retry_decision(
-                Some(SessionStatus::Idle),
-                Some(&SessionTranscript::new(vec![])),
-                id
-            ),
-            RetryDecision::Reuse(reused) if reused == "msg_cola_x"
+            retry_decision(Some(SessionStatus::Idle), Some(&unfinished), id, v2),
+            RetryDecision::NewId
         ));
+        // Nothing admitted (no anchor) → reuse on BOTH generations: both
+        // create and run the never-admitted id.
+        for reuse_continues in [v1, v2] {
+            assert!(matches!(
+                retry_decision(
+                    Some(SessionStatus::Idle),
+                    Some(&SessionTranscript::new(vec![])),
+                    id,
+                    reuse_continues
+                ),
+                RetryDecision::Reuse(reused) if reused == "msg_cola_x"
+            ));
+        }
     }
 }

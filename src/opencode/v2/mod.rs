@@ -531,6 +531,12 @@ impl GenerationStrategy for V2Strategy {
         true
     }
 
+    /// V2's prompt admits by `messageID`: once admitted, a same-id re-post is
+    /// a 200 no-op that runs nothing (only a never-admitted id runs).
+    fn reuse_continues_an_admitted_turn(&self) -> bool {
+        false
+    }
+
     /// The model's context-window size (tokens), from `GET /api/model`. Best
     /// effort like V1's provider read: any failure returns Ok(None) so the
     /// footer just omits the ratio.

@@ -138,6 +138,10 @@ impl Backend for OpenCodeBackend {
         OpenCodeBackend::keeps_session_selection(self)
     }
 
+    fn reuse_continues_an_admitted_turn(&self) -> bool {
+        OpenCodeBackend::reuse_continues_an_admitted_turn(self)
+    }
+
     async fn session_status(
         &self,
         session_id: &str,

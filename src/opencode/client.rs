@@ -362,6 +362,14 @@ impl OpenCodeBackend {
         self.strategy().keeps_session_selection()
     }
 
+    /// Whether a same-id re-post of an admitted user message can continue the
+    /// turn on the attached generation (V1's upsert-continue) or is a no-op
+    /// (V2's admission key). See
+    /// [`crate::backend::Backend::reuse_continues_an_admitted_turn`].
+    pub fn reuse_continues_an_admitted_turn(&self) -> bool {
+        self.strategy().reuse_continues_an_admitted_turn()
+    }
+
     pub async fn session_status(
         &self,
         session_id: &str,

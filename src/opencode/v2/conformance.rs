@@ -20,6 +20,7 @@ pub(crate) fn case() -> SessionCase {
     SessionCase {
         generation: Generation::V2,
         keeps_session_selection: true,
+        reuse_continues_an_admitted_turn: false,
         mount,
         mount_transcript,
         mount_recorded_transcript,
