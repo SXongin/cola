@@ -42,7 +42,13 @@
 //! order and content are asserted. Every V2 chain drives the production adapter:
 //! the prompt goes through the strategy's native admit-then-return submit and
 //! completion is observed from the transcript + run state, never a raw protocol
-//! read the Bridge would not perform (ADR-0056).
+//! read the Bridge would not perform (ADR-0056). The retry-id contract chain is
+//! the one deliberate exception: it also reads the raw wire rows, because that
+//! chain pins the row SHAPES the retry id policy rests on — an aborted
+//! `finish`/`error`, a tool still `running`, the appended idle event, and the
+//! byte-identical row a same-id re-post must leave behind — and the neutral
+//! transcript folds those fields away. Those reads are observations only; the
+//! submits under test still go through the production adapter.
 //!
 //! ## Re-recording the fixture corpus
 //!
@@ -350,15 +356,7 @@ async fn live_v2_scripted_transcript_read() {
 
     // The real adapter, pointed at the live child — its transport's env-proxy
     // workaround keeps the loopback traffic off a developer shell's proxy.
-    let backend = OpenCodeBackend::with_generation(
-        Some(provider::MODEL_REF),
-        server.base_url(),
-        Some("opencode"),
-        Some(server::PASSWORD),
-        Generation::V2,
-        None,
-    );
-    backend.disable_env_proxy(Some("opencode"), Some(server::PASSWORD));
+    let backend = v2_live_backend(&server);
 
     wait_for_ready(&backend, &server).await;
 
@@ -507,15 +505,7 @@ async fn live_v2_scripted_write_chain() {
     let provider = provider::start_with(provider::Tool::Shell, provider::ToolCommand::Slow).await;
     let server = LiveServer::start_v2(&binary, &provider.base_url()).await;
 
-    let backend = OpenCodeBackend::with_generation(
-        Some(provider::MODEL_REF),
-        server.base_url(),
-        Some("opencode"),
-        Some(server::PASSWORD),
-        Generation::V2,
-        None,
-    );
-    backend.disable_env_proxy(Some("opencode"), Some(server::PASSWORD));
+    let backend = v2_live_backend(&server);
 
     wait_for_ready(&backend, &server).await;
 
@@ -752,15 +742,7 @@ async fn live_v2_scripted_selection_chain() {
     let provider = provider::start_with(provider::Tool::Shell, provider::ToolCommand::Fast).await;
     let server = LiveServer::start_v2(&binary, &provider.base_url()).await;
 
-    let backend = OpenCodeBackend::with_generation(
-        Some(provider::MODEL_REF),
-        server.base_url(),
-        Some("opencode"),
-        Some(server::PASSWORD),
-        Generation::V2,
-        None,
-    );
-    backend.disable_env_proxy(Some("opencode"), Some(server::PASSWORD));
+    let backend = v2_live_backend(&server);
 
     wait_for_ready(&backend, &server).await;
 
@@ -1004,15 +986,7 @@ async fn live_v2_scripted_permission_chain() {
     let provider = provider::start_with(provider::Tool::Shell, provider::ToolCommand::Fast).await;
     let server = LiveServer::start_v2_with(&binary, &provider.base_url(), V2Permissions::AskShell).await;
 
-    let backend = OpenCodeBackend::with_generation(
-        Some(provider::MODEL_REF),
-        server.base_url(),
-        Some("opencode"),
-        Some(server::PASSWORD),
-        Generation::V2,
-        None,
-    );
-    backend.disable_env_proxy(Some("opencode"), Some(server::PASSWORD));
+    let backend = v2_live_backend(&server);
 
     wait_for_ready(&backend, &server).await;
 
@@ -1164,15 +1138,7 @@ async fn live_v2_scripted_form_chain() {
     let provider = provider::start_with(provider::Tool::Question, provider::ToolCommand::Fast).await;
     let server = LiveServer::start_v2_with(&binary, &provider.base_url(), V2Permissions::AllowQuestion).await;
 
-    let backend = OpenCodeBackend::with_generation(
-        Some(provider::MODEL_REF),
-        server.base_url(),
-        Some("opencode"),
-        Some(server::PASSWORD),
-        Generation::V2,
-        None,
-    );
-    backend.disable_env_proxy(Some("opencode"), Some(server::PASSWORD));
+    let backend = v2_live_backend(&server);
 
     wait_for_ready(&backend, &server).await;
 
@@ -1338,15 +1304,8 @@ async fn live_v2_scripted_retry_id_chain() {
 
     // A settled turn. The submit is the production adapter's admit-then-return
     // prompt; the turn settles through the transcript + run state.
-    let settled = backend
-        .create_session(&backend.new_session_input(Some(&work_dir)))
-        .await
-        .unwrap_or_else(|error| panic!("create session failed: {error}\n{}", server.stderr()));
-    let settled_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
-    backend
-        .prompt(&settled.id, PROMPT_TEXT, &[], None, None, None, Some(&settled_id))
-        .await
-        .unwrap_or_else(|error| panic!("prompt submit failed: {error}\n{}", server.stderr()));
+    let settled = scratch_session(&backend, &work_dir, &server).await;
+    let settled_id = start_turn(&backend, &server, &settled.id).await;
     let transcript = wait_for_turn(&backend, &settled.id, &settled_id, &server).await;
     assert!(
         turn_error(&transcript, &settled_id).is_none(),
@@ -1373,11 +1332,7 @@ async fn live_v2_scripted_retry_id_chain() {
 
     // A NEW id on the same session runs a second turn for real.
     let completions_before = provider_turn_completions(&provider);
-    let fresh_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
-    backend
-        .prompt(&settled.id, PROMPT_TEXT, &[], None, None, None, Some(&fresh_id))
-        .await
-        .unwrap_or_else(|error| panic!("new-id submit failed: {error}\n{}", server.stderr()));
+    let fresh_id = start_turn(&backend, &server, &settled.id).await;
     let fresh = wait_for_turn(&backend, &settled.id, &fresh_id, &server).await;
     assert_user_anchor(&fresh, &fresh_id);
     assert_turn_complete(&fresh, &fresh_id);
@@ -1399,25 +1354,9 @@ async fn live_v2_scripted_retry_id_chain() {
 
     // An aborted turn: interrupt the scripted slow tool mid-flight, then read
     // the aborted message's shape — the data the retry matrix evaluates.
-    let aborted = backend
-        .create_session(&backend.new_session_input(Some(&work_dir)))
-        .await
-        .unwrap_or_else(|error| panic!("create abort session failed: {error}\n{}", server.stderr()));
-    let aborted_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
-    backend
-        .prompt(&aborted.id, PROMPT_TEXT, &[], None, None, None, Some(&aborted_id))
-        .await
-        .unwrap_or_else(|error| panic!("abort prompt submit failed: {error}\n{}", server.stderr()));
-    poll_until(
-        "the abort turn's live tool",
-        POLL_TIMEOUT,
-        || async {
-            let transcript = backend.transcript(&aborted.id).await?;
-            Ok(has_live_tool(&transcript).then_some(()))
-        },
-        || server.stderr(),
-    )
-    .await;
+    let aborted = scratch_session(&backend, &work_dir, &server).await;
+    let aborted_id = start_turn(&backend, &server, &aborted.id).await;
+    wait_for_live_tool(&backend, &aborted.id, &server).await;
     backend
         .interrupt(&aborted.id)
         .await
@@ -1471,11 +1410,7 @@ async fn live_v2_scripted_retry_id_chain() {
             &binary,
             "live_v2_scripted_retry_id_chain",
         ),
-        &format!(
-            "{}/api/session/{}/message?order=asc&limit=200",
-            server.base_url(),
-            aborted.id
-        ),
+        &transcript_read_url(&server, &aborted.id),
     )
     .await;
 
@@ -1496,36 +1431,13 @@ async fn live_v2_scripted_retry_id_chain() {
     // stays running, while a fresh process reports the session idle. Re-posting
     // the same id is STILL the admission no-op — the id was already admitted,
     // so there is nothing to drain and the turn is not revived. This is the
-    // live answer to the speculation the spec flagged: the reuse arm never
-    // duplicates a submission, but it does not continue a run that already
-    // started.
-    let orphaned = backend
-        .create_session(&backend.new_session_input(Some(&work_dir)))
-        .await
-        .unwrap_or_else(|error| panic!("create orphan session failed: {error}\n{}", server.stderr()));
-    let orphaned_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
-    backend
-        .prompt(
-            &orphaned.id,
-            PROMPT_TEXT,
-            &[],
-            None,
-            None,
-            None,
-            Some(&orphaned_id),
-        )
-        .await
-        .unwrap_or_else(|error| panic!("orphan prompt submit failed: {error}\n{}", server.stderr()));
-    poll_until(
-        "the orphan turn's live tool",
-        POLL_TIMEOUT,
-        || async {
-            let transcript = backend.transcript(&orphaned.id).await?;
-            Ok(has_live_tool(&transcript).then_some(()))
-        },
-        || server.stderr(),
-    )
-    .await;
+    // live evidence for the generation capability the retry matrix reads
+    // (`Backend::reuse_continues_an_admitted_turn`): false on V2, and the reuse
+    // arm never duplicates a submission but does not continue a run that
+    // already started.
+    let orphaned = scratch_session(&backend, &work_dir, &server).await;
+    let orphaned_id = start_turn(&backend, &server, &orphaned.id).await;
+    wait_for_live_tool(&backend, &orphaned.id, &server).await;
     server.restart().await;
     let backend = v2_live_backend(&server);
     wait_for_ready(&backend, &server).await;
@@ -1597,10 +1509,12 @@ fn v2_live_backend(server: &LiveServer) -> OpenCodeBackend {
     backend
 }
 
-/// Re-post `message_id` through the production submit and assert the server's
-/// admission contract: accepted (the adapter maps a non-2xx to `Err`), no new
-/// assistant message, no model call, every existing wire row unchanged, and
-/// exactly one appended idle event. `what` names the turn state in failures.
+/// Re-post `message_id` and assert the server's admission contract: the raw
+/// answer is exactly `200 OK` echoing the admitted id, the production adapter's
+/// own submit path accepts it too, no new assistant message is produced, no
+/// model call is made, every existing wire row stays byte-identical, and each
+/// re-post appends exactly one idle event. `what` names the turn state in
+/// failures.
 async fn assert_retry_id_no_op(
     backend: &OpenCodeBackend,
     provider: &crate::test_http::TestHttpServer,
@@ -1614,22 +1528,33 @@ async fn assert_retry_id_no_op(
     let completions_before = provider_turn_completions(provider);
     let assistants_before = raw_assistant_count(&baseline);
 
-    backend
-        .prompt(session_id, PROMPT_TEXT, &[], None, None, None, Some(message_id))
-        .await
-        .unwrap_or_else(|error| {
-            panic!(
-                "{what}: the same-id re-post must be accepted: {error}\n{}",
-                server.stderr()
-            )
-        });
+    // The wire answer: exactly 200, with the admitted message echoed back (the
+    // re-post reconciles onto the existing admission, never a new id). The
+    // adapter maps any non-2xx to `Err`, so this raw submit is what pins the
+    // exact status the contract names.
+    let (status, body) = raw_prompt(server, session_id, message_id, PROMPT_TEXT).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "{what}: a same-id re-post must answer 200, got {status}: {body:#?}\n{}",
+        server.stderr()
+    );
+    assert_eq!(
+        body["data"]["id"].as_str(),
+        Some(message_id),
+        "{what}: the re-post must reconcile onto the admitted id: {body:#?}"
+    );
+
+    // …and the production submit path accepts it too (the adapter's `Ok` is
+    // its 2xx mapping).
+    submit_prompt(backend, server, session_id, message_id).await;
 
     let rows_after = poll_until(
-        &format!("{what}: the same-id re-post's idle event"),
+        &format!("{what}: the same-id re-posts' idle events"),
         POLL_TIMEOUT,
         || async {
             let read = raw_read(server, session_id).await;
-            Ok((raw_rows(&read).len() > rows_before.len()).then_some(raw_rows(&read)))
+            Ok((raw_rows(&read).len() >= rows_before.len() + 2).then_some(raw_rows(&read)))
         },
         || server.stderr(),
     )
@@ -1649,11 +1574,11 @@ async fn assert_retry_id_no_op(
         .collect();
     assert_eq!(
         appended.len(),
-        1,
-        "{what}: a same-id re-post appends only its idle event: {appended:#?}"
+        2,
+        "{what}: each same-id re-post appends only its idle event: {appended:#?}"
     );
-    assert_eq!(
-        appended[0]["type"], "idle",
+    assert!(
+        appended.iter().all(|row| row["type"].as_str() == Some("idle")),
         "{what}: the only effect of a same-id re-post is an idle event: {appended:#?}"
     );
     assert_eq!(
@@ -1669,16 +1594,98 @@ async fn assert_retry_id_no_op(
     );
 }
 
+/// A fresh cola-chosen message id — the admission key the retry policy uses.
+fn cola_message_id() -> String {
+    format!("msg_cola_{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Create one scratch session in the isolated store.
+async fn scratch_session(
+    backend: &OpenCodeBackend,
+    work_dir: &str,
+    server: &LiveServer,
+) -> crate::opencode::types::Session {
+    backend
+        .create_session(&backend.new_session_input(Some(work_dir)))
+        .await
+        .unwrap_or_else(|error| panic!("create session failed: {error}\n{}", server.stderr()))
+}
+
+/// Submit one fresh `msg_cola_` prompt through the production adapter and
+/// return the id it used.
+async fn start_turn(backend: &OpenCodeBackend, server: &LiveServer, session_id: &str) -> String {
+    let message_id = cola_message_id();
+    submit_prompt(backend, server, session_id, &message_id).await;
+    message_id
+}
+
+/// Submit `message_id` through the production adapter and assert acceptance.
+async fn submit_prompt(backend: &OpenCodeBackend, server: &LiveServer, session_id: &str, message_id: &str) {
+    backend
+        .prompt(session_id, PROMPT_TEXT, &[], None, None, None, Some(message_id))
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "prompt submit to session {session_id} failed: {error}\n{}",
+                server.stderr()
+            )
+        });
+}
+
+/// Submit `message_id` raw, with the wire body the V2 strategy sends (`text`,
+/// `id`, `delivery: "steer"`), returning the status and body — the exact-code
+/// answer the adapter's `Ok`/`Err` cannot express.
+async fn raw_prompt(
+    server: &LiveServer,
+    session_id: &str,
+    message_id: &str,
+    text: &str,
+) -> (reqwest::StatusCode, Value) {
+    let response = crate::test_http::no_proxy_transport()
+        .post(format!("{}/api/session/{}/prompt", server.base_url(), session_id))
+        .basic_auth("opencode", Some(server::PASSWORD))
+        .json(&serde_json::json!({ "text": text, "id": message_id, "delivery": "steer" }))
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("raw prompt submit failed: {error}\n{}", server.stderr()));
+    let status = response.status();
+    let body = response
+        .json()
+        .await
+        .unwrap_or_else(|error| panic!("raw prompt body is not JSON: {error}\n{}", server.stderr()));
+    (status, body)
+}
+
+/// Poll until the session's transcript shows a still-live tool call.
+async fn wait_for_live_tool(backend: &OpenCodeBackend, session_id: &str, server: &LiveServer) {
+    poll_until(
+        &format!("a live tool in session {session_id}"),
+        POLL_TIMEOUT,
+        || async {
+            let transcript = backend.transcript(session_id).await?;
+            Ok(has_live_tool(&transcript).then_some(()))
+        },
+        || server.stderr(),
+    )
+    .await;
+}
+
+/// The raw per-session message read both the shape assertions and the fixture
+/// capture read.
+fn transcript_read_url(server: &LiveServer, session_id: &str) -> String {
+    format!(
+        "{}/api/session/{}/message?order=asc&limit=200",
+        server.base_url(),
+        session_id
+    )
+}
+
 /// One raw transcript read: the wire rows the id policy's shape assertions
 /// name. The chains otherwise consume the production adapter; the shape of an
 /// aborted or orphaned row is a wire fact the neutral projection folds away.
 async fn raw_read(server: &LiveServer, session_id: &str) -> Value {
     let response = crate::test_http::no_proxy_transport()
-        .get(format!(
-            "{}/api/session/{}/message?order=asc&limit=200",
-            server.base_url(),
-            session_id
-        ))
+        .get(transcript_read_url(server, session_id))
         .basic_auth("opencode", Some(server::PASSWORD))
         .send()
         .await
@@ -1692,13 +1699,20 @@ async fn raw_read(server: &LiveServer, session_id: &str) -> Value {
     response.json().await.expect("the transcript read body is JSON")
 }
 
-/// The read's rows keyed by message id, for the unchanged-row assertion.
+/// The read's rows keyed by message id, for the unchanged-row assertion. Every
+/// row must carry a string id: an id-less row would silently collapse the map
+/// key and weaken the check it exists for.
 fn raw_rows(read: &Value) -> std::collections::BTreeMap<String, Value> {
     read["data"]
         .as_array()
         .into_iter()
         .flatten()
-        .map(|row| (row["id"].as_str().unwrap_or_default().to_string(), row.clone()))
+        .map(|row| {
+            let id = row["id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("every wire row carries a string id: {row:#?}"));
+            (id.to_string(), row.clone())
+        })
         .collect()
 }
 
