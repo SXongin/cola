@@ -20,6 +20,11 @@ pub enum CardState {
     Continued,
     Done,
     Error,
+    /// A failed card whose retry was submitted (spec #391): terminal, all
+    /// failed content preserved, header 「↩️ 已重试」, no retry button. The
+    /// retried attempt renders on a NEW card below it, so the record of the
+    /// failure stays readable and cannot be retried again by mistake.
+    Retried,
 }
 
 /// How much text ONE card carries before it is finalized and the rest continues

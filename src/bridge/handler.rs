@@ -634,7 +634,7 @@ impl App {
             text,
             message_id,
             subtitle,
-            existing_card_id: None,
+            is_retry: false,
             requester_open_id,
             is_group,
             cola_message_id: None,
@@ -1840,10 +1840,16 @@ impl App {
         })
     }
 
-    /// Re-submit a failed prompt on the SAME card (error-card "retry" button).
-    /// The card callback must ack within 3s, so spawn the prompt pipeline and
-    /// return a "retrying" card immediately; run_prompt then resets the card to
-    /// Loading and streams the new attempt into it.
+    /// Re-submit a failed prompt from the error-card "retry" button (spec
+    /// #391). The card callback must ack within 3s, so the click claims the
+    /// retry (the atomic double-click guard behind the Turn interface), spawns
+    /// the decision pipeline and returns a "retrying" toast immediately; the
+    /// pipeline then reads the session's status and transcript once, decides,
+    /// marks the failed card `Retried` and submits the prompt onto a NEW card
+    /// below it.
+    ///
+    /// The claim is released when nothing is submitted (a busy run, or a
+    /// session/thread that vanished), so a later click can try again.
     async fn handle_retry_action(self: &Arc<Self>, value: &serde_json::Value) -> Option<CardActionResult> {
         let sid = value
             .get("session_id")
@@ -1853,50 +1859,143 @@ impl App {
         if sid.is_empty() {
             return None;
         }
+        let handles = self.turn_handles();
+        // The atomic gate: only one click can hold a claim, and only while the
+        // card is still in the Error state (a marked or live card is not).
+        let Some(retry) = crate::bridge::turn::Turn::claim_retry(&handles.cards, &sid).await else {
+            tracing::warn!("retry: no retryable error card for session {}", sid);
+            return None;
+        };
         let inflight = { self.inflight.lock().await.contains(&sid) };
-        let ctx = crate::bridge::turn::Turn::retry_request(&self.cards_handle(), &sid).await;
-        let thread_key = self.sessions.lock().await.thread_for_session(&sid);
-        if !inflight
-            && let Some(ctx) = ctx
-            && !ctx.prompt.is_empty()
-            && let Some(card_id) = ctx.card_message_id
-            && let Some(thread_key) = thread_key
+        let (thread_key, directory) = {
+            let sessions = self.sessions.lock().await;
+            (
+                sessions.thread_for_session(&sid),
+                sessions.directory_for_session(&sid),
+            )
+        };
+        let Some(thread_key) = thread_key else {
+            crate::bridge::turn::Turn::release_retry_claim(&handles.cards, &sid).await;
+            tracing::warn!("retry: no thread mapped for session {}", sid);
+            return None;
+        };
+        if inflight {
+            crate::bridge::turn::Turn::release_retry_claim(&handles.cards, &sid).await;
+            tracing::warn!("retry: session {} already has a prompt in flight", sid);
+            return None;
+        }
+        let app = Arc::clone(self);
+        let span = span::turn(&sid, &thread_key, None);
+        tokio::spawn(
+            async move {
+                app.run_retry(handles, retry, thread_key, directory).await;
+            }
+            .instrument(span),
+        );
+        Some(CardActionResult {
+            card: None,
+            toast: Some("正在重试...".to_string()),
+        })
+    }
+
+    /// The retry's read → decide → mark/submit pipeline, off the ack path.
+    ///
+    /// One bounded read pair — session status + session transcript, each with
+    /// the follow's per-read timeout — then the matrix (spec #391): a live run
+    /// submits nothing; a settled turn takes a fresh `msg_cola_` id; an
+    /// unpersisted or unfinished turn reuses the failed attempt's id; a read
+    /// that failed or timed out is unknown and submits a fresh id, so a
+    /// transient hiccup never recreates the "click does nothing" bug. Both
+    /// submit branches mark the failed card `Retried` first and reply a new
+    /// card.
+    async fn run_retry(
+        self: Arc<Self>,
+        handles: crate::bridge::handles::TurnHandles,
+        retry: crate::bridge::turn::TurnRetry,
+        thread_key: ThreadKey,
+        directory: Option<String>,
+    ) {
+        let read_timeout_ms = handles.config.follow_read_timeout_ms();
+        // Each read is bounded on its own: a hung status must not swallow the
+        // transcript read, and vice versa.
+        let status = match crate::bridge::bounded_call(
+            "retry session status",
+            read_timeout_ms,
+            handles
+                .backend
+                .session_status(&retry.session_id, directory.as_deref()),
+        )
+        .await
         {
-            let app = Arc::clone(self);
-            tokio::spawn(async move {
-                if let Err(e) = app
-                    .run_prompt(PromptContext {
-                        session_id: sid.to_string(),
-                        thread_key,
-                        text: ctx.prompt,
-                        message_id: ctx.reply_to,
-                        subtitle: ctx.subtitle,
-                        existing_card_id: Some(card_id),
-                        requester_open_id: ctx.requester_open_id,
-                        is_group: ctx.is_group,
-                        // Reuse the failed attempt's id so the server
-                        // deduplicates — the retry is the same logical user
-                        // message (ADR-0026).
-                        cola_message_id: ctx.cola_message_id,
-                        images: Vec::new(),
-                    })
-                    .await
-                {
-                    tracing::error!("retry prompt: {}", e);
-                }
-            });
-            let mut r = crate::bridge::pollers::result_card("⏳ 正在重试...", "blue", "已重新提交原始问题。");
-            r.toast = Some("正在重试...".to_string());
-            Some(r)
-        } else {
-            // Nothing to retry (no stored prompt / card, or a prompt is already
-            // in flight): keep the card as it is.
-            tracing::warn!(
-                "retry: no retryable context for session {} (inflight={})",
-                sid,
-                inflight
-            );
-            None
+            Some(Ok(Some(status))) => Some(status),
+            Some(Ok(None)) => {
+                tracing::warn!(
+                    "retry: session {} status unreadable; deciding as unknown",
+                    retry.session_id
+                );
+                None
+            }
+            Some(Err(e)) => {
+                tracing::warn!("retry session status: {}", e);
+                None
+            }
+            // `bounded_call` already logged the timeout.
+            None => None,
+        };
+        let transcript = match crate::bridge::bounded_call(
+            "retry transcript",
+            read_timeout_ms,
+            handles.backend.transcript(&retry.session_id),
+        )
+        .await
+        {
+            Some(Ok(transcript)) => Some(transcript),
+            Some(Err(e)) => {
+                tracing::warn!("retry transcript: {}", e);
+                None
+            }
+            None => None,
+        };
+        let decision = crate::bridge::turn::retry_decision(
+            status,
+            transcript.as_ref(),
+            retry.cola_message_id.as_deref(),
+        );
+        let cola_message_id = match decision {
+            crate::bridge::turn::RetryDecision::Busy => {
+                // The run is alive: no prompt. The re-attach cell is ticket
+                // #393; until then the claim goes back so the button still
+                // works once the run ends.
+                crate::bridge::turn::Turn::release_retry_claim(&handles.cards, &retry.session_id).await;
+                tracing::info!(
+                    "retry: session {} still busy; nothing submitted",
+                    retry.session_id
+                );
+                return;
+            }
+            crate::bridge::turn::RetryDecision::NewId => None,
+            crate::bridge::turn::RetryDecision::Reuse(id) => Some(id),
+        };
+        // Mark before submitting: the fresh Run::start replaces the
+        // accumulator, and the mark must land on the failed card while it is
+        // still the session's card.
+        crate::bridge::turn::Turn::mark_retried(&handles.cards, &retry.session_id).await;
+        if let Err(e) = self
+            .run_prompt(PromptContext {
+                session_id: retry.session_id,
+                thread_key,
+                text: retry.prompt,
+                message_id: retry.reply_to,
+                subtitle: retry.subtitle,
+                is_retry: true,
+                requester_open_id: retry.requester_open_id,
+                is_group: retry.is_group,
+                cola_message_id,
+                images: Vec::new(),
+            })
+            .await
+        {
+            tracing::error!("retry prompt: {}", e);
         }
     }
 }

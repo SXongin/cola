@@ -75,7 +75,7 @@ pub(crate) fn ctx(session_id: &str, text: &str) -> PromptContext {
         text: text.into(),
         message_id: "msg_1".into(),
         subtitle: "p2p".into(),
-        existing_card_id: None,
+        is_retry: false,
         requester_open_id: None,
         is_group: false,
         cola_message_id: Some("msg_cola_anchor".into()),

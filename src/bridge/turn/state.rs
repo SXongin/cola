@@ -286,13 +286,15 @@ impl CardSession {
 
     /// True while this card belongs to a Turn that has not finished: the pull
     /// condition for `/card` (ADR-0043, 2026-09-22 amendment). A completed
-    /// (Done) or failed (Error) card session stays in the cards handle's map until
-    /// the next Turn replaces it, so the map's key alone does not mean a live
-    /// card.
+    /// (Done), failed (Error) or retried (Retried) card session stays in the
+    /// cards handle's map until the next Turn replaces it, so the map's key
+    /// alone does not mean a live card.
     pub(super) fn is_running(&self) -> bool {
         !matches!(
             self.acc.card_state,
-            crate::feishu::card::CardState::Done | crate::feishu::card::CardState::Error
+            crate::feishu::card::CardState::Done
+                | crate::feishu::card::CardState::Error
+                | crate::feishu::card::CardState::Retried
         )
     }
 
@@ -345,12 +347,14 @@ impl CardFallback {
     }
 }
 
-/// A retry's render baseline (#387). A retry reuses the failed attempt's
-/// `msg_cola_` user message (ADR-0026), so the failed attempt's messages are
-/// still in the turn window; the baseline keeps them out of the rebuilt card.
-/// It travels as one fact: `suppressed` is the carried frontier (written once
-/// at retry time), `observed` is what this attempt has examined (the next
-/// retry unions it in).
+/// A retry's render baseline (#387, restated by spec #391). The retry's
+/// reused-id branch reuses the failed attempt's `msg_cola_` user message
+/// (ADR-0026), so the failed attempt's messages are still in the fresh card's
+/// turn window; the baseline keeps them out of it. The new-id branch carries
+/// the same baseline under a fresh anchor, where it is inert (the new attempt's
+/// messages carry new server ids). It travels as one fact: `suppressed` is the
+/// carried frontier (written once at retry time), `observed` is what this
+/// attempt has examined (the next retry unions it in).
 #[derive(Default, Clone)]
 pub(super) struct AttemptBaseline {
     /// Assistant message ids from EARLIER attempts: never rendered, their
@@ -451,6 +455,11 @@ pub(super) struct StreamAccumulator {
     /// The full original prompt text of this turn, kept so the error-card
     /// "retry" button can re-submit it without the user retyping.
     pub(super) prompt: Option<String>,
+    /// Whether this card's error-card retry has been claimed (spec #391). The
+    /// click is acked immediately, so a second click can arrive before the
+    /// retry's own Error→Retried marking lands; the claim is checked and set
+    /// under the cards lock, so exactly one click submits.
+    pub(super) retry_claimed: bool,
     /// The id this turn's user message carries (`msg_cola_…`, ADR-0026), so a
     /// later error-card retry reuses it and the server deduplicates by id.
     pub(super) cola_message_id: Option<String>,
@@ -515,11 +524,12 @@ impl StreamAccumulator {
 
     /// Carry a previous attempt's render baseline into this accumulator
     /// (#387): every message the failed attempt SUPPRESSED or OBSERVED is
-    /// suppressed here. `Turn::start` calls this on an error-card retry, whose
-    /// fresh accumulator would otherwise replay the failed attempt's whole
-    /// turn window (the retry reuses the same `msg_cola_` user message,
-    /// ADR-0026) — the new attempt's messages alone render into the rebuilt
-    /// card, and the union chains across repeated retries.
+    /// suppressed here. `Turn::start` calls this on an explicit retry signal
+    /// (spec #391): the reused-id branch renders the same `msg_cola_` user
+    /// message (ADR-0026), so without the baseline the fresh card would replay
+    /// the whole failed turn window — the new attempt's messages alone render,
+    /// and the union chains across repeated retries. The new-id branch carries
+    /// it inertly: a fresh anchor's window holds none of the old ids.
     pub(super) fn carry_attempt_baseline(&mut self, previous: &Self) {
         self.baseline.suppressed = previous
             .baseline
@@ -1419,8 +1429,17 @@ impl StreamAccumulator {
                 builder = builder.with_text(&format!("\n**错误**: {}", err));
             }
 
-            // Error card: offer a retry that re-submits the original prompt on
-            // the same card, so the user doesn't have to retype it.
+            // The retry marker (spec #391): this failed attempt was retried on
+            // a new card below. All failed content stays; the marker line is
+            // the card's terminal stamp. A Retried state also suppresses the
+            // retry button below (only Error offers it).
+            if self.card_state == CardState::Retried {
+                builder = builder.with_text("已重试，见下方新卡片");
+            }
+
+            // Error card: offer a retry that re-submits the original prompt
+            // (spec #391), so the user doesn't have to retype it. Only Error
+            // offers the button — a Retried or live card must not.
             if self.card_state == CardState::Error
                 && let Some(sid) = &self.session_id
             {
