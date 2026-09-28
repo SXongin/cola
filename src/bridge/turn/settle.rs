@@ -31,7 +31,9 @@ use crate::opencode::types::SessionStatus;
 
 use super::{SettleTiming, Turn};
 
-/// What the loop watches to know it still owns the card.
+/// What the loop watches to know it still owns the card. The variant is also
+/// the loop's identity: each carries its own label, so a caller cannot pair
+/// one loop's guard with the other's name.
 pub(super) enum Ownership {
     /// The accumulator's Turn anchor is unchanged: a new Turn (or an external
     /// renderer arming over it) replaces the session's card.
@@ -57,6 +59,15 @@ impl Ownership {
     fn anchor(&self) -> &TurnAnchor {
         match self {
             Self::TurnAnchor(anchor) | Self::Chain { anchor, .. } => anchor,
+        }
+    }
+
+    /// The loop's name in the bounded-call labels and log lines. Owned by the
+    /// variant, so the guard and the name always travel together.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::TurnAnchor(_) => "drain follow",
+            Self::Chain { .. } => "wake continuation",
         }
     }
 }
@@ -147,16 +158,16 @@ async fn render_once(flow: &FlowHandles, session_id: &str, read_timeout_ms: u64,
 
 /// Run one out-of-turn settle loop until it no longer owns the card or reaches
 /// an ending. `None` means it stopped without an ending: its card was replaced,
-/// or the accumulator vanished. `label` names the loop in the bounded-call
-/// labels and log lines (`drain follow` / `wake continuation`).
+/// or the accumulator vanished. `owns` carries the loop's name (its variant),
+/// which labels the bounded calls and log lines.
 pub(super) async fn run(
     flow: &FlowHandles,
     session_id: &str,
     directory: &str,
     timing: SettleTiming,
     owns: &Ownership,
-    label: &str,
 ) -> Option<Ending> {
+    let label = owns.label();
     let grace = tokio::time::Duration::from_millis(timing.grace_ms);
     let mut last_contact = tokio::time::Instant::now();
     let mut stuck_since: Option<tokio::time::Instant> = None;

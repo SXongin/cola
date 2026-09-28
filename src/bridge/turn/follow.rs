@@ -75,8 +75,7 @@ async fn run(
 ) {
     let flow = handles.flow();
     let owns = settle::Ownership::TurnAnchor(anchor);
-    let Some(ending) = settle::run(&flow, &session_id, &directory, timing, &owns, "drain follow").await
-    else {
+    let Some(ending) = settle::run(&flow, &session_id, &directory, timing, &owns).await else {
         return;
     };
     settle::stamp(&flow.cards, &session_id, &ending).await;
