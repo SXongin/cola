@@ -7,7 +7,10 @@
 //! still say `⏳` and freezes everything after the bound. The released Turn
 //! therefore hands the SAME accumulator and card chain to this follow, which
 //! keeps polling and rendering them until the session reports a non-busy
-//! status, then finalizes Done — or Error when the settled turn failed.
+//! status, then ends through the single settle decision (ADR-0059): Done, the
+//! settled failure's Error, `Stopped` for a sticky `/stop`, or the
+//! 「⏳ 等待后台任务」 yield while Background Tasks are still live — and it
+//! keeps observing while a Wake's Execution has not reached its boundary yet.
 //!
 //! The follow has NO total budget (#386): a readable run may take as long as
 //! it takes, and a Permission/Question wait is unbounded by design — the card
@@ -34,7 +37,7 @@ use std::time::Duration;
 
 use tracing::Instrument;
 
-use crate::backend::{SessionTranscript, TurnAnchor};
+use crate::backend::{TurnAnchor, TurnSettle};
 use crate::bridge::handles::TurnHandles;
 use crate::bridge::span;
 use crate::config::ThreadKey;
@@ -95,10 +98,11 @@ pub(super) fn spawn(
 /// The follow loop. One tick: sleep, bail if the accumulator was replaced,
 /// finalize promptly on `/stop`, read and render the session, then let the
 /// session's own status decide — Busy/Retry keeps it alive (there is no total
-/// budget), a readable non-busy session finalizes (Done, or the settled
-/// failure's Error), and an idle session that keeps a `⏳` panel runs the
-/// stuck-panel grace. A tick that did not read BOTH the transcript and the
-/// status runs the lost-contact grace; every fully-answered tick resets it.
+/// budget), a readable non-busy session ends through the settle decision
+/// (Done, the settled failure's Error, or the waiting yield), and an idle
+/// session that keeps a `⏳` panel runs the stuck-panel grace. A tick that did
+/// not read BOTH the transcript and the status runs the lost-contact grace;
+/// every fully-answered tick resets it.
 async fn run(
     handles: TurnHandles,
     session_id: String,
@@ -214,15 +218,15 @@ async fn run(
             Some(Some(SessionStatus::Busy | SessionStatus::Retry)) => {
                 stuck_since = None;
             }
-            // Non-busy: finalize — but never over a panel still marked live
-            // (`⏳`). A crash-orphaned tool can leave one behind on an idle
-            // session; it gets the grace to settle, then ends Error rather
-            // than a false `✅`.
+            // Non-busy: the single settle decision (ADR-0059) owns the ending —
+            // never over a panel still marked live (`⏳`). A crash-orphaned tool
+            // can leave one behind on an idle session; it gets the grace to
+            // settle, then ends Error rather than a false `✅`.
             //
             // The settled turn's own failure decides the ending (ADR-0056):
             // the failure lives on the newest assistant message, so a long
             // turn that ended in a provider failure must finalize Error, not
-            // Done.
+            // Done — and a failure dominates waiting.
             Some(_) => {
                 let live_panels = Turn::has_live_tools(&handles.cards, &session_id).await;
                 match transcript.as_ref() {
@@ -238,22 +242,43 @@ async fn run(
                             finalize_stop(&handles, &session_id, started_at).await;
                             return;
                         }
-                        match turn_failure(transcript, &anchor) {
-                            Some(error) => {
+                        match transcript.settle(&anchor, true) {
+                            TurnSettle::Failed(error) => {
                                 Turn::finalize_error(&handles.cards, &session_id, &error).await;
                                 super::send_completion_notice(&handles, &session_id, started_at).await;
                                 tracing::info!(
                                     "drain follow: session {} failed; finalized Error",
                                     session_id
                                 );
+                                return;
                             }
-                            None => {
+                            TurnSettle::Complete => {
                                 Turn::finalize_done(&handles.cards, &session_id).await;
                                 super::send_completion_notice(&handles, &session_id, started_at).await;
                                 tracing::info!("drain follow: session {} idle; finalized", session_id);
+                                return;
                             }
+                            // The Execution ended but Background Tasks are
+                            // still live: the card yields 「⏳ 等待后台任务」 and
+                            // stops updating. No Completion Notice — the
+                            // notice belongs to the true end, and the next
+                            // Wake continues the chain on a new card
+                            // (ADR-0059).
+                            TurnSettle::Waiting => {
+                                Turn::finalize_waiting(&handles.cards, &session_id).await;
+                                tracing::info!(
+                                    "drain follow: session {} idle with live background tasks; yielded waiting",
+                                    session_id
+                                );
+                                return;
+                            }
+                            // A Wake's Execution has not reached its boundary
+                            // yet: the ending is not decided, and the Wake's
+                            // content must not declare it complete. Keep
+                            // observing — the follow has no total budget — and
+                            // let the next fully-answered tick decide.
+                            TurnSettle::Running => stuck_since = None,
                         }
-                        return;
                     }
                     // No fresh transcript: do not claim an ending from a read
                     // the follow could not make — the lost-contact grace owns
@@ -279,14 +304,6 @@ async fn run(
             return;
         }
     }
-}
-
-/// The failure the followed turn recorded, read from its settled transcript
-/// through the same projection the Turn's own finalization uses
-/// ([`crate::backend::TurnView::error`]: the NEWEST assistant message's
-/// failure, so a recovered earlier step is not a failure).
-fn turn_failure(transcript: &SessionTranscript, anchor: &TurnAnchor) -> Option<String> {
-    transcript.turn_for_user(anchor).error
 }
 
 /// The stop ending (#394): the session carries the `/stop` marker, so the card

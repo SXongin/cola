@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use tracing::Instrument;
 
-use crate::backend::{MessageRole, SessionTranscript, TurnAnchor};
+use crate::backend::{MessageRole, SessionTranscript, TurnAnchor, TurnSettle};
 use crate::bridge::handler::image_inputs;
 use crate::bridge::handles::{CardsHandle, RequestsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
@@ -59,6 +59,10 @@ enum DrainState {
     /// A cola-authored Supplement newer than the turn anchor has no assistant
     /// reply after it.
     Supplement,
+    /// The session is idle but Background Tasks are still live (ADR-0059): the
+    /// Turn yields 「⏳ 等待后台任务」 — not Done, no Completion Notice — and
+    /// the next Wake continues the chain on a new card.
+    Waiting,
 }
 
 /// The per-call timeout for one drain request: the fixed request bound,
@@ -586,6 +590,28 @@ impl Turn {
             }
         };
 
+        // The single settle decision (ADR-0059): a Turn that idles with live
+        // Background Tasks yields waiting — never ✅, never a terminal, no
+        // Completion Notice. The drain's own ending decides; the final
+        // reconcile read re-decides it so a task that appeared, or the
+        // retirement that arrived, inside this finalization window is honored:
+        // a read whose ending is `Running` (a Wake whose Execution has not
+        // reached its boundary, or no anchor to judge) keeps the drain's own
+        // disposition, and a stop or a failure dominates below.
+        let waiting = {
+            let settle = final_transcript.as_ref().and_then(|transcript| {
+                transcript
+                    .anchor_of_user(&self.cola_message_id)
+                    .map(|anchor| transcript.settle(&anchor, true))
+            });
+            let waiting = match settle {
+                Some(TurnSettle::Waiting) => true,
+                Some(TurnSettle::Complete | TurnSettle::Failed(_)) => false,
+                Some(TurnSettle::Running) | None => drain_outcome == Some(DrainState::Waiting),
+            };
+            waiting && !stopped && prompt_err.is_none()
+        };
+
         // #284: a drain bound reached while the session is still running is NOT
         // completion. The turn ends as usual (the guard is released below, so
         // the next message is a normal new Turn), but its card must not be
@@ -686,6 +712,11 @@ impl Turn {
                     } else if let Some(err) = &prompt_err {
                         acc.error = Some(err.clone());
                         acc.card_state = crate::feishu::card::CardState::Error;
+                    } else if waiting {
+                        // The execution idled but Background Tasks are still
+                        // live (ADR-0059): the card yields 「⏳ 等待后台任务」
+                        // and stops updating — not Done, and no notice below.
+                        acc.set_waiting();
                     } else {
                         acc.card_state = crate::feishu::card::CardState::Done;
                     }
@@ -756,8 +787,9 @@ impl Turn {
         // card is patched in place, which pushes no notification and does not
         // bump the conversation — so reply to the requester's message to
         // notify them. A followed turn notifies when the FOLLOW finalizes (its
-        // real end), not at the drain bound.
-        if !follow {
+        // real end), not at the drain bound; a Waiting yield never notifies
+        // (ADR-0059): the notice belongs to the true end.
+        if !follow && !waiting {
             send_completion_notice(handles, &self.session_id, self.started_at).await;
         }
 
@@ -805,12 +837,20 @@ impl Turn {
     /// not-busy path and becomes a normal new Turn.
     ///
     /// Returns the state the last drain observed at its bound when that was
-    /// still pending (`Some(Running)` / `Some(Supplement)`), `None` when the
-    /// drain settled or never saw anything pending. `finish` turns
+    /// still pending (`Some(Running)` / `Some(Supplement)`), `Some(Waiting)`
+    /// when the settle decision ended it with live Background Tasks, `None`
+    /// when the drain settled or never saw anything pending. `finish` turns
     /// bound-with-`Running` into the out-of-turn follow (#284) instead of
-    /// finalizing a card under a live session.
+    /// finalizing a card under a live session, and `Some(Waiting)` into the
+    /// card's waiting yield (ADR-0059).
     async fn drain_after_prompt(&mut self, handles: &TurnHandles) -> Option<DrainState> {
         let last = self.drain(handles).await;
+        // A waiting yield is the ending: no racing-Supplement re-check may
+        // reopen the drain (its render would add content to a card that is
+        // about to stop updating, and the yield was already decided).
+        if last == Some(DrainState::Waiting) {
+            return last;
+        }
         if self
             .drain_tick(handles, drain_request_timeout(drain_deadline(handles)))
             .await
@@ -833,8 +873,10 @@ impl Turn {
     /// budget, so a hung Backend cannot hold the drain past the bound.
     ///
     /// `Some(state)` means the bound was reached with `state` the last thing
-    /// observed — the caller must not read it as completion (#284); `None`
-    /// means the drain settled, stopped, or never observed anything pending.
+    /// observed — the caller must not read it as completion (#284) — except
+    /// for [`DrainState::Waiting`], the settle decision's yield, which ends
+    /// the drain immediately; `None` means the drain settled, stopped, or
+    /// never observed anything pending.
     async fn drain(&mut self, handles: &TurnHandles) -> Option<DrainState> {
         let poll_ms = handles.config.render_poll_ms();
         let deadline = drain_deadline(handles);
@@ -844,6 +886,10 @@ impl Turn {
             // the run is already on the Backend when the submit returns.
             match self.drain_tick(handles, drain_request_timeout(deadline)).await {
                 Some(DrainState::Settled) => return None,
+                // The Turn yields waiting (ADR-0059): the ending is decided, so
+                // there is nothing left to observe — the card stops updating
+                // and the next Wake continues the chain on a new card.
+                Some(state @ DrainState::Waiting) => return Some(state),
                 Some(state) => last = Some(state),
                 None if last.is_none() => return None,
                 None => {}
@@ -951,10 +997,14 @@ impl Turn {
         // a recorded failure, or a step CREATED at/after the anchor — never a
         // completed straddling step from a prior turn (the transcript's
         // membership includes such a straddler, so only the created-at/after
-        // filter keeps it from flipping this). The snapshot's failure is kept
-        // as the finalization fallback. A REJECTED submit is the exception: no
-        // run was scheduled, so the error is the outcome and one idle read
-        // settles.
+        // filter keeps it from flipping this). These signs say the run STARTED;
+        // they never say it finished — a Wake's content is a step created
+        // at/after the anchor too, so only [`SessionTranscript::settle`] may
+        // decide the ending (ADR-0059): idle, with no Wake's Execution left
+        // unanswered and no live Background Task. The snapshot's failure is
+        // kept as the finalization fallback. A REJECTED submit is the
+        // exception: no run was scheduled, so the error is the outcome and one
+        // idle read settles.
         if let Some(anchor) = &anchor {
             let turn = transcript.turn_for_user(anchor);
             let produced_a_step = turn.messages.iter().any(|message| {
@@ -989,23 +1039,49 @@ impl Turn {
                 self.drain_started = true;
                 DrainState::Running
             }
-            // A non-busy status: completion once the run was observed, and
-            // confirmed absence before that — a run that never registers stops
-            // after the window instead of observing to the drain bound.
-            Some(Ok(_)) => self.settle_or_confirm(observed),
+            // A non-busy status: the settle decision owns the ending (ADR-0059)
+            // once the run was observed; before that the confirmation window
+            // still bounds an unregistered submit. The failed and timed-out
+            // status paths take the same rule.
+            Some(Ok(_)) => self.settle_or_yield(transcript, anchor.as_ref(), observed),
             Some(Err(e)) => {
                 tracing::warn!("turn drain session status: {}", e);
-                self.settle_or_confirm(observed)
+                self.settle_or_yield(transcript, anchor.as_ref(), observed)
             }
             // The bounded status call timed out: same rule as a failed read.
-            None => self.settle_or_confirm(observed),
+            None => self.settle_or_yield(transcript, anchor.as_ref(), observed),
         }
     }
 
-    /// The non-busy (or unreadable) status rule: once the run was observed the
-    /// turn settles; before that, [`IDLE_CONFIRMATIONS`] consecutive reads are
-    /// required before the submit is treated as never registered. Shared by
-    /// the idle, failed and timed-out status paths so they cannot drift.
+    /// The ending a non-busy (or unreadable) status read gives the Turn
+    /// (ADR-0059): the single settle decision decides it once the run was
+    /// observed — `Waiting` yields the card, `Running` keeps observing (the
+    /// read carries a Wake whose Execution has not reached its boundary yet:
+    /// the Wake's content must never declare the Turn complete),
+    /// `Complete`/`Failed` settle it. Before the run was observed, or with no
+    /// anchor to judge against, [`Self::settle_or_confirm`]'s confirmation
+    /// window still bounds an unregistered submit.
+    fn settle_or_yield(
+        &mut self,
+        transcript: &SessionTranscript,
+        anchor: Option<&TurnAnchor>,
+        observed: bool,
+    ) -> DrainState {
+        let Some(anchor) = anchor.filter(|_| observed) else {
+            return self.settle_or_confirm(observed);
+        };
+        match transcript.settle(anchor, true) {
+            TurnSettle::Waiting => DrainState::Waiting,
+            TurnSettle::Running => DrainState::Running,
+            TurnSettle::Complete | TurnSettle::Failed(_) => DrainState::Settled,
+        }
+    }
+
+    /// The non-busy (or unreadable) status rule with no anchor to apply the
+    /// settle decision to: once the run was observed the turn settles; before
+    /// that, [`IDLE_CONFIRMATIONS`] consecutive reads are required before the
+    /// submit is treated as never registered. Shared by the idle, failed and
+    /// timed-out status paths so they cannot drift.
     fn settle_or_confirm(&mut self, observed: bool) -> DrainState {
         if observed {
             return DrainState::Settled;
@@ -1419,6 +1495,21 @@ impl Turn {
     pub(crate) async fn finalize_stopped(cards: &CardsHandle, session_id: &str) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
             card.acc.set_stopped();
+        }
+        Self::refresh_work_context(cards, session_id).await;
+        Self::flush_card(cards, session_id).await;
+    }
+
+    /// Yield a card as Waiting on Background Work (ADR-0059): the settle
+    /// decision found the Session idle with live Background Tasks, so the card
+    /// takes its waiting disposition — header 「⏳ 等待后台任务」, phase timer
+    /// cleared, work context refreshed, flushed once — and stops updating.
+    /// Not a terminal and never ✅, and no Completion Notice is sent: the
+    /// notice belongs to the true end. Used by the out-of-turn follow; the
+    /// Wake continuation ends through the same settle rule.
+    pub(crate) async fn finalize_waiting(cards: &CardsHandle, session_id: &str) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.set_waiting();
         }
         Self::refresh_work_context(cards, session_id).await;
         Self::flush_card(cards, session_id).await;

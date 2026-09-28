@@ -682,6 +682,17 @@ impl StreamAccumulator {
         self.card_state = CardState::Stopped;
     }
 
+    /// The waiting yield (ADR-0059): the Execution ended but Background Tasks
+    /// are still live. Not a terminal and never ✅ — the card stops updating
+    /// (the phase timer clears with the state) and the next Wake continues the
+    /// chain on a new card. The content the Turn produced stays; any recorded
+    /// failure is the caller's fact and dominates this call (the caller never
+    /// yields waiting over one).
+    pub(super) fn set_waiting(&mut self) {
+        self.card_state = CardState::Waiting;
+        self.refresh_phase();
+    }
+
     /// Add an interaction block to the card unless a block for the same
     /// request is already present (the poll loop and the adopt-time snapshot
     /// both feed blocks in). Live blocks render in the card's tail; resolving
