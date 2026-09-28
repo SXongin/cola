@@ -8,19 +8,60 @@
 //! A failed turn is transcript content: the server records the failure on its
 //! assistant message, and the async-native Turn derives the turn's error from
 //! that field ([`TurnView::error`]) instead of a blocking prompt response.
+//!
+//! The transcript also carries the current generation's own interaction facts
+//! (ADR-0059): each **Execution**'s durable boundary and outcome, each
+//! **Wake**, and the **Background Tasks** still live at the end of the read.
+//! They are typed here and empty on a generation that records none (V1), so no
+//! flow re-derives them from message kinds or timestamps.
 
 use serde_json::Value;
 
 /// One Session's normalized read: every message the backend reports, decoded
-/// into typed views, in the order the backend returned them.
+/// into typed views, in the order the backend returned them, plus the current
+/// generation's interaction facts.
 #[derive(Debug, Clone, Default)]
 pub struct SessionTranscript {
     pub messages: Vec<TranscriptMessage>,
+    /// The Execution boundaries the backend recorded, oldest first. Empty on a
+    /// generation that records none (V1) and when no boundary is present — a
+    /// shutdown writes none, and absence is tolerated, never invented.
+    pub executions: Vec<Execution>,
+    /// The Wakes the backend recorded, oldest first. Empty on a generation
+    /// without them (V1).
+    pub wakes: Vec<Wake>,
+    /// The Background Tasks still live at the end of the read: derived from the
+    /// assistant tool parts that started them, with every matching Wake
+    /// applied. Empty on a generation without them (V1).
+    pub background_tasks: Vec<BackgroundTask>,
 }
 
 impl SessionTranscript {
     pub fn new(messages: Vec<TranscriptMessage>) -> Self {
-        Self { messages }
+        Self {
+            messages,
+            executions: Vec::new(),
+            wakes: Vec::new(),
+            background_tasks: Vec::new(),
+        }
+    }
+
+    /// Attach the Execution boundaries the backend recorded.
+    pub fn with_executions(mut self, executions: Vec<Execution>) -> Self {
+        self.executions = executions;
+        self
+    }
+
+    /// Attach the Wakes the backend recorded.
+    pub fn with_wakes(mut self, wakes: Vec<Wake>) -> Self {
+        self.wakes = wakes;
+        self
+    }
+
+    /// Attach the Background Tasks still live at the end of the read.
+    pub fn with_background_tasks(mut self, background_tasks: Vec<BackgroundTask>) -> Self {
+        self.background_tasks = background_tasks;
+        self
     }
 
     /// The newest user message by server time, if any — the message a Turn's
@@ -321,6 +362,102 @@ pub struct TurnView<'a> {
     /// The failure recorded on the Turn's NEWEST assistant message, if any — a
     /// recovered earlier step is not a failure.
     pub error: Option<String>,
+}
+
+/// One Execution boundary, as the backend records it: the durable marker that
+/// a busy period ended, its server time, and the outcome it recorded. A
+/// shutdown records none, so absence is a normal read — never invented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Execution {
+    /// The marker message's identity.
+    pub id: MessageId,
+    /// When the Execution ended (the marker's server time).
+    pub ended_ms: i64,
+    pub outcome: ExecutionOutcome,
+}
+
+/// How an Execution ended, as the backend recorded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionOutcome {
+    Succeeded,
+    Failed,
+    Interrupted,
+    /// An outcome this build does not know, kept verbatim.
+    Other(String),
+    /// The payload reported no outcome at all.
+    Unknown,
+}
+
+/// One Wake: a backend-generated message that resumed a Session with no user
+/// message — a Background Task finishing, a subagent completing, the server
+/// continuing after an interruption or restart (ADR-0059). The correlation
+/// keys are what retire the Background Task it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wake {
+    /// The message's identity.
+    pub id: MessageId,
+    /// The message's server time.
+    pub created_ms: i64,
+    /// What woke the Session.
+    pub source: WakeSource,
+    /// The shell a shell Wake completed, when it named one.
+    pub shell_id: Option<String>,
+    /// The background job a shell Wake completed, when it named one.
+    pub job_id: Option<String>,
+    /// The child session a subagent Wake completed, when it named one.
+    pub child_id: Option<String>,
+    /// The finished task's state as the Wake reported it (`completed`,
+    /// `cancelled`, `error`), when it reported one.
+    pub state: Option<String>,
+}
+
+impl Wake {
+    /// Whether this Wake retires `task` — the backend's own completion
+    /// correlation: a shell Wake names the task's shell id or the tool call
+    /// that started it, and a subagent Wake names the task's child session. A
+    /// Wake that names nothing retires nothing.
+    pub fn retires(&self, task: &BackgroundTask) -> bool {
+        let names_shell_or_call = |id: &str| task.shell_id.as_deref() == Some(id) || task.tool.call_id == id;
+        self.shell_id.as_deref().is_some_and(names_shell_or_call)
+            || self.job_id.as_deref().is_some_and(names_shell_or_call)
+            || self
+                .child_id
+                .as_deref()
+                .is_some_and(|child| task.child_id.as_deref() == Some(child))
+    }
+}
+
+/// What kind of event woke the Session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeSource {
+    /// A backgrounded shell command finished.
+    Shell,
+    /// A subagent finished.
+    Subagent,
+    /// The server restarted while the Session was working.
+    Restart,
+    /// The backend resumed an interrupted response.
+    Interrupt,
+    /// A source this build does not know, kept verbatim.
+    Other(String),
+    /// The payload named no source at all (OpenCode 2.0.x's interruption
+    /// continuation carries no marker).
+    Unknown,
+}
+
+/// Work the agent left running in the background: derived from the assistant
+/// tool part that started it, live until its Wake retires it (ADR-0059). While
+/// one is live its Turn is not complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundTask {
+    /// The tool call that started the task — the part's own identity.
+    pub tool: ToolIdentity,
+    /// The shell the task runs in, when the part reported one.
+    pub shell_id: Option<String>,
+    /// The child session a subagent runs in, when the part reported one.
+    pub child_id: Option<String>,
+    /// When the tool call started the task, when the payload reported a time.
+    pub started_at: Option<i64>,
 }
 
 /// One recent-conversation tail entry: a text-bearing user/assistant message's

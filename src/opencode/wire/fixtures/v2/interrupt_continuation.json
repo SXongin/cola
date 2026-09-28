@@ -1,0 +1,338 @@
+{
+  "capture": {
+    "captured_at": "2026-09-29",
+    "command": "curl -u \"$OPENCODE_SERVER_USERNAME:$OPENCODE_SERVER_PASSWORD\" \"$OPENCODE_URL/api/session/<session>/message?order=asc&limit=200\"",
+    "generation": "v2",
+    "source": "opencode v2.0.18"
+  },
+  "response": {
+    "cursor": {
+      "next": "cursor_next_fixture"
+    },
+    "data": [
+      {
+        "id": "msg_errored_step_1",
+        "time": {
+          "created": 1700000000000,
+          "streamed": 1700000111751,
+          "completed": 1700000111772
+        },
+        "type": "assistant",
+        "agent": "build",
+        "model": {
+          "id": "scripted-model",
+          "providerID": "scripted",
+          "variant": "default"
+        },
+        "content": [
+          {
+            "type": "reasoning",
+            "text": "live-harness-reasoning",
+            "state": {
+              "reasoningField": "reasoning_content"
+            },
+            "time": {
+              "created": 1700000005380,
+              "completed": 1700000111746
+            }
+          }
+        ],
+        "snapshot": {
+          "start": "snapshot_fixture_start",
+          "end": "snapshot_fixture_end",
+          "files": []
+        },
+        "finish": "error",
+        "error": {
+          "type": "provider.transport",
+          "message": "live-harness-error",
+          "status": 200
+        },
+        "retry": {
+          "attempt": 5,
+          "at": 1700000120273,
+          "error": {
+            "type": "provider.transport",
+            "message": "live-harness-error",
+            "status": 200
+          }
+        },
+        "cost": 0
+      },
+      {
+        "id": "msg_interrupt_continuation_1",
+        "time": {
+          "created": 1700000120274
+        },
+        "text": "The previous response was interrupted. Continue from where you left off without repeating completed content.",
+        "type": "synthetic"
+      },
+      {
+        "id": "msg_continued_step_1",
+        "time": {
+          "created": 1700000186472,
+          "streamed": 1700000196057,
+          "completed": 1700000216240
+        },
+        "type": "assistant",
+        "agent": "build",
+        "model": {
+          "id": "scripted-model",
+          "providerID": "scripted",
+          "variant": "default"
+        },
+        "content": [
+          {
+            "type": "reasoning",
+            "text": "live-harness-reasoning",
+            "state": {
+              "reasoningField": "reasoning_content"
+            },
+            "time": {
+              "created": 1700000191975,
+              "completed": 1700000196048
+            }
+          },
+          {
+            "type": "tool",
+            "id": "call_fixture_1",
+            "name": "shell",
+            "executed": false,
+            "state": {
+              "status": "completed",
+              "input": {
+                "command": "sleep 2; echo live-harness-tool",
+                "workdir": "/work/live-harness"
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "live-harness-tool\n"
+                }
+              ],
+              "metadata": {
+                "status": "completed",
+                "truncated": false,
+                "exit": 0
+              }
+            },
+            "time": {
+              "created": 1700000195666,
+              "ran": 1700000196053,
+              "completed": 1700000216223
+            }
+          }
+        ],
+        "snapshot": {
+          "start": "snapshot_fixture_start",
+          "end": "snapshot_fixture_end",
+          "files": []
+        },
+        "finish": "tool-calls",
+        "rawFinish": "tool_calls",
+        "cost": 0,
+        "tokens": {
+          "input": 236,
+          "output": 159,
+          "reasoning": 763,
+          "cache": {
+            "read": 240256,
+            "write": 0
+          }
+        }
+      },
+      {
+        "id": "msg_errored_step_2",
+        "time": {
+          "created": 1700000216312,
+          "streamed": 1700000309370,
+          "completed": 1700000309387
+        },
+        "type": "assistant",
+        "agent": "build",
+        "model": {
+          "id": "scripted-model",
+          "providerID": "scripted",
+          "variant": "default"
+        },
+        "content": [
+          {
+            "type": "reasoning",
+            "text": "live-harness-reasoning",
+            "state": {
+              "reasoningField": "reasoning_content"
+            },
+            "time": {
+              "created": 1700000234290,
+              "completed": 1700000309367
+            }
+          }
+        ],
+        "snapshot": {
+          "start": "snapshot_fixture_start",
+          "end": "snapshot_fixture_end",
+          "files": []
+        },
+        "finish": "error",
+        "error": {
+          "type": "provider.transport",
+          "message": "live-harness-error",
+          "status": 200
+        },
+        "retry": {
+          "attempt": 2,
+          "at": 1700000311788,
+          "error": {
+            "type": "provider.transport",
+            "message": "live-harness-error",
+            "status": 200
+          }
+        },
+        "cost": 0
+      },
+      {
+        "id": "msg_interrupt_continuation_2",
+        "time": {
+          "created": 1700000311794
+        },
+        "text": "The previous response was interrupted. Continue from where you left off without repeating completed content.",
+        "type": "synthetic"
+      },
+      {
+        "id": "msg_continued_step_2",
+        "time": {
+          "created": 1700000311850,
+          "streamed": 1700000329090,
+          "completed": 1700000340349
+        },
+        "type": "assistant",
+        "agent": "build",
+        "model": {
+          "id": "scripted-model",
+          "providerID": "scripted",
+          "variant": "default"
+        },
+        "content": [
+          {
+            "type": "reasoning",
+            "text": "live-harness-reasoning",
+            "state": {
+              "reasoningField": "reasoning_content"
+            },
+            "time": {
+              "created": 1700000326922,
+              "completed": 1700000329082
+            }
+          },
+          {
+            "type": "tool",
+            "id": "call_fixture_2",
+            "name": "shell",
+            "executed": false,
+            "state": {
+              "status": "completed",
+              "input": {
+                "command": "sleep 2; echo live-harness-tool",
+                "workdir": "/work/live-harness"
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "live-harness-tool\n"
+                },
+                {
+                  "type": "text",
+                  "text": "live-harness-tool\n"
+                }
+              ],
+              "metadata": {
+                "status": "completed",
+                "truncated": false,
+                "exit": 1
+              }
+            },
+            "time": {
+              "created": 1700000328826,
+              "ran": 1700000329087,
+              "completed": 1700000340333
+            }
+          }
+        ],
+        "snapshot": {
+          "start": "snapshot_fixture_start",
+          "end": "snapshot_fixture_end",
+          "files": []
+        },
+        "finish": "tool-calls",
+        "rawFinish": "tool_calls",
+        "cost": 0,
+        "tokens": {
+          "input": 250,
+          "output": 113,
+          "reasoning": 421,
+          "cache": {
+            "read": 241280,
+            "write": 0
+          }
+        }
+      },
+      {
+        "id": "msg_continued_answer",
+        "time": {
+          "created": 1700000364615,
+          "streamed": 1700000372851,
+          "completed": 1700000372889
+        },
+        "type": "assistant",
+        "agent": "build",
+        "model": {
+          "id": "scripted-model",
+          "providerID": "scripted",
+          "variant": "default"
+        },
+        "content": [
+          {
+            "type": "reasoning",
+            "text": "live-harness-reasoning",
+            "state": {
+              "reasoningField": "reasoning_content"
+            },
+            "time": {
+              "created": 1700000368950,
+              "completed": 1700000372845
+            }
+          },
+          {
+            "type": "text",
+            "text": "live-harness-answer"
+          }
+        ],
+        "snapshot": {
+          "start": "snapshot_fixture_start",
+          "end": "snapshot_fixture_end",
+          "files": []
+        },
+        "finish": "stop",
+        "rawFinish": "stop",
+        "cost": 0,
+        "tokens": {
+          "input": 181,
+          "output": 314,
+          "reasoning": 536,
+          "cache": {
+            "read": 241920,
+            "write": 0
+          }
+        }
+      },
+      {
+        "id": "msg_idle",
+        "time": {
+          "created": 1700000372895
+        },
+        "type": "idle",
+        "outcome": "succeeded"
+      }
+    ]
+  }
+}

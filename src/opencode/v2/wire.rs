@@ -29,9 +29,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::backend::{
-    ContentBlock, FinishReason, MessageId, MessageRole, MessageTime, ModelIdentity, OtherPart, Part,
-    ReasoningPart, SessionTranscript, StepFinish, TextPart, TokenUsage, ToolCall, ToolIdentity, ToolOutput,
-    ToolStatus, TranscriptMessage,
+    BackgroundTask, ContentBlock, Execution, ExecutionOutcome, FinishReason, MessageId, MessageRole,
+    MessageTime, ModelIdentity, OtherPart, Part, ReasoningPart, SessionTranscript, StepFinish, TextPart,
+    TokenUsage, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, Wake, WakeSource,
 };
 use crate::opencode::types::{
     AgentInfo, FormFieldKind, ModelInfo, ModelOption, PermissionRequest, QuestionInfo, QuestionOption,
@@ -565,8 +565,149 @@ impl MessagesPage {
 /// part. An explicit `"unknown"` is a spelled-out reason (the provider ended
 /// the step without naming why) and stays terminal, unlike a missing reason —
 /// the same distinction the neutral [`FinishReason::Unknown`] documents.
+///
+/// The read's interaction facts decode alongside the messages: a durable
+/// `idle` marker becomes an [`Execution`], a `synthetic` message becomes a
+/// [`Wake`], and the assistant tool parts that backgrounded a run become the
+/// [`BackgroundTask`]s no Wake has retired yet. All three are V2-only shapes;
+/// the neutral fields stay empty on a generation that records none.
 pub(super) fn decode_messages(data: &[Value]) -> SessionTranscript {
+    let executions: Vec<Execution> = data.iter().filter_map(decode_execution).collect();
+    let wakes: Vec<Wake> = data.iter().filter_map(decode_wake).collect();
+    let background_tasks = decode_background_tasks(data, &wakes);
     SessionTranscript::new(data.iter().map(decode_message).collect())
+        .with_executions(executions)
+        .with_wakes(wakes)
+        .with_background_tasks(background_tasks)
+}
+
+/// Decode one durable `idle` marker into an Execution boundary. A marker
+/// without a server time cannot be placed in the transcript and is ignored —
+/// the boundary is only ever what the backend recorded, never invented.
+fn decode_execution(message: &Value) -> Option<Execution> {
+    if message.get("type").and_then(Value::as_str) != Some("idle") {
+        return None;
+    }
+    Some(Execution {
+        id: message_id(message),
+        ended_ms: message.pointer("/time/created").and_then(Value::as_i64)?,
+        outcome: decode_execution_outcome(message.get("outcome").and_then(Value::as_str)),
+    })
+}
+
+/// How an Execution ended. A missing outcome never declares success: it is its
+/// own arm, exactly like every other missing field the decoders tolerate.
+fn decode_execution_outcome(outcome: Option<&str>) -> ExecutionOutcome {
+    match outcome {
+        Some("succeeded") => ExecutionOutcome::Succeeded,
+        Some("failed") => ExecutionOutcome::Failed,
+        Some("interrupted") => ExecutionOutcome::Interrupted,
+        Some(other) => ExecutionOutcome::Other(other.to_string()),
+        None => ExecutionOutcome::Unknown,
+    }
+}
+
+/// Decode one `synthetic` message into a Wake. Its metadata carries the source
+/// marker and the correlation keys (`shellID`/`jobID`/`childID`/`state`); a
+/// continuation written without metadata is still a Wake, it just names no
+/// source and retires nothing. A Wake without a server time cannot be placed
+/// or ordered and is ignored.
+fn decode_wake(message: &Value) -> Option<Wake> {
+    if message.get("type").and_then(Value::as_str) != Some("synthetic") {
+        return None;
+    }
+    let metadata = non_null(message.get("metadata"));
+    let key = |field: &str| {
+        metadata
+            .and_then(|metadata| metadata.get(field))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    Some(Wake {
+        id: message_id(message),
+        created_ms: message.pointer("/time/created").and_then(Value::as_i64)?,
+        source: decode_wake_source(metadata),
+        shell_id: key("shellID"),
+        job_id: key("jobID"),
+        child_id: key("childID"),
+        state: key("state"),
+    })
+}
+
+/// A Wake's source: the marker the backend wrote (`metadata.source`, or the
+/// restart notice's `metadata.notice`). No marker is its own arm — never
+/// guessed — and an unknown one stays verbatim.
+fn decode_wake_source(metadata: Option<&Value>) -> WakeSource {
+    let marker = metadata
+        .and_then(|metadata| metadata.get("source").or_else(|| metadata.get("notice")))
+        .and_then(Value::as_str);
+    match marker {
+        Some("shell") => WakeSource::Shell,
+        Some("subagent") => WakeSource::Subagent,
+        Some("restart") => WakeSource::Restart,
+        Some("interrupt") => WakeSource::Interrupt,
+        Some(other) => WakeSource::Other(other.to_string()),
+        None => WakeSource::Unknown,
+    }
+}
+
+/// The Background Tasks a read leaves live: every assistant tool part that
+/// recorded a backgrounded run, minus the ones a Wake already retired. The
+/// predicate is the backend's own (the official app's derivation): a `shell`
+/// or `subagent` tool part whose call has completed — it returned the
+/// background handle — while its metadata still says the run is `running`. A
+/// settled tool's metadata says `completed`, so it is not live; the input's
+/// `background: true` flag is not required, because a foreground run the user
+/// moved to the background never had one.
+fn decode_background_tasks(data: &[Value], wakes: &[Wake]) -> Vec<BackgroundTask> {
+    let mut tasks = Vec::new();
+    for message in data {
+        if message.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(content) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for item in content {
+            let Some(task) = decode_background_task(item) else {
+                continue;
+            };
+            if wakes.iter().any(|wake| wake.retires(&task)) {
+                continue;
+            }
+            tasks.push(task);
+        }
+    }
+    tasks
+}
+
+/// One backgrounded run as its tool part recorded it. The part's name decides
+/// which identity the task carries: a shell reports its shell id, a subagent
+/// the child session it runs in; any other tool never backgrounds through this
+/// shape, and a part still streaming or running has not returned a background
+/// handle yet.
+fn decode_background_task(item: &Value) -> Option<BackgroundTask> {
+    let name = item.get("name").and_then(Value::as_str)?;
+    let state = non_null(item.get("state"))?;
+    if state.get("status").and_then(Value::as_str) != Some("completed") {
+        return None;
+    }
+    let metadata = non_null(state.get("metadata"))?;
+    if metadata.get("status").and_then(Value::as_str) != Some("running") {
+        return None;
+    }
+    let key = |field: &str| metadata.get(field).and_then(Value::as_str).map(str::to_string);
+    let (shell_id, child_id) = match name {
+        "shell" => (key("shellID"), None),
+        "subagent" => (None, key("sessionID")),
+        _ => return None,
+    };
+    Some(BackgroundTask {
+        tool: decode_tool_identity(item.get("name"), item.get("id")),
+        shell_id,
+        child_id,
+        started_at: item.pointer("/time/created").and_then(Value::as_i64),
+    })
 }
 
 /// Decode one projected message. Its identity, role, server time and recorded
@@ -575,13 +716,7 @@ fn decode_message(message: &Value) -> TranscriptMessage {
     let kind = message.get("type").and_then(Value::as_str);
     let (role, parts) = decode_body(kind, message);
     TranscriptMessage {
-        id: MessageId::new(
-            message
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-        ),
+        id: message_id(message),
         role,
         time: decode_time(message),
         model: decode_model(message.get("model")),
@@ -589,6 +724,18 @@ fn decode_message(message: &Value) -> TranscriptMessage {
         error: message.get("error").and_then(decode_error),
         parts,
     }
+}
+
+/// A message's identity: the server's own id, or empty when the payload lost
+/// it — the tolerant read every message-level fact shares.
+fn message_id(message: &Value) -> MessageId {
+    MessageId::new(
+        message
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    )
 }
 
 /// The neutral server time. A message without a numeric `time.created` cannot
@@ -1363,5 +1510,415 @@ mod tests {
             "an explicit null is no error"
         );
         assert_eq!(transcript.messages[2].error.as_deref(), Some("just a string"));
+    }
+
+    /// The `data` array of one committed recording.
+    fn fixture_data(recorded: &crate::opencode::wire::RecordedResponse) -> Vec<Value> {
+        recorded
+            .response
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "the recorded response carries a data array: {:#?}",
+                    recorded.response
+                )
+            })
+    }
+
+    /// A `shell` tool part that returned its background handle: the exact shape
+    /// the recorded #403 read carries — the call completed, its metadata still
+    /// says the run is `running`, and the shell id names the run.
+    fn background_shell_part(call_id: &str, shell_id: &str) -> Value {
+        serde_json::json!({
+            "type": "tool",
+            "id": call_id,
+            "name": "shell",
+            "state": {
+                "status": "completed",
+                "input": {"command": "sleep 2", "background": true},
+                "content": [{"type": "text", "text": "Command moved to the background"}],
+                "metadata": {"status": "running", "truncated": false, "shellID": shell_id},
+            },
+            "time": {"created": 1000},
+        })
+    }
+
+    /// A `subagent` tool part that returned its background handle: the child
+    /// session rides in the metadata.
+    fn background_subagent_part(call_id: &str, child_id: &str) -> Value {
+        serde_json::json!({
+            "type": "tool",
+            "id": call_id,
+            "name": "subagent",
+            "state": {
+                "status": "completed",
+                "input": {"description": "review", "background": true},
+                "content": [{"type": "text", "text": "The subagent is working in the background"}],
+                "metadata": {"status": "running", "sessionID": child_id},
+            },
+            "time": {"created": 1000},
+        })
+    }
+
+    /// One `synthetic` message with the given metadata.
+    fn synthetic_wake(id: &str, created_ms: i64, metadata: Value) -> Value {
+        serde_json::json!({
+            "id": id,
+            "type": "synthetic",
+            "text": "wake",
+            "time": {"created": created_ms},
+            "metadata": metadata,
+        })
+    }
+
+    /// A read made of one assistant message carrying `part` plus every `wake`,
+    /// decoded in server order.
+    fn read_with(part: Value, wakes: Vec<Value>) -> SessionTranscript {
+        let mut data = vec![serde_json::json!({
+            "id": "msg_a",
+            "type": "assistant",
+            "time": {"created": 1000, "completed": 2000},
+            "content": [part],
+        })];
+        data.extend(wakes);
+        decode_messages(&data)
+    }
+
+    /// The real #403 read (2.0.18): one unfiltered response carries the
+    /// Execution boundary (the durable `idle`), the shell Wake with its source
+    /// and correlation keys, and two backgrounded runs — the one the Wake
+    /// names retired, the one whose Wake had not arrived still live.
+    #[test]
+    fn the_recorded_background_read_decodes_its_execution_wake_and_live_task() {
+        let recorded = crate::opencode::wire::v2_background_wake();
+        assert_eq!(recorded.capture.generation, "v2");
+        assert_eq!(recorded.capture.source, "opencode v2.0.18");
+        let data = fixture_data(&recorded);
+        let transcript = decode_messages(&data);
+
+        // The Execution boundary: the durable idle marker, succeeded.
+        assert_eq!(transcript.executions.len(), 1, "{:#?}", transcript.executions);
+        let execution = &transcript.executions[0];
+        assert_eq!(execution.id.as_str(), "msg_idle");
+        assert_eq!(execution.outcome, ExecutionOutcome::Succeeded);
+        assert!(execution.ended_ms > 0);
+
+        // The Wake: source and correlation keys survive.
+        assert_eq!(transcript.wakes.len(), 1, "{:#?}", transcript.wakes);
+        let wake = &transcript.wakes[0];
+        assert_eq!(wake.id.as_str(), "msg_wake_shell");
+        assert_eq!(wake.source, WakeSource::Shell);
+        assert_eq!(wake.shell_id.as_deref(), Some("sh_fixture_retired"));
+        assert_eq!(wake.job_id.as_deref(), Some("sh_fixture_retired"));
+        assert_eq!(wake.state.as_deref(), Some("completed"));
+        assert!(wake.child_id.is_none());
+
+        // Both backgrounded runs are in the read's messages...
+        let started: Vec<&str> = transcript
+            .messages
+            .iter()
+            .flat_map(|message| message.parts.iter())
+            .filter_map(|part| match part {
+                Part::Tool(call)
+                    if call
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("status"))
+                        .and_then(Value::as_str)
+                        == Some("running") =>
+                {
+                    Some(call.identity.call_id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            started,
+            vec!["call_background_retired", "call_background_live"],
+            "the recorded read carries both backgrounded runs: {transcript:#?}"
+        );
+
+        // ...and only the one without a Wake is still live.
+        assert_eq!(
+            transcript
+                .background_tasks
+                .iter()
+                .map(|task| task.tool.call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["call_background_live"],
+            "the Wake retires the run it names; the other stays live: {:#?}",
+            transcript.background_tasks
+        );
+        let live = &transcript.background_tasks[0];
+        assert_eq!(live.tool.name, "shell");
+        assert_eq!(live.shell_id.as_deref(), Some("sh_fixture_live"));
+        assert!(live.child_id.is_none());
+
+        // The recorded Wake retires the recorded retired run, and not the live
+        // one: the correlation is the backend's own, on real keys.
+        let retired = data
+            .iter()
+            .filter(|message| message.get("type").and_then(Value::as_str) == Some("assistant"))
+            .filter_map(|message| message.get("content").and_then(Value::as_array))
+            .flatten()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some("call_background_retired"))
+            .and_then(decode_background_task)
+            .expect("the retired run's tool part decodes");
+        assert!(
+            wake.retires(&retired),
+            "the recorded Wake must retire its own run"
+        );
+        assert!(!wake.retires(live), "and must not retire the live one");
+    }
+
+    /// The real #403 interruption continuation (2.0.18): a `synthetic` with no
+    /// metadata at all is still a Wake — it just names no source and no
+    /// correlation key, and never becomes a user message — while the idle that
+    /// closes its Execution decodes as the boundary.
+    #[test]
+    fn the_recorded_interruption_continuation_decodes_as_a_sourceless_wake() {
+        let recorded = crate::opencode::wire::v2_interrupt_continuation();
+        assert_eq!(recorded.capture.source, "opencode v2.0.18");
+        let data = fixture_data(&recorded);
+        let transcript = decode_messages(&data);
+
+        assert_eq!(transcript.wakes.len(), 2, "{:#?}", transcript.wakes);
+        for wake in &transcript.wakes {
+            assert_eq!(wake.source, WakeSource::Unknown, "{wake:#?}");
+            assert!(
+                wake.shell_id.is_none()
+                    && wake.job_id.is_none()
+                    && wake.child_id.is_none()
+                    && wake.state.is_none(),
+                "a continuation without metadata names no key: {wake:#?}"
+            );
+        }
+
+        let continuation = transcript
+            .messages
+            .iter()
+            .find(|message| message.id.as_str() == "msg_interrupt_continuation_1")
+            .expect("the recorded continuation is in the read");
+        assert!(
+            continuation
+                .text()
+                .starts_with("The previous response was interrupted"),
+            "the continuation's text survives verbatim: {continuation:#?}"
+        );
+        assert!(
+            transcript.newest_user().is_none(),
+            "a Wake is never a user message"
+        );
+
+        assert_eq!(transcript.executions.len(), 1, "{:#?}", transcript.executions);
+        assert_eq!(transcript.executions[0].outcome, ExecutionOutcome::Succeeded);
+        assert!(
+            transcript.background_tasks.is_empty(),
+            "an interrupted continuation backgrounds nothing: {:#?}",
+            transcript.background_tasks
+        );
+    }
+
+    /// A backgrounded run is retired by its Wake under every correlation key
+    /// the backend writes — the shell id, the job id, or the tool part's own id
+    /// (the official app's predicate) — while a Wake that names nothing of the
+    /// sort retires nothing.
+    #[test]
+    fn a_background_task_is_retired_by_shell_id_job_id_or_part_id() {
+        let part = background_shell_part("call_bg", "sh_bg");
+        for key in ["shellID", "jobID"] {
+            for id in ["sh_bg", "call_bg"] {
+                let wake = synthetic_wake(
+                    "msg_w",
+                    2000,
+                    serde_json::json!({"source": "shell", key: id, "state": "completed"}),
+                );
+                let transcript = read_with(part.clone(), vec![wake]);
+                assert!(
+                    transcript.background_tasks.is_empty(),
+                    "`{key}` = `{id}` must retire the run: {:#?}",
+                    transcript.background_tasks
+                );
+            }
+        }
+
+        let unrelated = synthetic_wake(
+            "msg_w",
+            2000,
+            serde_json::json!({"source": "shell", "shellID": "sh_other", "jobID": "job_other", "state": "completed"}),
+        );
+        let transcript = read_with(part, vec![unrelated]);
+        assert_eq!(
+            transcript
+                .background_tasks
+                .iter()
+                .map(|task| task.tool.call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["call_bg"],
+            "an unrelated Wake retires nothing"
+        );
+    }
+
+    /// A subagent's backgrounded run is retired by the Wake's `childID`; a
+    /// child the Wake does not name leaves it live.
+    #[test]
+    fn a_subagent_wake_retires_by_child_id() {
+        let part = background_subagent_part("call_sub", "ses_child");
+
+        let matching = synthetic_wake(
+            "msg_w",
+            2000,
+            serde_json::json!({"source": "subagent", "childID": "ses_child", "state": "completed"}),
+        );
+        let transcript = read_with(part.clone(), vec![matching]);
+        assert!(
+            transcript.background_tasks.is_empty(),
+            "{:#?}",
+            transcript.background_tasks
+        );
+
+        let unrelated = synthetic_wake(
+            "msg_w",
+            2000,
+            serde_json::json!({"source": "subagent", "childID": "ses_other", "state": "completed"}),
+        );
+        let transcript = read_with(part, vec![unrelated]);
+        assert_eq!(transcript.background_tasks.len(), 1);
+        assert_eq!(
+            transcript.background_tasks[0].child_id.as_deref(),
+            Some("ses_child")
+        );
+    }
+
+    /// Only a completed call whose recorded run is still `running` is a live
+    /// Background Task: a settled run and a call that has not returned its
+    /// background handle yet are not.
+    #[test]
+    fn a_backgrounded_run_stays_live_only_while_its_recorded_run_is_running() {
+        let part = background_shell_part("call_bg", "sh_bg");
+        let transcript = read_with(part.clone(), Vec::new());
+        assert_eq!(
+            transcript
+                .background_tasks
+                .iter()
+                .map(|task| task.tool.call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["call_bg"],
+            "no Wake yet: the run is live"
+        );
+
+        let mut settled = part.clone();
+        settled["state"]["metadata"]["status"] = Value::String("completed".into());
+        assert!(read_with(settled, Vec::new()).background_tasks.is_empty());
+
+        let mut running = part;
+        running["state"]["status"] = Value::String("running".into());
+        assert!(read_with(running, Vec::new()).background_tasks.is_empty());
+
+        // A tool that never backgrounds through this shape is not a task, even
+        // with the same metadata.
+        let mut other = background_shell_part("call_other", "sh_other");
+        other["name"] = Value::String("read".into());
+        assert!(read_with(other, Vec::new()).background_tasks.is_empty());
+
+        // A foreground run moved to the background mid-flight carries no
+        // `background` input flag; the metadata still marks it (the official
+        // app's predicate), so it counts.
+        let mut moved = background_shell_part("call_moved", "sh_moved");
+        moved["state"]["input"] = serde_json::json!({"command": "sleep 2"});
+        assert_eq!(read_with(moved, Vec::new()).background_tasks.len(), 1);
+    }
+
+    /// A Wake's source decodes from the marker the backend wrote: the shell and
+    /// subagent metadata carry `source`, the restart notice carries `notice`,
+    /// an unknown marker stays verbatim, and an absent one is its own arm.
+    #[test]
+    fn wake_sources_decode_from_the_recorded_marker_or_stay_unknown() {
+        let sources = |metadata: Value| synthetic_wake("msg_w", 2000, metadata);
+        let source_of = |wake: Value| decode_messages(&[wake]).wakes[0].source.clone();
+
+        assert_eq!(
+            source_of(sources(serde_json::json!({"source": "shell"}))),
+            WakeSource::Shell
+        );
+        assert_eq!(
+            source_of(sources(serde_json::json!({"source": "subagent"}))),
+            WakeSource::Subagent
+        );
+        // 2.0.18's restart notice spells its marker as `notice`.
+        assert_eq!(
+            source_of(sources(serde_json::json!({"notice": "restart"}))),
+            WakeSource::Restart
+        );
+        assert_eq!(
+            source_of(sources(serde_json::json!({"source": "interrupt"}))),
+            WakeSource::Interrupt
+        );
+        // A source this build does not know stays verbatim.
+        assert_eq!(
+            source_of(sources(serde_json::json!({"source": "compaction"}))),
+            WakeSource::Other("compaction".into())
+        );
+        // No metadata at all (the real interruption continuation): never guessed.
+        assert_eq!(source_of(sources(serde_json::json!({}))), WakeSource::Unknown);
+        assert_eq!(
+            source_of(sources(serde_json::json!({"description": "no marker"}))),
+            WakeSource::Unknown
+        );
+    }
+
+    /// A shutdown writes no `idle` marker: the Execution boundary is absent —
+    /// never invented — and a Wake in the same read still decodes. A marker
+    /// without a server time cannot be placed and is ignored like any other
+    /// timeless message.
+    #[test]
+    fn a_shutdown_leaves_no_execution_boundary() {
+        let transcript = decode_messages(&[synthetic_wake(
+            "msg_w",
+            2000,
+            serde_json::json!({"source": "restart"}),
+        )]);
+        assert!(transcript.executions.is_empty(), "{:#?}", transcript.executions);
+        assert_eq!(transcript.wakes.len(), 1);
+
+        let timeless = decode_messages(&[serde_json::json!({
+            "id": "msg_i", "type": "idle", "outcome": "succeeded"
+        })]);
+        assert!(
+            timeless.executions.is_empty(),
+            "a timeless boundary cannot be placed: {:#?}",
+            timeless.executions
+        );
+    }
+
+    /// Every outcome arm decodes exactly, and one this build does not know (or
+    /// a missing one) is never read as success.
+    #[test]
+    fn execution_outcomes_decode_exactly() {
+        let outcome_of = |outcome: Value| {
+            decode_messages(&[serde_json::json!({
+                "id": "msg_i", "type": "idle", "outcome": outcome, "time": {"created": 1}
+            })])
+            .executions[0]
+                .outcome
+                .clone()
+        };
+
+        assert_eq!(
+            outcome_of(serde_json::json!("succeeded")),
+            ExecutionOutcome::Succeeded
+        );
+        assert_eq!(outcome_of(serde_json::json!("failed")), ExecutionOutcome::Failed);
+        assert_eq!(
+            outcome_of(serde_json::json!("interrupted")),
+            ExecutionOutcome::Interrupted
+        );
+        assert_eq!(
+            outcome_of(serde_json::json!("weird")),
+            ExecutionOutcome::Other("weird".into())
+        );
+        assert_eq!(outcome_of(Value::Null), ExecutionOutcome::Unknown);
     }
 }
