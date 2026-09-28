@@ -1898,16 +1898,17 @@ impl App {
         })
     }
 
-    /// The retry's read → decide → mark/submit pipeline, off the ack path.
+    /// The retry's read → decide → submit pipeline, off the ack path.
     ///
     /// One bounded read pair — session status + session transcript, each with
     /// the follow's per-read timeout — then the matrix (spec #391): a live run
     /// submits nothing; a settled turn takes a fresh `msg_cola_` id; an
     /// unpersisted or unfinished turn reuses the failed attempt's id; a read
     /// that failed or timed out is unknown and submits a fresh id, so a
-    /// transient hiccup never recreates the "click does nothing" bug. Both
-    /// submit branches mark the failed card `Retried` first and reply a new
-    /// card.
+    /// transient hiccup never recreates the "click does nothing" bug. The
+    /// submit branches hand off to `Turn::start`, which marks the failed card
+    /// `Retried` once it holds the session's inflight guard and replies the
+    /// attempt's new card.
     async fn run_retry(
         self: Arc<Self>,
         handles: crate::bridge::handles::TurnHandles,
@@ -1976,23 +1977,11 @@ impl App {
             crate::bridge::turn::RetryDecision::NewId => None,
             crate::bridge::turn::RetryDecision::Reuse(id) => Some(id),
         };
-        // Mark before submitting: the fresh Run::start replaces the
-        // accumulator, and the mark must land on the failed card while it is
-        // still the session's card.
-        crate::bridge::turn::Turn::mark_retried(&handles.cards, &retry.session_id).await;
+        // `Turn::start` marks the failed card Retried once it holds the
+        // inflight guard, so a retry that loses the guard never marks without
+        // submitting.
         if let Err(e) = self
-            .run_prompt(PromptContext {
-                session_id: retry.session_id,
-                thread_key,
-                text: retry.prompt,
-                message_id: retry.reply_to,
-                subtitle: retry.subtitle,
-                is_retry: true,
-                requester_open_id: retry.requester_open_id,
-                is_group: retry.is_group,
-                cola_message_id,
-                images: Vec::new(),
-            })
+            .run_prompt(retry.into_context(thread_key, cola_message_id))
             .await
         {
             tracing::error!("retry prompt: {}", e);

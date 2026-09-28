@@ -285,17 +285,12 @@ impl CardSession {
     }
 
     /// True while this card belongs to a Turn that has not finished: the pull
-    /// condition for `/card` (ADR-0043, 2026-09-22 amendment). A completed
-    /// (Done), failed (Error) or retried (Retried) card session stays in the
-    /// cards handle's map until the next Turn replaces it, so the map's key
-    /// alone does not mean a live card.
+    /// condition for `/card` (ADR-0043, 2026-09-22 amendment). A terminal
+    /// (Done/Error/Retried) card session stays in the cards handle's map until
+    /// the next Turn replaces it, so the map's key alone does not mean a live
+    /// card.
     pub(super) fn is_running(&self) -> bool {
-        !matches!(
-            self.acc.card_state,
-            crate::feishu::card::CardState::Done
-                | crate::feishu::card::CardState::Error
-                | crate::feishu::card::CardState::Retried
-        )
+        !self.acc.card_state.is_terminal()
     }
 
     /// Re-point the live card identity at a new message (ADR-0028: a re-adopt
