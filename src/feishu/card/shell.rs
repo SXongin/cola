@@ -323,15 +323,17 @@ impl CardBuilder {
 /// `progress.awaiting` (a pending permission and/or question) overrides the
 /// phase label entirely, naming whichever kind is pending. The override is for
 /// ACTIVE states only: a terminal card (Done/Error/Retried/Stopped) is no
-/// longer waiting for anyone, and its state must win — or a fallback Error
-/// under a still-pending block would read as "waiting for your authorization"
-/// forever (#386).
+/// longer waiting for anyone, and a Waiting card yields for its Background
+/// Tasks, not for the operator (ADR-0059), so each shows its own state —
+/// otherwise a fallback Error under a still-pending block would read as
+/// "waiting for your authorization" forever (#386).
 pub(crate) fn header_title_and_template(
     state: &CardState,
     running_tool: Option<&ToolPanel>,
     progress: &HeaderProgress,
 ) -> (String, &'static str) {
     if !state.is_terminal()
+        && !matches!(state, CardState::Waiting)
         && let Some(title) = progress.awaiting.title()
     {
         return (title.to_string(), "orange");
@@ -354,6 +356,10 @@ pub(crate) fn header_title_and_template(
         CardState::Error => ("❌ 出错".to_string(), "red"),
         CardState::Retried => ("↩️ 已重试".to_string(), "grey"),
         CardState::Stopped => ("⏹ 已停止".to_string(), "grey"),
+        // The Turn's Execution ended but its Background Tasks are still live
+        // (ADR-0059): the card yields, grey like the other non-working ends —
+        // it is not ✅ and not a terminal. The next Wake continues the chain.
+        CardState::Waiting => ("⏳ 等待后台任务".to_string(), "grey"),
     };
     let mut title = label;
     match state {
@@ -934,11 +940,13 @@ mod tests {
     fn a_terminal_state_wins_over_a_pending_wait() {
         // A fallback Error (or a Done/Stopped) with a still-pending block must
         // show its own header: the card is no longer waiting for anyone (#386,
-        // #394).
+        // #394). A Waiting card yields for its Background Tasks, not for the
+        // operator, so it must win too (ADR-0059).
         for (state, title) in [
             (CardState::Error, "❌ 出错"),
             (CardState::Done, "✅ 完成"),
             (CardState::Stopped, "⏹ 已停止"),
+            (CardState::Waiting, "⏳ 等待后台任务"),
         ] {
             let card = CardBuilder::new()
                 .with_state(state.clone())

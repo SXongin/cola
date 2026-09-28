@@ -31,12 +31,20 @@ pub enum CardState {
     /// never written to the card. The next Turn clears the session's stopped
     /// marker and replaces this card.
     Stopped,
+    /// A card whose Execution ended but whose Turn still has live Background
+    /// Tasks (ADR-0059): it yields with 「⏳ 等待后台任务」 — NOT a terminal and
+    /// never ✅ — and stops receiving updates. The next Wake continues the
+    /// chain on a new continuation card; a later Turn supersedes this one or a
+    /// switch-away collects it (spec #405).
+    Waiting,
 }
 
 impl CardState {
     /// Whether this state ends the card's lifecycle: no more content arrives,
     /// the header timer stops, and the only action left is the Error card's
-    /// retry. `Continued` is NOT terminal — the chain continues on a new card.
+    /// retry. `Continued` is NOT terminal — the chain continues on a new card —
+    /// and neither is `Waiting`: the Turn's Background Tasks are still live and
+    /// a Wake will continue its chain on a new card (ADR-0059).
     /// One definition, so a new terminal state (#394's `Stopped`) cannot leave
     /// a probe reading the set differently.
     pub(crate) fn is_terminal(&self) -> bool {

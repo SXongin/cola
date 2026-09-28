@@ -11,8 +11,9 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::backend::{
-    ContentBlock, FinishReason, MessageRole, Part, SessionTranscript, StepFinish, TextPart, ToolOutput,
-    ToolStatus, TranscriptMessage,
+    BackgroundTask, ContentBlock, Execution, ExecutionOutcome, FinishReason, MessageId, MessageRole, Part,
+    SessionTranscript, StepFinish, TextPart, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, Wake,
+    WakeSource,
 };
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{PromptContext, Turn};
@@ -64,6 +65,42 @@ fn tool_assistant(created: i64, status: ToolStatus, output: &str) -> TranscriptM
             }),
         ],
     )
+}
+
+/// One Execution boundary at `ended_ms` — the durable `idle` marker of a busy
+/// period (ADR-0059).
+fn execution(ended_ms: i64) -> Execution {
+    Execution {
+        id: MessageId::new(format!("msg_idle_{ended_ms}")),
+        ended_ms: Some(ended_ms),
+        outcome: ExecutionOutcome::Succeeded,
+    }
+}
+
+/// The live Background Task a backgrounded shell started at `started_at`.
+fn background_shell(started_at: i64) -> BackgroundTask {
+    BackgroundTask {
+        tool: ToolIdentity {
+            name: "shell".into(),
+            call_id: "call_bg".into(),
+        },
+        shell_id: Some("sh_bg".into()),
+        child_id: None,
+        started_at: Some(started_at),
+    }
+}
+
+/// The shell completion Wake that retires [`background_shell`].
+fn shell_wake(created_ms: i64) -> Wake {
+    Wake {
+        id: MessageId::new(format!("msg_wake_{created_ms}")),
+        created_ms: Some(created_ms),
+        source: WakeSource::Shell,
+        shell_id: Some("sh_bg".into()),
+        job_id: Some("sh_bg".into()),
+        child_id: None,
+        state: Some("completed".into()),
+    }
 }
 
 /// The turn under test: the anchor id is fixed so the scripted Backend timeline can name
@@ -1743,4 +1780,468 @@ async fn an_idle_session_exits_the_drain_without_waiting() {
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
     assert!(card_header(&final_card).contains("完成"));
     assert!(!app.inflight.lock().await.contains("ses_test"));
+}
+
+// ---------------------------------------------------------------------------
+// The settle decision (ADR-0059, spec #405 ticket 2): a Turn whose Execution
+// idled with live Background Tasks yields 「⏳ 等待后台任务」 — never ✅, no
+// Completion Notice — and completes only at the true end.
+// ---------------------------------------------------------------------------
+
+/// Replace the session's scripted transcript snapshots (what the next Backend
+/// reads serve).
+async fn script_transcript(backend: &Arc<MockBackend>, snapshots: Vec<SessionTranscript>) {
+    *backend
+        .transcript_scripts
+        .lock()
+        .await
+        .get_mut("ses_test")
+        .expect("a scripted session") = snapshots;
+}
+
+/// Whether the platform sent any Completion Notice.
+async fn noticed(platform: &RecordingPlatform) -> bool {
+    platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .any(|call| matches!(call, PlatformCall::CompletionNotice { .. }))
+}
+
+/// A V2 group turn whose Execution idles with a live Background Task yields
+/// 「⏳ 等待后台任务」: not ✅, not a terminal, and no Completion Notice — the
+/// notice belongs to the true end (spec #405 ticket 2).
+#[tokio::test]
+async fn a_turn_idling_with_a_live_background_task_yields_waiting() {
+    let _wd = test_work_dir();
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
+    // A group turn would notify at a true end, so a missing notice proves the
+    // yield deferred it.
+    let mut context = ctx("ses_test", "跑一下 CI");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+
+    Turn::run(&app.turn_handles(), context).await.unwrap();
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "the idle-with-live-task ending yields the waiting disposition"
+    );
+    let card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_header(&card).contains("等待后台任务"),
+        "the yield names the wait: {card}"
+    );
+    assert!(
+        !card_header(&card).contains("完成"),
+        "a waiting card is never ✅: {card}"
+    );
+    assert!(
+        !noticed(&platform).await,
+        "no Completion Notice before the true end: {:?}",
+        platform.calls.lock().await
+    );
+    assert!(
+        !app.inflight.lock().await.contains("ses_test"),
+        "the guard is released at the yield"
+    );
+    assert_no_further_rendering(&backend, &platform).await;
+}
+
+/// The yield stops the card: a later retirement of the last Background Task
+/// leaves the waiting card alone — the Wake continues the chain on a new card
+/// (ticket 3) and this card's notice never fires (there is no true end here).
+#[tokio::test]
+async fn a_retirement_after_the_yield_leaves_the_waiting_card_alone() {
+    let _wd = test_work_dir();
+    let live = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting)
+    );
+    let patches = platform.updated_cards().await.len();
+
+    // The task retires later and its Execution ends: a true end for the chain,
+    // but this card has already yielded — nothing restamps it.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, "已经交给后台了。"),
+                assistant(3_100, "CI 通过了。"),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000)])
+            .with_wakes(vec![shell_wake(2_900)]),
+        ],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    assert_eq!(
+        platform.updated_cards().await.len(),
+        patches,
+        "a yielded card stops updating"
+    );
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting)
+    );
+    assert!(
+        !noticed(&platform).await,
+        "the notice belongs to the true end, on the continuation card"
+    );
+}
+
+/// The retirement can land inside the finalization window: the drain's read
+/// shows the live task (a waiting yield), and the final reconcile read shows
+/// the Wake and its Execution boundary — the true end, so the turn ends ✅
+/// with its notice instead of yielding.
+#[tokio::test]
+async fn a_retirement_inside_the_finalization_window_ends_the_turn_normally() {
+    let _wd = test_work_dir();
+    let live = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let retired = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+        assistant(3_100, "CI 通过了。"),
+    ])
+    .with_executions(vec![execution(2_500), execution(4_000)])
+    .with_wakes(vec![shell_wake(2_900)]);
+    let (_dir, app, _backend, platform) = scripted_app(vec![live, retired], Some(SessionStatus::Idle)).await;
+    let mut context = ctx("ses_test", "跑一下 CI");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+
+    Turn::run(&app.turn_handles(), context).await.unwrap();
+
+    let card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_header(&card).contains("完成"),
+        "a retirement inside the window is the true end: {card}"
+    );
+    assert!(
+        card_text(&card).contains("CI 通过了。"),
+        "the true end's content lands: {card}"
+    );
+    assert!(
+        noticed(&platform).await,
+        "the notice fires at the true end: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// A Wake's content landing in the finalization window must not satisfy the
+/// Turn's completion check: its Execution has not reached a boundary yet, so
+/// the Turn keeps observing (the old "any terminal step since the anchor" rule
+/// is gone) and only the later boundary ends it.
+#[tokio::test]
+async fn a_wake_in_the_finalization_window_cannot_complete_the_turn_early() {
+    let _wd = test_work_dir();
+    let running = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![running], Some(SessionStatus::Busy)).await;
+    let mut context = ctx("ses_test", "跑一下 CI");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+
+    let turn = spawn_turn(&app, context);
+    // The drain is polling the busy session.
+    wait_for_card_text(&platform, "已经交给后台了。").await;
+
+    // The Wake retires the task and its content streams, but its Execution has
+    // not idled: the read is idle-looking and the task is gone. The old rule
+    // would stamp ✅ here from the Wake's terminal step.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, "已经交给后台了。"),
+                assistant(3_100, "CI 通过了，正在合并。"),
+            ])
+            .with_executions(vec![execution(2_500)])
+            .with_wakes(vec![shell_wake(2_900)]),
+        ],
+    )
+    .await;
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let state = Turn::card_state(&app.cards_handle(), "ses_test").await;
+    assert!(
+        !matches!(state, Some(CardState::Done | CardState::Waiting)),
+        "the Wake's content must not declare the ending: {state:?}"
+    );
+    assert!(
+        app.inflight.lock().await.contains("ses_test"),
+        "the Turn keeps observing until the Wake's Execution boundary"
+    );
+    assert!(
+        !noticed(&platform).await,
+        "no notice while the Wake's Execution is unbounded"
+    );
+
+    // The Wake's Execution idles: the boundary answers the Wake and the true
+    // end lands, content included.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, "已经交给后台了。"),
+                assistant(3_100, "CI 通过了，正在合并。"),
+                assistant(4_100, "合并完成。"),
+            ])
+            .with_executions(vec![execution(2_500), execution(5_000)])
+            .with_wakes(vec![shell_wake(2_900)]),
+        ],
+    )
+    .await;
+
+    let result = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the boundary must end the turn")
+        .unwrap();
+    result.unwrap();
+
+    let card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(card_header(&card).contains("完成"), "{card}");
+    assert!(
+        card_text(&card).contains("合并完成。"),
+        "the true end's content lands: {card}"
+    );
+    assert!(noticed(&platform).await, "the notice fires at the true end");
+}
+
+/// A retirement observed while the out-of-turn follow is still rendering ends
+/// the turn normally: the follow's settle decision sees the Wake's answered
+/// Execution and no live task, so the card finalizes ✅ with its notice.
+#[tokio::test]
+async fn a_task_retiring_while_the_follow_renders_ends_the_turn_normally() {
+    let _wd = test_work_dir();
+    let running = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![running], Some(SessionStatus::Busy)).await;
+    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
+    app.turn_follow_grace_ms.store(30, Ordering::Relaxed);
+    let mut context = ctx("ses_test", "跑一下 CI");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+
+    // The drain bound hands the still-busy session to the follow.
+    let result = tokio::time::timeout(Duration::from_secs(5), spawn_turn(&app, context))
+        .await
+        .expect("the turn must hand off at the drain bound")
+        .unwrap();
+    result.unwrap();
+    assert!(!app.inflight.lock().await.contains("ses_test"));
+
+    // The task retires while the follow renders, and its Execution ends: the
+    // true end, on the followed card.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, "已经交给后台了。"),
+                assistant(3_100, "CI 通过了。"),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000)])
+            .with_wakes(vec![shell_wake(2_900)]),
+        ],
+    )
+    .await;
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+
+    wait_for_card_header(&platform, "完成").await;
+    let final_card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&final_card).contains("CI 通过了。"),
+        "the true end's content lands: {final_card}"
+    );
+    assert!(noticed(&platform).await, "the notice fires at the true end");
+    assert_no_further_rendering(&backend, &platform).await;
+}
+
+/// A settled failure dominates waiting: a failed Turn with live Background
+/// Tasks ends ❌ — the later Wake continues on a new card (ticket 3) — never
+/// 「⏳ 等待后台任务」.
+#[tokio::test]
+async fn a_settled_failure_dominates_a_live_background_task() {
+    let _wd = test_work_dir();
+    let mut failed = assistant(2_000, "失败的一步");
+    failed.error = Some("provider 503".into());
+    let transcript = SessionTranscript::new(vec![user("msg_cola_anchor", 1_000, "跑一下 CI"), failed])
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![background_shell(2_100)]);
+    let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
+        .await
+        .unwrap();
+
+    let card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_header(&card).contains("出错"),
+        "a settled failure dominates the live task: {card}"
+    );
+    assert!(
+        !card_header(&card).contains("等待后台任务"),
+        "a failed Turn never yields waiting: {card}"
+    );
+    assert!(
+        card_text(&card).contains("provider 503"),
+        "the failure reaches the card: {card}"
+    );
+}
+
+/// A deliberate `/stop` dominates waiting too: a stopped Turn with live
+/// Background Tasks finalizes 「⏹ 已停止」, never the waiting yield.
+#[tokio::test]
+async fn a_stop_dominates_a_live_background_task() {
+    let _wd = test_work_dir();
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    // Busy keeps the drain polling until the stop marker ends it.
+    let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Busy)).await;
+
+    let turn = spawn_turn(&app, ctx("ses_test", "跑一下 CI"));
+    wait_for_card_text(&platform, "已经交给后台了。").await;
+    app.handle_message(incoming(
+        "msg_stop".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/stop".into(),
+        None,
+    ))
+    .await;
+
+    let result = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the stop must end the drain")
+        .unwrap();
+    result.unwrap();
+
+    let card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_header(&card).contains("已停止"),
+        "a deliberate stop dominates: {card}"
+    );
+    assert!(
+        !card_header(&card).contains("等待后台任务"),
+        "a stopped Turn never yields waiting: {card}"
+    );
+}
+
+/// The settle decision's ordinary ending is unchanged: a V2 read at an idle
+/// Execution boundary with no live Background Task finalizes ✅ and notifies,
+/// exactly as the V1-shaped read always did.
+#[tokio::test]
+async fn a_v2_idle_read_with_no_live_background_task_completes_as_before() {
+    let _wd = test_work_dir();
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一轮回答。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_wakes(vec![shell_wake(1_500)]);
+    let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
+    let mut context = ctx("ses_test", "第一条消息");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+
+    Turn::run(&app.turn_handles(), context).await.unwrap();
+
+    let card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(card_header(&card).contains("完成"), "{card}");
+    assert!(
+        noticed(&platform).await,
+        "the notice fires at the true end: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// The out-of-turn follow takes the same waiting yield when the run it
+/// inherited idles with live Background Tasks: the card yields
+/// 「⏳ 等待后台任务」, no Completion Notice fires, and the follow stops.
+#[tokio::test]
+async fn a_follow_idling_with_a_live_background_task_yields_waiting() {
+    let _wd = test_work_dir();
+    let live = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Busy)).await;
+    app.turn_drain_timeout_ms.store(30, Ordering::Relaxed);
+    app.turn_follow_grace_ms.store(30, Ordering::Relaxed);
+    let mut context = ctx("ses_test", "跑一下 CI");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+
+    // The drain bound hands the still-busy session to the follow.
+    let result = tokio::time::timeout(Duration::from_secs(5), spawn_turn(&app, context))
+        .await
+        .expect("the turn must hand off at the drain bound")
+        .unwrap();
+    result.unwrap();
+
+    // The Execution then idles with the task still live: the follow yields.
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+
+    wait_for_card_header(&platform, "等待后台任务").await;
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting)
+    );
+    assert!(
+        !noticed(&platform).await,
+        "the follow's yield sends no notice: {:?}",
+        platform.calls.lock().await
+    );
+    assert_no_further_rendering(&backend, &platform).await;
 }
