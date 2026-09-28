@@ -814,6 +814,87 @@ async fn session_selection_reads_the_model_ref_with_its_variant_and_the_agent() 
     );
 }
 
+/// The last-run model read: the adapter asks for the newest assistant message
+/// (`type=assistant&order=desc&limit=1`) and decodes its model ref, variant
+/// included; a session with no assistant message answers `None`, never an
+/// error.
+#[tokio::test]
+async fn session_last_run_model_reads_the_newest_assistant_ref() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "GET",
+        "/api/session/ses_ran/message",
+        200,
+        serde_json::json!({
+            "data": [{
+                "id": "msg_a",
+                "type": "assistant",
+                "model": {"id": "deepseek-v4-flash", "providerID": "opencode-go", "variant": "high"},
+            }],
+            "cursor": {},
+        })
+        .to_string(),
+    );
+    server.route(
+        "GET",
+        "/api/session/ses_empty/message",
+        200,
+        serde_json::json!({"data": [], "cursor": {}}).to_string(),
+    );
+    server.route(
+        "GET",
+        "/api/session/ses_defaulted/message",
+        200,
+        serde_json::json!({
+            "data": [{
+                "id": "msg_b",
+                "type": "assistant",
+                "model": {"id": "deepseek-v4-flash", "providerID": "opencode-go", "variant": "default"},
+            }],
+            "cursor": {},
+        })
+        .to_string(),
+    );
+    let client = v2_wire_client(&server);
+
+    let model = client
+        .session_last_run_model("ses_ran", Some("/work/cola"))
+        .await
+        .unwrap()
+        .expect("the newest assistant message names a model");
+    assert_eq!(model.provider_id, "opencode-go");
+    assert_eq!(model.id, "deepseek-v4-flash");
+    assert_eq!(model.variant.as_deref(), Some("high"));
+
+    let read = request_at(&server, 0);
+    assert_eq!(read.path, "/api/session/ses_ran/message");
+    assert_eq!(read.query_param("type").as_deref(), Some("assistant"));
+    assert_eq!(read.query_param("order").as_deref(), Some("desc"));
+    assert_eq!(read.query_param("limit").as_deref(), Some("1"));
+
+    assert!(
+        client
+            .session_last_run_model("ses_empty", None)
+            .await
+            .unwrap()
+            .is_none(),
+        "no assistant message means no last-run model"
+    );
+
+    // The reserved `default` sentinel is unset, not a thinking level
+    // (ADR-0020), so the message ref normalizes it exactly like the session
+    // read does.
+    let defaulted = client
+        .session_last_run_model("ses_defaulted", None)
+        .await
+        .unwrap()
+        .expect("the defaulted message names a model");
+    assert!(
+        defaulted.variant.is_none(),
+        "the reserved `default` spelling is no variant"
+    );
+}
+
 /// The session-scoped switches: V2's `POST /api/session/{id}/model` carries the
 /// whole `Model.Ref` (variant inside it) and `/agent` the agent id, both
 /// answering 204. A tagged 404 is session-not-found, not a bare proxy 404.

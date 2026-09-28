@@ -1810,6 +1810,199 @@ async fn think_pick_rewrites_the_model_ref_with_the_variant() {
     assert_eq!(calls[1].1.variant, None, "reset rewrites the ref without it");
 }
 
+/// On a durable generation (V2) the session DTO names a model only after an
+/// explicit switch; with no selection and no configured default, `/think`
+/// falls back to the model the session last actually ran with — what the
+/// server's own next-turn resolution keeps using — instead of claiming no
+/// current model on a working session.
+#[tokio::test]
+async fn think_card_falls_back_to_the_last_run_model_on_v2() {
+    use crate::opencode::types::{ModelInfo, SessionSelection};
+
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_models(vec![crate::opencode::types::ProviderModels {
+        provider: "opencode-go".into(),
+        models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
+    }]);
+    backend.with_session_selection("ses_test", SessionSelection::default());
+    backend.with_session_last_run_model(
+        "ses_test",
+        ModelInfo {
+            id: "deepseek-v4-flash".into(),
+            provider_id: "opencode-go".into(),
+            variant: Some("high".into()),
+        },
+    );
+    let (app, platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: key.clone(),
+            session_id: "ses_test".into(),
+            directory: "/tmp/aa".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    send_command_in(
+        &app,
+        "/think",
+        key.clone(),
+        "msg_think_last_run",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    let card = calls
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::ReplyCard { card, .. } => Some(card.clone()),
+            _ => None,
+        })
+        .next()
+        .expect("a think card should be sent");
+    let text = card.to_string();
+    assert!(
+        text.contains("opencode-go/deepseek-v4-flash"),
+        "the last-run model must be shown: {text}"
+    );
+    assert!(
+        text.contains("当前思考等级") && text.contains("`high`"),
+        "the variant the session ran with must be current: {text}"
+    );
+    let buttons = card_buttons(&card);
+    assert!(
+        buttons.iter().any(|b| b["value"]["value"] == "low"),
+        "the model's variants must be offered: {text}"
+    );
+}
+
+/// A `/think <variant>` pick on a durable generation with no session
+/// selection resolves the last-run model and rewrites its ref with the
+/// variant — setting the thinking level on the model in use instead of the
+/// "pick a model" refusal.
+#[tokio::test]
+async fn think_pick_uses_the_last_run_model_on_v2() {
+    use crate::opencode::types::{ModelInfo, SessionSelection};
+
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_models(vec![crate::opencode::types::ProviderModels {
+        provider: "opencode-go".into(),
+        models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
+    }]);
+    backend.with_session_selection("ses_test", SessionSelection::default());
+    backend.with_session_last_run_model(
+        "ses_test",
+        ModelInfo {
+            id: "deepseek-v4-flash".into(),
+            provider_id: "opencode-go".into(),
+            variant: None,
+        },
+    );
+    let switch_calls = backend.switch_model_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: key.clone(),
+            session_id: "ses_test".into(),
+            directory: "/tmp/aa".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    send_command_in(
+        &app,
+        "/think high",
+        key.clone(),
+        "msg_think_last_run",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    assert_eq!(
+        switch_calls.lock().await.as_slice(),
+        &[(
+            "ses_test".to_string(),
+            ModelInfo {
+                id: "deepseek-v4-flash".into(),
+                provider_id: "opencode-go".into(),
+                variant: Some("high".into()),
+            },
+        )],
+        "the pick must rewrite the last-run model's ref with the variant"
+    );
+    let text = platform.texts().await.join("\n");
+    assert!(text.contains("Thinking: high"), "pick feedback: {text}");
+}
+
+/// A failed last-run read degrades the ladder to "no current model" — a text
+/// explanation, never a hang or a guessed model.
+#[tokio::test]
+async fn think_card_degrades_when_the_last_run_read_fails() {
+    use crate::opencode::types::SessionSelection;
+
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_session_selection("ses_test", SessionSelection::default());
+    backend.fail_session_last_run_model("last-run read is down");
+    let (app, platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: key.clone(),
+            session_id: "ses_test".into(),
+            directory: "/tmp/aa".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    send_command_in(
+        &app,
+        "/think",
+        key,
+        "msg_think_last_run",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let texts = platform.texts().await.join("\n");
+    assert!(
+        texts.contains("无法确定当前模型"),
+        "a failed read must degrade to the pick-a-model prompt: {texts}"
+    );
+}
+
 /// A durable-generation `/agent` pick (V2) switches the session's agent; the
 /// reset switches to the server's default agent id (V2 has no unset arm).
 #[tokio::test]

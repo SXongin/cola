@@ -159,13 +159,17 @@ impl RawModelRef {
         ModelInfo {
             id: self.id,
             provider_id: self.provider_id,
-            // V2 serializes "no variant" as the literal `"default"` on the
-            // session read (`Session.Info` normalizes an absent variant to it)
-            // and treats that spelling as unset everywhere else, so the
-            // neutral ref must not carry it as a real variant.
-            variant: self.variant.filter(|variant| variant != "default"),
+            variant: real_variant(self.variant),
         }
     }
+}
+
+/// The one "no variant" spelling: V2 normalizes an absent variant to the
+/// literal `"default"` on session and message model refs and treats that
+/// spelling as unset everywhere else, so the neutral refs must never carry it
+/// as a real variant (ADR-0020: clearing is a mechanism, never a value word).
+fn real_variant(variant: Option<String>) -> Option<String> {
+    variant.filter(|variant| variant != "default")
 }
 
 /// `GET /api/agent` — one `Agent.Info`. `id` is the wire identity a session
@@ -528,6 +532,16 @@ pub(super) struct MessagesPage {
 }
 
 impl MessagesPage {
+    /// The first assistant message in the page. A `type=assistant`-filtered
+    /// one-message read makes this the newest assistant; the tolerant scan
+    /// keeps the answer correct if a server ever ignores the filter (the first
+    /// assistant present is still "the newest one present").
+    pub(super) fn newest_assistant(&self) -> Option<&Value> {
+        self.data
+            .iter()
+            .find(|message| message.get("type").and_then(Value::as_str) == Some("assistant"))
+    }
+
     /// Whether the newest assistant message is scheduled for retry. The
     /// strategy requests `type=assistant&order=desc&limit=1`, so this is the
     /// latest assistant; the tolerant scan keeps the answer correct if a server
@@ -535,9 +549,7 @@ impl MessagesPage {
     /// present"). An absent `retry` — including an explicit JSON null, which is
     /// how V2 serializes the cleared field — means no retry.
     pub(super) fn newest_assistant_retrying(&self) -> bool {
-        self.data
-            .iter()
-            .find(|message| message.get("type").and_then(Value::as_str) == Some("assistant"))
+        self.newest_assistant()
             .and_then(|message| message.get("retry"))
             .is_some_and(|retry| !retry.is_null())
     }
@@ -591,7 +603,9 @@ fn decode_time(message: &Value) -> Option<MessageTime> {
     })
 }
 
-/// The model that produced an assistant message (`Model.Ref`), when named.
+/// The model that produced an assistant message (`Model.Ref`), when named. The
+/// variant is normalized through [`real_variant`] so the reserved `"default"`
+/// sentinel never reads as a real thinking level (ADR-0020).
 fn decode_model(model: Option<&Value>) -> Option<ModelIdentity> {
     let model = model?;
     let model_id = model.get("id").and_then(Value::as_str)?;
@@ -602,7 +616,18 @@ fn decode_model(model: Option<&Value>) -> Option<ModelIdentity> {
             .unwrap_or_default()
             .to_string(),
         model_id: model_id.to_string(),
-        variant: model.get("variant").and_then(Value::as_str).map(str::to_string),
+        variant: real_variant(model.get("variant").and_then(Value::as_str).map(str::to_string)),
+    })
+}
+
+/// The model ref one projected message names, decoded to the neutral
+/// variant-carrying [`ModelInfo`] the effective-model ladder speaks. Shares
+/// [`decode_model`] with the transcript decode, so the two cannot drift.
+pub(super) fn decode_message_model(message: &Value) -> Option<ModelInfo> {
+    decode_model(message.get("model")).map(|model| ModelInfo {
+        id: model.model_id,
+        provider_id: model.provider_id,
+        variant: model.variant,
     })
 }
 
@@ -1119,6 +1144,47 @@ mod tests {
             Part::StepFinish(StepFinish {
                 reason: FinishReason::Stop
             })
+        );
+    }
+
+    /// The reserved `"default"` variant sentinel is unset on message refs too
+    /// (ADR-0020: clearing is a mechanism, never a value word) — the same
+    /// normalization the session read applies — while a real level and a
+    /// missing variant keep their meaning.
+    #[test]
+    fn message_model_refs_never_carry_the_reserved_default_variant() {
+        fn assistant(variant: Option<&str>) -> Value {
+            let mut model = serde_json::json!({"id": "deepseek-v4-flash", "providerID": "opencode-go"});
+            if let Some(variant) = variant {
+                model["variant"] = Value::String(variant.to_string());
+            }
+            serde_json::json!({"id": "msg_a", "type": "assistant", "model": model})
+        }
+
+        let defaulted = decode_messages(&[assistant(Some("default"))]);
+        assert!(
+            defaulted.messages[0].model.as_ref().unwrap().variant.is_none(),
+            "the transcript ref must not carry the sentinel"
+        );
+        assert!(
+            decode_message_model(&assistant(Some("default")))
+                .expect("a model")
+                .variant
+                .is_none(),
+            "the message-ref decode must not carry the sentinel"
+        );
+        assert_eq!(
+            decode_message_model(&assistant(Some("high")))
+                .expect("a model")
+                .variant
+                .as_deref(),
+            Some("high")
+        );
+        assert!(
+            decode_message_model(&assistant(None))
+                .expect("a model")
+                .variant
+                .is_none()
         );
     }
 

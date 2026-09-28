@@ -318,6 +318,18 @@ impl GenerationStrategy for V1Strategy {
         Ok(None)
     }
 
+    /// V1 answers `None` without a request: the effective-model ladder's last
+    /// rung already reads the model the server recorded on the session through
+    /// [`Self::session_info`], so no message-level fallback is needed.
+    async fn session_last_run_model(
+        &self,
+        _http: &Transport,
+        _session_id: &str,
+        _directory: Option<&str>,
+    ) -> Result<Option<ModelInfo>> {
+        Ok(None)
+    }
+
     /// V1's model selection is per prompt — deliberately a no-op, so the
     /// generation-blind Bridge may call it unconditionally.
     async fn switch_session_model(

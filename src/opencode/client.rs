@@ -338,6 +338,19 @@ impl OpenCodeBackend {
             .await
     }
 
+    /// The model the session last actually ran with where the generation can
+    /// name one (V2's newest assistant message); `None` on V1, whose ladder
+    /// reads the server-recorded session model instead.
+    pub async fn session_last_run_model(
+        &self,
+        session_id: &str,
+        directory: Option<&str>,
+    ) -> crate::error::Result<Option<ModelInfo>> {
+        self.strategy()
+            .session_last_run_model(&self.transport, session_id, directory)
+            .await
+    }
+
     /// Make the session's model selection durable (V2); a no-op on V1.
     pub async fn switch_session_model(
         &self,
