@@ -15,6 +15,10 @@
 //!
 //! Re-record with the live harness's `COLA_LIVE_CAPTURE_DIR` hook (see
 //! `crate::opencode::live`), sanitize ids/times/cursors by hand, and commit.
+//! The background-wake and interruption-continuation fixtures are the one
+//! manual exception: they are unfiltered message reads of a real session from
+//! #403 (`?type=idle` is not a legal message filter), and their stamp records
+//! the read command instead of a live test.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -65,6 +69,22 @@ pub(crate) fn v2_transcript_turn() -> RecordedResponse {
 /// stamp and no `finish` — the in-flight shape turn membership turns on.
 pub(crate) fn v2_transcript_inflight() -> RecordedResponse {
     RecordedResponse::parse(include_str!("fixtures/v2/transcript_inflight.json"))
+}
+
+/// The #403 session's background-wake cycle (2.0.18): a background shell tool
+/// part, the shell Wake that retired it, and a later backgrounded run whose
+/// Wake had not arrived when the read was taken — one unfiltered transcript
+/// read (`?type=idle` is not a legal message filter, so the durable idle
+/// boundary rides along), sanitized to neutral ids, times and text.
+pub(crate) fn v2_background_wake() -> RecordedResponse {
+    RecordedResponse::parse(include_str!("fixtures/v2/background_wake.json"))
+}
+
+/// The #403 session's interruption continuation (2.0.18): a `synthetic` that
+/// resumed an interrupted response with no metadata at all, the continued
+/// steps, and the idle boundary — recorded in the same unfiltered read.
+pub(crate) fn v2_interrupt_continuation() -> RecordedResponse {
+    RecordedResponse::parse(include_str!("fixtures/v2/interrupt_continuation.json"))
 }
 
 #[cfg(test)]

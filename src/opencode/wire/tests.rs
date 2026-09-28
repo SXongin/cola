@@ -5,12 +5,15 @@
 //! turn projections the Session Snapshot tail, the external-message sync and
 //! the follow renderers consume.
 
-use crate::backend::{MessageRole, Part, SessionTranscript, ToolStatus};
+use crate::backend::{ExecutionOutcome, MessageRole, Part, SessionTranscript, ToolStatus, WakeSource};
 use crate::opencode::conformance::SessionCase;
 use crate::opencode::strategy::Generation;
 use crate::test_http::TestHttpServer;
 
-use super::{RecordedResponse, v1_transcript_turn, v2_transcript_inflight, v2_transcript_turn};
+use super::{
+    RecordedResponse, v1_transcript_turn, v2_background_wake, v2_interrupt_continuation,
+    v2_transcript_inflight, v2_transcript_turn,
+};
 
 /// The session id the recorded bodies are served under: the recording's own id
 /// was sanitized, and the route is per-test, so the value only has to be one
@@ -213,4 +216,74 @@ async fn recorded_v2_inflight_step_keeps_the_turn_open() {
         .expect("the in-flight step carries the running tool");
     assert!(tool.status.is_live(), "the tool is still running: {tool:#?}");
     assert_eq!(tool.identity.call_id, "call_live_harness_1", "{tool:#?}");
+}
+
+/// V1 records none of the V2 interaction facts: the recorded turn decodes
+/// exactly as it always did, and the new neutral fields stay empty — V1 is the
+/// retirement surface, never half-ported.
+#[tokio::test]
+async fn recorded_v1_turn_carries_no_v2_interaction_facts() {
+    let case = crate::opencode::v1::conformance::case();
+    let transcript = decode_recorded(&case, &v1_transcript_turn()).await;
+
+    assert!(
+        transcript.executions.is_empty(),
+        "V1 has no idle boundaries: {:#?}",
+        transcript.executions
+    );
+    assert!(
+        transcript.wakes.is_empty(),
+        "V1 has no Wakes: {:#?}",
+        transcript.wakes
+    );
+    assert!(
+        transcript.background_tasks.is_empty(),
+        "V1 has no Background Tasks: {:#?}",
+        transcript.background_tasks
+    );
+
+    // The turn read itself is unchanged.
+    assert_completed_turn(&transcript);
+}
+
+/// The recorded #403 facts decode through the real adapter — the wire resume,
+/// the envelope, the cursor follow and the decoder together: one shell Wake
+/// retires its run while the other stays live, the idle is the Execution
+/// boundary, and the interruption continuations are sourceless Wakes.
+#[tokio::test]
+async fn recorded_v2_background_facts_decode_through_the_adapter() {
+    let case = crate::opencode::v2::conformance::case();
+
+    let transcript = decode_recorded(&case, &v2_background_wake()).await;
+    assert_eq!(transcript.executions.len(), 1, "{:#?}", transcript.executions);
+    assert_eq!(transcript.executions[0].outcome, ExecutionOutcome::Succeeded);
+    assert_eq!(transcript.wakes.len(), 1, "{:#?}", transcript.wakes);
+    assert_eq!(transcript.wakes[0].source, WakeSource::Shell);
+    assert_eq!(
+        transcript.wakes[0].shell_id.as_deref(),
+        Some("sh_fixture_retired")
+    );
+    assert_eq!(
+        transcript
+            .background_tasks
+            .iter()
+            .map(|task| task.tool.call_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["call_background_live"],
+        "the Wake retires its run, the other stays live: {:#?}",
+        transcript.background_tasks
+    );
+
+    let transcript = decode_recorded(&case, &v2_interrupt_continuation()).await;
+    assert_eq!(transcript.wakes.len(), 2, "{:#?}", transcript.wakes);
+    assert!(
+        transcript
+            .wakes
+            .iter()
+            .all(|wake| wake.source == WakeSource::Unknown),
+        "the recorded continuations carry no source marker: {:#?}",
+        transcript.wakes
+    );
+    assert_eq!(transcript.executions.len(), 1, "{:#?}", transcript.executions);
+    assert!(transcript.background_tasks.is_empty());
 }

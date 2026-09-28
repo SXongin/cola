@@ -1,0 +1,640 @@
+{
+  "capture": {
+    "captured_at": "2026-09-29",
+    "command": "curl -u \"$OPENCODE_SERVER_USERNAME:$OPENCODE_SERVER_PASSWORD\" \"$OPENCODE_URL/api/session/<session>/message?order=asc&limit=200\"",
+    "generation": "v2",
+    "source": "opencode v2.0.18"
+  },
+  "response": {
+    "cursor": {
+      "next": "cursor_next_fixture"
+    },
+    "data": [
+      {
+        "id": "msg_background_start",
+        "time": {
+          "created": 1700000000000,
+          "streamed": 1700000014752,
+          "completed": 1700000016463
+        },
+        "type": "assistant",
+        "agent": "build",
+        "model": {
+          "id": "scripted-model",
+          "providerID": "scripted",
+          "variant": "default"
+        },
+        "content": [
+          {
+            "type": "reasoning",
+            "text": "live-harness-reasoning",
+            "state": {
+              "reasoningField": "reasoning_content"
+            },
+            "time": {
+              "created": 1700000007671,
+              "completed": 1700000014736
+            }
+          },
+          {
+            "type": "text",
+            "text": "live-harness-text"
+          },
+          {
+            "type": "tool",
+            "id": "call_background_retired",
+            "name": "shell",
+            "executed": false,
+            "state": {
+              "status": "completed",
+              "input": {
+                "command": "sleep 2; echo live-harness-tool",
+                "background": true,
+                "workdir": "/work/live-harness"
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Command moved to the background (shell ID: sh_fixture_retired).\nOutput is streaming to: /tmp/opencode/sh_fixture_retired.out"
+                },
+                {
+                  "type": "text",
+                  "text": "live-harness-tool\n"
+                }
+              ],
+              "metadata": {
+                "status": "running",
+                "truncated": false,
+                "shellID": "sh_fixture_retired"
+              }
+            },
+            "time": {
+              "created": 1700000014248,
+              "ran": 1700000014740,
+              "completed": 1700000014766
+            }
+          },
+          {
+            "type": "tool",
+            "id": "call_fixture_1",
+            "name": "shell",
+            "executed": false,
+            "state": {
+              "status": "completed",
+              "input": {
+                "command": "sleep 2; echo live-harness-tool",
+                "workdir": "/work/live-harness"
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "live-harness-tool\n"
+                }
+              ],
+              "metadata": {
+                "status": "completed",
+                "truncated": false,
+                "exit": 0
+              }
+            },
+            "time": {
+              "created": 1700000014705,
+              "ran": 1700000014746,
+              "completed": 1700000016449
+            }
+          }
+        ],
+        "snapshot": {
+          "start": "snapshot_fixture_start",
+          "end": "snapshot_fixture_end",
+          "files": []
+        },
+        "finish": "tool-calls",
+        "rawFinish": "tool_calls",
+        "cost": 0,
+        "tokens": {
+          "input": 2714,
+          "output": 178,
+          "reasoning": 1328,
+          "cache": {
+            "read": 175232,
+            "write": 0
+          }
+        }
+      },
+      {
+        "id": "msg_step_1",
+        "time": {
+          "created": 1700000016532,
+          "streamed": 1700000025556,
+          "completed": 1700000031352
+        },
+        "type": "assistant",
+        "agent": "build",
+        "model": {
+          "id": "scripted-model",
+          "providerID": "scripted",
+          "variant": "default"
+        },
+        "content": [
+          {
+            "type": "reasoning",
+            "text": "live-harness-reasoning",
+            "state": {
+              "reasoningField": "reasoning_content"
+            },
+            "time": {
+              "created": 1700000021800,
+              "completed": 1700000025544
+            }
+          },
+          {
+            "type": "tool",
+            "id": "call_fixture_2",
+            "name": "shell",
+            "executed": false,
+            "state": {
+              "status": "completed",
+              "input": {
+                "command": "sleep 2; echo live-harness-tool",
+                "workdir": "/work/live-harness"
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "live-harness-tool\n"
+                }
+              ],
+              "metadata": {
+                "status": "completed",
+                "truncated": false,
+                "exit": 0
+              }
+            },
+            "time": {
+              "created": 1700000024476,
+              "ran": 1700000025552,
+              "completed": 1700000031336
+            }
+          }
+        ],
+        "snapshot": {
+          "start": "snapshot_fixture_start",
+          "end": "snapshot_fixture_end",
+          "files": []
+        },
+        "finish": "tool-calls",
+        "rawFinish": "tool_calls",
+        "cost": 0,
+        "tokens": {
+          "input": 1184,
+          "output": 398,
+          "reasoning": 537,
+          "cache": {
+            "read": 178816,
+            "write": 0
+          }
+        }
+      },
+      {
+        "id": "msg_step_2",
+        "time": {
+          "created": 1700000031406,
+          "streamed": 1700000050803,
+          "completed": 1700000050850
+        },
+        "type": "assistant",
+        "agent": "build",
+        "model": {
+          "id": "scripted-model",
+          "providerID": "scripted",
+          "variant": "default"
+        },
+        "content": [
+          {
+            "type": "reasoning",
+            "text": "live-harness-reasoning",
+            "state": {
+              "reasoningField": "reasoning_content"
+            },
+            "time": {
+              "created": 1700000047595,
+              "completed": 1700000050789
+            }
+          },
+          {
+            "type": "text",
+            "text": "live-harness-text"
+          },
+          {
+            "type": "tool",
+            "id": "call_fixture_3",
+            "name": "shell",
+            "executed": false,
+            "state": {
+              "status": "completed",
+              "input": {
+                "command": "sleep 2; echo live-harness-tool",
+                "workdir": "/work/live-harness"
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "live-harness-tool\n"
+                }
+              ],
+              "metadata": {
+                "status": "completed",
+                "truncated": false,
+                "exit": 0
+              }
+            },
+            "time": {
+              "created": 1700000050776,
+              "ran": 1700000050796,
+              "completed": 1700000050827
+            }
+          }
+        ],
+        "snapshot": {
+          "start": "snapshot_fixture_start",
+          "end": "snapshot_fixture_end",
+          "files": []
+        },
+        "finish": "tool-calls",
+        "rawFinish": "tool_calls",
+        "cost": 0,
+        "tokens": {
+          "input": 225,
+          "output": 71,
+          "reasoning": 686,
+          "cache": {
+            "read": 180736,
+            "write": 0
+          }
+        }
+      },
+      {
+        "id": "msg_step_3",
+        "time": {
+          "created": 1700000050914,
+          "streamed": 1700000061664,
+          "completed": 1700000062988
+        },
+        "type": "assistant",
+        "agent": "build",
+        "model": {
+          "id": "scripted-model",
+          "providerID": "scripted",
+          "variant": "default"
+        },
+        "content": [
+          {
+            "type": "tool",
+            "id": "call_fixture_4",
+            "name": "shell",
+            "executed": false,
+            "state": {
+              "status": "completed",
+              "input": {
+                "command": "sleep 2; echo live-harness-tool",
+                "workdir": "/work/live-harness"
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "live-harness-tool\n"
+                }
+              ],
+              "metadata": {
+                "status": "completed",
+                "truncated": false,
+                "exit": 0
+              }
+            },
+            "time": {
+              "created": 1700000060733,
+              "ran": 1700000061661,
+              "completed": 1700000062973
+            }
+          }
+        ],
+        "snapshot": {
+          "start": "snapshot_fixture_start",
+          "end": "snapshot_fixture_end",
+          "files": []
+        },
+        "finish": "tool-calls",
+        "rawFinish": "tool_calls",
+        "cost": 0,
+        "tokens": {
+          "input": 202,
+          "output": 313,
+          "reasoning": 0,
+          "cache": {
+            "read": 181632,
+            "write": 0
+          }
+        }
+      },
+      {
+        "id": "msg_wake_shell",
+        "metadata": {
+          "source": "shell",
+          "shellID": "sh_fixture_retired",
+          "jobID": "sh_fixture_retired",
+          "state": "completed",
+          "truncated": false,
+          "exit": 0
+        },
+        "time": {
+          "created": 1700000063001
+        },
+        "text": "<shell id=\"sh_fixture_retired\" state=\"completed\" command=\"sleep 2; echo live-harness-tool\">\nlive-harness-tool\n</shell>",
+        "description": "sleep 2; echo live-harness-tool",
+        "type": "synthetic"
+      },
+      {
+        "id": "msg_wake_continuation",
+        "time": {
+          "created": 1700000063056,
+          "streamed": 1700000079442,
+          "completed": 1700000092005
+        },
+        "type": "assistant",
+        "agent": "build",
+        "model": {
+          "id": "scripted-model",
+          "providerID": "scripted",
+          "variant": "default"
+        },
+        "content": [
+          {
+            "type": "reasoning",
+            "text": "live-harness-reasoning",
+            "state": {
+              "reasoningField": "reasoning_content"
+            },
+            "time": {
+              "created": 1700000076757,
+              "completed": 1700000079428
+            }
+          },
+          {
+            "type": "text",
+            "text": "live-harness-text"
+          },
+          {
+            "type": "tool",
+            "id": "call_fixture_5",
+            "name": "shell",
+            "executed": false,
+            "state": {
+              "status": "completed",
+              "input": {
+                "command": "sleep 2; echo live-harness-tool",
+                "workdir": "/work/live-harness"
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "live-harness-tool\n"
+                }
+              ],
+              "metadata": {
+                "status": "completed",
+                "truncated": false,
+                "exit": 0
+              }
+            },
+            "time": {
+              "created": 1700000079242,
+              "ran": 1700000079434,
+              "completed": 1700000091989
+            }
+          }
+        ],
+        "snapshot": {
+          "start": "snapshot_fixture_start",
+          "end": "snapshot_fixture_end",
+          "files": []
+        },
+        "finish": "tool-calls",
+        "rawFinish": "tool_calls",
+        "cost": 0,
+        "tokens": {
+          "input": 2795,
+          "output": 114,
+          "reasoning": 638,
+          "cache": {
+            "read": 182144,
+            "write": 0
+          }
+        }
+      },
+      {
+        "id": "msg_step_4",
+        "time": {
+          "created": 1700000092068,
+          "streamed": 1700000104343,
+          "completed": 1700000110921
+        },
+        "type": "assistant",
+        "agent": "build",
+        "model": {
+          "id": "scripted-model",
+          "providerID": "scripted",
+          "variant": "default"
+        },
+        "content": [
+          {
+            "type": "tool",
+            "id": "call_fixture_6",
+            "name": "shell",
+            "executed": false,
+            "state": {
+              "status": "completed",
+              "input": {
+                "command": "sleep 2; echo live-harness-tool",
+                "workdir": "/work/live-harness"
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "live-harness-tool\n"
+                }
+              ],
+              "metadata": {
+                "status": "completed",
+                "truncated": false,
+                "exit": 0
+              }
+            },
+            "time": {
+              "created": 1700000099492,
+              "ran": 1700000104340,
+              "completed": 1700000110905
+            }
+          }
+        ],
+        "snapshot": {
+          "start": "snapshot_fixture_start",
+          "end": "snapshot_fixture_end",
+          "files": []
+        },
+        "finish": "tool-calls",
+        "rawFinish": "tool_calls",
+        "cost": 0,
+        "tokens": {
+          "input": 217,
+          "output": 606,
+          "reasoning": 0,
+          "cache": {
+            "read": 185600,
+            "write": 0
+          }
+        }
+      },
+      {
+        "id": "msg_background_live",
+        "time": {
+          "created": 1700000110985,
+          "streamed": 1700000121307,
+          "completed": 1700000121375
+        },
+        "type": "assistant",
+        "agent": "build",
+        "model": {
+          "id": "scripted-model",
+          "providerID": "scripted",
+          "variant": "default"
+        },
+        "content": [
+          {
+            "type": "reasoning",
+            "text": "live-harness-reasoning",
+            "state": {
+              "reasoningField": "reasoning_content"
+            },
+            "time": {
+              "created": 1700000116181,
+              "completed": 1700000121295
+            }
+          },
+          {
+            "type": "text",
+            "text": "live-harness-text"
+          },
+          {
+            "type": "tool",
+            "id": "call_background_live",
+            "name": "shell",
+            "executed": false,
+            "state": {
+              "status": "completed",
+              "input": {
+                "background": true,
+                "command": "sleep 2; echo live-harness-tool",
+                "workdir": "/work/live-harness"
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Command moved to the background (shell ID: sh_fixture_live).\nOutput is streaming to: /tmp/opencode/sh_fixture_live.out"
+                },
+                {
+                  "type": "text",
+                  "text": "live-harness-tool\n"
+                }
+              ],
+              "metadata": {
+                "status": "running",
+                "truncated": false,
+                "shellID": "sh_fixture_live"
+              }
+            },
+            "time": {
+              "created": 1700000121045,
+              "ran": 1700000121301,
+              "completed": 1700000121354
+            }
+          }
+        ],
+        "snapshot": {
+          "start": "snapshot_fixture_start",
+          "end": "snapshot_fixture_end",
+          "files": []
+        },
+        "finish": "tool-calls",
+        "rawFinish": "tool_calls",
+        "cost": 0,
+        "tokens": {
+          "input": 210,
+          "output": 130,
+          "reasoning": 1018,
+          "cache": {
+            "read": 186240,
+            "write": 0
+          }
+        }
+      },
+      {
+        "id": "msg_live_answer",
+        "time": {
+          "created": 1700000121476,
+          "streamed": 1700000130195,
+          "completed": 1700000130211
+        },
+        "type": "assistant",
+        "agent": "build",
+        "model": {
+          "id": "scripted-model",
+          "providerID": "scripted",
+          "variant": "default"
+        },
+        "content": [
+          {
+            "type": "reasoning",
+            "text": "live-harness-reasoning",
+            "state": {
+              "reasoningField": "reasoning_content"
+            },
+            "time": {
+              "created": 1700000125137,
+              "completed": 1700000130188
+            }
+          },
+          {
+            "type": "text",
+            "text": "live-harness-answer"
+          }
+        ],
+        "snapshot": {
+          "start": "snapshot_fixture_start",
+          "end": "snapshot_fixture_end",
+          "files": []
+        },
+        "finish": "stop",
+        "rawFinish": "stop",
+        "cost": 0,
+        "tokens": {
+          "input": 304,
+          "output": 650,
+          "reasoning": 482,
+          "cache": {
+            "read": 187520,
+            "write": 0
+          }
+        }
+      },
+      {
+        "id": "msg_idle",
+        "time": {
+          "created": 1700000130217
+        },
+        "type": "idle",
+        "outcome": "succeeded"
+      }
+    ]
+  }
+}
