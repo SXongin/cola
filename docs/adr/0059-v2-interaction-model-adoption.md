@@ -59,6 +59,16 @@ onto the V1-shaped one.**
   return relies on the ADR-0028 snapshot (ADR-0017's no-interleaving rule is
   unchanged).
 
+  One settle decision (`SessionTranscript::settle`) serves every ending — the
+  drain, the out-of-turn follow and the Wake continuation. It reads the read's
+  own Executions, Wakes and Background Tasks, never a terminal step: a Turn is
+  complete only at an idle read whose newest Execution boundary answers every
+  placeable Wake — a Wake opens an Execution, so a Wake's content landing in a
+  finalization window cannot declare the Turn complete — with no live
+  Background Task, and the Turn's settled failure dominates the waiting
+  disposition (a failed or stopped Turn never yields waiting). A generation
+  without these facts (V1) decides as today.
+
 - **Routing key: live Execution.** A user message arriving while an Execution
   is live is a **Supplement** — submitted without starting a competing Turn,
   the chain splitting below it. When the session is idle, including the
