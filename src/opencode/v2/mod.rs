@@ -54,6 +54,11 @@ const SESSION: &str = "/api/session";
 /// admit-then-return prompt, used for both the main dispatch and a mid-turn
 /// supplement (the server's default delivery is `steer`).
 const SESSION_PROMPT_SUFFIX: &str = "/prompt";
+/// The delivery mode every prompt carries: `steer` merges a mid-turn
+/// supplement at the next step boundary while the session is busy, and starts
+/// the run when it is idle. Single-sourced so the live retry-id chain's raw
+/// same-id re-post speaks the exact body this strategy sends.
+pub(crate) const PROMPT_DELIVERY: &str = "steer";
 /// The interrupt endpoint (`POST /api/session/{id}/interrupt`).
 const SESSION_INTERRUPT_SUFFIX: &str = "/interrupt";
 /// The durable model switch (`POST /api/session/{id}/model`, 204).
@@ -699,7 +704,7 @@ impl V2Strategy {
         if let Some(message_id) = message_id {
             body["id"] = serde_json::json!(message_id);
         }
-        body["delivery"] = serde_json::json!("steer");
+        body["delivery"] = serde_json::json!(PROMPT_DELIVERY);
         let response = http
             .client()
             .post(http.url(&format!("{SESSION}/{session_id}{SESSION_PROMPT_SUFFIX}")))
