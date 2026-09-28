@@ -543,19 +543,6 @@ impl Turn {
         // handler's not-busy path.
         let drain_outcome = self.drain_after_prompt(handles).await;
 
-        // A deliberate `/stop` owns this turn's ending (#394): the abort the
-        // server recorded is NOT a failure, its text must never reach the
-        // card, and the card finalizes `Stopped` — here, or by the follow's own
-        // stop branch if the drain had already handed the card off. The marker
-        // is sticky until the next Turn's `start` clears it, so reading it once
-        // here is authoritative for this finalization.
-        let stopped = handles
-            .waits
-            .stopped_sessions
-            .lock()
-            .await
-            .contains(&self.session_id);
-
         // The turn's outcome is OBSERVED, not returned (ADR-0056): a rejected
         // submit is the call's Err, and a submitted run's failure is recorded
         // on its newest assistant message — the blocking response used to carry
@@ -566,6 +553,15 @@ impl Turn {
         // drain last observed stands in, so a hiccup cannot stamp Done over a
         // failed turn.
         let final_transcript = handles.backend.transcript(&self.session_id).await.ok();
+
+        // A deliberate `/stop` owns this turn's ending (#394): the abort the
+        // server recorded is NOT a failure, its text must never reach the
+        // card, and the card finalizes `Stopped` — here, or by the follow's own
+        // stop branch if the drain had already handed the card off. The marker
+        // is sticky until the next Turn's `start` clears it. Read it AFTER the
+        // transcript read: that read is an await, so a stop landing during it
+        // must still win.
+        let mut stopped = handles.waits.is_stopped(&self.session_id).await;
         let prompt_err = match prompt_resp {
             Err(e) => Some(e.to_string()),
             Ok(()) => {
@@ -646,6 +642,14 @@ impl Turn {
             // Reconcile: render any parts the incremental poll missed from the
             // settled transcript read above, then mark the card Stopped, Done
             // or Error.
+            //
+            // A stop landing after the read above (during the leftover
+            // rejection, or any scheduler hop since) must still win: re-read
+            // the marker immediately before the stamp. The residual window is
+            // the cards-lock acquisition below; a stop landing after it is
+            // indistinguishable from one landing just after a completed turn,
+            // and the next Turn owns it.
+            stopped = stopped || handles.waits.is_stopped(&self.session_id).await;
             {
                 let mut cards = handles.cards.cards.lock().await;
                 if let Some(acc) = cards.get_mut(&self.session_id).map(|c| &mut c.acc) {
@@ -674,11 +678,11 @@ impl Turn {
                     }
                     if stopped {
                         // `/stop` is the operator's decision, not a failure:
-                        // discard the abort's error text (if the transcript
-                        // recorded one) and end the card in its own terminal
-                        // (#394). The content the turn produced stays.
-                        acc.error = None;
-                        acc.card_state = crate::feishu::card::CardState::Stopped;
+                        // `set_stopped` discards the abort's error text (if
+                        // the transcript recorded one) and ends the card in
+                        // its own terminal (#394). The content the turn
+                        // produced stays.
+                        acc.set_stopped();
                     } else if let Some(err) = &prompt_err {
                         acc.error = Some(err.clone());
                         acc.card_state = crate::feishu::card::CardState::Error;
@@ -894,13 +898,7 @@ impl Turn {
         // the session is stopped). The marker is cleared by the next Turn's
         // `start`. The finalization is logged once per Turn: the drain and the
         // re-check that follows it both read the same sticky marker.
-        if handles
-            .waits
-            .stopped_sessions
-            .lock()
-            .await
-            .contains(&self.session_id)
-        {
+        if handles.waits.is_stopped(&self.session_id).await {
             if !self.stop_finalization_logged {
                 self.stop_finalization_logged = true;
                 tracing::info!("turn drain: session {} was stopped; finalizing", self.session_id);
@@ -1398,8 +1396,7 @@ impl Turn {
     /// out-of-turn follow's stop branch.
     pub(crate) async fn finalize_stopped(cards: &CardsHandle, session_id: &str) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.acc.error = None;
-            card.acc.card_state = crate::feishu::card::CardState::Stopped;
+            card.acc.set_stopped();
         }
         Self::refresh_work_context(cards, session_id).await;
         Self::flush_card(cards, session_id).await;

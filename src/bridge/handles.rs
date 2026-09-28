@@ -869,6 +869,16 @@ pub(crate) struct WaitsHandle {
     pub(crate) message_pins: Arc<MessagePins>,
 }
 
+impl WaitsHandle {
+    /// Whether this session's run was stopped with `/stop` — the sticky marker
+    /// the drain rule (ADR-0043) and the stop terminal (#394) read. One
+    /// accessor so the lock-and-check exists in one place, and every reader
+    /// sees the same fact.
+    pub(crate) async fn is_stopped(&self, session_id: &str) -> bool {
+        self.stopped_sessions.lock().await.contains(session_id)
+    }
+}
+
 /// The turn knobs: the completion-notice flags, the injectable cadences and
 /// thresholds, and the default work directory. Holds no locks (the cadences are
 /// atomics).
