@@ -139,6 +139,66 @@ impl SessionTranscript {
         }
     }
 
+    /// The single settle decision every Turn ending uses (ADR-0059): the
+    /// drain, the out-of-turn follow, and the Wake continuation all read a
+    /// Turn's ending from here.
+    ///
+    /// The decision never reads a terminal step. A Turn spans every Execution
+    /// its chain opened — including ones a Wake opened after the Backend went
+    /// idle — so its ending is decidable only at an idle read whose newest
+    /// Execution boundary answers every [placeable](Wake::created_ms) Wake:
+    /// the Wake's own content (an assistant step with a terminal finish)
+    /// landing inside a finalization window can no longer declare the Turn
+    /// complete. `session_idle` is the Backend's live run state: `false` while
+    /// an Execution is live (Busy/Retry), `true` at an idle read — an
+    /// unreadable status is passed as idle, exactly as the callers always
+    /// treated it.
+    ///
+    /// At an idle, answered read the ending is, in decision order:
+    ///
+    /// - [`TurnSettle::Failed`] — the Turn's settled failure (its newest
+    ///   assistant message's error). A failure dominates: a failed Turn never
+    ///   yields waiting, even with live Background Tasks;
+    /// - [`TurnSettle::Waiting`] — Background Tasks are live: the card yields
+    ///   「⏳ 等待后台任务」, neither ✅ nor a terminal, and sends no Completion
+    ///   Notice;
+    /// - [`TurnSettle::Complete`] — the true end: idle with no live Background
+    ///   Task.
+    ///
+    /// A read with no Executions, Wakes or Background Tasks (V1) decides
+    /// exactly as before: idle with no live Background Task is complete.
+    pub fn settle(&self, anchor: &TurnAnchor, session_idle: bool) -> TurnSettle {
+        if !session_idle || !self.wakes_answered() {
+            return TurnSettle::Running;
+        }
+        if let Some(error) = self.turn_for_user(anchor).error {
+            return TurnSettle::Failed(error);
+        }
+        if !self.background_tasks.is_empty() {
+            return TurnSettle::Waiting;
+        }
+        TurnSettle::Complete
+    }
+
+    /// Whether the read is idle-bounded after its Wakes: every Wake the read
+    /// can place is answered by an Execution boundary at/after it (a Wake
+    /// opens an Execution, and the Execution's durable `idle` closes it). A
+    /// read with no placeable Wake is bounded — V1 carries none and neither
+    /// does the session's first read — and a Wake without a server time is
+    /// durable evidence that never blocks an ending, exactly like
+    /// [`Wake::retires`]' own tolerance: it cannot be ordered against the
+    /// boundary.
+    fn wakes_answered(&self) -> bool {
+        let Some(newest_wake) = self.wakes.iter().filter_map(|wake| wake.created_ms).max() else {
+            return true;
+        };
+        self.executions
+            .iter()
+            .filter_map(|execution| execution.ended_ms)
+            .max()
+            .is_some_and(|boundary| boundary >= newest_wake)
+    }
+
     /// The recent-conversation tail: the last (at most four) text-bearing
     /// user/assistant messages, newest last. A message is text-bearing when it
     /// carries at least one non-empty text part; reasoning/tool/step parts are
@@ -367,6 +427,26 @@ pub struct TurnView<'a> {
     /// The failure recorded on the Turn's NEWEST assistant message, if any — a
     /// recovered earlier step is not a failure.
     pub error: Option<String>,
+}
+
+/// How a Turn ends, as [`SessionTranscript::settle`] decides it (ADR-0059).
+/// The one ending decision the drain, the out-of-turn follow and the Wake
+/// continuation share; the sticky `/stop` marker dominates it in the callers
+/// that know about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnSettle {
+    /// The ending is not decided: the Session is still running, or a Wake's
+    /// Execution has not reached its boundary yet. Keep observing.
+    Running,
+    /// The true end with the Turn's settled failure — the newest assistant
+    /// message's error. A failure dominates [`Self::Waiting`].
+    Failed(String),
+    /// The Execution ended but Background Tasks are still live: the card
+    /// yields 「⏳ 等待后台任务」 — not ✅, not a terminal, no Completion
+    /// Notice — and the next Wake continues the chain on a new card.
+    Waiting,
+    /// The true end: idle with no live Background Task.
+    Complete,
 }
 
 /// One Execution boundary, as the backend records it: the durable marker that
@@ -1024,6 +1104,140 @@ mod tests {
         let clean = assistant("msg_a2", 1_300, 1_400, None);
         let transcript = SessionTranscript::new(vec![previous, failed_step, clean]);
         assert!(transcript.turn_for_user(&anchor).error.is_none());
+    }
+
+    /// One Execution boundary with the given end time.
+    fn boundary(ended_ms: i64) -> Execution {
+        Execution {
+            id: MessageId::new(format!("msg_idle_{ended_ms}")),
+            ended_ms: Some(ended_ms),
+            outcome: ExecutionOutcome::Succeeded,
+        }
+    }
+
+    /// One shell Wake carrying the live task's correlation key.
+    fn shell_wake(created_ms: i64) -> Wake {
+        Wake {
+            id: MessageId::new(format!("msg_wake_{created_ms}")),
+            created_ms: Some(created_ms),
+            source: WakeSource::Shell,
+            shell_id: Some("sh_bg".into()),
+            job_id: Some("sh_bg".into()),
+            child_id: None,
+            state: Some("completed".into()),
+        }
+    }
+
+    /// The one live Background Task [`shell_wake`] retires.
+    fn background_shell(started_at: i64) -> BackgroundTask {
+        BackgroundTask {
+            tool: ToolIdentity {
+                name: "shell".into(),
+                call_id: "call_bg".into(),
+            },
+            shell_id: Some("sh_bg".into()),
+            child_id: None,
+            started_at: Some(started_at),
+        }
+    }
+
+    /// A terminal assistant step at `created`, optionally failed.
+    fn assistant_step(id: &str, created: i64, error: Option<&str>) -> TranscriptMessage {
+        let mut message = message(
+            id,
+            MessageRole::Assistant,
+            Some(MessageTime {
+                created,
+                completed: Some(created + 100),
+            }),
+            vec![finish(FinishReason::Stop)],
+        );
+        message.error = error.map(str::to_string);
+        message
+    }
+
+    /// The settle decision never reads a terminal step for liveness: a running
+    /// session is `Running` whatever the read carries.
+    #[test]
+    fn settle_is_running_while_the_session_runs() {
+        let (_, anchor) = anchored("msg_u1", 1_000);
+        let transcript = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
+            .with_executions(vec![boundary(1_200)])
+            .with_background_tasks(vec![background_shell(1_100)]);
+
+        assert_eq!(transcript.settle(&anchor, false), TurnSettle::Running);
+    }
+
+    /// Idle with no live Background Task is the true end — on a V2 read with a
+    /// boundary and on a V1 read that carries no interaction facts at all.
+    #[test]
+    fn settle_completes_an_idle_read_with_no_live_background_task() {
+        let (_, anchor) = anchored("msg_u1", 1_000);
+        let v2 = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
+            .with_executions(vec![boundary(1_200)])
+            .with_wakes(vec![shell_wake(1_050)]);
+        assert_eq!(v2.settle(&anchor, true), TurnSettle::Complete);
+
+        let v1 = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)]);
+        assert_eq!(v1.settle(&anchor, true), TurnSettle::Complete);
+    }
+
+    /// A live Background Task turns the idle ending into Waiting; a settled
+    /// failure dominates it — a failed Turn never yields waiting.
+    #[test]
+    fn settle_yields_waiting_and_a_settled_failure_dominates_it() {
+        let (_, anchor) = anchored("msg_u1", 1_000);
+        let waiting = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
+            .with_executions(vec![boundary(1_200)])
+            .with_background_tasks(vec![background_shell(1_100)]);
+        assert_eq!(waiting.settle(&anchor, true), TurnSettle::Waiting);
+
+        let failed = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, Some("provider 503"))])
+            .with_executions(vec![boundary(1_200)])
+            .with_background_tasks(vec![background_shell(1_100)]);
+        assert_eq!(
+            failed.settle(&anchor, true),
+            TurnSettle::Failed("provider 503".into())
+        );
+    }
+
+    /// A Wake opens an Execution, so its content landing before that
+    /// Execution's boundary cannot declare the Turn complete (or waiting): the
+    /// decision stays Running until a boundary answers the Wake. Retiring the
+    /// Background Task alone does not end the Turn.
+    #[test]
+    fn an_unanswered_wake_keeps_the_turn_running() {
+        let (_, anchor) = anchored("msg_u1", 1_000);
+        let woke = SessionTranscript::new(vec![
+            assistant_step("msg_a1", 1_100, None),
+            assistant_step("msg_wake_reply", 1_400, None),
+        ])
+        .with_executions(vec![boundary(1_200)])
+        .with_wakes(vec![shell_wake(1_300)]);
+        assert_eq!(woke.settle(&anchor, true), TurnSettle::Running);
+
+        // The Wake's Execution ends: the boundary after the Wake answers it.
+        let answered = SessionTranscript::new(vec![
+            assistant_step("msg_a1", 1_100, None),
+            assistant_step("msg_wake_reply", 1_400, None),
+        ])
+        .with_executions(vec![boundary(1_200), boundary(1_500)])
+        .with_wakes(vec![shell_wake(1_300)]);
+        assert_eq!(answered.settle(&anchor, true), TurnSettle::Complete);
+    }
+
+    /// A Wake without a server time cannot be ordered against a boundary, so
+    /// — like its retirement rule — it never blocks an ending.
+    #[test]
+    fn an_untimed_wake_never_blocks_an_ending() {
+        let (_, anchor) = anchored("msg_u1", 1_000);
+        let mut untimed = shell_wake(1_300);
+        untimed.created_ms = None;
+        let transcript = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
+            .with_executions(vec![boundary(1_200)])
+            .with_wakes(vec![untimed]);
+
+        assert_eq!(transcript.settle(&anchor, true), TurnSettle::Complete);
     }
 
     #[test]
