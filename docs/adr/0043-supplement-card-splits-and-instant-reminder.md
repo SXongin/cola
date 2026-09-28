@@ -414,7 +414,8 @@ whose `task` subagents outlived the budget by 1.6 s).
   unreadable — at that ceiling finalizes Error: never Done under a running
   panel, never an eternal spinner. `/stop` ends the follow promptly through the
   same sticky stopped-session marker the drain observes, with the same final
-  reconcile before the Done card.
+  reconcile before the Done card. **(Superseded by the 2026-09-28 stop-terminal
+  amendment below: the card finalizes `Stopped`, not Done.)**
 - **The completion notice belongs to the follow's end** when it owns the card,
   so 「✅ 已完成」 is only ever sent for a run that actually ended. The topic
   cover is synced once at the hand-off (starting its title-retry window there)
@@ -454,8 +455,9 @@ act (#386).
 - **No total budget.** A readable run may take as long as it takes; the
   follow keeps rendering until the session reports non-busy, then finalizes
   Done (or the settled failure's Error, unchanged). `/stop` remains the
-  operator's escape hatch, and a new Turn still replaces the accumulator and
-  ends the follow silently.
+  operator's escape hatch — **(superseded by the 2026-09-28 stop-terminal
+  amendment below: `/stop` finalizes `Stopped`, not Done)** — and a new Turn
+  still replaces the accumulator and ends the follow silently.
 - **The grace bounds only the two unobservable failure modes.** The injected
   bound (`turn_follow_grace_ms`, default 10 min) is now a grace for:
   - **lost contact** — no tick in the grace produced a full read pair (BOTH
@@ -499,11 +501,20 @@ after one last reconcile render. That line is superseded by the stop terminal
 - **The abort is not a failure.** The server records the interrupt as an error
   on the turn's transcript; a turn whose session carries the stopped marker
   (`waits.stopped_sessions`) is classified `Stopped` and that error text is
-  never written to the card. The turn's other cleanup (rejecting the pending
-  Permission/Question the abort strands, ADR-0038 rule 7) is unchanged.
+  never written to the card. The turn's cleanup of the pending
+  Permission/Question requests the abort strands (ADR-0038 rule 7) keeps the
+  same mechanism, with its trigger widened to deliberate stops: a stopped turn
+  rejects its leftovers even when the stop recorded no error text, because the
+  abort strands whatever was pending.
 - **Both finalization paths classify by the marker**: `finish` for the in-turn
   path — which also never hands a stopped card to the follow — and the
-  out-of-turn follow's stop branch, which finalized Done before.
+  out-of-turn follow's stop branch, which finalized Done before. Each re-reads
+  the marker at its last await boundary (after `finish`'s transcript read and
+  the leftover rejection; at the follow's settled-run classification), so a
+  stop that lands while a tick or a finalization is already in flight still
+  wins. The stop command records the marker BEFORE the interrupt round-trip
+  (rolling back only a marker that call itself inserted, when the interrupt
+  fails), so the abort's own server-side settling cannot beat the marker.
 - **The completion notice follows the card's real terminal**: 「⏹ 已停止。」,
   never 完成 or 出错.
 
