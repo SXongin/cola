@@ -14,7 +14,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use super::drain::{
-    assistant, ctx, script_transcript, scripted_app, user, wait_for_card_header, wait_for_card_text,
+    assistant, ctx, script_transcript, scripted_app, spawn_turn, user, wait_for_card_header,
+    wait_for_card_text,
 };
 use crate::backend::{
     BackgroundTask, MessageRole, SessionTranscript, ToolIdentity, ToolStatus, TranscriptMessage,
@@ -961,4 +962,126 @@ async fn an_unreadable_status_never_settles_a_wake_before_the_grace() {
         card_text(&last).contains("失去联系"),
         "the lost-contact copy: {last}"
     );
+}
+
+/// ADR-0059's routing key, waiting-window half: the waiting yield left the
+/// Session idle and handed the guard back, so a message arriving now starts a
+/// NEW Turn on a new card — never a Supplement merged into the ended chain.
+/// The held prompt keeps the new Turn observable at its card.
+#[tokio::test]
+async fn a_message_in_the_waiting_window_starts_a_new_turn() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let waiting = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_transcript("ses_test", vec![waiting]);
+    backend.with_session_status("ses_test", Some(SessionStatus::Idle));
+    // Hold every prompt: the single permit lets the first Turn reach its
+    // waiting yield, and the second message's held prompt keeps the new
+    // Turn's in-flight card observable.
+    let gate = backend.hold_prompts();
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    app.turn_drain_timeout_ms.store(5_000, Ordering::Relaxed);
+
+    // The first Turn: idle + a live Background Task yields 「等待后台任务」 and
+    // hands the guard back.
+    let first = spawn_turn(&app, ctx("ses_test", "跑一下 CI"));
+    gate.add_permits(1);
+    let result = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("the first turn must reach the waiting yield")
+        .unwrap();
+    result.unwrap();
+    wait_for_card_header(&platform, "等待后台任务").await;
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting)
+    );
+    assert!(
+        !app.inflight.lock().await.contains("ses_test"),
+        "the waiting yield must release the guard"
+    );
+    let waiting_anchor = Turn::armed_turn_anchor(&app.cards_handle(), "ses_test").await;
+    assert!(waiting_anchor.is_some(), "the waiting card keeps its accumulator");
+
+    // The next message arrives in the waiting window: idle, so a new Turn.
+    let second = {
+        let app = Arc::clone(&app);
+        tokio::spawn(async move {
+            app.handle_message(incoming(
+                "msg_next".into(),
+                "chat_1".into(),
+                "p2p".into(),
+                None,
+                "新问题".into(),
+                None,
+            ))
+            .await;
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let replied = {
+                let calls = platform.calls.lock().await;
+                calls
+                    .iter()
+                    .any(|c| matches!(c, PlatformCall::ReplyCard { reply_to, .. } if reply_to == "msg_next"))
+            };
+            if replied {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the new Turn must reply its own card to the message");
+
+    assert!(
+        backend.prompt_calls.lock().await.iter().any(|t| t == "新问题"),
+        "the new Turn's prompt must be submitted: {:?}",
+        backend.prompt_calls.lock().await
+    );
+    assert!(
+        app.inflight.lock().await.contains("ses_test"),
+        "the new Turn holds the guard while its prompt is in flight"
+    );
+    assert_ne!(
+        Turn::armed_turn_anchor(&app.cards_handle(), "ses_test").await,
+        waiting_anchor,
+        "the new Turn replaces the waiting accumulator (a new card)"
+    );
+    assert!(
+        !platform.texts().await.iter().any(|t| t.contains("还在处理中")),
+        "the waiting session is not answered busy: {:?}",
+        platform.calls.lock().await
+    );
+    assert!(
+        platform
+            .calls
+            .lock()
+            .await
+            .iter()
+            .filter_map(call_card)
+            .all(|card| !card_text(card).contains("📨 已收到补充")),
+        "an idle waiting session takes a normal Turn, never a Supplement split: {:?}",
+        platform.calls.lock().await
+    );
+
+    // Release the held prompt so the new Turn can finish.
+    gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .expect("the new Turn must finish")
+        .unwrap();
+    assert!(!app.inflight.lock().await.contains("ses_test"));
 }

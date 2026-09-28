@@ -791,11 +791,13 @@ async fn busy_follow_question_block_resolves() {
     );
 }
 
-/// A cola prompt during the follow takes over: `run_prompt` replaces the
-/// accumulator, the follow renderer exits, and the user's own turn
-/// renders into its own card — the snapshot is never touched again.
+/// ADR-0059's routing key on an EXTERNAL run: the Session has a live
+/// Execution, so a cola prompt during the snapshot follow is a Supplement — it
+/// merges into the running work and the Card Chain splits below it, instead of
+/// starting a competing Turn that replaces the follow's accumulator. The
+/// external renderer keeps streaming into the continuation.
 #[tokio::test]
-async fn user_prompt_during_follow_takes_over() {
+async fn user_prompt_during_follow_merges_as_a_supplement() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -808,23 +810,20 @@ async fn user_prompt_during_follow_takes_over() {
     )]);
     backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
     backend.external_message_for("ses_alpha01", "帮我重构这个模块");
-    let (app, platform) = build_app(cfg, backend).await;
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     app.core
         .external
         .render_poll_ms
         .store(50, std::sync::atomic::Ordering::Relaxed);
-    // The Busy status is this test's fixture for the FOLLOW decision; the
-    // user's own turn must not sit in the post-prompt drain waiting on a run
-    // that never ends in this mock, so disable the drain before it sleeps.
-    app.core
-        .turn_drain_timeout_ms
-        .store(0, std::sync::atomic::Ordering::Relaxed);
 
     send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
     let follow_anchor = Turn::armed_turn_anchor(&app.cards_handle(), "ses_alpha01").await;
     assert!(follow_anchor.is_some(), "follow armed");
 
-    // The user prompts cola in the thread.
+    // The user prompts cola in the thread: the live Execution makes it a
+    // Supplement, not a competing Turn.
     app.handle_message(incoming(
         "msg_prompt".into(),
         "chat_1".into(),
@@ -836,17 +835,41 @@ async fn user_prompt_during_follow_takes_over() {
     .await;
 
     let cards = app.core.cards_handle();
-    assert!(
-        Turn::has_card(&cards, "ses_alpha01").await,
-        "the prompt inserted its own accumulator"
+    assert_eq!(
+        Turn::armed_turn_anchor(&cards, "ses_alpha01").await,
+        follow_anchor,
+        "no competing Turn: the external follow keeps its accumulator"
     );
-    let new_anchor = Turn::armed_turn_anchor(&cards, "ses_alpha01").await;
-    assert_ne!(new_anchor, follow_anchor, "the follow accumulator was replaced");
-    let calls = platform.calls.lock().await.clone();
     assert!(
-        calls
-            .iter()
-            .any(|c| matches!(c, PlatformCall::ReplyCard { reply_to, .. } if reply_to == "msg_prompt")),
-        "the user's own turn rendered into its own card: {calls:?}"
+        backend.prompt_calls.lock().await.iter().any(|t| t == "继续"),
+        "the Supplement must be submitted to the Backend: {:?}",
+        backend.prompt_calls.lock().await
+    );
+    assert!(
+        !platform.texts().await.iter().any(|t| t.contains("还在处理中")),
+        "a follow-window message is never answered busy: {:?}",
+        platform.calls.lock().await
+    );
+
+    // The chain split at the message: a continuation replies to it with the
+    // Supplement receipt, and the followed card is finalized.
+    let calls = platform.calls.lock().await.clone();
+    let continuation = calls
+        .iter()
+        .find_map(|c| match c {
+            PlatformCall::ReplyCard { reply_to, card } if reply_to == "msg_prompt" => Some(card.clone()),
+            _ => None,
+        })
+        .expect("the split continuation must reply to the message");
+    assert!(
+        card_text(&continuation).contains("📨 已收到补充"),
+        "the continuation carries the Supplement receipt: {continuation}"
+    );
+    assert!(
+        calls.iter().any(|c| matches!(
+            c,
+            PlatformCall::UpdateMessage { card, .. } if card_header(card).contains("部分完成")
+        )),
+        "the followed card is finalized with the standard split header: {calls:?}"
     );
 }

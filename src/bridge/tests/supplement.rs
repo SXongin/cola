@@ -221,6 +221,108 @@ async fn supplement_splits_the_chain_and_the_continuation_takes_over() {
     assert!(has(&last_update.1, "后续进度。"));
 }
 
+/// ADR-0059's routing key: the Backend's own liveness decides, not cola's
+/// bookkeeping. With NO inflight guard at all (a restart lost it, or another
+/// client is running the Session), a `Busy` Session still routes the message
+/// as a Supplement — the status read says the Execution is live, so the
+/// message merges into it and the chain splits, never a competing Turn. A
+/// V2 prompt carries the merge delivery, so the Backend's behavior is
+/// identical either way.
+#[tokio::test]
+async fn a_message_while_the_backend_reports_a_live_run_splits_the_chain() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Busy));
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+
+    // A live card, but deliberately NO guard: only the Backend knows the run
+    // is alive.
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
+    Turn::set_card_state(&cards, "ses_test", CardState::Streaming).await;
+    Turn::push_text(&cards, "ses_test", "第一段进度。").await;
+    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
+    assert!(!app.inflight.lock().await.contains("ses_test"));
+
+    app.handle_message(incoming(
+        "msg_sup".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "补充一下，改用方案 B".into(),
+        None,
+    ))
+    .await;
+
+    // The admission read the Backend's own status...
+    assert!(
+        backend
+            .session_status_reads
+            .lock()
+            .await
+            .iter()
+            .any(|sid| sid == "ses_test"),
+        "the routing key must be a status read: {:?}",
+        backend.session_status_reads.lock().await
+    );
+    // ... and the message merged: submitted, no busy notice, no competing
+    // Turn's card.
+    assert!(
+        backend
+            .prompt_calls
+            .lock()
+            .await
+            .iter()
+            .any(|text| text == "补充一下，改用方案 B"),
+        "the Supplement must be submitted: {:?}",
+        backend.prompt_calls.lock().await
+    );
+    assert!(
+        !platform
+            .texts()
+            .await
+            .iter()
+            .any(|text| text.contains("还在处理中")),
+        "a live-Execution message is never answered busy: {:?}",
+        platform.calls.lock().await
+    );
+    assert!(
+        !app.inflight.lock().await.contains("ses_test"),
+        "a Supplement never takes the guard"
+    );
+    assert_eq!(
+        Turn::reply_target(&cards, "ses_test").await.as_deref(),
+        Some("msg_sup"),
+        "the chain re-anchored on the supplement"
+    );
+
+    // The chain split at the message: exactly one card replies to it, the
+    // continuation, carrying the receipt.
+    let calls = platform.calls.lock().await.clone();
+    let replies: Vec<&serde_json::Value> = calls
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::ReplyCard { reply_to, card } if reply_to == "msg_sup" => Some(card),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        replies.len(),
+        1,
+        "no competing Turn may reply a card to the message: {calls:?}"
+    );
+    assert!(
+        has(replies[0], "📨 已收到补充"),
+        "the continuation carries the receipt: {}",
+        replies[0]
+    );
+}
+
 /// A split while a tool is running: the panel is live tail content (ADR-0045),
 /// so the finalized card finalizes WITHOUT it and the continuation — the new
 /// live card — carries it, its header still naming the Turn's running tool
