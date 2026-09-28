@@ -2085,16 +2085,21 @@ impl Turn {
         transcript: &SessionTranscript,
         turn_anchor: &TurnAnchor,
     ) -> Option<WakeContinuation> {
-        let chain = cards.cards.lock().await.get(session_id).cloned();
+        // The diff is a sync read of the accumulator's dedup state, so the
+        // cards lock is held only for its scan — no clone of the chain (whose
+        // rendered content can be a card's worth) is built to run it off-lock.
+        {
+            let live = cards.cards.lock().await;
+            if let Some(card) = live.get(session_id) {
+                return render::renders_new_content(&card.acc, transcript, turn_anchor)
+                    .then_some(WakeContinuation::ContinueChain);
+            }
+        }
         let newest_wake = transcript
             .wakes
             .iter()
             .filter(|wake| wake.created_ms.is_some())
             .max_by_key(|wake| wake.created_ms);
-        if let Some(card) = chain {
-            return render::renders_new_content(&card.acc, transcript, turn_anchor)
-                .then_some(WakeContinuation::ContinueChain);
-        }
         let anchor = newest_wake?.anchor()?;
         let probe = StreamAccumulator::new("");
         render::renders_new_content(&probe, transcript, &anchor).then_some(WakeContinuation::Fresh { anchor })
@@ -2185,8 +2190,7 @@ impl Turn {
             chain,
             anchor: anchor.clone(),
         };
-        let Some(ending) = settle::run(flow, session_id, directory, timing, &owns, "wake continuation").await
-        else {
+        let Some(ending) = settle::run(flow, session_id, directory, timing, &owns).await else {
             return;
         };
         settle::stamp(&flow.cards, session_id, &ending).await;

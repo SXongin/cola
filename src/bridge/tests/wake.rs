@@ -16,7 +16,9 @@ use std::time::Duration;
 use super::drain::{
     assistant, ctx, script_transcript, scripted_app, user, wait_for_card_header, wait_for_card_text,
 };
-use crate::backend::{SessionTranscript, TranscriptMessage};
+use crate::backend::{
+    BackgroundTask, MessageRole, SessionTranscript, ToolIdentity, ToolStatus, TranscriptMessage,
+};
 use crate::bridge::test_support::*;
 use crate::bridge::turn::Turn;
 use crate::feishu::card::CardState;
@@ -27,6 +29,37 @@ fn failed_assistant(created: i64, text: &str, error: &str) -> TranscriptMessage 
     let mut message = assistant(created, text);
     message.error = Some(error.to_string());
     message
+}
+
+/// An assistant message whose only content is a `bash` call that never
+/// settles: a live `⏳` panel on the card (the stuck-panel grace's fixture).
+fn assistant_with_live_tool(created: i64) -> TranscriptMessage {
+    typed_message(
+        &format!("msg_a_{created}"),
+        MessageRole::Assistant,
+        Some(created),
+        vec![tool_part(
+            "bash",
+            "call_live",
+            ToolStatus::Running,
+            serde_json::json!({ "command": "sleep 600" }),
+            "",
+        )],
+    )
+}
+
+/// A live Background Task with its own correlation ids: the shared fixture
+/// names one shell, so a scenario with a SECOND live task needs its own.
+fn another_background_shell(started_at: i64) -> BackgroundTask {
+    BackgroundTask {
+        tool: ToolIdentity {
+            name: "shell".into(),
+            call_id: "call_bg2".into(),
+        },
+        shell_id: Some("sh_bg2".into()),
+        child_id: None,
+        started_at: Some(started_at),
+    }
 }
 
 /// Start Session Sync's poll loop with tiny injected cadences: the sync tick,
@@ -813,4 +846,119 @@ async fn a_wake_clears_a_stale_stop_marker() {
         "a stop from before the Wake must not abort the resumed run: {last}"
     );
     assert!(card_text(&last).contains("CI 通过了。"), "{last}");
+}
+
+/// The panel-grace rule the shared loop adopted from the follow (#386): a Wake
+/// continuation whose settle would be `Waiting` (a live Background Task) but
+/// whose card still carries a live `⏳` panel must NOT settle — the panel gets
+/// the grace, and the card then ends Error with the stuck-panel copy. The old
+/// Wake loop stamped the waiting yield immediately, hiding the orphaned tool.
+#[tokio::test]
+async fn a_live_panel_outranks_the_wake_settle() {
+    let _wd = test_work_dir();
+    let waiting = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
+        .await
+        .unwrap();
+
+    // The resumed run starts a foreground tool that never settles, retires the
+    // first task and backgrounds a second one: the settle says Waiting, the
+    // card's panel says live.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, "已经交给后台了。"),
+                assistant_with_live_tool(3_100),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000)])
+            .with_wakes(vec![shell_wake(2_900)])
+            .with_background_tasks(vec![another_background_shell(3_200)]),
+        ],
+    )
+    .await;
+    // The panel grace, injected tiny (the follow's own rule).
+    app.external.render_timeout_ms.store(40, Ordering::Relaxed);
+
+    spawn_sync(&app);
+    wait_for_card_header(&platform, "出错").await;
+
+    let last = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&last).contains("未收尾"),
+        "the live panel takes the grace and ends with its copy: {last}"
+    );
+    assert!(
+        !card_header(&last).contains("等待后台任务"),
+        "a live panel must not take the waiting yield: {last}"
+    );
+    assert!(
+        card_text(&last).contains("⏳ bash"),
+        "the orphaned panel stays visible under the error: {last}"
+    );
+}
+
+/// The status-read rule the shared loop adopted from the follow: a Wake
+/// continuation whose status read fails never claims an ending from the
+/// transcript — it reads settleable here — and the lost-contact grace owns the
+/// state instead. The old Wake loop settled from the last known transcript.
+#[tokio::test]
+async fn an_unreadable_status_never_settles_a_wake_before_the_grace() {
+    let _wd = test_work_dir();
+    let waiting = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
+        .await
+        .unwrap();
+
+    // The resumed run reads settleable (its boundary landed, nothing live) ...
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, "已经交给后台了。"),
+                assistant(3_100, "CI 通过了。"),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000)])
+            .with_wakes(vec![shell_wake(2_900)]),
+        ],
+    )
+    .await;
+    // ... but the status read never answers, so no ending may be claimed.
+    backend.session_status_fails.store(true, Ordering::SeqCst);
+    app.external.render_timeout_ms.store(400, Ordering::Relaxed);
+
+    spawn_sync(&app);
+    // The resumed work still streams (the transcript is readable) ...
+    wait_for_card_text(&platform, "CI 通过了。").await;
+    // ... and nothing settles before the grace: the card stays live.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let live = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        !card_header(&live).contains("✅"),
+        "no ending may be claimed from a broken status read: {live}"
+    );
+    assert!(!card_header(&live).contains("出错"), "{live}");
+
+    // The grace then ends it Error with the lost-contact copy, not Done from
+    // the transcript.
+    wait_for_card_header(&platform, "出错").await;
+    let last = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&last).contains("失去联系"),
+        "the lost-contact copy: {last}"
+    );
 }
