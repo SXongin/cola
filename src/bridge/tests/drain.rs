@@ -26,7 +26,7 @@ pub(crate) fn user(id: &str, created: i64, text: &str) -> TranscriptMessage {
 }
 
 /// A finished assistant turn whose only visible content is `text`.
-fn assistant(created: i64, text: &str) -> TranscriptMessage {
+pub(crate) fn assistant(created: i64, text: &str) -> TranscriptMessage {
     typed_message(
         &format!("msg_a_{created}"),
         MessageRole::Assistant,
@@ -196,7 +196,7 @@ pub(crate) async fn wait_for_card_text(platform: &RecordingPlatform, needle: &st
 
 /// Await a card update whose header carries `needle`, or panic after 5 s — the
 /// follow finalizes out of turn, so tests wait on the card, not on a handle.
-async fn wait_for_card_header(platform: &RecordingPlatform, needle: &str) {
+pub(crate) async fn wait_for_card_header(platform: &RecordingPlatform, needle: &str) {
     wait_for_card_update(
         platform,
         &format!("card header {needle:?}"),
@@ -1753,7 +1753,7 @@ async fn an_idle_session_exits_the_drain_without_waiting() {
 
 /// Replace the session's scripted transcript snapshots (what the next Backend
 /// reads serve).
-async fn script_transcript(backend: &Arc<MockBackend>, snapshots: Vec<SessionTranscript>) {
+pub(crate) async fn script_transcript(backend: &Arc<MockBackend>, snapshots: Vec<SessionTranscript>) {
     *backend
         .transcript_scripts
         .lock()

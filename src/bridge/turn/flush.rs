@@ -20,6 +20,13 @@ const SUPPLEMENT_RECEIPT: &str = "📨 已收到补充";
 /// Interaction Receipt.
 const PULL_RECEIPT: &str = "⏬ 实时卡片已移到底部";
 
+/// The 承接 line a Wake continuation opens with (ADR-0059): the new card is
+/// itself the notification, and this line says why it appeared — the Turn was
+/// resumed by the Backend after going idle. Source-neutral on purpose: a Wake
+/// can be a finished background task, a subagent, an interruption or a server
+/// restart, and cola never claims more than "the work resumed".
+pub(super) const WAKE_RECEIPT: &str = "🔔 已恢复执行，继续处理…";
+
 /// Whether `e` is Feishu's deterministic card-content rejection (`230099`).
 /// The same card JSON fails on every retry, so the flush degrades instead.
 fn is_card_content_rejected(e: &crate::error::BridgeError) -> bool {
@@ -189,7 +196,10 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str) {
             // renders NO tail — its live Interaction Blocks migrate to the
             // continuation (ADR-0038), so the old card's controls are settled
             // rather than left dead.
-            let finalized = if supplement_split_requested && !built.full {
+            let wake_split = pending_split
+                .iter()
+                .any(|split| split.kind == crate::bridge::turn::SplitKind::Wake);
+            let (finalized, restamp) = if supplement_split_requested && !built.full {
                 // The live slice still fits, but a supplement forces the split
                 // anyway: finalize the slice here and HAND IT OFF — the
                 // continuation carries only the receipts queued below and the
@@ -198,9 +208,18 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str) {
                 let Some(card) = cards.get_mut(session_id) else {
                     return;
                 };
-                card.acc.build_finalized_handoff()
+                // A Wake split continues a card that has already ENDED (the
+                // 等待后台任务 yield, a settled failure, a stop): the handoff
+                // advances the render boundary either way, but only a waiting
+                // card takes the standard 「部分完成，继续中…」 header — a
+                // terminal card keeps the ending it recorded. Every other
+                // split kind (a Supplement, `/card`) re-stamps the tracked
+                // card unconditionally: its slice may not have reached Feishu
+                // yet (the loading-card window's deferred split).
+                let restamp = !wake_split || !card.acc.card_state.is_terminal();
+                (card.acc.build_finalized_handoff(), restamp)
             } else {
-                built.card
+                (built.card, true)
             };
             // Persist the finalization BEFORE the send: a failed or cancelled
             // send must not leave the next flush thinking this card still
@@ -209,6 +228,12 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str) {
                 let mut cards = cards.cards.lock().await;
                 if let Some(card) = cards.get_mut(session_id) {
                     card.card_is_live = false;
+                    if wake_split {
+                        // The continuation card is a fresh live card: the
+                        // ended attempt's display facts stay with the card the
+                        // handoff just finalized (ADR-0059).
+                        card.acc.continue_on_new_card();
+                    }
                 }
             }
             card_is_live = false;
@@ -220,7 +245,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str) {
                 // them.
                 push_queued_receipts(cards, session_id).await;
             }
-            if let Err(e) = cards.feishu.update_message(&card_id, &finalized).await {
+            if restamp && let Err(e) = cards.feishu.update_message(&card_id, &finalized).await {
                 tracing::warn!("Card update failed: {}", e);
                 if is_card_content_rejected(&e) {
                     if matches!(
@@ -361,6 +386,7 @@ async fn push_queued_receipts(cards: &CardsHandle, session_id: &str) {
         let receipt = match card.pending_split[i].kind {
             crate::bridge::turn::SplitKind::Supplement => SUPPLEMENT_RECEIPT,
             crate::bridge::turn::SplitKind::Pull => PULL_RECEIPT,
+            crate::bridge::turn::SplitKind::Wake => WAKE_RECEIPT,
         };
         card.acc.push_receipt(receipt);
         card.pending_split[i].receipt_pushed = true;

@@ -27,3 +27,4 @@ pub(crate) mod supplement;
 pub(crate) mod surfaces;
 pub(crate) mod switch;
 pub(crate) mod topic;
+pub(crate) mod wake;

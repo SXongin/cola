@@ -47,12 +47,14 @@ use super::Turn;
 
 /// What the follow records when its reads stopped answering for the grace:
 /// the card never sits on an eternal spinner over a Backend it cannot see.
-const LOST_CONTACT_ERROR: &str = "与运行失去联系，已停止更新。";
+/// Re-exported through the turn module: the Wake continuation's out-of-turn
+/// loop has the same two unobservable endings.
+pub(crate) const LOST_CONTACT_ERROR: &str = "与运行失去联系，已停止更新。";
 
 /// What the follow records when a readable, non-busy session carries a live
 /// Tool Panel past the grace (a crash-orphaned call): the card ends Error,
 /// never Done over a `⏳` panel.
-const STUCK_PANEL_ERROR: &str = "运行已结束但工具状态未收尾，已停止更新。";
+pub(crate) const STUCK_PANEL_ERROR: &str = "运行已结束但工具状态未收尾，已停止更新。";
 
 /// The follow's injected timing knobs, bundled so the loop's signature stays
 /// readable: the render poll cadence, the lost-contact / stuck-panel grace,
