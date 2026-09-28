@@ -15,6 +15,17 @@ itself and give the poller sole ownership of the sync state.
 
 > **Amended by ADR-0053**: the `/api/*` generation labels below were flipped upstream — the unprefixed routes are now the V1 compatibility surface and `/api/...` is the current protocol. The "legacy `/api/...`" wording below describes the earlier generation and is superseded on this point.
 
+> **Corrected 2026-09-28 (spec #391, ADR-0058)**: decision 1's "a retry reuses
+> the same id" and decision 3's "the user's retry reuses the same `messageID`"
+> describe the retry scope too broadly. Reuse is now reserved for two shapes:
+> an id the server never admitted (no anchor for it — both generations still
+> create and run it) and V1's admitted-but-unfinished continuation (its upsert
+> re-post runs a new step). A settled turn, an unknown status or transcript
+> read, and every admitted turn on V2 take a FRESH `msg_cola_` id — on V2 the
+> id is an admission key, so a same-id re-post of an admitted turn is a `200`
+> no-op. The no-duplicate property below is unchanged; what narrowed is when
+> reuse is the right submit. ADR-0058 holds the state → action matrix.
+
 ## Decision
 
 1. **cola assigns every user message it submits a self-identifying id

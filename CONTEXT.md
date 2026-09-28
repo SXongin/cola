@@ -106,6 +106,10 @@ _Avoid_: Root, seed message, confirmation card
 A single user→assistant exchange inside a Session (one prompt plus its streamed card response). cola's internal vocabulary is the English word "turn" (Turn Footer, ADR-0019); there is deliberately NO user-facing Chinese noun for it — the UI never labels individual turns. If one is ever needed, use 轮次/本轮.
 _Avoid_: 对话 as a user-facing term for this (overloads "conversation"); 消息 (a single message, not a full exchange).
 
+**Retry** (重试):
+The action an Error **Card** offers for a failed **Turn**: run that turn's question again on the same **Session**. A Retry never oversubmits — if the run is still alive (cola may merely have lost sight of it), the card is re-attached to it instead of asking again — and it never overwrites the failed attempt: the failed card is marked 「↩️ 已重试」 and the new attempt renders on a new card below it, so the failure stays readable and a stale click cannot retry a newer turn. A deliberate stop is not a failure and offers no Retry.
+_Avoid_: Resend, re-ask (both imply an unconditional second submission)
+
 **Supplement** (补充消息):
 A user message sent while its **Session** has a **Turn** in flight. cola does not start a competing Turn: it submits the message to the Backend's running loop, which merges it into that Turn when the loop is still alive, or starts a new Turn when it has already exited. Either way the message lands below the live card, so it splits the **Card Chain** — the continuation card is its reply and carries a receipt line; there is no separate text acknowledgement. A command reply is NOT a Supplement: cola deliberately leaves it as the newest message — unless the user runs `/card`, which explicitly pulls the live card back down.
 _Avoid_: Follow-up, addition, queued message
