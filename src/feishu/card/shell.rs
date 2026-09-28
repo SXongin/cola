@@ -360,6 +360,14 @@ pub(crate) fn header_title_and_template(
         // (ADR-0059): the card yields, grey like the other non-working ends —
         // it is not ✅ and not a terminal. The next Wake continues the chain.
         CardState::Waiting => ("⏳ 等待后台任务".to_string(), "grey"),
+        // A waiting card collected by a new Turn in its thread (ADR-0059): the
+        // wait is over — the new message took over — while the background work
+        // runs on. 部分完成 echoes the split header, pointing at the takeover.
+        CardState::Superseded => ("⏳ 部分完成 · 已由新消息接管".to_string(), "grey"),
+        // A waiting card collected by a switch away (ADR-0059): its Session is
+        // no longer the thread's Active Session, so this chain can no longer be
+        // continued by a message here; the background work runs on.
+        CardState::SwitchedAway => ("⏳ 已切换会话 · 后台任务仍在运行".to_string(), "grey"),
     };
     let mut title = label;
     match state {
@@ -941,12 +949,15 @@ mod tests {
         // A fallback Error (or a Done/Stopped) with a still-pending block must
         // show its own header: the card is no longer waiting for anyone (#386,
         // #394). A Waiting card yields for its Background Tasks, not for the
-        // operator, so it must win too (ADR-0059).
+        // operator, so it must win too (ADR-0059) — and so do the collected
+        // waiting states, whose wait is already over.
         for (state, title) in [
             (CardState::Error, "❌ 出错"),
             (CardState::Done, "✅ 完成"),
             (CardState::Stopped, "⏹ 已停止"),
             (CardState::Waiting, "⏳ 等待后台任务"),
+            (CardState::Superseded, "⏳ 部分完成 · 已由新消息接管"),
+            (CardState::SwitchedAway, "⏳ 已切换会话 · 后台任务仍在运行"),
         ] {
             let card = CardBuilder::new()
                 .with_state(state.clone())

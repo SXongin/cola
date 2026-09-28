@@ -1061,6 +1061,20 @@ pub(crate) struct FlowHandles {
     pub(crate) platform: Arc<dyn feishu::Platform>,
 }
 
+impl FlowHandles {
+    /// Promote `entry` as its thread's Active Session, collecting the displaced
+    /// Session's waiting card first (ADR-0059, spec #405): the one write path
+    /// every switch/adopt surface shares, so no activation can leave a card on
+    /// 「⏳ 等待后台任务」 behind. See
+    /// [`Turn::activate_collecting`](crate::bridge::turn::Turn::activate_collecting).
+    pub(crate) async fn activate_collecting(
+        &self,
+        entry: crate::config::SessionEntry,
+    ) -> crate::error::Result<()> {
+        crate::bridge::turn::Turn::activate_collecting(&self.sessions, &self.cards, entry).await
+    }
+}
+
 /// The OpenCode server-ownership concern (ADR-0013): the start policy, the
 /// preferred port, and the lock serializing every server mutation.
 ///

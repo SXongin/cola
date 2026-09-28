@@ -1244,6 +1244,14 @@ async fn handle_switch_action(
         SwitchAction::Match(keyword) => handle_switch(handles, thread_key, &keyword, message_id, kind).await,
         SwitchAction::Forget => {
             let removed = handles.flow.sessions.remove_thread_sessions(thread_key).await?;
+            // Unmapping stops each removed Session from being this thread's
+            // Active Session, so a card it left on 「⏳ 等待后台任务」 is
+            // collected as 「⏳ 已切换会话 · 后台任务仍在运行」 — no waiting card
+            // may hang forever (ADR-0059, spec #405).
+            for entry in &removed {
+                crate::bridge::turn::Turn::collect_switched_away(&handles.flow.cards, &entry.session_id)
+                    .await;
+            }
             if removed.is_empty() {
                 handles
                     .flow
@@ -1318,7 +1326,7 @@ async fn handle_switch(
                 .cloned()
         };
         if let Some(entry) = entry {
-            handles.flow.sessions.activate(entry).await?;
+            handles.flow.activate_collecting(entry).await?;
         }
         // ADR-0028 suppression: re-activating a session already mapped to
         // this thread reports a snapshot only when there is content to show —
@@ -1922,7 +1930,7 @@ async fn adopt_session(
     entry.agent = info.agent.clone();
     entry.topic_anchor = anchor.clone();
     entry.topic_root = pending_topic_root;
-    handles.flow.sessions.activate(entry).await?;
+    handles.flow.activate_collecting(entry).await?;
     crate::bridge::topic::claim_pending_cover(&handles.topic_handles(), thread_key, &info.id).await;
     // In a topic the snapshot was already sent inside it (the in-thread send
     // above); don't reply twice.
