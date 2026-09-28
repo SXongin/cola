@@ -242,7 +242,12 @@ async fn run(
                             finalize_stop(&handles, &session_id, started_at).await;
                             return;
                         }
-                        match transcript.settle(&anchor, true) {
+                        // The single settle decision (ADR-0059). This match is
+                        // exhaustive on purpose: unlike the drain, the follow
+                        // needs the failure's message (to write the card) and
+                        // acts per disposition, so every decision variant must
+                        // be answered here explicitly.
+                        match transcript.settle(&anchor) {
                             TurnSettle::Failed(error) => {
                                 Turn::finalize_error(&handles.cards, &session_id, &error).await;
                                 super::send_completion_notice(&handles, &session_id, started_at).await;

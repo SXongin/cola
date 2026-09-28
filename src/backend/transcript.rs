@@ -149,12 +149,13 @@ impl SessionTranscript {
     /// Execution boundary answers every [placeable](Wake::created_ms) Wake:
     /// the Wake's own content (an assistant step with a terminal finish)
     /// landing inside a finalization window can no longer declare the Turn
-    /// complete. `session_idle` is the Backend's live run state: `false` while
-    /// an Execution is live (Busy/Retry), `true` at an idle read — an
-    /// unreadable status is passed as idle, exactly as the callers always
-    /// treated it.
+    /// complete. The caller owns the liveness read: it asks for a decision
+    /// only once the Session reads non-busy (an unreadable status counts as
+    /// idle, the callers' pre-existing treatment), so [`TurnSettle::Running`]
+    /// here means the read's own boundary rule is unsatisfied — never "the
+    /// session is busy".
     ///
-    /// At an idle, answered read the ending is, in decision order:
+    /// At an answered read the ending is, in decision order:
     ///
     /// - [`TurnSettle::Failed`] — the Turn's settled failure (its newest
     ///   assistant message's error). A failure dominates: a failed Turn never
@@ -167,8 +168,8 @@ impl SessionTranscript {
     ///
     /// A read with no Executions, Wakes or Background Tasks (V1) decides
     /// exactly as before: idle with no live Background Task is complete.
-    pub fn settle(&self, anchor: &TurnAnchor, session_idle: bool) -> TurnSettle {
-        if !session_idle || !self.wakes_answered() {
+    pub fn settle(&self, anchor: &TurnAnchor) -> TurnSettle {
+        if !self.wakes_answered() {
             return TurnSettle::Running;
         }
         if let Some(error) = self.turn_for_user(anchor).error {
@@ -435,8 +436,9 @@ pub struct TurnView<'a> {
 /// that know about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnSettle {
-    /// The ending is not decided: the Session is still running, or a Wake's
-    /// Execution has not reached its boundary yet. Keep observing.
+    /// The ending is not decided: a Wake's Execution has not reached its
+    /// boundary yet, or the read carries no boundary to lean on. Keep
+    /// observing; the caller's own liveness read already filtered "busy".
     Running,
     /// The true end with the Turn's settled failure — the newest assistant
     /// message's error. A failure dominates [`Self::Waiting`].
@@ -1106,7 +1108,10 @@ mod tests {
         assert!(transcript.turn_for_user(&anchor).error.is_none());
     }
 
-    /// One Execution boundary with the given end time.
+    /// One Execution boundary with the given end time. The read-model tests
+    /// keep their own fixtures on purpose: this layer must not depend on the
+    /// Bridge's test support (`src/bridge/test_support.rs`), which mirrors
+    /// these in its scripting fixtures for bridge tests.
     fn boundary(ended_ms: i64) -> Execution {
         Execution {
             id: MessageId::new(format!("msg_idle_{ended_ms}")),
@@ -1156,18 +1161,6 @@ mod tests {
         message
     }
 
-    /// The settle decision never reads a terminal step for liveness: a running
-    /// session is `Running` whatever the read carries.
-    #[test]
-    fn settle_is_running_while_the_session_runs() {
-        let (_, anchor) = anchored("msg_u1", 1_000);
-        let transcript = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
-            .with_executions(vec![boundary(1_200)])
-            .with_background_tasks(vec![background_shell(1_100)]);
-
-        assert_eq!(transcript.settle(&anchor, false), TurnSettle::Running);
-    }
-
     /// Idle with no live Background Task is the true end — on a V2 read with a
     /// boundary and on a V1 read that carries no interaction facts at all.
     #[test]
@@ -1176,10 +1169,10 @@ mod tests {
         let v2 = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
             .with_executions(vec![boundary(1_200)])
             .with_wakes(vec![shell_wake(1_050)]);
-        assert_eq!(v2.settle(&anchor, true), TurnSettle::Complete);
+        assert_eq!(v2.settle(&anchor), TurnSettle::Complete);
 
         let v1 = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)]);
-        assert_eq!(v1.settle(&anchor, true), TurnSettle::Complete);
+        assert_eq!(v1.settle(&anchor), TurnSettle::Complete);
     }
 
     /// A live Background Task turns the idle ending into Waiting; a settled
@@ -1190,31 +1183,33 @@ mod tests {
         let waiting = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
             .with_executions(vec![boundary(1_200)])
             .with_background_tasks(vec![background_shell(1_100)]);
-        assert_eq!(waiting.settle(&anchor, true), TurnSettle::Waiting);
+        assert_eq!(waiting.settle(&anchor), TurnSettle::Waiting);
 
         let failed = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, Some("provider 503"))])
             .with_executions(vec![boundary(1_200)])
             .with_background_tasks(vec![background_shell(1_100)]);
-        assert_eq!(
-            failed.settle(&anchor, true),
-            TurnSettle::Failed("provider 503".into())
-        );
+        assert_eq!(failed.settle(&anchor), TurnSettle::Failed("provider 503".into()));
     }
 
     /// A Wake opens an Execution, so its content landing before that
     /// Execution's boundary cannot declare the Turn complete (or waiting): the
-    /// decision stays Running until a boundary answers the Wake. Retiring the
-    /// Background Task alone does not end the Turn.
+    /// decision stays Running until a boundary answers the Wake — and a read
+    /// with no boundary at all cannot decide either. Retiring the Background
+    /// Task alone does not end the Turn.
     #[test]
     fn an_unanswered_wake_keeps_the_turn_running() {
         let (_, anchor) = anchored("msg_u1", 1_000);
+        let no_boundary = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
+            .with_wakes(vec![shell_wake(1_300)]);
+        assert_eq!(no_boundary.settle(&anchor), TurnSettle::Running);
+
         let woke = SessionTranscript::new(vec![
             assistant_step("msg_a1", 1_100, None),
             assistant_step("msg_wake_reply", 1_400, None),
         ])
         .with_executions(vec![boundary(1_200)])
         .with_wakes(vec![shell_wake(1_300)]);
-        assert_eq!(woke.settle(&anchor, true), TurnSettle::Running);
+        assert_eq!(woke.settle(&anchor), TurnSettle::Running);
 
         // The Wake's Execution ends: the boundary after the Wake answers it.
         let answered = SessionTranscript::new(vec![
@@ -1223,7 +1218,7 @@ mod tests {
         ])
         .with_executions(vec![boundary(1_200), boundary(1_500)])
         .with_wakes(vec![shell_wake(1_300)]);
-        assert_eq!(answered.settle(&anchor, true), TurnSettle::Complete);
+        assert_eq!(answered.settle(&anchor), TurnSettle::Complete);
     }
 
     /// A Wake without a server time cannot be ordered against a boundary, so
@@ -1237,7 +1232,7 @@ mod tests {
             .with_executions(vec![boundary(1_200)])
             .with_wakes(vec![untimed]);
 
-        assert_eq!(transcript.settle(&anchor, true), TurnSettle::Complete);
+        assert_eq!(transcript.settle(&anchor), TurnSettle::Complete);
     }
 
     #[test]

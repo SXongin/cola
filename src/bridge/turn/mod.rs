@@ -65,6 +65,38 @@ enum DrainState {
     Waiting,
 }
 
+/// The disposition one [`TurnSettle`] decision gives a Turn ending. The read
+/// model decides once; this is the ONE place the Turn maps that decision, so
+/// the drain (`settle_or_yield`) and finalization (`finish`) cannot read it
+/// differently and a new decision variant needs one mapping edit here.
+///
+/// [`TurnSettle::Failed`] folds into [`Self::Settle`] deliberately: both
+/// callers only need "the ending is decided" — the failure's message is read
+/// from the same final transcript through the existing [`Turn::turn_error`]
+/// projection, so it is not re-plumbed here. The out-of-turn follow matches
+/// the full decision instead: it needs the message to write the card and acts
+/// per disposition (❌ / ✅ / yield / observe).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    /// The ending is not decided (a Wake's Execution has not reached its
+    /// boundary yet): keep observing.
+    Observe,
+    /// The card yields waiting.
+    Waiting,
+    /// The ending is decided and the turn settles.
+    Settle,
+}
+
+impl From<TurnSettle> for Ending {
+    fn from(settle: TurnSettle) -> Self {
+        match settle {
+            TurnSettle::Running => Self::Observe,
+            TurnSettle::Waiting => Self::Waiting,
+            TurnSettle::Complete | TurnSettle::Failed(_) => Self::Settle,
+        }
+    }
+}
+
 /// The per-call timeout for one drain request: the fixed request bound,
 /// shrunk to the remaining drain budget so a hung Backend cannot hold the
 /// drain (or `/stop`) past its deadline. Never zero — a deadline already
@@ -595,19 +627,19 @@ impl Turn {
         // Completion Notice. The drain's own ending decides; the final
         // reconcile read re-decides it so a task that appeared, or the
         // retirement that arrived, inside this finalization window is honored:
-        // a read whose ending is `Running` (a Wake whose Execution has not
-        // reached its boundary, or no anchor to judge) keeps the drain's own
-        // disposition, and a stop or a failure dominates below.
+        // an undecided read (a Wake whose Execution has not reached its
+        // boundary, or no anchor to judge) keeps the drain's own disposition,
+        // and a stop or a failure dominates below.
         let waiting = {
-            let settle = final_transcript.as_ref().and_then(|transcript| {
+            let ending = final_transcript.as_ref().and_then(|transcript| {
                 transcript
                     .anchor_of_user(&self.cola_message_id)
-                    .map(|anchor| transcript.settle(&anchor, true))
+                    .map(|anchor| Ending::from(transcript.settle(&anchor)))
             });
-            let waiting = match settle {
-                Some(TurnSettle::Waiting) => true,
-                Some(TurnSettle::Complete | TurnSettle::Failed(_)) => false,
-                Some(TurnSettle::Running) | None => drain_outcome == Some(DrainState::Waiting),
+            let waiting = match ending {
+                Some(Ending::Waiting) => true,
+                Some(Ending::Settle) => false,
+                Some(Ending::Observe) | None => drain_outcome == Some(DrainState::Waiting),
             };
             waiting && !stopped && prompt_err.is_none()
         };
@@ -787,9 +819,10 @@ impl Turn {
         // card is patched in place, which pushes no notification and does not
         // bump the conversation — so reply to the requester's message to
         // notify them. A followed turn notifies when the FOLLOW finalizes (its
-        // real end), not at the drain bound; a Waiting yield never notifies
-        // (ADR-0059): the notice belongs to the true end.
-        if !follow && !waiting {
+        // real end), not at the drain bound; `send_completion_notice` itself
+        // declines a card that is not at an ending, so a Waiting yield never
+        // notifies — the notice belongs to the true end (ADR-0059).
+        if !follow {
             send_completion_notice(handles, &self.session_id, self.started_at).await;
         }
 
@@ -1042,7 +1075,9 @@ impl Turn {
             // A non-busy status: the settle decision owns the ending (ADR-0059)
             // once the run was observed; before that the confirmation window
             // still bounds an unregistered submit. The failed and timed-out
-            // status paths take the same rule.
+            // paths take the same rule, counting an unreadable status as idle
+            // (the pre-settle rule's own treatment, and conservative: only the
+            // transcript's durable facts then decide) — see `settle_or_yield`.
             Some(Ok(_)) => self.settle_or_yield(transcript, anchor.as_ref(), observed),
             Some(Err(e)) => {
                 tracing::warn!("turn drain session status: {}", e);
@@ -1061,6 +1096,13 @@ impl Turn {
     /// `Complete`/`Failed` settle it. Before the run was observed, or with no
     /// anchor to judge against, [`Self::settle_or_confirm`]'s confirmation
     /// window still bounds an unregistered submit.
+    ///
+    /// An unreadable status (a failed or timed-out call) counts as idle here,
+    /// the pre-settle rule's own treatment — the conservative choice: the
+    /// Turn can never end MORE than it used to (the old rule settled on the
+    /// same read), and a read with a live Background Task or an unanswered
+    /// Wake now yields waiting / keeps observing instead of stamping Done on
+    /// a session cola cannot see. Only a bounded, task-free read settles.
     fn settle_or_yield(
         &mut self,
         transcript: &SessionTranscript,
@@ -1070,10 +1112,10 @@ impl Turn {
         let Some(anchor) = anchor.filter(|_| observed) else {
             return self.settle_or_confirm(observed);
         };
-        match transcript.settle(anchor, true) {
-            TurnSettle::Waiting => DrainState::Waiting,
-            TurnSettle::Running => DrainState::Running,
-            TurnSettle::Complete | TurnSettle::Failed(_) => DrainState::Settled,
+        match Ending::from(transcript.settle(anchor)) {
+            Ending::Observe => DrainState::Running,
+            Ending::Waiting => DrainState::Waiting,
+            Ending::Settle => DrainState::Settled,
         }
     }
 
@@ -1082,6 +1124,12 @@ impl Turn {
     /// that, [`IDLE_CONFIRMATIONS`] consecutive reads are required before the
     /// submit is treated as never registered. Shared by the idle, failed and
     /// timed-out status paths so they cannot drift.
+    ///
+    /// It cannot drift from [`Self::settle_or_yield`]: the two are mutually
+    /// exclusive — this is reached only when there is no anchor for a settle
+    /// decision to judge — and it deliberately makes no ending decision the
+    /// settle decision could contradict. It only bounds an unregistered
+    /// submit; every anchored read takes the settle path.
     fn settle_or_confirm(&mut self, observed: bool) -> DrainState {
         if observed {
             return DrainState::Settled;
@@ -1911,7 +1959,9 @@ async fn release_inflight(handles: &TurnHandles, session_id: &str) {
 /// start, so the long-task threshold measures the whole run; a retry re-attach
 /// (#393) arms the follow with "now" instead, because the original turn's
 /// start is no longer known there. The copy follows the card's real terminal
-/// (#394): 完成, 出错, or 已停止 for a deliberate `/stop`.
+/// (#394): 完成, 出错, or 已停止 for a deliberate `/stop` — and the function
+/// itself declines a card that is not at an ending, so a Waiting card can
+/// never be announced as 完成 even by a caller that forgot to guard (ADR-0059).
 async fn send_completion_notice(handles: &TurnHandles, session_id: &str, started_at: std::time::Instant) {
     if !(handles.config.group_completion_notice || handles.config.long_task_notice) {
         return;
@@ -1932,12 +1982,20 @@ async fn send_completion_notice(handles: &TurnHandles, session_id: &str, started
         })
     };
     if let Some((reply_to, requester, is_group, state)) = notice {
-        // The card's real terminal decides the copy (#394): a deliberate stop
-        // is announced as 已停止, never as 完成 or 出错.
+        // The card's real disposition decides the copy (#394): a deliberate
+        // stop is announced as 已停止, never as 完成 or 出错. A card that is
+        // NOT at an ending declines here — a Waiting card has not reached its
+        // true end (the notice belongs to the true end, and the next Wake
+        // continues the chain, ADR-0059); a Retried card's failure was already
+        // announced when it failed; and a live/split card (Loading…Continued)
+        // is no ending at all. The refusal lives HERE, not only at the call
+        // sites, so a caller that forgets to guard cannot announce one as
+        // 已完成.
         let text = match state {
+            crate::feishu::card::CardState::Done => "✅ 已完成。",
             crate::feishu::card::CardState::Stopped => "⏹ 已停止。",
             crate::feishu::card::CardState::Error => "❌ 上一条请求处理出错了，可点击卡片上的「重试」。",
-            _ => "✅ 已完成。",
+            _ => return,
         };
         // Best-effort @-mention: the display name needs the contact API
         // (permission granted). On any lookup failure cola falls back to a
@@ -2238,6 +2296,64 @@ mod tests {
             cola_message_id: None,
             images: Vec::new(),
         }
+    }
+
+    /// The notice itself declines a card that is not at an ending, so a caller
+    /// that forgets to guard cannot announce a Waiting card as 已完成
+    /// (ADR-0059) — while the same card at its true end still notifies.
+    #[tokio::test]
+    async fn the_completion_notice_declines_a_card_that_has_not_ended() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        // A group turn: the opt-in rules WOULD notify, so only the state can
+        // refuse.
+        Turn::seed_card(&app.cards_handle(), "ses_test", Some("om_1")).await;
+        Turn::set_reply_target(&app.cards_handle(), "ses_test", "msg_1").await;
+        Turn::set_turn_identity(
+            &app.cards_handle(),
+            "ses_test",
+            crate::bridge::test_support::TEST_HOST,
+            true,
+            1,
+        )
+        .await;
+        Turn::set_card_state(
+            &app.cards_handle(),
+            "ses_test",
+            crate::feishu::card::CardState::Waiting,
+        )
+        .await;
+
+        send_completion_notice(&app.turn_handles(), "ses_test", std::time::Instant::now()).await;
+
+        assert!(
+            !platform.calls.lock().await.iter().any(|call| matches!(
+                call,
+                crate::bridge::test_support::PlatformCall::CompletionNotice { .. }
+            )),
+            "a waiting card must never be announced: {:?}",
+            platform.calls.lock().await
+        );
+
+        // The same card at its true end does notify: the refusal is the
+        // disposition, not a broken notice.
+        Turn::set_card_state(
+            &app.cards_handle(),
+            "ses_test",
+            crate::feishu::card::CardState::Done,
+        )
+        .await;
+        send_completion_notice(&app.turn_handles(), "ses_test", std::time::Instant::now()).await;
+        assert!(
+            platform.calls.lock().await.iter().any(|call| matches!(
+                call,
+                crate::bridge::test_support::PlatformCall::CompletionNotice { .. }
+            )),
+            "a Done card notifies: {:?}",
+            platform.calls.lock().await
+        );
     }
 
     /// A failed Loading reply must not leave the session looking busy forever:
