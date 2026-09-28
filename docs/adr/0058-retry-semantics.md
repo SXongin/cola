@@ -34,9 +34,9 @@ evaluates the matrix top-down.
 
 Each row presupposes the rows above it did not match. The status cell
 dominates: an unreadable status submits a fresh id without consulting the
-transcript, because the click must always have an effect and a same-id re-post
-against an admitted turn can be a no-op. The settled/unfinished split is read
-through the same neutral turn projection the finalization uses
+transcript read, because the click must always have an effect and a same-id
+re-post against an admitted turn can be a no-op. The settled/unfinished split
+is read through the same neutral turn projection the finalization uses
 (`turn_for_user(..).complete`), so the retry and the card agree on what "the
 turn ended" means.
 
@@ -50,9 +50,10 @@ failure can be retried, and the out-of-turn follow keeps rendering the same
 card until the run truly ends (Done, Error, or Stopped). Re-attach adds no new
 loop: it hands the card to the follow that already owns Busy→non-busy
 finalization, `/stop`, the failure graces and the silent exit when a new Turn
-replaces the accumulator (ADR-0043, ADR-0050). When the card is no longer in
-Error, has no anchor to follow, or has vanished, nothing is submitted either:
-the claim is released and the Error card keeps a working retry.
+replaces the accumulator (ADR-0043, ADR-0050). When there is nothing to follow
+— the card has vanished, is no longer in Error, or carries no anchor — nothing
+is submitted either: the claim goes back, so an Error card that still exists
+keeps a working retry.
 
 ### One card per attempt; the failed card is marked, not reset
 
@@ -63,15 +64,16 @@ line appended, every byte of the failed content preserved — so the failure
 stays readable and a stale click cannot retry a newer turn. The marking happens
 only under the session's inflight guard (a retry that loses the guard marks
 nothing and releases its claim), and the atomic claim that gates the click is
-taken only while the card is an unclaimed Error, so a double-click submits at
-most once. The attempt's fresh accumulator carries the failed attempt's render
-baseline across: the old attempt's already-observed messages stay suppressed,
-and the new card shows only the new attempt (ADR-0040's 2026-09-28 amendment).
+taken only for an Error card that still has a sent card, a stored prompt, and
+no earlier claim, so a double-click submits at most once. The attempt's fresh
+accumulator carries the failed attempt's render baseline across: the old
+attempt's already-observed messages stay suppressed, and the new card shows
+only the new attempt (ADR-0040's 2026-09-28 amendment).
 
 ### Why the id policy is generation-aware
 
 The id is sometimes reused and sometimes fresh because the two generations'
-servers give `msg_cola_` ids different meanings (ADR-0055):
+prompt contracts give `msg_cola_` ids different meanings (ADR-0056):
 
 - **Fresh id — nothing else runs.** A same-id re-post of an admitted turn is a
   silent no-op on V2: the id is an admission key, and the server reconciles the
@@ -104,7 +106,20 @@ is terminal for every running probe and renders no retry button, so a stopped
 card never enters this matrix; the abort text the server recorded is never
 written to the card, and the completion notice says 已停止.
 
-## Evidence
+## Considered options
+
+- **Always submit under a fresh id.** Rejected: it drops the idempotent
+  protection for a submission that may have landed but was never persisted —
+  the one shape both generations still create and run.
+- **Always reuse the failed id.** Rejected: the original bug. Once the id is
+  admitted on V2 a same-id re-post is a no-op, so the card lands back on Error
+  and the click has no effect.
+- **Guess the generation from the id's presence or shape.** Rejected: the
+  server contract is already a capability
+  (`Backend::reuse_continues_an_admitted_turn`); reading it keeps the policy
+  honest per attachment and testable without a live server.
+
+## Verification
 
 - **V1's admitted-unfinished continuation** is pinned live by
   `live_v1_scripted_failure_and_retry_chain`: a same-id re-post after a failed
@@ -130,9 +145,17 @@ written to the card, and the completion notice says 已停止.
 - Images are not re-sent by a retry (deferred by #391).
 - External aborts (another client's stop) still read as failures and remain
   retryable; classifying them as stops is out of scope.
-- ADR-0026's "a retry reuses the same id" is narrowed by a dated correction
-  note there: reuse covers only the never-admitted case plus V1's
-  admitted-unfinished continuation.
+- ADR-0026 carries a dated correction note for its retry-reuse claim (see
+  there); the reuse scope itself lives in this ADR.
+
+## Domain note
+
+**Retry** enters the glossary with this ADR's semantics and nothing below the
+surface. The **Card** entry's terminal enumeration is completed: what was a
+linear live progression ending at "done" now names its four terminals (✅ 完成,
+❌ 出错, ⏹ 已停止, ↩️ 已重试), the last two introduced by this spec's terminal
+work (#394's stop; the retry marker). The generation-specific id policy
+deliberately stays out of the glossary.
 
 Source: spec #391 (retry semantics; build tickets #392–#396). Related: #387
 (the replay flood), PR #390 (the render baseline), #386 (the follow whose

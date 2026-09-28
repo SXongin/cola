@@ -107,7 +107,7 @@ A single user→assistant exchange inside a Session (one prompt plus its streame
 _Avoid_: 对话 as a user-facing term for this (overloads "conversation"); 消息 (a single message, not a full exchange).
 
 **Retry** (重试):
-The action an Error **Card** offers for a failed **Turn**: run that turn's question again on the same **Session**. A Retry never oversubmits — if the run is still alive (cola may merely have lost sight of it), the card is re-attached to it instead of asking again — and it never overwrites the failed attempt: the failed card is marked 「↩️ 已重试」 and the new attempt renders on a new card below it, so the failure stays readable and a stale click cannot retry a newer turn. A deliberate stop is not a failure and offers no Retry.
+The action an Error **Card** offers for a failed **Turn**: run that turn's question again on the same **Session**. A Retry never oversubmits — if the run is still alive (cola may merely have lost sight of it), the card is re-attached to it instead of asking again — and it never overwrites the failed attempt: the failed card is marked 「↩️ 已重试」 and the new attempt renders on a new card below it, so the failure stays readable and a stale click cannot retry a newer turn (ADR-0058). A deliberate stop is not a failure and offers no Retry.
 _Avoid_: Resend, re-ask (both imply an unconditional second submission)
 
 **Supplement** (补充消息):
@@ -181,7 +181,7 @@ The one read-only card a Chat/Topic receives when it activates a Session it was 
 _Avoid_: Briefing, takeover summary, handoff card
 
 **Card**:
-A Feishu interactive message card. Evolves through states (loading → reasoning → running → streaming → done), uses collapsible panels for secondary content, and shows progress in its header (phase timer, silence, reasoning length) so a slow turn is distinguishable from a dead one — including a "等待你的授权"/"等待你的回答" state that names whichever pending request blocks the turn (both at once reads "等待你的授权/回答").
+A Feishu interactive message card. It evolves through live states (loading → reasoning → running → streaming) and ends in one of four terminals — 「✅ 完成」, 「❌ 出错」, 「⏹ 已停止」 for a deliberate stop, or 「↩️ 已重试」 once its retry was submitted. It uses collapsible panels for secondary content and shows progress in its header (phase timer, silence, reasoning length) so a slow turn is distinguishable from a dead one — including a "等待你的授权"/"等待你的回答" state that names whichever pending request blocks the turn (both at once reads "等待你的授权/回答").
 _Avoid_: Widget, component, bubble
 
 **Card Chain**:

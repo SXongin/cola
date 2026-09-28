@@ -17,14 +17,23 @@ itself and give the poller sole ownership of the sync state.
 
 > **Corrected 2026-09-28 (spec #391, ADR-0058)**: decision 1's "a retry reuses
 > the same id" and decision 3's "the user's retry reuses the same `messageID`"
-> describe the retry scope too broadly. Reuse is now reserved for two shapes:
-> an id the server never admitted (no anchor for it — both generations still
-> create and run it) and V1's admitted-but-unfinished continuation (its upsert
-> re-post runs a new step). A settled turn, an unknown status or transcript
-> read, and every admitted turn on V2 take a FRESH `msg_cola_` id — on V2 the
-> id is an admission key, so a same-id re-post of an admitted turn is a `200`
-> no-op. The no-duplicate property below is unchanged; what narrowed is when
-> reuse is the right submit. ADR-0058 holds the state → action matrix.
+> apply to two shapes only: an id the server never admitted (no anchor for it —
+> both generations still create and run it) and V1's admitted-but-unfinished
+> continuation (its upsert re-post runs a new step). A settled turn, an unknown
+> status or transcript read, and every admitted turn on V2 take a FRESH
+> `msg_cola_` id — on V2 the id is an admission key, so a same-id re-post of an
+> admitted turn is a `200` no-op.
+>
+> Two statements below narrow accordingly rather than being silently rewritten:
+> the Verification bullet "Re-posting the same `messageID` does not duplicate
+> the user message (single row kept) — retries are idempotent server-side" now
+> means no SECOND RUN of an admitted submission, not that a same-id re-post is
+> always the right retry (ADR-0058's live chains pin each generation's shape);
+> and the Consequences bullet "Retries can no longer duplicate user-message
+> rows" narrows to *of the same submission* — a settled fresh-id retry
+> deliberately adds one new user row ("asked again"). What survives unchanged
+> is no duplicate run of one submission and no duplicate notification of it.
+> ADR-0058 holds the state → action matrix.
 
 ## Decision
 
