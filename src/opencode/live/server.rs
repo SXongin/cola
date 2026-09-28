@@ -67,6 +67,9 @@ pub struct LiveServer {
     /// Held so the isolated trees (and their contents) live exactly as long as
     /// the server does.
     _root: tempfile::TempDir,
+    /// What [`Self::restart`] needs to start the same server again.
+    generation: Generation,
+    binary: String,
     base_url: String,
     work_dir: PathBuf,
     stderr: Arc<Mutex<String>>,
@@ -100,6 +103,22 @@ impl LiveServer {
         Self::launch(Generation::V2, binary, provider_base_url, permissions).await
     }
 
+    /// Kill the child and start the same binary again against the SAME
+    /// isolated trees — the store, config and work directory survive, the
+    /// in-memory run state does not. This is what a shared server's crash,
+    /// upgrade or restart looks like from a client: a run that was in flight
+    /// is orphaned mid-message instead of being finalized.
+    pub async fn restart(&mut self) {
+        let _ = self.child.start_kill();
+        // Reap before the replacement opens the same store: SIGKILL lands
+        // immediately, and the bound only guards a pathological child.
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await;
+        let (child, base_url) =
+            spawn_serve(self._root.path(), self.generation, &self.binary, &self.stderr).await;
+        self.child = child;
+        self.base_url = base_url;
+    }
+
     /// The shared launch path: one isolated temp world, the generation's own
     /// config, and the generation's own listening line.
     async fn launch(
@@ -119,98 +138,15 @@ impl LiveServer {
             Generation::V2 => write_v2_config(&dirs("config"), provider_base_url, v2_permissions),
         }
 
-        let mut command = tokio::process::Command::new(resolve_binary(binary));
-        command
-            .arg("serve")
-            .arg("--hostname")
-            .arg("127.0.0.1")
-            .arg("--port")
-            .arg("0")
-            .current_dir(&work_dir)
-            // A clean, proxy-free environment: the only network the server may
-            // reach is the loopback provider (models.dev fetch is disabled, so
-            // no credentials or external services are involved at all).
-            .env_clear()
-            .env("HOME", dirs("home"))
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-            .env("XDG_DATA_HOME", dirs("data"))
-            .env("XDG_CONFIG_HOME", dirs("config"))
-            .env("XDG_CACHE_HOME", dirs("cache"))
-            .env("XDG_STATE_HOME", dirs("state"))
-            .env("TMPDIR", dirs("tmp"))
-            .env("OPENCODE_SERVER_PASSWORD", PASSWORD)
-            .env("OPENCODE_DISABLE_MODELS_FETCH", "1")
-            .env("OPENCODE_DISABLE_AUTOUPDATE", "1")
-            .env("NO_PROXY", "127.0.0.1,localhost")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        if generation == Generation::V2 {
-            // V2's own explicit config-dir override (the wrapper's recipe).
-            command.env("OPENCODE_CONFIG_DIR", dirs("config").join("opencode"));
-        }
-        let mut child = command.spawn().unwrap_or_else(|error| {
-            panic!(
-                "cannot start the live OpenCode {} binary `{binary}`: {error}\n\
-                 set {} to the pinned binary (or put `opencode` on PATH)",
-                generation.as_str(),
-                live_binary_env(generation)
-            )
-        });
-
         let stderr = Arc::new(Mutex::new(String::new()));
-        if let Some(pipe) = child.stderr.take() {
-            let buffer = Arc::clone(&stderr);
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(pipe).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let mut collected = buffer.lock().unwrap();
-                    collected.push_str(&line);
-                    collected.push('\n');
-                }
-            });
-        }
-
-        let stdout = child.stdout.take().expect("the server stdout is piped");
-        let (listen_tx, listen_rx) = oneshot::channel::<String>();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            let mut listen_tx = Some(listen_tx);
-            while let Ok(Some(line)) = lines.next_line().await {
-                // Keep draining after the handshake so a chatty server can
-                // never block on a full pipe. V1 prefixes the line with the
-                // artifact name, V2 does not.
-                if let Some(url) = listen_line(&line)
-                    && let Some(tx) = listen_tx.take()
-                {
-                    let _ = tx.send(url.trim().to_string());
-                }
-            }
-        });
-
-        let listen = tokio::time::timeout(STARTUP_TIMEOUT, listen_rx)
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "the live {} server did not report its listening address within {}s:\n{}",
-                    generation.as_str(),
-                    STARTUP_TIMEOUT.as_secs(),
-                    stderr.lock().unwrap()
-                )
-            })
-            .unwrap_or_else(|_| {
-                panic!(
-                    "the live {} server exited before reporting its listening address:\n{}",
-                    generation.as_str(),
-                    stderr.lock().unwrap()
-                )
-            });
+        let (child, base_url) = spawn_serve(root.path(), generation, binary, &stderr).await;
 
         Self {
             child,
             _root: root,
-            base_url: listen,
+            generation,
+            binary: binary.to_string(),
+            base_url,
             work_dir,
             stderr,
         }
@@ -231,6 +167,108 @@ impl LiveServer {
     pub fn stderr(&self) -> String {
         self.stderr.lock().unwrap().clone()
     }
+}
+
+/// Spawn `binary serve` inside the isolated trees under `root` and wait for
+/// its listening line. Split out of [`LiveServer::launch`] so
+/// [`LiveServer::restart`] can reuse exactly the same environment.
+async fn spawn_serve(
+    root: &Path,
+    generation: Generation,
+    binary: &str,
+    stderr: &Arc<Mutex<String>>,
+) -> (tokio::process::Child, String) {
+    let dirs = |name: &str| root.join(name);
+    let work_dir = dirs("work");
+
+    let mut command = tokio::process::Command::new(resolve_binary(binary));
+    command
+        .arg("serve")
+        .arg("--hostname")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg("0")
+        .current_dir(&work_dir)
+        // A clean, proxy-free environment: the only network the server may
+        // reach is the loopback provider (models.dev fetch is disabled, so
+        // no credentials or external services are involved at all).
+        .env_clear()
+        .env("HOME", dirs("home"))
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("XDG_DATA_HOME", dirs("data"))
+        .env("XDG_CONFIG_HOME", dirs("config"))
+        .env("XDG_CACHE_HOME", dirs("cache"))
+        .env("XDG_STATE_HOME", dirs("state"))
+        .env("TMPDIR", dirs("tmp"))
+        .env("OPENCODE_SERVER_PASSWORD", PASSWORD)
+        .env("OPENCODE_DISABLE_MODELS_FETCH", "1")
+        .env("OPENCODE_DISABLE_AUTOUPDATE", "1")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if generation == Generation::V2 {
+        // V2's own explicit config-dir override (the wrapper's recipe).
+        command.env("OPENCODE_CONFIG_DIR", dirs("config").join("opencode"));
+    }
+    let mut child = command.spawn().unwrap_or_else(|error| {
+        panic!(
+            "cannot start the live OpenCode {} binary `{binary}`: {error}\n\
+             set {} to the pinned binary (or put `opencode` on PATH)",
+            generation.as_str(),
+            live_binary_env(generation)
+        )
+    });
+
+    if let Some(pipe) = child.stderr.take() {
+        let buffer = Arc::clone(stderr);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(pipe).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut collected = buffer.lock().unwrap();
+                collected.push_str(&line);
+                collected.push('\n');
+            }
+        });
+    }
+
+    let stdout = child.stdout.take().expect("the server stdout is piped");
+    let (listen_tx, listen_rx) = oneshot::channel::<String>();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stdout).lines();
+        let mut listen_tx = Some(listen_tx);
+        while let Ok(Some(line)) = lines.next_line().await {
+            // Keep draining after the handshake so a chatty server can
+            // never block on a full pipe. V1 prefixes the line with the
+            // artifact name, V2 does not.
+            if let Some(url) = listen_line(&line)
+                && let Some(tx) = listen_tx.take()
+            {
+                let _ = tx.send(url.trim().to_string());
+            }
+        }
+    });
+
+    let listen = tokio::time::timeout(STARTUP_TIMEOUT, listen_rx)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the live {} server did not report its listening address within {}s:\n{}",
+                generation.as_str(),
+                STARTUP_TIMEOUT.as_secs(),
+                stderr.lock().unwrap()
+            )
+        })
+        .unwrap_or_else(|_| {
+            panic!(
+                "the live {} server exited before reporting its listening address:\n{}",
+                generation.as_str(),
+                stderr.lock().unwrap()
+            )
+        });
+
+    (child, listen)
 }
 
 impl Drop for LiveServer {

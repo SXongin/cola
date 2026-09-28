@@ -13,13 +13,16 @@
 //! (`live_v2_scripted_permission_chain`: a gated shell tool answered through the
 //! session-scoped decision), the form round-trip
 //! (`live_v2_scripted_form_chain`: a typed question form answered with a keyed
-//! value, plus a cancellation by delete) and the session-scoped selection
+//! value, plus a cancellation by delete), the session-scoped selection
 //! (`live_v2_scripted_selection_chain`: durable model/agent/variant switches,
 //! the next turn running them with nothing re-sent, and the coupling to the
-//! bridge's ADR-0020 clear rule). Each test spawns the binary of its own
-//! generation into its own temp store, so neither can touch the machine's
-//! default store, credentials or config; each refuses a binary of the other
-//! generation.
+//! bridge's ADR-0020 clear rule) and the retry-id contract
+//! (`live_v2_scripted_retry_id_chain`: the `msg_cola_` id as the server's
+//! admission key — a re-post is a no-op, a new id runs, an aborted message's
+//! shape, and an unfinished run the server died in). Each test spawns the
+//! binary of its own generation into its own temp store, so neither can touch
+//! the machine's default store, credentials or config; each refuses a binary of
+//! the other generation.
 //!
 //! These tests are `#[ignore]`-gated, so `cargo test --workspace --locked`
 //! stays hermetic and credential-free. Run one generation with the pinned
@@ -1297,6 +1300,433 @@ async fn live_v2_scripted_form_chain() {
     // The cancelled turn may settle with a tool failure; let the run reach its
     // end so the server is not left with a blocked run.
     wait_for_idle(&backend, &cancel_session.id, &work_dir, &server).await;
+}
+
+/// The V2 retry-id contract against the pinned V2 server: the server keeps
+/// cola's `msg_cola_` id as an ADMISSION key.
+///
+/// - a re-post with an id the server already admitted is a no-op: the submit
+///   is accepted, no assistant message is produced, no model call is made, and
+///   every stored row is unchanged — only an idle event is appended;
+/// - a re-post with a NEW id runs a fresh turn;
+/// - an ABORTED assistant message carries `finish="error"` plus an `aborted`
+///   error — exactly the shape the retry matrix reads (a terminal finish, so
+///   the settled arm picks a new id);
+/// - the matrix's "unfinished + idle + reuse continues the turn" cell is
+///   pinned the way the server actually behaves: a run the server died in
+///   leaves the turn unfinished and the session idle, and re-posting the SAME
+///   id still runs nothing (the id's admission already exists, so there is
+///   nothing to drain). The reuse arm is therefore idempotent — it never
+///   duplicates — but it does not revive a run that already started.
+///
+/// Every turn is scripted: the provider answers with a tool call and a closing
+/// text, so a "run" is observable as assistant rows and model calls, not as a
+/// wall-clock wait. The scratch sessions are deleted at the end; the whole
+/// chain runs in the isolated store (ADR-0057).
+#[tokio::test]
+#[ignore = "live: needs a V2 binary (see the module docs)"]
+async fn live_v2_scripted_retry_id_chain() {
+    let binary = live_v2_binary();
+    let version = server::ensure_v2_binary(&binary).await;
+    eprintln!("live V2 binary: {binary} ({version})");
+
+    let provider = provider::start_with(provider::Tool::Shell, provider::ToolCommand::Slow).await;
+    let mut server = LiveServer::start_v2(&binary, &provider.base_url()).await;
+    let backend = v2_live_backend(&server);
+    wait_for_ready(&backend, &server).await;
+    let work_dir = server.work_dir();
+
+    // A settled turn. The submit is the production adapter's admit-then-return
+    // prompt; the turn settles through the transcript + run state.
+    let settled = backend
+        .create_session(&backend.new_session_input(Some(&work_dir)))
+        .await
+        .unwrap_or_else(|error| panic!("create session failed: {error}\n{}", server.stderr()));
+    let settled_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
+    backend
+        .prompt(&settled.id, PROMPT_TEXT, &[], None, None, None, Some(&settled_id))
+        .await
+        .unwrap_or_else(|error| panic!("prompt submit failed: {error}\n{}", server.stderr()));
+    let transcript = wait_for_turn(&backend, &settled.id, &settled_id, &server).await;
+    assert!(
+        turn_error(&transcript, &settled_id).is_none(),
+        "the submitted turn must not record a model error: {:?}",
+        turn_error(&transcript, &settled_id)
+    );
+    assert_user_anchor(&transcript, &settled_id);
+    assert_turn_complete(&transcript, &settled_id);
+    wait_for_idle(&backend, &settled.id, &work_dir, &server).await;
+
+    // Same id, settled turn: the server has already admitted that id, so the
+    // re-post reconciles onto it and runs nothing — the acceptance contract
+    // the retry matrix's settled arm (a fresh id) exists for.
+    assert_retry_id_no_op(
+        &backend,
+        &provider,
+        &server,
+        &settled.id,
+        &settled_id,
+        "a settled turn",
+    )
+    .await;
+    wait_for_idle(&backend, &settled.id, &work_dir, &server).await;
+
+    // A NEW id on the same session runs a second turn for real.
+    let completions_before = provider_turn_completions(&provider);
+    let fresh_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
+    backend
+        .prompt(&settled.id, PROMPT_TEXT, &[], None, None, None, Some(&fresh_id))
+        .await
+        .unwrap_or_else(|error| panic!("new-id submit failed: {error}\n{}", server.stderr()));
+    let fresh = wait_for_turn(&backend, &settled.id, &fresh_id, &server).await;
+    assert_user_anchor(&fresh, &fresh_id);
+    assert_turn_complete(&fresh, &fresh_id);
+    assert!(
+        provider_turn_completions(&provider) > completions_before,
+        "a new id must actually run the turn:\n{}",
+        server.stderr()
+    );
+    assert_eq!(
+        fresh
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::User)
+            .count(),
+        2,
+        "the retried question appears as asked again: {fresh:#?}"
+    );
+    wait_for_idle(&backend, &settled.id, &work_dir, &server).await;
+
+    // An aborted turn: interrupt the scripted slow tool mid-flight, then read
+    // the aborted message's shape — the data the retry matrix evaluates.
+    let aborted = backend
+        .create_session(&backend.new_session_input(Some(&work_dir)))
+        .await
+        .unwrap_or_else(|error| panic!("create abort session failed: {error}\n{}", server.stderr()));
+    let aborted_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
+    backend
+        .prompt(&aborted.id, PROMPT_TEXT, &[], None, None, None, Some(&aborted_id))
+        .await
+        .unwrap_or_else(|error| panic!("abort prompt submit failed: {error}\n{}", server.stderr()));
+    poll_until(
+        "the abort turn's live tool",
+        POLL_TIMEOUT,
+        || async {
+            let transcript = backend.transcript(&aborted.id).await?;
+            Ok(has_live_tool(&transcript).then_some(()))
+        },
+        || server.stderr(),
+    )
+    .await;
+    backend
+        .interrupt(&aborted.id)
+        .await
+        .unwrap_or_else(|error| panic!("interrupt failed: {error}\n{}", server.stderr()));
+    wait_for_idle(&backend, &aborted.id, &work_dir, &server).await;
+
+    let read = raw_read(&server, &aborted.id).await;
+    let message = raw_assistant(&read).unwrap_or_else(|| {
+        panic!(
+            "the aborted turn is in the transcript:\n{}",
+            serde_json::to_string_pretty(&read).unwrap()
+        )
+    });
+    assert_eq!(
+        message["finish"], "error",
+        "an aborted assistant message reads as an error finish: {message:#?}"
+    );
+    assert_eq!(
+        message["error"]["type"], "aborted",
+        "the finish carries the aborted error: {message:#?}"
+    );
+    let tool =
+        raw_tool_part(&read).unwrap_or_else(|| panic!("the aborted turn carries its tool call: {read:#?}"));
+    assert_eq!(tool["state"]["status"], "error", "{tool:#?}");
+    assert_eq!(
+        tool["state"]["error"]["type"], "aborted",
+        "the interrupted tool is recorded as aborted: {tool:#?}"
+    );
+    // The neutral projection the matrix reads: `finish="error"` is a terminal
+    // step finish, so the turn reads settled AND carries the abort text.
+    let transcript = backend.transcript(&aborted.id).await.unwrap();
+    let anchor = transcript
+        .anchor_of_user(&aborted_id)
+        .expect("the aborted turn keeps its user anchor");
+    let turn = transcript.turn_for_user(&anchor);
+    assert!(
+        turn.complete,
+        "an aborted message is a terminal finish, so the turn reads settled: {transcript:#?}"
+    );
+    assert!(
+        turn.error.is_some(),
+        "the abort text lands on the turn's error: {transcript:#?}"
+    );
+
+    capture_fixture(
+        "v2/transcript_aborted",
+        "v2",
+        &version,
+        &capture_command(
+            "COLA_LIVE_OPENCODE_V2_BIN",
+            &binary,
+            "live_v2_scripted_retry_id_chain",
+        ),
+        &format!(
+            "{}/api/session/{}/message?order=asc&limit=200",
+            server.base_url(),
+            aborted.id
+        ),
+    )
+    .await;
+
+    // A same-id re-post on the aborted turn is the same admission no-op.
+    assert_retry_id_no_op(
+        &backend,
+        &provider,
+        &server,
+        &aborted.id,
+        &aborted_id,
+        "an aborted turn",
+    )
+    .await;
+    wait_for_idle(&backend, &aborted.id, &work_dir, &server).await;
+
+    // The "unfinished + idle + reuse" cell. A run the server is killed in
+    // never finalizes: the assistant message keeps no finish and its tool
+    // stays running, while a fresh process reports the session idle. Re-posting
+    // the same id is STILL the admission no-op — the id was already admitted,
+    // so there is nothing to drain and the turn is not revived. This is the
+    // live answer to the speculation the spec flagged: the reuse arm never
+    // duplicates a submission, but it does not continue a run that already
+    // started.
+    let orphaned = backend
+        .create_session(&backend.new_session_input(Some(&work_dir)))
+        .await
+        .unwrap_or_else(|error| panic!("create orphan session failed: {error}\n{}", server.stderr()));
+    let orphaned_id = format!("msg_cola_{}", uuid::Uuid::new_v4().simple());
+    backend
+        .prompt(
+            &orphaned.id,
+            PROMPT_TEXT,
+            &[],
+            None,
+            None,
+            None,
+            Some(&orphaned_id),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("orphan prompt submit failed: {error}\n{}", server.stderr()));
+    poll_until(
+        "the orphan turn's live tool",
+        POLL_TIMEOUT,
+        || async {
+            let transcript = backend.transcript(&orphaned.id).await?;
+            Ok(has_live_tool(&transcript).then_some(()))
+        },
+        || server.stderr(),
+    )
+    .await;
+    server.restart().await;
+    let backend = v2_live_backend(&server);
+    wait_for_ready(&backend, &server).await;
+
+    assert_eq!(
+        backend
+            .session_status(&orphaned.id, Some(&work_dir))
+            .await
+            .unwrap_or_else(|error| panic!("orphan status read failed: {error}\n{}", server.stderr())),
+        Some(SessionStatus::Idle),
+        "the dead run leaves the session idle"
+    );
+    let orphaned_read = raw_read(&server, &orphaned.id).await;
+    let message = raw_assistant(&orphaned_read)
+        .unwrap_or_else(|| panic!("the orphaned message survives the restart: {orphaned_read:#?}"));
+    assert!(
+        message["finish"].is_null(),
+        "a run the server died in leaves no finish: {message:#?}"
+    );
+    let tool = raw_tool_part(&orphaned_read)
+        .unwrap_or_else(|| panic!("the orphaned turn keeps its tool call: {orphaned_read:#?}"));
+    assert_eq!(
+        tool["state"]["status"], "running",
+        "the dead run's tool stays running: {tool:#?}"
+    );
+    let transcript = backend.transcript(&orphaned.id).await.unwrap();
+    let anchor = transcript
+        .anchor_of_user(&orphaned_id)
+        .expect("the orphaned turn keeps its user anchor");
+    let turn = transcript.turn_for_user(&anchor);
+    assert!(
+        !turn.complete,
+        "a message with no finish leaves the turn unfinished: {transcript:#?}"
+    );
+    assert!(
+        turn.error.is_none(),
+        "the dead run records no error on the message: {transcript:#?}"
+    );
+    assert_retry_id_no_op(
+        &backend,
+        &provider,
+        &server,
+        &orphaned.id,
+        &orphaned_id,
+        "an unfinished (orphaned) turn",
+    )
+    .await;
+
+    for session in [settled.id, aborted.id, orphaned.id] {
+        backend
+            .delete_session(&session)
+            .await
+            .unwrap_or_else(|error| panic!("delete session {session} failed: {error}\n{}", server.stderr()));
+    }
+}
+
+/// The production adapter pointed at the live child, with the env-proxy
+/// workaround — rebuilt after a [`LiveServer::restart`] because the port moved.
+fn v2_live_backend(server: &LiveServer) -> OpenCodeBackend {
+    let backend = OpenCodeBackend::with_generation(
+        Some(provider::MODEL_REF),
+        server.base_url(),
+        Some("opencode"),
+        Some(server::PASSWORD),
+        Generation::V2,
+        None,
+    );
+    backend.disable_env_proxy(Some("opencode"), Some(server::PASSWORD));
+    backend
+}
+
+/// Re-post `message_id` through the production submit and assert the server's
+/// admission contract: accepted (the adapter maps a non-2xx to `Err`), no new
+/// assistant message, no model call, every existing wire row unchanged, and
+/// exactly one appended idle event. `what` names the turn state in failures.
+async fn assert_retry_id_no_op(
+    backend: &OpenCodeBackend,
+    provider: &crate::test_http::TestHttpServer,
+    server: &LiveServer,
+    session_id: &str,
+    message_id: &str,
+    what: &str,
+) {
+    let baseline = raw_read(server, session_id).await;
+    let rows_before = raw_rows(&baseline);
+    let completions_before = provider_turn_completions(provider);
+    let assistants_before = raw_assistant_count(&baseline);
+
+    backend
+        .prompt(session_id, PROMPT_TEXT, &[], None, None, None, Some(message_id))
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "{what}: the same-id re-post must be accepted: {error}\n{}",
+                server.stderr()
+            )
+        });
+
+    let rows_after = poll_until(
+        &format!("{what}: the same-id re-post's idle event"),
+        POLL_TIMEOUT,
+        || async {
+            let read = raw_read(server, session_id).await;
+            Ok((raw_rows(&read).len() > rows_before.len()).then_some(raw_rows(&read)))
+        },
+        || server.stderr(),
+    )
+    .await;
+
+    for (id, row) in &rows_before {
+        assert_eq!(
+            rows_after.get(id),
+            Some(row),
+            "{what}: the {id} row must be unchanged by a same-id re-post"
+        );
+    }
+    let appended: Vec<&Value> = rows_after
+        .iter()
+        .filter(|(id, _)| !rows_before.contains_key(*id))
+        .map(|(_, row)| row)
+        .collect();
+    assert_eq!(
+        appended.len(),
+        1,
+        "{what}: a same-id re-post appends only its idle event: {appended:#?}"
+    );
+    assert_eq!(
+        appended[0]["type"], "idle",
+        "{what}: the only effect of a same-id re-post is an idle event: {appended:#?}"
+    );
+    assert_eq!(
+        raw_assistant_count(&raw_read(server, session_id).await),
+        assistants_before,
+        "{what}: a same-id re-post runs no new step:\n{}",
+        server.stderr()
+    );
+    assert_eq!(
+        provider_turn_completions(provider),
+        completions_before,
+        "{what}: a same-id re-post must not call the model"
+    );
+}
+
+/// One raw transcript read: the wire rows the id policy's shape assertions
+/// name. The chains otherwise consume the production adapter; the shape of an
+/// aborted or orphaned row is a wire fact the neutral projection folds away.
+async fn raw_read(server: &LiveServer, session_id: &str) -> Value {
+    let response = crate::test_http::no_proxy_transport()
+        .get(format!(
+            "{}/api/session/{}/message?order=asc&limit=200",
+            server.base_url(),
+            session_id
+        ))
+        .basic_auth("opencode", Some(server::PASSWORD))
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("raw transcript read failed: {error}\n{}", server.stderr()));
+    assert!(
+        response.status().is_success(),
+        "raw transcript read: HTTP {}\n{}",
+        response.status(),
+        server.stderr()
+    );
+    response.json().await.expect("the transcript read body is JSON")
+}
+
+/// The read's rows keyed by message id, for the unchanged-row assertion.
+fn raw_rows(read: &Value) -> std::collections::BTreeMap<String, Value> {
+    read["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|row| (row["id"].as_str().unwrap_or_default().to_string(), row.clone()))
+        .collect()
+}
+
+/// The read's first assistant message — the row whose `finish` the matrix reads.
+fn raw_assistant(read: &Value) -> Option<&Value> {
+    read["data"]
+        .as_array()?
+        .iter()
+        .find(|row| row["type"].as_str() == Some("assistant"))
+}
+
+/// How many assistant rows the read carries.
+fn raw_assistant_count(read: &Value) -> usize {
+    read["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| row["type"].as_str() == Some("assistant"))
+        .count()
+}
+
+/// The read's first tool content item, as the wire row spells it.
+fn raw_tool_part(read: &Value) -> Option<&Value> {
+    read["data"]
+        .as_array()?
+        .iter()
+        .flat_map(|row| row["content"].as_array().into_iter().flatten())
+        .find(|part| part["type"].as_str() == Some("tool"))
 }
 
 /// Whether any decoded part of the transcript is a still-live tool call.
