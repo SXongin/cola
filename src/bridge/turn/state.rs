@@ -266,6 +266,19 @@ pub struct CardSession {
     /// that exhausted the chain bound — or died between a finalize and its
     /// continuation — resumes the chain instead of losing the slice it sent.
     pub(super) card_is_live: bool,
+    /// The chain's identity, handed out fresh by [`CardSession::new`]. A
+    /// replacing session (a new Turn, an external arm, a Wake continuation
+    /// armed from scratch) gets a new one, so a render loop can tell "my
+    /// chain still exists" from "something else took the session over" even
+    /// when the two share a Turn anchor — a Wake continuation continues the
+    /// SAME Turn, so the anchor alone cannot tell them apart (ADR-0059).
+    chain_id: u64,
+}
+
+/// Hands out a fresh [`CardSession::chain_id`] per created session.
+fn next_chain_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl CardSession {
@@ -281,14 +294,23 @@ impl CardSession {
             last_context_sig,
             pending_split: Vec::new(),
             card_is_live: true,
+            chain_id: next_chain_id(),
         }
+    }
+
+    /// This session's chain identity (see the field's docs).
+    pub(super) fn chain_id(&self) -> u64 {
+        self.chain_id
     }
 
     /// True while this card belongs to a Turn that has not finished: the pull
     /// condition for `/card` (ADR-0043, 2026-09-22 amendment). A terminal
     /// (Done/Error/Retried/Stopped) card session stays in the cards handle's
     /// map until the next Turn replaces it, so the map's key alone does not
-    /// mean a live card.
+    /// mean a live card. A `Waiting` card reads as running here (it is not
+    /// terminal) — it is still the chain's newest card; Session Sync's Wake
+    /// step asks [`super::Turn::card_is_owned`] instead, which excludes the
+    /// waiting yield because the next Wake continues that chain (ADR-0059).
     pub(super) fn is_running(&self) -> bool {
         !self.acc.card_state.is_terminal()
     }
@@ -690,6 +712,27 @@ impl StreamAccumulator {
     /// yields waiting over one).
     pub(super) fn set_waiting(&mut self) {
         self.card_state = CardState::Waiting;
+        self.refresh_phase();
+    }
+
+    /// Start a Wake continuation on a NEW card from this accumulator
+    /// (ADR-0059): the previous card's slice was already finalized with the
+    /// facts it had, so the chain's newest card begins a fresh live phase —
+    /// Loading, with the ended attempt's failure display facts cleared (a
+    /// continuation carries no question to re-ask, so it never re-shows the
+    /// failure nor offers Retry). The rendered content, the timeline boundary
+    /// the handoff advanced and the interaction blocks stay: the continuation
+    /// renders only what arrives after the split and keeps the live controls
+    /// (ADR-0038).
+    pub(super) fn continue_on_new_card(&mut self) {
+        self.error = None;
+        self.prompt = None;
+        self.retry_claimed = false;
+        self.card_fallback = CardFallback::None;
+        self.card_state = CardState::Loading;
+        // The previous phase ended with the card; `refresh_phase` only resets
+        // on a change, so clear first for a fresh timer.
+        self.current_phase = None;
         self.refresh_phase();
     }
 
@@ -1513,8 +1556,12 @@ impl StreamAccumulator {
 
             // Error card: offer a retry that re-submits the original prompt
             // (spec #391), so the user doesn't have to retype it. Only Error
-            // offers the button — a Retried or live card must not.
+            // offers the button — a Retried or live card must not — and only a
+            // card that actually carries a question to re-ask: a Wake
+            // continuation deliberately has none (ADR-0059), and neither does
+            // an externally-rendered card.
             if self.card_state == CardState::Error
+                && self.prompt.is_some()
                 && let Some(sid) = &self.session_id
             {
                 builder = builder.with_error_buttons(vec![crate::feishu::card::CardActionButton {

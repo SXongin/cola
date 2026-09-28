@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
-use crate::backend::{MessageRole, Part, SessionTranscript, TurnAnchor};
+use crate::backend::{MessageRole, Part, SessionTranscript, TurnAnchor, TurnSettle};
 use crate::bridge::handles::{CardsHandle, FlowHandles};
 use crate::bridge::turn::Turn;
 
@@ -13,6 +13,11 @@ use crate::bridge::turn::Turn;
 /// excluded by their self-identifying `msg_cola_` id (ADR-0026), never by a
 /// timestamp baseline — authorship lives on the message, so a server crash
 /// mid-turn cannot make cola's own round look external afterwards.
+///
+/// ADR-0059 grows this into **Session Sync**: the same per-thread pass over the
+/// Active Session also renders **Wakes** (the Backend resuming the Session with
+/// no user message) as Card Chain continuations, so work that happens after a
+/// card was finalized reaches Feishu as a new message — its own notification.
 pub struct ExternalFlow {
     /// session_id → Sync Watermark: the created time of the newest user message
     /// the poller has already accounted for (cola-authored or external). Owned
@@ -174,6 +179,17 @@ impl ExternalFlow {
             return;
         };
         let cola_authored = crate::opencode::parsing::is_cola_message_id(newest.id.as_str());
+        if cola_authored {
+            // The Session Sync Wake step (ADR-0059): the newest user message is
+            // cola's own, so any work in this Session that the card chain has
+            // not rendered was resumed by the Backend (a Wake) or landed after
+            // its card was finalized — render it as a continuation. Runs before
+            // the watermark's early returns on purpose: a Wake's visibility
+            // must never depend on the Sync Watermark, which accounts user
+            // messages only and is never moved by a Wake (ADR-0026).
+            self.render_wake_continuation(handles, &transcript, sid, thread_key, directory, &turn_anchor)
+                .await;
+        }
         let mut map = self.last_user_msg_epoch.lock().await;
         let watermark = map.get(sid).copied();
         if cola_authored {
@@ -274,31 +290,7 @@ impl ExternalFlow {
             }
         };
         // Card subtitle: the server's live title (ADR-0007), or the id-tail.
-        let title = crate::bridge::bounded_call(
-            "external render session_info",
-            self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
-            handles
-                .backend
-                .clone()
-                .for_directory(session_dir.as_str())
-                .session_info(session_id),
-        )
-        .await
-        .and_then(|r| r.ok())
-        .and_then(|i| i.title)
-        .unwrap_or_default();
-        let clean = crate::feishu::card::clean_session_label(&title);
-        let id_tail: String = session_id
-            .strip_prefix("ses_")
-            .unwrap_or(session_id)
-            .chars()
-            .take(7)
-            .collect();
-        let subtitle = if clean.is_empty() {
-            id_tail
-        } else {
-            format!("{} · {}", clean, id_tail)
-        };
+        let subtitle = self.session_subtitle(handles, session_id, &session_dir).await;
 
         // Footer model@variant: capture the session's `/think` variant when the
         // turn is ARMED, not when it finalizes — a `/think` issued mid-render
@@ -491,6 +483,209 @@ impl ExternalFlow {
         );
         true
     }
+
+    /// The card subtitle a continuation carries: the server's live session
+    /// title (ADR-0007) plus the id tail, or the bare id tail when the server
+    /// has no real title yet. Bounded like every other poll read, so a hung
+    /// server degrades the subtitle instead of the send.
+    async fn session_subtitle(&self, handles: &FlowHandles, session_id: &str, session_dir: &str) -> String {
+        let title = crate::bridge::bounded_call(
+            "external render session_info",
+            self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
+            handles
+                .backend
+                .clone()
+                .for_directory(session_dir)
+                .session_info(session_id),
+        )
+        .await
+        .and_then(|r| r.ok())
+        .and_then(|i| i.title)
+        .unwrap_or_default();
+        let clean = crate::feishu::card::clean_session_label(&title);
+        let id_tail: String = session_id
+            .strip_prefix("ses_")
+            .unwrap_or(session_id)
+            .chars()
+            .take(7)
+            .collect();
+        if clean.is_empty() {
+            id_tail
+        } else {
+            format!("{} · {}", clean, id_tail)
+        }
+    }
+
+    /// Render a Wake's resumed work as a Card Chain continuation (ADR-0059) —
+    /// the Session Sync observation with no user message behind it. The caller
+    /// has already scoped it to the thread's Active Session whose newest user
+    /// message is a Cola-Authored Message; this owns "is anything owed", "where
+    /// does the card go" and "what does it reply to", then arms the
+    /// continuation and spawns its render loop.
+    ///
+    /// A chain that exists is continued by a SPLIT of that chain (the same
+    /// handoff ADR-0043 defined for supplements): the previous card is
+    /// finalized, the flush sends the new continuation card — the
+    /// notification — replied to the Turn's own reply target, and only content
+    /// the chain had not rendered lands on it. With no chain (a cola restart
+    /// happened while the Wake was pending) a fresh card is armed, scoped at
+    /// the newest Wake, and sent to the thread's reachable anchor — the Turn is
+    /// never replayed onto it. Both paths are independent of any in-memory
+    /// accumulator from before: the card-exists case diffs the chain's own
+    /// rendered state, the restart case scopes by the Wake's server time.
+    async fn render_wake_continuation(
+        &self,
+        handles: &FlowHandles,
+        transcript: &SessionTranscript,
+        sid: &str,
+        thread_key: &crate::config::ThreadKey,
+        directory: &str,
+        turn_anchor: &TurnAnchor,
+    ) {
+        // A live Turn/follow/renderer owns the session: it renders (or will
+        // render) whatever arrives — never double-render into a second card.
+        if handles.waits.inflight.lock().await.contains(sid) {
+            return;
+        }
+        if Turn::card_is_owned(&handles.cards, sid).await {
+            return;
+        }
+        let Some(continuation) = Turn::wake_continuation(&handles.cards, sid, transcript, turn_anchor).await
+        else {
+            return;
+        };
+        // The Feishu reply target: the Turn's own when the chain still knows
+        // it (the user's message the exchange continues from), else an in-topic
+        // anchor — the external path's fallback order. `None` means only a
+        // top-level send can reach the thread, which a split cannot do.
+        let reply_target = match Turn::reply_target(&handles.cards, sid).await {
+            Some(target) => Some(target),
+            None => {
+                crate::bridge::pollers::resolve_topic_anchor(&handles.sessions, &handles.platform, thread_key)
+                    .await
+            }
+        };
+        // The Wake starts new work: a `/stop` from before it is not this run's
+        // ending — the same rule a fresh Turn applies to the sticky marker
+        // (ADR-0043). A stop landing after this point ends the continuation
+        // promptly as ⏹ 已停止.
+        handles.waits.stopped_sessions.lock().await.remove(sid);
+
+        if Turn::has_card(&handles.cards, sid).await {
+            let Some(reply_to) = reply_target else {
+                tracing::warn!(
+                    "wake continuation: session {} has a chain but no reachable reply target",
+                    sid
+                );
+                return;
+            };
+            // The split carries the continuation: its flush re-stamps the
+            // previous card, sends the new card and tracks it. The loop's
+            // guard facts are read AFTER the split, so they describe the chain
+            // the continuation actually lives on.
+            if !Turn::split_chain_for_wake(&handles.cards, sid, &reply_to).await {
+                return;
+            }
+            let (Some(anchor), Some(chain)) = (
+                Turn::armed_turn_anchor(&handles.cards, sid).await,
+                Turn::chain_id(&handles.cards, sid).await,
+            ) else {
+                return;
+            };
+            tracing::info!("wake continuation: session {} continues its card chain", sid);
+            self.spawn_wake_render(handles, sid, thread_key, anchor, directory, chain);
+            return;
+        }
+
+        // No chain (a cola restart): arm a fresh card scoped at the newest
+        // Wake, so the lost card's content is never replayed.
+        let Some(anchor) = continuation.fresh_anchor() else {
+            return;
+        };
+        let subtitle = self.session_subtitle(handles, sid, directory).await;
+        let variant = handles
+            .sessions
+            .store
+            .lock()
+            .await
+            .entry_for_session(sid)
+            .and_then(|e| e.variant.clone());
+        let Some(card) = Turn::arm_wake_continuation(
+            &handles.cards,
+            sid,
+            &anchor,
+            reply_target.as_deref(),
+            &subtitle,
+            directory,
+            variant,
+        )
+        .await
+        else {
+            return;
+        };
+        let sent = match &reply_target {
+            Some(target) => handles.platform.reply_card(target, &card).await,
+            None => {
+                handles
+                    .platform
+                    .send_card("chat_id", &thread_key.chat_id, &card)
+                    .await
+            }
+        };
+        match sent {
+            Ok(card_id) => {
+                Turn::set_card_message_id(&handles.cards, sid, &card_id).await;
+                let Some(chain) = Turn::chain_id(&handles.cards, sid).await else {
+                    return;
+                };
+                tracing::info!("wake continuation: session {} continues after a restart", sid);
+                self.spawn_wake_render(handles, sid, thread_key, anchor, directory, chain);
+            }
+            Err(e) => {
+                tracing::warn!("wake continuation send: {}", e);
+                Turn::drop_armed_card(&handles.cards, sid, &anchor).await;
+            }
+        }
+    }
+
+    /// Spawn the Wake continuation's render loop with this flow's injectable
+    /// cadences: the render poll, the per-read bound, and the lost-contact
+    /// grace (the external render timeout's second reading).
+    fn spawn_wake_render(
+        &self,
+        handles: &FlowHandles,
+        sid: &str,
+        thread_key: &crate::config::ThreadKey,
+        anchor: TurnAnchor,
+        directory: &str,
+        chain: u64,
+    ) {
+        let handles = handles.clone();
+        let sid = sid.to_string();
+        let directory = directory.to_string();
+        let poll_ms = self.render_poll_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let read_timeout_ms = self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let grace_ms = self.render_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
+        // A spawn inherits no span: instrument the loop with this Session's
+        // `external` span (ADR-0048), rooted like the other render loops'.
+        let span = crate::bridge::span::external(sid.as_str(), Some(thread_key));
+        tokio::spawn(
+            async move {
+                wake_render_loop(
+                    handles,
+                    sid,
+                    anchor,
+                    directory,
+                    chain,
+                    poll_ms,
+                    read_timeout_ms,
+                    grace_ms,
+                )
+                .await;
+            }
+            .instrument(span),
+        );
+    }
 }
 
 /// The full anchor of the session's armed renderer, if one is armed: the
@@ -631,6 +826,216 @@ async fn external_render_loop(
                 );
             }
             break;
+        }
+    }
+}
+
+/// The Wake continuation's render loop (ADR-0059): streams a resumed Turn's
+/// work into a continuation card and ends through the single settle decision.
+///
+/// Owned by Session Sync and out of turn — the Turn's drain released its guard
+/// and the chain's previous card was finalized — so this loop is the only
+/// renderer of the new card, exactly like the external reply renderer. It holds
+/// no accumulator knowledge beyond the card's chain identity and the settle
+/// anchor, so a restart's fresh arm (a Wake whose previous card was lost)
+/// renders into a healthy card with no dependence on the old one.
+///
+/// It exits when:
+/// - the chain identity changed: a new Turn, an external arming, or another
+///   Wake continuation owns the session now — never double-render;
+/// - `/stop` marked the session: the deliberate stop's terminal (⏹ 已停止),
+///   never Done or Error (#394), after one last reconcile render;
+/// - the settle decision decides the ending: idle with no live Background Task
+///   → ✅, the Turn's settled failure → ❌ (no Retry — a continuation carries
+///   no question to re-ask), or live Background Tasks → the waiting yield;
+/// - no full read pair answered for the grace: a wedged Backend must not leave
+///   an eternal spinner (#386), and a readable card carrying a `⏳` panel that
+///   never settles ends Error the same way.
+///
+/// No Completion Notice is sent here: the continuation card is itself the
+/// notification (a new message), and the notice belongs to the Turn's prompt.
+#[allow(clippy::too_many_arguments)] // the loop's whole timing fixture
+async fn wake_render_loop(
+    handles: FlowHandles,
+    session_id: String,
+    anchor: TurnAnchor,
+    directory: String,
+    chain: u64,
+    poll_ms: u64,
+    read_timeout_ms: u64,
+    grace_ms: u64,
+) {
+    let grace = tokio::time::Duration::from_millis(grace_ms);
+    let mut last_contact = tokio::time::Instant::now();
+    let mut stuck_since: Option<tokio::time::Instant> = None;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(poll_ms)).await;
+        // The chain was replaced: a new Turn, an external arming, or another
+        // Wake continuation owns the card now. Never touch it again.
+        if Turn::chain_id(&handles.cards, &session_id).await != Some(chain) {
+            return;
+        }
+        // `/stop` aborted the resumed run: one last render reconciles the
+        // abort's settled tool states, then the stop terminal — a deliberate
+        // stop is not a failure and its abort's error never reaches the card.
+        if handles.waits.is_stopped(&session_id).await {
+            if let Some(Ok(transcript)) = crate::bridge::bounded_call(
+                "wake continuation transcript",
+                read_timeout_ms,
+                handles.backend.transcript(&session_id),
+            )
+            .await
+            {
+                Turn::render_and_flush(
+                    &handles.cards,
+                    &handles.sessions,
+                    &handles.backend,
+                    &handles.requests,
+                    &session_id,
+                    &transcript,
+                )
+                .await;
+            }
+            Turn::finalize_stopped(&handles.cards, &session_id).await;
+            tracing::info!(
+                "wake continuation: session {} stopped; finalized Stopped",
+                session_id
+            );
+            return;
+        }
+        // Both reads must answer for the tick to count as contact: a wedged
+        // transcript freezes the card and a wedged status hides the ending.
+        let mut in_contact = true;
+        let transcript = match crate::bridge::bounded_call(
+            "wake continuation transcript",
+            read_timeout_ms,
+            handles.backend.transcript(&session_id),
+        )
+        .await
+        {
+            Some(Ok(transcript)) => {
+                if Turn::render_and_flush(
+                    &handles.cards,
+                    &handles.sessions,
+                    &handles.backend,
+                    &handles.requests,
+                    &session_id,
+                    &transcript,
+                )
+                .await
+                .is_none()
+                {
+                    return; // the accumulator vanished
+                }
+                Some(transcript)
+            }
+            Some(Err(e)) => {
+                tracing::warn!("wake continuation transcript: {}", e);
+                in_contact = false;
+                None
+            }
+            None => {
+                in_contact = false;
+                None
+            }
+        };
+        let status = match crate::bridge::bounded_call(
+            "wake continuation session status",
+            read_timeout_ms,
+            handles.backend.session_status(&session_id, Some(&directory)),
+        )
+        .await
+        {
+            Some(Ok(status)) => Some(status),
+            Some(Err(e)) => {
+                tracing::warn!("wake continuation session status: {}", e);
+                in_contact = false;
+                None
+            }
+            None => {
+                in_contact = false;
+                None
+            }
+        };
+        if in_contact {
+            last_contact = tokio::time::Instant::now();
+        } else if last_contact.elapsed() >= grace {
+            Turn::finalize_error(
+                &handles.cards,
+                &session_id,
+                crate::bridge::turn::LOST_CONTACT_ERROR,
+            )
+            .await;
+            tracing::info!(
+                "wake continuation: session {} lost contact; finalized Error",
+                session_id
+            );
+            return;
+        }
+        // Still running: keep observing (no total budget — a readable run may
+        // take as long as it takes, ADR-0059).
+        if matches!(
+            status,
+            Some(Some(
+                crate::opencode::types::SessionStatus::Busy | crate::opencode::types::SessionStatus::Retry
+            ))
+        ) {
+            stuck_since = None;
+            continue;
+        }
+        // Unreadable status counts as idle (the drain's own treatment): only
+        // the transcript's durable facts may then decide the ending, so a
+        // Wake's Execution without its boundary keeps observing.
+        let Some(transcript) = &transcript else {
+            stuck_since = None;
+            continue;
+        };
+        match transcript.settle(&anchor) {
+            // The Wake's Execution has not reached its boundary: the ending is
+            // not decided and the Wake's content must not declare it.
+            TurnSettle::Running => stuck_since = None,
+            // The resumed run backgrounded work of its own: the continuation
+            // yields 「⏳ 等待后台任务」 and the next Wake continues the chain.
+            TurnSettle::Waiting => {
+                Turn::finalize_waiting(&handles.cards, &session_id).await;
+                tracing::info!(
+                    "wake continuation: session {} idle with live background tasks; yielded waiting",
+                    session_id
+                );
+                return;
+            }
+            TurnSettle::Failed(error) => {
+                Turn::finalize_error(&handles.cards, &session_id, &error).await;
+                tracing::info!(
+                    "wake continuation: session {} failed; finalized Error",
+                    session_id
+                );
+                return;
+            }
+            TurnSettle::Complete => {
+                // A readable card carrying a `⏳` panel must not be stamped
+                // ✅: keep observing (the grace closes an orphaned one Error).
+                if Turn::has_live_tools(&handles.cards, &session_id).await {
+                    let since = *stuck_since.get_or_insert_with(tokio::time::Instant::now);
+                    if since.elapsed() >= grace {
+                        Turn::finalize_error(
+                            &handles.cards,
+                            &session_id,
+                            crate::bridge::turn::STUCK_PANEL_ERROR,
+                        )
+                        .await;
+                        tracing::info!(
+                            "wake continuation: session {} ended with an unreconcilable panel",
+                            session_id
+                        );
+                        return;
+                    }
+                    continue;
+                }
+                Turn::finalize_done(&handles.cards, &session_id).await;
+                tracing::info!("wake continuation: session {} idle; finalized Done", session_id);
+                return;
+            }
         }
     }
 }

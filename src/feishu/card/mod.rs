@@ -51,6 +51,16 @@ impl CardState {
         matches!(self, Self::Done | Self::Error | Self::Retried | Self::Stopped)
     }
 
+    /// Whether a live renderer still owns the card's chain: the card is
+    /// neither ended nor yielded to its Background Tasks. `Waiting` is NOT
+    /// live in this sense — the Turn that owned it yielded and the next Wake
+    /// continues the chain on a new card (ADR-0059) — and neither is a
+    /// terminal card. Session Sync's Wake step reads this to decide whether
+    /// the chain can be handed over without double-rendering.
+    pub(crate) fn is_live(&self) -> bool {
+        !self.is_terminal() && !matches!(self, Self::Waiting)
+    }
+
     /// Whether this state's own header beats the awaiting-permission/question
     /// override (ADR-0014). A card paused on the operator keeps the override;
     /// every state that is no longer waiting for anyone must show itself
