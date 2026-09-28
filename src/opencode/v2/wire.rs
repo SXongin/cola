@@ -569,8 +569,11 @@ impl MessagesPage {
 /// The read's interaction facts decode alongside the messages: a durable
 /// `idle` marker becomes an [`Execution`], a `synthetic` message becomes a
 /// [`Wake`], and the assistant tool parts that backgrounded a run become the
-/// [`BackgroundTask`]s no Wake has retired yet. All three are V2-only shapes;
-/// the neutral fields stay empty on a generation that records none.
+/// [`BackgroundTask`]s no Wake has retired yet. All three follow the read's own
+/// order — the strategy requests `order=asc` and the decoder never re-sorts —
+/// so the transcript's messages and facts stay consistent. All three are
+/// V2-only shapes; the neutral fields stay empty on a generation that records
+/// none.
 pub(super) fn decode_messages(data: &[Value]) -> SessionTranscript {
     let executions: Vec<Execution> = data.iter().filter_map(decode_execution).collect();
     let wakes: Vec<Wake> = data.iter().filter_map(decode_wake).collect();
@@ -610,8 +613,9 @@ fn decode_execution_outcome(outcome: Option<&str>) -> ExecutionOutcome {
 /// Decode one `synthetic` message into a Wake. Its metadata carries the source
 /// marker and the correlation keys (`shellID`/`jobID`/`childID`/`state`); a
 /// continuation written without metadata is still a Wake, it just names no
-/// source and retires nothing. A Wake without a server time cannot be placed
-/// or ordered and is ignored.
+/// source and retires nothing. A Wake without a server time is still decoded —
+/// its keys retire their task, as durable evidence — it just cannot be ordered
+/// (`created_ms` stays `None`).
 fn decode_wake(message: &Value) -> Option<Wake> {
     if message.get("type").and_then(Value::as_str) != Some("synthetic") {
         return None;
@@ -619,7 +623,7 @@ fn decode_wake(message: &Value) -> Option<Wake> {
     let metadata = non_null(message.get("metadata"));
     Some(Wake {
         id: message_id(message),
-        created_ms: message.pointer("/time/created").and_then(Value::as_i64)?,
+        created_ms: message.pointer("/time/created").and_then(Value::as_i64),
         source: decode_wake_source(metadata),
         shell_id: string_field(metadata, "shellID"),
         job_id: string_field(metadata, "jobID"),
@@ -1791,7 +1795,10 @@ mod tests {
     /// A backgrounded run is retired by its Wake under every correlation key
     /// the backend writes — the shell id, the job id, or the tool part's own id
     /// (the official app's predicate) — while a Wake that names nothing of the
-    /// sort retires nothing.
+    /// sort retires nothing. A real 2.0.18 shell Wake carries `jobID ==
+    /// shellID` (the shell job is keyed by its shell id), so the
+    /// distinct-`jobID` pair pins the key/part-id branches the app's
+    /// `completed.has(part.id)` arm defines.
     #[test]
     fn a_background_task_is_retired_by_shell_id_job_id_or_part_id() {
         let part = background_shell_part("call_bg", "sh_bg");
@@ -1835,11 +1842,66 @@ mod tests {
             500,
             serde_json::json!({"source": "shell", "shellID": "sh_bg", "state": "completed"}),
         );
-        let transcript = read_with(part, vec![predating]);
+        let transcript = read_with(part.clone(), vec![predating]);
         assert_eq!(
             transcript.background_tasks.len(),
             1,
             "a Wake predating the task retires nothing: {:#?}",
+            transcript.background_tasks
+        );
+
+        // The job id can name the tool call on its own (the app's
+        // `completed.has(part.id)` arm): a Wake whose `jobID` differs from its
+        // `shellID` and matches the part still retires.
+        let distinct_job = synthetic_wake(
+            "msg_w",
+            2000,
+            serde_json::json!({"source": "shell", "shellID": "sh_other", "jobID": "call_bg", "state": "completed"}),
+        );
+        let transcript = read_with(part.clone(), vec![distinct_job]);
+        assert!(
+            transcript.background_tasks.is_empty(),
+            "a distinct job id naming the tool part retires: {:#?}",
+            transcript.background_tasks
+        );
+
+        // ...while one that names nothing retires nothing.
+        let nameless_job = synthetic_wake(
+            "msg_w",
+            2000,
+            serde_json::json!({"source": "shell", "shellID": "sh_other", "jobID": "job_other", "state": "completed"}),
+        );
+        let transcript = read_with(part, vec![nameless_job]);
+        assert_eq!(
+            transcript
+                .background_tasks
+                .iter()
+                .map(|task| task.tool.call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["call_bg"],
+            "a job id that names nothing retires nothing"
+        );
+    }
+
+    /// A `synthetic` whose payload lost its time is still a Wake: its keys
+    /// retire their task (the record of completion is durable evidence), it
+    /// just cannot be ordered.
+    #[test]
+    fn a_wake_without_a_time_still_retires_its_task() {
+        let part = background_shell_part("call_bg", "sh_bg");
+        let untimed = serde_json::json!({
+            "id": "msg_w",
+            "type": "synthetic",
+            "text": "wake",
+            "metadata": {"source": "shell", "shellID": "sh_bg", "state": "completed"},
+        });
+        let transcript = read_with(part, vec![untimed]);
+
+        assert_eq!(transcript.wakes.len(), 1, "{:#?}", transcript.wakes);
+        assert_eq!(transcript.wakes[0].created_ms, None);
+        assert!(
+            transcript.background_tasks.is_empty(),
+            "an untimed Wake still retires its task: {:#?}",
             transcript.background_tasks
         );
     }
@@ -2012,6 +2074,53 @@ mod tests {
         assert_eq!(
             boundary.ended_ms, None,
             "a boundary with no recorded time is still a boundary, just unplaceable"
+        );
+    }
+
+    /// The fact vectors keep the read's order: the decoder never re-sorts, so
+    /// `messages`, `executions` and `wakes` all follow the backend response
+    /// (V2 requests `order=asc`, so production reads arrive oldest first).
+    /// Deliberately out-of-time rows prove the order is the response's, not a
+    /// re-sort by time.
+    #[test]
+    fn interaction_facts_keep_the_backend_read_order() {
+        let idle = |id: &str, created_ms: i64| {
+            serde_json::json!({
+                "id": id, "type": "idle", "outcome": "succeeded", "time": {"created": created_ms}
+            })
+        };
+        let transcript = decode_messages(&[
+            synthetic_wake("msg_w_late", 9000, serde_json::json!({"source": "shell"})),
+            idle("msg_i_late", 8000),
+            synthetic_wake("msg_w_early", 1000, serde_json::json!({"source": "shell"})),
+            idle("msg_i_early", 2000),
+        ]);
+
+        assert_eq!(
+            transcript
+                .messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["msg_w_late", "msg_i_late", "msg_w_early", "msg_i_early"]
+        );
+        assert_eq!(
+            transcript
+                .wakes
+                .iter()
+                .map(|wake| wake.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["msg_w_late", "msg_w_early"],
+            "wakes follow the read, not their times"
+        );
+        assert_eq!(
+            transcript
+                .executions
+                .iter()
+                .map(|execution| execution.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["msg_i_late", "msg_i_early"],
+            "executions follow the read, not their times"
         );
     }
 
