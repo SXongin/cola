@@ -108,11 +108,24 @@ impl LiveServer {
     /// in-memory run state does not. This is what a shared server's crash,
     /// upgrade or restart looks like from a client: a run that was in flight
     /// is orphaned mid-message instead of being finalized.
+    ///
+    /// The stderr buffer is deliberately shared with the replacement, so a
+    /// failure spanning the restart shows both processes' output.
     pub async fn restart(&mut self) {
         let _ = self.child.start_kill();
-        // Reap before the replacement opens the same store: SIGKILL lands
-        // immediately, and the bound only guards a pathological child.
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await;
+        // Never open the same store twice: the replacement must only start
+        // once the old process is reaped. SIGKILL lands immediately, so a
+        // timeout means something is fundamentally wrong — fail loudly.
+        if tokio::time::timeout(Duration::from_secs(5), self.child.wait())
+            .await
+            .is_err()
+        {
+            panic!(
+                "the live server did not exit within 5s of SIGKILL; refusing to start a \
+                 second server against the same store\n{}",
+                self.stderr()
+            );
+        }
         let (child, base_url) =
             spawn_serve(self._root.path(), self.generation, &self.binary, &self.stderr).await;
         self.child = child;
@@ -275,7 +288,11 @@ impl Drop for LiveServer {
     fn drop(&mut self) {
         // `kill_on_drop` guards the process, but the temp tree drops right
         // after this — so reap the child (bounded) before the tree goes away,
-        // or a still-writing server could race the cleanup.
+        // or a still-writing server could race the cleanup. Unlike
+        // [`Self::restart`], no replacement is spawned here, so a child that
+        // somehow outlived the bound cannot open a second writer against the
+        // store; the bound stays a cleanup grace and is deliberately not fatal
+        // in a destructor.
         let _ = self.child.start_kill();
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
