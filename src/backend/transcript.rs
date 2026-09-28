@@ -23,12 +23,15 @@ use serde_json::Value;
 #[derive(Debug, Clone, Default)]
 pub struct SessionTranscript {
     pub messages: Vec<TranscriptMessage>,
-    /// The Execution boundaries the backend recorded, oldest first. Empty on a
-    /// generation that records none (V1) and when no boundary is present — a
-    /// shutdown writes none, and absence is tolerated, never invented.
+    /// The Execution boundaries the backend recorded, in the read's order
+    /// (V2 reads `order=asc`, so oldest first; the decoder never re-sorts).
+    /// Empty on a generation that records none (V1) and when no boundary is
+    /// present — a shutdown writes none, and absence is tolerated, never
+    /// invented.
     pub executions: Vec<Execution>,
-    /// The Wakes the backend recorded, oldest first. Empty on a generation
-    /// without them (V1).
+    /// The Wakes the backend recorded, in the read's order (V2 reads
+    /// `order=asc`, so oldest first; the decoder never re-sorts). Empty on a
+    /// generation without them (V1).
     pub wakes: Vec<Wake>,
     /// The Background Tasks still live at the end of the read: derived from the
     /// assistant tool parts that started them, with every matching Wake
@@ -401,8 +404,10 @@ pub enum ExecutionOutcome {
 pub struct Wake {
     /// The message's identity.
     pub id: MessageId,
-    /// The message's server time.
-    pub created_ms: i64,
+    /// The message's server time. `None` when the payload carried no usable
+    /// time: the Wake is still durable evidence that its task finished — it
+    /// just cannot be ordered.
+    pub created_ms: Option<i64>,
     /// What woke the Session.
     pub source: WakeSource,
     /// The shell a shell Wake completed, when it named one.
@@ -421,9 +426,14 @@ impl Wake {
     /// correlation: a shell Wake names the task's shell id or the tool call
     /// that started it, and a subagent Wake names the task's child session. A
     /// Wake that names nothing retires nothing, and a Wake written before the
-    /// task started cannot have completed it.
+    /// task started cannot have completed it — but only when both times are
+    /// known: an untimed record is durable evidence, never a reason to keep a
+    /// phantom task live.
     pub fn retires(&self, task: &BackgroundTask) -> bool {
-        if task.started_at.is_some_and(|started| self.created_ms < started) {
+        if matches!(
+            (self.created_ms, task.started_at),
+            (Some(created), Some(started)) if created < started
+        ) {
             return false;
         }
         let names_shell_or_call = |id: &str| task.shell_id.as_deref() == Some(id) || task.tool.call_id == id;
