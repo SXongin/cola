@@ -50,6 +50,17 @@ impl CardState {
     pub(crate) fn is_terminal(&self) -> bool {
         matches!(self, Self::Done | Self::Error | Self::Retried | Self::Stopped)
     }
+
+    /// Whether this state's own header beats the awaiting-permission/question
+    /// override (ADR-0014). A card paused on the operator keeps the override;
+    /// every state that is no longer waiting for anyone must show itself
+    /// instead — a terminal card (its wait is over: #386's fallback Error,
+    /// #394's Stopped) and a Waiting card, which yields for its Background
+    /// Tasks rather than for the operator (ADR-0059). One definition, so a new
+    /// state cannot leave the header probe reading the set differently.
+    pub(crate) fn overrides_awaiting(&self) -> bool {
+        self.is_terminal() || matches!(self, Self::Waiting)
+    }
 }
 
 /// How much text ONE card carries before it is finalized and the rest continues
@@ -266,6 +277,34 @@ pub(crate) fn truncate_md(text: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one set of states whose header must beat the awaiting override
+    /// (ADR-0014/#386, ADR-0059): a terminal card's wait is over and a Waiting
+    /// card yields for its Background Tasks. Pinned here so a new state cannot
+    /// quietly change the header probe.
+    #[test]
+    fn only_ended_states_override_the_awaiting_title() {
+        for state in [
+            CardState::Loading,
+            CardState::Reasoning,
+            CardState::Streaming,
+            CardState::Continued,
+        ] {
+            assert!(
+                !state.overrides_awaiting(),
+                "a live card still waits for the operator: {state:?}"
+            );
+        }
+        for state in [
+            CardState::Done,
+            CardState::Error,
+            CardState::Retried,
+            CardState::Stopped,
+            CardState::Waiting,
+        ] {
+            assert!(state.overrides_awaiting(), "{state:?} has its own ending to show");
+        }
+    }
 
     /// The liveness line's wait label (ADR-0054) must always be the header
     /// title minus its icon — one vocabulary, two render sites.

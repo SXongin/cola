@@ -321,19 +321,19 @@ impl CardBuilder {
 /// streaming header.
 /// Active states append the progress signals passed in from the accumulator;
 /// `progress.awaiting` (a pending permission and/or question) overrides the
-/// phase label entirely, naming whichever kind is pending. The override is for
-/// ACTIVE states only: a terminal card (Done/Error/Retried/Stopped) is no
-/// longer waiting for anyone, and a Waiting card yields for its Background
-/// Tasks, not for the operator (ADR-0059), so each shows its own state —
-/// otherwise a fallback Error under a still-pending block would read as
-/// "waiting for your authorization" forever (#386).
+/// phase label entirely, naming whichever kind is pending — for states that are
+/// still waiting on the operator. A state whose
+/// [`overrides_awaiting`](CardState::overrides_awaiting) is true shows its own
+/// header instead: a fallback Error (or Done/Stopped) under a still-pending
+/// block must not read as "waiting for your authorization" forever (#386), and
+/// a Waiting card yields for its Background Tasks, not for the operator
+/// (ADR-0059).
 pub(crate) fn header_title_and_template(
     state: &CardState,
     running_tool: Option<&ToolPanel>,
     progress: &HeaderProgress,
 ) -> (String, &'static str) {
-    if !state.is_terminal()
-        && !matches!(state, CardState::Waiting)
+    if !state.overrides_awaiting()
         && let Some(title) = progress.awaiting.title()
     {
         return (title.to_string(), "orange");

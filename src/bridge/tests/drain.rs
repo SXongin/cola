@@ -11,9 +11,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::backend::{
-    BackgroundTask, ContentBlock, Execution, ExecutionOutcome, FinishReason, MessageId, MessageRole, Part,
-    SessionTranscript, StepFinish, TextPart, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, Wake,
-    WakeSource,
+    ContentBlock, FinishReason, MessageRole, Part, SessionTranscript, StepFinish, TextPart, ToolOutput,
+    ToolStatus, TranscriptMessage,
 };
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{PromptContext, Turn};
@@ -65,42 +64,6 @@ fn tool_assistant(created: i64, status: ToolStatus, output: &str) -> TranscriptM
             }),
         ],
     )
-}
-
-/// One Execution boundary at `ended_ms` — the durable `idle` marker of a busy
-/// period (ADR-0059).
-fn execution(ended_ms: i64) -> Execution {
-    Execution {
-        id: MessageId::new(format!("msg_idle_{ended_ms}")),
-        ended_ms: Some(ended_ms),
-        outcome: ExecutionOutcome::Succeeded,
-    }
-}
-
-/// The live Background Task a backgrounded shell started at `started_at`.
-fn background_shell(started_at: i64) -> BackgroundTask {
-    BackgroundTask {
-        tool: ToolIdentity {
-            name: "shell".into(),
-            call_id: "call_bg".into(),
-        },
-        shell_id: Some("sh_bg".into()),
-        child_id: None,
-        started_at: Some(started_at),
-    }
-}
-
-/// The shell completion Wake that retires [`background_shell`].
-fn shell_wake(created_ms: i64) -> Wake {
-    Wake {
-        id: MessageId::new(format!("msg_wake_{created_ms}")),
-        created_ms: Some(created_ms),
-        source: WakeSource::Shell,
-        shell_id: Some("sh_bg".into()),
-        job_id: Some("sh_bg".into()),
-        child_id: None,
-        state: Some("completed".into()),
-    }
 }
 
 /// The turn under test: the anchor id is fixed so the scripted Backend timeline can name

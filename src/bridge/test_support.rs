@@ -8,9 +8,9 @@ pub(crate) use crate::feishu;
 pub(crate) use crate::opencode;
 
 use crate::backend::{
-    ContentBlock, FinishReason, MessageId, MessageRole, MessageTime, Part, ReasoningPart, SessionTranscript,
-    StepFinish, StepStart, TextPart, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
-    TurnAnchor,
+    BackgroundTask, ContentBlock, Execution, ExecutionOutcome, FinishReason, MessageId, MessageRole,
+    MessageTime, Part, ReasoningPart, SessionTranscript, StepFinish, StepStart, TextPart, ToolCall,
+    ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, TurnAnchor, Wake, WakeSource,
 };
 
 /// One typed transcript message for view-shaped fixtures (spec #332): identity,
@@ -79,6 +79,44 @@ pub(crate) fn turn_anchor(created_ms: i64) -> TurnAnchor {
     TurnAnchor {
         message_id: MessageId::new(format!("msg_anchor_{created_ms}")),
         created_ms,
+    }
+}
+
+/// One fixture Execution boundary at `ended_ms` — the durable `idle` marker of
+/// a busy period (ADR-0059). Shared by every test that scripts a V2 read, so
+/// the background-task/wake fixtures below cannot drift from it.
+pub(crate) fn execution(ended_ms: i64) -> Execution {
+    Execution {
+        id: MessageId::new(format!("msg_idle_{ended_ms}")),
+        ended_ms: Some(ended_ms),
+        outcome: ExecutionOutcome::Succeeded,
+    }
+}
+
+/// The live Background Task a backgrounded shell started at `started_at` —
+/// the fixture [`shell_wake`] retires.
+pub(crate) fn background_shell(started_at: i64) -> BackgroundTask {
+    BackgroundTask {
+        tool: ToolIdentity {
+            name: "shell".into(),
+            call_id: "call_bg".into(),
+        },
+        shell_id: Some("sh_bg".into()),
+        child_id: None,
+        started_at: Some(started_at),
+    }
+}
+
+/// The shell completion Wake that retires [`background_shell`].
+pub(crate) fn shell_wake(created_ms: i64) -> Wake {
+    Wake {
+        id: MessageId::new(format!("msg_wake_{created_ms}")),
+        created_ms: Some(created_ms),
+        source: WakeSource::Shell,
+        shell_id: Some("sh_bg".into()),
+        job_id: Some("sh_bg".into()),
+        child_id: None,
+        state: Some("completed".into()),
     }
 }
 
