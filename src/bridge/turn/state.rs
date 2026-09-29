@@ -7,9 +7,9 @@
 //! Turn module, and every read or write goes through a `Turn::` method. The
 //! accumulator's own tests are the module's internal seam.
 
-use crate::backend::TurnAnchor;
+use crate::backend::{Part, SessionTranscript, TurnAnchor};
 use crate::bridge::handles::CardsHandle;
-use crate::feishu::card::ledger::{TaskCompletionEntry, TaskLedgerRow};
+use crate::feishu::card::ledger::{TaskCompletionEntry, TaskKind, TaskLedgerRow};
 use crate::feishu::card::shell::CardBuilder;
 use crate::feishu::card::tool_render::{TASK_TOOL, TaskLiveness, ToolPanel};
 use crate::feishu::card::{AwaitingAction, CardState};
@@ -1344,6 +1344,15 @@ impl StreamAccumulator {
     }
 
     /// Replace the live Background Task ledger from a transcript read
+    /// (ADR-0060) — the ONE site a read's rows and clock enter the accumulator,
+    /// shared by the live render and Session Sync's Wake handover / yielded
+    /// refresh, so those paths cannot drift. Returns whether the card owes a
+    /// flush: a membership change, or a row's elapsed crossing a whole minute.
+    pub(super) fn set_ledger_from_read(&mut self, transcript: &SessionTranscript, now_ms: i64) -> bool {
+        self.set_ledger(ledger_rows(transcript), now_ms)
+    }
+
+    /// Replace the live Background Task ledger from an already-derived read
     /// (ADR-0060), stamped with the read's clock. The read is the authority: a
     /// task it no longer lists has retired and leaves the section, a new one
     /// joins in transcript order. Returns whether the card owes a flush: a
@@ -1351,7 +1360,7 @@ impl StreamAccumulator {
     /// section last rendered. The clock is minute-granular on purpose — the
     /// seconds inside a minute never owe one, so a yielded card is not PATCHed
     /// on every read, while the read that crosses a minute is.
-    pub(super) fn set_ledger(&mut self, rows: Vec<TaskLedgerRow>, now_ms: i64) -> bool {
+    fn set_ledger(&mut self, rows: Vec<TaskLedgerRow>, now_ms: i64) -> bool {
         let clock = crate::feishu::card::ledger::task_ledger_clock(&rows, now_ms);
         if self.ledger == rows && self.ledger_clock == clock {
             return false;
@@ -1412,6 +1421,24 @@ impl StreamAccumulator {
     pub(super) fn build_card_with_split(&mut self) -> (serde_json::Value, bool) {
         let built = self.build_card_with_info();
         (built.card, built.full)
+    }
+
+    /// Build the whole live slice for a card that must NOT split — the yielded
+    /// ledger refresh (ADR-0060, ticket #419): the remaining timeline PLUS the
+    /// tail, rendered as the tracked card, with `render_from` untouched so the
+    /// next flush still renders from the same place and no continuation is
+    /// ever owed. Used only where a ledger-only change must not post a new
+    /// card; the delta such a change adds (one entry, one row less, a minute's
+    /// elapsed) sits inside the splitter's own reserve margin, so the card
+    /// stays under Feishu's hard cap even when its estimate crosses the split
+    /// budget.
+    pub(super) fn build_card_unsplit(&self) -> BuiltCard {
+        let (card, spans) = self.build_card_inner(self.render_from, self.timeline.len(), true, None);
+        BuiltCard {
+            card,
+            full: false,
+            spans,
+        }
     }
 
     /// Build the card's LIVE slice (`render_from` to the end) as a finalized
@@ -1865,6 +1892,81 @@ pub(super) async fn refresh_context_window(
         acc.context_window_key = Some(key);
         acc.context_window = window;
     }
+}
+
+/// The live Background Task ledger a transcript read owes the card
+/// (ADR-0060): one row per live task, in the read's own (transcript) order,
+/// each labelled from the input of the tool part that started it — joined by
+/// the task's `call_id` over the WHOLE read, because a task can outlive the
+/// Turn that started it. The read is the authority: a task a Wake retired is
+/// no longer in `background_tasks`, so its row leaves the section. The one
+/// derivation [`StreamAccumulator::set_ledger_from_read`] feeds, so the live
+/// render and Session Sync's ledger paths cannot disagree.
+fn ledger_rows(transcript: &SessionTranscript) -> Vec<TaskLedgerRow> {
+    // The common case (V1, or a session with no live task) does no scan: an
+    // empty read clears an empty ledger, so nothing can owe a flush.
+    if transcript.background_tasks.is_empty() {
+        return Vec::new();
+    }
+    let inputs: std::collections::HashMap<&str, &serde_json::Value> = transcript
+        .messages
+        .iter()
+        .flat_map(|message| &message.parts)
+        .filter_map(|part| match part {
+            Part::Tool(call) => call
+                .input
+                .as_ref()
+                .map(|input| (call.identity.call_id.as_str(), input)),
+            _ => None,
+        })
+        .collect();
+    transcript
+        .background_tasks
+        .iter()
+        .map(|task| {
+            // The kind is derived ONCE per task: the row's type noun and the
+            // label arm below read the same value, so the two cannot disagree.
+            let kind = task_kind(&task.tool.name);
+            TaskLedgerRow {
+                kind,
+                label: task_label(kind, inputs.get(task.tool.call_id.as_str()).copied()),
+                started_at: task.started_at,
+            }
+        })
+        .collect()
+}
+
+/// The ledger kind of a Background Task's tool. Only `shell` and `subagent`
+/// ever background through the V2 tool shape (`decode_background_task` returns
+/// `None` for every other name), so the pair is matched once, here.
+fn task_kind(tool: &str) -> TaskKind {
+    match tool {
+        "subagent" => TaskKind::Subagent,
+        _ => TaskKind::Shell,
+    }
+}
+
+/// The label the originating tool part's input names for a task of `kind`:
+/// the shell's `command` (or its `description` when the payload carries no
+/// command), the subagent's `description` — the `subagent` arm nothing else
+/// needed. `None` when the input names no label, so the row renders bare
+/// rather than inventing one (the completion entry's own rule).
+fn task_label(kind: TaskKind, input: Option<&serde_json::Value>) -> Option<String> {
+    let label = match kind {
+        TaskKind::Shell => input
+            .and_then(|input| input.get("command"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                input
+                    .and_then(|input| input.get("description"))
+                    .and_then(serde_json::Value::as_str)
+            }),
+        TaskKind::Subagent => input
+            .and_then(|input| input.get("description"))
+            .and_then(serde_json::Value::as_str),
+    }?;
+    let label = label.trim();
+    (!label.is_empty()).then(|| label.to_string())
 }
 
 #[cfg(test)]
@@ -2325,6 +2427,53 @@ mod tests {
             rest_text.contains("很长的回答。"),
             "tail text must appear on the continuation: {}",
             rest_text
+        );
+    }
+
+    /// The yielded-refresh guard (ADR-0060, ticket #419): `build_card_unsplit`
+    /// renders the whole live slice — tail included — on the tracked card and
+    /// leaves `render_from` untouched, so a ledger-only change can never
+    /// finalize the card and owe a continuation, even when the estimate
+    /// crosses the split budget.
+    #[test]
+    fn build_card_unsplit_keeps_the_whole_slice_on_one_card() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Waiting;
+        acc.set_ledger(
+            vec![TaskLedgerRow {
+                kind: TaskKind::Shell,
+                label: Some("npm run build".into()),
+                started_at: None,
+            }],
+            0,
+        );
+        acc.push_text(&"很长的回答。".repeat(2000)); // over one card's budget
+
+        // The normal build finalizes this slice and advances the boundary.
+        let (finalized, full) = acc.build_card_with_split();
+        assert!(full, "the oversized slice must split");
+        let boundary = acc.render_from;
+        assert!(boundary > 0, "the split advances the boundary");
+        assert!(
+            finalized.to_string().contains("部分完成，继续中"),
+            "the split card finalizes: {finalized}"
+        );
+
+        // The unsplit build keeps the remainder AND the tail on the tracked
+        // card, with the boundary untouched: nothing is owed a continuation.
+        let unsplit = acc.build_card_unsplit();
+        assert!(!unsplit.full, "an unsplit build never finalizes");
+        assert_eq!(acc.render_from, boundary, "the boundary is untouched");
+        let text = unsplit.card.to_string();
+        assert!(
+            !text.contains("部分完成，继续中"),
+            "the card keeps its own header: {}",
+            unsplit.card
+        );
+        assert!(
+            text.contains("⏳ 后台任务（1）") && text.contains("npm run build"),
+            "the ledger tail rides the unsplit card: {}",
+            unsplit.card
         );
     }
 

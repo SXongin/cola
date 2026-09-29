@@ -52,6 +52,26 @@ enum FallbackAdvance {
     Stop,
 }
 
+/// Whether a flush may finalize the tracked card and continue on a new one.
+#[derive(Clone, Copy)]
+pub(super) enum SplitPolicy {
+    /// The standard flush: a slice that outgrows its card finalizes and hands
+    /// off to a continuation.
+    Allow,
+    /// A yielded card's ledger-only refresh (ADR-0060): the freeze's carve-out
+    /// must never post a new card for a ledger update. The whole live slice —
+    /// tail included — is re-rendered on the same card instead, with
+    /// `render_from` untouched, so the chain keeps its card and the next flush
+    /// resumes from the same place. The caller passes this only for a card
+    /// that is still live with no split queued
+    /// ([`Turn::refresh_yielded_ledger`](super::Turn::refresh_yielded_ledger)),
+    /// so the unsplit build always takes the plain-update path. The ledger
+    /// delta sits inside the splitter's own reserve margin, so the card stays
+    /// under Feishu's hard cap even when its estimate crosses the split
+    /// budget.
+    Forbid,
+}
+
 /// Advance the turn's [`CardFallback`] after Feishu rejected a card it built.
 async fn advance_card_fallback(cards: &CardsHandle, session_id: &str) -> FallbackAdvance {
     use crate::bridge::turn::state::CardFallback;
@@ -76,7 +96,9 @@ async fn advance_card_fallback(cards: &CardsHandle, session_id: &str) -> Fallbac
 /// [`Turn::split_card_chain`](super::Turn::split_card_chain),
 /// [`Turn::split_chain_for_wake`](super::Turn::split_chain_for_wake) or
 /// [`Turn::refresh_yielded_ledger`](super::Turn::refresh_yielded_ledger).
-pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str) {
+/// `split_policy` decides whether an over-budget slice may finalize the card
+/// and continue on a new one ([`SplitPolicy`]).
+pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str, split_policy: SplitPolicy) {
     // The card-chain state a flush resumes from: a pending Supplement split
     // (ADR-0043) and whether the tracked card is still the live (growing) one.
     // Both survive the flush — a chain that exhausted the size bound, or died
@@ -137,7 +159,12 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str) {
             // failed continuation send must restore it, or the slice it built
             // reaches no card and the retry silently starts after it.
             let slice_from = card.acc.render_from;
-            let built = card.acc.build_card_with_info();
+            let built = match split_policy {
+                SplitPolicy::Allow => card.acc.build_card_with_info(),
+                // A ledger-only refresh never finalizes: the whole live slice
+                // renders on the tracked card, `render_from` unmoved.
+                SplitPolicy::Forbid => card.acc.build_card_unsplit(),
+            };
             let slice_to = card.acc.render_from;
             let rendered = built
                 .spans

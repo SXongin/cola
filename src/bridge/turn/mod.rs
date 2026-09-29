@@ -1298,7 +1298,7 @@ impl Turn {
     pub(crate) async fn flush_card(cards: &CardsHandle, session_id: &str) {
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
-        flush::flush_card_locked(cards, session_id).await;
+        flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow).await;
     }
 
     /// Split `session_id`'s Card Chain at a user message (ADR-0043): append the
@@ -1338,7 +1338,7 @@ impl Turn {
                 handover: false,
             });
         }
-        flush::flush_card_locked(cards, session_id).await;
+        flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow).await;
     }
 
     /// Hand an ENDED card chain over to a Wake continuation (ADR-0059): write
@@ -1400,7 +1400,7 @@ impl Turn {
                 handover,
             });
         }
-        flush::flush_card_locked(cards, session_id).await;
+        flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow).await;
         true
     }
 
@@ -1417,7 +1417,15 @@ impl Turn {
     /// Only the yielded `Waiting` card is refreshed: a live card is
     /// render-owned (its own loop streams into it, and Session Sync's Wake step
     /// above refused to touch it), and a terminal card keeps the ending it
-    /// recorded. Runs under the session's card-write lock
+    /// recorded. The refresh can NEVER post a card
+    /// ([`SplitPolicy::Forbid`](flush::SplitPolicy::Forbid)): a ledger-only
+    /// change re-renders the whole live slice on the same card — tail included
+    /// — instead of finalizing it and continuing the chain, so the acceptance
+    /// "no new card" holds even for a card whose estimate was near the split
+    /// budget. A card a half-finished handoff left behind (a finalized slice
+    /// whose continuation send failed, or a queued split) is NOT refreshed:
+    /// that handoff owns the chain's next write, and this pass must not post
+    /// the card it owes. Runs under the session's card-write lock
     /// ([`CardsHandle::write_lock`]), like every other card write, so the facts
     /// and the PATCH they owe cannot interleave with a split, a collect or
     /// another flush. `now_ms` is the read's clock, shared with the same pass's
@@ -1439,13 +1447,18 @@ impl Turn {
             if card.acc.card_state != crate::feishu::card::CardState::Waiting {
                 return false;
             }
+            if !card.card_is_live || !card.pending_split.is_empty() {
+                return false;
+            }
             let anchor = card.acc.turn_anchor.clone();
             render::apply_ledger_read(&mut card.acc, transcript, anchor.as_ref(), now_ms)
         };
         if !changed {
             return false;
         }
-        flush::flush_card_locked(cards, session_id).await;
+        // The guard (ADR-0060): a ledger-only refresh must never post a new
+        // card, so this flush may not finalize and continue the chain.
+        flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Forbid).await;
         true
     }
 }

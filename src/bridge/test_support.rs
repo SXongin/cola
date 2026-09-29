@@ -2459,6 +2459,19 @@ pub(crate) async fn wait_for_card_update(
     updates: CardUpdates,
     check: impl Fn(&serde_json::Value) -> bool,
 ) {
+    wait_for_card_update_within(platform, label, std::time::Duration::from_secs(5), updates, check).await;
+}
+
+/// [`wait_for_card_update`] with an explicit bound: a test that must wait out
+/// real wall-clock time (a ledger minute turning over) stretches the default
+/// 5 s without loosening every other caller's bound.
+pub(crate) async fn wait_for_card_update_within(
+    platform: &RecordingPlatform,
+    label: &str,
+    timeout: std::time::Duration,
+    updates: CardUpdates,
+    check: impl Fn(&serde_json::Value) -> bool,
+) {
     let wait = async {
         loop {
             let cards = platform.updated_cards().await;
@@ -2472,7 +2485,7 @@ pub(crate) async fn wait_for_card_update(
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     };
-    tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+    tokio::time::timeout(timeout, wait)
         .await
         .unwrap_or_else(|_| panic!("card never reached {label}"));
 }
