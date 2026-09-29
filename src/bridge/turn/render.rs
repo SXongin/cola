@@ -16,7 +16,7 @@ use crate::bridge::handles::{CardsHandle, RequestsHandle, SessionsHandle, TurnHa
 use crate::bridge::span;
 use crate::bridge::turn::state::{RenderedPart, StreamAccumulator};
 use crate::config::ThreadKey;
-use crate::feishu::card::ledger::{TaskCompletionEntry, TaskKind, TaskLedgerRow};
+use crate::feishu::card::ledger::{TaskCompletionEntry, TaskKind};
 use crate::feishu::card::tool_render::{ChildActivity, TaskLiveness};
 
 use super::Turn;
@@ -330,79 +330,6 @@ fn wake_completion_entry(
     })
 }
 
-/// The live Background Task ledger a transcript read owes the card
-/// (ADR-0060): one row per live task, in the read's own (transcript) order,
-/// each labelled from the input of the tool part that started it — joined by
-/// the task's `call_id` over the WHOLE read, because a task can outlive the
-/// Turn that started it. The read is the authority: a task a Wake retired is
-/// no longer in `background_tasks`, so its row leaves the section.
-fn ledger_rows(transcript: &SessionTranscript) -> Vec<TaskLedgerRow> {
-    // The common case (V1, or a session with no live task) does no scan: an
-    // empty read clears an empty ledger, so nothing can owe a flush.
-    if transcript.background_tasks.is_empty() {
-        return Vec::new();
-    }
-    let inputs: std::collections::HashMap<&str, &serde_json::Value> = transcript
-        .messages
-        .iter()
-        .flat_map(|message| &message.parts)
-        .filter_map(|part| match part {
-            Part::Tool(call) => call
-                .input
-                .as_ref()
-                .map(|input| (call.identity.call_id.as_str(), input)),
-            _ => None,
-        })
-        .collect();
-    transcript
-        .background_tasks
-        .iter()
-        .map(|task| {
-            // The kind is derived ONCE per task: the row's type noun and the
-            // label arm below read the same value, so the two cannot disagree.
-            let kind = task_kind(&task.tool.name);
-            TaskLedgerRow {
-                kind,
-                label: task_label(kind, inputs.get(task.tool.call_id.as_str()).copied()),
-                started_at: task.started_at,
-            }
-        })
-        .collect()
-}
-
-/// The ledger kind of a Background Task's tool. Only `shell` and `subagent`
-/// ever background through the V2 tool shape (`decode_background_task` returns
-/// `None` for every other name), so the pair is matched once, here.
-fn task_kind(tool: &str) -> TaskKind {
-    match tool {
-        "subagent" => TaskKind::Subagent,
-        _ => TaskKind::Shell,
-    }
-}
-
-/// The label the originating tool part's input names for a task of `kind`:
-/// the shell's `command` (or its `description` when the payload carries no
-/// command), the subagent's `description` — the `subagent` arm nothing else
-/// needed. `None` when the input names no label, so the row renders bare
-/// rather than inventing one (the completion entry's own rule).
-fn task_label(kind: TaskKind, input: Option<&serde_json::Value>) -> Option<String> {
-    let label = match kind {
-        TaskKind::Shell => input
-            .and_then(|input| input.get("command"))
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| {
-                input
-                    .and_then(|input| input.get("description"))
-                    .and_then(serde_json::Value::as_str)
-            }),
-        TaskKind::Subagent => input
-            .and_then(|input| input.get("description"))
-            .and_then(serde_json::Value::as_str),
-    }?;
-    let label = label.trim();
-    (!label.is_empty()).then(|| label.to_string())
-}
-
 /// Insert the completion entry for every Wake whose resumed work this render is
 /// about to show, and report whether any was inserted (so an entry reaches the
 /// card even when no part changed). A Wake that opened the card itself was
@@ -445,10 +372,11 @@ fn render_wake_entries(
 /// ones stay, on a continuation's very first payload or on a yielded card's
 /// in-place refresh — and each retiring shell/subagent Wake's completion entry,
 /// keyed where the completion happened, so the entry stays on the card that
-/// hosted the task. Both come from the same derivations the live render uses
-/// ([`ledger_rows`], [`render_wake_entries`]), so no path can drift from it.
-/// `now_ms` is the read's clock, at the minute granularity
-/// [`set_ledger`](StreamAccumulator::set_ledger) compares.
+/// hosted the task. Both enter the accumulator through the same one-site
+/// primitives the live render uses
+/// ([`set_ledger_from_read`](StreamAccumulator::set_ledger_from_read),
+/// [`render_wake_entries`]), so no path can drift from it. `now_ms` is the
+/// read's clock, at the minute granularity that primitive compares.
 ///
 /// A Wake handover calls this on the OUTGOING card before its chain splits;
 /// Session Sync's in-place pass calls it on a yielded card. Returns whether the
@@ -463,7 +391,7 @@ pub(super) fn apply_ledger_read(
     anchor: Option<&TurnAnchor>,
     now_ms: i64,
 ) -> bool {
-    let mut changed = acc.set_ledger(ledger_rows(transcript), now_ms);
+    let mut changed = acc.set_ledger_from_read(transcript, now_ms);
     if let Some(anchor) = anchor {
         changed |= render_wake_entries(acc, transcript, anchor);
     }
@@ -532,7 +460,7 @@ pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &Se
     // part moved, so it counts as rendered content. The decision's clock is
     // this read's own; the card renders the rows from its build clock, the
     // same minute.
-    rendered_any |= acc.set_ledger(ledger_rows(transcript), chrono::Utc::now().timestamp_millis());
+    rendered_any |= acc.set_ledger_from_read(transcript, chrono::Utc::now().timestamp_millis());
     rendered_any
 }
 

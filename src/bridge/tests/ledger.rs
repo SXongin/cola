@@ -1077,8 +1077,9 @@ async fn a_waiting_cards_elapsed_refreshes_on_the_minute() {
 
     // A read whose row's elapsed is seconds short of the whole minute: the
     // start moved, so this membership change PATCHes once, deterministically
-    // before the boundary.
-    let started = chrono::Utc::now().timestamp_millis() - 58_000;
+    // before the boundary. 55 s leaves a full 5 s before the minute turns, so
+    // the pre-boundary assertions below cannot race a loaded runner.
+    let started = chrono::Utc::now().timestamp_millis() - 55_000;
     let near_boundary = waiting_shell(started);
     script_transcript(&backend, vec![near_boundary]).await;
     spawn_sync(&app);
@@ -1087,12 +1088,26 @@ async fn a_waiting_cards_elapsed_refreshes_on_the_minute() {
     })
     .await;
 
-    // The minute turns over: one more PATCH with the new elapsed, and that is
-    // all — if the refresh were second-granular, every read in between would
-    // have PATCHed too.
-    wait_for_card_update(&platform, "the elapsed minute", CardUpdates::Latest, |card| {
-        ledger_elapsed(card, "· shell：gh run watch · ").starts_with("1m")
-    })
+    // Within the same minute the seconds move on every read, but a full second
+    // of passes leaves the card exactly as the start move left it.
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    assert_eq!(
+        patches_to(&platform, "om_waiting").await.len(),
+        1,
+        "the seconds inside a minute must not PATCH: {:?}",
+        platform.updated_cards().await
+    );
+
+    // The minute turns over ~5 s after the scripted read: one more PATCH with
+    // the new elapsed, and that is all — the longer bound covers the real
+    // boundary this test deliberately waits out.
+    wait_for_card_update_within(
+        &platform,
+        "the elapsed minute",
+        Duration::from_secs(12),
+        CardUpdates::Latest,
+        |card| ledger_elapsed(card, "· shell：gh run watch · ").starts_with("1m"),
+    )
     .await;
     assert_eq!(
         patches_to(&platform, "om_waiting").await.len(),
@@ -1100,12 +1115,84 @@ async fn a_waiting_cards_elapsed_refreshes_on_the_minute() {
         "one PATCH for the start move and one for the minute turn: {:?}",
         platform.updated_cards().await
     );
-    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The seconds inside the NEW minute do not owe another either.
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
     assert_eq!(
         patches_to(&platform, "om_waiting").await.len(),
         2,
         "the seconds inside the new minute do not PATCH: {:?}",
         platform.updated_cards().await
+    );
+}
+
+/// The no-split guard (ADR-0060, ticket #419): a ledger-only refresh must not
+/// post a new card even when its entry tips the estimate over the split budget
+/// — the corner is reachable, since a completion entry outweighs the row it
+/// replaces. The entry here carries a pathological id so that delta alone
+/// crosses the budget deterministically; the waiting card takes ONE in-place
+/// PATCH, keeps its own header (never 「部分完成，继续中…」) and nothing is
+/// posted.
+#[tokio::test]
+async fn a_ledger_only_refresh_never_splits_the_waiting_card() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let sub_started = now - 4_000;
+    let live = waiting_shell_and_subagent(now - 5_000, sub_started);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    yield_waiting_card(&app, &platform, 2).await;
+    let cards_before = created_cards(&platform).await.len();
+
+    // The retired shell's entry names an id far past one card's split budget:
+    // without the guard the flush would finalize the card and continue on a
+    // NEW card.
+    let mut wake = shell_wake(2_900);
+    wake.shell_id = Some(format!("sh_{}", "x".repeat(26_000)));
+    wake.job_id = wake.shell_id.clone();
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(two_task_timeline(vec![]))
+                .with_executions(vec![execution(2_500)])
+                .with_wakes(vec![wake])
+                .with_background_tasks(vec![live_subagent(sub_started, "call_sub")]),
+        ],
+    )
+    .await;
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the oversized entry", CardUpdates::Latest, |card| {
+        card_text(card).contains("🔔 后台任务完成：gh run watch")
+    })
+    .await;
+
+    // One in-place PATCH, and the chain did not move: the card keeps its
+    // waiting header instead of 「部分完成，继续中…」, and no continuation or
+    // any other card was posted.
+    let patches = patches_to(&platform, "om_waiting").await;
+    assert_eq!(patches.len(), 1, "one in-place PATCH, never a split: {patches:?}");
+    let updated = &patches[0];
+    assert!(
+        card_header(updated).contains("等待后台任务"),
+        "the card keeps its own header: {updated}"
+    );
+    assert!(
+        !card_header(updated).contains("继续中"),
+        "a ledger-only refresh never finalizes the card: {updated}"
+    );
+    let text = card_text(updated);
+    assert!(
+        text.contains("🔔 后台任务完成：gh run watch") && text.contains("⏳ 后台任务（1）"),
+        "the entry and the remaining list land in place: {updated}"
+    );
+    assert!(
+        continuation_sends(&platform).await.is_empty(),
+        "no continuation is posted: {:?}",
+        platform.calls.lock().await
+    );
+    assert_eq!(
+        created_cards(&platform).await.len(),
+        cards_before,
+        "no new card is posted"
     );
 }
 
