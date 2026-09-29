@@ -1,5 +1,10 @@
 # Adopt the V2 interaction model: idle-bounded Executions, synthesized Wakes, and the waiting card
 
+> **Amended by ADR-0060**: the waiting card is no longer strictly frozen — the
+> **Background Task Ledger** updates it in place, and a last task retiring with
+> nothing to render settles it ✅ there (the "the card stops updating" half of
+> this ADR is narrowed; everything else stands).
+
 ## Context
 
 OpenCode 2 changed what a "turn" is. V1 had no formal turn boundary — a
