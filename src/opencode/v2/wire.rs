@@ -681,8 +681,8 @@ fn decode_wake_source(metadata: Option<&Value>) -> WakeSource {
 
 /// The Background Tasks a read leaves live: every assistant tool part that
 /// recorded a backgrounded run, minus the ones a Wake retired. Derived from
-/// the read's own typed parts, through the same call-level fact the panel's
-/// 「已转后台」 reads ([`ToolCall::background_launch`]), so the ledger and the
+/// the read's own typed parts, through the same call-level fact the panel's 🌙
+/// marker reads ([`ToolCall::background_launch`]), so the ledger and the
 /// running call can never disagree. The predicate is the backend's own — the
 /// exact derivation the official 2.0.x app uses
 /// (`packages/app/src/session/requests/background.ts`): a `shell` or

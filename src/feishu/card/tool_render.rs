@@ -29,10 +29,11 @@ pub struct ToolPanel {
 }
 
 /// The status marker a backgrounded call's panel shows instead of ✅
-/// (ADR-0060, the pinned copy): the call settled by returning the background
-/// handle, so the panel never claims the run completed — the Background Task
-/// Ledger owns the run's liveness, before and after retirement.
-pub(crate) const BACKGROUNDED_STATUS: &str = "已转后台";
+/// (ADR-0060, the pinned marker): the call settled by returning the background
+/// handle, so the 🌙 icon in the status slot marks the launch — never a claim
+/// that the run completed. The Background Task Ledger owns the run's liveness,
+/// before and after retirement.
+pub(crate) const BACKGROUNDED_MARKER: &str = "🌙";
 
 impl ToolPanel {
     pub fn new(call: ToolCall) -> Self {
@@ -60,11 +61,11 @@ impl ToolPanel {
 
     pub fn status_icon(&self) -> &'static str {
         // A backgrounded call never claims completion (ADR-0060): it settled
-        // at launch while its run continues, so the panel reads 已转后台 —
-        // durably, before and after the task retires. The ledger owns the
-        // run's liveness.
+        // at launch while its run continues, so the panel reads the 🌙 marker
+        // in its status slot — durably, before and after the task retires. The
+        // ledger owns the run's liveness.
         if self.backgrounded() {
-            return BACKGROUNDED_STATUS;
+            return BACKGROUNDED_MARKER;
         }
         match self.status() {
             ToolStatus::Running | ToolStatus::Pending => "⏳",
@@ -99,8 +100,9 @@ impl ToolPanel {
     /// backend's own durable marker on the call — the settled `shell`/
     /// `subagent` launch whose metadata still says the run is going
     /// ([`ToolCall::background_launch`]). Such a panel keeps its timeline place
-    /// as the record of the request and reads [`BACKGROUNDED_STATUS`] instead
-    /// of ✅ — never claiming completion, whatever the ledger currently lists.
+    /// as the record of the request and reads [`BACKGROUNDED_MARKER`] in its
+    /// status slot instead of ✅ — never claiming completion, whatever the
+    /// ledger currently lists.
     pub(crate) fn backgrounded(&self) -> bool {
         self.call.background_launch().is_some()
     }
@@ -1177,14 +1179,14 @@ mod tests {
         assert!(!running(ToolStatus::Pending));
     }
 
-    /// ADR-0060 (#416): a settled `shell`/`subagent` call whose metadata says
-    /// its run is still going reads 「已转后台」 instead of ✅ — it keeps its
-    /// timeline place as the record of the request and never claims completion,
-    /// before AND after the run retires (the marker is durable). A foreground
-    /// call, a V1 `task` and a launch that has not returned its handle yet
-    /// render exactly as today.
+    /// ADR-0060 (#416, restyled by #423): a settled `shell`/`subagent` call
+    /// whose metadata says its run is still going renders the 🌙 marker in its
+    /// status slot instead of ✅ — it keeps its timeline place as the record of
+    /// the request and never claims completion, before AND after the run
+    /// retires (the marker is durable). A foreground call, a V1 `task` and a
+    /// launch that has not returned its handle yet render exactly as today.
     #[test]
-    fn a_backgrounded_call_renders_moved_to_the_background() {
+    fn a_backgrounded_call_renders_the_launch_marker() {
         let at = crate::feishu::card::test_local_ms(2026, 9, 16, 14, 5);
         let panel = |name: &str, status: ToolStatus, metadata: Option<serde_json::Value>| {
             CardBuilder::new()
@@ -1213,12 +1215,13 @@ mod tests {
                 .to_string()
         };
 
-        // The pinned copy. The metadata keeps saying `running` after a run
-        // retires, so the panel's marker is the same before and after.
+        // The pinned marker: the icon sits in the status slot, the title's
+        // other parts are a normal panel's. The metadata keeps saying `running`
+        // after a run retires, so the marker is the same before and after.
         let running = Some(json!({"status": "running", "shellID": "sh_1"}));
         assert_eq!(
             title(&panel("shell", ToolStatus::Completed, running.clone())),
-            format!("{BACKGROUNDED_STATUS} shell · 14:05")
+            "🌙 shell · 14:05"
         );
         assert_eq!(
             title(&panel(
@@ -1226,9 +1229,9 @@ mod tests {
                 ToolStatus::Completed,
                 Some(json!({"status": "running", "sessionID": "ses_1"}))
             )),
-            format!("{BACKGROUNDED_STATUS} subagent · 14:05")
+            "🌙 subagent · 14:05"
         );
-        assert_eq!(BACKGROUNDED_STATUS, "已转后台", "the pinned copy");
+        assert_eq!(BACKGROUNDED_MARKER, "🌙", "the pinned marker");
 
         // Foreground control: the run finished inside the call — its metadata
         // says `completed`, or names no run status at all.
@@ -1254,7 +1257,7 @@ mod tests {
             "✅ task · 14:05"
         );
         // A launch that has not returned its handle yet is still live: ⏳, not
-        // 已转后台 (the marker only holds once the call settled).
+        // the launch marker (it only holds once the call settled).
         assert_eq!(
             title(&panel("shell", ToolStatus::Running, running)),
             "⏳ shell · 14:05"

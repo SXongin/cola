@@ -36,14 +36,26 @@ one meaning for ✅.
 
 **One ledger, following the newest card.** Every live Background Task of the
 Session — across Turns — renders in a card-tail section like the Todo Panel and
-live Tool Panels (ADR-0045): title `⏳ 后台任务（N）`, rows
-`· shell：<label> · 3m12s` / `· 子代理：<description> · 1m05s`. The label is
-joined from the tool part's input by `call_id` (shell: `command`/`description`;
-`subagent` needs its own rendering arm), clipped like the receipt; elapsed is
-minute-granular and driven by the existing reads (the 8 s Session Sync pass) —
+live Tool Panels (ADR-0045): a folded-by-default collapsible panel titled
+`⏳ 后台任务（N）` — the title is the count, so the folded panel still answers
+how many tasks are running, and a stable `element_id` keeps the reader's fold
+state across re-renders — whose body is one row per task: `· shell：<label> ·
+3m12s` / `· 子代理：<description> · 1m05s`. The label is joined from the tool
+part's input by `call_id` (shell: `command`/`description`; `subagent` needs its
+own rendering arm), clipped like the receipt; elapsed is rendered
+second-granular and driven by the existing reads (the 8 s Session Sync pass) —
 no new polling cadence. Exactly one card carries the live list: when a Wake
 continues the chain or a new Turn takes over, the handover removes it from the
 old card.
+
+**The yielded ledger ticks at the read cadence.** A Waiting card has no render
+loop of its own, so the existing 8 s Session Sync reads are its only clock: the
+in-place refresh owes a PATCH whenever the ledger it would render differs from
+the one the card last rendered — membership, or any row's rendered elapsed at
+**second** granularity (≈0.125 QPS per waiting card at the 8 s cadence, far
+below Feishu's per-message cap). Repeated reads inside one rendered second owe
+nothing. The live render keeps whole-minute gating: its flushes are
+content-driven, and a per-render second clock would be clock churn.
 
 **A completion leaves a fixed entry where the task lived.** The task leaves the
 live list and becomes a collapsible entry on the card that hosted it — the
@@ -72,8 +84,9 @@ threshold). This supersedes drain.rs's
 
 **The launch panel stops reading as done.** The settled `shell`/`subagent` call
 whose metadata says the run is still going keeps its place in the timeline as
-the record of the request, but renders 「已转后台」 instead of ✅; the ledger,
-not the panel, owns the run's liveness.
+the record of the request, but renders 🌙 in its status slot instead of ✅ — the
+rest of the title is a normal panel's (`🌙 shell · <label>`); the ledger, not
+the panel, owns the run's liveness.
 
 V1 carries none of these facts: there the section is empty and behavior is
 today's (the ADR-0059 degradation).
@@ -103,16 +116,40 @@ today's (the ADR-0059 degradation).
 
 - CONTEXT.md gains **Background Task Ledger**; **Wake**, **Card**, **Tool
   Panel** and **Waiting on Background Work** record the entry copy, the launch
-  panel's 已转后台 state, and the carve-out.
-- New rendering work: a third card-tail section; a fold element for entries;
-  a `subagent` arm in the input formatter; the `call_id` label join.
+  panel's 🌙 marker, and the carve-out.
+- New rendering work: a third card-tail section; a fold element for the live
+  list and the entries; a `subagent` arm in the input formatter; the `call_id`
+  label join.
 - The ledger must fit the card budget like the existing tail sections — many
   live tasks are still one section, rows clipped like the receipt.
 - Tests pin: the exact copy, one and several live tasks, out-of-order
   completions, a completion while the card is live vs waiting, the list
-  surviving a split/continuation, the handover removal, and the quiet true end
-  (✅ + notice, no new card).
+  surviving a split/continuation, the handover removal, the second-granular
+  yielded refresh (and the live path's whole-minute gating), and the quiet true
+  end (✅ + notice, no new card).
 - A cola restart still loses live cards; the next Wake pass rebuilds the
   ledger on a new card exactly as it rebuilds any continuation.
 
 Related: #412, #405, #403, ADR-0059, ADR-0045, ADR-0043, ADR-0040, ADR-0054.
+
+## Amendment (2026-09-29): the launch marker, the folded live list, and the yielded second
+
+The #412 batch's acceptance review (#423) changed three presentation decisions
+recorded above; the mechanics — one ledger, following the newest card, entries
+where the task lived, Policy W, the freeze's one carve-out, the quiet true end —
+are unchanged.
+
+- The launch marker is the 🌙 icon in the panel's status slot, not the text
+  「已转后台」 (#416 superseded): the title reads `🌙 shell · <label>`, the
+  semantics are the same — it never claims completion, it persists after the
+  run retires, and the ledger owns the run's liveness.
+- The live list is a folded-by-default `collapsible_panel` titled
+  `⏳ 后台任务（N）` — the title is the count, the rows are its markdown body,
+  and a stable `element_id` (`task_ledger`) keeps the reader's fold state
+  across re-renders (#415's flat markdown section superseded; the rows and
+  their pinned formats are unchanged). An empty ledger still renders nothing.
+- The yielded refresh compares the ledger it would render against the one the
+  card last rendered at **second** granularity, superseding #419's
+  whole-minute rule on that path: a rendered second moving owes the PATCH,
+  repeated reads inside it owe nothing. The live render and its Wake handover
+  keep whole-minute gating.

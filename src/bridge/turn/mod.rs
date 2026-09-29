@@ -1300,8 +1300,8 @@ pub(crate) enum YieldedUpdate {
     /// The read owed nothing: no PATCH at all, the card stays exactly as the
     /// yield left it.
     Unchanged,
-    /// The ledger moved (a row joined or left, a minute turned, an entry
-    /// arrived): the card is PATCHed in place and the wait goes on.
+    /// The ledger moved (a row joined or left, a rendered second advanced, an
+    /// entry arrived): the card is PATCHed in place and the wait goes on.
     Refreshed,
     /// The last Background Task retired and the read judged the true end: the
     /// card settled in place and stopped updating. `notice_at` is the
@@ -1436,7 +1436,13 @@ impl Turn {
             }
             let anchor = card.acc.turn_anchor.clone();
             let handover = anchor.as_ref().is_some_and(|anchor| {
-                render::apply_ledger_read(&mut card.acc, transcript, Some(anchor), now_ms)
+                render::apply_ledger_read(
+                    &mut card.acc,
+                    transcript,
+                    Some(anchor),
+                    now_ms,
+                    state::LedgerCadence::Minute,
+                )
             });
             card.pending_split.push(state::PendingSplit {
                 reply_to: reply_to.to_string(),
@@ -1456,11 +1462,13 @@ impl Turn {
     /// — so the existing reads are what keep its section true: a task that
     /// retired quietly (its Wake's resumed run renders nothing, so no
     /// continuation is owed) leaves the live list while its fixed completion
-    /// entry arrives on the host card, an elapsed row moves when a whole
-    /// minute turns, and an unchanged read leaves the card otherwise alone —
-    /// no PATCH at all, so its header, timeline and footer stay frozen. The one
-    /// exception is the read below: a read whose ledger did not change can
-    /// still be the true end, and that read PATCHes the card as it settles.
+    /// entry arrives on the host card, an elapsed row moves the moment its
+    /// rendered second advances (the read's own cadence, far below Feishu's
+    /// per-message cap), and a read that would render the ledger the card
+    /// already shows leaves the card otherwise alone — no PATCH at all, so its
+    /// header, timeline and footer stay frozen. The one exception is the read
+    /// below: a read whose ledger did not change can still be the true end, and
+    /// that read PATCHes the card as it settles.
     ///
     /// The same read is also the true end's judge (ADR-0060): when it shows
     /// the last Background Task retired, the card settles in place — ✅ when
@@ -1512,7 +1520,13 @@ impl Turn {
                 return YieldedUpdate::Unchanged;
             }
             let anchor = card.acc.turn_anchor.clone();
-            let changed = render::apply_ledger_read(&mut card.acc, transcript, anchor.as_ref(), now_ms);
+            let changed = render::apply_ledger_read(
+                &mut card.acc,
+                transcript,
+                anchor.as_ref(),
+                now_ms,
+                state::LedgerCadence::Second,
+            );
             // The read's own settle decision judges the true end (ADR-0059):
             // only a read whose Wakes are answered and that retired the last
             // Background Task settles, and the ending stamped is the one the

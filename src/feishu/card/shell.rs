@@ -2,7 +2,8 @@ use serde_json::json;
 
 use super::MAX_ELEMENT_TEXT_CHARS;
 use super::ledger::{
-    TaskCompletionEntry, TaskLedgerRow, task_entry_body, task_entry_title, task_ledger_text,
+    TASK_LEDGER_ELEMENT_ID, TaskCompletionEntry, TaskLedgerRow, task_entry_body, task_entry_title,
+    task_ledger_text, task_ledger_title,
 };
 use super::sanitize::CardMarkdown;
 use super::tool_render::{ToolPanel, tool_panel_element};
@@ -237,14 +238,20 @@ impl CardBuilder {
     }
 
     /// The Background Task Ledger section (ADR-0060): a Session's live
-    /// Background Tasks as one card-tail markdown element, in the order given
-    /// (the transcript's own). Pushed where the caller calls it, so the tail's
-    /// section order stays the accumulator's; a no-op while no task is live,
-    /// so an empty ledger never leaves an empty header.
+    /// Background Tasks as one card-tail collapsible panel, folded by default,
+    /// in the order given (the transcript's own). The pinned count
+    /// (`⏳ 后台任务（N）`) is the panel title, so the folded panel still answers
+    /// how many tasks are running; the rows are its markdown body. The stable
+    /// [`TASK_LEDGER_ELEMENT_ID`] keeps the reader's fold state across
+    /// re-renders. Pushed where the caller calls it, so the tail's section
+    /// order stays the accumulator's; a no-op while no task is live, so an
+    /// empty ledger never leaves an empty panel.
     pub fn with_task_ledger(mut self, rows: &[TaskLedgerRow]) -> Self {
-        if let Some(text) = task_ledger_text(rows, chrono::Utc::now().timestamp_millis()) {
-            let content = self.markdown.element(&text);
-            self.body.push(json!({ "tag": "markdown", "content": content }));
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if let (Some(title), Some(body)) = (task_ledger_title(rows), task_ledger_text(rows, now_ms)) {
+            let content = self.markdown.element(&body);
+            self.body
+                .push(collapsible_panel(&title, &content, Some(TASK_LEDGER_ELEMENT_ID)));
         }
         self
     }
@@ -601,12 +608,14 @@ mod tests {
         );
     }
 
-    /// The Background Task Ledger (ADR-0060): the live list is one markdown
-    /// element rendered where the caller puts it (the tail's order), and
-    /// model-authored labels are sanitized like any other card markdown.
+    /// The Background Task Ledger (ADR-0060, #423): the live list is one
+    /// card-tail `collapsible_panel`, folded by default — the count as its
+    /// title, the rows as its sanitized markdown body, one stable element id
+    /// for the reader's fold state — rendered where the caller puts it (the
+    /// tail's order).
     #[test]
     fn task_ledger_renders_where_it_is_called() {
-        use crate::feishu::card::ledger::{TaskKind, TaskLedgerRow};
+        use crate::feishu::card::ledger::{TASK_LEDGER_ELEMENT_ID, TaskKind, TaskLedgerRow};
 
         let now = chrono::Utc::now().timestamp_millis();
         let rows = vec![TaskLedgerRow {
@@ -622,11 +631,22 @@ mod tests {
             .build();
         let elements = card["body"]["elements"].as_array().unwrap();
         assert_eq!(elements.len(), 3, "{card}");
-        let content = elements[1]["content"].as_str().unwrap();
-        assert!(content.contains("⏳ 后台任务（1）"), "{content}");
+        let panel = &elements[1];
+        assert_eq!(panel["tag"], "collapsible_panel", "{card}");
+        assert_eq!(panel["expanded"], false, "the live list folds by default");
+        assert_eq!(
+            panel["element_id"], TASK_LEDGER_ELEMENT_ID,
+            "stable fold identity"
+        );
+        assert_eq!(panel["header"]["title"]["content"], "⏳ 后台任务（1）");
+        let body = panel["elements"][0]["content"].as_str().unwrap();
         assert!(
-            content.contains("· shell：a &#60;number_tag> | b · 0m00s"),
-            "the label is sanitized and the elapsed bare: {content}"
+            body.contains("· shell：a &#60;number_tag> | b · 0m00s"),
+            "the rows are the panel body, sanitized and bare: {body}"
+        );
+        assert!(
+            !body.contains("后台任务（"),
+            "the count lives in the title, not the body: {body}"
         );
         assert_eq!(elements[2]["content"], "后续");
 

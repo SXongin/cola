@@ -184,9 +184,10 @@ impl ExternalFlow {
             return;
         };
         let cola_authored = crate::opencode::parsing::is_cola_message_id(newest.id.as_str());
-        // The Session Sync pass's clock (ADR-0060): the ledger's refresh is
-        // minute-granular, and the Wake decision and the yielded refresh of
-        // this same read must stamp one moment, not two.
+        // The Session Sync pass's clock (ADR-0060): the yielded refresh
+        // compares the ledger's rendered elapsed at second granularity, and
+        // the Wake decision and the yielded refresh of this same read must
+        // stamp one moment, not two.
         let now_ms = chrono::Utc::now().timestamp_millis();
         if cola_authored {
             // The Session Sync Wake step (ADR-0059): the newest user message is
