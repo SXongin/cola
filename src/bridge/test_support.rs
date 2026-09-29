@@ -770,6 +770,11 @@ pub struct MockBackend {
     /// Same as `hang_list_permissions`, for `list_sessions` (the Lazy Start
     /// readiness probe).
     pub hang_list_sessions: Arc<std::sync::atomic::AtomicUsize>,
+    /// While set, `list_permissions` fails with the structural 500 a deleted
+    /// session directory produces (`FileSystem.realPath` ENOENT, #421) instead
+    /// of serving the scripted requests. Flippable mid-test: a sweep must stop
+    /// calling while the directory is gone and resume when it returns.
+    pub fail_list_permissions: Arc<std::sync::atomic::AtomicBool>,
     /// Counts `list_permissions` calls. The sweep lists once per known
     /// directory — never once per session — so a store with many sessions in
     /// one directory still makes exactly one call per sweep (the V2 poller's
@@ -1030,6 +1035,7 @@ impl MockBackend {
             hang_transcript: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             hang_session_info: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             hang_list_sessions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            fail_list_permissions: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             list_permission_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             list_question_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             external_user_message: None,
@@ -1848,6 +1854,14 @@ impl crate::backend::Backend for MockBackend {
         self.list_permission_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         hang_if_scripted(&self.hang_list_permissions).await;
+        if self
+            .fail_list_permissions
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(crate::error::BridgeError::OpenCode(
+                "permission list failed: 500 Internal Server Error".into(),
+            ));
+        }
         let replied = self.replied_permissions.lock().await;
         let mut out: Vec<_> = self
             .permissions

@@ -6,6 +6,7 @@
 //! 204 mutations, the run-state derivation, the admit-then-return prompt, the
 //! session-scoped switches, and the permission/form surface.
 
+use crate::bridge::test_support::{assert_line_level, capture_logs, level_count};
 use crate::error::BridgeError;
 use crate::opencode::client::OpenCodeBackend;
 use crate::opencode::strategy::Generation;
@@ -506,14 +507,13 @@ async fn session_status_surfaces_failures() {
     );
     retry_down.route("GET", "/api/session/ses_1/message", 500, r#"{"message":"boom"}"#);
     let client = v2_wire_client(&retry_down);
-    let (status, logs) =
-        crate::bridge::test_support::capture_logs(async { client.session_status("ses_1", None).await }).await;
+    let (status, logs) = capture_logs(async { client.session_status("ses_1", None).await }).await;
     assert_eq!(
         status.unwrap(),
         Some(SessionStatus::Busy),
         "the failed retry read degrades to Running"
     );
-    let warning = crate::bridge::test_support::assert_line_level(&logs, "session retry read failed", "WARN");
+    let warning = assert_line_level(&logs, "session retry read failed", "WARN");
     assert!(
         warning.contains("session ses_1") && warning.contains("500"),
         "the warning names the session and the status: {warning}"
@@ -535,10 +535,9 @@ async fn session_status_surfaces_failures() {
         "<html>nope</html>",
     );
     let client = v2_wire_client(&retry_garbled);
-    let (status, logs) =
-        crate::bridge::test_support::capture_logs(async { client.session_status("ses_1", None).await }).await;
+    let (status, logs) = capture_logs(async { client.session_status("ses_1", None).await }).await;
     assert_eq!(status.unwrap(), Some(SessionStatus::Busy));
-    let warning = crate::bridge::test_support::assert_line_level(&logs, "session retry read parse", "WARN");
+    let warning = assert_line_level(&logs, "session retry read parse", "WARN");
     assert!(
         warning.contains("nope"),
         "the warning carries the body: {warning}"
@@ -1271,6 +1270,53 @@ async fn list_questions_decodes_typed_form_fields_from_the_location_list() {
         request.query_param("location[directory]").as_deref(),
         Some("/work/cola")
     );
+}
+
+/// Both V2 pending-list reads (permissions and forms) keep their body
+/// diagnostics at DEBUG: the request sweep's per-directory latch owns the one
+/// WARN for the condition (#421), so a failed list must not add a second.
+/// The returned errors stay card-safe and status-only.
+#[tokio::test]
+async fn pending_list_reads_keep_their_body_diagnostics_at_debug() {
+    let server = TestHttpServer::start().await;
+    server.route("GET", "/api/permission/request", 500, r#"{"message":"ENOENT"}"#);
+    server.route("GET", "/api/form", 500, r#"{"message":"ENOENT form"}"#);
+    let client = v2_wire_client(&server);
+
+    let (results, logs) = capture_logs(async {
+        let permission = client.list_permissions(None).await;
+        let form = client.list_questions(None).await;
+        (permission, form)
+    })
+    .await;
+
+    let permission = opencode_error(results.0.unwrap_err());
+    assert!(
+        permission.contains("permission list failed"),
+        "unexpected: {permission}"
+    );
+    assert!(!permission.contains("ENOENT"), "body-free: {permission}");
+    let form = opencode_error(results.1.unwrap_err());
+    assert!(form.contains("form list failed"), "unexpected: {form}");
+    assert!(!form.contains("ENOENT form"), "body-free: {form}");
+
+    let permission = assert_line_level(&logs, "permission list failed", "DEBUG");
+    assert!(
+        permission.contains("ENOENT"),
+        "the DEBUG diagnostic carries the body: {permission}"
+    );
+    let form = assert_line_level(&logs, "form list failed", "DEBUG");
+    assert!(
+        form.contains("ENOENT form"),
+        "the DEBUG diagnostic carries the body: {form}"
+    );
+    for needle in ["permission list failed", "form list failed"] {
+        assert_eq!(
+            level_count(&logs, needle, "WARN"),
+            0,
+            "the sweep's latch owns the WARN; {needle} must not add one:\n{logs}"
+        );
+    }
 }
 
 /// The session-scoped form reply: `POST /api/session/{id}/form/{formID}/reply`
