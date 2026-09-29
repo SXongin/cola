@@ -6,6 +6,7 @@
 //! beside its strategy has the same shape.
 
 use super::*;
+use crate::bridge::test_support::{assert_line_level, capture_logs, level_count};
 use crate::error::BridgeError;
 use crate::opencode::client::OpenCodeBackend;
 use crate::opencode::parsing::parse_model;
@@ -723,19 +724,67 @@ async fn list_permissions_sends_the_directory_scope_and_parses_requests() {
     assert_eq!(request.query_param("directory").as_deref(), Some("/work/cola"));
 }
 
+/// A failed list read returns the card-safe, status-only error — and its body
+/// diagnostic is DEBUG, not WARN: the request sweep's per-directory latch owns
+/// the one WARN for the condition (#421), so a WARN here would double every
+/// failed-directory line.
 #[tokio::test]
 async fn list_permissions_maps_a_failed_status_to_a_diagnostic_opencode_error() {
     let server = TestHttpServer::start().await;
     server.route("GET", "/permission", 502, r#"{"error":"bad gateway"}"#);
     let client = v1_wire_client(&server, None);
 
-    let message = opencode_error(client.list_permissions(None).await.unwrap_err());
+    let (result, logs) = capture_logs(async { client.list_permissions(None).await }).await;
+    let message = opencode_error(result.unwrap_err());
 
     assert!(
         message.contains("permission list failed"),
         "unexpected: {message}"
     );
     assert!(message.contains("502"), "unexpected: {message}");
+    assert!(
+        !message.contains("bad gateway"),
+        "the returned error stays body-free (it may be surfaced): {message}"
+    );
+    let diagnostic = assert_line_level(&logs, "permission list failed", "DEBUG");
+    assert!(
+        diagnostic.contains("bad gateway"),
+        "the DEBUG diagnostic carries the body preview: {diagnostic}"
+    );
+    assert_eq!(
+        level_count(&logs, "permission list failed", "WARN"),
+        0,
+        "the sweep's latch owns the WARN; this read must not add one:\n{logs}"
+    );
+}
+
+/// The question list read follows the permission read's policy: a card-safe,
+/// status-only error and a DEBUG body diagnostic (#421).
+#[tokio::test]
+async fn list_questions_keeps_its_body_diagnostic_at_debug() {
+    let server = TestHttpServer::start().await;
+    server.route("GET", "/question", 500, r#"{"error":"ENOENT"}"#);
+    let client = v1_wire_client(&server, None);
+
+    let (result, logs) = capture_logs(async { client.list_questions(None).await }).await;
+    let message = opencode_error(result.unwrap_err());
+
+    assert!(message.contains("question list failed"), "unexpected: {message}");
+    assert!(message.contains("500"), "unexpected: {message}");
+    assert!(
+        !message.contains("ENOENT"),
+        "the returned error stays body-free: {message}"
+    );
+    let diagnostic = assert_line_level(&logs, "question list failed", "DEBUG");
+    assert!(
+        diagnostic.contains("ENOENT"),
+        "the DEBUG diagnostic carries the body preview: {diagnostic}"
+    );
+    assert_eq!(
+        level_count(&logs, "question list failed", "WARN"),
+        0,
+        "the sweep's latch owns the WARN; this read must not add one:\n{logs}"
+    );
 }
 
 #[tokio::test]

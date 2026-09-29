@@ -342,6 +342,74 @@ async fn a_surfaced_permission_carries_its_session_chat_and_topic() {
     );
 }
 
+/// #421: a session directory deleted from disk makes every list call fail
+/// structurally (`FileSystem.realPath` ENOENT — a 500 no retry can fix). The
+/// first failure WARNs once through the ADR-0048 latch, further sweeps skip
+/// the call entirely, and the path returning resumes the poll and logs the
+/// recovery. Without the skip, one (directory, kind) pair kept failing every
+/// 3 s forever: two WARN lines per tick and a doomed server boot per attempt.
+#[tokio::test]
+async fn a_dead_directory_warns_once_and_is_skipped_until_it_returns() {
+    let _wd = test_work_dir();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&cfg_dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
+
+    // Mapped while it existed, deleted from disk afterwards (a deleted repo,
+    // a pruned worktree), its lists failing with the server's structural 500.
+    let work = cfg_dir.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    let work = work.to_str().unwrap().to_string();
+    seed_session(&app, "ses_1", &work).await;
+    std::fs::remove_dir(&work).unwrap();
+    backend
+        .fail_list_permissions
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let mut seen = std::collections::HashSet::new();
+    let (_, logs) = capture_logs(async {
+        app.permission.sweep(&app.flow_handles(), &mut seen).await;
+        app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    })
+    .await;
+
+    assert_eq!(
+        backend.list_permission_calls.load(Ordering::SeqCst),
+        1,
+        "the second sweep must not call the server for a directory that is gone:\n{logs}"
+    );
+    let warned = line_with(&logs, "failed");
+    assert!(
+        warned.contains(&work) && warned.contains("directory is gone"),
+        "the one WARN names the directory and the condition: {warned}"
+    );
+    assert_eq!(
+        level_count(&logs, "failed", "WARN"),
+        1,
+        "one WARN for the state change, not one per tick:\n{logs}"
+    );
+
+    // The directory returns (the repo is re-cloned, the worktree re-created):
+    // the poll resumes and reports the recovery.
+    std::fs::create_dir(&work).unwrap();
+    backend
+        .fail_list_permissions
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let (_, logs) = capture_logs(async {
+        app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    })
+    .await;
+
+    assert_eq!(
+        backend.list_permission_calls.load(Ordering::SeqCst),
+        2,
+        "the returned directory is polled again"
+    );
+    assert_line_level(&logs, "recovered", "INFO");
+}
+
 /// A card click is session-scoped once its Session is resolved (ADR-0048): a
 /// permission reply carries the session even though the card payload has no
 /// chat — the span completes chat/topic from the store.

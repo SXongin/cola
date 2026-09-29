@@ -1201,6 +1201,56 @@ async fn failed_directory_list_keeps_permission_surfaces() {
     .await;
 }
 
+/// #421 × #130: a directory whose list failed while it was already gone is
+/// skipped after one WARN — but a skipped directory still counts as a failed
+/// one, so its live permission surfaces are never read as resolved.
+#[tokio::test]
+async fn skipped_dead_directory_keeps_live_permission_surfaces() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+
+    // Mapped while it existed, then gone from disk; every list fails.
+    let work = dir.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    let work = work.to_str().unwrap().to_string();
+    seed_session(&app, "ses_1", &work).await;
+    app.permission.sent_cards.lock().await.insert(
+        "per_card".into(),
+        crate::bridge::request::flow::SentCard {
+            message_id: "om_card".into(),
+            summary: "待处理的请求".into(),
+            directory: work.clone(),
+        },
+    );
+    std::fs::remove_dir(&work).unwrap();
+    backend
+        .fail_list_permissions
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let mut seen = std::collections::HashSet::new();
+    // The failing sweep marks the directory dead; the skipped sweep must
+    // still read it as failed (#130), not as "the request left the list".
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    assert!(
+        app.permission.sent_cards.lock().await.contains_key("per_card"),
+        "a skipped dead directory must not mark its card stale"
+    );
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        calls.iter().all(|c| !matches!(
+            c,
+            PlatformCall::UpdateMessage { message_id, .. } if message_id == "om_card"
+        )),
+        "a skipped dead directory must not re-render its surfaces: {calls:?}"
+    );
+}
+
 /// A topic-backed session with no streaming card falls back to a separate
 /// permission card. The card replies to the session's topic anchor (a
 /// message inside the topic), which keeps it inside the topic — the create
