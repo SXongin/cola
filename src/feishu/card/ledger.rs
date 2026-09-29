@@ -17,7 +17,7 @@
 //! did before, and V1 (which carries no Background Task facts) never shows
 //! one.
 
-use super::{fmt_local_time, truncate_md};
+use super::{first_n_chars_bytes, fmt_local_time, truncate_md};
 
 /// Characters of a task label the ledger row shows before clipping — shared
 /// with the completion entry's collapsed title (`🔔 后台任务完成：<label>`), so
@@ -190,7 +190,7 @@ pub(crate) fn task_ledger_estimate(rows: &[TaskLedgerRow]) -> usize {
     let labels: usize = rows
         .iter()
         .filter_map(|row| row.label.as_deref())
-        .map(|label| first_n_bytes(label, TASK_LABEL_CHARS))
+        .map(|label| first_n_chars_bytes(label, TASK_LABEL_CHARS))
         .sum();
     300 + labels + rows.len() * 120
 }
@@ -203,17 +203,10 @@ pub(crate) fn task_entry_estimate(entry: &TaskCompletionEntry) -> usize {
     let label = entry
         .label
         .as_deref()
-        .map(|label| first_n_bytes(label, TASK_LABEL_CHARS))
+        .map(|label| first_n_chars_bytes(label, TASK_LABEL_CHARS))
         .unwrap_or(0);
     let id = entry.id.as_deref().map(str::len).unwrap_or(0);
     300 + label + id + 80
-}
-
-/// Byte length of the first `n` characters of `s` — the shape both estimates
-/// charge for a rendered clip: the render clips at [`TASK_LABEL_CHARS`], so the
-/// estimates must count in the same unit.
-fn first_n_bytes(s: &str, n: usize) -> usize {
-    s.chars().take(n).map(|c| c.len_utf8()).sum()
 }
 
 /// The ledger row's elapsed: bare, with no Chinese label (ADR-0060) — `3m12s`,

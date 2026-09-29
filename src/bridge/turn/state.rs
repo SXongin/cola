@@ -9,6 +9,7 @@
 
 use crate::backend::{Part, SessionTranscript, TurnAnchor};
 use crate::bridge::handles::CardsHandle;
+use crate::feishu::card::first_n_chars_bytes;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskKind, TaskLedgerRow};
 use crate::feishu::card::shell::CardBuilder;
 use crate::feishu::card::tool_render::{TASK_TOOL, TaskLiveness, ToolPanel};
@@ -90,15 +91,14 @@ pub(super) struct BuiltCard {
 /// plus the capped input and output the renderer keeps). Shared by the
 /// timeline's tool items and the todo tail reserve.
 fn panel_estimate(p: &ToolPanel) -> usize {
-    let first_n_bytes = |s: &str, n: usize| s.chars().take(n).map(|c| c.len_utf8()).sum::<usize>();
     let input = p
         .input()
         .map(|x| x.to_string())
-        .map(|s| first_n_bytes(&s, 400))
+        .map(|s| first_n_chars_bytes(&s, 400))
         .unwrap_or(0);
     let output = p
         .output()
-        .map(|s| first_n_bytes(&s, crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS))
+        .map(|s| first_n_chars_bytes(&s, crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS))
         .unwrap_or(0);
     400 + input + output
 }
@@ -1504,9 +1504,6 @@ impl StreamAccumulator {
     /// slice is the final, tail-carrying one — see
     /// [`Self::build_card_with_info`].
     fn estimate_split_index(&self, start: usize, reserve_tail: bool) -> usize {
-        // Byte length of the first `n` chars (mirrors `truncate_md`, which caps
-        // rendered content by characters).
-        let first_n_bytes = |s: &str, n: usize| s.chars().take(n).map(|c| c.len_utf8()).sum::<usize>();
         let mut comps = 0usize;
         let mut size = 0usize;
         let mut card_text = 0usize;
@@ -1532,7 +1529,7 @@ impl StreamAccumulator {
         }
         for (i, item) in self.timeline.iter().enumerate().skip(start) {
             let (c, s, t) = match &item.kind {
-                TimelineKind::Reasoning(r) => (4, 300 + first_n_bytes(r, 800), 0),
+                TimelineKind::Reasoning(r) => (4, 300 + first_n_chars_bytes(r, 800), 0),
                 TimelineKind::Tool(call_id) => {
                     (4, self.tools.get(call_id).map(panel_estimate).unwrap_or(400), 0)
                 }
