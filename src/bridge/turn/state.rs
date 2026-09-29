@@ -9,6 +9,7 @@
 
 use crate::backend::TurnAnchor;
 use crate::bridge::handles::CardsHandle;
+use crate::feishu::card::ledger::TaskLedgerRow;
 use crate::feishu::card::shell::CardBuilder;
 use crate::feishu::card::tool_render::{TASK_TOOL, TaskLiveness, ToolPanel};
 use crate::feishu::card::{AwaitingAction, CardState};
@@ -94,6 +95,30 @@ fn panel_estimate(p: &ToolPanel) -> usize {
         .map(|s| first_n_bytes(&s, crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS))
         .unwrap_or(0);
     400 + input + output
+}
+
+/// Estimated serialized size (bytes) of the Background Task Ledger section
+/// (ADR-0060): the header, one row per task with its clipped label and a short
+/// elapsed tail, plus the element overhead. Rough like [`panel_estimate`],
+/// with a margin over the real serialized row so a full card splits before the
+/// ledger pushes it over Feishu's cap.
+fn ledger_estimate(rows: &[TaskLedgerRow]) -> usize {
+    let labels: usize = rows
+        .iter()
+        .map(|row| {
+            row.label
+                .as_deref()
+                .map(|label| {
+                    label
+                        .chars()
+                        .take(crate::feishu::card::ledger::TASK_LABEL_CHARS)
+                        .map(|c| c.len_utf8())
+                        .sum::<usize>()
+                })
+                .unwrap_or(0)
+        })
+        .sum();
+    300 + labels + rows.len() * 120
 }
 
 /// A permission request surfaced inline on the streaming card (instead of a
@@ -460,6 +485,12 @@ pub(super) struct StreamAccumulator {
     /// [`Self::todo_panel`] — its panel header shows when the list was last
     /// written.
     pub(super) todo_shown_at: Option<i64>,
+    /// The Background Task Ledger (ADR-0060): the Session's live Background
+    /// Tasks, rebuilt from each transcript read ([`Self::set_ledger`]) and
+    /// rendered as a card-TAIL section, so the list rides the newest (live)
+    /// card. Empty renders nothing — V1 has no Background Task facts, so its
+    /// ledger is always empty.
+    pub(super) ledger: Vec<TaskLedgerRow>,
     /// Text, reasoning, tool and receipt entries ordered by their key (the
     /// server-side part start time) — the card is built from this, so message ↔
     /// tool interleaving is preserved even when a part renders late.
@@ -1302,6 +1333,19 @@ impl StreamAccumulator {
         true
     }
 
+    /// Replace the live Background Task ledger from a transcript read
+    /// (ADR-0060). The read is the authority: a task it no longer lists has
+    /// retired and leaves the section, a new one joins in transcript order.
+    /// Returns whether the rendered section changed, so a membership change
+    /// flushes even when no part did.
+    pub(super) fn set_ledger(&mut self, rows: Vec<TaskLedgerRow>) -> bool {
+        if self.ledger == rows {
+            return false;
+        }
+        self.ledger = rows;
+        true
+    }
+
     /// Build the whole card (tests + simple callers). Assembles the full
     /// timeline with the tail sections (inline interactions, buttons, footer).
     #[cfg(test)]
@@ -1396,10 +1440,11 @@ impl StreamAccumulator {
     /// hundred bytes — the `MAX_CARD_JSON_CHARS` margin absorbs the rest.
     ///
     /// `reserve_tail` charges the panels the built card will ALSO carry in its
-    /// tail — the todo list and every running tool's panel (ADR-0045) — to the
-    /// same budget, keeping the card and its tail together under the cap.
-    /// Callers pass it only when the slice is the final, tail-carrying one —
-    /// see [`Self::build_card_with_info`].
+    /// tail — the todo list, the Background Task Ledger (ADR-0060) and every
+    /// running tool's panel (ADR-0045) — to the same budget, keeping the card
+    /// and its tail together under the cap. Callers pass it only when the
+    /// slice is the final, tail-carrying one — see
+    /// [`Self::build_card_with_info`].
     fn estimate_split_index(&self, start: usize, reserve_tail: bool) -> usize {
         // Byte length of the first `n` chars (mirrors `truncate_md`, which caps
         // rendered content by characters).
@@ -1409,12 +1454,16 @@ impl StreamAccumulator {
         let mut card_text = 0usize;
         if reserve_tail {
             // The tail rides only the live card, but it counts against that
-            // card's budget: the todo list, then every running tool's panel
-            // (ADR-0045). When they don't fit, the card finalizes without the
-            // tail and the continuation carries it.
+            // card's budget: the todo list, the Background Task Ledger, then
+            // every running tool's panel (ADR-0045). When they don't fit, the
+            // card finalizes without the tail and the continuation carries it.
             if let Some(panel) = &self.todo_panel {
                 comps += 1;
                 size += panel_estimate(panel);
+            }
+            if !self.ledger.is_empty() {
+                comps += 1;
+                size += ledger_estimate(&self.ledger);
             }
             for call_id in self.live_tools.keys() {
                 if let Some(panel) = self.tools.get(call_id) {
@@ -1549,6 +1598,11 @@ impl StreamAccumulator {
             if let Some(todo) = &self.todo_panel {
                 builder = builder.with_tool_at(todo.clone(), self.todo_shown_at, Some("todo"));
             }
+            // The Background Task Ledger follows the todo list (ADR-0060): the
+            // Session's live tasks, kept on the newest card by the tail's own
+            // handover. Empty renders nothing, so V1 (no Background Task
+            // facts) shows exactly what it always did.
+            builder = builder.with_task_ledger(&self.ledger);
             // Running tools are live content, so their panels ride the tail —
             // after the todo list and before the interaction blocks, keeping a
             // running tool's Permission/Question below its own panel. A split

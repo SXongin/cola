@@ -12,6 +12,7 @@ pub(crate) mod config_commands;
 pub(crate) mod dir;
 pub(crate) mod drain;
 pub(crate) mod external;
+pub(crate) mod ledger;
 pub(crate) mod leftovers;
 pub(crate) mod logs;
 pub(crate) mod message_pins;
