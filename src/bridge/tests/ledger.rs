@@ -921,6 +921,48 @@ fn elapsed_secs(elapsed: &str) -> u64 {
     minutes.parse::<u64>().unwrap() * 60 + seconds.parse::<u64>().unwrap()
 }
 
+/// A start clock ahead of cola's (`now + 1h`): the row's elapsed clamps to
+/// `0m00s` forever, so its second-granular clock can never tick. The
+/// event-count tests use it for a task that stays live across the event, so
+/// "exactly one PATCH for this retirement / collect" is deterministic; the
+/// second-granular cadence itself is pinned by the rate tests, where the
+/// starts are real.
+fn frozen_start(now: i64) -> i64 {
+    now + 3_600_000
+}
+
+/// A card's visible text with every ledger row's rendered elapsed folded to
+/// `<t>` — the "same ledger, a later second" comparison: a patch that only
+/// advanced a row's time compares equal to its predecessor, while a row
+/// joining/leaving or an entry arriving still differs. Only the elapsed after
+/// the rows' ` · ` is folded (`XmYYs` / `XhYYm`); a completion entry's
+/// minute-only duration is left verbatim.
+fn text_ignoring_elapsed(card: &serde_json::Value) -> String {
+    // `·` is two UTF-8 bytes, so the separator's length is what advances the
+    // scan (a hardcoded +3 would cut before the trailing space).
+    const SEP: &str = " · ";
+    let text = card_text(card);
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(pos) = rest.find(SEP) {
+        out.push_str(&rest[..pos + SEP.len()]);
+        rest = &rest[pos + SEP.len()..];
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        let tail = &rest[digits..];
+        let elapsed = digits > 0
+            && matches!(
+                tail.as_bytes(),
+                [b'm' | b'h', b'0'..=b'9', b'0'..=b'9', b's' | b'm', ..]
+            );
+        if elapsed {
+            out.push_str("<t>");
+            rest = &tail[4..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The same read with the subagent still live beside the shell: the quiet
 /// retirement retires the shell only, so the card stays Waiting (the LAST
 /// retirement's settle belongs to a different ticket).
@@ -1226,7 +1268,9 @@ async fn a_settled_failure_dominates_the_quiet_true_end() {
 async fn a_retirement_with_a_live_task_left_never_settles() {
     let _wd = test_work_dir();
     let now = chrono::Utc::now().timestamp_millis();
-    let sub_started = now - 4_000;
+    // The subagent stays live across the retirement, with a frozen clock: the
+    // event's PATCH count below cannot be disturbed by a later rendered second.
+    let sub_started = frozen_start(now);
     let live = waiting_shell_and_subagent(now - 5_000, sub_started);
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
     // A group turn with a requester: a settle would notify, so the silence is
@@ -1259,14 +1303,23 @@ async fn a_retirement_with_a_live_task_left_never_settles() {
         Some(CardState::Waiting),
         "a live Background Task keeps the card waiting"
     );
-    // The retirement's own PATCH is the first one: the later reads only
-    // advance the subagent row's rendered second (the #423 cadence).
+    // The retirement is exactly ONE in-place PATCH: give the loop several more
+    // passes (the injected cadence is 20 ms) and count — the remaining
+    // subagent's clock is frozen, so a later read renders the same ledger and
+    // PATCHes nothing (ADR-0060's carve-out admits the elapsed refresh, not a
+    // PATCH per read).
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let patches = patches_to(&platform, "om_waiting").await;
-    let first = patches.first().expect("the retirement PATCHed");
-    let text = card_text(first);
+    assert_eq!(
+        patches.len(),
+        1,
+        "the retirement is one in-place PATCH: {patches:?}"
+    );
+    let text = card_text(&patches[0]);
     assert!(
-        card_header(first).contains("等待后台任务") && text.contains("⏳ 后台任务（1）"),
-        "the refreshed card is still the wait: {first}"
+        card_header(&patches[0]).contains("等待后台任务") && text.contains("⏳ 后台任务（1）"),
+        "the refreshed card is still the wait: {}",
+        patches[0]
     );
     // The notice would trail the refresh in the same pass: give it the moment,
     // then assert the silence.
@@ -1530,7 +1583,9 @@ async fn a_continuations_quiet_true_end_settles_without_a_second_notice() {
 async fn a_quiet_retirement_updates_the_waiting_card_in_place() {
     let _wd = test_work_dir();
     let now = chrono::Utc::now().timestamp_millis();
-    let sub_started = now - 4_000;
+    // The subagent stays live across the retirement, with a frozen clock: the
+    // event's PATCH count below cannot be disturbed by a later rendered second.
+    let sub_started = frozen_start(now);
     let live = waiting_shell_and_subagent(now - 5_000, sub_started);
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
     yield_waiting_card(&app, &platform, 2).await;
@@ -1555,11 +1610,17 @@ async fn a_quiet_retirement_updates_the_waiting_card_in_place() {
     })
     .await;
 
-    // The retirement's own in-place PATCH carries both facts: the row left and
-    // the entry arrived, with the remaining list riding along. (Later reads
-    // only advance the remaining row's rendered second — the #423 cadence.)
+    // The retirement is exactly ONE in-place PATCH carrying both facts: give
+    // the loop several more passes (the injected cadence is 20 ms) and count —
+    // the remaining subagent's clock is frozen, so no later read can PATCH.
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let patches = patches_to(&platform, "om_waiting").await;
-    let updated = patches.first().expect("the retirement PATCHed");
+    assert_eq!(
+        patches.len(),
+        1,
+        "the retirement is one in-place PATCH: {patches:?}"
+    );
+    let updated = &patches[0];
     let text = card_text(updated);
     assert!(
         !text.contains("· shell：gh run watch"),
@@ -1606,8 +1667,10 @@ async fn a_quiet_retirement_updates_the_waiting_card_in_place() {
 /// row's rendered second advancing. The injected ~20 ms passes stand in for
 /// the ~8 s Session Sync reads, so over a 1.2 s window at most two rendered
 /// seconds can advance (plus the boundary the yield itself sat on): the card
-/// is never PATCHed once per read, and nothing is posted. The control at the
-/// end proves the loop was alive for the whole window.
+/// is never PATCHed once per read, and nothing is posted. Every PATCH that
+/// does land is the same card with a later second. The control at the end
+/// proves the loop was alive for the whole window: a read that changes the
+/// ledger PATCHes right away, and that retirement is exactly one PATCH.
 #[tokio::test]
 async fn repeated_reads_inside_the_same_rendered_second_patch_nothing() {
     let _wd = test_work_dir();
@@ -1645,16 +1708,31 @@ async fn repeated_reads_inside_the_same_rendered_second_patch_nothing() {
         );
         previous = next;
     }
+    // Every refresh is the same card with a later second — the wait's header
+    // stays, and nothing but the rows' elapsed differs — so the passes can
+    // never smuggle another change in under the rate bound.
+    assert!(
+        patches
+            .iter()
+            .all(|patch| card_header(patch).contains("等待后台任务")),
+        "a ledger-only refresh never restyles the card: {patches:?}"
+    );
+    let normalized: Vec<String> = patches.iter().map(text_ignoring_elapsed).collect();
+    assert!(
+        normalized.windows(2).all(|pair| pair[0] == pair[1]),
+        "every later PATCH is a ledger-only elapsed advance: {patches:?}"
+    );
 
     // Control: the same loop is listening — a read that changes the ledger
-    // PATCHes right away.
+    // PATCHes right away. The retirement's transition is ONE PATCH: the
+    // remaining subagent's clock is frozen, so no refresh can follow it.
     script_transcript(
         &backend,
         vec![
             SessionTranscript::new(two_task_timeline(vec![]))
                 .with_executions(vec![execution(2_500)])
                 .with_wakes(vec![shell_wake(2_900)])
-                .with_background_tasks(vec![live_subagent(sub_started, "call_sub")]),
+                .with_background_tasks(vec![live_subagent(frozen_start(now), "call_sub")]),
         ],
     )
     .await;
@@ -1662,6 +1740,19 @@ async fn repeated_reads_inside_the_same_rendered_second_patch_nothing() {
         !card_text(card).contains("· shell：gh run watch")
     })
     .await;
+    // Several more passes (the injected cadence is 20 ms) must add nothing: the
+    // frozen clock renders the same ledger, so the retirement is one PATCH.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let patches = patches_to(&platform, "om_waiting").await;
+    let event = patches
+        .iter()
+        .position(|patch| card_text(patch).contains("🔔 后台任务完成：gh run watch"))
+        .expect("the retirement PATCHed");
+    assert_eq!(
+        event,
+        patches.len() - 1,
+        "the retirement is one PATCH and nothing follows it: {patches:?}"
+    );
 }
 
 /// Acceptance 3 (#423): elapsed refresh is SECOND-granular and driven by the
@@ -1709,7 +1800,9 @@ async fn a_waiting_cards_elapsed_refreshes_on_the_rendered_second() {
 
     // Over the next 2.5 s every advanced rendered second PATCHes — at most one
     // per second, never one per 20 ms read — and the card's rendered elapsed
-    // ends well past the yield's.
+    // ends well past the yield's. Every one of those PATCHes is the same card
+    // with a later second: the wait's header stays and nothing but the row's
+    // elapsed differs.
     tokio::time::sleep(Duration::from_millis(2_500)).await;
     let patches = patches_to(&platform, "om_waiting").await;
     let advanced = patches.len() - moved;
@@ -1717,6 +1810,17 @@ async fn a_waiting_cards_elapsed_refreshes_on_the_rendered_second() {
         (2..=6).contains(&advanced),
         "one PATCH per advanced rendered second (~2-3 in 2.5 s), not per read: {advanced} in {:?}",
         platform.updated_cards().await
+    );
+    assert!(
+        patches
+            .iter()
+            .all(|patch| card_header(patch).contains("等待后台任务")),
+        "a ledger-only refresh never restyles the card: {patches:?}"
+    );
+    let normalized: Vec<String> = patches.iter().map(text_ignoring_elapsed).collect();
+    assert!(
+        normalized.windows(2).all(|pair| pair[0] == pair[1]),
+        "every later PATCH is a ledger-only elapsed advance: {patches:?}"
     );
     let last = platform.updated_cards().await.last().cloned().unwrap();
     let last_elapsed = elapsed_secs(&ledger_elapsed(&last, "· shell：gh run watch · "));
@@ -1730,14 +1834,15 @@ async fn a_waiting_cards_elapsed_refreshes_on_the_rendered_second() {
 /// post a new card even when its entry tips the estimate over the split budget
 /// — the corner is reachable, since a completion entry outweighs the row it
 /// replaces. The entry here carries a pathological id so that delta alone
-/// crosses the budget deterministically; every refresh of the waiting card is
-/// in place, the card keeps its own header (never 「部分完成，继续中…」) and
-/// nothing is posted.
+/// crosses the budget deterministically; the waiting card's ONE in-place PATCH
+/// keeps its own header (never 「部分完成，继续中…」) and nothing is posted.
 #[tokio::test]
 async fn a_ledger_only_refresh_never_splits_the_waiting_card() {
     let _wd = test_work_dir();
     let now = chrono::Utc::now().timestamp_millis();
-    let sub_started = now - 4_000;
+    // The subagent stays live across the retirement, with a frozen clock, so
+    // the event's PATCH count is deterministic.
+    let sub_started = frozen_start(now);
     let live = waiting_shell_and_subagent(now - 5_000, sub_started);
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
     yield_waiting_card(&app, &platform, 2).await;
@@ -1765,19 +1870,26 @@ async fn a_ledger_only_refresh_never_splits_the_waiting_card() {
     })
     .await;
 
-    // The retirement's PATCH is in place, and the chain did not move: the card
-    // keeps its waiting header instead of 「部分完成，继续中…」, and no
-    // continuation or any other card was posted. (Later reads only advance the
-    // remaining row's rendered second; every one of them stays in place.)
+    // The retirement is exactly ONE in-place PATCH, and the chain did not move:
+    // give the loop several more passes (the injected cadence is 20 ms) and
+    // count — the remaining subagent's clock is frozen, so no later read can
+    // PATCH. The card keeps its waiting header instead of 「部分完成，继续中…」,
+    // and no continuation or any other card was posted.
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let patches = patches_to(&platform, "om_waiting").await;
-    let updated = patches.first().expect("the oversized entry PATCHed");
-    assert!(
-        patches.iter().all(|patch| !card_header(patch).contains("继续中")),
-        "a ledger-only refresh never finalizes the card: {patches:?}"
+    assert_eq!(
+        patches.len(),
+        1,
+        "the oversized entry is one in-place PATCH, never a split: {patches:?}"
     );
+    let updated = &patches[0];
     assert!(
         card_header(updated).contains("等待后台任务"),
         "the card keeps its own header: {updated}"
+    );
+    assert!(
+        !card_header(updated).contains("继续中"),
+        "a ledger-only refresh never finalizes the card: {updated}"
     );
     let text = card_text(updated);
     assert!(
@@ -1803,7 +1915,9 @@ async fn a_ledger_only_refresh_never_splits_the_waiting_card() {
 async fn a_quiet_retirement_survives_a_later_takeover() {
     let _wd = test_work_dir();
     let now = chrono::Utc::now().timestamp_millis();
-    let sub_started = now - 4_000;
+    // The subagent stays live across the retirement, with a frozen clock, so
+    // the retirement and the collect are the card's only PATCHes.
+    let sub_started = frozen_start(now);
     let live = waiting_shell_and_subagent(now - 5_000, sub_started);
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
     yield_waiting_card(&app, &platform, 2).await;
@@ -1825,6 +1939,16 @@ async fn a_quiet_retirement_survives_a_later_takeover() {
         card_text(card).contains("🔔 后台任务完成：gh run watch")
     })
     .await;
+    // The retirement is exactly ONE PATCH: several more passes (the injected
+    // cadence is 20 ms) with the remaining subagent's clock frozen must add
+    // nothing.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        patches_to(&platform, "om_waiting").await.len(),
+        1,
+        "the retirement is one PATCH: {:?}",
+        platform.updated_cards().await
+    );
 
     // The user posts again: the new Turn collects the waiting card, dropping
     // its live list — the entry stays.
@@ -1842,13 +1966,25 @@ async fn a_quiet_retirement_survives_a_later_takeover() {
     second.cola_message_id = Some("msg_cola_next".into());
     Turn::run(&app.turn_handles(), second).await.unwrap();
 
-    // The collect is the waiting card's LAST PATCH: the retirement's own
-    // in-place PATCH (and the second-tick refreshes that followed) came first.
+    // The collect is the second and LAST PATCH: a few more passes after it
+    // (the card is collected, the remaining clock frozen) add nothing.
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let patches = patches_to(&platform, "om_waiting").await;
-    let collected = patches.last().expect("the collect PATCHed the waiting card");
+    assert_eq!(
+        patches.len(),
+        2,
+        "the retirement and the collect are the waiting card's PATCHes: {patches:?}"
+    );
+    let retirement = &patches[0];
+    assert!(
+        card_text(retirement).contains("🔔 后台任务完成：gh run watch")
+            && card_header(retirement).contains("等待后台任务"),
+        "the retirement is the first PATCH: {retirement}"
+    );
+    let collected = &patches[1];
     assert!(
         card_header(collected).contains("已由新消息接管"),
-        "the collect is the waiting card's last PATCH: {patches:?}"
+        "the collect is the waiting card's last PATCH: {collected}"
     );
     assert!(
         !card_text(collected).contains("后台任务（"),
