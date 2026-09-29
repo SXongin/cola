@@ -378,9 +378,16 @@ async fn push_queued_receipts(cards: &CardsHandle, session_id: &str) {
         if card.pending_split[i].receipt_pushed {
             continue;
         }
-        let receipt = card.pending_split[i].kind.receipt();
+        let kind = card.pending_split[i].kind;
+        let line = card.pending_split[i].line.clone();
         card.acc
-            .push_receipt_at(card.pending_split[i].receipt_at, receipt);
+            .push_receipt_at(line.as_ref().map(|line| line.at), kind.receipt());
+        if let Some(wake) = line.as_ref().and_then(|line| line.wake.as_deref()) {
+            // The 承接 line announces this Wake's completion: mark it, so the
+            // merged-path receipt (a Wake that resumes an already-live card)
+            // cannot double it.
+            card.acc.announce_wake(wake);
+        }
         card.pending_split[i].receipt_pushed = true;
     }
 }

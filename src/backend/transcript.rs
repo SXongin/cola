@@ -501,6 +501,12 @@ pub struct Wake {
     /// The finished task's state as the Wake reported it (`completed`,
     /// `cancelled`, `error`), when it reported one.
     pub state: Option<String>,
+    /// The finished work's label as the Wake's OWN text named it: the shell
+    /// command from `<shell … command="…">`, or the subagent's task
+    /// description from `<subagent … description="…">`. `None` when the
+    /// payload carried none — the label is never invented from the Wake's
+    /// prose, and a receipt then claims only that something finished.
+    pub label: Option<String>,
 }
 
 impl Wake {
@@ -1140,6 +1146,7 @@ mod tests {
             job_id: Some("sh_bg".into()),
             child_id: None,
             state: Some("completed".into()),
+            label: Some("gh run watch".into()),
         }
     }
 

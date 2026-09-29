@@ -621,15 +621,43 @@ fn decode_wake(message: &Value) -> Option<Wake> {
         return None;
     }
     let metadata = non_null(message.get("metadata"));
+    let source = decode_wake_source(metadata);
     Some(Wake {
         id: message_id(message),
         created_ms: message.pointer("/time/created").and_then(Value::as_i64),
-        source: decode_wake_source(metadata),
+        label: decode_wake_label(message, &source),
+        source,
         shell_id: string_field(metadata, "shellID"),
         job_id: string_field(metadata, "jobID"),
         child_id: string_field(metadata, "childID"),
         state: string_field(metadata, "state"),
     })
+}
+
+/// The finished work's label the Wake's own text named, when it named one: the
+/// shell command (`<shell … command="…">`) or the subagent's task description
+/// (`<subagent … description="…">`). The label is the backend's own tag
+/// attribute — never taken from the Wake's prose — and any other source has
+/// none.
+fn decode_wake_label(message: &Value, source: &WakeSource) -> Option<String> {
+    let text = message.get("text").and_then(Value::as_str)?;
+    match source {
+        WakeSource::Shell => tag_attribute(text, "shell", "command"),
+        WakeSource::Subagent => tag_attribute(text, "subagent", "description"),
+        _ => None,
+    }
+}
+
+/// The value of one `name="…"` attribute in `text`'s opening `tag`, when the
+/// payload named it. A tiny quote-aware scan, not a parser: the Wake text is
+/// the backend's own fixed tag shape (`<shell … command="…">`), and the value
+/// is read up to its closing quote, so a command containing `>` or spaces
+/// survives.
+fn tag_attribute(text: &str, tag: &str, attribute: &str) -> Option<String> {
+    let rest = &text[text.find(&format!("<{tag}"))?..];
+    let needle = format!("{attribute}=\"");
+    let value = &rest[rest.find(&needle)? + needle.len()..];
+    Some(value[..value.find('"')?].to_string())
 }
 
 /// A Wake's source: the marker the backend wrote (`metadata.source`, or the
@@ -1589,6 +1617,58 @@ mod tests {
         })
     }
 
+    /// The Wake label is the Wake text's OWN tag attribute — the recorded
+    /// subagent read names the task in the text (`description="…"`), not in
+    /// the message's top-level `description` (which is the Wake's own prose) —
+    /// and a source that has no label, or a text that names none, stays `None
+    /// forever: the merged receipt never invents detail.
+    #[test]
+    fn a_wake_label_comes_from_its_own_tag_attribute() {
+        // The recorded subagent read: the text attribute wins.
+        let data = fixture_data(&crate::opencode::wire::v2_subagent_wake());
+        let transcript = decode_messages(&data);
+        let subagent = transcript
+            .wakes
+            .iter()
+            .find(|wake| wake.source == WakeSource::Subagent)
+            .expect("the fixture carries a subagent wake");
+        assert_eq!(subagent.label.as_deref(), Some("live-harness-task-a"));
+
+        // The recorded interruption continuation: correct source, no label.
+        let data = fixture_data(&crate::opencode::wire::v2_interrupt_continuation());
+        let transcript = decode_messages(&data);
+        assert!(
+            transcript.wakes.iter().all(|wake| wake.label.is_none()),
+            "an interruption continuation names no task: {:#?}",
+            transcript.wakes
+        );
+
+        // A shell Wake whose text names no command, and one whose command
+        // carries spaces and `>`: read up to the closing quote.
+        let mut no_command = synthetic_wake(
+            "msg_wake_none",
+            1_000,
+            serde_json::json!({"source": "shell", "shellID": "sh_1"}),
+        );
+        no_command["text"] = Value::String("<shell id=\"sh_1\" state=\"completed\">".into());
+        let transcript = decode_messages(&[no_command]);
+        assert_eq!(transcript.wakes[0].label, None);
+
+        let mut redirects = synthetic_wake(
+            "msg_wake_redirect",
+            1_000,
+            serde_json::json!({"source": "shell", "shellID": "sh_2"}),
+        );
+        redirects["text"] = Value::String(
+            "<shell id=\"sh_2\" command=\"sh -c 'echo hi > /tmp/x' &amp;&amp; true\">\nout\n</shell>".into(),
+        );
+        let transcript = decode_messages(&[redirects]);
+        assert_eq!(
+            transcript.wakes[0].label.as_deref(),
+            Some("sh -c 'echo hi > /tmp/x' &amp;&amp; true")
+        );
+    }
+
     /// A read made of one assistant message carrying `part` plus every `wake`,
     /// decoded in server order.
     fn read_with(part: Value, wakes: Vec<Value>) -> SessionTranscript {
@@ -1630,6 +1710,9 @@ mod tests {
         assert_eq!(wake.job_id.as_deref(), Some("sh_fixture_retired"));
         assert_eq!(wake.state.as_deref(), Some("completed"));
         assert!(wake.child_id.is_none());
+        // The label is the Wake text's own `command` attribute, for the merged
+        // receipt's copy.
+        assert_eq!(wake.label.as_deref(), Some("sleep 2; echo live-harness-tool"));
 
         // Both backgrounded runs are in the read's messages...
         let started: Vec<&str> = transcript

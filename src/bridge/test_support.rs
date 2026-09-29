@@ -107,7 +107,8 @@ pub(crate) fn background_shell(started_at: i64) -> BackgroundTask {
     }
 }
 
-/// The shell completion Wake that retires [`background_shell`].
+/// The shell Wake that retires [`background_shell`], carrying the command
+/// label the Wake's own text names.
 pub(crate) fn shell_wake(created_ms: i64) -> Wake {
     Wake {
         id: MessageId::new(format!("msg_wake_{created_ms}")),
@@ -117,6 +118,22 @@ pub(crate) fn shell_wake(created_ms: i64) -> Wake {
         job_id: Some("sh_bg".into()),
         child_id: None,
         state: Some("completed".into()),
+        label: Some("gh run watch".into()),
+    }
+}
+
+/// A subagent completion Wake with the task description its text names, for the
+/// merged-receipt copy (`🔔 子代理完成：…`).
+pub(crate) fn subagent_wake(created_ms: i64, description: &str) -> Wake {
+    Wake {
+        id: MessageId::new(format!("msg_wake_sub_{created_ms}")),
+        created_ms: Some(created_ms),
+        source: WakeSource::Subagent,
+        shell_id: None,
+        job_id: None,
+        child_id: Some("ses_child".into()),
+        state: Some("completed".into()),
+        label: Some(description.into()),
     }
 }
 

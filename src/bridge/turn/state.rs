@@ -235,8 +235,9 @@ pub(super) struct PendingSplit {
     /// instead of cola's "now": a Wake continuation's 承接 line precedes work
     /// whose server times are already in the past at poll time (ADR-0059).
     /// `None` — every Supplement and `/card` pull — keeps the
-    /// resolution-moment key, unchanged.
-    pub(super) receipt_at: Option<i64>,
+    /// resolution-moment key, unchanged. The line also names the Wake it
+    /// covers, marked so the merged-path receipt cannot double it.
+    pub(super) line: Option<super::ContinuationLine>,
 }
 
 /// One live card per session: the streaming accumulator plus the card identity
@@ -557,6 +558,13 @@ pub(super) struct StreamAccumulator {
     /// Retry, whatever the previous attempt's facts were. Set by
     /// [`Self::continue_on_new_card`] and by a fresh (restart) arm.
     pub(super) wake_continuation: bool,
+    /// The Wakes whose completion this chain has already announced: marked by
+    /// its own opening 承接 line (a Wake that opened a card) or by the
+    /// merged-path receipt (a shell/subagent Wake that resumed an already-live
+    /// card). One mark per Wake id; the set is kept across
+    /// [`Self::continue_on_new_card`], so a Wake that resumes a
+    /// wake-continuation card still marks exactly once (ADR-0059).
+    pub(super) announced_wakes: std::collections::HashSet<String>,
     /// The Turn's anchor, captured as one fact: the identity of the user
     /// message this turn answers together with that message's server time. An
     /// external render arms with the external message's anchor directly; a
@@ -859,6 +867,13 @@ impl StreamAccumulator {
     pub(super) fn push_receipt_at(&mut self, at_ms: Option<i64>, text: &str) {
         let key = at_ms.unwrap_or_else(|| self.next_order());
         self.insert_kind(key, None, TimelineKind::Receipt(text.to_string()));
+    }
+
+    /// Mark `wake_id`'s completion as announced on this chain — by the opening
+    /// 承接 line or by the merged-path receipt. Returns false when it already
+    /// was: the exactly-once gate both paths honour (ADR-0059).
+    pub(super) fn announce_wake(&mut self, wake_id: &str) -> bool {
+        self.announced_wakes.insert(wake_id.to_string())
     }
 
     /// Replace a question block's display state (the live 已选/✅ markers) in
