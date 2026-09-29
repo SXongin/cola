@@ -1410,7 +1410,7 @@ async fn a_merged_shell_wake_leaves_one_entry_on_the_live_turn_card() {
     let turn = spawn_turn(&app, ctx("ses_test", "跑一下 CI"));
     wait_for_card_update(&platform, "the live ledger row", CardUpdates::Any, |card| {
         let text = card_text(card);
-        text.contains("⏳ 后台任务（1）") && text.contains("· shell：gh run watch")
+        text.contains("⏳ 后台任务（1）") && text.contains("· shell：**gh run watch**")
     })
     .await;
 
