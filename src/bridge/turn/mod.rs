@@ -1457,8 +1457,10 @@ impl Turn {
     /// retired quietly (its Wake's resumed run renders nothing, so no
     /// continuation is owed) leaves the live list while its fixed completion
     /// entry arrives on the host card, an elapsed row moves when a whole
-    /// minute turns, and an unchanged read leaves the card completely alone —
-    /// no PATCH at all, so its header, timeline and footer stay frozen.
+    /// minute turns, and an unchanged read leaves the card otherwise alone —
+    /// no PATCH at all, so its header, timeline and footer stay frozen. The one
+    /// exception is the read below: a read whose ledger did not change can
+    /// still be the true end, and that read PATCHes the card as it settles.
     ///
     /// The same read is also the true end's judge (ADR-0060): when it shows
     /// the last Background Task retired, the card settles in place — ✅ when
