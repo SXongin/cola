@@ -2486,6 +2486,20 @@ impl Turn {
             .is_some_and(|card| card.acc.card_state.is_render_owned())
     }
 
+    /// Whether `session_id`'s card yielded to live Background Tasks
+    /// (ADR-0059): not terminal, but owned by no renderer — only the quiet
+    /// true end settles it, once the last task retires (ADR-0060). A `/stop`
+    /// cannot be stamped on such a card promptly, so the command acks the
+    /// deferred ending instead of leaving the operator with nothing to see.
+    pub(crate) async fn card_is_waiting(cards: &CardsHandle, session_id: &str) -> bool {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|card| card.acc.card_state == crate::feishu::card::CardState::Waiting)
+    }
+
     /// `session_id`'s chain identity, when it has a card session — the Wake
     /// continuation loop's ownership guard. A Wake continues the SAME Turn, so
     /// its accumulator's anchor cannot tell its loop apart from a new Turn's;
