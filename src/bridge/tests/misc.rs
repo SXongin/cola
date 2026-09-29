@@ -1,5 +1,7 @@
 use crate::bridge::command::*;
 use crate::bridge::test_support::*;
+use crate::bridge::turn::Turn;
+use crate::feishu::card::CardState;
 
 /// `/model`, `/agent`, `/stop` and `/compact` used to silently no-op on a
 /// thread with no mapped session; they now reply a hint instead.
@@ -58,6 +60,123 @@ async fn a_failed_stop_rolls_back_only_its_own_marker() {
             "preset={preset}: a failed stop must roll back only the marker it inserted"
         );
     }
+}
+
+/// A `/stop` with a mapped session but no live card (an idle session) has
+/// nothing to finalize, so the command itself says what happened. The
+/// interrupt still goes out: the run may be live server-side even when cola's
+/// card is not.
+#[tokio::test]
+async fn a_stop_without_a_live_card_replies_that_nothing_ran() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let interrupt_calls = backend.interrupt_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+
+    send_command_in(
+        &app,
+        "/stop",
+        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+        "msg_stop",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    assert_eq!(
+        interrupt_calls.lock().await.as_slice(),
+        &["ses_test".to_string()],
+        "the interrupt still goes out with no live card"
+    );
+    let texts = platform.texts().await.join("\n");
+    assert!(
+        texts.contains(NO_RUNNING_TASK),
+        "an invisible stop must say what happened: {texts}"
+    );
+}
+
+/// The same reply covers a card that is already terminal: it will never stamp
+/// the stop, and no running turn may be implied. The command leaves it alone.
+#[tokio::test]
+async fn a_stop_over_a_terminal_card_replies_that_nothing_ran() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let interrupt_calls = backend.interrupt_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+    Turn::seed_card(&app.cards_handle(), "ses_test", Some("om_card")).await;
+    Turn::set_card_state(&app.cards_handle(), "ses_test", CardState::Done).await;
+
+    send_command_in(
+        &app,
+        "/stop",
+        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+        "msg_stop",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    assert_eq!(
+        interrupt_calls.lock().await.as_slice(),
+        &["ses_test".to_string()],
+        "the interrupt still goes out over a terminal card"
+    );
+    let texts = platform.texts().await.join("\n");
+    assert!(
+        texts.contains(NO_RUNNING_TASK),
+        "a terminal card cannot render the stop: {texts}"
+    );
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done),
+        "a terminal card is never restamped by the command"
+    );
+}
+
+/// A `/stop` over a card that yielded 「⏳ 等待后台任务」 must ack: the Turn has
+/// no render loop, and the card only settles at the quiet true end — after the
+/// last Background Task retires (ADR-0059/0060) — so the command names the
+/// ending that will land then and leaves the card waiting.
+#[tokio::test]
+async fn a_stop_over_a_waiting_card_acks_the_deferred_settle() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let interrupt_calls = backend.interrupt_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+    Turn::seed_card(&app.cards_handle(), "ses_test", Some("om_card")).await;
+    Turn::set_card_state(&app.cards_handle(), "ses_test", CardState::Waiting).await;
+
+    send_command_in(
+        &app,
+        "/stop",
+        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+        "msg_stop",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    assert_eq!(
+        interrupt_calls.lock().await.as_slice(),
+        &["ses_test".to_string()],
+        "the interrupt still goes out over a waiting card"
+    );
+    let texts = platform.texts().await.join("\n");
+    assert!(
+        texts.contains(STOPPED_WAITING),
+        "a deferred settle must be acked: {texts}"
+    );
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "the command does not restamp the waiting card — the quiet true end does"
+    );
 }
 
 /// A reply injects its parent's text as Quoted Context, prefixed ahead of

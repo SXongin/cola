@@ -123,6 +123,19 @@ pub(crate) const TOPIC_ADOPT_NEST_REJECTION: &str =
 /// card.
 const NO_LIVE_CARD: &str = "当前没有正在运行的实时卡片。";
 
+/// `/stop` with no live card to finalize (an idle session, or a card already
+/// at a terminal): nothing will render the stop, so the command itself says
+/// what happened. With a render-owned card the reply is suppressed — its
+/// settle loop stamps 「⏹ 已停止」 in place (#394), and that card IS the
+/// acknowledgement.
+pub(crate) const NO_RUNNING_TASK: &str = "当前没有正在执行的任务。";
+
+/// `/stop` on a card that yielded 「⏳ 等待后台任务」 (ADR-0059/0060): the Turn
+/// has no render loop to stamp the stop promptly, and the card only settles at
+/// the quiet true end — once the last Background Task retires — so the command
+/// acks and names the ending that will land then.
+pub(crate) const STOPPED_WAITING: &str = "⏹ 已停止等待；后台任务结束后卡片会标记为已停止。";
+
 /// What `/switch` should do (ADR-0012). The text-direct forms all share the
 /// session store; the no-arg form pops the interactive card.
 #[derive(Debug, Clone, PartialEq)]
@@ -851,6 +864,20 @@ pub(crate) async fn handle_command(
         }
         Command::Stop => {
             if let Some(id) = handles.flow.sessions.get_session_id(&thread_key).await {
+                // What the card will do with the stop decides the ack, read
+                // BEFORE the marker/interrupt round-trip: a render-owned card
+                // (a live Turn, follow or external renderer) is stamped
+                // 「⏹ 已停止」 by that owner on its next tick (#394) and IS the
+                // acknowledgement; a Waiting card has no render owner and only
+                // settles at the quiet true end (ADR-0060), so it needs an ack
+                // naming that ending; anything else (no card, terminal card)
+                // will never show the stop. The pre-stop read is deliberate —
+                // after the interrupt a render-owned card may already be
+                // stamped, and a post-read could not tell that from a card
+                // that was terminal all along.
+                let cards = &handles.flow.cards;
+                let render_owned = crate::bridge::turn::Turn::card_is_owned(cards, &id).await;
+                let waiting = !render_owned && crate::bridge::turn::Turn::card_is_waiting(cards, &id).await;
                 // Mark the session stopped BEFORE the interrupt round-trip: the
                 // abort settles the run server-side, and a drain/follow tick
                 // that observes that settled run can beat the marker back and
@@ -867,11 +894,13 @@ pub(crate) async fn handle_command(
                     }
                     return Err(e);
                 }
-                handles
-                    .flow
-                    .platform
-                    .reply_text(message_id, "Interrupted.")
-                    .await?;
+                // One reply per state (the consts carry the rationale). The
+                // interrupt still ran in every arm: the run may be live
+                // server-side even when cola's card is not.
+                if !render_owned {
+                    let text = if waiting { STOPPED_WAITING } else { NO_RUNNING_TASK };
+                    handles.flow.platform.reply_text(message_id, text).await?;
+                }
             } else {
                 handles
                     .flow

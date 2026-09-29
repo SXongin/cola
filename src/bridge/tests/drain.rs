@@ -496,8 +496,8 @@ async fn stop_ends_the_drain_promptly() {
         "the drain must end promptly after /stop"
     );
     assert!(
-        platform.texts().await.iter().any(|t| t.contains("Interrupted")),
-        "the command reply still lands: {:?}",
+        platform.texts().await.is_empty(),
+        "a stop with a live card sends no text reply — the card's 已停止 is the acknowledgement: {:?}",
         platform.calls.lock().await
     );
     let final_card = platform.updated_cards().await.last().cloned().unwrap();
@@ -871,8 +871,8 @@ async fn stop_during_the_follow_finalizes_promptly() {
         "a stopped card must not offer a retry: {final_card}"
     );
     assert!(
-        platform.texts().await.iter().any(|t| t.contains("Interrupted")),
-        "the command reply still lands: {:?}",
+        platform.texts().await.is_empty(),
+        "a followed stop sends no text reply either — the finalized card carries 已停止: {:?}",
         platform.calls.lock().await
     );
     assert_no_further_rendering(&backend, &platform).await;
