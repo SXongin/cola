@@ -83,10 +83,26 @@ pub(crate) fn task_ledger_text(rows: &[TaskLedgerRow], now_ms: i64) -> Option<St
     Some(text)
 }
 
+/// Estimated serialized size (bytes) of the ledger section, for the card
+/// splitter's tail reserve: the header, one row per task with its clipped
+/// label and a short elapsed tail, plus the element overhead. Rough like the
+/// Bridge's `panel_estimate` for the tail's other sections, but owned here so
+/// the estimate and [`task_ledger_text`] cannot drift apart — both clip a
+/// label at [`TASK_LABEL_CHARS`].
+pub(crate) fn task_ledger_estimate(rows: &[TaskLedgerRow]) -> usize {
+    let first_n_bytes = |s: &str, n: usize| s.chars().take(n).map(|c| c.len_utf8()).sum::<usize>();
+    let labels: usize = rows
+        .iter()
+        .filter_map(|row| row.label.as_deref())
+        .map(|label| first_n_bytes(label, TASK_LABEL_CHARS))
+        .sum();
+    300 + labels + rows.len() * 120
+}
+
 /// The ledger row's elapsed: bare, with no Chinese label (ADR-0060) — `3m12s`,
 /// `1m05s` under an hour, `1h05m` above it. Seconds are zero-padded so the
 /// rows stay visually aligned; the minutes above an hour are too.
-pub(crate) fn fmt_task_elapsed(secs: u64) -> String {
+fn fmt_task_elapsed(secs: u64) -> String {
     if secs < 3600 {
         format!("{}m{:02}s", secs / 60, secs % 60)
     } else {
@@ -199,6 +215,29 @@ mod tests {
         assert!(
             task_ledger_text(&rows, 1_000).unwrap().ends_with(" · 0m00s"),
             "a skewed clock must not render a negative age"
+        );
+    }
+
+    /// The estimate is clipped like the render it estimates: a label longer
+    /// than the cap costs no more than a capped one, and each task adds a row.
+    #[test]
+    fn the_estimate_clips_labels_like_the_render() {
+        let row = |label: String| TaskLedgerRow {
+            kind: TaskKind::Shell,
+            label: Some(label),
+            started_at: None,
+        };
+        let long = row("x".repeat(TASK_LABEL_CHARS + 500));
+        let capped = row("x".repeat(TASK_LABEL_CHARS));
+        assert_eq!(
+            task_ledger_estimate(&[long]),
+            task_ledger_estimate(std::slice::from_ref(&capped)),
+            "the estimate must not grow past the rendered clip"
+        );
+        let pair = [capped.clone(), capped.clone()];
+        assert!(
+            task_ledger_estimate(&pair) > task_ledger_estimate(std::slice::from_ref(&capped)),
+            "each task adds a row to the estimate"
         );
     }
 }

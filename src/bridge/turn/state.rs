@@ -97,30 +97,6 @@ fn panel_estimate(p: &ToolPanel) -> usize {
     400 + input + output
 }
 
-/// Estimated serialized size (bytes) of the Background Task Ledger section
-/// (ADR-0060): the header, one row per task with its clipped label and a short
-/// elapsed tail, plus the element overhead. Rough like [`panel_estimate`],
-/// with a margin over the real serialized row so a full card splits before the
-/// ledger pushes it over Feishu's cap.
-fn ledger_estimate(rows: &[TaskLedgerRow]) -> usize {
-    let labels: usize = rows
-        .iter()
-        .map(|row| {
-            row.label
-                .as_deref()
-                .map(|label| {
-                    label
-                        .chars()
-                        .take(crate::feishu::card::ledger::TASK_LABEL_CHARS)
-                        .map(|c| c.len_utf8())
-                        .sum::<usize>()
-                })
-                .unwrap_or(0)
-        })
-        .sum();
-    300 + labels + rows.len() * 120
-}
-
 /// A permission request surfaced inline on the streaming card (instead of a
 /// separate card), so the whole turn lives on ONE card.
 #[derive(Debug, Clone)]
@@ -1463,7 +1439,7 @@ impl StreamAccumulator {
             }
             if !self.ledger.is_empty() {
                 comps += 1;
-                size += ledger_estimate(&self.ledger);
+                size += crate::feishu::card::ledger::task_ledger_estimate(&self.ledger);
             }
             for call_id in self.live_tools.keys() {
                 if let Some(panel) = self.tools.get(call_id) {
