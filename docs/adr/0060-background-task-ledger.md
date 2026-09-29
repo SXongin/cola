@@ -41,7 +41,7 @@ live Tool Panels (ADR-0045): a folded-by-default collapsible panel titled
 how many tasks are running, and a stable `element_id` keeps the reader's fold
 state across re-renders — whose body is one row per task, the pinned copy
 `· shell：**npm run build** · 14:02 · 3m12s` / `· 子代理：**review the diff** ·
-14:03 · 1m05s`: the type word plain, the label bolded and clipped, then the
+14:04 · 1m05s`: the type word plain, the label bolded and clipped, then the
 task's server `started_at` as local `HH:MM` and the bare elapsed. The label is
 joined from the tool part's input by `call_id` (shell: `command`/`description`;
 `subagent` needs its own rendering arm), clipped like the receipt; elapsed is
@@ -166,10 +166,11 @@ review round as the amendment above):
   is bolded, the start clock is the task's server `started_at` in local
   `HH:MM` (the completion entry body's clock), and the elapsed format is
   unchanged (`3m12s` / `1h05m`). No label or no start omits its part whole.
-- A label's own `*`/`_` become their numeric entities before the `**…**` wrap,
-  so a command cannot close the span or bleed formatting into the next row
-  (Feishu decodes the entities back to the literal characters — the same
-  mechanism as the `<` escape). The clip is unchanged: `TASK_LABEL_CHARS`
+- A label's own `&`, `*` and `_` become their numeric entities before the
+  `**…**` wrap (`&` first, so a label carrying entity text of its own stays
+  literal), so a command cannot close the span or bleed formatting into the
+  next row (Feishu decodes the entities back to the literal characters — the
+  same mechanism as the `<` escape). The clip is unchanged: `TASK_LABEL_CHARS`
   characters plus the `…` marker, inside the bold.
 - Identity and icons stay out of the live row: Feishu cards have no hover
   tooltips, and future task types have no recognizable glyphs. The completion

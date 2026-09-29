@@ -617,11 +617,14 @@ mod tests {
     fn task_ledger_renders_where_it_is_called() {
         use crate::feishu::card::ledger::{TASK_LEDGER_ELEMENT_ID, TaskKind, TaskLedgerRow};
 
-        let now = chrono::Utc::now().timestamp_millis();
+        // A fixed server start: the row's start clock is the task's own
+        // `started_at`, so it renders exactly (only the elapsed depends on the
+        // build clock).
+        let start = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
         let rows = vec![TaskLedgerRow {
             kind: TaskKind::Shell,
             label: Some("a <number_tag> | b".into()),
-            started_at: Some(now),
+            started_at: Some(start),
         }];
         let card = CardBuilder::new()
             .with_state(CardState::Streaming)
@@ -641,14 +644,17 @@ mod tests {
         assert_eq!(panel["header"]["title"]["content"], "⏳ 后台任务（1）");
         let body = panel["elements"][0]["content"].as_str().unwrap();
         let row = body.lines().next().expect("the row");
-        let clock = row
+        let (clock, elapsed) = row
             .strip_prefix("· shell：**a &#60;number&#95;tag> | b** · ")
-            .and_then(|rest| rest.strip_suffix(" · 0m00s"))
-            .unwrap_or_else(|| panic!("the row carries the clock and the elapsed: {row:?}"));
+            .and_then(|rest| rest.split_once(" · "))
+            .unwrap_or_else(|| panic!("the row carries its clock and elapsed: {row:?}"));
         assert_eq!(
-            (clock.len(), &clock[2..3]),
-            (5, ":"),
-            "the start clock is a local HH:MM: {clock:?}"
+            clock, "14:02",
+            "the start clock is the row's own fixed started_at: {row:?}"
+        );
+        assert!(
+            matches!(elapsed.chars().last(), Some('s' | 'm')),
+            "the bare elapsed follows the clock: {row:?}"
         );
         assert!(
             !body.contains("后台任务（"),

@@ -18,7 +18,12 @@
 //! - markdown images become plain links (an image key must be uploaded by the
 //!   app; the model cannot hold one, so `![…](…)` is always an invalid key),
 //! - markdown tables beyond the per-card budget or over the row cap are
-//!   wrapped in a code fence, where Feishu counts no tables and no rows.
+//!   wrapped in a code fence, where Feishu counts no tables and no rows,
+//! - the numeric entities that neutralize markdown emphasis inside a span that
+//!   must stay intact (the **Background Task Ledger**'s bold label): `&` becomes
+//!   [`AMPERSAND_ESCAPE`] FIRST, then `*`/`_` become [`ASTERISK_ESCAPE`] /
+//!   [`UNDERSCORE_ESCAPE`], so a label's own entity text is not decoded into a
+//!   new construct and a command cannot close its `**…**` wrap.
 //!
 //! One instance is one card build: the table budget is per card, shared by
 //! every element and panel the build emits.
@@ -37,6 +42,21 @@ pub(crate) const MAX_TABLE_ROWS: usize = 49;
 
 /// Feishu's documented escape for a literal `<` in card markdown.
 const LESS_THAN_ESCAPE: &str = "&#60;";
+
+/// The numeric entity for a literal `*` in card markdown: Feishu decodes it
+/// back to the character, so text can sit inside an emphasis span without
+/// opening or closing one.
+pub(crate) const ASTERISK_ESCAPE: &str = "&#42;";
+
+/// The numeric entity for a literal `_` in card markdown — the emphasis
+/// character's partner of [`ASTERISK_ESCAPE`].
+pub(crate) const UNDERSCORE_ESCAPE: &str = "&#95;";
+
+/// The numeric entity for a literal `&` in card markdown. Applied BEFORE
+/// [`ASTERISK_ESCAPE`] / [`UNDERSCORE_ESCAPE`], so a piece of text carrying
+/// entity syntax of its own (`&#42;`, `&amp;`) renders those characters
+/// literally instead of being decoded into a construct.
+pub(crate) const AMPERSAND_ESCAPE: &str = "&amp;";
 
 /// Sanitize a single markdown element for its own card — for one-shot cards
 /// whose text never shares a table budget with other elements (notifications,
