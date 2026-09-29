@@ -4,7 +4,8 @@
 //! retried on every sweep: without a latch, a condition that keeps failing — a
 //! missing Feishu scope, a chat the bot cannot pin in — WARNs on every tick for
 //! as long as it lasts. The latch keys its state by condition (the Chat/Topic
-//! for the reminder, the message for the pin) and applies the level policy: the
+//! for the reminder, the message for the pin, the session directory for the
+//! request sweep's list calls) and applies the level policy: the
 //! first failure for a key, and any changed error, logs WARN once with the
 //! cause and the actionable scope; an identical repeat logs DEBUG; a success
 //! after a failure logs INFO. Retry cadence and the best-effort decision stay
@@ -60,6 +61,15 @@ impl FailureLatch {
         if self.warned.remove(key).is_some() {
             tracing::info!("{} recovered", condition_label(what, key));
         }
+    }
+
+    /// Drop every condition `keep` rejects, WITHOUT logging: a condition that
+    /// left the caller's watch set (a session directory whose mapping was
+    /// forgotten) is not a recovery and must not be remembered — a later
+    /// recurrence is a fresh failure that WARNs again, and the map cannot grow
+    /// with conditions the caller no longer watches.
+    pub(crate) fn retain(&mut self, keep: impl Fn(&str) -> bool) {
+        self.warned.retain(|key, _| keep(key));
     }
 }
 
@@ -195,5 +205,42 @@ mod tests {
             "each key warns on its own first failure:\n{logs}"
         );
         assert_eq!(level_count(&logs, "recovered", "INFO"), 1, "{logs}");
+    }
+
+    /// A condition dropped from the watch set is forgotten WITHOUT a recovery
+    /// line: its next failure is a fresh WARN, while a still-watched key stays
+    /// latched (identical repeats stay DEBUG).
+    #[tokio::test]
+    async fn a_retained_out_condition_forgets_its_latch_silently() {
+        let mut latch = FailureLatch::default();
+        let (_, logs) = capture_logs(async {
+            latch.failed("dir_a", "poll 权限", "", "boom");
+            latch.failed("dir_b", "poll 权限", "", "boom");
+            latch.retain(|key| key == "dir_a");
+            // The retained-out key is gone: its success is silent (nothing
+            // latched) and its next failure is a fresh WARN.
+            latch.succeeded("dir_b", "poll 权限");
+            latch.failed("dir_b", "poll 权限", "", "boom");
+            // The still-watched key stays latched: the identical repeat is
+            // DEBUG, not another WARN.
+            latch.failed("dir_a", "poll 权限", "", "boom");
+        })
+        .await;
+
+        assert_eq!(
+            level_count(&logs, "failed", "WARN"),
+            3,
+            "dir_a's first, dir_b's first, and dir_b's fresh failure after retention:\n{logs}"
+        );
+        assert_eq!(
+            level_count(&logs, "still failing", "DEBUG"),
+            1,
+            "dir_a stays latched (DEBUG); dir_b was forgotten:\n{logs}"
+        );
+        assert_eq!(
+            level_count(&logs, "recovered", "INFO"),
+            0,
+            "a retained-out condition is not a recovery:\n{logs}"
+        );
     }
 }
