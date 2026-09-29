@@ -19,6 +19,7 @@
 //! did before, and V1 (which carries no Background Task facts) never shows
 //! one.
 
+use super::sanitize::{AMPERSAND_ESCAPE, ASTERISK_ESCAPE, UNDERSCORE_ESCAPE};
 use super::{first_n_chars_bytes, fmt_local_time, truncate_md};
 
 /// Characters of a task label the ledger row shows before clipping — shared
@@ -145,7 +146,7 @@ pub(crate) fn task_ledger_title(rows: &[TaskLedgerRow]) -> Option<String> {
 ///
 /// ```text
 /// · shell：**npm run build** · 14:02 · 3m12s
-/// · 子代理：**review the diff** · 14:03 · 1m05s
+/// · 子代理：**review the diff** · 14:04 · 1m05s
 /// ```
 ///
 /// `None` when no task is live (the title's own emptiness rule, kept here so
@@ -209,15 +210,19 @@ fn folded_label(label: &str) -> String {
 }
 
 /// The live row's label: the shared folded/clipped shape ([`folded_label`])
-/// wrapped in the row's bold markers, with the label's own `*`/`_` swapped for
-/// their numeric entities so a command can never close the span or bleed
-/// formatting into the next row. Feishu decodes the entities back to the
-/// literal characters (the same mechanism as the `<` escape), so the label
-/// reads unchanged while exactly one bold span exists per row. The completion
-/// entry's title is plain text and keeps [`folded_label`] raw — nothing there
-/// interprets markdown.
+/// wrapped in the row's bold markers, with the label's own `&` / `*` / `_`
+/// swapped for the sanitizer's numeric entities so a command can never close
+/// the span or bleed formatting into the next row. `&` goes first: a label
+/// carrying entity text of its own renders it literally instead of seeding a
+/// new construct. Feishu decodes the entities back to the characters, so the
+/// label reads unchanged while exactly one bold span exists per row. The
+/// completion entry's title is plain text and keeps [`folded_label`] raw —
+/// nothing there interprets markdown.
 fn bold_label(label: &str) -> String {
-    let escaped = folded_label(label).replace('*', "&#42;").replace('_', "&#95;");
+    let escaped = folded_label(label)
+        .replace('&', AMPERSAND_ESCAPE)
+        .replace('*', ASTERISK_ESCAPE)
+        .replace('_', UNDERSCORE_ESCAPE);
     format!("**{escaped}**")
 }
 
@@ -355,40 +360,77 @@ mod tests {
         );
     }
 
-    /// A label's own emphasis characters cannot bleed out of its bold span: the
-    /// row swaps `*`/`_` for their numeric entities before the `**…**` wrap, so
-    /// exactly one bold span exists per row whatever the command contains (the
-    /// completion entry's plain-text title keeps the raw label).
+    /// A label's own markdown characters cannot bleed out of its bold span:
+    /// the row swaps `&` first, then `*`/`_`, for the sanitizer's numeric
+    /// entities before the `**…**` wrap, so exactly one bold span exists per
+    /// row whatever the command contains, and a label carrying entity text of
+    /// its own (`&#42;`, `&amp;`) renders that text literally once decoded
+    /// instead of seeding a construct. The completion entry's plain-text title
+    /// keeps the raw label.
     #[test]
-    fn a_labels_emphasis_characters_stay_inside_its_bold_span() {
-        let rows = vec![TaskLedgerRow {
-            kind: TaskKind::Shell,
-            label: Some("git log --format=*_*_* -- foo_bar".into()),
-            started_at: None,
-        }];
-        let row = task_ledger_text(&rows, 0).unwrap();
+    fn a_labels_markdown_characters_stay_inside_its_bold_span() {
+        let render = |label: &str| {
+            task_ledger_text(
+                &[TaskLedgerRow {
+                    kind: TaskKind::Shell,
+                    label: Some(label.into()),
+                    started_at: None,
+                }],
+                0,
+            )
+            .unwrap()
+        };
+
+        // `*`/`_` are neutralized inside the wrap.
+        let row = render("git log --format=*_*_* -- foo_bar");
         assert_eq!(
             row, "· shell：**git log --format=&#42;&#95;&#42;&#95;&#42; -- foo&#95;bar**",
             "only the entities replace the characters"
         );
-        assert_eq!(
-            row.matches("**").count(),
-            2,
-            "one bold span is its two markers, nothing for a command to close: {row}"
-        );
+        // `&` goes first: a label's own entity text stays literal text once
+        // decoded (`&amp;#42;` → `&#42;`), never a new emphasis character.
+        let entity = render("echo &#42; & done");
+        assert_eq!(entity, "· shell：**echo &amp;#42; &amp; done**");
+        // The order matters when a label holds both characters: with the
+        // escape applied to `*` first, `a*b` would become `a&amp;#42;b` and
+        // decode to the entity text instead of the star.
+        assert_eq!(render("a*b & c"), "· shell：**a&#42;b &amp; c**");
+
+        for label in [
+            "git log --format=*_*_* -- foo_bar",
+            "echo &#42; & done",
+            "a*b_c&d",
+        ] {
+            let row = render(label);
+            assert_eq!(
+                row.matches("**").count(),
+                2,
+                "one bold span is its two markers, nothing for a command to close: {row}"
+            );
+        }
+
         // Both the wrap and the entities run through the builder's markdown
         // sanitizer untouched (it only rewrites `<` and images).
         use crate::feishu::card::CardState;
         use crate::feishu::card::shell::CardBuilder;
 
-        let card = CardBuilder::new()
+        let rows = vec![TaskLedgerRow {
+            kind: TaskKind::Shell,
+            label: Some("git log --format=*_*_* -- foo_bar".into()),
+            started_at: None,
+        }];
+        let built = CardBuilder::new()
             .with_state(CardState::Streaming)
             .with_task_ledger(&rows)
             .build();
-        let body = card["body"]["elements"][0]["elements"][0]["content"]
+        let body = built["body"]["elements"][0]["elements"][0]["content"]
             .as_str()
             .unwrap();
-        assert_eq!(body, row, "the sanitizer leaves the row alone: {card}");
+        assert_eq!(
+            body,
+            render("git log --format=*_*_* -- foo_bar"),
+            "the sanitizer leaves the row alone: {built}"
+        );
     }
 
     /// No live task means no section — neither the title nor the body renders,

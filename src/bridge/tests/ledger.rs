@@ -2033,7 +2033,9 @@ async fn a_future_start_time_renders_zero_elapsed() {
 
     let _turn = spawn_turn(&app, ctx("ses_test", "跑一下"));
     wait_for_card_update(&platform, "the clamped elapsed", CardUpdates::Any, |card| {
-        card_text(card).contains("· shell：**npm run build** · ")
+        card_text(card)
+            .lines()
+            .any(|line| line.starts_with("· shell：**npm run build** · ") && line.ends_with("0m00s"))
     })
     .await;
     // A few more renders of the SAME task must keep rendering the same
