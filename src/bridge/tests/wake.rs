@@ -218,11 +218,17 @@ async fn a_wake_after_a_waiting_yield_continues_on_a_new_card() {
 
     spawn_sync(&app);
     wait_for_card_text(&platform, "CI 通过了。").await;
+    // The wait is tied to the CONTINUATION's own ending (lead + this test's
+    // resumed text): the earlier waiting card is not ✅ and cannot satisfy it.
     wait_for_card_update(
         &platform,
         "the continuation's done card",
         CardUpdates::Latest,
-        |card| card_header(card).contains("✅"),
+        |card| {
+            card_header(card).contains("✅")
+                && card_text(card).contains(WAKE_LEAD)
+                && card_text(card).contains("CI 通过了。")
+        },
     )
     .await;
 
@@ -377,11 +383,13 @@ async fn a_wake_after_a_restart_posts_a_continuation_card() {
     );
 
     spawn_sync(&app);
+    // A fresh app has no earlier card: the ✅ can only be the restart
+    // continuation's, and the resumed text ties the wait to it.
     wait_for_card_update(
         &platform,
         "the restart continuation's done card",
         CardUpdates::Latest,
-        |card| card_header(card).contains("✅"),
+        |card| card_header(card).contains("✅") && card_text(card).contains("CI 通过了。"),
     )
     .await;
 
@@ -758,11 +766,13 @@ async fn a_rendered_wake_is_never_re_posted() {
     let (_dir, app, _backend, platform) = scripted_app(vec![resumed], Some(SessionStatus::Idle)).await;
 
     spawn_sync(&app);
+    // The ✅ can only be this continuation's (a fresh app, one card), and the
+    // resumed text ties the wait to it.
     wait_for_card_update(
         &platform,
         "the continuation's done card",
         CardUpdates::Latest,
-        |card| card_header(card).contains("✅"),
+        |card| card_header(card).contains("✅") && card_text(card).contains("CI 通过了。"),
     )
     .await;
     let posted = continuation_sends(&platform).await.len();
@@ -903,11 +913,13 @@ async fn a_wake_clears_a_stale_stop_marker() {
     .await;
 
     spawn_sync(&app);
+    // The waiting card is not ✅; the resumed text ties the wait to the
+    // continuation that answers the stale-marker rule under test.
     wait_for_card_update(
         &platform,
         "the continuation's done card",
         CardUpdates::Latest,
-        |card| card_header(card).contains("✅"),
+        |card| card_header(card).contains("✅") && card_text(card).contains("CI 通过了。"),
     )
     .await;
 
@@ -1241,11 +1253,13 @@ async fn a_top_level_continuation_keeps_its_chain() {
     let (_dir, app, _backend, platform) = scripted_app(vec![resumed], Some(SessionStatus::Idle)).await;
 
     spawn_sync(&app);
+    // The first card hands over at 继续中 (never ✅); the long resumed text ties
+    // the wait to the top-level continuation that takes the ending.
     wait_for_card_update(
         &platform,
         "the continuation's done card",
         CardUpdates::Latest,
-        |card| card_header(card).contains("✅"),
+        |card| card_header(card).contains("✅") && card_text(card).contains("很长的回答。"),
     )
     .await;
 
