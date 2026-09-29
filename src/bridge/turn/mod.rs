@@ -2153,13 +2153,17 @@ pub(crate) enum WakeContinuation {
 
 /// The destination and identity a Wake continuation card is armed with:
 /// where it replies, its subtitle, the session's work directory (the Turn
-/// Footer) and the `/think` variant captured at arm time (ADR-0019). Grouped
-/// so the arming call stays readable.
+/// Footer), the `/think` variant captured at arm time (ADR-0019) and the
+/// Chat a top-level card's later continuations fall back to. Grouped so the
+/// arming call stays readable.
 pub(crate) struct ContinuationFacts<'a> {
     /// The Feishu message the card replies to. `None` lets the caller send at
     /// the chat top level (a restart leaves no reply target to recover); the
     /// split path needs one and resolves it before choosing that branch.
     pub(crate) reply_to: Option<&'a str>,
+    /// The Chat the card belongs to: the top-level target a size split of
+    /// this card continues into when `reply_to` is `None`.
+    pub(crate) chat_id: &'a str,
     pub(crate) subtitle: &'a str,
     pub(crate) directory: &'a str,
     pub(crate) variant: Option<String>,
@@ -2224,6 +2228,22 @@ impl Turn {
             }
         }
         let anchor = newest_wake?.anchor()?;
+        // A Wake older than the newest user message is STALE: the conversation
+        // has moved past it — a later cola life already saw or superseded it —
+        // and re-posting it after a restart would replay every turn that
+        // followed (the live 102k-char replay). The genuine restart case (the
+        // Wake's run is still pending, or it finished while cola was down) has
+        // no newer user message and still posts. Only the Fresh path needs
+        // this: a chain continuation renders just what the chain missed, so a
+        // stale Wake can never replay history through it, and the content-diff
+        // fallback (which also fires with a chain) stays untouched.
+        let stale = transcript
+            .newest_user()
+            .and_then(|message| message.time)
+            .is_some_and(|time| time.created > anchor.created_ms);
+        if stale {
+            return None;
+        }
         let probe = StreamAccumulator::new("");
         render::renders_new_content(&probe, transcript, &anchor).then_some(WakeContinuation::Fresh { anchor })
     }
@@ -2292,7 +2312,11 @@ impl Turn {
             let mut probe = acc.clone();
             probe.build_card_with_split().0
         };
-        live.insert(session_id.to_string(), state::CardSession::new(acc, None));
+        let mut session = state::CardSession::new(acc, None);
+        // A top-level card must be able to continue top-level when its run
+        // overflows one card (there is no reply target to hand over to).
+        session.fallback_chat = Some(facts.chat_id.to_string());
+        live.insert(session_id.to_string(), session);
         Some(card)
     }
 

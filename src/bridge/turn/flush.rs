@@ -273,19 +273,31 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str) {
         // split in `build_finalized_handoff` — so this card renders only the
         // delta after it (the receipts included), never the prior content
         // again.
-        let reply_to = match pending_split.last() {
-            // A supplement split anchors its chain at the NEWEST supplement:
-            // one continuation serves the whole queued batch.
-            Some(split) => Some(split.reply_to.clone()),
-            None => {
-                let cards = cards.cards.lock().await;
-                cards
-                    .get(session_id)
-                    .and_then(|c| c.acc.reply_to_message_id.clone())
+        //
+        // Where it goes: the newest queued split's message, else the chain's
+        // own reply target, else — a top-level Wake continuation armed after a
+        // restart, which has no user message to reply to — the Chat the card
+        // was sent to. Only when neither is known does the chain stop: nothing
+        // can reach a card that answers nowhere.
+        let (reply_to, fallback_chat) = {
+            let live = cards.cards.lock().await;
+            let card = live.get(session_id);
+            match pending_split.last() {
+                // A supplement split anchors its chain at the NEWEST
+                // supplement: one continuation serves the whole queued batch.
+                Some(split) => (Some(split.reply_to.clone()), None),
+                None => (
+                    card.and_then(|c| c.acc.reply_to_message_id.clone()),
+                    card.and_then(|c| c.fallback_chat.clone()),
+                ),
             }
         };
-        let Some(reply_to) = reply_to else { return };
-        match cards.feishu.reply_card(&reply_to, &built.card).await {
+        let sent = match (reply_to.as_deref(), fallback_chat.as_deref()) {
+            (Some(reply_to), _) => cards.feishu.reply_card(reply_to, &built.card).await,
+            (None, Some(chat)) => cards.feishu.send_card("chat_id", chat, &built.card).await,
+            (None, None) => return,
+        };
+        match sent {
             Ok(new_id) => {
                 {
                     let mut cards = cards.cards.lock().await;
