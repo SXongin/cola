@@ -167,6 +167,25 @@ seconds) — a job-level skip leaves the matrix unexpanded or the required
 `Live V1`/`Live V2` checks unreported, so only their steps are gated.
 `Dependency audit` always runs, and the release cut keeps its CodeQL gate.
 
+### Security scanning alerts
+
+CodeQL runs on `main` pushes, PRs and a weekly schedule, but on normal PRs it is
+advisory (above). Its credential and cleartext findings on this repo fall into
+two known, deliberate categories — dismiss them with the matching reason instead
+of "fixing" the code:
+
+- **Test-only values** — fixture passwords in `#[cfg(test)]` code and the
+  ignored live harness (`src/opencode/live/`). Reason: *used in tests*.
+- **cola's own server bootstrap** — the fixed password passed to the
+  self-spawned `opencode serve --hostname 127.0.0.1` (ADR-0013), which must stay
+  stable across restarts. Reason: *won't fix*.
+
+A genuine scanner mis-read (e.g. an empty string flowing into a password
+parameter) is *false positive*. Never obfuscate a literal (`concat!`, runtime
+assembly) to silence the scanner: that trades a visible, triaged alert for a
+hidden one. OpenSSF Scorecard findings follow ADR-0034 — several are deliberate
+no-s; do not "fix" them without revisiting that ADR.
+
 Description template:
 
 ```markdown
