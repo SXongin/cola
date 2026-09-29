@@ -137,6 +137,32 @@ pub(crate) fn subagent_wake(created_ms: i64, description: &str) -> Wake {
     }
 }
 
+/// The one user-facing marker a Wake continuation opens with (the 承接 line) —
+/// what the platform-call helpers key on to recognise a continuation card.
+pub(crate) const WAKE_LEAD: &str = "已恢复执行";
+
+/// Every card SEND (a reply or a top-level send) carrying the Wake
+/// continuation's 承接 line, in call order. A re-post would be another SEND,
+/// while the render updates the one continuation card in place many times —
+/// so this is the counter for "was a new continuation card posted?", never
+/// `updated_cards` nor a payload scan that also sees PATCHes.
+pub(crate) async fn continuation_sends(platform: &RecordingPlatform) -> Vec<serde_json::Value> {
+    platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|call| match call {
+            PlatformCall::ReplyCard { card, .. } | PlatformCall::SendCard { card, .. }
+                if card_text(card).contains(WAKE_LEAD) =>
+            {
+                Some(card.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// A recorded `reply_question` call: (request_id, answers).
 type QuestionReplyRecord = (String, Vec<Vec<String>>);
 
