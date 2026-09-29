@@ -6,9 +6,12 @@
 //! Active Session — `/switch` away (or `/switch forget`) — collects it as
 //! 「⏳ 已切换会话 · 后台任务仍在运行」. Neither collect sends a Completion
 //! Notice (the notice belongs to a true end), the collected card stops
-//! updating, and the background work itself is unaffected: a later Wake still
-//! continues the chain on a new card, and switching back reports the Session
-//! through the ADR-0028 snapshot.
+//! updating, and the background work itself is unaffected: a Wake that lands
+//! while the Session is away renders nothing during the absence, and when the
+//! Session becomes the thread's Active Session again, Session Sync's Wake pass
+//! continues the newest chain on a new card — one continuation for the missed
+//! work, exactly once. Switching back reports the Session through the ADR-0028
+//! snapshot (possibly its suppressed one-line state).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -86,6 +89,26 @@ async fn patches_to(platform: &RecordingPlatform, message_id: &str) -> Vec<serde
                 message_id: mid,
                 card,
             } if mid == message_id => Some(card.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every card SEND (reply or top-level) carrying the Wake continuation's 承接
+/// line, in call order. A re-post would be another send, while the render
+/// updates the one continuation card in place many times.
+async fn continuation_sends(platform: &RecordingPlatform) -> Vec<serde_json::Value> {
+    platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|call| match call {
+            PlatformCall::ReplyCard { card, .. } | PlatformCall::SendCard { card, .. }
+                if card_text(card).contains(WAKE_LEAD) =>
+            {
+                Some(card.clone())
+            }
             _ => None,
         })
         .collect()
@@ -427,9 +450,11 @@ async fn forgetting_a_session_collects_its_waiting_card() {
     );
 }
 
-/// Acceptance 3: after switching back the Session Snapshot reports the
-/// Session's current state, and a later Wake still continues the collected
-/// chain on a new card — the collected card itself never updates again.
+/// Acceptance 3: a Wake that lands while the Session is away renders nothing
+/// during the absence; after switching back the Session Snapshot reports the
+/// Session's current state, and Session Sync's Wake pass continues the
+/// collected chain on a new card — exactly one continuation, never re-posted
+/// by a later pass, the collected card itself never updating again.
 #[tokio::test]
 async fn a_collected_chain_still_takes_a_wake_after_switching_back() {
     let _wd = test_work_dir();
@@ -447,8 +472,19 @@ async fn a_collected_chain_still_takes_a_wake_after_switching_back() {
     );
     assert!(!noticed(&platform).await, "the collect sends no notice");
 
-    // ...and switching back reports the Session: an external newest user makes
-    // the ADR-0028 re-switch snapshot emit its full 切换 card rather than the
+    // ...and the Wake lands while the Session is NOT active: Session Sync is
+    // polling the thread, but nothing renders for the absent Session.
+    script_transcript(&backend, vec![resumed_transcript()]).await;
+    spawn_sync(&app);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        continuation_sends(&platform).await.is_empty(),
+        "a Wake on a non-active Session must not render during the absence: {:?}",
+        platform.calls.lock().await
+    );
+
+    // Switching back reports the Session: an external newest user makes the
+    // ADR-0028 re-switch snapshot emit its full 切换 card rather than the
     // suppressed one-line state.
     script_transcript(&backend, vec![external_newest_transcript()]).await;
     send_command(&app, "/switch ses_test", "msg_switch_back").await;
@@ -465,7 +501,6 @@ async fn a_collected_chain_still_takes_a_wake_after_switching_back() {
     // The Wake resumes the Session: its continuation is a new card below the
     // collected chain, and the collected card keeps its ending untouched.
     script_transcript(&backend, vec![resumed_transcript()]).await;
-    spawn_sync(&app);
     wait_for_card_update(&platform, "the Wake's done card", CardUpdates::Latest, |card| {
         card_header(card).contains("✅")
     })
@@ -479,6 +514,22 @@ async fn a_collected_chain_still_takes_a_wake_after_switching_back() {
     assert!(
         card_text(&rendered).contains("CI 通过了。"),
         "the continuation renders the resumed work: {rendered}"
+    );
+
+    // Exactly one continuation for the missed work; a later Session Sync pass
+    // over the same read must not re-post it.
+    assert_eq!(
+        continuation_sends(&platform).await.len(),
+        1,
+        "the missed Wake renders exactly one continuation: {:?}",
+        platform.calls.lock().await
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        continuation_sends(&platform).await.len(),
+        1,
+        "later Session Sync passes must not re-post the rendered Wake: {:?}",
+        platform.calls.lock().await
     );
     assert_eq!(
         patches_to(&platform, "om_waiting").await.len(),

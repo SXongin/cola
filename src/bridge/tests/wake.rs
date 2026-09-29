@@ -652,8 +652,9 @@ async fn a_wake_when_the_newest_user_message_is_external_stays_unrendered() {
     );
 }
 
-/// Acceptance 5b: a Wake on a non-active Session is never rendered — ADR-0017's
-/// no-interleaving scope is unchanged.
+/// Acceptance 5b: a Wake on a non-active Session is not rendered while it is
+/// away — ADR-0017's no-interleaving scope is unchanged. The missed Wake
+/// renders when the Session becomes active again (collect.rs).
 #[tokio::test]
 async fn a_wake_on_a_non_active_session_is_not_rendered() {
     let _wd = test_work_dir();

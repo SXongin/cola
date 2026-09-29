@@ -55,9 +55,15 @@ onto the V1-shaped one.**
   bound (a `gh run watch` may take an hour); a long-lived task holds the Turn
   until either the next user message supersedes it — the waiting card collects
   as 「⏳ 部分完成 · 已由新消息接管」 — or the Session stops being the thread's
-  Active Session — it collects as 「⏳ 已切换会话 · 后台任务仍在运行」 and the
-  return relies on the ADR-0028 snapshot (ADR-0017's no-interleaving rule is
-  unchanged).
+  Active Session — it collects as 「⏳ 已切换会话 · 后台任务仍在运行」. While the
+  Session is not active, no Wake is rendered for it (ADR-0017's no-interleaving
+  rule is unchanged): nothing is posted during the absence. When it becomes the
+  thread's Active Session again, Session Sync's Wake pass renders the missed
+  Wake on the newest card chain as a continuation card — one continuation for
+  the missed work, exactly once (later passes must not re-post it). The Session
+  Snapshot keeps its state/navigation role and may be suppressed by ADR-0028
+  when the recent life is already in the thread; the continuation card, not the
+  snapshot, carries the missed content.
 
   One settle decision (`SessionTranscript::settle`) serves every ending — the
   drain, the out-of-turn follow and the Wake continuation. It reads the read's
