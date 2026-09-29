@@ -40,7 +40,7 @@ use crate::backend::SessionTranscript;
 use crate::error::Result;
 
 use super::strategy::GenerationStrategy;
-use super::transport::{Transport, body_preview, read_failure};
+use super::transport::{Transport, body_preview, read_failure, read_failure_quiet};
 use super::types::{
     AgentInfo, FormAnswer, FormValue, ImageInput, ModelInfo, PermissionRequest, ProviderModels,
     QuestionRequest, SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
@@ -325,7 +325,7 @@ impl GenerationStrategy for V2Strategy {
         let url = location_url(&http.url(PERMISSION_REQUEST), directory)?;
         let resp = http.client().get(url).send().await?;
         if !resp.status().is_success() {
-            return Err(read_failure(resp, "permission list").await);
+            return Err(read_failure_quiet(resp, "permission list").await);
         }
         let page: wire::DataEnvelope<Vec<wire::RawPermission>> = resp.json().await?;
         Ok(page
@@ -346,7 +346,7 @@ impl GenerationStrategy for V2Strategy {
         let url = location_url(&http.url(FORM), directory)?;
         let resp = http.client().get(url).send().await?;
         if !resp.status().is_success() {
-            return Err(read_failure(resp, "form list").await);
+            return Err(read_failure_quiet(resp, "form list").await);
         }
         let page: wire::DataEnvelope<Vec<wire::RawForm>> = resp.json().await?;
         Ok(page.data.into_iter().map(wire::RawForm::into_neutral).collect())

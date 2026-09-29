@@ -87,6 +87,18 @@ pub struct RequestFlow {
     /// Replaced wholesale, and only when no directory failed — unknown is never
     /// read as resolved (#130), exactly like the reminder's own rule.
     pending_sessions: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Directories whose list call failed while the path was already gone from
+    /// disk (#421). The server boots a directory's instance on every request,
+    /// and `FileSystem.realPath` fails on a missing path, so a retry can never
+    /// succeed — the sweep stops calling until the path exists again. The
+    /// entries stay mapped, and a skipped directory still counts as FAILED
+    /// (#130), so its pending state is never read as resolved.
+    dead_dirs: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// The ADR-0048 warn-once policy for per-directory list failures: the first
+    /// failure WARNs with its cause, an identical repeat is DEBUG, and a
+    /// recovery logs INFO. Without it a persistently failing directory WARNed
+    /// on every 3 s tick.
+    list_failures: Arc<Mutex<crate::bridge::failure_latch::FailureLatch>>,
     /// The persisted surface mirror (ADR-0038 restart re-adoption): every
     /// standalone card this flow sends is written through, and its persisted
     /// records seed [`Self::recovered`] at startup.
@@ -143,6 +155,8 @@ impl RequestFlow {
             question_state: Arc::new(Mutex::new(HashMap::new())),
             answered_results: Arc::new(Mutex::new(HashMap::new())),
             pending_sessions: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            dead_dirs: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            list_failures: Arc::new(Mutex::new(crate::bridge::failure_latch::FailureLatch::default())),
             surfaces,
             recovered: Arc::new(Mutex::new(recovered)),
         }
@@ -523,8 +537,27 @@ impl RequestFlow {
         // Directories that DID list successfully this sweep, remembered on the
         // flow so a later late click can classify a missing state entry.
         let mut listed_now: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let what = format!("poll {}", self.kind.label());
         for dir in &directories {
             let backend = handles.backend.clone().for_directory(dir);
+            // #421: a directory whose last list failed while the path was
+            // already gone from disk can never list again — the server boots
+            // the directory's instance on every request and `realPath` fails
+            // on a missing path — so the call is skipped until the path
+            // exists again. It still counts as a FAILED directory: unknown is
+            // never read as resolved (#130). The check runs AFTER a failure,
+            // not before every call: ADR-0046 rejected per-row filesystem
+            // checks for the `/dir` card, and here one stat replaces the next
+            // tick's doomed HTTP call.
+            if self.dead_dirs.lock().await.contains(dir) {
+                if !std::path::Path::new(dir).exists() {
+                    failed_dirs.insert(dir.clone());
+                    continue;
+                }
+                // The path is back: poll it again (a failure re-marks it if
+                // the path is gone once more).
+                self.dead_dirs.lock().await.remove(dir);
+            }
             // Bound the list call: a server restart can leave an in-flight
             // request on a half-open connection, and without a timeout the
             // poller would sit on it forever (no cards, no auto-accept).
@@ -538,12 +571,16 @@ impl RequestFlow {
             {
                 Some(listed) => listed,
                 None => {
+                    // `bounded_call` already logged this one line, and unlike
+                    // the structural 500 below a timeout is transient — the
+                    // next tick retries and the connection may heal.
                     failed_dirs.insert(dir.clone());
                     continue;
                 }
             };
             match listed {
                 Ok(requests) => {
+                    self.list_failures.lock().await.succeeded(dir, &what);
                     listed_now.insert(dir.clone());
                     for req in &requests {
                         pending.insert(req.id().to_string());
@@ -572,8 +609,24 @@ impl RequestFlow {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("poll {} ({}): {}", self.kind.label(), dir, e);
                     failed_dirs.insert(dir.clone());
+                    if std::path::Path::new(dir).exists() {
+                        // Transient (or unknown): retry next tick, WARN once
+                        // per distinct cause and DEBUG the identical repeats
+                        // (ADR-0048).
+                        self.list_failures.lock().await.failed(dir, &what, "", e);
+                    } else {
+                        // Structural: the path is gone, so no retry can
+                        // succeed (#421). Stop calling until it returns; the
+                        // WARN names the state change.
+                        self.dead_dirs.lock().await.insert(dir.clone());
+                        self.list_failures.lock().await.failed(
+                            dir,
+                            &what,
+                            "",
+                            format!("{e}; the directory is gone — skipping it until it returns"),
+                        );
+                    }
                 }
             }
         }
@@ -767,6 +820,21 @@ impl RequestFlow {
             let mut known = self.listed_dirs.lock().await;
             known.retain(|dir| directories.contains(dir));
             known.extend(listed_now);
+        }
+        // #421: a dead directory whose mapping was removed from the store (it
+        // was forgotten) is dropped with it; a still-mapped one stays dead
+        // until its path returns. The failure latch is pruned the same way: a
+        // forgotten condition must not suppress the next WARN, and neither map
+        // grows with directories no longer watched.
+        {
+            self.dead_dirs
+                .lock()
+                .await
+                .retain(|dir| directories.contains(dir));
+            self.list_failures
+                .lock()
+                .await
+                .retain(|dir| directories.iter().any(|mapped| mapped == dir));
         }
         // #130: forget question state whose request left the pending list —
         // the flip side of the stale-card / inline / claim cleanups above.

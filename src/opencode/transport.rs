@@ -40,9 +40,28 @@ pub(crate) fn body_preview(body: &str) -> &str {
 /// (and none of them silently writes to stderr). The returned error names the
 /// operation and the status; its callers log it and surface a fixed card.
 pub(crate) async fn read_failure(response: reqwest::Response, what: &str) -> crate::error::BridgeError {
+    read_failure_with(response, what, true).await
+}
+
+/// [`read_failure`] with its body diagnostic at DEBUG instead of WARN: the
+/// pending-request list reads use it because their caller — the request
+/// sweep — owns the one WARN per directory through its failure latch (#421).
+/// A WARN here too would make a single failed list cost two WARN lines every
+/// tick, and the sweep's line is the one that names the directory.
+pub(crate) async fn read_failure_quiet(response: reqwest::Response, what: &str) -> crate::error::BridgeError {
+    read_failure_with(response, what, false).await
+}
+
+/// The shared body of the two variants: `warn` picks the diagnostic's level
+/// (the returned error never carries the body — it may be surfaced to users).
+async fn read_failure_with(response: reqwest::Response, what: &str, warn: bool) -> crate::error::BridgeError {
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
-    tracing::warn!("{what} failed: {status} — body: {}", body_preview(&body));
+    if warn {
+        tracing::warn!("{what} failed: {status} — body: {}", body_preview(&body));
+    } else {
+        tracing::debug!("{what} failed: {status} — body: {}", body_preview(&body));
+    }
     crate::error::BridgeError::OpenCode(format!("{what} failed: {status}"))
 }
 

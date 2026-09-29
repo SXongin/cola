@@ -25,7 +25,7 @@ use crate::backend::SessionTranscript;
 use crate::error::Result;
 
 use super::strategy::GenerationStrategy;
-use super::transport::{REPLY_TIMEOUT, Transport, read_failure};
+use super::transport::{REPLY_TIMEOUT, Transport, read_failure, read_failure_quiet};
 use super::types::{
     AgentInfo, FormAnswer, FormFieldKind, ImageInput, ModelInfo, ModelOption, PermissionRequest,
     ProviderModels, QuestionInfo, QuestionOption, QuestionRequest, SessionInfo, SessionListInfo,
@@ -281,7 +281,7 @@ impl GenerationStrategy for V1Strategy {
         }
         let resp = http.client().get(url).send().await?;
         if !resp.status().is_success() {
-            return Err(read_failure(resp, "permission list").await);
+            return Err(read_failure_quiet(resp, "permission list").await);
         }
         let wire: Vec<WirePermission> = resp.json().await?;
         Ok(wire.into_iter().map(WirePermission::into_neutral).collect())
@@ -411,7 +411,7 @@ impl GenerationStrategy for V1Strategy {
         }
         let resp = http.client().get(url).send().await?;
         if !resp.status().is_success() {
-            return Err(read_failure(resp, "question list").await);
+            return Err(read_failure_quiet(resp, "question list").await);
         }
         let wire: Vec<WireQuestion> = resp.json().await?;
         Ok(wire.into_iter().map(WireQuestion::into_neutral).collect())

@@ -629,8 +629,15 @@ pub(crate) async fn approve_pending_for_session(
     session_id: &str,
     directory: &str,
 ) -> Vec<String> {
-    let Ok(perms) = backend.clone().for_directory(directory).list_permissions().await else {
-        return Vec::new();
+    let perms = match backend.clone().for_directory(directory).list_permissions().await {
+        Ok(perms) => perms,
+        Err(e) => {
+            // The read's body diagnostic rides at DEBUG (its poll caller owns
+            // the WARN); this one-shot approval path must not drop the failure
+            // silently.
+            tracing::warn!("auto-accept: listing pending permissions failed: {e}");
+            return Vec::new();
+        }
     };
     let mut approved = Vec::new();
     for p in &perms {
