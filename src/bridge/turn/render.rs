@@ -10,12 +10,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::Instrument;
 
-use crate::backend::{Part, SessionTranscript, ToolStatus, TurnAnchor, Wake, WakeSource};
+use crate::backend::{BackgroundTask, Part, SessionTranscript, ToolStatus, TurnAnchor, Wake, WakeSource};
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
 use crate::bridge::handles::{CardsHandle, RequestsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
 use crate::bridge::turn::state::{RenderedPart, StreamAccumulator};
 use crate::config::ThreadKey;
+use crate::feishu::card::ledger::{TASK_LABEL_CHARS, TaskKind, TaskLedgerRow};
 use crate::feishu::card::tool_render::{ChildActivity, TaskLiveness};
 
 use super::Turn;
@@ -271,7 +272,9 @@ pub(super) fn capture_footer_model(acc: &mut StreamAccumulator, message: &crate:
 }
 
 /// How much of a Wake's label the merged-path receipt shows: one short line.
-const RECEIPT_LABEL_CHARS: usize = 60;
+/// The Background Task Ledger's rows clip their labels at the same length
+/// (ADR-0060), so one label has one visible length wherever it renders.
+const RECEIPT_LABEL_CHARS: usize = TASK_LABEL_CHARS;
 
 /// The merged-path completion receipt for a Wake whose work resumes a card
 /// that is already live (ADR-0059): one short, mechanical line, because the
@@ -295,6 +298,68 @@ fn wake_receipt(wake: &Wake) -> Option<String> {
         ),
         None => format!("🔔 {noun}"),
     })
+}
+
+/// The live Background Task ledger a transcript read owes the card
+/// (ADR-0060): one row per live task, in the read's own (transcript) order,
+/// each labelled from the input of the tool part that started it — joined by
+/// the task's `call_id` over the WHOLE read, because a task can outlive the
+/// Turn that started it. The read is the authority: a task a Wake retired is
+/// no longer in `background_tasks`, so its row leaves the section.
+fn ledger_rows(transcript: &SessionTranscript) -> Vec<TaskLedgerRow> {
+    // The common case (V1, or a session with no live task) does no scan: an
+    // empty read clears an empty ledger, so nothing can owe a flush.
+    if transcript.background_tasks.is_empty() {
+        return Vec::new();
+    }
+    let inputs: std::collections::HashMap<&str, &serde_json::Value> = transcript
+        .messages
+        .iter()
+        .flat_map(|message| &message.parts)
+        .filter_map(|part| match part {
+            Part::Tool(call) => call
+                .input
+                .as_ref()
+                .map(|input| (call.identity.call_id.as_str(), input)),
+            _ => None,
+        })
+        .collect();
+    transcript
+        .background_tasks
+        .iter()
+        .map(|task| TaskLedgerRow {
+            kind: match task.tool.name.as_str() {
+                "subagent" => TaskKind::Subagent,
+                _ => TaskKind::Shell,
+            },
+            label: task_label(task, inputs.get(task.tool.call_id.as_str()).copied()),
+            started_at: task.started_at,
+        })
+        .collect()
+}
+
+/// The label the originating tool part's input names for `task`: the shell's
+/// `command` (or its `description` when the payload carries no command), the
+/// subagent's `description` — the `subagent` arm nothing else needed. `None`
+/// when the input names no label, so the row renders bare rather than
+/// inventing one (the receipt's own rule).
+fn task_label(task: &BackgroundTask, input: Option<&serde_json::Value>) -> Option<String> {
+    let label = match task.tool.name.as_str() {
+        "shell" => input
+            .and_then(|input| input.get("command"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                input
+                    .and_then(|input| input.get("description"))
+                    .and_then(serde_json::Value::as_str)
+            }),
+        "subagent" => input
+            .and_then(|input| input.get("description"))
+            .and_then(serde_json::Value::as_str),
+        _ => None,
+    }?;
+    let label = label.trim();
+    (!label.is_empty()).then(|| label.to_string())
 }
 
 /// Insert a merged-path receipt for every Wake whose resumed work this render
@@ -334,7 +399,8 @@ fn render_wake_receipts(
 }
 
 /// Render the parts of this turn's assistant messages that haven't been
-/// rendered yet. Returns true if anything new was rendered.
+/// rendered yet, and refresh the live Background Task ledger from the read.
+/// Returns true if anything new was rendered.
 ///
 /// Turn membership is the Session Transcript's shared `turn_for_user`
 /// projection, anchored on the Turn's own anchor — the SERVER's message
@@ -388,6 +454,11 @@ pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &Se
             }
         }
     }
+    // The live Background Task Ledger (ADR-0060) rides the card tail this
+    // render feeds. The transcript read is its authority, and a membership
+    // change must flush even when no part moved, so it counts as rendered
+    // content.
+    rendered_any |= acc.set_ledger(ledger_rows(transcript));
     rendered_any
 }
 

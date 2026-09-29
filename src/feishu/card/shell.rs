@@ -1,6 +1,7 @@
 use serde_json::json;
 
 use super::MAX_ELEMENT_TEXT_CHARS;
+use super::ledger::{TaskLedgerRow, task_ledger_text};
 use super::sanitize::CardMarkdown;
 use super::tool_render::{ToolPanel, tool_panel_element};
 use super::{
@@ -231,6 +232,19 @@ impl CardBuilder {
     #[cfg(test)]
     pub fn with_tool(self, tool: ToolPanel) -> Self {
         self.with_tool_at(tool, None, None)
+    }
+
+    /// The Background Task Ledger section (ADR-0060): a Session's live
+    /// Background Tasks as one card-tail markdown element, in the order given
+    /// (the transcript's own). Pushed where the caller calls it, so the tail's
+    /// section order stays the accumulator's; a no-op while no task is live,
+    /// so an empty ledger never leaves an empty header.
+    pub fn with_task_ledger(mut self, rows: &[TaskLedgerRow]) -> Self {
+        if let Some(text) = task_ledger_text(rows, chrono::Utc::now().timestamp_millis()) {
+            let content = self.markdown.element(&text);
+            self.body.push(json!({ "tag": "markdown", "content": content }));
+        }
+        self
     }
 
     /// The Turn's globally running tool for the header, preferred over this
@@ -570,6 +584,43 @@ mod tests {
             content.contains("&#60;number_tag>") && content.contains("&#60;link>"),
             "reasoning markdown is escaped: {content}"
         );
+    }
+
+    /// The Background Task Ledger (ADR-0060): the live list is one markdown
+    /// element rendered where the caller puts it (the tail's order), and
+    /// model-authored labels are sanitized like any other card markdown.
+    #[test]
+    fn task_ledger_renders_where_it_is_called() {
+        use crate::feishu::card::ledger::{TaskKind, TaskLedgerRow};
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let rows = vec![TaskLedgerRow {
+            kind: TaskKind::Shell,
+            label: Some("a <number_tag> | b".into()),
+            started_at: Some(now),
+        }];
+        let card = CardBuilder::new()
+            .with_state(CardState::Streaming)
+            .with_text("正文")
+            .with_task_ledger(&rows)
+            .with_text("后续")
+            .build();
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 3, "{card}");
+        let content = elements[1]["content"].as_str().unwrap();
+        assert!(content.contains("⏳ 后台任务（1）"), "{content}");
+        assert!(
+            content.contains("· shell：a &#60;number_tag> | b · 0m00s"),
+            "the label is sanitized and the elapsed bare: {content}"
+        );
+        assert_eq!(elements[2]["content"], "后续");
+
+        // No live task: no element at all — an empty ledger renders nothing.
+        let bare = CardBuilder::new()
+            .with_state(CardState::Streaming)
+            .with_task_ledger(&[])
+            .build();
+        assert_eq!(bare["body"]["elements"].as_array().unwrap().len(), 0);
     }
 
     #[test]

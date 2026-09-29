@@ -1,5 +1,6 @@
 pub(crate) mod command;
 pub(crate) mod help;
+pub(crate) mod ledger;
 pub(crate) mod notify;
 pub(crate) mod picker;
 pub(crate) mod question;
