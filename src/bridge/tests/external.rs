@@ -1036,6 +1036,107 @@ async fn external_reply_render_times_out_and_finalizes_partial_content() {
     );
 }
 
+/// A deliberate `/stop` on a live EXTERNAL run finalizes the notification card
+/// ⏹ 已停止, never ✅ (#394) — the external renderer owns that card, so it must
+/// hold up the "a render-owned card stamps the stop" invariant the command
+/// relies on. A stale marker from before the run is dropped when the renderer
+/// arms (the same rule a fresh Turn applies), or an earlier stop would end a
+/// healthy new turn.
+#[tokio::test]
+async fn external_reply_render_honors_a_stop_and_drops_a_stale_marker() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.external_message("OpenChamber 里发的消息");
+    // A partial reply with NO step-finish: the turn never completes, so only
+    // the stop can end the render (the production render timeout stays long).
+    mock.external_reply(vec![
+        Part::StepStart(StepStart),
+        Part::Reasoning(ReasoningPart {
+            text: "我在想。".into(),
+            started_at: None,
+        }),
+        text_part("部分回答。"),
+    ])
+    .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (app, platform) = build_app(cfg, mock).await;
+
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
+            session_id: "ses_ext".into(),
+            directory: "/tmp/ext".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+    app.external
+        .poll_interval_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
+    app.external
+        .render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    let watermark = chrono::Utc::now().timestamp_millis() - 60_000;
+    app.external
+        .last_user_msg_epoch
+        .lock()
+        .await
+        .insert("ses_ext".into(), watermark);
+
+    // A stop from BEFORE this run: arming must drop it, or the renderer would
+    // stamp ⏹ over a healthy new turn on its first tick.
+    app.stopped_sessions.lock().await.insert("ses_ext".to_string());
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            let _ = app.external.poll_loop(&app.flow_handles()).await;
+        }
+    });
+    wait_for_card_update(
+        &platform,
+        "the streamed external reply",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("部分回答"),
+    )
+    .await;
+    assert!(
+        !app.stopped_sessions.lock().await.contains("ses_ext"),
+        "arming a new external run clears a stale stop marker"
+    );
+    let running = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        !card_header(&running).contains("已停止"),
+        "a stale marker must not end the new run: {running}"
+    );
+
+    // The operator stops THIS run: the renderer stamps the stop terminal.
+    app.stopped_sessions.lock().await.insert("ses_ext".to_string());
+    wait_for_card_update(
+        &platform,
+        "the external stop terminal",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("已停止"),
+    )
+    .await;
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_ext").await,
+        Some(crate::feishu::card::CardState::Stopped),
+        "the external renderer's stop must land as Stopped, never Done"
+    );
+    let stopped = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        !card_header(&stopped).contains("完成"),
+        "a deliberate stop is never ✅: {stopped}"
+    );
+}
+
 /// The user's external message stays ABOVE the streamed reply even though the
 /// reply's parts carry server times (the preview is keyed just before the
 /// turn's epoch): keying the whole timeline by part time must not reorder the
