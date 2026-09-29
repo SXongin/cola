@@ -94,7 +94,17 @@ onto the V1-shaped one.**
   Wake rendering applies only while the Session's newest user message is a
   Cola-Authored Message — durable authorship, so it survives a cola restart —
   and the Session is the thread's Active Session; everything else stays with
-  the external-message and snapshot flows.
+  the external-message and snapshot flows. A shell or subagent Wake whose work
+  renders into a card that is ALREADY LIVE (a running Turn's drain, its
+  follow, or a continuation card a later Wake resumes) gets one mechanical
+  completion receipt at the Wake's own server time — `🔔 后台任务完成：<command>`
+  / `🔔 子代理完成：<description>`, the label taken from the Wake text's own tag
+  attribute and clipped to a short line, bare when it names none (a Wake with
+  no server time gets no receipt at all: it cannot be ordered) — so the
+  completion is visible without depending on the model narrating it. A Wake
+  that opened a card itself is already announced by that card's 承接 line, and
+  restart or interruption Wakes keep today's behavior: exactly one mark per
+  Wake id, never double-marked.
 
 - **Card state stays in memory.** A cola restart loses live cards, as today: a
   waiting card goes stale, but the Wake path is card-independent — a Wake on a

@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::Instrument;
 
-use crate::backend::{Part, SessionTranscript, ToolStatus, TurnAnchor};
+use crate::backend::{Part, SessionTranscript, ToolStatus, TurnAnchor, Wake, WakeSource};
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
 use crate::bridge::handles::{CardsHandle, RequestsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
@@ -270,6 +270,69 @@ pub(super) fn capture_footer_model(acc: &mut StreamAccumulator, message: &crate:
     }
 }
 
+/// How much of a Wake's label the merged-path receipt shows: one short line.
+const RECEIPT_LABEL_CHARS: usize = 60;
+
+/// The merged-path completion receipt for a Wake whose work resumes a card
+/// that is already live (ADR-0059): one short, mechanical line, because the
+/// completion must not depend on the model narrating it. Only the Background
+/// Task sources get one — a restart notice or an interruption continuation
+/// keeps today's behavior — and the label is the Wake's own tag attribute
+/// ([`Wake::label`]); a Wake that named none says only what finished, never
+/// inventing detail.
+fn wake_receipt(wake: &Wake) -> Option<String> {
+    let noun = match wake.source {
+        WakeSource::Shell => "后台任务完成",
+        WakeSource::Subagent => "子代理完成",
+        WakeSource::Restart | WakeSource::Interrupt | WakeSource::Other(_) | WakeSource::Unknown => {
+            return None;
+        }
+    };
+    Some(match wake.label.as_deref().filter(|label| !label.is_empty()) {
+        Some(label) => format!(
+            "🔔 {noun}：{}",
+            crate::feishu::card::truncate_md(label, RECEIPT_LABEL_CHARS)
+        ),
+        None => format!("🔔 {noun}"),
+    })
+}
+
+/// Insert a merged-path receipt for every Wake whose resumed work this render
+/// is about to show, and report whether any was inserted (so a receipt reaches
+/// the card even when no part changed). A Wake that opened the card itself was
+/// already announced by its 承接 line, a Wake with no server time cannot be
+/// ordered, and a Wake outside this card's Turn is not this render's content —
+/// all are skipped. Each Wake marks at most once per chain
+/// ([`StreamAccumulator::announce_wake`]), so a repeated poll never doubles a
+/// receipt.
+fn render_wake_receipts(
+    acc: &mut StreamAccumulator,
+    transcript: &SessionTranscript,
+    anchor: &TurnAnchor,
+) -> bool {
+    let mut inserted = false;
+    for wake in &transcript.wakes {
+        let Some(created_ms) = wake.created_ms else {
+            continue;
+        };
+        if created_ms < anchor.created_ms {
+            continue;
+        }
+        let Some(receipt) = wake_receipt(wake) else {
+            continue;
+        };
+        if !acc.announce_wake(wake.id.as_str()) {
+            continue;
+        }
+        // Keyed at the Wake's moment, so the receipt sorts before the work it
+        // announces, whose server times are at/after it (the 承接 line's own
+        // lesson).
+        acc.push_receipt_at(Some(created_ms.saturating_sub(1)), &receipt);
+        inserted = true;
+    }
+    inserted
+}
+
 /// Render the parts of this turn's assistant messages that haven't been
 /// rendered yet. Returns true if anything new was rendered.
 ///
@@ -296,7 +359,9 @@ pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &Se
     let Some(anchor) = acc.turn_anchor.clone() else {
         return false;
     };
-    let mut rendered_any = false;
+    // A merged Wake's completion is marked before its work renders, so the
+    // receipt sorts above the parts it announces.
+    let mut rendered_any = render_wake_receipts(acc, transcript, &anchor);
     for message in transcript.turn_for_user(&anchor).messages {
         // An error-card retry carries the failed attempt's baseline (#387):
         // its messages stay suppressed, so the rebuilt card streams only the

@@ -19,7 +19,7 @@ use super::drain::{
 };
 use crate::backend::{
     BackgroundTask, ContentBlock, FinishReason, MessageRole, Part, ReasoningPart, SessionTranscript,
-    StepFinish, TextPart, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
+    StepFinish, TextPart, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, WakeSource,
 };
 use crate::bridge::test_support::*;
 use crate::bridge::turn::Turn;
@@ -1285,4 +1285,320 @@ async fn a_top_level_continuation_keeps_its_chain() {
         card_text(&last).contains("很长的回答。"),
         "the remainder lands on the continuation: {last}"
     );
+}
+
+/// The merged-path receipt (approved extension, ADR-0059): a shell Wake whose
+/// work resumes a CARD THAT IS ALREADY LIVE gets one mechanical completion
+/// line at the Wake's moment, before the resumed work — so "never silently
+/// dropped" does not depend on the model narrating it. A repeated poll must
+/// not duplicate it.
+#[tokio::test]
+async fn a_merged_shell_wake_marks_the_live_turn_card_once() {
+    let _wd = test_work_dir();
+    let live = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Busy)).await;
+
+    // The Turn is live: its drain keeps rendering onto the same card.
+    let turn = spawn_turn(&app, ctx("ses_test", "跑一下 CI"));
+    wait_for_card_text(&platform, "已经交给后台了。").await;
+
+    // The shell Wake retires the task and its run resumes on the SAME card
+    // (its Execution has not reached a boundary yet).
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, "已经交给后台了。"),
+                assistant(3_100, "CI 通过了。"),
+            ])
+            .with_executions(vec![execution(2_500)])
+            .with_wakes(vec![shell_wake(2_900)]),
+        ],
+    )
+    .await;
+    wait_for_card_text(&platform, "CI 通过了。").await;
+    wait_for_card_update(
+        &platform,
+        "the merged completion receipt",
+        CardUpdates::Any,
+        |card| card_text(card).contains("后台任务完成"),
+    )
+    .await;
+
+    let last = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&last).contains("🔔 后台任务完成：gh run watch"),
+        "the Wake's own command labels the receipt: {last}"
+    );
+    assert_eq!(
+        card_text(&last).matches("后台任务完成").count(),
+        1,
+        "exactly one receipt: {last}"
+    );
+    let receipt = body_index(&last, "后台任务完成").expect("the receipt renders");
+    let work = body_index(&last, "CI 通过了。").expect("the resumed work renders");
+    assert!(
+        receipt < work,
+        "the receipt precedes the work it announces (receipt@{receipt}, work@{work}): {last}"
+    );
+
+    // Later polls over the same read must not duplicate it.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let later = platform.updated_cards().await.last().cloned().unwrap();
+    assert_eq!(
+        card_text(&later).matches("后台任务完成").count(),
+        1,
+        "a repeated poll must not duplicate the receipt: {later}"
+    );
+
+    // Let the run end so the Turn finishes cleanly.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, "已经交给后台了。"),
+                assistant(3_100, "CI 通过了。"),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000)])
+            .with_wakes(vec![shell_wake(2_900)]),
+        ],
+    )
+    .await;
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    let result = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the boundary ends the turn")
+        .unwrap();
+    result.unwrap();
+}
+
+/// A subagent Wake merging into a live card marks itself with its own task
+/// description, truncated to one short line.
+#[tokio::test]
+async fn a_merged_subagent_wake_marks_the_live_card_with_its_description() {
+    let _wd = test_work_dir();
+    let long = "很长的子代理任务描述".repeat(10); // 100 chars: the receipt clips at 60
+    let live = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Busy)).await;
+    let turn = spawn_turn(&app, ctx("ses_test", "跑一下 CI"));
+    wait_for_card_text(&platform, "已经交给后台了。").await;
+
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, "已经交给后台了。"),
+                assistant(3_100, "子代理跑完了。"),
+            ])
+            .with_executions(vec![execution(2_500)])
+            .with_wakes(vec![subagent_wake(2_900, &long)]),
+        ],
+    )
+    .await;
+    wait_for_card_text(&platform, "子代理跑完了。").await;
+
+    let last = platform.updated_cards().await.last().cloned().unwrap();
+    let clipped = format!("🔔 子代理完成：{}…", long.chars().take(60).collect::<String>());
+    assert!(
+        card_text(&last).contains(&clipped),
+        "the subagent's description labels the receipt, clipped to 60 chars: {last}"
+    );
+    assert!(
+        !card_text(&last).contains(&long),
+        "the full label must not leak past the clip: {last}"
+    );
+    assert_eq!(
+        card_text(&last).matches("子代理完成").count(),
+        1,
+        "exactly one receipt: {last}"
+    );
+
+    // End the turn: the wake's retirement also releases the background task.
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, "已经交给后台了。"),
+                assistant(3_100, "子代理跑完了。"),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000)])
+            .with_wakes(vec![subagent_wake(2_900, &long)])
+            .with_background_tasks(vec![background_shell(2_100)]),
+        ],
+    )
+    .await;
+    let result = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the boundary ends the turn")
+        .unwrap();
+    result.unwrap();
+}
+
+/// The wake-continuation path (ADR-0059): the card a Wake opens carries the
+/// 承接 line and NOT the merged receipt for its own Wake; a later Wake that
+/// resumes that live continuation card does get its receipt — exactly once.
+#[tokio::test]
+async fn a_chained_wake_marks_the_live_continuation_card_once() {
+    let _wd = test_work_dir();
+    let waiting = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
+        .await
+        .unwrap();
+
+    // The Wake opens the continuation card; its Execution has no boundary yet,
+    // so the card stays live.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, "已经交给后台了。"),
+                assistant(3_100, "第一段进展。"),
+            ])
+            .with_executions(vec![execution(2_500)])
+            .with_wakes(vec![shell_wake(2_900)]),
+        ],
+    )
+    .await;
+    spawn_sync(&app);
+    wait_for_card_text(&platform, "第一段进展。").await;
+
+    let opened = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&opened).contains(LEAD),
+        "the continuation opens with the 承接 line: {opened}"
+    );
+    assert!(
+        !card_text(&opened).contains("后台任务完成"),
+        "the Wake that opened the card is announced by the line alone: {opened}"
+    );
+
+    // A SECOND Wake resumes the same live continuation card: its completion is
+    // marked mechanically, before its work.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, "已经交给后台了。"),
+                assistant(3_100, "第一段进展。"),
+                assistant(4_100, "第二段进展。"),
+            ])
+            .with_executions(vec![execution(2_500)])
+            .with_wakes(vec![shell_wake(2_900), shell_wake(3_900)]),
+        ],
+    )
+    .await;
+    wait_for_card_text(&platform, "第二段进展。").await;
+
+    let last = platform.updated_cards().await.last().cloned().unwrap();
+    assert_eq!(
+        card_text(&last).matches("后台任务完成").count(),
+        1,
+        "the chained Wake marks exactly once: {last}"
+    );
+    let receipt = body_index(&last, "后台任务完成").expect("the chained receipt renders");
+    let work = body_index(&last, "第二段进展。").expect("the chained work renders");
+    assert!(
+        receipt < work,
+        "the chained receipt precedes its work (receipt@{receipt}, work@{work}): {last}"
+    );
+
+    // Later polls must not duplicate the chained receipt.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let later = platform.updated_cards().await.last().cloned().unwrap();
+    assert_eq!(
+        card_text(&later).matches("后台任务完成").count(),
+        1,
+        "a repeated poll must not duplicate the chained receipt: {later}"
+    );
+}
+
+/// A Wake that is neither a shell nor a subagent completion (a restart notice,
+/// an interruption continuation) keeps today's behavior: no merged receipt.
+#[tokio::test]
+async fn a_restart_wake_gets_no_merged_receipt() {
+    let _wd = test_work_dir();
+    let live = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Busy)).await;
+    let turn = spawn_turn(&app, ctx("ses_test", "跑一下 CI"));
+    wait_for_card_text(&platform, "已经交给后台了。").await;
+
+    // A restart notice (the fixture keeps its shell keys, the source is what
+    // the rule reads).
+    let mut restart = shell_wake(2_900);
+    restart.source = WakeSource::Restart;
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, "已经交给后台了。"),
+                assistant(3_100, "重启后继续。"),
+            ])
+            .with_executions(vec![execution(2_500)])
+            .with_wakes(vec![restart.clone()]),
+        ],
+    )
+    .await;
+    wait_for_card_text(&platform, "重启后继续。").await;
+
+    let last = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        !card_text(&last).contains("后台任务完成") && !card_text(&last).contains("子代理完成"),
+        "a restart notice gets no merged receipt: {last}"
+    );
+
+    // End the turn: its Execution idles after the restart wake.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "跑一下 CI"),
+                assistant(2_000, "已经交给后台了。"),
+                assistant(3_100, "重启后继续。"),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000)])
+            .with_wakes(vec![restart]),
+        ],
+    )
+    .await;
+    backend
+        .set_session_status("ses_test", Some(SessionStatus::Idle))
+        .await;
+    let result = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the boundary ends the turn")
+        .unwrap();
+    result.unwrap();
 }

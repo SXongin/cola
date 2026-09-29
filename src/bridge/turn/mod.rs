@@ -1332,7 +1332,7 @@ impl Turn {
                 receipt_pushed: false,
                 // A Supplement's or a pull's content always arrives after the
                 // split: the receipt keeps cola's "now" key.
-                receipt_at: None,
+                line: None,
             });
         }
         flush::flush_card_locked(cards, session_id).await;
@@ -1347,16 +1347,15 @@ impl Turn {
     /// [`Self::split_card_chain`], the chain must NOT be owned by a live
     /// Turn/renderer: the Wake decision reads a snapshot, and a Wake
     /// continuation must never split a card somebody else is still streaming
-    /// into. `receipt_at` is the timeline key the 承接 line takes — just before
-    /// the resumed work, whose server times are already in the past at poll
-    /// time, so a "now" key would sort the receipt after it. Returns false —
-    /// nothing queued — when the session has no card or a live renderer owns
-    /// it.
+    /// into. `line` carries the 承接 line's key (just before the resumed work,
+    /// whose server times are already in the past at poll time) and the Wake
+    /// it covers. Returns false — nothing queued — when the session has no
+    /// card or a live renderer owns it.
     pub(crate) async fn split_chain_for_wake(
         cards: &CardsHandle,
         session_id: &str,
         reply_to: &str,
-        receipt_at: i64,
+        line: ContinuationLine,
     ) -> bool {
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
@@ -1372,7 +1371,7 @@ impl Turn {
                 reply_to: reply_to.to_string(),
                 kind: SplitKind::Wake,
                 receipt_pushed: false,
-                receipt_at: Some(receipt_at),
+                line: Some(line),
             });
         }
         flush::flush_card_locked(cards, session_id).await;
@@ -2140,15 +2139,25 @@ impl Turn {
 pub(crate) enum WakeContinuation {
     /// A card chain exists: continue it by split. Only the content the chain
     /// has not rendered lands on the continuation, and the accumulator's own
-    /// anchor scopes the settle decision. `receipt_at` is the timeline key the
-    /// 承接 receipt takes — just before the work this continuation will render
-    /// (the Wake's own server time, or the Turn's content in the content-diff
-    /// fallback): that work is already in the past at poll time, so a key at
-    /// cola's "now" would sort the receipt after it (the live order bug).
-    ContinueChain { receipt_at: i64 },
+    /// anchor scopes the settle decision. `line` is the new card's opening
+    /// 承接 line, whose key sits just before the work this continuation will
+    /// render (that work is already in the past at poll time, so a key at
+    /// cola's "now" would sort the receipt after it — the live order bug).
+    ContinueChain { line: ContinuationLine },
     /// No chain (a cola restart): arm a fresh card, scoped at the newest
     /// Wake's own anchor so the lost card's content is never replayed.
     Fresh { anchor: TurnAnchor },
+}
+
+/// The opening 承接 line of a Wake continuation card (ADR-0059): the timeline
+/// key the line takes — just before the work the continuation renders — and
+/// the Wake whose completion the line already announces, so the merged-path
+/// receipt (the render pass's) cannot double it. `wake` is `None` for the
+/// content-diff fallback, which answers no Wake.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ContinuationLine {
+    pub(crate) at: i64,
+    pub(crate) wake: Option<String>,
 }
 
 /// The destination and identity a Wake continuation card is armed with:
@@ -2218,13 +2227,20 @@ impl Turn {
                 // will render: the newest Wake's own server time when there is
                 // one, else the Turn's own content (the content-diff
                 // fallback). That work's parts carry server times already in
-                // the past at poll time, so they sort after this key.
-                let receipt_at = newest_wake
-                    .and_then(|wake| wake.anchor())
-                    .map(|wake| wake.created_ms)
-                    .unwrap_or(turn_anchor.created_ms)
+                // the past at poll time, so they sort after this key. The
+                // covered Wake is marked too: its completion is announced by
+                // this line, never doubled by the merged-path receipt.
+                let wake = newest_wake.and_then(|wake| wake.anchor());
+                let at = wake
+                    .as_ref()
+                    .map_or(turn_anchor.created_ms, |wake| wake.created_ms)
                     .saturating_sub(1);
-                return Some(WakeContinuation::ContinueChain { receipt_at });
+                return Some(WakeContinuation::ContinueChain {
+                    line: ContinuationLine {
+                        at,
+                        wake: wake.map(|wake| wake.message_id.to_string()),
+                    },
+                });
             }
         }
         let anchor = newest_wake?.anchor()?;
@@ -2301,6 +2317,9 @@ impl Turn {
         acc.reply_to_message_id = facts.reply_to.map(str::to_string);
         acc.variant = facts.variant;
         acc.wake_continuation = true;
+        // The 承接 line announces this Wake's completion: mark it, so the
+        // merged-path receipt never doubles the line when the work renders.
+        acc.announce_wake(anchor.message_id.as_str());
         acc.apply_work_context(work_context);
         // The 承接 line is keyed just before the Wake's own work so the
         // resumed parts — whose server times are at or after the anchor —
