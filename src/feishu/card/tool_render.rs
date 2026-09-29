@@ -250,45 +250,60 @@ fn tool_output(call: &ToolCall) -> Option<String> {
 }
 
 /// For a file-editing tool (`edit`, `apply_patch`), prefer the REAL diff
-/// recorded in the call's raw metadata (`createTwoFilesPatch`) over the tool's
-/// plain text output ("Edit applied successfully." / "Success. Updated the
-/// following files: …"), which tells the reader nothing about what changed.
-/// Failures keep their extracted error text.
+/// recorded in the call's raw metadata over the tool's plain text output
+/// ("Edit applied successfully." / "Success. Updated the following files: …" /
+/// V2's "Edited <file> (N replacement)"), which tells the reader nothing about
+/// what changed. Failures keep their extracted error text.
 fn edit_tool_output(call: &ToolCall) -> Option<String> {
-    let orig = tool_output(call);
+    let text = tool_output(call);
     if call.status == ToolStatus::Error {
-        return orig;
+        return text;
     }
-    let diff = call
-        .metadata
-        .as_ref()
-        .and_then(|metadata| metadata.get("diff"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|diff| !diff.is_empty())?;
-    // The success sentence (and, for apply_patch, the A/M/D file summary after
-    // it) is noise once the diff is shown; anything beyond it (e.g. an "LSP
-    // errors detected" note) is kept as a tail after the diff.
-    let tail = orig
-        .as_deref()
-        .and_then(|output| match call.identity.name.as_str() {
-            "apply_patch" => strip_patch_summary(output),
-            _ => output.strip_prefix("Edit applied successfully."),
-        })
-        .map(|s| s.trim_start_matches('\n'))
-        .filter(|s| !s.is_empty());
+    let diff = recorded_diff(call)?;
+    // Everything up to the text output's first blank line is the tool's
+    // success summary — noise once the hunks are shown, whatever generation
+    // generated it. A note the tool reported after it (V1's "LSP errors
+    // detected …") keeps its place as a tail after the diff.
+    let tail = text.as_deref().and_then(summary_tail);
     Some(match tail {
         Some(t) => format!("{diff}\n\n{t}"),
-        None => diff.to_string(),
+        None => diff,
     })
 }
 
-/// Drop `apply_patch`'s success summary — `Success. Updated the following
-/// files:` plus its `A`/`M`/`D` path lines — and return what follows (the LSP
-/// note blocks, separated by a blank line), or `None` when nothing follows.
-fn strip_patch_summary(output: &str) -> Option<&str> {
+/// The trailing note after a file-editing call's success summary: everything
+/// following the output's first blank line, trimmed. `None` when the text IS
+/// the summary (or nothing) — the summary is dropped, never shown beside the
+/// hunks it summarizes.
+fn summary_tail(output: &str) -> Option<&str> {
     output
-        .strip_prefix("Success. Updated the following files:")
-        .and_then(|rest| rest.split_once("\n\n").map(|(_, tail)| tail))
+        .split_once("\n\n")
+        .map(|(_, tail)| tail.trim())
+        .filter(|tail| !tail.is_empty())
+}
+
+/// The unified diff a file-editing call recorded, whichever generation wrote
+/// it: V1 stores one plain string at `metadata.diff`; V2 stores
+/// `metadata.files[]`, one `{file, patch, …}` per touched file, whose patches
+/// join here in file order. Each patch keeps its own `Index:` header —
+/// `apply_patch`'s multi-file parser reads those for per-file attribution.
+fn recorded_diff(call: &ToolCall) -> Option<String> {
+    let metadata = call.metadata.as_ref()?;
+    if let Some(diff) = metadata
+        .get("diff")
+        .and_then(serde_json::Value::as_str)
+        .filter(|diff| !diff.is_empty())
+    {
+        return Some(diff.to_string());
+    }
+    let patches = metadata
+        .get("files")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .filter_map(|file| file.get("patch").and_then(serde_json::Value::as_str))
+        .filter(|patch| !patch.is_empty())
+        .collect::<Vec<_>>();
+    (!patches.is_empty()).then(|| patches.join("\n"))
 }
 
 /// A Tool Panel for tests, built from the typed pieces a formatter reads: the
@@ -435,13 +450,13 @@ pub(super) fn tool_panel_element(
     collapsible_panel(&title, &content, element_id)
 }
 
-/// The meaningful parts of an `edit` tool's unified diff (recorded by OpenCode
-/// in `state.metadata.diff` / an edit permission request's `diff`): the target
-/// path and the hunk lines (`@@`, `-`, `+`) plus the counted change. The
-/// `Index:`, `===`, `---`, `+++` header noise and unchanged context lines
-/// (starting with a space) are dropped — oldString/newString are often
-/// near-identical full-block snapshots whose context would otherwise render as
-/// walls of repeated text around a few changed lines.
+/// The meaningful parts of a unified file diff (a file-editing tool's recorded
+/// diff, or an edit permission request's `diff`): the target path and the hunk
+/// lines (`@@`, `-`, `+`) plus the counted change. The `Index:`, `===`, `---`,
+/// `+++` header noise and unchanged context lines (starting with a space) are
+/// dropped — oldString/newString are often near-identical full-block snapshots
+/// whose context would otherwise render as walls of repeated text around a few
+/// changed lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EditDiff {
     pub path: Option<String>,
@@ -978,6 +993,14 @@ fn is_setext_underline(line: &str) -> bool {
     body.bytes().all(|b| b == b'-') || body.bytes().all(|b| b == b'=')
 }
 
+/// A file-tool input's target path: V1 names it `filePath`, V2 names it `path`.
+/// Every formatter that shows a file reads it through this one rule.
+fn input_path(obj: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
+    ["filePath", "path"]
+        .iter()
+        .find_map(|key| obj.get(*key).and_then(|value| value.as_str()))
+}
+
 /// Render a tool's input JSON as human-readable markdown, keyed on the tool
 /// name. Recognized tools get tailored one-liners (bash → the command, read →
 /// the file path, edit → the file; the edit's actual change comes from its diff
@@ -1009,27 +1032,19 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
             // them), so showing their -/+ first lines reads as duplicated
             // content and hides the real change — which now comes from the
             // tool's unified diff (see `parse_edit_diff`).
-            format!("📄 `{}`", get("filePath").unwrap_or("?"))
+            format!("📄 `{}`", input_path(obj).unwrap_or("?"))
         }
         "read" | "write" | "glob" | "grep" => {
             let mut parts = Vec::new();
             // `pattern` is the search key for glob/grep — show it as "匹配",
             // not twice. File paths render as plain paths.
-            if name == "grep" || name == "glob" {
-                if let Some(v) = get("pattern") {
-                    parts.push(format!("匹配 `{}`", v));
-                }
-                for k in ["filePath", "path"] {
-                    if let Some(v) = get(k) {
-                        parts.push(format!("`{}`", v));
-                    }
-                }
-            } else {
-                for k in ["filePath", "path"] {
-                    if let Some(v) = get(k) {
-                        parts.push(format!("`{}`", v));
-                    }
-                }
+            if (name == "grep" || name == "glob")
+                && let Some(v) = get("pattern")
+            {
+                parts.push(format!("匹配 `{}`", v));
+            }
+            if let Some(path) = input_path(obj) {
+                parts.push(format!("`{}`", path));
             }
             if let Some(v) = get("include") {
                 parts.push(format!("include `{}`", v));
@@ -1726,6 +1741,127 @@ Index: src/main.rs
         assert!(md.contains("\n```"), "closing fence: {}", md);
     }
 
+    /// V2 records the edit's diff as `metadata.files[]` (one
+    /// `{file, patch, …}` per touched file), not V1's `metadata.diff` string,
+    /// and its text output is a server-generated summary — "Edited <file> (N
+    /// replacement)" on live 2.0.18. The panel must find the diff, show the
+    /// hunks, and drop the summary as noise.
+    #[test]
+    fn edit_v2_metadata_files_render_the_hunks_and_drop_the_summary() {
+        // The real 2.0.18 shape, captured from `GET /api/session/{id}/message`
+        // (field names and patch framing verbatim; the file trimmed).
+        let patch = "\
+Index: .config/opencode/AGENTS.md
+===================================================================
+--- .config/opencode/AGENTS.md
++++ .config/opencode/AGENTS.md
+@@ -1,6 +1,4 @@
+-# English Learning Rule
++# Interaction Rules
+ 
+-I am practicing English.
+-## Interaction Rules
+ When a skill instructs you to interview the user, use the question tool.
+";
+        let tool = ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
+                name: "edit".into(),
+                call_id: "call_00_g2baryak60jmfn29i1ftx4ro".into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: None,
+            input: Some(json!({
+                "path": "/root/.config/opencode/AGENTS.md",
+                "oldString": "# English Learning Rule",
+                "newString": "# Interaction Rules"
+            })),
+            metadata: Some(json!({
+                "files": [{
+                    "file": ".config/opencode/AGENTS.md",
+                    "patch": patch,
+                    "status": "modified",
+                    "additions": 1,
+                    "deletions": 3
+                }],
+                "truncated": false
+            })),
+            output: ToolOutput {
+                raw: Some(json!("Edited .config/opencode/AGENTS.md (1 replacement)")),
+                blocks: vec![ContentBlock::Text(
+                    "Edited .config/opencode/AGENTS.md (1 replacement)".into(),
+                )],
+                error: None,
+            },
+        });
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        let md = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .expect("panel markdown content");
+        assert!(
+            md.contains("**Input**\n📄 `/root/.config/opencode/AGENTS.md`"),
+            "file in input: {md}"
+        );
+        assert!(md.contains("**Output**\n\n+1 −3"), "count header: {md}");
+        assert!(md.contains("```\n@@ -1,6 +1,4 @@"), "fenced hunk: {md}");
+        assert!(md.contains("-# English Learning Rule"), "removed line: {md}");
+        assert!(md.contains("+# Interaction Rules"), "added line: {md}");
+        assert!(!md.contains("(1 replacement)"), "generated summary dropped: {md}");
+    }
+
+    /// V1's text output is its success sentence, then — when the LSP reported
+    /// diagnostics — a note after a blank line. The summary is dropped, the
+    /// note stays after the hunks: the blank line is the boundary, so a
+    /// summary in any wording cannot leak into the diff block.
+    #[test]
+    fn edit_v1_lsp_note_survives_the_summary_strip() {
+        let diff = "\
+Index: src/main.rs
+===================================================================
+--- src/main.rs
++++ src/main.rs
+@@ -1,2 +1,2 @@
+-let a = 1;
++let a = 2;
+";
+        let text_output = "Edit applied successfully.\n\nLSP errors detected in this file, please fix:\n\
+                           unused variable `a`";
+        let tool = ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
+                name: "edit".into(),
+                call_id: "call_edit".into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: None,
+            input: Some(json!({"filePath": "src/main.rs"})),
+            metadata: Some(json!({ "diff": diff })),
+            output: ToolOutput {
+                raw: Some(json!(text_output)),
+                blocks: vec![ContentBlock::Text(text_output.into())],
+                error: None,
+            },
+        });
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        let md = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .expect("panel markdown content");
+        assert!(md.contains("**Output**\n\n+1 −1"), "count header: {md}");
+        assert!(md.contains("-let a = 1;"), "removed line: {md}");
+        assert!(
+            md.contains("LSP errors detected in this file, please fix:"),
+            "note kept: {md}"
+        );
+        assert!(
+            !md.contains("Edit applied successfully."),
+            "summary dropped: {md}"
+        );
+    }
+
     /// #202: an `apply_patch` panel shows the same hunks as `edit`, fenced
     /// (monospace, no wrapping), with each patched file named in the body —
     /// and the tool's LSP note, which follows the success summary in the raw
@@ -2291,6 +2427,35 @@ LSP errors detected in a.rs, please fix:
         assert!(!text.contains("oldString"), "raw key leaked: {}", text);
         assert!(!text.contains("newString"), "raw key leaked: {}", text);
         assert!(!text.contains("filePath"), "raw key leaked: {}", text);
+    }
+
+    /// The target's field name is the generation's own: V1 spells it
+    /// `filePath`, V2 spells it `path` (live 2.0.18). Reading only V1's spelling
+    /// renders the placeholder `📄 `?`` and the reader cannot tell what was
+    /// edited.
+    #[test]
+    fn tool_input_edit_shows_the_v2_path_field() {
+        let tool = ToolPanel::for_test(
+            "edit",
+            ToolStatus::Completed,
+            Some(json!({
+                "path": "/root/.config/opencode/AGENTS.md",
+                "oldString": "# English Learning Rule",
+                "newString": "# Interaction Rules"
+            })),
+            None,
+        );
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        let text = card.to_string();
+        assert!(
+            text.contains("📄 `/root/.config/opencode/AGENTS.md`"),
+            "file missing: {}",
+            text
+        );
+        assert!(!text.contains("📄 `?`"), "placeholder shown: {}", text);
     }
 
     #[test]
