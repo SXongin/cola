@@ -927,8 +927,33 @@ fn elapsed_secs(elapsed: &str) -> u64 {
 /// "exactly one PATCH for this retirement / collect" is deterministic; the
 /// second-granular cadence itself is pinned by the rate tests, where the
 /// starts are real.
+///
+/// ORDERING: a test that counts PATCHes exactly must call `spawn_sync` only
+/// AFTER `script_transcript` — the loop must not already be running while a
+/// still-ticking row could add a leading PATCH before the event's own, which
+/// would over-report the count.
 fn frozen_start(now: i64) -> i64 {
     now + 3_600_000
+}
+
+/// Assert every one of `patches` is the same wait card with only its rows'
+/// elapsed advanced: the header still reads 「⏳ 等待后台任务」, and consecutive
+/// patches compare equal modulo the rows' times ([`text_ignoring_elapsed`]).
+/// A ledger-only refresh (ADR-0060) has exactly this shape, so a PATCH that
+/// smuggled any other change in fails here — the cadence may repeat a patch,
+/// never vary what it renders.
+fn assert_ledger_only_refreshes(patches: &[serde_json::Value]) {
+    assert!(
+        patches
+            .iter()
+            .all(|patch| card_header(patch).contains("等待后台任务")),
+        "a ledger-only refresh never restyles the card: {patches:?}"
+    );
+    let normalized: Vec<String> = patches.iter().map(text_ignoring_elapsed).collect();
+    assert!(
+        normalized.windows(2).all(|pair| pair[0] == pair[1]),
+        "every later PATCH is a ledger-only elapsed advance: {patches:?}"
+    );
 }
 
 /// A card's visible text with every ledger row's rendered elapsed folded to
@@ -1711,17 +1736,7 @@ async fn repeated_reads_inside_the_same_rendered_second_patch_nothing() {
     // Every refresh is the same card with a later second — the wait's header
     // stays, and nothing but the rows' elapsed differs — so the passes can
     // never smuggle another change in under the rate bound.
-    assert!(
-        patches
-            .iter()
-            .all(|patch| card_header(patch).contains("等待后台任务")),
-        "a ledger-only refresh never restyles the card: {patches:?}"
-    );
-    let normalized: Vec<String> = patches.iter().map(text_ignoring_elapsed).collect();
-    assert!(
-        normalized.windows(2).all(|pair| pair[0] == pair[1]),
-        "every later PATCH is a ledger-only elapsed advance: {patches:?}"
-    );
+    assert_ledger_only_refreshes(&patches);
 
     // Control: the same loop is listening — a read that changes the ledger
     // PATCHes right away. The retirement's transition is ONE PATCH: the
@@ -1768,6 +1783,10 @@ async fn a_waiting_cards_elapsed_refreshes_on_the_rendered_second() {
     yield_waiting_card(&app, &platform, 1).await;
     let yielded = platform.updated_cards().await.last().cloned().unwrap();
     let yielded_elapsed = elapsed_secs(&ledger_elapsed(&yielded, "· shell：gh run watch · "));
+    // ORDERING: the loop is not running yet, so the scripted start move below
+    // is the card's FIRST PATCH. `spawn_sync` must stay AFTER `script_transcript`
+    // (a loop running against the old row could tick in between and over-report
+    // the exact count).
     let patches_before = patches_to(&platform, "om_waiting").await.len();
 
     // The seconds inside the first rendered second do not owe a PATCH: give
@@ -1801,8 +1820,7 @@ async fn a_waiting_cards_elapsed_refreshes_on_the_rendered_second() {
     // Over the next 2.5 s every advanced rendered second PATCHes — at most one
     // per second, never one per 20 ms read — and the card's rendered elapsed
     // ends well past the yield's. Every one of those PATCHes is the same card
-    // with a later second: the wait's header stays and nothing but the row's
-    // elapsed differs.
+    // with a later second.
     tokio::time::sleep(Duration::from_millis(2_500)).await;
     let patches = patches_to(&platform, "om_waiting").await;
     let advanced = patches.len() - moved;
@@ -1811,17 +1829,7 @@ async fn a_waiting_cards_elapsed_refreshes_on_the_rendered_second() {
         "one PATCH per advanced rendered second (~2-3 in 2.5 s), not per read: {advanced} in {:?}",
         platform.updated_cards().await
     );
-    assert!(
-        patches
-            .iter()
-            .all(|patch| card_header(patch).contains("等待后台任务")),
-        "a ledger-only refresh never restyles the card: {patches:?}"
-    );
-    let normalized: Vec<String> = patches.iter().map(text_ignoring_elapsed).collect();
-    assert!(
-        normalized.windows(2).all(|pair| pair[0] == pair[1]),
-        "every later PATCH is a ledger-only elapsed advance: {patches:?}"
-    );
+    assert_ledger_only_refreshes(&patches);
     let last = platform.updated_cards().await.last().cloned().unwrap();
     let last_elapsed = elapsed_secs(&ledger_elapsed(&last, "· shell：gh run watch · "));
     assert!(
