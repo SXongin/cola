@@ -188,7 +188,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str) {
             // completion entry arrived. A terminal card that received one
             // still owes the handover PATCH.
             let handover = pending_split.iter().any(|split| split.handover);
-            let (finalized, patch) = if supplement_split_requested && !built.full {
+            let (finalized, should_patch) = if supplement_split_requested && !built.full {
                 // The live slice still fits, but a supplement forces the split
                 // anyway: finalize the slice here and HAND IT OFF — the
                 // continuation carries only the receipts queued below and the
@@ -236,7 +236,7 @@ pub(super) async fn flush_card_locked(cards: &CardsHandle, session_id: &str) {
                 // them.
                 push_queued_receipts(cards, session_id).await;
             }
-            if patch && let Err(e) = cards.feishu.update_message(&card_id, &finalized).await {
+            if should_patch && let Err(e) = cards.feishu.update_message(&card_id, &finalized).await {
                 tracing::warn!("Card update failed: {}", e);
                 if is_card_content_rejected(&e) {
                     if matches!(
@@ -425,23 +425,6 @@ mod tests {
             .to_string()
     }
 
-    /// Every card the platform PATCHed onto `message_id`, in call order.
-    async fn updates_of(platform: &RecordingPlatform, message_id: &str) -> Vec<serde_json::Value> {
-        platform
-            .calls
-            .lock()
-            .await
-            .iter()
-            .filter_map(|c| match c {
-                PlatformCall::UpdateMessage {
-                    message_id: mid,
-                    card,
-                } if mid == message_id => Some(card.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// Every card the platform was asked to send, in call order.
     async fn sent_cards(platform: &RecordingPlatform) -> Vec<serde_json::Value> {
         platform
@@ -498,7 +481,7 @@ mod tests {
 
         Turn::flush_card(&app.cards_handle(), "ses_test").await;
 
-        let updates = updates_of(&platform, "om_live").await;
+        let updates = patches_to(&platform, "om_live").await;
         assert_eq!(
             updates.len(),
             2,
@@ -549,7 +532,7 @@ mod tests {
 
         Turn::flush_card(&app.cards_handle(), "ses_test").await;
 
-        let updates = updates_of(&platform, "om_live").await;
+        let updates = patches_to(&platform, "om_live").await;
         assert_eq!(
             updates.len(),
             2,
@@ -627,7 +610,7 @@ mod tests {
 
         Turn::flush_card(&app.cards_handle(), "ses_test").await;
         assert_eq!(
-            updates_of(&platform, "om_live").await.len(),
+            patches_to(&platform, "om_live").await.len(),
             2,
             "the plain attempt and the fenced one only"
         );
@@ -639,7 +622,7 @@ mod tests {
         // A later poll must not PATCH the suspended card again.
         Turn::flush_card(&app.cards_handle(), "ses_test").await;
         assert_eq!(
-            updates_of(&platform, "om_live").await.len(),
+            patches_to(&platform, "om_live").await.len(),
             2,
             "a suspended card is not retried on later flushes"
         );

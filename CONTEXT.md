@@ -119,7 +119,7 @@ A user message sent while its **Session** has a live **Execution** — the routi
 _Avoid_: Follow-up, addition, queued message
 
 **Background Task** (后台任务):
-Work the agent left running in the background — a backgrounded shell command, a subagent — that will **Wake** the Session when it finishes. Durable and pollable: the tool part records it as a completed call whose run is still running, and its Wake retires it (ADR-0059). It belongs to the Session, not to the Turn that started it: while one is live its Turn is not complete, and a completion arriving after the user moved on renders on the newest card chain.
+Work the agent left running in the background — a backgrounded shell command, a subagent — that will **Wake** the Session when it finishes. Durable and pollable: the tool part records it as a completed call whose run is still running, and its Wake retires it (ADR-0059). It belongs to the Session, not to the Turn that started it: while one is live its Turn is not complete, and a completion arriving after the user moved on continues on the newest card chain — the resumed work lands there, while the fixed completion entry stays on the card the task lived on (the **Background Task Ledger**).
 _Avoid_: Job, task (the task tool call is the call, not the work), pending work
 
 **Background Task Ledger** (后台任务账本):

@@ -74,23 +74,6 @@ fn external_newest_transcript() -> SessionTranscript {
     .with_background_tasks(vec![background_shell(2_100)])
 }
 
-/// Every in-place PATCH the platform recorded for `message_id`, in call order.
-async fn patches_to(platform: &RecordingPlatform, message_id: &str) -> Vec<serde_json::Value> {
-    platform
-        .calls
-        .lock()
-        .await
-        .iter()
-        .filter_map(|call| match call {
-            PlatformCall::UpdateMessage {
-                message_id: mid,
-                card,
-            } if mid == message_id => Some(card.clone()),
-            _ => None,
-        })
-        .collect()
-}
-
 /// The first card the platform replied to `reply_to` satisfying `check`, or
 /// `None` — the recorded calls under one lock.
 async fn replied_card_where(

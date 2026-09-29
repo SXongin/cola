@@ -611,24 +611,6 @@ async fn yield_the_two_task_card(app: &Arc<App>, platform: &RecordingPlatform) {
     Turn::set_card_message_id(&app.cards_handle(), "ses_test", "om_waiting").await;
 }
 
-/// Every in-place PATCH the platform recorded for `message_id`, in call order —
-/// so a handover's own update can be told apart from every other card's.
-async fn patches_to(platform: &RecordingPlatform, message_id: &str) -> Vec<serde_json::Value> {
-    platform
-        .calls
-        .lock()
-        .await
-        .iter()
-        .filter_map(|call| match call {
-            PlatformCall::UpdateMessage {
-                message_id: mid,
-                card,
-            } if mid == message_id => Some(card.clone()),
-            _ => None,
-        })
-        .collect()
-}
-
 /// Handover cause 1 (#418): a Wake continuation takes the live list to the new
 /// card. The waiting card's handover PATCH loses the section and gains the
 /// retired task's fixed completion entry — the entry stays on the card that
