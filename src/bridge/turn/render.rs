@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::Instrument;
 
-use crate::backend::{BackgroundTask, Part, SessionTranscript, ToolStatus, TurnAnchor, Wake, WakeSource};
+use crate::backend::{Part, SessionTranscript, ToolStatus, TurnAnchor, Wake, WakeSource};
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
 use crate::bridge::handles::{CardsHandle, RequestsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
@@ -327,25 +327,37 @@ fn ledger_rows(transcript: &SessionTranscript) -> Vec<TaskLedgerRow> {
     transcript
         .background_tasks
         .iter()
-        .map(|task| TaskLedgerRow {
-            kind: match task.tool.name.as_str() {
-                "subagent" => TaskKind::Subagent,
-                _ => TaskKind::Shell,
-            },
-            label: task_label(task, inputs.get(task.tool.call_id.as_str()).copied()),
-            started_at: task.started_at,
+        .map(|task| {
+            // The kind is derived ONCE per task: the row's type noun and the
+            // label arm below read the same value, so the two cannot disagree.
+            let kind = task_kind(&task.tool.name);
+            TaskLedgerRow {
+                kind,
+                label: task_label(kind, inputs.get(task.tool.call_id.as_str()).copied()),
+                started_at: task.started_at,
+            }
         })
         .collect()
 }
 
-/// The label the originating tool part's input names for `task`: the shell's
-/// `command` (or its `description` when the payload carries no command), the
-/// subagent's `description` — the `subagent` arm nothing else needed. `None`
-/// when the input names no label, so the row renders bare rather than
-/// inventing one (the receipt's own rule).
-fn task_label(task: &BackgroundTask, input: Option<&serde_json::Value>) -> Option<String> {
-    let label = match task.tool.name.as_str() {
-        "shell" => input
+/// The ledger kind of a Background Task's tool. Only `shell` and `subagent`
+/// ever background through the V2 tool shape (`decode_background_task` returns
+/// `None` for every other name), so the pair is matched once, here.
+fn task_kind(tool: &str) -> TaskKind {
+    match tool {
+        "subagent" => TaskKind::Subagent,
+        _ => TaskKind::Shell,
+    }
+}
+
+/// The label the originating tool part's input names for a task of `kind`:
+/// the shell's `command` (or its `description` when the payload carries no
+/// command), the subagent's `description` — the `subagent` arm nothing else
+/// needed. `None` when the input names no label, so the row renders bare
+/// rather than inventing one (the receipt's own rule).
+fn task_label(kind: TaskKind, input: Option<&serde_json::Value>) -> Option<String> {
+    let label = match kind {
+        TaskKind::Shell => input
             .and_then(|input| input.get("command"))
             .and_then(serde_json::Value::as_str)
             .or_else(|| {
@@ -353,10 +365,9 @@ fn task_label(task: &BackgroundTask, input: Option<&serde_json::Value>) -> Optio
                     .and_then(|input| input.get("description"))
                     .and_then(serde_json::Value::as_str)
             }),
-        "subagent" => input
+        TaskKind::Subagent => input
             .and_then(|input| input.get("description"))
             .and_then(serde_json::Value::as_str),
-        _ => None,
     }?;
     let label = label.trim();
     (!label.is_empty()).then(|| label.to_string())
