@@ -2,11 +2,12 @@
 //! #415; restyled by #423): a Session's live Background Tasks ride the newest
 //! (live) card's tail like the Todo Panel and the live Tool Panels — one
 //! folded-by-default `collapsible_panel` whose title is the pinned count
-//! (`⏳ 后台任务（N）`) and whose body is one row per task, labelled from the
-//! originating tool part's input by `call_id`, elapsed bare — and a retirement
-//! leaves the section on the card's existing render cadence. The launch panel
-//! itself (ticket #416) keeps its timeline place and renders 🌙 in its status
-//! slot instead of ✅, before and after the retirement.
+//! (`⏳ 后台任务（N）`) and whose body is one row per task — bold label joined
+//! from the originating tool part's input by `call_id`, start clock, bare
+//! elapsed — and a retirement leaves the section on the card's existing render
+//! cadence. The launch panel itself (ticket #416) keeps its timeline place and
+//! renders 🌙 in its status slot instead of ✅, before and after the
+//! retirement.
 //!
 //! The section follows the chain's newest card (ticket #418): when a Wake
 //! opens a continuation card or a new Turn takes over a waiting card, the
@@ -155,16 +156,20 @@ fn todowrite(created: i64, call_id: &str) -> TranscriptMessage {
     )
 }
 
-/// The elapsed tail of the row starting with `prefix` — the time after the
-/// row's `· `. Panics when the row is missing (the section itself is the
-/// test's first assertion).
+/// The elapsed tail of the row starting with `prefix` — the row's LAST ` · `
+/// segment, after the type word, the bolded label and the ` · HH:MM` start
+/// clock. Panics when the row is missing (the section itself is the test's
+/// first assertion).
 fn ledger_elapsed(card: &serde_json::Value, prefix: &str) -> String {
     let text = card_text(card);
     let row = text
         .lines()
         .find(|line| line.starts_with(prefix))
         .unwrap_or_else(|| panic!("no ledger row {prefix:?}: {text}"));
-    row[prefix.len()..].to_string()
+    row.rsplit(" · ")
+        .next()
+        .expect("rsplit always yields one segment")
+        .to_string()
 }
 
 /// The elapsed is the read model's own start against the build clock: bare,
@@ -202,7 +207,8 @@ async fn one_live_task_rides_the_live_cards_tail() {
 
     let _turn = spawn_turn(&app, ctx("ses_test", "跑一下构建"));
     wait_for_card_update(&platform, "the live ledger", CardUpdates::Any, |card| {
-        card_text(card).contains("⏳ 后台任务（1）") && card_text(card).contains("· shell：npm run build · ")
+        card_text(card).contains("⏳ 后台任务（1）")
+            && card_text(card).contains("· shell：**npm run build** · ")
     })
     .await;
 
@@ -211,7 +217,7 @@ async fn one_live_task_rides_the_live_cards_tail() {
         !card_header(&card).contains("完成"),
         "the ledger rides the LIVE card, not a settled one: {card}"
     );
-    assert_elapsed_shaped(&ledger_elapsed(&card, "· shell：npm run build · "));
+    assert_elapsed_shaped(&ledger_elapsed(&card, "· shell：**npm run build** · "));
     // The live list is a folded panel (ADR-0060, #423): the count is its
     // title, the rows its body, and one stable id keeps the reader's fold
     // state across re-renders. An empty ledger renders no panel at all.
@@ -231,7 +237,7 @@ async fn one_live_task_rides_the_live_cards_tail() {
     );
     let body = panel["elements"][0]["content"].as_str().unwrap();
     assert!(
-        body.starts_with("· shell：npm run build · ") && !body.contains("后台任务（"),
+        body.starts_with("· shell：**npm run build** · ") && !body.contains("后台任务（"),
         "the rows are the panel body, the count its title: {body}"
     );
     // The launch's own panel keeps its timeline place beside the ledger row.
@@ -356,8 +362,8 @@ async fn several_tasks_list_in_transcript_order_beside_the_other_tail_sections()
     wait_for_card_update(&platform, "the full tail", CardUpdates::Any, |card| {
         let text = card_text(card);
         text.contains("⏳ 后台任务（2）")
-            && text.contains("· shell：npm run build")
-            && text.contains("· 子代理：review the diff")
+            && text.contains("· shell：**npm run build**")
+            && text.contains("· 子代理：**review the diff**")
             && text.contains("todowrite")
     })
     .await;
@@ -369,8 +375,10 @@ async fn several_tasks_list_in_transcript_order_beside_the_other_tail_sections()
         1,
         "exactly one ledger section: {text}"
     );
-    let shell_row = text.find("· shell：npm run build").expect("the shell row");
-    let sub_row = text.find("· 子代理：review the diff").expect("the subagent row");
+    let shell_row = text.find("· shell：**npm run build**").expect("the shell row");
+    let sub_row = text
+        .find("· 子代理：**review the diff**")
+        .expect("the subagent row");
     assert!(
         shell_row < sub_row,
         "rows keep transcript order (shell before subagent): {text}"
@@ -383,8 +391,8 @@ async fn several_tasks_list_in_transcript_order_beside_the_other_tail_sections()
         text.contains("⏳ bash"),
         "the live Tool Panel coexists with the ledger: {text}"
     );
-    assert_elapsed_shaped(&ledger_elapsed(&card, "· shell：npm run build · "));
-    assert_elapsed_shaped(&ledger_elapsed(&card, "· 子代理：review the diff · "));
+    assert_elapsed_shaped(&ledger_elapsed(&card, "· shell：**npm run build** · "));
+    assert_elapsed_shaped(&ledger_elapsed(&card, "· 子代理：**review the diff** · "));
 }
 
 /// Acceptance 2 + 3: the label joins by `call_id` — a shell's `description`
@@ -433,11 +441,11 @@ async fn labels_join_by_call_id_and_clip_like_the_entry_title() {
     let card = platform.updated_cards().await.last().cloned().unwrap();
     let text = card_text(&card);
     assert!(
-        text.contains("· shell：watch the CI · "),
+        text.contains("· shell：**watch the CI** · "),
         "a shell falls back to its description: {text}"
     );
     assert!(
-        text.contains("· 子代理：review the diff · "),
+        text.contains("· 子代理：**review the diff** · "),
         "the subagent arm reads its description: {text}"
     );
     assert!(
@@ -445,12 +453,12 @@ async fn labels_join_by_call_id_and_clip_like_the_entry_title() {
         "a task whose input names no label renders bare: {text}"
     );
     assert!(
-        !text.contains("· shell：very long command very long command very long command very long command"),
+        !text.contains("· shell：**very long command very long command very long command very long command"),
         "a long label must clip like the completion entry's title in the ROW: {text}"
     );
     let clipped = text
         .lines()
-        .find(|line| line.starts_with("· shell：very long command"))
+        .find(|line| line.starts_with("· shell：**very long command"))
         .expect("the clipped row");
     assert!(
         clipped.contains('…') && !clipped.contains(long.as_str()),
@@ -528,7 +536,7 @@ async fn a_task_appears_and_retires_on_the_live_card_in_cadence() {
         |card| {
             let text = card_text(card);
             text.contains("⏳ 后台任务（1）")
-                && text.contains("· shell：npm run build")
+                && text.contains("· shell：**npm run build**")
                 && !text.contains("子代理")
         },
     )
@@ -672,7 +680,7 @@ async fn a_wake_continuation_hands_the_live_list_to_the_new_card() {
             let text = card_text(card);
             text.contains(WAKE_LEAD)
                 && text.contains("⏳ 后台任务（1）")
-                && text.contains("· 子代理：review the diff")
+                && text.contains("· 子代理：**review the diff**")
         },
     )
     .await;
@@ -697,7 +705,7 @@ async fn a_wake_continuation_hands_the_live_list_to_the_new_card() {
     let continuation = platform.updated_cards().await.last().cloned().unwrap();
     let text = card_text(&continuation);
     assert!(
-        !text.contains("· shell：gh run watch"),
+        !text.contains("· shell：**gh run watch**"),
         "the retired task's live row leaves the continuation: {continuation}"
     );
     assert!(
@@ -874,13 +882,13 @@ async fn a_new_turn_takes_the_live_list_over_from_the_waiting_card() {
         CardUpdates::Latest,
         |card| {
             let text = card_text(card);
-            text.contains("⏳ 后台任务（1）") && text.contains("· 子代理：review the diff")
+            text.contains("⏳ 后台任务（1）") && text.contains("· 子代理：**review the diff**")
         },
     )
     .await;
     let live = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
-        !card_text(&live).contains("· shell：gh run watch"),
+        !card_text(&live).contains("· shell：**gh run watch**"),
         "the retired task's row does not migrate onto the new Turn's card: {live}"
     );
 }
@@ -1631,7 +1639,7 @@ async fn a_quiet_retirement_updates_the_waiting_card_in_place() {
     spawn_sync(&app);
     wait_for_card_update(&platform, "the quiet retirement", CardUpdates::Latest, |card| {
         card_text(card).contains("🔔 后台任务完成：gh run watch")
-            && !card_text(card).contains("· shell：gh run watch")
+            && !card_text(card).contains("· shell：**gh run watch**")
     })
     .await;
 
@@ -1648,11 +1656,11 @@ async fn a_quiet_retirement_updates_the_waiting_card_in_place() {
     let updated = &patches[0];
     let text = card_text(updated);
     assert!(
-        !text.contains("· shell：gh run watch"),
+        !text.contains("· shell：**gh run watch**"),
         "the retired task's row leaves: {updated}"
     );
     assert!(
-        text.contains("⏳ 后台任务（1）") && text.contains("· 子代理：review the diff"),
+        text.contains("⏳ 后台任务（1）") && text.contains("· 子代理：**review the diff**"),
         "the remaining list rides the same card: {updated}"
     );
     assert!(
@@ -1705,7 +1713,7 @@ async fn repeated_reads_inside_the_same_rendered_second_patch_nothing() {
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
     yield_waiting_card(&app, &platform, 2).await;
     let yielded = platform.updated_cards().await.last().cloned().unwrap();
-    let elapsed = ledger_elapsed(&yielded, "· shell：gh run watch · ");
+    let elapsed = ledger_elapsed(&yielded, "· shell：**gh run watch** · ");
     let cards_before = created_cards(&platform).await.len();
 
     // ~60 passes at the injected cadence: at most one PATCH per advanced
@@ -1726,7 +1734,7 @@ async fn repeated_reads_inside_the_same_rendered_second_patch_nothing() {
     // are the yield's own read, and the sequence never runs backwards.
     let mut previous = elapsed_secs(&elapsed);
     for patch in &patches {
-        let next = elapsed_secs(&ledger_elapsed(patch, "· shell：gh run watch · "));
+        let next = elapsed_secs(&ledger_elapsed(patch, "· shell：**gh run watch** · "));
         assert!(
             next >= previous,
             "the rendered elapsed never runs backwards ({previous} -> {next}): {patch}"
@@ -1752,7 +1760,7 @@ async fn repeated_reads_inside_the_same_rendered_second_patch_nothing() {
     )
     .await;
     wait_for_card_update(&platform, "the read that moved", CardUpdates::Latest, |card| {
-        !card_text(card).contains("· shell：gh run watch")
+        !card_text(card).contains("· shell：**gh run watch**")
     })
     .await;
     // Several more passes (the injected cadence is 20 ms) must add nothing: the
@@ -1782,7 +1790,7 @@ async fn a_waiting_cards_elapsed_refreshes_on_the_rendered_second() {
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
     yield_waiting_card(&app, &platform, 1).await;
     let yielded = platform.updated_cards().await.last().cloned().unwrap();
-    let yielded_elapsed = elapsed_secs(&ledger_elapsed(&yielded, "· shell：gh run watch · "));
+    let yielded_elapsed = elapsed_secs(&ledger_elapsed(&yielded, "· shell：**gh run watch** · "));
     // ORDERING: the loop is not running yet, so the scripted start move below
     // is the card's FIRST PATCH. `spawn_sync` must stay AFTER `script_transcript`
     // (a loop running against the old row could tick in between and over-report
@@ -1796,7 +1804,7 @@ async fn a_waiting_cards_elapsed_refreshes_on_the_rendered_second() {
     script_transcript(&backend, vec![near_boundary]).await;
     spawn_sync(&app);
     wait_for_card_update(&platform, "the moved start", CardUpdates::Latest, |card| {
-        ledger_elapsed(card, "· shell：gh run watch · ").starts_with("0m5")
+        ledger_elapsed(card, "· shell：**gh run watch** · ").starts_with("0m5")
     })
     .await;
 
@@ -1831,7 +1839,7 @@ async fn a_waiting_cards_elapsed_refreshes_on_the_rendered_second() {
     );
     assert_ledger_only_refreshes(&patches);
     let last = platform.updated_cards().await.last().cloned().unwrap();
-    let last_elapsed = elapsed_secs(&ledger_elapsed(&last, "· shell：gh run watch · "));
+    let last_elapsed = elapsed_secs(&ledger_elapsed(&last, "· shell：**gh run watch** · "));
     assert!(
         last_elapsed > yielded_elapsed,
         "the card's elapsed kept moving past the yield's {yielded_elapsed}s: {last}"
@@ -2006,7 +2014,7 @@ async fn a_quiet_retirement_survives_a_later_takeover() {
 
 /// The ledger's elapsed is rendered at card build time: a task whose start
 /// clock is ahead (server skew) clamps to `0m00s`, so a row never renders a
-/// negative age.
+/// negative age. The start clock still renders the skewed start's own time.
 #[tokio::test]
 async fn a_future_start_time_renders_zero_elapsed() {
     let _wd = test_work_dir();
@@ -2025,7 +2033,7 @@ async fn a_future_start_time_renders_zero_elapsed() {
 
     let _turn = spawn_turn(&app, ctx("ses_test", "跑一下"));
     wait_for_card_update(&platform, "the clamped elapsed", CardUpdates::Any, |card| {
-        card_text(card).contains("· shell：npm run build · 0m00s")
+        card_text(card).contains("· shell：**npm run build** · ")
     })
     .await;
     // A few more renders of the SAME task must keep rendering the same
@@ -2033,7 +2041,7 @@ async fn a_future_start_time_renders_zero_elapsed() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     let card = platform.updated_cards().await.last().cloned().unwrap();
     assert_eq!(
-        ledger_elapsed(&card, "· shell：npm run build · "),
+        ledger_elapsed(&card, "· shell：**npm run build** · "),
         "0m00s",
         "a skewed clock clamps to zero, it does not drift: {card}"
     );

@@ -39,14 +39,16 @@ Session — across Turns — renders in a card-tail section like the Todo Panel 
 live Tool Panels (ADR-0045): a folded-by-default collapsible panel titled
 `⏳ 后台任务（N）` — the title is the count, so the folded panel still answers
 how many tasks are running, and a stable `element_id` keeps the reader's fold
-state across re-renders — whose body is one row per task: `· shell：<label> ·
-3m12s` / `· 子代理：<description> · 1m05s`. The label is joined from the tool
-part's input by `call_id` (shell: `command`/`description`; `subagent` needs its
-own rendering arm), clipped like the receipt; elapsed is rendered
-second-granular and driven by the existing reads (the 8 s Session Sync pass) —
-no new polling cadence. Exactly one card carries the live list: when a Wake
-continues the chain or a new Turn takes over, the handover removes it from the
-old card.
+state across re-renders — whose body is one row per task, the pinned copy
+`· shell：**npm run build** · 14:02 · 3m12s` / `· 子代理：**review the diff** ·
+14:03 · 1m05s`: the type word plain, the label bolded and clipped, then the
+task's server `started_at` as local `HH:MM` and the bare elapsed. The label is
+joined from the tool part's input by `call_id` (shell: `command`/`description`;
+`subagent` needs its own rendering arm), clipped like the receipt; elapsed is
+rendered second-granular and driven by the existing reads (the 8 s Session Sync
+pass) — no new polling cadence. Exactly one card carries the live list: when a
+Wake continues the chain or a new Turn takes over, the handover removes it from
+the old card.
 
 **The yielded ledger ticks at the read cadence.** A Waiting card has no render
 loop of its own, so the existing 8 s Session Sync reads are its only clock: the
@@ -146,10 +148,29 @@ are unchanged.
 - The live list is a folded-by-default `collapsible_panel` titled
   `⏳ 后台任务（N）` — the title is the count, the rows are its markdown body,
   and a stable `element_id` (`task_ledger`) keeps the reader's fold state
-  across re-renders (#415's flat markdown section superseded; the rows and
-  their pinned formats are unchanged). An empty ledger still renders nothing.
+  across re-renders (#415's flat markdown section superseded). An empty ledger
+  still renders nothing.
 - The yielded refresh compares the ledger it would render against the one the
   card last rendered at **second** granularity, superseding #419's
   whole-minute rule on that path: a rendered second moving owes the PATCH,
   repeated reads inside it owe nothing. The live render and its Wake handover
   keep whole-minute gating.
+
+## Amendment (2026-09-29, the live row's copy): the start clock and the bold label
+
+The live row gains the task's own start clock and a bolded label (the same
+review round as the amendment above):
+
+- `· shell：**npm run build** · 14:02 · 3m12s`, `· shell · 14:02 · 0m05s`,
+  `· shell：**npm run build**`, `· shell`. The type word stays plain, the label
+  is bolded, the start clock is the task's server `started_at` in local
+  `HH:MM` (the completion entry body's clock), and the elapsed format is
+  unchanged (`3m12s` / `1h05m`). No label or no start omits its part whole.
+- A label's own `*`/`_` become their numeric entities before the `**…**` wrap,
+  so a command cannot close the span or bleed formatting into the next row
+  (Feishu decodes the entities back to the literal characters — the same
+  mechanism as the `<` escape). The clip is unchanged: `TASK_LABEL_CHARS`
+  characters plus the `…` marker, inside the bold.
+- Identity and icons stay out of the live row: Feishu cards have no hover
+  tooltips, and future task types have no recognizable glyphs. The completion
+  entry's fold body keeps the identity.

@@ -1,13 +1,13 @@
 //! The Background Task Ledger (ADR-0060).
 //!
 //! The card-tail section that lists a Session's live Background Tasks — task
-//! type, label, elapsed — riding the newest card of its Card Chain like the
-//! Todo Panel and the live Tool Panels. One folded collapsible panel: the
-//! pinned count (`⏳ 后台任务（N）`) is its title, so it stays readable folded,
-//! and the rows are its body. The Bridge gathers the facts (which tasks are
-//! live, what label their originating tool part's input names) and hands them
-//! over as [`TaskLedgerRow`]s; this module owns the pinned copy, the elapsed
-//! format and nothing else.
+//! type, bolded label, start clock, elapsed — riding the newest card of its
+//! Card Chain like the Todo Panel and the live Tool Panels. One folded
+//! collapsible panel: the pinned count (`⏳ 后台任务（N）`) is its title, so it
+//! stays readable folded, and the rows are its body. The Bridge gathers the
+//! facts (which tasks are live, what label their originating tool part's input
+//! names) and hands them over as [`TaskLedgerRow`]s; this module owns the
+//! pinned copy, the elapsed format and nothing else.
 //!
 //! A completed task leaves that list: its mechanical completion line becomes
 //! the collapsed title of one folded entry on the card the task lived on
@@ -144,16 +144,21 @@ pub(crate) fn task_ledger_title(rows: &[TaskLedgerRow]) -> Option<String> {
 /// The ledger section's fold body — one row per live task, the pinned copy:
 ///
 /// ```text
-/// · shell：<label> · 3m12s
-/// · 子代理：<description> · 1m05s
+/// · shell：**npm run build** · 14:02 · 3m12s
+/// · 子代理：**review the diff** · 14:03 · 1m05s
 /// ```
 ///
 /// `None` when no task is live (the title's own emptiness rule, kept here so
-/// the two renderings cannot drift). Rows render in the order given (the
-/// transcript's own), one line each: a label goes through the shared
-/// [`folded_label`], so a multi-line command cannot break the row layout and
-/// one label clips identically wherever the ledger renders it. The caller
-/// sanitizes the text like any other model-authored markdown.
+/// the two renderings cannot drift). The type word stays plain, the label is
+/// bolded through [`bold_label`], then the task's server `started_at` renders
+/// as its local `HH:MM` start clock (the completion entry body's own clock)
+/// and the bare elapsed follows. A part the read named none of is omitted
+/// whole: `· shell · 14:02 · 0m05s`, `· shell：**npm run build**`, `· shell`.
+/// Identity stays out of the live row — the completion entry's fold body
+/// carries it. Rows render in the order given (the transcript's own), one line
+/// each: a multi-line command cannot break the row layout, and one label clips
+/// identically wherever the ledger renders it. The caller sanitizes the text
+/// like any other model-authored markdown.
 pub(crate) fn task_ledger_text(rows: &[TaskLedgerRow], now_ms: i64) -> Option<String> {
     if rows.is_empty() {
         return None;
@@ -167,9 +172,12 @@ pub(crate) fn task_ledger_text(rows: &[TaskLedgerRow], now_ms: i64) -> Option<St
         text.push_str(row.kind.noun());
         if let Some(label) = row.label.as_deref().filter(|label| !label.is_empty()) {
             text.push('：');
-            text.push_str(&folded_label(label));
+            text.push_str(&bold_label(label));
         }
         if let Some(at) = row.started_at {
+            if let Some(clock) = fmt_local_time(at) {
+                text.push_str(&format!(" · {clock}"));
+            }
             text.push_str(&format!(" · {}", fmt_task_elapsed(secs_since(at, now_ms))));
         }
     }
@@ -200,17 +208,31 @@ fn folded_label(label: &str) -> String {
     truncate_md(&label, TASK_LABEL_CHARS)
 }
 
+/// The live row's label: the shared folded/clipped shape ([`folded_label`])
+/// wrapped in the row's bold markers, with the label's own `*`/`_` swapped for
+/// their numeric entities so a command can never close the span or bleed
+/// formatting into the next row. Feishu decodes the entities back to the
+/// literal characters (the same mechanism as the `<` escape), so the label
+/// reads unchanged while exactly one bold span exists per row. The completion
+/// entry's title is plain text and keeps [`folded_label`] raw — nothing there
+/// interprets markdown.
+fn bold_label(label: &str) -> String {
+    let escaped = folded_label(label).replace('*', "&#42;").replace('_', "&#95;");
+    format!("**{escaped}**")
+}
+
 /// Estimated serialized size (bytes) of the ledger section, for the card
 /// splitter's tail reserve: the folded panel's title and element overhead, plus
-/// one row per task with its clipped label and a short elapsed tail. Rough like
-/// the Bridge's `panel_estimate` for the tail's other sections, but owned here
-/// so the estimate and [`task_ledger_text`] cannot drift apart — both clip a
-/// label at [`TASK_LABEL_CHARS`].
+/// one row per task — its ` · HH:MM` start clock, its ` · XmYYs` elapsed, and
+/// its bolded label, counted exactly as [`bold_label`] renders it (clipped at
+/// [`TASK_LABEL_CHARS`], entity-escaped and wrapped) so the estimate and the
+/// row cannot drift apart. Rough like the Bridge's `panel_estimate` for the
+/// tail's other sections.
 pub(crate) fn task_ledger_estimate(rows: &[TaskLedgerRow]) -> usize {
     let labels: usize = rows
         .iter()
-        .filter_map(|row| row.label.as_deref())
-        .map(|label| first_n_chars_bytes(label, TASK_LABEL_CHARS))
+        .filter_map(|row| row.label.as_deref().filter(|label| !label.is_empty()))
+        .map(|label| bold_label(label).len())
         .sum();
     // The +80 is the folded panel's own element overhead, exactly like the
     // completion entry's estimate charges it (`task_entry_estimate`).
@@ -264,28 +286,109 @@ mod tests {
     use super::*;
 
     /// The pinned copy (ADR-0060, #412/#423): the title is the count, the body
-    /// one row per task — type noun, label and bare elapsed — `3m12s` / `1m05s`
-    /// for this pair.
+    /// one row per task — type noun, bolded label, start clock and bare elapsed
+    /// — `3m12s` / `1m05s` for this pair.
     #[test]
     fn the_section_renders_the_pinned_copy() {
-        let now = 1_800_000_000_000;
+        let start = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
+        // 127 s apart at 14:04:07, so the second row's clock is 14:04 and its
+        // elapsed 1m05s at `now` (14:05:12).
+        let second_start = start + 127_000;
+        let now = start + 192_000;
         let rows = vec![
             TaskLedgerRow {
                 kind: TaskKind::Shell,
                 label: Some("gh run watch".into()),
-                started_at: Some(now - 192_000),
+                started_at: Some(start),
             },
             TaskLedgerRow {
                 kind: TaskKind::Subagent,
                 label: Some("review the diff".into()),
-                started_at: Some(now - 65_000),
+                started_at: Some(second_start),
             },
         ];
         assert_eq!(task_ledger_title(&rows).unwrap(), "⏳ 后台任务（2）");
         assert_eq!(
             task_ledger_text(&rows, now).unwrap(),
-            "· shell：gh run watch · 3m12s\n· 子代理：review the diff · 1m05s"
+            "· shell：**gh run watch** · 14:02 · 3m12s\n· 子代理：**review the diff** · 14:04 · 1m05s"
         );
+    }
+
+    /// The four shape edges of a live row (ADR-0060 amendment, #423): the
+    /// start clock ` · HH:MM` and the ` · XmYYs` elapsed arrive together only
+    /// when the read carried a start, and a missing label drops its `：…` span
+    /// whole — never a dangling colon or separator. The type word stays plain
+    /// and only the label is bolded.
+    #[test]
+    fn the_row_renders_its_four_shapes() {
+        let at = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
+        let now = at + 192_000; // 14:05:12, so the elapsed is 3m12s
+        let row = |label: Option<&str>, started_at: Option<i64>| TaskLedgerRow {
+            kind: TaskKind::Shell,
+            label: label.map(str::to_string),
+            started_at,
+        };
+        let render = |row: &TaskLedgerRow| task_ledger_text(std::slice::from_ref(row), now).unwrap();
+
+        assert_eq!(
+            render(&row(Some("npm run build"), Some(at))),
+            "· shell：**npm run build** · 14:02 · 3m12s"
+        );
+        assert_eq!(render(&row(None, Some(at))), "· shell · 14:02 · 3m12s");
+        assert_eq!(
+            render(&row(Some("npm run build"), None)),
+            "· shell：**npm run build**"
+        );
+        assert_eq!(render(&row(None, None)), "· shell");
+        // The subagent keeps its own noun.
+        assert_eq!(
+            task_ledger_text(
+                &[TaskLedgerRow {
+                    kind: TaskKind::Subagent,
+                    label: Some("review the diff".into()),
+                    started_at: Some(at),
+                }],
+                now,
+            )
+            .unwrap(),
+            "· 子代理：**review the diff** · 14:02 · 3m12s"
+        );
+    }
+
+    /// A label's own emphasis characters cannot bleed out of its bold span: the
+    /// row swaps `*`/`_` for their numeric entities before the `**…**` wrap, so
+    /// exactly one bold span exists per row whatever the command contains (the
+    /// completion entry's plain-text title keeps the raw label).
+    #[test]
+    fn a_labels_emphasis_characters_stay_inside_its_bold_span() {
+        let rows = vec![TaskLedgerRow {
+            kind: TaskKind::Shell,
+            label: Some("git log --format=*_*_* -- foo_bar".into()),
+            started_at: None,
+        }];
+        let row = task_ledger_text(&rows, 0).unwrap();
+        assert_eq!(
+            row, "· shell：**git log --format=&#42;&#95;&#42;&#95;&#42; -- foo&#95;bar**",
+            "only the entities replace the characters"
+        );
+        assert_eq!(
+            row.matches("**").count(),
+            2,
+            "one bold span is its two markers, nothing for a command to close: {row}"
+        );
+        // Both the wrap and the entities run through the builder's markdown
+        // sanitizer untouched (it only rewrites `<` and images).
+        use crate::feishu::card::CardState;
+        use crate::feishu::card::shell::CardBuilder;
+
+        let card = CardBuilder::new()
+            .with_state(CardState::Streaming)
+            .with_task_ledger(&rows)
+            .build();
+        let body = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert_eq!(body, row, "the sanitizer leaves the row alone: {card}");
     }
 
     /// No live task means no section — neither the title nor the body renders,
@@ -296,16 +399,17 @@ mod tests {
         assert_eq!(task_ledger_text(&[], 1_800_000_000_000), None);
     }
 
-    /// A task whose input names no label renders bare (type + elapsed only),
-    /// and a task with no start time shows no elapsed at all.
+    /// A task whose input names no label renders bare (the type first, then the
+    /// clock and elapsed), and a task with no start time shows neither clock
+    /// nor elapsed.
     #[test]
     fn a_label_less_task_renders_bare() {
-        let now = 1_800_000_000_000;
+        let now = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
         let rows = vec![
             TaskLedgerRow {
                 kind: TaskKind::Shell,
                 label: None,
-                started_at: Some(now - 5_000),
+                started_at: Some(now - 5_000), // 14:01:55
             },
             TaskLedgerRow {
                 kind: TaskKind::Subagent,
@@ -313,15 +417,18 @@ mod tests {
                 started_at: None,
             },
         ];
-        assert_eq!(task_ledger_text(&rows, now).unwrap(), "· shell · 0m05s\n· 子代理");
+        assert_eq!(
+            task_ledger_text(&rows, now).unwrap(),
+            "· shell · 14:01 · 0m05s\n· 子代理"
+        );
     }
 
     /// The label clips exactly like the completion entry's title: at
-    /// [`TASK_LABEL_CHARS`] characters plus the `…` marker, and a multi-line
-    /// command folds to one row.
+    /// [`TASK_LABEL_CHARS`] characters plus the `…` marker (inside the bold),
+    /// and a multi-line command folds to one row.
     #[test]
     fn labels_clip_like_the_receipt() {
-        let now = 1_800_000_000_000;
+        let now = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
         let long = "x".repeat(TASK_LABEL_CHARS + 20);
         let rows = vec![TaskLedgerRow {
             kind: TaskKind::Shell,
@@ -330,7 +437,10 @@ mod tests {
         }];
         let text = task_ledger_text(&rows, now).unwrap();
         let row = text.lines().next().unwrap();
-        assert_eq!(row, format!("· shell：{}… · 0m00s", "x".repeat(TASK_LABEL_CHARS)));
+        assert_eq!(
+            row,
+            format!("· shell：**{}…** · 14:02 · 0m00s", "x".repeat(TASK_LABEL_CHARS))
+        );
         assert!(!text.contains("second line"), "one task, one row: {text}");
     }
 
@@ -409,13 +519,20 @@ mod tests {
         let capped = row("x".repeat(TASK_LABEL_CHARS));
         assert_eq!(
             task_ledger_estimate(&[long]),
-            task_ledger_estimate(std::slice::from_ref(&capped)),
-            "the estimate must not grow past the rendered clip"
+            task_ledger_estimate(std::slice::from_ref(&capped)) + "…".len(),
+            "a longer label costs no more than the rendered clip plus its marker"
         );
         let pair = [capped.clone(), capped.clone()];
         assert!(
             task_ledger_estimate(&pair) > task_ledger_estimate(std::slice::from_ref(&capped)),
             "each task adds a row to the estimate"
+        );
+        // The estimate counts the label exactly as the row renders it: the
+        // bold markers and any neutralized emphasis characters included.
+        let starred = row("*".repeat(TASK_LABEL_CHARS));
+        assert!(
+            task_ledger_estimate(&[starred]) > task_ledger_estimate(std::slice::from_ref(&capped)),
+            "an escaped label costs what its entities render"
         );
     }
 

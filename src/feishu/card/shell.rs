@@ -640,9 +640,15 @@ mod tests {
         );
         assert_eq!(panel["header"]["title"]["content"], "⏳ 后台任务（1）");
         let body = panel["elements"][0]["content"].as_str().unwrap();
-        assert!(
-            body.contains("· shell：a &#60;number_tag> | b · 0m00s"),
-            "the rows are the panel body, sanitized and bare: {body}"
+        let row = body.lines().next().expect("the row");
+        let clock = row
+            .strip_prefix("· shell：**a &#60;number&#95;tag> | b** · ")
+            .and_then(|rest| rest.strip_suffix(" · 0m00s"))
+            .unwrap_or_else(|| panic!("the row carries the clock and the elapsed: {row:?}"));
+        assert_eq!(
+            (clock.len(), &clock[2..3]),
+            (5, ":"),
+            "the start clock is a local HH:MM: {clock:?}"
         );
         assert!(
             !body.contains("后台任务（"),
