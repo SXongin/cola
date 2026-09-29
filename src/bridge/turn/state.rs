@@ -9,7 +9,7 @@
 
 use crate::backend::TurnAnchor;
 use crate::bridge::handles::CardsHandle;
-use crate::feishu::card::ledger::TaskLedgerRow;
+use crate::feishu::card::ledger::{TaskCompletionEntry, TaskLedgerRow};
 use crate::feishu::card::shell::CardBuilder;
 use crate::feishu::card::tool_render::{TASK_TOOL, TaskLiveness, ToolPanel};
 use crate::feishu::card::{AwaitingAction, CardState};
@@ -67,6 +67,12 @@ pub(super) enum TimelineKind {
     /// everything that was on the card when the Host clicked and above
     /// everything resolved afterwards.
     Receipt(String),
+    /// A completed Background Task's ledger entry (ADR-0060): the mechanical
+    /// completion line as a folded collapsible panel's title, the task's
+    /// identity and timing in the fold. Keyed at the Wake's own server time,
+    /// so the entry sits where the completion happened — never on a later
+    /// card, and never doubled by a repeated poll.
+    LedgerEntry(TaskCompletionEntry),
 }
 
 /// A card as built for one message: the JSON, whether the timeline had to
@@ -237,7 +243,7 @@ pub(super) struct PendingSplit {
     /// whose server times are already in the past at poll time (ADR-0059).
     /// `None` — every Supplement and `/card` pull — keeps the
     /// resolution-moment key, unchanged. The line also names the Wake it
-    /// covers, marked so the merged-path receipt cannot double it.
+    /// covers, marked so the merged-path entry cannot double it.
     pub(super) line: Option<super::ContinuationLine>,
 }
 
@@ -567,8 +573,8 @@ pub(super) struct StreamAccumulator {
     pub(super) wake_continuation: bool,
     /// The Wakes whose completion this chain has already announced: marked by
     /// its own opening 承接 line (a Wake that opened a card) or by the
-    /// merged-path receipt (a shell/subagent Wake that resumed an already-live
-    /// card). One mark per Wake id; the set is kept across
+    /// merged-path completion entry (a shell/subagent Wake that resumed an
+    /// already-live card). One mark per Wake id; the set is kept across
     /// [`Self::continue_on_new_card`], so a Wake that resumes a
     /// wake-continuation card still marks exactly once (ADR-0059).
     pub(super) announced_wakes: std::collections::HashSet<String>,
@@ -877,10 +883,19 @@ impl StreamAccumulator {
     }
 
     /// Mark `wake_id`'s completion as announced on this chain — by the opening
-    /// 承接 line or by the merged-path receipt. Returns false when it already
-    /// was: the exactly-once gate both paths honour (ADR-0059).
+    /// 承接 line or by the merged-path completion entry. Returns false when it
+    /// already was: the exactly-once gate both paths honour (ADR-0059).
     pub(super) fn announce_wake(&mut self, wake_id: &str) -> bool {
         self.announced_wakes.insert(wake_id.to_string())
+    }
+
+    /// The completed Background Task ledger entry a shell/subagent Wake leaves
+    /// on the card that hosted its task (ADR-0060): one folded panel, keyed at
+    /// the Wake's own server time so it sorts where the completion happened —
+    /// before the resumed work it announces, and never on another card.
+    pub(super) fn push_ledger_entry_at(&mut self, at_ms: Option<i64>, entry: TaskCompletionEntry) {
+        let key = at_ms.unwrap_or_else(|| self.next_order());
+        self.insert_kind(key, None, TimelineKind::LedgerEntry(entry));
     }
 
     /// Replace a question block's display state (the live 已选/✅ markers) in
@@ -1466,6 +1481,11 @@ impl StreamAccumulator {
                 }
                 // A receipt is one small markdown line.
                 TimelineKind::Receipt(line) => (1, line.len() + 40, 0),
+                // A completion entry is one folded panel: its estimate is owned
+                // beside its render, like the ledger section's.
+                TimelineKind::LedgerEntry(entry) => {
+                    (4, crate::feishu::card::ledger::task_entry_estimate(entry), 0)
+                }
             };
             comps += c;
             size += s;
@@ -1557,6 +1577,16 @@ impl StreamAccumulator {
                         pending.clear();
                     }
                     builder = builder.with_text(line);
+                }
+                // A completed Background Task's ledger entry (ADR-0060): one
+                // folded panel in the Wake's own position, its `entry_{seq}`
+                // id keeping the reader's fold state across re-renders.
+                TimelineKind::LedgerEntry(entry) => {
+                    if !pending.is_empty() {
+                        builder = builder.with_text(&pending);
+                        pending.clear();
+                    }
+                    builder = builder.with_task_entry(entry, Some(&format!("entry_{}", item.seq)));
                 }
             }
         }

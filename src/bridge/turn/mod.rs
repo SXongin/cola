@@ -2229,7 +2229,7 @@ impl Turn {
                 // fallback). That work's parts carry server times already in
                 // the past at poll time, so they sort after this key. The
                 // covered Wake is marked too: its completion is announced by
-                // this line, never doubled by the merged-path receipt.
+                // this line, never doubled by the merged-path entry.
                 let wake = newest_wake.and_then(|wake| wake.anchor());
                 let at = wake
                     .as_ref()
@@ -2318,7 +2318,7 @@ impl Turn {
         acc.variant = facts.variant;
         acc.wake_continuation = true;
         // The 承接 line announces this Wake's completion: mark it, so the
-        // merged-path receipt never doubles the line when the work renders.
+        // merged-path entry never doubles the line when the work renders.
         acc.announce_wake(anchor.message_id.as_str());
         acc.apply_work_context(work_context);
         // The 承接 line is keyed just before the Wake's own work so the

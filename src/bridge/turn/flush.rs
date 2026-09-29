@@ -384,7 +384,7 @@ async fn push_queued_receipts(cards: &CardsHandle, session_id: &str) {
             .push_receipt_at(line.as_ref().map(|line| line.at), kind.receipt());
         if let Some(wake) = line.as_ref().and_then(|line| line.wake.as_deref()) {
             // The 承接 line announces this Wake's completion: mark it, so the
-            // merged-path receipt (a Wake that resumes an already-live card)
+            // merged-path entry (a Wake that resumes an already-live card)
             // cannot double it.
             card.acc.announce_wake(wake);
         }

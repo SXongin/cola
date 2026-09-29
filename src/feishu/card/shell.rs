@@ -1,7 +1,9 @@
 use serde_json::json;
 
 use super::MAX_ELEMENT_TEXT_CHARS;
-use super::ledger::{TaskLedgerRow, task_ledger_text};
+use super::ledger::{
+    TaskCompletionEntry, TaskLedgerRow, task_entry_body, task_entry_title, task_ledger_text,
+};
 use super::sanitize::CardMarkdown;
 use super::tool_render::{ToolPanel, tool_panel_element};
 use super::{
@@ -244,6 +246,19 @@ impl CardBuilder {
             let content = self.markdown.element(&text);
             self.body.push(json!({ "tag": "markdown", "content": content }));
         }
+        self
+    }
+
+    /// One completed Background Task's ledger entry (ADR-0060): a folded
+    /// collapsible panel whose title is the mechanical completion line and
+    /// whose fold carries the task's identity and timing. Pushed where the
+    /// caller calls it, so the entry keeps the Wake's place in the timeline;
+    /// `element_id` names the panel for the reader's fold state, like the tool
+    /// panels'.
+    pub fn with_task_entry(mut self, entry: &TaskCompletionEntry, element_id: Option<&str>) -> Self {
+        let title = task_entry_title(entry);
+        let body = self.markdown.element(&task_entry_body(entry));
+        self.body.push(collapsible_panel(&title, &body, element_id));
         self
     }
 
@@ -621,6 +636,59 @@ mod tests {
             .with_task_ledger(&[])
             .build();
         assert_eq!(bare["body"]["elements"].as_array().unwrap().len(), 0);
+    }
+
+    /// A completion entry (ADR-0060): a folded panel whose header is the
+    /// mechanical completion line and whose body is the identity/timing line,
+    /// rendered where the caller puts it (the timeline's own order) with a
+    /// stable element id for the reader's fold state.
+    #[test]
+    fn task_entry_renders_a_folded_panel_where_it_is_called() {
+        use crate::feishu::card::ledger::{TaskCompletionEntry, TaskKind};
+
+        let finished = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
+        let entry = TaskCompletionEntry {
+            kind: TaskKind::Shell,
+            label: Some("gh run watch".into()),
+            id: Some("sh_abc".into()),
+            started_at: Some(finished - 12 * 60_000),
+            finished_at: finished,
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Streaming)
+            .with_text("正文")
+            .with_task_entry(&entry, Some("entry_1"))
+            .with_text("后续")
+            .build();
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 3, "{card}");
+        assert_eq!(elements[1]["tag"], "collapsible_panel");
+        assert_eq!(elements[1]["expanded"], false, "the entry starts collapsed");
+        assert_eq!(elements[1]["element_id"], "entry_1", "stable fold identity");
+        assert_eq!(
+            elements[1]["header"]["title"]["content"],
+            "🔔 后台任务完成：gh run watch"
+        );
+        assert_eq!(
+            elements[1]["elements"][0]["content"],
+            "shell sh_abc · 14:02 · 12m"
+        );
+        assert_eq!(elements[2]["content"], "后续");
+
+        // An unnamed completion renders the bare title and no dangling `：`.
+        let unnamed = TaskCompletionEntry { label: None, ..entry };
+        let card = CardBuilder::new()
+            .with_state(CardState::Streaming)
+            .with_task_entry(&unnamed, None)
+            .build();
+        assert_eq!(
+            card["body"]["elements"][0]["header"]["title"]["content"],
+            "🔔 后台任务完成"
+        );
+        assert!(
+            card["body"]["elements"][0]["element_id"].is_null(),
+            "no id → no element_id"
+        );
     }
 
     #[test]

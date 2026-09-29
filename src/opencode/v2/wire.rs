@@ -703,7 +703,7 @@ fn decode_background_tasks(messages: &[TranscriptMessage], wakes: &[Wake]) -> Ve
             let Part::Tool(call) = part else {
                 continue;
             };
-            let Some(task) = background_task_of(call) else {
+            let Some(task) = call.background_task() else {
                 continue;
             };
             if wakes.iter().any(|wake| wake.retires(&task)) {
@@ -715,28 +715,32 @@ fn decode_background_tasks(messages: &[TranscriptMessage], wakes: &[Wake]) -> Ve
     tasks
 }
 
-/// One backgrounded run as its typed tool call recorded it. The part's name
-/// decides which identity the task carries: a `shell` reports its shell id, a
-/// `subagent` the child session it runs in — the names and metadata keys of
-/// OpenCode 2.0.x's own plugins (`packages/core/src/tool/plugin/{shell,
-/// subagent}.ts`). OpenCode 1's `task` tool is a different generation: its
-/// foreground parts do appear in shared-store reads, but they carry no
-/// background marker and their completions never produce a V2 Wake, so they
-/// are never a Background Task here.
-fn background_task_of(call: &ToolCall) -> Option<BackgroundTask> {
-    let (shell_id, child_id) = match call.background_launch()? {
-        BackgroundLaunch::Shell { shell_id } => (shell_id, None),
-        BackgroundLaunch::Subagent { child_id } => (None, child_id),
-    };
-    Some(BackgroundTask {
-        tool: call.identity.clone(),
-        shell_id,
-        child_id,
-        started_at: call.started_at,
-    })
-}
-
 impl ToolCall {
+    /// One backgrounded run as its typed tool call recorded it. The part's name
+    /// decides which identity the task carries: a `shell` reports its shell id,
+    /// a `subagent` the child session it runs in — the names and metadata keys
+    /// of OpenCode 2.0.x's own plugins (`packages/core/src/tool/plugin/{shell,
+    /// subagent}.ts`). OpenCode 1's `task` tool is a different generation: its
+    /// foreground parts do appear in shared-store reads, but they carry no
+    /// background marker and their completions never produce a V2 Wake, so they
+    /// are never a Background Task here.
+    ///
+    /// One derivation, so the read's live-task list and a retiring Wake's
+    /// completion entry (which joins its launch back through this shape and
+    /// [`Wake::retires`]) can never disagree.
+    pub(crate) fn background_task(&self) -> Option<BackgroundTask> {
+        let (shell_id, child_id) = match self.background_launch()? {
+            BackgroundLaunch::Shell { shell_id } => (shell_id, None),
+            BackgroundLaunch::Subagent { child_id } => (None, child_id),
+        };
+        Some(BackgroundTask {
+            tool: self.identity.clone(),
+            shell_id,
+            child_id,
+            started_at: self.started_at,
+        })
+    }
+
     /// The background run this call left behind, if it moved its run to the
     /// background (ADR-0059/0060). This is V2's own marker, read here where the
     /// generation's payload knowledge lives: a `shell`/`subagent` call that
@@ -1646,7 +1650,7 @@ mod tests {
     /// subagent read names the task in the text (`description="…"`), not in
     /// the message's top-level `description` (which is the Wake's own prose) —
     /// and a source that has no label, or a text that names none, stays `None
-    /// forever: the merged receipt never invents detail.
+    /// forever: the merged entry never invents detail.
     #[test]
     fn a_wake_label_comes_from_its_own_tag_attribute() {
         // The recorded subagent read: the text attribute wins.
@@ -1716,7 +1720,7 @@ mod tests {
             .iter()
             .flat_map(|message| &message.parts)
             .find_map(|part| match part {
-                Part::Tool(call) if call.identity.call_id == call_id => background_task_of(call),
+                Part::Tool(call) if call.identity.call_id == call_id => call.background_task(),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("the recorded `{call_id}` part starts a background task"))

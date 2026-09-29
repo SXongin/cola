@@ -122,8 +122,8 @@ pub(crate) fn shell_wake(created_ms: i64) -> Wake {
     }
 }
 
-/// A subagent completion Wake with the task description its text names, for the
-/// merged-receipt copy (`🔔 子代理完成：…`).
+/// A subagent completion Wake with the task description its text names, for
+/// the completion entry's title (`🔔 子代理完成：…`).
 pub(crate) fn subagent_wake(created_ms: i64, description: &str) -> Wake {
     Wake {
         id: MessageId::new(format!("msg_wake_sub_{created_ms}")),
