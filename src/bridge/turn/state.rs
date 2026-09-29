@@ -444,6 +444,22 @@ pub(super) struct AttemptBaseline {
     pub(super) observed: std::collections::HashSet<String>,
 }
 
+/// The granularity at which a ledger read compares its clock against what the
+/// card last rendered (ADR-0060). The stored clock is the rendered elapsed in
+/// whole seconds; the cadence decides how much of it must move to owe a flush.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LedgerCadence {
+    /// Whole minutes — the live render and its Wake handover, whose flushes are
+    /// content-driven: a per-render second clock would owe a flush on nearly
+    /// every render. A read inside the same rendered minute owes nothing.
+    Minute,
+    /// Whole seconds — the yielded refresh: the ~8 s Session Sync reads are a
+    /// waiting card's only clock, so the moment a row's rendered second moves,
+    /// the card owes the PATCH (≈0.125 QPS per waiting card, far below
+    /// Feishu's per-message cap).
+    Second,
+}
+
 /// Accumulates streaming state for one session.
 #[derive(Default, Clone)]
 pub(super) struct StreamAccumulator {
@@ -479,11 +495,14 @@ pub(super) struct StreamAccumulator {
     /// card. Empty renders nothing — V1 has no Background Task facts, so its
     /// ledger is always empty.
     pub(super) ledger: Vec<TaskLedgerRow>,
-    /// The ledger's refresh clock ([`Self::set_ledger`]): each row's elapsed in
-    /// whole minutes as of the read that last moved the section (ADR-0060).
-    /// The rows alone cannot tell that a yielded card's elapsed went stale, and
-    /// the rendered seconds move on every read — this coarser key owes a flush
-    /// exactly when a minute turns, so an unchanged read PATCHes nothing.
+    /// The ledger's render clock ([`Self::set_ledger`]): each row's elapsed in
+    /// whole seconds as of the read that last moved the section (ADR-0060) —
+    /// the very value the row last rendered. The rows alone cannot tell that a
+    /// yielded card's elapsed went stale, and the rendered seconds move on
+    /// every read — so each path compares this key at its own cadence
+    /// ([`LedgerCadence`]): the live render at whole minutes (no per-render
+    /// clock churn), the yielded refresh at whole seconds (its reads are the
+    /// card's only clock).
     ledger_clock: Vec<Option<u64>>,
     /// Text, reasoning, tool and receipt entries ordered by their key (the
     /// server-side part start time) — the card is built from this, so message ↔
@@ -1354,23 +1373,42 @@ impl StreamAccumulator {
     /// Replace the live Background Task ledger from a transcript read
     /// (ADR-0060) — the ONE site a read's rows and clock enter the accumulator,
     /// shared by the live render and Session Sync's Wake handover / yielded
-    /// refresh, so those paths cannot drift. Returns whether the card owes a
-    /// flush: a membership change, or a row's elapsed crossing a whole minute.
-    pub(super) fn set_ledger_from_read(&mut self, transcript: &SessionTranscript, now_ms: i64) -> bool {
-        self.set_ledger(ledger_rows(transcript), now_ms)
+    /// refresh, so those paths cannot drift. `cadence` is the path's own
+    /// comparison granularity ([`LedgerCadence`]). Returns whether the card
+    /// owes a flush: a membership change, or a row's rendered elapsed moving at
+    /// that cadence.
+    pub(super) fn set_ledger_from_read(
+        &mut self,
+        transcript: &SessionTranscript,
+        now_ms: i64,
+        cadence: LedgerCadence,
+    ) -> bool {
+        self.set_ledger(ledger_rows(transcript), now_ms, cadence)
     }
 
     /// Replace the live Background Task ledger from an already-derived read
     /// (ADR-0060), stamped with the read's clock. The read is the authority: a
     /// task it no longer lists has retired and leaves the section, a new one
-    /// joins in transcript order. Returns whether the card owes a flush: a
-    /// membership change, or a row's elapsed crossing a whole minute since the
-    /// section last rendered. The clock is minute-granular on purpose — the
-    /// seconds inside a minute never owe one, so a yielded card is not PATCHed
-    /// on every read, while the read that crosses a minute is.
-    fn set_ledger(&mut self, rows: Vec<TaskLedgerRow>, now_ms: i64) -> bool {
+    /// joins in transcript order. Returns whether the card owes a flush:
+    /// membership, or a row's rendered elapsed moving at `cadence` since the
+    /// section last rendered. The clock stores the rendered seconds — what the
+    /// card last rendered — so the live path compares whole minutes of it (the
+    /// seconds inside a rendered minute never owe one and the card gains no
+    /// per-render clock churn) while the yielded path compares whole seconds
+    /// (its 8 s reads keep the visible elapsed true).
+    fn set_ledger(&mut self, rows: Vec<TaskLedgerRow>, now_ms: i64, cadence: LedgerCadence) -> bool {
         let clock = crate::feishu::card::ledger::task_ledger_clock(&rows, now_ms);
-        if self.ledger == rows && self.ledger_clock == clock {
+        // `rows` equality implies equal lengths, so the zip covers every row.
+        let unchanged = self.ledger == rows
+            && self
+                .ledger_clock
+                .iter()
+                .zip(&clock)
+                .all(|(rendered, new)| match cadence {
+                    LedgerCadence::Minute => rendered.map(|secs| secs / 60) == new.map(|secs| secs / 60),
+                    LedgerCadence::Second => rendered == new,
+                });
+        if unchanged {
             return false;
         }
         self.ledger = rows;
@@ -1436,7 +1474,7 @@ impl StreamAccumulator {
     /// tail, rendered as the tracked card, with `render_from` untouched so the
     /// next flush still renders from the same place and no continuation is
     /// ever owed. Used only where a ledger-only change must not post a new
-    /// card; the delta such a change adds (one entry, one row less, a minute's
+    /// card; the delta such a change adds (one entry, one row less, a second's
     /// elapsed) sits inside the splitter's own reserve margin, so the card
     /// stays under Feishu's hard cap even when its estimate crosses the split
     /// budget.
@@ -2451,6 +2489,7 @@ mod tests {
                 started_at: None,
             }],
             0,
+            LedgerCadence::Minute,
         );
         acc.push_text(&"很长的回答。".repeat(2000)); // over one card's budget
 
@@ -2480,6 +2519,69 @@ mod tests {
             "the ledger tail rides the unsplit card: {}",
             unsplit.card
         );
+    }
+
+    /// The ledger's clock records what the card last rendered — each row's
+    /// elapsed in whole seconds — and each path compares it at its own cadence
+    /// (ADR-0060, #423): two reads inside one rendered second owe nothing
+    /// either way; the yielded path (whole seconds) owes the moment a rendered
+    /// second moves, while the live path (whole minutes) waits for the minute
+    /// and so gains no per-render clock churn.
+    #[test]
+    fn the_ledger_clock_owes_a_flush_at_each_paths_cadence() {
+        let start = 1_800_000_000_000;
+        let rows = || {
+            vec![TaskLedgerRow {
+                kind: TaskKind::Shell,
+                label: Some("npm run build".into()),
+                started_at: Some(start),
+            }]
+        };
+        let cadence = |acc: &mut StreamAccumulator, at: i64, cadence| acc.set_ledger(rows(), at, cadence);
+        let mut acc = StreamAccumulator::new("test");
+
+        // The first read is a membership change (empty -> one row).
+        assert!(cadence(&mut acc, start, LedgerCadence::Minute));
+        // Two reads inside one rendered second owe nothing, either cadence.
+        assert!(!cadence(&mut acc, start + 999, LedgerCadence::Second));
+        assert!(!cadence(&mut acc, start + 999, LedgerCadence::Minute));
+        // A rendered second moving owes the yielded PATCH, not the live one.
+        assert!(cadence(&mut acc, start + 1_000, LedgerCadence::Second));
+        assert!(!cadence(&mut acc, start + 1_000, LedgerCadence::Minute));
+        // The seconds inside the minute keep owing on the yielded path and
+        // never on the live one...
+        for secs in [2_000, 30_000, 59_000] {
+            assert!(cadence(&mut acc, start + secs, LedgerCadence::Second));
+            assert!(!cadence(&mut acc, start + secs, LedgerCadence::Minute));
+        }
+        // ...until the whole minute turns, which owes the live flush too.
+        assert!(cadence(&mut acc, start + 60_000, LedgerCadence::Minute));
+        // A retired task is a membership change on both paths: the row leaves.
+        assert!(acc.set_ledger(Vec::new(), start + 61_000, LedgerCadence::Minute));
+        assert!(acc.set_ledger(rows(), start + 61_000, LedgerCadence::Second));
+        // The same read repeated never owes one, on either cadence.
+        assert!(!cadence(&mut acc, start + 61_500, LedgerCadence::Minute));
+        assert!(!cadence(&mut acc, start + 61_500, LedgerCadence::Second));
+    }
+
+    /// A row with no start time has no clock: a read that only re-reports it
+    /// (the same label, no start) never owes a flush on either cadence — the
+    /// clock tracks the rendered elapsed, and there is none.
+    #[test]
+    fn a_start_less_row_never_ticks_the_ledger_clock() {
+        let rows = || {
+            vec![TaskLedgerRow {
+                kind: TaskKind::Subagent,
+                label: Some("review the diff".into()),
+                started_at: None,
+            }]
+        };
+        let mut acc = StreamAccumulator::new("test");
+        assert!(acc.set_ledger(rows(), 1_000, LedgerCadence::Minute));
+        for at in [1_000, 5_000, 90_000] {
+            assert!(!acc.set_ledger(rows(), at, LedgerCadence::Minute));
+            assert!(!acc.set_ledger(rows(), at, LedgerCadence::Second));
+        }
     }
 
     /// `push_text` chunks one large blob into bounded timeline items so a single

@@ -14,7 +14,7 @@ use crate::backend::{Part, SessionTranscript, ToolStatus, TurnAnchor, Wake, Wake
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
 use crate::bridge::handles::{CardsHandle, RequestsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
-use crate::bridge::turn::state::{RenderedPart, StreamAccumulator};
+use crate::bridge::turn::state::{LedgerCadence, RenderedPart, StreamAccumulator};
 use crate::config::ThreadKey;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskKind};
 use crate::feishu::card::tool_render::{ChildActivity, TaskLiveness};
@@ -376,7 +376,9 @@ fn render_wake_entries(
 /// primitives the live render uses
 /// ([`set_ledger_from_read`](StreamAccumulator::set_ledger_from_read),
 /// [`render_wake_entries`]), so no path can drift from it. `now_ms` is the
-/// read's clock, at the minute granularity that primitive compares.
+/// read's clock; `cadence` is the granularity its ledger clock is compared at
+/// (the live render and its Wake handover at whole minutes, the yielded
+/// refresh at whole seconds — [`LedgerCadence`]).
 ///
 /// A Wake handover calls this on the OUTGOING card before its chain splits;
 /// Session Sync's in-place pass calls it on a yielded card. Returns whether the
@@ -390,8 +392,9 @@ pub(super) fn apply_ledger_read(
     transcript: &SessionTranscript,
     anchor: Option<&TurnAnchor>,
     now_ms: i64,
+    cadence: LedgerCadence,
 ) -> bool {
-    let mut changed = acc.set_ledger_from_read(transcript, now_ms);
+    let mut changed = acc.set_ledger_from_read(transcript, now_ms, cadence);
     if let Some(anchor) = anchor {
         changed |= render_wake_entries(acc, transcript, anchor);
     }
@@ -456,11 +459,17 @@ pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &Se
     }
     // The live Background Task Ledger (ADR-0060) rides the card tail this
     // render feeds. The transcript read is its authority: a membership change
-    // — or a row's elapsed crossing a whole minute — must flush even when no
-    // part moved, so it counts as rendered content. The decision's clock is
-    // this read's own; the card renders the rows from its build clock, the
-    // same minute.
-    rendered_any |= acc.set_ledger_from_read(transcript, chrono::Utc::now().timestamp_millis());
+    // — or a row's rendered elapsed crossing a whole minute — must flush even
+    // when no part moved, so it counts as rendered content. The clock is
+    // compared at the live path's whole-minute cadence on purpose: this loop
+    // flushes on content, and a per-render second clock would be churn. The
+    // decision's clock is this read's own; the card renders the rows from its
+    // build clock, the same second.
+    rendered_any |= acc.set_ledger_from_read(
+        transcript,
+        chrono::Utc::now().timestamp_millis(),
+        LedgerCadence::Minute,
+    );
     rendered_any
 }
 

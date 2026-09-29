@@ -2,10 +2,12 @@
 //!
 //! The card-tail section that lists a Session's live Background Tasks — task
 //! type, label, elapsed — riding the newest card of its Card Chain like the
-//! Todo Panel and the live Tool Panels. The Bridge gathers the facts (which
-//! tasks are live, what label their originating tool part's input names) and
-//! hands them over as [`TaskLedgerRow`]s; this module owns the pinned copy,
-//! the elapsed format and nothing else.
+//! Todo Panel and the live Tool Panels. One folded collapsible panel: the
+//! pinned count (`⏳ 后台任务（N）`) is its title, so it stays readable folded,
+//! and the rows are its body. The Bridge gathers the facts (which tasks are
+//! live, what label their originating tool part's input names) and hands them
+//! over as [`TaskLedgerRow`]s; this module owns the pinned copy, the elapsed
+//! format and nothing else.
 //!
 //! A completed task leaves that list: its mechanical completion line becomes
 //! the collapsed title of one folded entry on the card the task lived on
@@ -23,6 +25,11 @@ use super::{first_n_chars_bytes, fmt_local_time, truncate_md};
 /// with the completion entry's collapsed title (`🔔 后台任务完成：<label>`), so
 /// one label clips identically wherever the ledger renders it (ADR-0060).
 pub(crate) const TASK_LABEL_CHARS: usize = 60;
+
+/// The live list's stable `element_id` on the card (ADR-0060): the ledger is
+/// one card-tail section with no timeline position of its own, so one fixed id
+/// keeps the reader's fold state across re-renders.
+pub(crate) const TASK_LEDGER_ELEMENT_ID: &str = "task_ledger";
 
 /// The kind of Background Task a ledger row names. Only these two background
 /// through the V2 tool shape (ADR-0059/0060).
@@ -125,16 +132,25 @@ pub(crate) fn task_entry_body(entry: &TaskCompletionEntry) -> String {
     body
 }
 
-/// The ledger section's markdown text — the pinned copy:
+/// The ledger section's title — the pinned copy `⏳ 后台任务（N）`:
+///
+/// `None` when no task is live (no empty header, so the section renders
+/// nothing at all). The count is the folded panel's whole answer to "how many
+/// are still running?", readable without unfolding (ADR-0060).
+pub(crate) fn task_ledger_title(rows: &[TaskLedgerRow]) -> Option<String> {
+    (!rows.is_empty()).then(|| format!("⏳ 后台任务（{}）", rows.len()))
+}
+
+/// The ledger section's fold body — one row per live task, the pinned copy:
 ///
 /// ```text
-/// ⏳ 后台任务（N）
 /// · shell：<label> · 3m12s
 /// · 子代理：<description> · 1m05s
 /// ```
 ///
-/// `None` when no task is live (no empty header). Rows render in the order
-/// given (the transcript's own), one line each: a label goes through the shared
+/// `None` when no task is live (the title's own emptiness rule, kept here so
+/// the two renderings cannot drift). Rows render in the order given (the
+/// transcript's own), one line each: a label goes through the shared
 /// [`folded_label`], so a multi-line command cannot break the row layout and
 /// one label clips identically wherever the ledger renders it. The caller
 /// sanitizes the text like any other model-authored markdown.
@@ -142,9 +158,11 @@ pub(crate) fn task_ledger_text(rows: &[TaskLedgerRow], now_ms: i64) -> Option<St
     if rows.is_empty() {
         return None;
     }
-    let mut text = format!("⏳ 后台任务（{}）", rows.len());
-    for row in rows {
-        text.push('\n');
+    let mut text = String::new();
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            text.push('\n');
+        }
         text.push_str("· ");
         text.push_str(row.kind.noun());
         if let Some(label) = row.label.as_deref().filter(|label| !label.is_empty()) {
@@ -158,33 +176,35 @@ pub(crate) fn task_ledger_text(rows: &[TaskLedgerRow], now_ms: i64) -> Option<St
     Some(text)
 }
 
-/// The ledger's refresh clock (ADR-0060): each row's elapsed in whole minutes
-/// against `now_ms`, in row order. [`task_ledger_text`] renders the elapsed in
-/// seconds; this coarser key is what the Bridge compares across reads, so a
-/// card with no render loop — a yielded one — owes a PATCH exactly when a
-/// whole minute turns and none for the seconds inside it. A row with no start
-/// time never ticks (`None`), and a start skewed into the future clamps like
-/// the render it keys.
+/// The ledger's render clock (ADR-0060): each row's elapsed in whole seconds
+/// against `now_ms` — the very value [`task_ledger_text`] renders — in row
+/// order, so the clock records what the card last rendered. The Bridge compares
+/// it at the cadence each path owes (`LedgerCadence`): the live render at whole
+/// minutes (its flushes are content-driven; a per-render second clock would be
+/// churn), the yielded refresh at whole seconds (its ~8 s reads are a waiting
+/// card's only clock). A row with no start time never ticks (`None`), and a
+/// start skewed into the future clamps like the render it keys.
 pub(crate) fn task_ledger_clock(rows: &[TaskLedgerRow], now_ms: i64) -> Vec<Option<u64>> {
     rows.iter()
-        .map(|row| row.started_at.map(|at| secs_since(at, now_ms) / 60))
+        .map(|row| row.started_at.map(|at| secs_since(at, now_ms)))
         .collect()
 }
 
 /// The one shape a task label takes inside the ledger: newlines fold to spaces
-/// (a multi-line command cannot break a row or a panel header) and the text
-/// clips like a short line. Shared by the live row and the completion entry's
-/// title, so the two renderings of one label cannot drift apart (ADR-0060).
+/// (a multi-line command cannot break a row or a completion entry's panel
+/// header) and the text clips like a short line. Shared by the live row and
+/// the completion entry's title, so the two renderings of one label cannot
+/// drift apart (ADR-0060).
 fn folded_label(label: &str) -> String {
     let label = label.replace(['\n', '\r'], " ");
     truncate_md(&label, TASK_LABEL_CHARS)
 }
 
 /// Estimated serialized size (bytes) of the ledger section, for the card
-/// splitter's tail reserve: the header, one row per task with its clipped
-/// label and a short elapsed tail, plus the element overhead. Rough like the
-/// Bridge's `panel_estimate` for the tail's other sections, but owned here so
-/// the estimate and [`task_ledger_text`] cannot drift apart — both clip a
+/// splitter's tail reserve: the folded panel's title and element overhead, plus
+/// one row per task with its clipped label and a short elapsed tail. Rough like
+/// the Bridge's `panel_estimate` for the tail's other sections, but owned here
+/// so the estimate and [`task_ledger_text`] cannot drift apart — both clip a
 /// label at [`TASK_LABEL_CHARS`].
 pub(crate) fn task_ledger_estimate(rows: &[TaskLedgerRow]) -> usize {
     let labels: usize = rows
@@ -192,7 +212,9 @@ pub(crate) fn task_ledger_estimate(rows: &[TaskLedgerRow]) -> usize {
         .filter_map(|row| row.label.as_deref())
         .map(|label| first_n_chars_bytes(label, TASK_LABEL_CHARS))
         .sum();
-    300 + labels + rows.len() * 120
+    // The +80 is the folded panel's own element overhead, exactly like the
+    // completion entry's estimate charges it (`task_entry_estimate`).
+    300 + labels + rows.len() * 120 + 80
 }
 
 /// Estimated serialized size (bytes) of one completion entry's folded panel,
@@ -241,8 +263,9 @@ fn secs_since(at_ms: i64, now_ms: i64) -> u64 {
 mod tests {
     use super::*;
 
-    /// The pinned copy (ADR-0060, #412): one row per task, type noun, label
-    /// and bare elapsed — `3m12s` / `1m05s` for this pair.
+    /// The pinned copy (ADR-0060, #412/#423): the title is the count, the body
+    /// one row per task — type noun, label and bare elapsed — `3m12s` / `1m05s`
+    /// for this pair.
     #[test]
     fn the_section_renders_the_pinned_copy() {
         let now = 1_800_000_000_000;
@@ -258,16 +281,18 @@ mod tests {
                 started_at: Some(now - 65_000),
             },
         ];
+        assert_eq!(task_ledger_title(&rows).unwrap(), "⏳ 后台任务（2）");
         assert_eq!(
             task_ledger_text(&rows, now).unwrap(),
-            "⏳ 后台任务（2）\n· shell：gh run watch · 3m12s\n· 子代理：review the diff · 1m05s"
+            "· shell：gh run watch · 3m12s\n· 子代理：review the diff · 1m05s"
         );
     }
 
-    /// No live task means no section — the empty header never renders, so a
-    /// card (and V1, which has no Background Task facts) is unchanged.
+    /// No live task means no section — neither the title nor the body renders,
+    /// so a card (and V1, which has no Background Task facts) is unchanged.
     #[test]
     fn an_empty_ledger_renders_nothing() {
+        assert_eq!(task_ledger_title(&[]), None);
         assert_eq!(task_ledger_text(&[], 1_800_000_000_000), None);
     }
 
@@ -288,10 +313,7 @@ mod tests {
                 started_at: None,
             },
         ];
-        assert_eq!(
-            task_ledger_text(&rows, now).unwrap(),
-            "⏳ 后台任务（2）\n· shell · 0m05s\n· 子代理"
-        );
+        assert_eq!(task_ledger_text(&rows, now).unwrap(), "· shell · 0m05s\n· 子代理");
     }
 
     /// The label clips exactly like the completion entry's title: at
@@ -307,7 +329,7 @@ mod tests {
             started_at: Some(now),
         }];
         let text = task_ledger_text(&rows, now).unwrap();
-        let row = text.lines().nth(1).unwrap();
+        let row = text.lines().next().unwrap();
         assert_eq!(row, format!("· shell：{}… · 0m00s", "x".repeat(TASK_LABEL_CHARS)));
         assert!(!text.contains("second line"), "one task, one row: {text}");
     }
@@ -339,12 +361,12 @@ mod tests {
         );
     }
 
-    /// The refresh clock is the elapsed in whole minutes (ADR-0060): the
-    /// seconds inside a minute never move it, crossing one does, a row with no
-    /// start time has no clock at all, and a future start clamps like the
-    /// render it keys.
+    /// The render clock records the elapsed in whole SECONDS — the value the
+    /// row renders (ADR-0060): the Bridge compares it at the cadence each path
+    /// owes, so a row with no start time has no clock at all, and a future
+    /// start clamps like the render it keys.
     #[test]
-    fn the_refresh_clock_moves_once_a_minute() {
+    fn the_render_clock_reads_whole_seconds() {
         let start = 1_800_000_000_000;
         let rows = vec![
             TaskLedgerRow {
@@ -360,16 +382,11 @@ mod tests {
         ];
 
         let clock = task_ledger_clock(&rows, start + 59_000);
-        assert_eq!(clock, vec![Some(0), None], "the whole minutes, in row order");
-        assert_eq!(
-            task_ledger_clock(&rows, start + 59_999),
-            clock,
-            "the seconds inside the minute do not move the clock"
-        );
+        assert_eq!(clock, vec![Some(59), None], "the rendered seconds, in row order");
         assert_eq!(
             task_ledger_clock(&rows, start + 60_000),
-            vec![Some(1), None],
-            "crossing the minute moves it"
+            vec![Some(60), None],
+            "the seconds keep moving through a minute"
         );
         assert_eq!(
             task_ledger_clock(&rows, start - 5_000),
