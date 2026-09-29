@@ -4,8 +4,8 @@ use tokio::sync::Mutex;
 use tracing::Instrument;
 
 use crate::backend::{MessageRole, Part, SessionTranscript, TurnAnchor};
-use crate::bridge::handles::{CardsHandle, FlowHandles};
-use crate::bridge::turn::{ContinuationFacts, SettleTiming, Turn, WakeContinuation};
+use crate::bridge::handles::{CardsHandle, FlowHandles, NoticeRules};
+use crate::bridge::turn::{ContinuationFacts, SettleTiming, Turn, WakeContinuation, YieldedUpdate};
 
 /// The external-message flow: watches for user messages that were NOT sent by
 /// cola (someone posted from OpenChamber or another client on the shared store)
@@ -39,16 +39,21 @@ pub struct ExternalFlow {
     /// loop idles and times out; the card then simply stays the "有新消息"
     /// notification. Injected small in tests to exercise the timeout branch.
     pub render_timeout_ms: std::sync::atomic::AtomicU64,
+    /// The Completion Notice's opt-in rules (ADR-0043), wired by the
+    /// coordinator: this pass settles a yielded card's quiet true end (ADR-0060)
+    /// and announces it with the same notice every other turn end sends.
+    notice: NoticeRules,
 }
 
 impl ExternalFlow {
-    pub fn new() -> Self {
+    pub fn new(notice: NoticeRules) -> Self {
         Self {
             last_user_msg_epoch: Arc::new(Mutex::new(HashMap::new())),
             poll_interval_ms: std::sync::atomic::AtomicU64::new(8_000),
             request_timeout_ms: std::sync::atomic::AtomicU64::new(30_000),
             render_poll_ms: std::sync::atomic::AtomicU64::new(1_500),
             render_timeout_ms: std::sync::atomic::AtomicU64::new(600_000),
+            notice,
         }
     }
 
@@ -202,13 +207,35 @@ impl ExternalFlow {
             )
             .await;
             // The same read also keeps a yielded (Waiting) card's ledger fresh
-            // in place (ADR-0060) — the freeze's carve-out. Ordered after the
-            // Wake step on purpose: a Wake that owes a continuation hands the
-            // ledger over through its split and leaves no Waiting card behind,
-            // so only the quiet retirement (no continuation to render) lands
-            // here, and a read that changed nothing PATCHes nothing.
-            if Turn::refresh_yielded_ledger(&handles.cards, sid, &transcript, now_ms).await {
-                tracing::info!("yielded ledger refreshed: session {sid}");
+            // in place — and settles the card when that read is its true end
+            // (ADR-0060): the freeze's carve-out. Ordered after the Wake step on
+            // purpose: a Wake that owes a continuation hands the ledger over
+            // through its split and leaves no Waiting card behind, so only the
+            // quiet retirement (no continuation to render) lands here, and a
+            // read that changed nothing PATCHes nothing.
+            let stopped = handles.waits.is_stopped(sid).await;
+            match Turn::refresh_yielded_ledger(&handles.cards, sid, &transcript, now_ms, stopped).await {
+                YieldedUpdate::Unchanged => {}
+                YieldedUpdate::Refreshed => {
+                    tracing::info!("yielded ledger refreshed: session {sid}");
+                }
+                YieldedUpdate::Settled { notice_at } => {
+                    tracing::info!("yielded ledger settled the true end: session {sid}");
+                    // The Completion Notice's existing rules (ADR-0043): groups
+                    // per the opt-in, p2p per the long-task threshold. A Wake
+                    // continuation carries the clock as `None` — its own card
+                    // send was the notification (ADR-0059).
+                    if let Some(started_at) = notice_at {
+                        crate::bridge::turn::send_completion_notice(
+                            &handles.cards,
+                            &handles.platform,
+                            &self.notice,
+                            sid,
+                            started_at,
+                        )
+                        .await;
+                    }
+                }
             }
         }
         let mut map = self.last_user_msg_epoch.lock().await;

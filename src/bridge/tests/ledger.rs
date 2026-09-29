@@ -16,15 +16,18 @@
 //! the decode, see `opencode::v2::wire`).
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use super::drain::{assistant, ctx, script_transcript, scripted_app, spawn_sync, spawn_turn, user};
+use super::drain::{
+    assistant, ctx, noticed, script_transcript, scripted_app, scripted_app_with, spawn_sync, spawn_turn, user,
+};
 use crate::backend::{
     BackgroundTask, ContentBlock, FinishReason, MessageRole, Part, SessionTranscript, StepFinish, ToolCall,
     ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
 };
 use crate::bridge::test_support::*;
-use crate::bridge::turn::Turn;
+use crate::bridge::turn::{PromptContext, Turn};
 use crate::feishu::card::CardState;
 use crate::opencode::types::SessionStatus;
 
@@ -864,6 +867,11 @@ async fn a_new_turn_takes_the_live_list_over_from_the_waiting_card() {
 // elapsed moves when a whole minute turns, and an unchanged read PATCHes
 // nothing. The carve-out is the ledger alone: the rest of the yielded card
 // stays frozen.
+//
+// The last quiet retirement is also the card's true end (ticket #420): the
+// same read settles the host card in place — ✅, or the ❌/⏹ a settled failure
+// or a deliberate stop dominates with — and sends the Completion Notice per
+// its existing rules. No new card, and only a Waiting card is ever stamped.
 // ---------------------------------------------------------------------------
 
 /// The one-task waiting read the in-place tests yield from: the timeline's
@@ -921,6 +929,417 @@ async fn created_cards(platform: &RecordingPlatform) -> Vec<serde_json::Value> {
             _ => None,
         })
         .collect()
+}
+
+/// Run `context`'s turn to its waiting yield on a single live task and name the
+/// yielded card `om_waiting` (the harness replies every card with one id, so
+/// the rename tells the settle's PATCHes apart from the yield's own).
+async fn yield_one_task_card(app: &Arc<App>, platform: &RecordingPlatform, context: PromptContext) {
+    Turn::run(&app.turn_handles(), context).await.unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "the turn yields on its live task"
+    );
+    let yielded = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&yielded).contains("⏳ 后台任务（1）"),
+        "the waiting card carries its live task: {yielded}"
+    );
+    Turn::set_card_message_id(&app.cards_handle(), "ses_test", "om_waiting").await;
+}
+
+/// Script the read that retires the one live task with nothing to render: the
+/// Wake is answered by a later Execution boundary and no resumed work follows,
+/// so the read is the true end.
+async fn script_quiet_true_end(backend: &Arc<MockBackend>) {
+    script_transcript(
+        backend,
+        vec![
+            SessionTranscript::new(two_task_timeline(vec![]))
+                .with_executions(vec![execution(2_500), execution(4_000)])
+                .with_wakes(vec![shell_wake(2_900)]),
+        ],
+    )
+    .await;
+}
+
+/// Await the Completion Notice — sent right after the settle PATCH, so it can
+/// trail the card update — or panic after 5 s.
+async fn wait_for_notice(platform: &RecordingPlatform) -> Vec<(String, String, Option<String>, String)> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let notices = platform.completion_notices().await;
+        if !notices.is_empty() {
+            return notices;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no Completion Notice arrived: {:?}",
+            platform.calls.lock().await
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Acceptance 1 (#420): the last task retires with nothing to render, so the
+/// read settles the WAITING card in place — ✅, terminal, the fixed completion
+/// entry kept, no new card — and the Completion Notice fires per its existing
+/// group rule.
+#[tokio::test]
+async fn a_quiet_true_end_settles_the_host_card_in_place() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell(now - 5_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    // A group turn with a requester: the notice's opt-in default (test_config)
+    // notifies, so a missing notice would be the settle's bug.
+    let mut context = ctx("ses_test", "跑一下构建并审阅");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+    yield_one_task_card(&app, &platform, context).await;
+    let cards_before = created_cards(&platform).await.len();
+
+    script_quiet_true_end(&backend).await;
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the settled card", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅") && card_text(card).contains("🔔 后台任务完成：gh run watch")
+    })
+    .await;
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done),
+        "the true end is the card's terminal"
+    );
+    let patches = patches_to(&platform, "om_waiting").await;
+    assert_eq!(patches.len(), 1, "the settle is one in-place PATCH: {patches:?}");
+    let settled = &patches[0];
+    let text = card_text(settled);
+    assert!(
+        !text.contains("后台任务（"),
+        "the retired task's live list is gone: {settled}"
+    );
+    assert!(
+        text.contains("🔔 后台任务完成：gh run watch") && text.contains("shell sh_bg · "),
+        "the fixed entry stays on the card that hosted the task: {settled}"
+    );
+    assert!(
+        text.contains("已经交给后台了。") && text.contains("📁"),
+        "the settled card keeps its timeline and footer: {settled}"
+    );
+
+    // Nothing was posted: the settle is in place.
+    assert!(
+        continuation_sends(&platform).await.is_empty(),
+        "a quiet true end owes no continuation: {:?}",
+        platform.calls.lock().await
+    );
+    assert_eq!(
+        created_cards(&platform).await.len(),
+        cards_before,
+        "no new card is posted for the settle"
+    );
+
+    // The notice fires per its existing rules: a group turn with the opt-in
+    // replies to the requester with the ✅ copy.
+    let notices = wait_for_notice(&platform).await;
+    assert_eq!(notices.len(), 1, "exactly one notice: {notices:?}");
+    assert_eq!(notices[0].0, "msg_1", "it replies to the prompt");
+    assert_eq!(notices[0].1, TEST_HOST);
+    assert!(
+        notices[0].3.contains("已完成"),
+        "unexpected notice text: {}",
+        notices[0].3
+    );
+}
+
+/// Acceptance 3 (#420): a deliberate `/stop` during the wait dominates the
+/// quiet true end — the settle stamps ⏹ 已停止 in place, never ✅ — and the
+/// notice follows the card's real terminal.
+#[tokio::test]
+async fn a_stop_during_the_wait_settles_the_card_as_stopped() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell(now - 5_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    let mut context = ctx("ses_test", "跑一下构建并审阅");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+    yield_one_task_card(&app, &platform, context).await;
+    // The user stops while the card waits: the marker is sticky until a Wake
+    // clears it (a quiet retirement never does).
+    app.stopped_sessions.lock().await.insert("ses_test".to_string());
+
+    script_quiet_true_end(&backend).await;
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the stop terminal", CardUpdates::Latest, |card| {
+        card_header(card).contains("已停止") && card_text(card).contains("🔔 后台任务完成：gh run watch")
+    })
+    .await;
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Stopped),
+        "the deliberate stop owns the ending"
+    );
+    let patches = patches_to(&platform, "om_waiting").await;
+    assert_eq!(patches.len(), 1, "the settle is one in-place PATCH: {patches:?}");
+    assert!(
+        !card_header(&patches[0]).contains("完成"),
+        "the ledger path never stamps ✅ over a stop: {}",
+        patches[0]
+    );
+    let notices = wait_for_notice(&platform).await;
+    assert_eq!(notices.len(), 1, "exactly one notice: {notices:?}");
+    assert!(
+        notices[0].3.contains("已停止"),
+        "the notice follows the card's terminal: {}",
+        notices[0].3
+    );
+}
+
+/// Acceptance 3 (#420): a card that already settled as a failure keeps its
+/// terminal — the ledger path reads the accumulator's recorded state and never
+/// stamps ✅ (or anything else) over it. Nothing is even PATCHed: the card
+/// stopped updating at its ending.
+#[tokio::test]
+async fn a_terminal_card_is_never_restamped_by_a_retirement() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell(now - 5_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    // A group turn with a requester: if the ledger path stamped over the
+    // terminal, the notice would fire and expose it.
+    let mut context = ctx("ses_test", "跑一下构建并审阅");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+    yield_one_task_card(&app, &platform, context).await;
+    // A settled failure (the shape the follow's Error terminal records).
+    Turn::set_card_state(&app.cards_handle(), "ses_test", CardState::Error).await;
+    let patches_before = patches_to(&platform, "om_waiting").await.len();
+
+    script_quiet_true_end(&backend).await;
+    spawn_sync(&app);
+    // Several passes at the injected cadence: none may touch the terminal.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Error),
+        "the settled failure keeps its terminal"
+    );
+    assert_eq!(
+        patches_to(&platform, "om_waiting").await.len(),
+        patches_before,
+        "a terminal card is not refreshed: {:?}",
+        platform.updated_cards().await
+    );
+    assert!(
+        !noticed(&platform).await,
+        "a terminal card's retirement sends no notice"
+    );
+}
+
+/// The notice's p2p rule is reused, not re-invented (#420): a quiet true end
+/// that ran past the long-task threshold notifies — the whole run's clock, the
+/// turn's start recorded on the card — with no @ mention (p2p's reply is the
+/// notification).
+#[tokio::test]
+async fn a_long_quiet_true_end_notifies_in_p2p() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell(now - 5_000);
+    let (_dir, app, backend, platform) = scripted_app_with(vec![live], Some(SessionStatus::Idle), |cfg| {
+        cfg.bridge.long_task_notice = true;
+    })
+    .await;
+    app.long_task_notice_ms.store(1, Ordering::Relaxed);
+    let mut context = ctx("ses_test", "跑一下构建并审阅");
+    context.requester_open_id = Some(TEST_HOST.to_string());
+    yield_one_task_card(&app, &platform, context).await;
+    // The yield and the settle read take real milliseconds, so the threshold
+    // above is already past by the time the settle fires.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    script_quiet_true_end(&backend).await;
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the settled p2p card", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+
+    let notices = wait_for_notice(&platform).await;
+    assert_eq!(notices.len(), 1, "exactly one notice: {notices:?}");
+    assert_eq!(notices[0].0, "msg_1", "it replies to the prompt");
+    assert_eq!(notices[0].1, TEST_HOST);
+    assert_eq!(notices[0].2, None, "p2p needs no @ mention");
+    assert!(
+        notices[0].3.contains("已完成"),
+        "unexpected notice text: {}",
+        notices[0].3
+    );
+}
+
+/// The other half of the p2p rule (#420): a quiet true end under the threshold
+/// stays silent, exactly like a short normal turn.
+#[tokio::test]
+async fn a_short_quiet_true_end_stays_silent_in_p2p() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell(now - 5_000);
+    let (_dir, app, backend, platform) = scripted_app_with(vec![live], Some(SessionStatus::Idle), |cfg| {
+        cfg.bridge.long_task_notice = true;
+    })
+    .await;
+    app.long_task_notice_ms.store(60_000, Ordering::Relaxed);
+    let mut context = ctx("ses_test", "跑一下构建并审阅");
+    context.requester_open_id = Some(TEST_HOST.to_string());
+    yield_one_task_card(&app, &platform, context).await;
+
+    script_quiet_true_end(&backend).await;
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the settled p2p card", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+    // The notice would trail the settle PATCH in the same pass: give it the
+    // moment, then assert the silence.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(
+        platform.completion_notices().await.is_empty(),
+        "a short p2p run must not notify: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// The true end waits for the Wake's own boundary (the read's settle decision,
+/// ADR-0059): a read that already dropped the task but whose Wake has no
+/// Execution boundary yet only refreshes the ledger — the resumed run could
+/// still render work — and the read that carries the boundary settles.
+#[tokio::test]
+async fn a_retirement_before_the_wakes_boundary_does_not_settle() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell(now - 5_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    yield_one_task_card(&app, &platform, ctx("ses_test", "跑一下构建并审阅")).await;
+
+    // The Wake's boundary is still missing: the ledger moves in place (the row
+    // leaves, the entry arrives) but the card keeps waiting.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(two_task_timeline(vec![]))
+                .with_executions(vec![execution(2_500)])
+                .with_wakes(vec![shell_wake(2_900)]),
+        ],
+    )
+    .await;
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the refreshed wait", CardUpdates::Latest, |card| {
+        card_text(card).contains("🔔 后台任务完成：gh run watch")
+    })
+    .await;
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "an unanswered Wake keeps the card waiting"
+    );
+    assert!(
+        card_header(&platform.updated_cards().await.last().cloned().unwrap()).contains("等待后台任务"),
+        "the refreshed card is still the wait"
+    );
+
+    // The boundary lands: the same ledger, now the true end — settled in place.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(two_task_timeline(vec![]))
+                .with_executions(vec![execution(2_500), execution(4_000)])
+                .with_wakes(vec![shell_wake(2_900)]),
+        ],
+    )
+    .await;
+    wait_for_card_update(&platform, "the settled card", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done),
+        "the read that answers the Wake is the true end"
+    );
+}
+
+/// A Wake continuation's own quiet true end (#420): the continuation yields
+/// Waiting on the task its resumed run left live, and THAT card's last
+/// retirement settles it in place — ✅ — without a second notice: the
+/// continuation's own card send was the notification (ADR-0059).
+#[tokio::test]
+async fn a_continuations_quiet_true_end_settles_without_a_second_notice() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let sub_started = now - 4_000;
+    let (_dir, app, backend, platform) =
+        scripted_app(vec![two_task_waiting()], Some(SessionStatus::Idle)).await;
+    // A group turn with a requester: the continuation inherits both, so its
+    // settle WOULD notify if the guard did not stay silent.
+    let mut context = ctx("ses_test", "跑一下构建并审阅");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+    Turn::run(&app.turn_handles(), context).await.unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting)
+    );
+    Turn::set_card_message_id(&app.cards_handle(), "ses_test", "om_waiting").await;
+
+    // The shell retires with resumed work: the chain continues on a new card,
+    // which yields Waiting on the remaining subagent.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(two_task_timeline(vec![assistant(3_100, "CI 通过了。")]))
+                .with_executions(vec![execution(2_500), execution(4_000)])
+                .with_wakes(vec![shell_wake(2_900)])
+                .with_background_tasks(vec![live_subagent(sub_started, "call_sub")]),
+        ],
+    )
+    .await;
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the continuation waiting on the subagent",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("等待后台任务") && card_text(card).contains(WAKE_LEAD),
+    )
+    .await;
+
+    // The subagent retires quietly: the continuation card reaches its true end.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(two_task_timeline(vec![]))
+                .with_executions(vec![execution(2_500), execution(4_000)])
+                .with_wakes(vec![shell_wake(2_900), subagent_wake(3_500, "review the diff")]),
+        ],
+    )
+    .await;
+    wait_for_card_update(
+        &platform,
+        "the continuation's true end",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅") && !card_text(card).contains("后台任务（"),
+    )
+    .await;
+
+    assert!(
+        !noticed(&platform).await,
+        "a Wake continuation's own send was the notification: {:?}",
+        platform.calls.lock().await
+    );
 }
 
 /// Acceptance 1 (#419): a quiet retirement — the shell's Wake with no resumed

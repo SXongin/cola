@@ -16,7 +16,9 @@ use tracing::Instrument;
 
 use crate::backend::{MessageRole, SessionTranscript, TurnAnchor, TurnSettle};
 use crate::bridge::handler::image_inputs;
-use crate::bridge::handles::{CardsHandle, FlowHandles, RequestsHandle, SessionsHandle, TurnHandles};
+use crate::bridge::handles::{
+    CardsHandle, FlowHandles, NoticeRules, RequestsHandle, SessionsHandle, TurnHandles,
+};
 use crate::bridge::span;
 use crate::bridge::turn::state::StreamAccumulator;
 use crate::config::ThreadKey;
@@ -347,9 +349,14 @@ impl Turn {
         // busy guard from this insert — no I/O — so the card-less window is as
         // small as the two mutexes make it. The flush leaves the split pending
         // on a missing id, and the first flush after the id lands serves it.
+        let started_at = std::time::Instant::now();
         let mut acc = StreamAccumulator::new(&subtitle);
         acc.reply_to_message_id = Some(message_id.clone());
         acc.session_id = Some(session_id.clone());
+        // The notice's clock travels on the card (ADR-0060): a quiet true end
+        // is settled by Session Sync, which has no Turn to read `started_at`
+        // from.
+        acc.turn_started_at = Some(started_at);
         // The id this turn's user message carries, so a later retry reuses
         // it (ADR-0026) — the server deduplicates by id.
         acc.cola_message_id = Some(cola_message_id.clone());
@@ -448,7 +455,7 @@ impl Turn {
             images,
             directory: session_dir,
             turn_variant: None,
-            started_at: std::time::Instant::now(),
+            started_at,
             drain_started: false,
             unstarted_reads: 0,
             submit_failed: false,
@@ -831,7 +838,14 @@ impl Turn {
         // declines a card that is not at an ending, so a Waiting yield never
         // notifies — the notice belongs to the true end (ADR-0059).
         if !follow {
-            send_completion_notice(handles, &self.session_id, self.started_at).await;
+            send_completion_notice(
+                &handles.cards,
+                &handles.platform,
+                &handles.config.notice_rules(),
+                &self.session_id,
+                self.started_at,
+            )
+            .await;
         }
 
         // The guard is released here for every end except a follow hand-off:
@@ -1279,6 +1293,38 @@ impl CollectReason {
     }
 }
 
+/// What one Session Sync read did to a yielded (Waiting) card in place
+/// (ADR-0060): the freeze's carve-out answers what the read owes — the ledger
+/// refresh and the quiet true end ride the same read.
+pub(crate) enum YieldedUpdate {
+    /// The read owed nothing: no PATCH at all, the card stays exactly as the
+    /// yield left it.
+    Unchanged,
+    /// The ledger moved (a row joined or left, a minute turned, an entry
+    /// arrived): the card is PATCHed in place and the wait goes on.
+    Refreshed,
+    /// The last Background Task retired and the read judged the true end: the
+    /// card settled in place and stopped updating. `notice_at` is the
+    /// Completion Notice's clock — `Some` when this card owes the notice (the
+    /// Turn's own waiting card), `None` when it must stay silent (a Wake
+    /// continuation, whose own send was the notification, or a card with no
+    /// recorded turn start).
+    Settled { notice_at: Option<std::time::Instant> },
+}
+
+/// The ending a quiet true-end read stamps in place — the same choices
+/// [`settle::stamp`] maps its [`Ending`]s to, with the failure's message kept
+/// (the out-of-turn loops re-read it from the transcript; this path has it in
+/// hand).
+enum QuietEnding {
+    /// The true end: idle with no live Background Task.
+    Done,
+    /// The Turn's settled failure.
+    Failed(String),
+    /// `/stop` marked the session: the deliberate stop's terminal.
+    Stopped,
+}
+
 /// The Turn's card-delivery interface (spec #298, A2a): the operations sibling
 /// flows invoke when they own the trigger moment — the render poll, the
 /// request poller surfacing an inline block, the external renderer finalizing
@@ -1414,6 +1460,18 @@ impl Turn {
     /// minute turns, and an unchanged read leaves the card completely alone —
     /// no PATCH at all, so its header, timeline and footer stay frozen.
     ///
+    /// The same read is also the true end's judge (ADR-0060): when it shows
+    /// the last Background Task retired, the card settles in place — ✅ when
+    /// the read's own settle decision is complete (ADR-0059), ❌ with the
+    /// failure's message when a settled failure dominates it, ⏹ 已停止 for a
+    /// deliberate `/stop` — and reports the notice the caller owes
+    /// ([`YieldedUpdate::Settled`]). A card that already ended (a settled
+    /// failure or stop, or a collected wait) keeps the ending it recorded:
+    /// only a `Waiting` card is ever stamped here. `stopped` is the session's
+    /// sticky `/stop` marker, read by the caller; the stop dominates only once
+    /// the read can judge the end too — a read still reporting live Background
+    /// Tasks leaves the card waiting (its ledger still has rows to show).
+    ///
     /// Only the yielded `Waiting` card is refreshed: a live card is
     /// render-owned (its own loop streams into it, and Session Sync's Wake step
     /// above refused to touch it), and a terminal card keeps the ending it
@@ -1429,37 +1487,85 @@ impl Turn {
     /// ([`CardsHandle::write_lock`]), like every other card write, so the facts
     /// and the PATCH they owe cannot interleave with a split, a collect or
     /// another flush. `now_ms` is the read's clock, shared with the same pass's
-    /// Wake decision. Returns whether this read moved the ledger — the card is
-    /// PATCHed when it did.
+    /// Wake decision. Returns what this read did — the card is PATCHed exactly
+    /// when it moved.
     pub(crate) async fn refresh_yielded_ledger(
         cards: &CardsHandle,
         session_id: &str,
         transcript: &SessionTranscript,
         now_ms: i64,
-    ) -> bool {
+        stopped: bool,
+    ) -> YieldedUpdate {
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
-        let changed = {
+        let (changed, settled, notice_at) = {
             let mut live = cards.cards.lock().await;
             let Some(card) = live.get_mut(session_id) else {
-                return false;
+                return YieldedUpdate::Unchanged;
             };
             if card.acc.card_state != crate::feishu::card::CardState::Waiting {
-                return false;
+                return YieldedUpdate::Unchanged;
             }
             if !card.card_is_live || !card.pending_split.is_empty() {
-                return false;
+                return YieldedUpdate::Unchanged;
             }
             let anchor = card.acc.turn_anchor.clone();
-            render::apply_ledger_read(&mut card.acc, transcript, anchor.as_ref(), now_ms)
+            let changed = render::apply_ledger_read(&mut card.acc, transcript, anchor.as_ref(), now_ms);
+            // The read's own settle decision judges the true end (ADR-0059):
+            // only a read whose Wakes are answered and that retired the last
+            // Background Task settles, and the ending stamped is the one the
+            // out-of-turn loops would stamp ([`QuietEnding`] mirrors
+            // `settle::stamp`'s mapping) — a settled failure or a deliberate
+            // stop dominates ✅.
+            let ending = match anchor.as_ref().map(|anchor| transcript.settle(anchor)) {
+                Some(TurnSettle::Complete | TurnSettle::Failed(_)) if stopped => Some(QuietEnding::Stopped),
+                Some(TurnSettle::Complete) => Some(QuietEnding::Done),
+                Some(TurnSettle::Failed(error)) => Some(QuietEnding::Failed(error)),
+                Some(TurnSettle::Waiting | TurnSettle::Running) | None => None,
+            };
+            if let Some(ending) = &ending {
+                match ending {
+                    QuietEnding::Done => card.acc.card_state = crate::feishu::card::CardState::Done,
+                    QuietEnding::Failed(error) => {
+                        card.acc.error = Some(error.clone());
+                        card.acc.card_state = crate::feishu::card::CardState::Error;
+                    }
+                    QuietEnding::Stopped => card.acc.set_stopped(),
+                }
+            }
+            // A settled Wake continuation owes no notice: its own card send was
+            // the notification (ADR-0059). The Turn's own waiting card carries
+            // its start as the long-task clock.
+            let notice_at = if card.acc.wake_continuation {
+                None
+            } else {
+                card.acc.turn_started_at
+            };
+            (changed, ending, notice_at)
         };
+        if let Some(ending) = settled {
+            let what = match ending {
+                QuietEnding::Done => "done",
+                QuietEnding::Failed(_) => "failed",
+                QuietEnding::Stopped => "stopped",
+            };
+            // The footer is refreshed one last time (ADR-0019): the card
+            // stopped updating at the yield, and the work behind it may have
+            // moved the branch or the tree. Under the same write lock as the
+            // flush, so the refreshed footer and the ending ride one PATCH.
+            // Best effort, like every other finalize.
+            state::refresh_work_context(cards, session_id).await;
+            flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Forbid).await;
+            tracing::info!("yielded card settled in place: session {session_id} ({what})");
+            return YieldedUpdate::Settled { notice_at };
+        }
         if !changed {
-            return false;
+            return YieldedUpdate::Unchanged;
         }
         // The guard (ADR-0060): a ledger-only refresh must never post a new
         // card, so this flush may not finalize and continue the chain.
         flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Forbid).await;
-        true
+        YieldedUpdate::Refreshed
     }
 }
 
@@ -2486,28 +2592,36 @@ async fn release_inflight(handles: &TurnHandles, session_id: &str) {
 /// "long" is the one event worth surfacing even though the user was presumably
 /// around.
 ///
-/// A free function because both ends of a turn call it: `finish` for a turn
-/// that ended normally, and the out-of-turn drain follow (#284) when the turn
-/// it inherited actually ends. A drain hand-off keeps the ORIGINAL turn's
+/// A free function because every end of a turn calls it: `finish` for a turn
+/// that ended normally, the out-of-turn drain follow (#284) when the turn it
+/// inherited actually ends, and Session Sync when a yielded card's quiet true
+/// end settles in place (ADR-0060). A drain hand-off keeps the ORIGINAL turn's
 /// start, so the long-task threshold measures the whole run; a retry re-attach
 /// (#393) arms the follow with "now" instead, because the original turn's
-/// start is no longer known there. The copy follows the card's real terminal
+/// start is no longer known there; the quiet true end reads the start the card
+/// recorded at turn start. The copy follows the card's real terminal
 /// (#394): 完成, 出错, or 已停止 for a deliberate `/stop` — and the function
 /// itself declines a card that is not at an ending, so a Waiting card can
 /// never be announced as 完成 even by a caller that forgot to guard (ADR-0059).
-async fn send_completion_notice(handles: &TurnHandles, session_id: &str, started_at: std::time::Instant) {
-    if !(handles.config.group_completion_notice || handles.config.long_task_notice) {
+pub(crate) async fn send_completion_notice(
+    cards: &CardsHandle,
+    platform: &Arc<dyn crate::feishu::Platform>,
+    rules: &NoticeRules,
+    session_id: &str,
+    started_at: std::time::Instant,
+) {
+    if !(rules.group_completion_notice || rules.long_task_notice) {
         return;
     }
     let notice = {
-        let cards = handles.cards.cards.lock().await;
+        let cards = cards.cards.lock().await;
         cards.get(session_id).map(|c| &c.acc).and_then(|a| {
             let requester = a.requester_open_id.clone()?;
             let reply_to = a.reply_to_message_id.clone()?;
-            let long_task = started_at.elapsed()
-                >= std::time::Duration::from_millis(handles.config.long_task_notice_ms());
-            if !(a.is_group && handles.config.group_completion_notice
-                || !a.is_group && handles.config.long_task_notice && long_task)
+            let long_task =
+                started_at.elapsed() >= std::time::Duration::from_millis(rules.long_task_notice_ms());
+            if !(a.is_group && rules.group_completion_notice
+                || !a.is_group && rules.long_task_notice && long_task)
             {
                 return None;
             }
@@ -2536,12 +2650,11 @@ async fn send_completion_notice(handles: &TurnHandles, session_id: &str, started
         // plain reply, which still notifies the message author. p2p needs no
         // @ — the reply itself is the notification.
         let name = if is_group {
-            handles.platform.user_name(&requester).await.unwrap_or(None)
+            platform.user_name(&requester).await.unwrap_or(None)
         } else {
             None
         };
-        if let Err(e) = handles
-            .platform
+        if let Err(e) = platform
             .reply_completion_notice(&reply_to, &requester, name.as_deref(), text)
             .await
         {
@@ -2860,7 +2973,14 @@ mod tests {
         )
         .await;
 
-        send_completion_notice(&app.turn_handles(), "ses_test", std::time::Instant::now()).await;
+        send_completion_notice(
+            &app.cards_handle(),
+            &app.feishu,
+            &app.turn_config().notice_rules(),
+            "ses_test",
+            std::time::Instant::now(),
+        )
+        .await;
 
         assert!(
             !platform.calls.lock().await.iter().any(|call| matches!(
@@ -2879,7 +2999,14 @@ mod tests {
             crate::feishu::card::CardState::Done,
         )
         .await;
-        send_completion_notice(&app.turn_handles(), "ses_test", std::time::Instant::now()).await;
+        send_completion_notice(
+            &app.cards_handle(),
+            &app.feishu,
+            &app.turn_config().notice_rules(),
+            "ses_test",
+            std::time::Instant::now(),
+        )
+        .await;
         assert!(
             platform.calls.lock().await.iter().any(|call| matches!(
                 call,

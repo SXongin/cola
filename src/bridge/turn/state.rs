@@ -559,6 +559,14 @@ pub(super) struct StreamAccumulator {
     pub(super) requester_open_id: Option<String>,
     /// Whether the prompt came from a group chat (completion notice is group-only).
     pub(super) is_group: bool,
+    /// When the Turn that owns this card chain started (the same instant the
+    /// Turn's own `started_at` records), for the Completion Notice's p2p
+    /// long-task threshold. The quiet true end (ADR-0060) is settled by Session
+    /// Sync, which has no Turn object: the card carries the notice's clock.
+    /// `None` for a card no Turn started (an external render's, or a Wake
+    /// continuation armed after a restart) — a Wake continuation never owes the
+    /// notice anyway, its own send was the notification (ADR-0059).
+    pub(super) turn_started_at: Option<std::time::Instant>,
     /// The Chat/Topic's turn generation at this turn's start (ADR-0043),
     /// assigned by [`crate::bridge::reminder::ReminderState::begin_turn`]. The Instant
     /// Reminder pin lifecycle reads it so every pin carries the turn it

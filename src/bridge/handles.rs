@@ -803,7 +803,8 @@ impl CardsHandle {
     /// and `split_chain_for_wake` (which enqueue their split and flush it under
     /// the same lock; `split_chain_for_wake` also writes the outgoing card's
     /// ledger handover), `refresh_yielded_ledger` (a yielded card's in-place
-    /// ledger update) and `resolve_blocks` are the holders.
+    /// ledger update and quiet true-end settle) and `resolve_blocks` are the
+    /// holders.
     pub(crate) async fn write_lock(&self, session_id: &str) -> Arc<Mutex<()>> {
         self.write_locks
             .lock()
@@ -1012,7 +1013,44 @@ impl TurnConfig {
         self.turn_follow_read_timeout_ms.load(Ordering::Relaxed)
     }
 
-    /// The long-task completion-notice threshold (ms).
+    /// The Completion Notice's opt-in rules as a bundle of their own, so
+    /// Session Sync — which settles a yielded card's quiet true end and sends
+    /// the same notice, without a Turn's config or its cadence knobs — can
+    /// carry exactly what the notice decides on (ADR-0060).
+    pub(crate) fn notice_rules(&self) -> NoticeRules {
+        NoticeRules::new(
+            self.group_completion_notice,
+            self.long_task_notice,
+            Arc::clone(&self.long_task_notice_ms),
+        )
+    }
+}
+
+/// The Completion Notice's opt-in rules (ADR-0043 amendment 2026-09-21), split
+/// out of [`TurnConfig`] for callers that are not a Turn: whether groups notify,
+/// whether a long p2p run notifies, and the injectable threshold. The threshold
+/// stays the SAME atomic as the Turn config's, so a test that stores a tiny
+/// value moves both clock readers at once.
+#[derive(Clone)]
+pub(crate) struct NoticeRules {
+    pub(crate) group_completion_notice: bool,
+    pub(crate) long_task_notice: bool,
+    long_task_notice_ms: Arc<AtomicU64>,
+}
+
+impl NoticeRules {
+    pub(crate) fn new(
+        group_completion_notice: bool,
+        long_task_notice: bool,
+        long_task_notice_ms: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            group_completion_notice,
+            long_task_notice,
+            long_task_notice_ms,
+        }
+    }
+
     pub(crate) fn long_task_notice_ms(&self) -> u64 {
         self.long_task_notice_ms.load(Ordering::Relaxed)
     }

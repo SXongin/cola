@@ -97,8 +97,25 @@ pub(crate) async fn scripted_app(
     Arc<MockBackend>,
     Arc<RecordingPlatform>,
 ) {
+    scripted_app_with(scripts, status, |_| {}).await
+}
+
+/// [`scripted_app`] with the config adjusted before the App is built: the
+/// completion-notice opt-ins are fixed at construction, so a test that needs
+/// them (the p2p long-task notice) must set them here.
+pub(crate) async fn scripted_app_with(
+    scripts: Vec<SessionTranscript>,
+    status: Option<SessionStatus>,
+    configure: impl FnOnce(&mut crate::config::Config),
+) -> (
+    tempfile::TempDir,
+    Arc<App>,
+    Arc<MockBackend>,
+    Arc<RecordingPlatform>,
+) {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut cfg = test_config(&dir.path().join("sessions.json"));
+    configure(&mut cfg);
     let mut backend = MockBackend::new(realistic_parts());
     backend.given_transcript("ses_test", scripts);
     if let Some(status) = status {
@@ -1924,11 +1941,16 @@ async fn a_turn_idling_with_a_live_background_task_yields_waiting() {
     assert_no_further_rendering(&backend, &platform).await;
 }
 
-/// The yield stops the card: a later retirement of the last Background Task
-/// leaves the waiting card alone — the Wake continues the chain on a new card
-/// (ticket 3) and this card's notice never fires (there is no true end here).
+/// The yield's true end (ADR-0060, ticket #420): the last Background Task
+/// retires with nothing to render, so Session Sync's own read settles the
+/// WAITING card in place — ✅, the fixed completion entry on the card that
+/// hosted the task, no new card. This supersedes the old "a retirement leaves
+/// the waiting card alone" expectation: a retirement that still leaves a task
+/// live (or one whose resumed run renders work) does not settle, but the last
+/// quiet one does. The p2p turn carries no notice opt-in and no requester, so
+/// nothing notifies; the notice's own cases live in `ledger.rs`.
 #[tokio::test]
-async fn a_retirement_after_the_yield_leaves_the_waiting_card_alone() {
+async fn a_quiet_retirement_after_the_yield_settles_the_waiting_card() {
     let _wd = test_work_dir();
     let live = SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000, "跑一下 CI"),
@@ -1945,37 +1967,51 @@ async fn a_retirement_after_the_yield_leaves_the_waiting_card_alone() {
         Turn::card_state(&app.cards_handle(), "ses_test").await,
         Some(CardState::Waiting)
     );
-    let patches = platform.updated_cards().await.len();
+    Turn::set_card_message_id(&app.cards_handle(), "ses_test", "om_waiting").await;
 
-    // The task retires later and its Execution ends: a true end for the chain,
-    // but this card has already yielded — nothing restamps it.
+    // The task retires later and its Execution ends — and its run resumes
+    // nothing, so the read is the chain's true end.
     script_transcript(
         &backend,
         vec![
             SessionTranscript::new(vec![
                 user("msg_cola_anchor", 1_000, "跑一下 CI"),
                 assistant(2_000, "已经交给后台了。"),
-                assistant(3_100, "CI 通过了。"),
             ])
             .with_executions(vec![execution(2_500), execution(4_000)])
             .with_wakes(vec![shell_wake(2_900)]),
         ],
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the settled card", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅") && card_text(card).contains("🔔 后台任务完成：gh run watch")
+    })
+    .await;
 
     assert_eq!(
-        platform.updated_cards().await.len(),
-        patches,
-        "a yielded card stops updating"
-    );
-    assert_eq!(
         Turn::card_state(&app.cards_handle(), "ses_test").await,
-        Some(CardState::Waiting)
+        Some(CardState::Done),
+        "the quiet true end is the card's terminal"
+    );
+    let settled = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&settled);
+    assert!(
+        !text.contains("后台任务（"),
+        "the retired task's live list is gone: {settled}"
+    );
+    assert!(
+        text.contains("🔔 后台任务完成：gh run watch") && text.contains("shell sh_bg · "),
+        "the fixed entry stays on the card that hosted the task: {settled}"
+    );
+    assert!(
+        continuation_sends(&platform).await.is_empty(),
+        "a quiet true end owes no continuation: {:?}",
+        platform.calls.lock().await
     );
     assert!(
         !noticed(&platform).await,
-        "the notice belongs to the true end, on the continuation card"
+        "no notice opt-in and no requester: nothing notifies"
     );
 }
 
