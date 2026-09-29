@@ -90,15 +90,12 @@ pub struct TaskCompletionEntry {
 /// The completion entry's collapsed title (ADR-0060) — the mechanical
 /// completion line the merged-path receipt always carried,
 /// `🔔 后台任务完成：<label>` / `🔔 子代理完成：<label>`, bare when the Wake
-/// named no label. The label folds to one line and clips exactly like the live
-/// row, so one label has one visible length wherever it renders.
+/// named no label. The label goes through the shared [`folded_label`], so one
+/// label has one visible shape wherever the ledger renders it.
 pub(crate) fn task_entry_title(entry: &TaskCompletionEntry) -> String {
     let noun = entry.kind.completion_noun();
     match entry.label.as_deref().filter(|label| !label.is_empty()) {
-        Some(label) => {
-            let label = label.replace(['\n', '\r'], " ");
-            format!("🔔 {noun}：{}", truncate_md(&label, TASK_LABEL_CHARS))
-        }
+        Some(label) => format!("🔔 {noun}：{}", folded_label(label)),
         None => format!("🔔 {noun}"),
     }
 }
@@ -135,10 +132,10 @@ pub(crate) fn task_entry_body(entry: &TaskCompletionEntry) -> String {
 /// ```
 ///
 /// `None` when no task is live (no empty header). Rows render in the order
-/// given (the transcript's own), one line each: a label's newlines fold to
-/// spaces so a multi-line command cannot break the row layout, and the label
-/// is clipped like the completion entry's title. The caller sanitizes the text
-/// like any other model-authored markdown.
+/// given (the transcript's own), one line each: a label goes through the shared
+/// [`folded_label`], so a multi-line command cannot break the row layout and
+/// one label clips identically wherever the ledger renders it. The caller
+/// sanitizes the text like any other model-authored markdown.
 pub(crate) fn task_ledger_text(rows: &[TaskLedgerRow], now_ms: i64) -> Option<String> {
     if rows.is_empty() {
         return None;
@@ -149,15 +146,23 @@ pub(crate) fn task_ledger_text(rows: &[TaskLedgerRow], now_ms: i64) -> Option<St
         text.push_str("· ");
         text.push_str(row.kind.noun());
         if let Some(label) = row.label.as_deref().filter(|label| !label.is_empty()) {
-            let label = label.replace(['\n', '\r'], " ");
             text.push('：');
-            text.push_str(&truncate_md(&label, TASK_LABEL_CHARS));
+            text.push_str(&folded_label(label));
         }
         if let Some(at) = row.started_at {
             text.push_str(&format!(" · {}", fmt_task_elapsed(secs_since(at, now_ms))));
         }
     }
     Some(text)
+}
+
+/// The one shape a task label takes inside the ledger: newlines fold to spaces
+/// (a multi-line command cannot break a row or a panel header) and the text
+/// clips like a short line. Shared by the live row and the completion entry's
+/// title, so the two renderings of one label cannot drift apart (ADR-0060).
+fn folded_label(label: &str) -> String {
+    let label = label.replace(['\n', '\r'], " ");
+    truncate_md(&label, TASK_LABEL_CHARS)
 }
 
 /// Estimated serialized size (bytes) of the ledger section, for the card
@@ -167,7 +172,6 @@ pub(crate) fn task_ledger_text(rows: &[TaskLedgerRow], now_ms: i64) -> Option<St
 /// the estimate and [`task_ledger_text`] cannot drift apart — both clip a
 /// label at [`TASK_LABEL_CHARS`].
 pub(crate) fn task_ledger_estimate(rows: &[TaskLedgerRow]) -> usize {
-    let first_n_bytes = |s: &str, n: usize| s.chars().take(n).map(|c| c.len_utf8()).sum::<usize>();
     let labels: usize = rows
         .iter()
         .filter_map(|row| row.label.as_deref())
@@ -181,7 +185,6 @@ pub(crate) fn task_ledger_estimate(rows: &[TaskLedgerRow]) -> usize {
 /// like [`task_entry_title`] clips it), the body's identity and clock, and the
 /// panel's element overhead. Owned here so it cannot drift from the render.
 pub(crate) fn task_entry_estimate(entry: &TaskCompletionEntry) -> usize {
-    let first_n_bytes = |s: &str, n: usize| s.chars().take(n).map(|c| c.len_utf8()).sum::<usize>();
     let label = entry
         .label
         .as_deref()
@@ -189,6 +192,13 @@ pub(crate) fn task_entry_estimate(entry: &TaskCompletionEntry) -> usize {
         .unwrap_or(0);
     let id = entry.id.as_deref().map(str::len).unwrap_or(0);
     300 + label + id + 80
+}
+
+/// Byte length of the first `n` characters of `s` — the shape both estimates
+/// charge for a rendered clip: the render clips at [`TASK_LABEL_CHARS`], so the
+/// estimates must count in the same unit.
+fn first_n_bytes(s: &str, n: usize) -> usize {
+    s.chars().take(n).map(|c| c.len_utf8()).sum()
 }
 
 /// The ledger row's elapsed: bare, with no Chinese label (ADR-0060) — `3m12s`,
