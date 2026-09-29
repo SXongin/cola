@@ -652,8 +652,27 @@ mod tests {
             clock, "14:02",
             "the start clock is the row's own fixed started_at: {row:?}"
         );
+        // The ledger row's bare elapsed shape: `XmYYs` / `XhYYm` — digits and
+        // units only (a suffix check would pass `garbage-s`).
+        fn elapsed_shaped(elapsed: &str) -> bool {
+            let bytes = elapsed.as_bytes();
+            let digits = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
+            digits > 0
+                && matches!(
+                    bytes.get(digits..),
+                    Some([b'm' | b'h', b'0'..=b'9', b'0'..=b'9', b's' | b'm'])
+                )
+        }
         assert!(
-            matches!(elapsed.chars().last(), Some('s' | 'm')),
+            elapsed_shaped("3m12s") && elapsed_shaped("1h05m"),
+            "the helper accepts both bare shapes"
+        );
+        assert!(
+            !elapsed_shaped("garbage-s") && !elapsed_shaped("99:99") && !elapsed_shaped("3m12"),
+            "the helper rejects a suffix or a clock wearing the elapsed's tail"
+        );
+        assert!(
+            elapsed_shaped(elapsed),
             "the bare elapsed follows the clock: {row:?}"
         );
         assert!(

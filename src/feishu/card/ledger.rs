@@ -369,28 +369,23 @@ mod tests {
     /// keeps the raw label.
     #[test]
     fn a_labels_markdown_characters_stay_inside_its_bold_span() {
-        let render = |label: &str| {
-            task_ledger_text(
-                &[TaskLedgerRow {
-                    kind: TaskKind::Shell,
-                    label: Some(label.into()),
-                    started_at: None,
-                }],
-                0,
-            )
-            .unwrap()
+        let row = |label: &str| TaskLedgerRow {
+            kind: TaskKind::Shell,
+            label: Some(label.into()),
+            started_at: None,
         };
+        let render = |label: &str| task_ledger_text(&[row(label)], 0).unwrap();
 
         // `*`/`_` are neutralized inside the wrap.
-        let row = render("git log --format=*_*_* -- foo_bar");
+        let starry_rendered = render("git log --format=*_*_* -- foo_bar");
         assert_eq!(
-            row, "· shell：**git log --format=&#42;&#95;&#42;&#95;&#42; -- foo&#95;bar**",
+            starry_rendered, "· shell：**git log --format=&#42;&#95;&#42;&#95;&#42; -- foo&#95;bar**",
             "only the entities replace the characters"
         );
         // `&` goes first: a label's own entity text stays literal text once
         // decoded (`&amp;#42;` → `&#42;`), never a new emphasis character.
-        let entity = render("echo &#42; & done");
-        assert_eq!(entity, "· shell：**echo &amp;#42; &amp; done**");
+        let entity_rendered = render("echo &#42; & done");
+        assert_eq!(entity_rendered, "· shell：**echo &amp;#42; &amp; done**");
         // The order matters when a label holds both characters: with the
         // escape applied to `*` first, `a*b` would become `a&amp;#42;b` and
         // decode to the entity text instead of the star.
@@ -401,35 +396,31 @@ mod tests {
             "echo &#42; & done",
             "a*b_c&d",
         ] {
-            let row = render(label);
+            let each = render(label);
             assert_eq!(
-                row.matches("**").count(),
+                each.matches("**").count(),
                 2,
-                "one bold span is its two markers, nothing for a command to close: {row}"
+                "one bold span is its two markers, nothing for a command to close: {each}"
             );
         }
 
         // Both the wrap and the entities run through the builder's markdown
-        // sanitizer untouched (it only rewrites `<` and images).
+        // sanitizer untouched (it only rewrites `<` and images) — the label
+        // carrying `&` / literal entity text included.
         use crate::feishu::card::CardState;
         use crate::feishu::card::shell::CardBuilder;
 
-        let rows = vec![TaskLedgerRow {
-            kind: TaskKind::Shell,
-            label: Some("git log --format=*_*_* -- foo_bar".into()),
-            started_at: None,
-        }];
         let built = CardBuilder::new()
             .with_state(CardState::Streaming)
-            .with_task_ledger(&rows)
+            .with_task_ledger(&[row("git log --format=*_*_* -- foo_bar"), row("echo &#42; & done")])
             .build();
         let body = built["body"]["elements"][0]["elements"][0]["content"]
             .as_str()
             .unwrap();
         assert_eq!(
             body,
-            render("git log --format=*_*_* -- foo_bar"),
-            "the sanitizer leaves the row alone: {built}"
+            format!("{starry_rendered}\n{entity_rendered}"),
+            "the sanitizer leaves the rows alone: {built}"
         );
     }
 
