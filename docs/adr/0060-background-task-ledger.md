@@ -1,0 +1,118 @@
+# The background-task ledger: one live list on the newest card, entries where they lived
+
+## Context
+
+ADR-0059 made a Turn's Background Tasks gate its card (`⏳ 等待后台任务`) and
+gave their completions a Wake continuation, but never showed the tasks as
+tasks. The tool part that launches one settles at launch — the call returns the
+handle, so the panel reads ✅ — and while any task is live the header is the
+only trace: no list, no per-task state, no readable set of "these are the
+things still running". Completion renders ad hoc: a Wake continuation card, or
+one merged receipt line (`🔔 后台任务完成：<命令>`) when the Wake's work landed
+in an already-live card. Issue #412 (raised during #405's acceptance) asked for
+a pinned live list, fixed completed entries, and a decision between Policy W
+(ADR-0059: not complete while tasks are live) and Policy C (`✅` = the turn's
+answer is done).
+
+The design round (2026-09-29) established the mechanics this builds on: Session
+Sync keeps polling a yielded session every 8 s (the inflight guard is released
+at the yield) but PATCHes only when its content diff owes content; the request
+sweeps (3 s) can already PATCH a waiting card in place; Wake continuations are
+content-gated (`wake_continuation` returns `None` when the resumed run renders
+nothing, so a quiet completion posts nothing today); the receipt is a plain
+timeline line with no folding; and the read model's `BackgroundTask` carries
+identity and timing but no label — the originating tool part's `input` (same
+`call_id`) does.
+
+## Decision
+
+**Policy W stands** (ADR-0059's terminal semantics are unchanged): ✅ and the
+Completion Notice still fire only at a Turn's true end — idle with no live
+Background Task. Policy C was rejected: every completion already opens a Wake
+continuation, so W's chain reads ⏳ → … → ✅ for one request, while C would
+stamp ✅ on each interim card (✅ → ✅ → ✅) and force CONTEXT.md to re-narrow
+what ✅ promises. The ledger supplies the visibility C was meant to buy, with
+one meaning for ✅.
+
+**One ledger, following the newest card.** Every live Background Task of the
+Session — across Turns — renders in a card-tail section like the Todo Panel and
+live Tool Panels (ADR-0045): title `⏳ 后台任务（N）`, rows
+`· shell：<label> · 3m12s` / `· 子代理：<description> · 1m05s`. The label is
+joined from the tool part's input by `call_id` (shell: `command`/`description`;
+`subagent` needs its own rendering arm), clipped like the receipt; elapsed is
+minute-granular and driven by the existing reads (the 8 s Session Sync pass) —
+no new polling cadence. Exactly one card carries the live list: when a Wake
+continues the chain or a new Turn takes over, the handover removes it from the
+old card.
+
+**A completion leaves a fixed entry where the task lived.** The task leaves the
+live list and becomes a collapsible entry on the card that hosted it — the
+handover PATCH carries both — with the mechanical receipt line as its collapsed
+title (`🔔 后台任务完成：<命令>` / `🔔 子代理完成：<描述>`, bare when the Wake
+names no label) and identity and timing inside (`shell sh_abc · 14:02 · 12m`).
+The receipt line and the entry are one mechanism, not two renderings; the
+completion still never depends on the model narrating it. A continuation card
+carries only its 承接 line and the remaining live list — the entry does not
+migrate.
+
+**The ledger is the freeze's one carve-out.** ADR-0059's "the card stops
+updating" (Waiting on Background Work) is narrowed to allow the host card to be
+re-rendered in place for the ledger: membership and elapsed stay fresh while
+the card is otherwise yielded. The carve-out covers the handover removal above
+and the case below, nothing else.
+
+**A quiet true end settles the waiting card in place.** When the last
+Background Task retires and the Wake's resumed run renders nothing, nothing
+posts today — the waiting card would be left saying ⏳ forever. With the ledger
+updating it anyway, that read is also the true end: the host waiting card
+settles ✅ in place and the Completion Notice fires per its existing rules
+(groups per `[bridge] group_completion_notice`, p2p per the long-task
+threshold). This supersedes drain.rs's
+`a_retirement_after_the_yield_leaves_the_waiting_card_alone` expectation.
+
+**The launch panel stops reading as done.** The settled `shell`/`subagent` call
+whose metadata says the run is still going keeps its place in the timeline as
+the record of the request, but renders 「已转后台」 instead of ✅; the ledger,
+not the panel, owns the run's liveness.
+
+V1 carries none of these facts: there the section is empty and behavior is
+today's (the ADR-0059 degradation).
+
+## Considered options
+
+- **Policy C (`✅` = the turn's answer is done).** Rejected — with every
+  completion already continuing the chain, C makes one user request produce a
+  row of ✅s and requires re-narrowing ✅ in the glossary; W plus the ledger
+  keeps ✅ single-meaning and still shows the running set.
+- **No ledger; keep the opaque header.** Rejected — the header says something
+  is running without saying what or for how long, which is #412's whole point.
+- **The completed entry follows the newest card** (the spec's first wording).
+  Rejected — an entry that migrates accumulates history onto every continuation
+  card, contradicting the 承接 rule that a continuation carries only new work
+  (ADR-0043); the entry is the audit residue of the card the task lived on.
+- **A separate receipt line plus a ledger entry.** Rejected — one fact, one
+  rendering.
+- **Only refresh the ledger at card handovers.** Rejected — the ledger would
+  read as a snapshot the moment the card yields, which is exactly when a user
+  checks it.
+- **Keep the waiting card frozen until superseded (today's quiet-end
+  behavior).** Rejected — the card would show a completed entry under a header
+  claiming ⏳, and the Turn's ✅ would never render for a quiet completion.
+
+## Consequences
+
+- CONTEXT.md gains **Background Task Ledger**; **Wake**, **Card**, **Tool
+  Panel** and **Waiting on Background Work** record the entry copy, the launch
+  panel's 已转后台 state, and the carve-out.
+- New rendering work: a third card-tail section; a fold element for entries;
+  a `subagent` arm in the input formatter; the `call_id` label join.
+- The ledger must fit the card budget like the existing tail sections — many
+  live tasks are still one section, rows clipped like the receipt.
+- Tests pin: the exact copy, one and several live tasks, out-of-order
+  completions, a completion while the card is live vs waiting, the list
+  surviving a split/continuation, the handover removal, and the quiet true end
+  (✅ + notice, no new card).
+- A cola restart still loses live cards; the next Wake pass rebuilds the
+  ledger on a new card exactly as it rebuilds any continuation.
+
+Related: #412, #405, #403, ADR-0059, ADR-0045, ADR-0043, ADR-0040, ADR-0054.
