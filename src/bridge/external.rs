@@ -179,6 +179,10 @@ impl ExternalFlow {
             return;
         };
         let cola_authored = crate::opencode::parsing::is_cola_message_id(newest.id.as_str());
+        // The Session Sync pass's clock (ADR-0060): the ledger's refresh is
+        // minute-granular, and the Wake decision and the yielded refresh of
+        // this same read must stamp one moment, not two.
+        let now_ms = chrono::Utc::now().timestamp_millis();
         if cola_authored {
             // The Session Sync Wake step (ADR-0059): the newest user message is
             // cola's own, so any work in this Session that the card chain has
@@ -187,8 +191,25 @@ impl ExternalFlow {
             // the watermark's early returns on purpose: a Wake's visibility
             // must never depend on the Sync Watermark, which accounts user
             // messages only and is never moved by a Wake (ADR-0026).
-            self.render_wake_continuation(handles, &transcript, sid, thread_key, directory, &turn_anchor)
-                .await;
+            self.render_wake_continuation(
+                handles,
+                &transcript,
+                sid,
+                thread_key,
+                directory,
+                &turn_anchor,
+                now_ms,
+            )
+            .await;
+            // The same read also keeps a yielded (Waiting) card's ledger fresh
+            // in place (ADR-0060) — the freeze's carve-out. Ordered after the
+            // Wake step on purpose: a Wake that owes a continuation hands the
+            // ledger over through its split and leaves no Waiting card behind,
+            // so only the quiet retirement (no continuation to render) lands
+            // here, and a read that changed nothing PATCHes nothing.
+            if Turn::refresh_yielded_ledger(&handles.cards, sid, &transcript, now_ms).await {
+                tracing::info!("yielded ledger refreshed: session {sid}");
+            }
         }
         let mut map = self.last_user_msg_epoch.lock().await;
         let watermark = map.get(sid).copied();
@@ -533,6 +554,10 @@ impl ExternalFlow {
     /// never replayed onto it. Both paths are independent of any in-memory
     /// accumulator from before: the card-exists case diffs the chain's own
     /// rendered state, the restart case scopes by the Wake's server time.
+    ///
+    /// `now_ms` is this pass's clock, carried to the split's ledger handover so
+    /// one read stamps one moment (ADR-0060).
+    #[allow(clippy::too_many_arguments)] // the pass's read: handles + transcript + session/thread/directory + anchor + clock
     async fn render_wake_continuation(
         &self,
         handles: &FlowHandles,
@@ -541,6 +566,7 @@ impl ExternalFlow {
         thread_key: &crate::config::ThreadKey,
         directory: &str,
         turn_anchor: &TurnAnchor,
+        now_ms: i64,
     ) {
         // A live Turn/follow/renderer owns the session: it renders (or will
         // render) whatever arrives — never double-render into a second card.
@@ -591,7 +617,8 @@ impl ExternalFlow {
                 // the retiring Wakes' entries, and the continuation — whose
                 // slice starts after both — opens with only its 承接 line and
                 // the remaining list.
-                if !Turn::split_chain_for_wake(&handles.cards, sid, &reply_to, line, transcript).await {
+                if !Turn::split_chain_for_wake(&handles.cards, sid, &reply_to, line, transcript, now_ms).await
+                {
                     return;
                 }
                 let (Some(anchor), Some(chain)) = (
