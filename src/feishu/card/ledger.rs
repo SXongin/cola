@@ -100,9 +100,11 @@ pub(crate) fn task_entry_title(entry: &TaskCompletionEntry) -> String {
     }
 }
 
-/// The completion entry's fold body: identity and timing, no Chinese labels
-/// (ADR-0060) — `shell sh_abc · 14:02 · 12m`. Each part is omitted when the
-/// read named none (an id-less or start-less entry stays honest rather than
+/// The completion entry's fold body: the task's identity and the run's timing —
+/// `shell sh_abc · 14:02 · 12m`, and `子代理 ses_child · 14:02 · 1m` for the
+/// subagent kind, whose noun is the ledger's own ([`TaskKind::noun`]). The
+/// timing parts carry no Chinese labels (ADR-0060). Each part is omitted when
+/// the read named none (an id-less or start-less entry stays honest rather than
 /// inventing detail), and the duration is the run's own server-time span
 /// (finished − started), so re-rendering the entry never drifts.
 pub(crate) fn task_entry_body(entry: &TaskCompletionEntry) -> String {

@@ -127,6 +127,40 @@ fn background_subagent_launch(
     )
 }
 
+/// The preamble every merged-entry scenario's card hosted: the anchor prompt,
+/// the assistant's hand-off line, and each settled launch panel the card
+/// showed. `resumed` appends the Wake's own work, when the scenario has it; the
+/// two side offsets are stated once, here.
+fn merged_entry_timeline(
+    started: i64,
+    launches: Vec<TranscriptMessage>,
+    resumed: Vec<TranscriptMessage>,
+) -> Vec<TranscriptMessage> {
+    let mut messages = vec![
+        user("msg_cola_anchor", started - 60_000, "跑一下 CI"),
+        assistant(started - 30_000, "已经交给后台了。"),
+    ];
+    messages.extend(launches);
+    messages.extend(resumed);
+    messages
+}
+
+/// [`merged_entry_timeline`] with the standard backgrounded `shell` launch —
+/// the shared `call_bg`/`sh_bg`/`gh run watch` fixture most merged-entry
+/// scenarios host.
+fn merged_shell_timeline(started: i64, resumed: Vec<TranscriptMessage>) -> Vec<TranscriptMessage> {
+    merged_entry_timeline(
+        started,
+        vec![background_shell_launch(
+            started,
+            "call_bg",
+            "sh_bg",
+            "gh run watch",
+        )],
+        resumed,
+    )
+}
+
 /// The resumed run's own work: reasoning, a settled tool and the closing text,
 /// each carrying the SERVER start time it really has. This is what a Wake
 /// continuation renders after the 承接 receipt — and the element kinds the
@@ -1366,16 +1400,7 @@ fn entry_span() -> (i64, i64) {
 async fn a_merged_shell_wake_leaves_one_entry_on_the_live_turn_card() {
     let _wd = test_work_dir();
     let (started, finished) = entry_span();
-    let timeline = |resumed: Option<TranscriptMessage>| {
-        let mut messages = vec![
-            user("msg_cola_anchor", started - 60_000, "跑一下 CI"),
-            assistant(started - 30_000, "已经交给后台了。"),
-            background_shell_launch(started, "call_bg", "sh_bg", "gh run watch"),
-        ];
-        messages.extend(resumed);
-        messages
-    };
-    let live = SessionTranscript::new(timeline(None))
+    let live = SessionTranscript::new(merged_shell_timeline(started, vec![]))
         .with_executions(vec![execution(started + 30_000)])
         .with_background_tasks(vec![background_shell(started)]);
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Busy)).await;
@@ -1394,9 +1419,12 @@ async fn a_merged_shell_wake_leaves_one_entry_on_the_live_turn_card() {
     script_transcript(
         &backend,
         vec![
-            SessionTranscript::new(timeline(Some(assistant(finished + 30_000, "CI 通过了。"))))
-                .with_executions(vec![execution(started + 30_000)])
-                .with_wakes(vec![shell_wake(finished)]),
+            SessionTranscript::new(merged_shell_timeline(
+                started,
+                vec![assistant(finished + 30_000, "CI 通过了。")],
+            ))
+            .with_executions(vec![execution(started + 30_000)])
+            .with_wakes(vec![shell_wake(finished)]),
         ],
     )
     .await;
@@ -1459,9 +1487,12 @@ async fn a_merged_shell_wake_leaves_one_entry_on_the_live_turn_card() {
     script_transcript(
         &backend,
         vec![
-            SessionTranscript::new(timeline(Some(assistant(finished + 30_000, "CI 通过了。"))))
-                .with_executions(vec![execution(started + 30_000), execution(finished + 60_000)])
-                .with_wakes(vec![shell_wake(finished)]),
+            SessionTranscript::new(merged_shell_timeline(
+                started,
+                vec![assistant(finished + 30_000, "CI 通过了。")],
+            ))
+            .with_executions(vec![execution(started + 30_000), execution(finished + 60_000)])
+            .with_wakes(vec![shell_wake(finished)]),
         ],
     )
     .await;
@@ -1496,19 +1527,21 @@ async fn a_merged_shell_wake_leaves_one_entry_on_the_live_turn_card() {
 #[tokio::test]
 async fn several_completions_leave_one_entry_each_in_wake_order() {
     let _wd = test_work_dir();
-    let base = crate::feishu::card::test_local_ms(2026, 9, 29, 13, 50);
-    let shell_wake_at = base + 12 * 60_000; // 14:02, 12m after its launch
-    let subagent_wake_at = base + 10 * 60_000; // 14:00, 5m after its launch
-    let timeline = |resumed: Option<TranscriptMessage>| {
-        let mut messages = vec![
-            user("msg_cola_anchor", base - 120_000, "跑一下 CI"),
-            assistant(base - 60_000, "已经交给后台了。"),
-            background_shell_launch(base, "call_bg", "sh_bg", "gh run watch"),
-            // The subagent started later but finishes first.
-            background_subagent_launch(base + 5 * 60_000, "call_sub", "ses_child", "review the diff"),
-        ];
-        messages.extend(resumed);
-        messages
+    // The shell run is the pinned `entry_span()` one: launched at 13:50,
+    // completed at 14:02 (`shell sh_bg · 14:02 · 12m`). The subagent starts
+    // later but finishes first.
+    let (base, shell_wake_at) = entry_span();
+    let subagent_wake_at = base + 10 * 60_000; // 14:00, 5m after its own launch
+    let timeline = |resumed: Vec<TranscriptMessage>| {
+        merged_entry_timeline(
+            base,
+            vec![
+                background_shell_launch(base, "call_bg", "sh_bg", "gh run watch"),
+                // The subagent started later but finishes first.
+                background_subagent_launch(base + 5 * 60_000, "call_sub", "ses_child", "review the diff"),
+            ],
+            resumed,
+        )
     };
     let shell_task = background_shell(base);
     let subagent_task = BackgroundTask {
@@ -1520,7 +1553,7 @@ async fn several_completions_leave_one_entry_each_in_wake_order() {
         child_id: Some("ses_child".into()),
         started_at: Some(base + 5 * 60_000),
     };
-    let live = SessionTranscript::new(timeline(None))
+    let live = SessionTranscript::new(timeline(vec![]))
         .with_executions(vec![execution(base + 30_000)])
         .with_background_tasks(vec![shell_task.clone(), subagent_task.clone()]);
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Busy)).await;
@@ -1535,7 +1568,7 @@ async fn several_completions_leave_one_entry_each_in_wake_order() {
     script_transcript(
         &backend,
         vec![
-            SessionTranscript::new(timeline(Some(assistant(shell_wake_at + 30_000, "都跑完了。"))))
+            SessionTranscript::new(timeline(vec![assistant(shell_wake_at + 30_000, "都跑完了。")]))
                 .with_executions(vec![execution(base + 30_000)])
                 .with_wakes(vec![
                     subagent_wake(subagent_wake_at, "review the diff"),
@@ -1577,7 +1610,7 @@ async fn several_completions_leave_one_entry_each_in_wake_order() {
     script_transcript(
         &backend,
         vec![
-            SessionTranscript::new(timeline(Some(assistant(shell_wake_at + 30_000, "都跑完了。"))))
+            SessionTranscript::new(timeline(vec![assistant(shell_wake_at + 30_000, "都跑完了。")]))
                 .with_executions(vec![execution(base + 30_000), execution(shell_wake_at + 60_000)])
                 .with_wakes(vec![
                     subagent_wake(subagent_wake_at, "review the diff"),
@@ -1605,16 +1638,19 @@ async fn a_merged_subagent_wake_labels_the_entry_with_its_description() {
     let _wd = test_work_dir();
     let long = "很长的子代理任务描述".repeat(10); // 100 chars: the title clips at 60
     let (started, finished) = entry_span();
-    let timeline = |resumed: Option<TranscriptMessage>| {
-        let mut messages = vec![
-            user("msg_cola_anchor", started - 60_000, "跑一下 CI"),
-            assistant(started - 30_000, "已经交给后台了。"),
-            background_subagent_launch(started, "call_sub", "ses_child", &long),
-        ];
-        messages.extend(resumed);
-        messages
+    let timeline = |resumed: Vec<TranscriptMessage>| {
+        merged_entry_timeline(
+            started,
+            vec![background_subagent_launch(
+                started,
+                "call_sub",
+                "ses_child",
+                &long,
+            )],
+            resumed,
+        )
     };
-    let live = SessionTranscript::new(timeline(None))
+    let live = SessionTranscript::new(timeline(vec![]))
         .with_executions(vec![execution(started + 30_000)])
         .with_background_tasks(vec![background_shell(started)]);
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Busy)).await;
@@ -1624,7 +1660,7 @@ async fn a_merged_subagent_wake_labels_the_entry_with_its_description() {
     script_transcript(
         &backend,
         vec![
-            SessionTranscript::new(timeline(Some(assistant(finished + 30_000, "子代理跑完了。"))))
+            SessionTranscript::new(timeline(vec![assistant(finished + 30_000, "子代理跑完了。")]))
                 .with_executions(vec![execution(started + 30_000)])
                 .with_wakes(vec![subagent_wake(finished, &long)]),
         ],
@@ -1667,7 +1703,7 @@ async fn a_merged_subagent_wake_labels_the_entry_with_its_description() {
     script_transcript(
         &backend,
         vec![
-            SessionTranscript::new(timeline(Some(assistant(finished + 30_000, "子代理跑完了。"))))
+            SessionTranscript::new(timeline(vec![assistant(finished + 30_000, "子代理跑完了。")]))
                 .with_executions(vec![execution(started + 30_000), execution(finished + 60_000)])
                 .with_wakes(vec![subagent_wake(finished, &long)])
                 .with_background_tasks(vec![background_shell(started)]),
@@ -1690,18 +1726,14 @@ async fn a_chained_wake_leaves_its_entry_on_the_live_continuation_card_once() {
     let _wd = test_work_dir();
     let (started, finished) = entry_span();
     let timeline = |first: bool, second: bool| {
-        let mut messages = vec![
-            user("msg_cola_anchor", started - 120_000, "跑一下 CI"),
-            assistant(started - 60_000, "已经交给后台了。"),
-            background_shell_launch(started, "call_bg", "sh_bg", "gh run watch"),
-        ];
+        let mut resumed = Vec::new();
         if first {
-            messages.push(assistant(started + 120_000, "第一段进展。"));
+            resumed.push(assistant(started + 120_000, "第一段进展。"));
         }
         if second {
-            messages.push(assistant(finished + 30_000, "第二段进展。"));
+            resumed.push(assistant(finished + 30_000, "第二段进展。"));
         }
-        messages
+        merged_shell_timeline(started, resumed)
     };
     let waiting = SessionTranscript::new(timeline(false, false))
         .with_executions(vec![execution(started + 30_000)])
@@ -1781,13 +1813,9 @@ async fn a_chained_wake_leaves_its_entry_on_the_live_continuation_card_once() {
 async fn a_restart_or_interrupt_wake_gets_no_entry() {
     let _wd = test_work_dir();
     let (started, finished) = entry_span();
-    let live = SessionTranscript::new(vec![
-        user("msg_cola_anchor", started - 60_000, "跑一下 CI"),
-        assistant(started - 30_000, "已经交给后台了。"),
-        background_shell_launch(started, "call_bg", "sh_bg", "gh run watch"),
-    ])
-    .with_executions(vec![execution(started + 30_000)])
-    .with_background_tasks(vec![background_shell(started)]);
+    let live = SessionTranscript::new(merged_shell_timeline(started, vec![]))
+        .with_executions(vec![execution(started + 30_000)])
+        .with_background_tasks(vec![background_shell(started)]);
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Busy)).await;
     let turn = spawn_turn(&app, ctx("ses_test", "跑一下 CI"));
     wait_for_card_text(&platform, "已经交给后台了。").await;
@@ -1801,14 +1829,7 @@ async fn a_restart_or_interrupt_wake_gets_no_entry() {
         interrupt.source = WakeSource::Interrupt;
         vec![restart, interrupt]
     };
-    let resumed = |text: &str| {
-        vec![
-            user("msg_cola_anchor", started - 60_000, "跑一下 CI"),
-            assistant(started - 30_000, "已经交给后台了。"),
-            background_shell_launch(started, "call_bg", "sh_bg", "gh run watch"),
-            assistant(finished + 30_000, text),
-        ]
-    };
+    let resumed = |text: &str| merged_shell_timeline(started, vec![assistant(finished + 30_000, text)]);
     script_transcript(
         &backend,
         vec![
@@ -1852,16 +1873,7 @@ async fn a_restart_or_interrupt_wake_gets_no_entry() {
 async fn an_unnamed_merged_wake_renders_the_bare_title() {
     let _wd = test_work_dir();
     let (started, finished) = entry_span();
-    let timeline = |resumed: Option<TranscriptMessage>| {
-        let mut messages = vec![
-            user("msg_cola_anchor", started - 60_000, "跑一下 CI"),
-            assistant(started - 30_000, "已经交给后台了。"),
-            background_shell_launch(started, "call_bg", "sh_bg", "gh run watch"),
-        ];
-        messages.extend(resumed);
-        messages
-    };
-    let live = SessionTranscript::new(timeline(None))
+    let live = SessionTranscript::new(merged_shell_timeline(started, vec![]))
         .with_executions(vec![execution(started + 30_000)])
         .with_background_tasks(vec![background_shell(started)]);
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Busy)).await;
@@ -1873,9 +1885,12 @@ async fn an_unnamed_merged_wake_renders_the_bare_title() {
     script_transcript(
         &backend,
         vec![
-            SessionTranscript::new(timeline(Some(assistant(finished + 30_000, "跑完了。"))))
-                .with_executions(vec![execution(started + 30_000)])
-                .with_wakes(vec![wake.clone()]),
+            SessionTranscript::new(merged_shell_timeline(
+                started,
+                vec![assistant(finished + 30_000, "跑完了。")],
+            ))
+            .with_executions(vec![execution(started + 30_000)])
+            .with_wakes(vec![wake.clone()]),
         ],
     )
     .await;
@@ -1905,9 +1920,12 @@ async fn an_unnamed_merged_wake_renders_the_bare_title() {
     script_transcript(
         &backend,
         vec![
-            SessionTranscript::new(timeline(Some(assistant(finished + 30_000, "跑完了。"))))
-                .with_executions(vec![execution(started + 30_000), execution(finished + 60_000)])
-                .with_wakes(vec![wake]),
+            SessionTranscript::new(merged_shell_timeline(
+                started,
+                vec![assistant(finished + 30_000, "跑完了。")],
+            ))
+            .with_executions(vec![execution(started + 30_000), execution(finished + 60_000)])
+            .with_wakes(vec![wake]),
         ],
     )
     .await;
