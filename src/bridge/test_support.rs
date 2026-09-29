@@ -2421,6 +2421,26 @@ pub(crate) fn card_text(card: &serde_json::Value) -> String {
     card_texts(card).join("\n")
 }
 
+/// Every in-place PATCH the platform recorded for `message_id`, in call order —
+/// so one card's own updates can be told apart from every other card's (the
+/// harness serves one message id per send, so a scenario that must count
+/// PATCHes per chain names each card itself).
+pub(crate) async fn patches_to(platform: &RecordingPlatform, message_id: &str) -> Vec<serde_json::Value> {
+    platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|call| match call {
+            PlatformCall::UpdateMessage {
+                message_id: mid,
+                card,
+            } if mid == message_id => Some(card.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Which recorded card updates [`wait_for_card_update`] checks.
 #[derive(Clone, Copy)]
 pub(crate) enum CardUpdates {

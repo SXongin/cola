@@ -800,8 +800,9 @@ impl CardsHandle {
     /// The lock serializing card writes for `session_id`. Every path that reads
     /// a session's card state, sends the result to Feishu, and then records it
     /// must hold this across the whole sequence: `flush_card`, `split_card_chain`
-    /// (which enqueues its split and flushes under the same lock) and
-    /// `resolve_blocks` are the holders.
+    /// and `split_chain_for_wake` (which enqueue their split and flush it under
+    /// the same lock; `split_chain_for_wake` also writes the outgoing card's
+    /// ledger handover) and `resolve_blocks` are the holders.
     pub(crate) async fn write_lock(&self, session_id: &str) -> Arc<Mutex<()>> {
         self.write_locks
             .lock()
