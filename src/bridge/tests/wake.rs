@@ -18,7 +18,8 @@ use super::drain::{
     wait_for_card_text,
 };
 use crate::backend::{
-    BackgroundTask, MessageRole, SessionTranscript, ToolIdentity, ToolStatus, TranscriptMessage,
+    BackgroundTask, ContentBlock, FinishReason, MessageRole, Part, ReasoningPart, SessionTranscript,
+    StepFinish, TextPart, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
 };
 use crate::bridge::test_support::*;
 use crate::bridge::turn::Turn;
@@ -61,6 +62,58 @@ fn another_background_shell(started_at: i64) -> BackgroundTask {
         child_id: None,
         started_at: Some(started_at),
     }
+}
+
+/// The resumed run's own work: reasoning, a settled tool and the closing text,
+/// each carrying the SERVER start time it really has. This is what a Wake
+/// continuation renders after the 承接 receipt — and the element kinds the
+/// live order bug put first (a receipt keyed at cola's poll moment sorts after
+/// work whose server times are already in the past).
+fn resumed_work(created: i64) -> TranscriptMessage {
+    typed_message(
+        &format!("msg_a_{created}"),
+        MessageRole::Assistant,
+        Some(created),
+        vec![
+            Part::Reasoning(ReasoningPart {
+                text: "正在验证 CI 结果。".into(),
+                started_at: Some(created),
+            }),
+            Part::Tool(ToolCall {
+                identity: ToolIdentity {
+                    name: "bash".into(),
+                    call_id: "call_resumed".into(),
+                },
+                status: ToolStatus::Completed,
+                started_at: Some(created),
+                input: Some(serde_json::json!({ "command": "gh run watch" })),
+                metadata: None,
+                output: ToolOutput {
+                    raw: None,
+                    blocks: vec![ContentBlock::Text("workflow run 123 成功".into())],
+                    error: None,
+                },
+            }),
+            Part::Text(TextPart {
+                text: "CI 通过了。".into(),
+                started_at: Some(created + 1),
+            }),
+            Part::StepFinish(StepFinish {
+                reason: FinishReason::Stop,
+            }),
+        ],
+    )
+}
+
+/// The index of the first card BODY element whose JSON contains `needle` —
+/// nested panel content included, so one reasoning/tool panel counts as the
+/// one element it renders as. The continuation's element ORDER is the live
+/// bug: the 承接 receipt is the card's first visible block.
+fn body_index(card: &serde_json::Value, needle: &str) -> Option<usize> {
+    card["body"]["elements"]
+        .as_array()?
+        .iter()
+        .position(|element| element.to_string().contains(needle))
 }
 
 /// The 承接 receipt line a Wake continuation opens with — the one user-facing
@@ -144,14 +197,15 @@ async fn a_wake_after_a_waiting_yield_continues_on_a_new_card() {
         Some(CardState::Waiting)
     );
 
-    // The Wake resumes the Turn: new work, and its Execution has ended.
+    // The Wake resumes the Turn with real work: reasoning, a settled tool and
+    // the answer, all carrying server times from the wake moment.
     script_transcript(
         &backend,
         vec![
             SessionTranscript::new(vec![
                 user("msg_cola_anchor", 1_000, "跑一下 CI"),
                 assistant(2_000, "已经交给后台了。"),
-                assistant(3_100, "CI 通过了。"),
+                resumed_work(3_100),
             ])
             .with_executions(vec![execution(2_500), execution(4_000)])
             .with_wakes(vec![shell_wake(2_900)]),
@@ -187,10 +241,23 @@ async fn a_wake_after_a_waiting_yield_continues_on_a_new_card() {
         "the continuation streams the resumed work before it ends: {:?}",
         platform.updated_cards().await
     );
-    assert!(
-        card_text(&last).contains(LEAD),
-        "the 承接 line opens the continuation: {last}"
+    // The 承接 receipt is the continuation's FIRST visible block, ahead of
+    // every part of the resumed run: the work carries server times from the
+    // wake (already in the past at poll time), so a receipt keyed at cola's
+    // "now" would sort after it — the live order bug.
+    let receipt = body_index(&last, LEAD).expect("the 承接 line rides the continuation");
+    assert_eq!(
+        receipt, 0,
+        "the 承接 line must open the continuation card: {last}"
     );
+    for work in ["正在验证 CI 结果。", "workflow run 123 成功", "CI 通过了。"] {
+        let at = body_index(&last, work)
+            .unwrap_or_else(|| panic!("the resumed work must render ({work}): {last}"));
+        assert!(
+            receipt < at,
+            "the 承接 receipt must precede the resumed work {work:?} (receipt@{receipt}, work@{at}): {last}"
+        );
+    }
     assert!(
         card_text(&last).contains("📁"),
         "the continuation keeps the Turn Footer: {last}"
@@ -316,7 +383,13 @@ async fn a_wake_after_a_restart_posts_a_continuation_card() {
     .await;
 
     let last = platform.updated_cards().await.last().cloned().unwrap();
-    assert!(card_text(&last).contains(LEAD), "the 承接 line opens it: {last}");
+    // The fresh arm keys the 承接 line before the Wake's own work, so it opens
+    // the card here too — not only in the split path.
+    assert_eq!(
+        body_index(&last, LEAD),
+        Some(0),
+        "the 承接 line opens the restart continuation: {last}"
+    );
     assert!(card_text(&last).contains("CI 通过了。"), "{last}");
     assert!(
         !card_text(&last).contains("已经交给后台了。"),
@@ -478,6 +551,11 @@ async fn content_a_finalized_card_missed_still_continues() {
     assert!(
         !card_text(&last).contains("第一轮回答。"),
         "only the missed content renders: {last}"
+    );
+    assert_eq!(
+        body_index(&last, LEAD),
+        Some(0),
+        "the 承接 line opens the content-diff continuation too: {last}"
     );
     assert!(
         platform.replied_cards().await.iter().any(is_continuation),

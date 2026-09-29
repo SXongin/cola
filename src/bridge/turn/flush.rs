@@ -367,7 +367,8 @@ async fn push_queued_receipts(cards: &CardsHandle, session_id: &str) {
             continue;
         }
         let receipt = card.pending_split[i].kind.receipt();
-        card.acc.push_receipt(receipt);
+        card.acc
+            .push_receipt_at(card.pending_split[i].receipt_at, receipt);
         card.pending_split[i].receipt_pushed = true;
     }
 }

@@ -227,9 +227,16 @@ pub(super) struct WorkContext {
 /// exactly-once when a continuation send fails and the split is retried.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct PendingSplit {
+    /// The message the continuation replies to (the newest queued split).
     pub(super) reply_to: String,
     pub(super) kind: super::SplitKind,
     pub(super) receipt_pushed: bool,
+    /// The timeline key the receipt takes, when it must sort at a SERVER time
+    /// instead of cola's "now": a Wake continuation's 承接 line precedes work
+    /// whose server times are already in the past at poll time (ADR-0059).
+    /// `None` — every Supplement and `/card` pull — keeps the
+    /// resolution-moment key, unchanged.
+    pub(super) receipt_at: Option<i64>,
 }
 
 /// One live card per session: the streaming accumulator plus the card identity
@@ -831,7 +838,18 @@ impl StreamAccumulator {
     /// Append one Interaction Receipt keyed at the resolution moment — the
     /// single residue a mode change leaves for every block it resolved.
     pub(super) fn push_receipt(&mut self, text: &str) {
-        let key = self.next_order();
+        self.push_receipt_at(None, text);
+    }
+
+    /// [`Self::push_receipt`] with an explicit timeline key: `at_ms` places the
+    /// receipt at a SERVER time instead of cola's "now". The Wake
+    /// continuation's 承接 line needs this — the work it announces carries
+    /// server times from before cola's poll, so a "now" key would sort the
+    /// receipt after that work (ADR-0059; the live order bug). The key only
+    /// orders: the receipt itself shows no clock (`shown_at` stays `None`,
+    /// like every other receipt).
+    pub(super) fn push_receipt_at(&mut self, at_ms: Option<i64>, text: &str) {
+        let key = at_ms.unwrap_or_else(|| self.next_order());
         self.insert_kind(key, None, TimelineKind::Receipt(text.to_string()));
     }
 
@@ -2622,5 +2640,35 @@ mod tests {
             !error_card(true).contains("重试"),
             "a Wake continuation never offers Retry"
         );
+    }
+
+    /// `push_receipt_at` can key a receipt at a SERVER time, ahead of work
+    /// whose server times are already in the past at poll time (the Wake
+    /// continuation's 承接 line), while `push_receipt` keeps the
+    /// resolution-moment key everything else uses (a click, a Supplement
+    /// split) — after everything already on the card.
+    #[test]
+    fn a_receipt_can_be_keyed_before_the_work_it_announces() {
+        let first_content = |card: &serde_json::Value| {
+            card["body"]["elements"][0]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        // The resumed work is keyed at its server time; the 承接 receipt is
+        // keyed just before it, so it opens the card.
+        let mut acc = StreamAccumulator::new("test");
+        acc.push_text_at(Some(1_000), "resumed work");
+        acc.push_receipt_at(Some(999), "🔔 承接");
+        assert_eq!(first_content(&acc.build_card()), "🔔 承接");
+
+        // The default key is cola's "now": after content already on the card.
+        let mut acc = StreamAccumulator::new("test");
+        acc.push_text_at(Some(1_000), "earlier content");
+        acc.push_receipt("📨 receipt");
+        let card = acc.build_card();
+        assert_eq!(first_content(&card), "earlier content");
+        assert_eq!(card["body"]["elements"][1]["content"], "📨 receipt");
     }
 }
