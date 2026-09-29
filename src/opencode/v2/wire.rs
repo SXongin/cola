@@ -29,9 +29,10 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::backend::{
-    BackgroundTask, ContentBlock, Execution, ExecutionOutcome, FinishReason, MessageId, MessageRole,
-    MessageTime, ModelIdentity, OtherPart, Part, ReasoningPart, SessionTranscript, StepFinish, TextPart,
-    TokenUsage, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, Wake, WakeSource,
+    BackgroundLaunch, BackgroundTask, ContentBlock, Execution, ExecutionOutcome, FinishReason, MessageId,
+    MessageRole, MessageTime, ModelIdentity, OtherPart, Part, ReasoningPart, SessionTranscript, StepFinish,
+    TextPart, TokenUsage, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, Wake,
+    WakeSource,
 };
 use crate::opencode::types::{
     AgentInfo, FormFieldKind, ModelInfo, ModelOption, PermissionRequest, QuestionInfo, QuestionOption,
@@ -577,8 +578,9 @@ impl MessagesPage {
 pub(super) fn decode_messages(data: &[Value]) -> SessionTranscript {
     let executions: Vec<Execution> = data.iter().filter_map(decode_execution).collect();
     let wakes: Vec<Wake> = data.iter().filter_map(decode_wake).collect();
-    let background_tasks = decode_background_tasks(data, &wakes);
-    SessionTranscript::new(data.iter().map(decode_message).collect())
+    let messages: Vec<TranscriptMessage> = data.iter().map(decode_message).collect();
+    let background_tasks = decode_background_tasks(&messages, &wakes);
+    SessionTranscript::new(messages)
         .with_executions(executions)
         .with_wakes(wakes)
         .with_background_tasks(background_tasks)
@@ -678,8 +680,11 @@ fn decode_wake_source(metadata: Option<&Value>) -> WakeSource {
 }
 
 /// The Background Tasks a read leaves live: every assistant tool part that
-/// recorded a backgrounded run, minus the ones a Wake retired. The predicate
-/// is the backend's own — the exact derivation the official 2.0.x app uses
+/// recorded a backgrounded run, minus the ones a Wake retired. Derived from
+/// the read's own typed parts, through the same call-level fact the panel's
+/// 「已转后台」 reads ([`ToolCall::background_launch`]), so the ledger and the
+/// running call can never disagree. The predicate is the backend's own — the
+/// exact derivation the official 2.0.x app uses
 /// (`packages/app/src/session/requests/background.ts`): a `shell` or
 /// `subagent` tool part whose call has completed (it returned the background
 /// handle) while its metadata still says the run is `running`. The input's
@@ -688,17 +693,17 @@ fn decode_wake_source(metadata: Option<&Value>) -> WakeSource {
 /// the shell tool's `jobs.block` returns `backgrounded` and it returns the
 /// background handle) carries no request-time flag, and the app counts it.
 /// A settled tool's metadata says `completed`, so it is not live.
-fn decode_background_tasks(data: &[Value], wakes: &[Wake]) -> Vec<BackgroundTask> {
+fn decode_background_tasks(messages: &[TranscriptMessage], wakes: &[Wake]) -> Vec<BackgroundTask> {
     let mut tasks = Vec::new();
-    for message in data {
-        if message.get("type").and_then(Value::as_str) != Some("assistant") {
+    for message in messages {
+        if message.role != MessageRole::Assistant {
             continue;
         }
-        let Some(content) = message.get("content").and_then(Value::as_array) else {
-            continue;
-        };
-        for item in content {
-            let Some(task) = decode_background_task(item) else {
+        for part in &message.parts {
+            let Part::Tool(call) = part else {
+                continue;
+            };
+            let Some(task) = background_task_of(call) else {
                 continue;
             };
             if wakes.iter().any(|wake| wake.retires(&task)) {
@@ -710,36 +715,24 @@ fn decode_background_tasks(data: &[Value], wakes: &[Wake]) -> Vec<BackgroundTask
     tasks
 }
 
-/// One backgrounded run as its tool part recorded it. The part's name decides
-/// which identity the task carries: a `shell` reports its shell id, a
+/// One backgrounded run as its typed tool call recorded it. The part's name
+/// decides which identity the task carries: a `shell` reports its shell id, a
 /// `subagent` the child session it runs in — the names and metadata keys of
 /// OpenCode 2.0.x's own plugins (`packages/core/src/tool/plugin/{shell,
 /// subagent}.ts`). OpenCode 1's `task` tool is a different generation: its
 /// foreground parts do appear in shared-store reads, but they carry no
 /// background marker and their completions never produce a V2 Wake, so they
-/// are never a Background Task here. A part still streaming or running has not
-/// returned a background handle yet, and any other tool never backgrounds
-/// through this shape.
-fn decode_background_task(item: &Value) -> Option<BackgroundTask> {
-    let name = item.get("name").and_then(Value::as_str)?;
-    let state = non_null(item.get("state"))?;
-    if state.get("status").and_then(Value::as_str) != Some("completed") {
-        return None;
-    }
-    let metadata = non_null(state.get("metadata"))?;
-    if metadata.get("status").and_then(Value::as_str) != Some("running") {
-        return None;
-    }
-    let (shell_id, child_id) = match name {
-        "shell" => (string_field(Some(metadata), "shellID"), None),
-        "subagent" => (None, string_field(Some(metadata), "sessionID")),
-        _ => return None,
+/// are never a Background Task here.
+fn background_task_of(call: &ToolCall) -> Option<BackgroundTask> {
+    let (shell_id, child_id) = match call.background_launch()? {
+        BackgroundLaunch::Shell { shell_id } => (shell_id, None),
+        BackgroundLaunch::Subagent { child_id } => (None, child_id),
     };
     Some(BackgroundTask {
-        tool: decode_tool_identity(item.get("name"), item.get("id")),
+        tool: call.identity.clone(),
         shell_id,
         child_id,
-        started_at: item.pointer("/time/created").and_then(Value::as_i64),
+        started_at: call.started_at,
     })
 }
 
@@ -1682,6 +1675,21 @@ mod tests {
         decode_messages(&data)
     }
 
+    /// The Background Task one recorded tool part started, before any Wake
+    /// retires it — the read derives its live list through the same typed call,
+    /// so a retired run's own task is still reachable here.
+    fn started_task(transcript: &SessionTranscript, call_id: &str) -> BackgroundTask {
+        transcript
+            .messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .find_map(|part| match part {
+                Part::Tool(call) if call.identity.call_id == call_id => background_task_of(call),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the recorded `{call_id}` part starts a background task"))
+    }
+
     /// The real #403 read (2.0.18): one unfiltered response carries the
     /// Execution boundary (the durable `idle`), the shell Wake with its source
     /// and correlation keys, and two backgrounded runs — the one the Wake
@@ -1757,14 +1765,7 @@ mod tests {
 
         // The recorded Wake retires the recorded retired run, and not the live
         // one: the correlation is the backend's own, on real keys.
-        let retired = data
-            .iter()
-            .filter(|message| message.get("type").and_then(Value::as_str) == Some("assistant"))
-            .filter_map(|message| message.get("content").and_then(Value::as_array))
-            .flatten()
-            .find(|item| item.get("id").and_then(Value::as_str) == Some("call_background_retired"))
-            .and_then(decode_background_task)
-            .expect("the retired run's tool part decodes");
+        let retired = started_task(&transcript, "call_background_retired");
         assert!(
             wake.retires(&retired),
             "the recorded Wake must retire its own run"
@@ -1862,14 +1863,7 @@ mod tests {
 
         // The recorded Wake retires the recorded retired child, and not the
         // still-running one.
-        let retired = data
-            .iter()
-            .filter(|message| message.get("type").and_then(Value::as_str) == Some("assistant"))
-            .filter_map(|message| message.get("content").and_then(Value::as_array))
-            .flatten()
-            .find(|item| item.get("id").and_then(Value::as_str) == Some("call_subagent_a"))
-            .and_then(decode_background_task)
-            .expect("the retired subagent part decodes");
+        let retired = started_task(&transcript, "call_subagent_a");
         let live = &transcript.background_tasks[0];
         assert!(wake.retires(&retired), "the recorded Wake must retire its child");
         assert!(!wake.retires(live), "and must not retire the live child");
