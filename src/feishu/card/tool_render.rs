@@ -32,7 +32,7 @@ pub struct ToolPanel {
 /// (ADR-0060, the pinned copy): the call settled by returning the background
 /// handle, so the panel never claims the run completed — the Background Task
 /// Ledger owns the run's liveness, before and after retirement.
-pub const BACKGROUNDED_STATUS: &str = "已转后台";
+pub(crate) const BACKGROUNDED_STATUS: &str = "已转后台";
 
 impl ToolPanel {
     pub fn new(call: ToolCall) -> Self {
