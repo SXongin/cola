@@ -1330,6 +1330,9 @@ impl Turn {
                 reply_to: reply_to.to_string(),
                 kind,
                 receipt_pushed: false,
+                // A Supplement's or a pull's content always arrives after the
+                // split: the receipt keeps cola's "now" key.
+                receipt_at: None,
             });
         }
         flush::flush_card_locked(cards, session_id).await;
@@ -1344,9 +1347,17 @@ impl Turn {
     /// [`Self::split_card_chain`], the chain must NOT be owned by a live
     /// Turn/renderer: the Wake decision reads a snapshot, and a Wake
     /// continuation must never split a card somebody else is still streaming
-    /// into. Returns false — nothing queued — when the session has no card or a
-    /// live renderer owns it.
-    pub(crate) async fn split_chain_for_wake(cards: &CardsHandle, session_id: &str, reply_to: &str) -> bool {
+    /// into. `receipt_at` is the timeline key the 承接 line takes — just before
+    /// the resumed work, whose server times are already in the past at poll
+    /// time, so a "now" key would sort the receipt after it. Returns false —
+    /// nothing queued — when the session has no card or a live renderer owns
+    /// it.
+    pub(crate) async fn split_chain_for_wake(
+        cards: &CardsHandle,
+        session_id: &str,
+        reply_to: &str,
+        receipt_at: i64,
+    ) -> bool {
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
         {
@@ -1361,6 +1372,7 @@ impl Turn {
                 reply_to: reply_to.to_string(),
                 kind: SplitKind::Wake,
                 receipt_pushed: false,
+                receipt_at: Some(receipt_at),
             });
         }
         flush::flush_card_locked(cards, session_id).await;
@@ -2128,8 +2140,12 @@ impl Turn {
 pub(crate) enum WakeContinuation {
     /// A card chain exists: continue it by split. Only the content the chain
     /// has not rendered lands on the continuation, and the accumulator's own
-    /// anchor scopes the settle decision.
-    ContinueChain,
+    /// anchor scopes the settle decision. `receipt_at` is the timeline key the
+    /// 承接 receipt takes — just before the work this continuation will render
+    /// (the Wake's own server time, or the Turn's content in the content-diff
+    /// fallback): that work is already in the past at poll time, so a key at
+    /// cola's "now" would sort the receipt after it (the live order bug).
+    ContinueChain { receipt_at: i64 },
     /// No chain (a cola restart): arm a fresh card, scoped at the newest
     /// Wake's own anchor so the lost card's content is never replayed.
     Fresh { anchor: TurnAnchor },
@@ -2180,21 +2196,33 @@ impl Turn {
         transcript: &SessionTranscript,
         turn_anchor: &TurnAnchor,
     ) -> Option<WakeContinuation> {
+        let newest_wake = transcript
+            .wakes
+            .iter()
+            .filter(|wake| wake.created_ms.is_some())
+            .max_by_key(|wake| wake.created_ms);
         // The diff is a sync read of the accumulator's dedup state, so the
         // cards lock is held only for its scan — no clone of the chain (whose
         // rendered content can be a card's worth) is built to run it off-lock.
         {
             let live = cards.cards.lock().await;
             if let Some(card) = live.get(session_id) {
-                return render::renders_new_content(&card.acc, transcript, turn_anchor)
-                    .then_some(WakeContinuation::ContinueChain);
+                if !render::renders_new_content(&card.acc, transcript, turn_anchor) {
+                    return None;
+                }
+                // Key the 承接 receipt just before the work the continuation
+                // will render: the newest Wake's own server time when there is
+                // one, else the Turn's own content (the content-diff
+                // fallback). That work's parts carry server times already in
+                // the past at poll time, so they sort after this key.
+                let receipt_at = newest_wake
+                    .and_then(|wake| wake.anchor())
+                    .map(|wake| wake.created_ms)
+                    .unwrap_or(turn_anchor.created_ms)
+                    .saturating_sub(1);
+                return Some(WakeContinuation::ContinueChain { receipt_at });
             }
         }
-        let newest_wake = transcript
-            .wakes
-            .iter()
-            .filter(|wake| wake.created_ms.is_some())
-            .max_by_key(|wake| wake.created_ms);
         let anchor = newest_wake?.anchor()?;
         let probe = StreamAccumulator::new("");
         render::renders_new_content(&probe, transcript, &anchor).then_some(WakeContinuation::Fresh { anchor })

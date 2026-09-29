@@ -572,7 +572,7 @@ impl ExternalFlow {
         handles.waits.stopped_sessions.lock().await.remove(sid);
 
         match continuation {
-            WakeContinuation::ContinueChain => {
+            WakeContinuation::ContinueChain { receipt_at } => {
                 // The split carries the continuation: its flush re-stamps the
                 // previous card, sends the new card and tracks it. The loop's
                 // guard facts are read AFTER the split, so they describe the
@@ -584,7 +584,7 @@ impl ExternalFlow {
                     );
                     return;
                 };
-                if !Turn::split_chain_for_wake(&handles.cards, sid, &reply_to).await {
+                if !Turn::split_chain_for_wake(&handles.cards, sid, &reply_to, receipt_at).await {
                     return;
                 }
                 let (Some(anchor), Some(chain)) = (
