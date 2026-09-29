@@ -1473,6 +1473,21 @@ async fn a_merged_shell_wake_leaves_one_entry_on_the_live_turn_card() {
         .expect("the boundary ends the turn")
         .unwrap();
     result.unwrap();
+
+    // The settled card is a full re-render of the same timeline: the entry is
+    // still exactly one, in its place.
+    let settled = platform.updated_cards().await.last().cloned().unwrap();
+    assert_eq!(
+        card_text(&settled).matches("后台任务完成").count(),
+        1,
+        "the settled re-render keeps exactly one entry: {settled}"
+    );
+    let entry = body_index(&settled, "后台任务完成").expect("the entry survives the settle");
+    let work = body_index(&settled, "CI 通过了。").expect("the work stays below it");
+    assert!(
+        entry < work,
+        "the entry keeps its place on the settled card (entry@{entry}, work@{work}): {settled}"
+    );
 }
 
 /// Several completions in one read: each Wake leaves its own entry, in the

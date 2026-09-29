@@ -282,8 +282,14 @@ pub(super) fn capture_footer_model(acc: &mut StreamAccumulator, message: &crate:
 /// correlation ([`Wake::retires`] over each part's derived task), so the entry
 /// can only name a run the Wake actually completed; the launch's start time
 /// gives the fold's duration. A read that no longer carries the launch renders
-/// the entry without a duration rather than inventing one.
-fn wake_completion_entry(wake: &Wake, transcript: &SessionTranscript) -> Option<TaskCompletionEntry> {
+/// the entry without a duration rather than inventing one. `finished_at` is the
+/// Wake's server time — the caller's own, already checked for orderability, so
+/// the entry's clock is never guessed here.
+fn wake_completion_entry(
+    wake: &Wake,
+    transcript: &SessionTranscript,
+    finished_at: i64,
+) -> Option<TaskCompletionEntry> {
     let kind = match wake.source {
         WakeSource::Shell => TaskKind::Shell,
         WakeSource::Subagent => TaskKind::Subagent,
@@ -320,7 +326,7 @@ fn wake_completion_entry(wake: &Wake, transcript: &SessionTranscript) -> Option<
         label: wake.label.clone(),
         id,
         started_at: retired.as_ref().and_then(|task| task.started_at),
-        finished_at: wake.created_ms?,
+        finished_at,
     })
 }
 
@@ -401,8 +407,9 @@ fn task_label(kind: TaskKind, input: Option<&serde_json::Value>) -> Option<Strin
 /// about to show, and report whether any was inserted (so an entry reaches the
 /// card even when no part changed). A Wake that opened the card itself was
 /// already announced by its 承接 line, a Wake with no server time cannot be
-/// ordered, and a Wake outside this card's Turn is not this render's content —
-/// all are skipped. Each Wake marks at most once per chain
+/// ordered (so it is skipped before its entry is built — the guard supplies
+/// `created_ms`), and a Wake outside this card's Turn is not this render's
+/// content — all are skipped. Each Wake marks at most once per chain
 /// ([`StreamAccumulator::announce_wake`]), so a repeated poll never doubles an
 /// entry.
 fn render_wake_entries(
@@ -418,7 +425,7 @@ fn render_wake_entries(
         if created_ms < anchor.created_ms {
             continue;
         }
-        let Some(entry) = wake_completion_entry(wake, transcript) else {
+        let Some(entry) = wake_completion_entry(wake, transcript, created_ms) else {
             continue;
         };
         if !acc.announce_wake(wake.id.as_str()) {
