@@ -305,6 +305,15 @@ pub(crate) fn truncate_md(text: &str, max_len: usize) -> String {
     }
 }
 
+/// Byte length of the first `n` characters of `s` — what a render that clips
+/// at `n` characters contributes to the card's serialized size. Card budgets
+/// count UTF-8 bytes (Feishu rejects on bytes, not characters) while every
+/// clip ([`truncate_md`]) counts characters, so this is the one conversion
+/// between the two units a size estimate may use.
+pub(crate) fn first_n_chars_bytes(s: &str, n: usize) -> usize {
+    s.chars().take(n).map(|c| c.len_utf8()).sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
